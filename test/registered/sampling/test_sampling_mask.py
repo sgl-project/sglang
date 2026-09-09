@@ -9,6 +9,11 @@ import torch
 from sglang.srt.layers import sampler as sampler_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
+from sglang.srt.sampling.custom_logit_processor import (
+    DisallowedTokensLogitsProcessor,
+    Qwen3ThinkingBudgetLogitProcessor,
+)
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -30,6 +35,7 @@ _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
     "--mem-fraction-static",
     "0.7",
+    "--enable-custom-logit-processor",
 )
 _INVALID_SAMPLING_MASK_ERROR = (
     "top_p-only sampling is valid but can return huge masks in the tail"
@@ -40,6 +46,64 @@ class TestSamplingMaskCapture(CustomTestCase):
     def setUp(self):
         self.sampler = Sampler.__new__(Sampler)
         torch.nn.Module.__init__(self.sampler)
+
+    def test_hard_exclusion_replay_in_mixed_batch(self):
+        backends = ["pytorch"] if is_hip() else ["pytorch", "flashinfer"]
+        for backend in backends:
+            with self.subTest(backend=backend):
+                logits = (
+                    torch.tensor([[0.3, 0.2, 0.5, 0.15, 0.1]], device="cuda")
+                    .log()
+                    .repeat(2, 1)
+                )
+                original = logits.clone()
+                info = SamplingBatchInfo(
+                    temperatures=torch.ones(2, 1, device="cuda"),
+                    top_ps=torch.full((2,), 0.9, device="cuda"),
+                    top_ks=torch.full((2,), 3, dtype=torch.int32, device="cuda"),
+                    min_ps=torch.zeros(2, device="cuda"),
+                    is_all_greedy=False,
+                    is_any_greedy=False,
+                    need_top_p_sampling=True,
+                    need_top_k_sampling=True,
+                    need_min_p_sampling=False,
+                    vocab_size=5,
+                    has_custom_logit_processor=True,
+                    custom_params=[{"token_ids": [2]}, None],
+                    custom_logit_processor={
+                        0: (
+                            DisallowedTokensLogitsProcessor(),
+                            torch.tensor([True, False], device="cuda"),
+                        )
+                    },
+                    return_sampling_masks=[True, True],
+                )
+                logits = self.sampler._preprocess_logits(logits, info)
+                with patch(
+                    "sglang.srt.layers.sampler.get_exec",
+                    return_value=SimpleNamespace(
+                        kernel=SimpleNamespace(sampling_backend=backend)
+                    ),
+                ):
+                    sampled, capture = self.sampler._sample_from_probs(
+                        logits.softmax(-1),
+                        info,
+                        positions=torch.zeros(2, dtype=torch.int64, device="cuda"),
+                        simple_sampling_case=False,
+                        return_sampling_mask=True,
+                    )
+                output = LogitsProcessorOutput(next_token_logits=None)
+                self.sampler._attach_sampling_mask_to_output(
+                    output, info, sampled, capture
+                )
+                support = output.next_token_sampling_mask_idx[0]
+                self.assertEqual(set(support), {0, 1, 3})
+                self.assertIn(int(sampled[0]), support)
+                expected = original[0, sampled[0]] - original[0, support].logsumexp(0)
+                self.assertAlmostEqual(
+                    output.next_token_sampling_logprobs[0], expected.item(), places=5
+                )
+                self.assertIn(2, output.next_token_sampling_mask_idx[1])
 
     @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
     def test_flashinfer_joint_cutoff_ties_match_capture(self):
@@ -232,12 +296,15 @@ class SamplingMaskTestMixin:
         return_sampling_mask=True,
         return_logprob=False,
         top_logprobs_num=0,
+        custom_logit_processor=None,
     ):
         payload = {
             "text": "The capital of France is",
             "sampling_params": sampling_params,
             "return_sampling_mask": return_sampling_mask,
         }
+        if custom_logit_processor is not None:
+            payload["custom_logit_processor"] = custom_logit_processor
         if return_logprob:
             payload["return_logprob"] = True
             payload["top_logprobs_num"] = top_logprobs_num
@@ -275,6 +342,55 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls._launch_server()
+
+    def test_disallowed_tokens_with_replay(self):
+        params = {
+            "temperature": 1.0,
+            "top_k": _TOP_K,
+            "top_p": _TOP_P,
+            "max_new_tokens": 1,
+            "ignore_eos": True,
+        }
+        baseline = self._post_generate(params)
+        self.assertEqual(baseline.status_code, 200, baseline.text)
+        # Exclude tokens that actually belong to the unmodified sampling support.
+        blocked = baseline.json()["meta_info"]["output_token_sampling_mask"][0][:2]
+        self.assertTrue(blocked)
+        response = self._post_generate(
+            {**params, "custom_params": {"token_ids": blocked}},
+            return_logprob=True,
+            top_logprobs_num=_TOP_LOGPROBS_NUM,
+            custom_logit_processor=DisallowedTokensLogitsProcessor.to_str(),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        output = response.json()
+        meta = output["meta_info"]
+        token = output["output_ids"][0]
+        mask = meta["output_token_sampling_mask"][0]
+        self.assertTrue(set(mask).isdisjoint(blocked))
+        self.assertIn(token, mask)
+        probs = {
+            int(tid): math.exp(lp) for lp, tid, _ in meta["output_top_logprobs"][0]
+        }
+        expected = math.log(probs[token] / sum(probs[tid] for tid in mask))
+        self.assertAlmostEqual(
+            meta["output_token_sampling_logprobs"][0], expected, delta=1e-2
+        )
+
+    def test_rejected_processors_do_not_break_generation(self):
+        params = {"top_k": _TOP_K, "max_new_tokens": 1}
+        for processor in (
+            Qwen3ThinkingBudgetLogitProcessor.to_str(),
+            "invalid processor",
+        ):
+            with self.subTest(processor=processor):
+                response = self._post_generate(params, custom_logit_processor=processor)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn(
+                    "only supports DisallowedTokensLogitsProcessor", response.text
+                )
+                recovery = self._post_generate(params)
+                self.assertEqual(recovery.status_code, 200, recovery.text)
 
     def test_generate_returns_sampling_mask(self):
         top_p_sampling_masks = self._generate_sampling_masks(

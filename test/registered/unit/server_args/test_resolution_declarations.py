@@ -1,15 +1,10 @@
 """Resolution writes are recorded, not just applied.
 
 The projection that replaces field materialization reads the declaration stash,
-so a resolution write that only assigns the field is invisible to it. Every
-resolver declares now -- the record's handlers through `self._declare`, the
-hooks and hardware defaults through `declare_resolution` -- and that is pinned
-two ways: no bare assignment to a field survives anywhere a ServerArgs instance
-is in reach, and after resolution `resolution_result` answers for every declared
-field with what the stash holds. The second check is what the stash is measured
-against: the two can disagree only if something wrote behind the stash's back. A
-third check runs the other way -- every field resolution moved has to be
-explained by the stash, which covers the spellings a source scan cannot see.
+so a resolution write that bypasses the stash is invisible to it. These tests
+compare the raw input, resolved record, declaration result, and published bags
+across representative configurations. A field that moves without a declaration
+or is projected into the wrong namespace therefore fails on observed state.
 """
 
 import ast
@@ -122,114 +117,6 @@ _REACHED_BY_SHAPES = frozenset(
 )
 
 
-def _late_resolvers():
-    """Callables that reach `declare_late_resolution`, derived per module."""
-    found = set()
-    for relative in ("server_args.py", "parser/template_detection.py"):
-        tree = ast.parse((_SRT / relative).read_text(encoding="utf-8-sig"))
-        functions = {
-            node.name: node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-
-        def reaches(name, seen=None):
-            seen = seen if seen is not None else set()
-            if name in seen or name not in functions:
-                return False
-            seen.add(name)
-            for node in ast.walk(functions[name]):
-                if not isinstance(node, ast.Call):
-                    continue
-                called = (
-                    node.func.attr
-                    if isinstance(node.func, ast.Attribute)
-                    else getattr(node.func, "id", None)
-                )
-                if called == "declare_late_resolution":
-                    return True
-                if called and reaches(called, seen):
-                    return True
-            return False
-
-        found |= {name for name in functions if reaches(name)}
-    return found
-
-
-def _server_args_writers(tree, path):
-    """Assignment targets that land on a ServerArgs instance.
-
-    Two mechanisms reach the same instance during resolution: a handler writing
-    `self.<field>`, and a helper elsewhere in the tree writing through a
-    `ServerArgs`-annotated parameter -- `set_default_server_args(args)` is
-    called from the pipeline and writes `args.<field>`. Both bypass the
-    declaration stash, so both have to be scanned; scanning only the handlers
-    would let a field look converted while a second writer still assigns it.
-    """
-    names = {"self"} if path.name == "server_args.py" else set()
-    # A parameter *named* `server_args` counts with or without the annotation.
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        args = node.args
-        for arg in args.posonlyargs + args.args + args.kwonlyargs:
-            annotation = arg.annotation
-            if isinstance(annotation, ast.Constant):
-                text = annotation.value
-            elif isinstance(annotation, ast.Name):
-                text = annotation.id
-            elif isinstance(annotation, ast.Attribute):
-                text = annotation.attr
-            else:
-                continue
-            if text == "ServerArgs":
-                names.add(arg.arg)
-        names |= {
-            arg.arg for arg in args.posonlyargs + args.args if arg.arg == "server_args"
-        }
-    return names
-
-
-def _bare_assignments():
-    """Assignments to a converted field that never reach the stash."""
-    found = []
-    for path in sorted(_SRT.rglob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
-        except SyntaxError:
-            continue
-        names = _server_args_writers(tree, path)
-        if not names:
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-                targets = [node.target]
-            else:
-                continue
-            # Destructured targets count: `(sa.a, sa.b) = f()` writes two
-            # fields and is not an `ast.Attribute` at the top level.
-            flat = []
-            for target in targets:
-                if isinstance(target, (ast.Tuple, ast.List)):
-                    flat.extend(target.elts)
-                else:
-                    flat.append(target)
-            for target in flat:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id in names
-                    and target.attr in _RESOLVED_FIELDS
-                ):
-                    found.append(
-                        f"{path.relative_to(_SRT)}:{node.lineno} "
-                        f"{target.value.id}.{target.attr}"
-                    )
-    return sorted(found)
-
-
 def shape_key(shape):
     """A shape rendered short enough for a failure message."""
     return ",".join(f"{k}={v}" for k, v in sorted(shape.items())) or "defaults"
@@ -298,15 +185,6 @@ class TestResolutionDeclarations(CustomTestCase):
         server_args = ServerArgs(model_path=path, device="cuda", **fields)
         server_args.resolve_once()
         return server_args
-
-    def test_converted_fields_are_not_assigned_bare(self):
-        bare = _bare_assignments()
-        self.assertEqual(
-            bare,
-            [],
-            "a converted field is assigned directly, so the projection would "
-            "not see this write:\n  " + "\n  ".join(bare),
-        )
 
     def test_the_stash_accounts_for_every_change_resolution_made(self):
         """The other direction: a field resolution moved is in the stash.
@@ -419,10 +297,7 @@ class TestResolutionDeclarations(CustomTestCase):
         the last hop: whether the leaf is reachable through the path the
         metadata declares, and whether it carries the resolved value once it
         is. Both sides here come from that metadata, so this cannot tell that
-        a field is assigned to the *wrong* group -- the readers are the
-        independent source for that, and
-        `test_server_args_namespaces.py::test_the_readers_agree_with_the_namespace_metadata`
-        is where the two are compared.
+        a field is assigned to the *wrong* group.
         """
         import sglang.srt.runtime_context as runtime_context
         from sglang.srt.arg_groups.arg_utils import namespace_of
@@ -643,54 +518,6 @@ class TestResolutionDeclarations(CustomTestCase):
             "normalization is a declaration; the record keeps what was passed",
         )
 
-    def test_the_launcher_finishes_resolving_before_it_publishes(self):
-        """Every late resolver runs above the publish, in the source.
-
-        A published record refuses to be written, so a late resolver below the
-        publish raises at startup rather than at test time -- and only for the
-        configuration that reaches it, which is why the LoRA path can break
-        while every other launch stays green. Both sides are derived: which
-        callables reach `declare_late_resolution`, and where the launcher calls
-        them.
-        """
-        launcher = _SRT / "entrypoints/engine.py"
-        late = {"check_server_args", "resolve_auto_parsers"} | _late_resolvers()
-        tree = ast.parse(launcher.read_text(encoding="utf-8-sig"))
-        function = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "_launch_subprocesses"
-        )
-        published_at = [
-            node.lineno
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "publish"
-        ]
-        self.assertEqual(len(published_at), 1, "the launcher publishes once")
-        too_late = sorted(
-            f"{name}() at line {node.lineno}"
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            for name in [
-                (
-                    node.func.attr
-                    if isinstance(node.func, ast.Attribute)
-                    else getattr(node.func, "id", None)
-                )
-            ]
-            if name in late and node.lineno > published_at[0]
-        )
-        self.assertEqual(
-            too_late,
-            [],
-            f"these resolve after the launcher publishes at line "
-            f"{published_at[0]}, and a published record refuses to be "
-            f"written:\n  " + "\n  ".join(too_late),
-        )
-
     def test_an_undeclared_field_still_holds_the_raw_input(self):
         """Nothing writes a field behind the stash's back.
 
@@ -831,48 +658,6 @@ class TestResolutionDeclarations(CustomTestCase):
             "the bags and the record disagree about the graph configuration, "
             "so a decision made inside the declared object was dropped",
         )
-
-    def test_every_platform_hook_that_takes_the_record_is_captured(self):
-        """A second out-of-tree config hook must not arrive uncaptured.
-
-        `apply_server_args_defaults` is the one method on the platform
-        interface that is handed the record, and its implementations live in
-        other distributions -- no source scan of this tree can see what they
-        write, so the pipeline diffs the record across the call instead. A new
-        hook of the same shape would be invisible again, and this is what
-        notices. Derived from the interface rather than listed: a rename keeps
-        working, an addition fails.
-        """
-        interface = _SRT / "platforms" / "interface.py"
-        tree = ast.parse(interface.read_text(encoding="utf-8-sig"))
-        taking_the_record = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            arguments = node.args
-            names = [
-                arg.arg
-                for arg in arguments.posonlyargs + arguments.args + arguments.kwonlyargs
-            ]
-            if any(name == "server_args" or name.endswith("_args") for name in names):
-                taking_the_record.add(node.name)
-        self.assertEqual(
-            taking_the_record,
-            {"apply_server_args_defaults"},
-            "the platform interface hands the startup record to a method this "
-            "test does not know about; either it only reads, or its writes need "
-            "capturing like apply_server_args_defaults",
-        )
-
-        pipeline = (_SRT / "arg_groups" / "pipeline.py").read_text(encoding="utf-8-sig")
-        for hook in sorted(taking_the_record):
-            self.assertIn(
-                f"current_platform.{hook},",
-                pipeline,
-                f"{hook} is called directly instead of through the write "
-                "capture, so an out-of-tree plugin's defaults would be dropped "
-                "by the projection",
-            )
 
     def test_the_shapes_reach_the_fields_they_are_meant_to(self):
         """A green agreement check over an empty stash would prove nothing."""

@@ -1322,6 +1322,9 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
+        self.arrival_processed_tokens: int = 0
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -3346,6 +3349,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
+        self.mamba_clear_indices = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
