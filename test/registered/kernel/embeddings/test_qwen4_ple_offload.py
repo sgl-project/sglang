@@ -4,15 +4,18 @@ import pytest
 import torch
 from torch import nn
 
+from sglang.kernels.ops.qwen4_ple import fused_qwen4_ngram_gather
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpNGramEmbedding,
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -149,6 +152,24 @@ def test_qwen4_ple_pinned_gather_empty_input():
     assert actual.numel() == 0
 
 
+@pytest.mark.parametrize("is_fp8", [False, True])
+def test_qwen4_ple_nonowner_does_not_access_backing(is_fp8):
+    ids = torch.tensor([0, 3, 8, 99], dtype=torch.long, device="cuda")
+    output = torch.full((4, 160), torch.nan, dtype=torch.bfloat16, device="cuda")
+    # All IDs are outside [4, 8), so even an unmapped backing must not be read.
+    qwen4_exp_module._gather_ple_embedding_from_pinned_kernel[(4,)](
+        0,
+        ids,
+        output,
+        embedding_dim=160,
+        tp_vocab_start=4,
+        tp_vocab_end=8,
+        is_fp8=is_fp8,
+        BLOCK_D=256,
+    )
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+
+
 def test_qwen4_ple_pinned_embedding_rejects_unsupported_weights():
     with pytest.raises(TypeError, match="requires bfloat16"):
         Qwen4ExpPinnedHostEmbedding(_make_source_embedding(dtype=torch.float16))
@@ -187,6 +208,184 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     assert graph_three_reused.data_ptr() == graph_three.data_ptr()
     assert graph_five.data_ptr() != graph_three.data_ptr()
     assert set(layer._graph_prefetch_buffers) == {3, 5}
+
+
+def _make_ngram_inputs(num_tokens):
+    contexts = (
+        torch.tensor(
+            [[1, 2, 3], [0, 2, 3], [1, 0, 3], [0, 0, 0], [3, 2, 1]],
+            dtype=torch.long,
+            device="cuda",
+        )
+        .repeat((num_tokens + 4) // 5, 1)[:num_tokens]
+        .contiguous()
+    )
+    multipliers = torch.tensor(
+        [190734863281251, 953674316406251, 4768371582031251],
+        dtype=torch.long,
+        device="cuda",
+    )
+    sizes = torch.tensor(
+        [17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79],
+        dtype=torch.long,
+        device="cuda",
+    )
+    offsets = sizes.cumsum(0) - sizes
+    return contexts, multipliers, sizes, offsets
+
+
+def _reference_ngram_ids(contexts, multipliers, sizes, offsets):
+    previous = torch.where(
+        (contexts[:, 0] == 0) | (contexts[:, 1] == 0), 0, contexts[:, 0]
+    )
+    mixed = (contexts[:, 2] * multipliers[0]) ^ (contexts[:, 1] * multipliers[1])
+    mixed_three = mixed ^ (previous * multipliers[2])
+    return torch.cat(
+        (
+            mixed[:, None].remainder(sizes[:8]) + offsets[:8],
+            mixed_three[:, None].remainder(sizes[8:]) + offsets[8:],
+        ),
+        dim=1,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("num_tokens", [0, 1, 5, 128])
+@pytest.mark.parametrize("vocab_start,vocab_end", [(0, 850), (100, 400)])
+def test_qwen4_fused_ngram_gather(dtype, num_tokens, vocab_start, vocab_end):
+    contexts, multipliers, sizes, offsets = _make_ngram_inputs(num_tokens)
+    weight = torch.empty((vocab_end - vocab_start, 160), dtype=dtype, pin_memory=True)
+    weight.copy_(
+        (torch.arange(weight.numel()).reshape(weight.shape) % 31 - 15).to(dtype)
+    )
+    output = torch.empty((num_tokens, 16, 160), dtype=torch.bfloat16, device="cuda")
+    actual = fused_qwen4_ngram_gather(
+        contexts, multipliers, sizes, offsets, 0, weight, vocab_start, vocab_end, output
+    )
+    ids = _reference_ngram_ids(contexts, multipliers, sizes, offsets)
+    in_range = (ids >= vocab_start) & (ids < vocab_end)
+    local_ids = torch.where(in_range, ids - vocab_start, 0)
+    rows = weight.to(device="cuda", dtype=torch.bfloat16)
+    expected = torch.where(in_range[..., None], rows[local_ids], 0)
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_qwen4_fused_ngram_gather_validates_output():
+    contexts, multipliers, sizes, offsets = _make_ngram_inputs(1)
+    weight = torch.empty((850, 160), dtype=torch.bfloat16, pin_memory=True)
+    out = torch.empty((1, 16, 159), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="invalid output buffer"):
+        fused_qwen4_ngram_gather(
+            contexts, multipliers, sizes, offsets, 0, weight, 0, 850, out
+        )
+
+
+@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize("gather_dp_tokens", [False, True])
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, ForwardMode.EXTEND]
+)
+def test_qwen4_ple_prefetch_stream_and_graph(
+    monkeypatch, fusion, gather_dp_tokens, mode
+):
+    contexts, multipliers, sizes, offsets = _make_ngram_inputs(5)
+    offloaded = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(embedding_dim=160, vocab_end=850, org_vocab_size=850)
+    )
+    rows = (torch.arange(850 * 160).reshape(850, 160) % 31).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    _load_rows(offloaded, rows)
+    offloaded.weight_scale = torch.ones(1, device="cuda", dtype=torch.bfloat16)
+    embedding = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(embedding)
+    embedding.ngram_embedding = offloaded
+    embedding.gather_dp_tokens = gather_dp_tokens
+    embedding.ngram_size = 3
+    embedding.ngram_heads = 16
+    embedding.heads_per_ngram = 8
+    embedding.eos_token_id = 0
+    embedding.enable_ple_fusion = fusion
+    embedding.layer_multipliers = multipliers
+    embedding.ngram_heads_vocab_sizes = sizes
+    embedding.ngram_heads_offsets = offsets
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embedding = embedding
+    layer.ple_embed_dim = 2560
+    layer._prefetch_stream = torch.cuda.Stream()
+    layer._graph_prefetch_buffers = {}
+    layer._eager_prefetch_buffer = None
+    layer._prefetch_state = None
+    pool = SimpleNamespace(ple_window_cache=None)
+    monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
+    capturing = False
+    monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: capturing)
+    forward_batch = SimpleNamespace(global_dp_buffer_len=5)
+    main_stream = torch.cuda.current_stream()
+    collectives = []
+
+    def gather(out, src, batch):
+        assert torch.cuda.current_stream() == main_stream
+        collectives.append("gather")
+        out.copy_(src)
+
+    def scatter(out, src, batch):
+        assert torch.cuda.current_stream() == main_stream
+        collectives.append("scatter")
+        out.copy_(src)
+
+    monkeypatch.setattr(qwen4_exp_module, "dp_gather_replicate", gather)
+    monkeypatch.setattr(qwen4_exp_module, "dp_scatter", scatter)
+    batch = SimpleNamespace(
+        ngram_context=contexts,
+        physical_tokens=5,
+        use_decode_fast_path=mode == ForwardMode.DECODE,
+        req_indices=torch.arange(5, device="cuda"),
+        token_offsets=torch.zeros(5, dtype=torch.long, device="cuda"),
+        mode=mode,
+    )
+
+    from sglang.kernels.ops import qwen4_ple
+
+    original = qwen4_ple.fused_qwen4_ngram_gather
+    streams = []
+
+    def checked_gather(*args, **kwargs):
+        streams.append(torch.cuda.current_stream())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(qwen4_ple, "fused_qwen4_ngram_gather", checked_gather)
+
+    def run():
+        pool.ple_window_cache = None
+        layer.start_prefetch(batch, forward_batch)
+        return layer._consume_prefetched_embeddings(forward_batch)
+
+    actual = run()
+    expected_ids = _reference_ngram_ids(contexts, multipliers, sizes, offsets)
+    torch.testing.assert_close(actual, rows[expected_ids].flatten(1), rtol=0, atol=0)
+    if fusion and not gather_dp_tokens:
+        assert streams == [layer._prefetch_stream]
+    else:
+        assert streams == []
+    assert collectives == (["gather", "scatter"] if gather_dp_tokens else [])
+    assert layer._prefetch_state is None
+
+    capturing = True
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        main_stream = torch.cuda.current_stream()
+        graph_output = run()
+    contexts.copy_(contexts.flip(0).clone())
+    graph.replay()
+    expected_ids = _reference_ngram_ids(contexts, multipliers, sizes, offsets)
+    torch.testing.assert_close(
+        graph_output, rows[expected_ids].flatten(1), rtol=0, atol=0
+    )
 
 
 if __name__ == "__main__":

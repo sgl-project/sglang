@@ -25,23 +25,18 @@ def _round_bf16_to_fp32(value):
 
 
 @triton.jit
-def _qwen4_ngram_hash_kernel(
+def _qwen4_ngram_id(
     contexts_ptr,
     multipliers_ptr,
     vocab_sizes_ptr,
     offsets_ptr,
-    output_ptr,
-    num_outputs,
+    token_idx,
+    head_idx,
+    mask,
     eos_token_id,
     NGRAM_SIZE: tl.constexpr,
     HEADS_PER_NGRAM: tl.constexpr,
-    NGRAM_HEADS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
 ):
-    output_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = output_idx < num_outputs
-    token_idx = output_idx // NGRAM_HEADS
-    head_idx = output_idx % NGRAM_HEADS
     context_base = token_idx * NGRAM_SIZE
 
     token_0 = tl.load(contexts_ptr + context_base, mask=mask, other=0)
@@ -64,7 +59,85 @@ def _qwen4_ngram_hash_kernel(
 
     vocab_size = tl.load(vocab_sizes_ptr + head_idx, mask=mask, other=1)
     offset = tl.load(offsets_ptr + head_idx, mask=mask, other=0)
-    tl.store(output_ptr + output_idx, mixed % vocab_size + offset, mask=mask)
+    return mixed % vocab_size + offset
+
+
+@triton.jit
+def _qwen4_ngram_hash_kernel(
+    contexts_ptr,
+    multipliers_ptr,
+    vocab_sizes_ptr,
+    offsets_ptr,
+    output_ptr,
+    num_outputs,
+    eos_token_id,
+    NGRAM_SIZE: tl.constexpr,
+    HEADS_PER_NGRAM: tl.constexpr,
+    NGRAM_HEADS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    output_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = output_idx < num_outputs
+    ids = _qwen4_ngram_id(
+        contexts_ptr,
+        multipliers_ptr,
+        vocab_sizes_ptr,
+        offsets_ptr,
+        output_idx // NGRAM_HEADS,
+        output_idx % NGRAM_HEADS,
+        mask,
+        eos_token_id,
+        NGRAM_SIZE,
+        HEADS_PER_NGRAM,
+    )
+    tl.store(output_ptr + output_idx, ids, mask=mask)
+
+
+@triton.jit
+def _qwen4_ngram_gather_kernel(
+    contexts_ptr,
+    multipliers_ptr,
+    vocab_sizes_ptr,
+    offsets_ptr,
+    weight_ptr,
+    output_ptr,
+    eos_token_id,
+    embedding_dim,
+    tp_vocab_start,
+    tp_vocab_end,
+    IS_FP8: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NGRAM_SIZE: tl.constexpr,
+    HEADS_PER_NGRAM: tl.constexpr,
+    NGRAM_HEADS: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    global_idx = _qwen4_ngram_id(
+        contexts_ptr,
+        multipliers_ptr,
+        vocab_sizes_ptr,
+        offsets_ptr,
+        row_id // NGRAM_HEADS,
+        row_id % NGRAM_HEADS,
+        True,
+        eos_token_id,
+        NGRAM_SIZE,
+        HEADS_PER_NGRAM,
+    )
+    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
+    local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < embedding_dim
+    if IS_FP8:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+    values = tl.load(
+        weight_ptr + local_idx * embedding_dim + offsets,
+        mask=mask & in_range,
+        other=0.0,
+    ).to(tl.bfloat16)
+    tl.store(output_ptr + row_id * embedding_dim + offsets, values, mask=mask)
 
 
 def can_fuse_qwen4_ngram_hash(
@@ -127,6 +200,54 @@ def fused_qwen4_ngram_hash(
             num_warps=4,
         )
     return output
+
+
+def fused_qwen4_ngram_gather(
+    contexts: torch.Tensor,
+    multipliers: torch.Tensor,
+    vocab_sizes: torch.Tensor,
+    offsets: torch.Tensor,
+    eos_token_id: int,
+    weight: torch.Tensor,
+    tp_vocab_start: int,
+    tp_vocab_end: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    if not can_fuse_qwen4_ngram_hash(contexts, multipliers, vocab_sizes, offsets):
+        raise ValueError("unsupported input for fused Qwen4 PLE N-gram gather")
+    if weight.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("PLE gather requires bfloat16 or fp8 weights")
+    if weight.ndim != 2 or not weight.is_contiguous() or not weight.is_pinned():
+        raise ValueError("PLE gather requires a contiguous pinned host table")
+    if not 0 <= tp_vocab_start <= tp_vocab_end <= tp_vocab_start + weight.shape[0]:
+        raise ValueError("invalid vocabulary range for PLE gather")
+    embedding_dim = weight.shape[1]
+    if (
+        out.shape != (contexts.shape[0], _QWEN4_NGRAM_HEADS, embedding_dim)
+        or out.device != contexts.device
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+    ):
+        raise ValueError("invalid output buffer for fused Qwen4 PLE N-gram gather")
+    if contexts.shape[0]:
+        _qwen4_ngram_gather_kernel[(contexts.shape[0] * _QWEN4_NGRAM_HEADS,)](
+            contexts,
+            multipliers,
+            vocab_sizes,
+            offsets,
+            weight.data_ptr(),
+            out,
+            eos_token_id,
+            embedding_dim,
+            tp_vocab_start,
+            tp_vocab_end,
+            IS_FP8=weight.dtype == torch.float8_e4m3fn,
+            BLOCK_D=triton.next_power_of_2(embedding_dim),
+            NGRAM_SIZE=_QWEN4_NGRAM_SIZE,
+            HEADS_PER_NGRAM=_QWEN4_HEADS_PER_NGRAM,
+            NGRAM_HEADS=_QWEN4_NGRAM_HEADS,
+        )
+    return out
 
 
 @triton.jit
