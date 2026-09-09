@@ -2967,7 +2967,7 @@ class DeepseekV4AscendAttnBackend(
         compress_lens = (pos + 1) // ratio
         q, _ = indexer.wq_b(q_lora)
         q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
-        q = _npu_rope_fq4(q, layer.freqs_cis, pos, indexer.rope_head_dim)
+        q = _npu_rope_tail(q, layer.freqs_cis, pos, indexer.rope_head_dim)
         weights = indexer.head_weights(x)
         publish = [] if indexer.is_candidate_source else None
         consume_masks = getattr(fm, "dsv41_candidate_masks", None)
@@ -3013,9 +3013,7 @@ class DeepseekV4AscendAttnBackend(
         fm.dsv41_low_ratio_topk_raw = raw_indices
         setattr(fm, f"c{ratio}_topk_indices", raw_indices)
         if publish is not None:
-            fm.dsv41_candidate_masks = (
-                torch.cat(publish) if len(publish) > 1 else publish[0]
-            )
+            fm.dsv41_candidate_masks = publish
 
 
 def _get_kv_indices(

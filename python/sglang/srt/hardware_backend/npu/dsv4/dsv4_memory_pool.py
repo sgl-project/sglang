@@ -541,7 +541,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # would collide across ratios). swa_kv_pool is sized layer_num=total_layers.
         kv = self.swa_kv_pool.kv_buffer[layer_id]
         if loc is not None:
-            kv = kv.flatten(0, 1)[loc]
+            if kv.dtype == torch.float8_e4m3fn:
+                kv = kv.view(torch.uint8).flatten(0, 1)[loc].view(torch.float8_e4m3fn)
+            else:
+                kv = kv.flatten(0, 1)[loc]
         return kv
 
     def get_compress_buffer(
@@ -580,7 +583,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         else:
             return None
         if loc is not None:
-            kv = kv.flatten(0, 1)[loc]
+            if kv.dtype == torch.float8_e4m3fn:
+                kv = kv.view(torch.uint8).flatten(0, 1)[loc].view(torch.float8_e4m3fn)
+            else:
+                kv = kv.flatten(0, 1)[loc]
         return kv
 
     def set_extra_key_buffer_fused(
