@@ -151,7 +151,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
-        self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
         self.harmony_call_token_id = self._resolve_harmony_call_token_id(
             get_serving().tool_call_parser
         )
