@@ -13,6 +13,11 @@ A second class covers the no_buffer interior checkpoint (`_insert_interior_check
 the fix for #22935): the tracked grid-boundary state must land on the tree as its
 own checkpointed node, must revive the tombstone a fresh n-1 lookup created, and
 must hand the main insert a prev_prefix_len that keeps the interior node's KV.
+
+A third class runs the same fix against UnifiedRadixCache, the default tree on
+current main: its MAMBA component mirrors MambaRadixCache's insert semantics
+(checkpoints only at insert ends, values leaf-only), so the no_buffer path has
+the same 0-hit failure, and `_insert_mamba_interior_checkpoint` restores reuse.
 """
 
 import unittest
@@ -20,17 +25,24 @@ from array import array
 from types import SimpleNamespace
 
 import torch
+from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    ComponentType,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -249,6 +261,143 @@ class TestMambaRadixCacheInteriorCheckpoint(unittest.TestCase):
         )
         self.assertEqual(prev, 7)
         self.assertEqual(cache.req_to_token_pool.mamba_allocator.freed, 1)
+
+
+class TestUnifiedRadixCacheInteriorCheckpoint(CustomTestCase):
+    """The no_buffer interior checkpoint on UnifiedRadixCache, the default
+    tree cache: `cache_finished_req`/`cache_unfinished_req` insert only at
+    their own end depths with leaf-only mamba values, so a lookup that stops
+    short of the end (`n - 1`) finds no reusable state (issue #22935). The
+    tracked grid-boundary state donated before the main insert restores the
+    match at that boundary."""
+
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=False,
+        kv_size=256,
+        max_context_len=512,
+    )
+
+    def _make_finished_req(self, cache, allocator, req_to_token_pool, tokens):
+        req = Req(
+            rid=f"unified-interior-{len(tokens)}",
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        req.origin_input_ids = array("q", tokens[:-1])
+        req.output_ids = array("q", tokens[-1:])
+        kv_indices = allocator.alloc(len(tokens))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.kv.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
+        return req
+
+    def _arm_interior(self, req_to_token_pool, req, interior_len):
+        slot = req_to_token_pool.mamba_allocator.alloc(1)
+        req.kv.mamba_interior_ckpt_idx = slot[0]
+        req.kv.mamba_interior_ckpt_seqlen = interior_len
+        return slot[0]
+
+    def _finish(self, cache, req):
+        cache.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
+
+    def test_n1_lookup_returns_zero_without_interior_checkpoint(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = list(range(1, CHUNK + 30))
+
+        req = self._make_finished_req(cache, allocator, req_to_token_pool, tokens)
+        self._finish(cache, req)
+
+        # The end node's value is beyond the n-1 walk, and no interior node
+        # holds state, so the match reuses nothing.
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens[:-1]))))
+        self.assertEqual(len(m.device_indices), 0)
+        cache.sanity_check()
+
+    def test_n1_lookup_reuses_interior_checkpoint(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = list(range(1, CHUNK + 30))
+
+        req = self._make_finished_req(cache, allocator, req_to_token_pool, tokens)
+        self._arm_interior(req_to_token_pool, req, CHUNK)
+        self._finish(cache, req)
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens[:-1]))))
+        self.assertEqual(len(m.device_indices), CHUNK)
+        self.assertIsNone(req.kv.mamba_interior_ckpt_idx)
+        self.assertIsNone(req.kv.mamba_interior_ckpt_seqlen)
+        cache.sanity_check()
+
+    def test_duplicate_interior_checkpoint_is_freed(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = list(range(1, CHUNK + 30))
+
+        # An earlier request already donated a checkpoint at the boundary.
+        holder = Req(
+            rid="unified-interior-holder",
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([holder])
+        prefix = tokens[:CHUNK]
+        value = allocator.alloc(len(prefix))
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prefix)),
+                value=value,
+                mamba_value=holder.kv.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        req = self._make_finished_req(cache, allocator, req_to_token_pool, tokens)
+        self._arm_interior(req_to_token_pool, req, CHUNK)
+        avail_after_arm = req_to_token_pool.mamba_allocator.available_size()
+
+        self._finish(cache, req)
+
+        # The existing node covers the depth; the tracked slot is a
+        # duplicate and returns to the allocator.
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), avail_after_arm + 1
+        )
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens[:-1]))))
+        self.assertEqual(len(m.device_indices), CHUNK)
+        cache.sanity_check()
+
+    def test_stale_interior_checkpoint_is_dropped(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = list(range(1, CHUNK + 30))
+
+        req = self._make_finished_req(cache, allocator, req_to_token_pool, tokens)
+        # A checkpoint deeper than what the request still holds cannot be
+        # inserted; the slot is freed and the main insert keeps its own
+        # prev_prefix_len.
+        self._arm_interior(req_to_token_pool, req, len(tokens) + 10)
+        avail_after_arm = req_to_token_pool.mamba_allocator.available_size()
+
+        self._finish(cache, req)
+
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), avail_after_arm + 1
+        )
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens[:-1]))))
+        self.assertEqual(len(m.device_indices), 0)
+        cache.sanity_check()
 
 
 if __name__ == "__main__":

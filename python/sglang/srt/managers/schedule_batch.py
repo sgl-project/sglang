@@ -2958,8 +2958,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Local import: mamba_radix_cache only imports Req under TYPE_CHECKING,
         # so there is no runtime cycle, but schedule_batch stays import-light.
         from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        if not isinstance(self.tree_cache, MambaRadixCache):
+        tree_cache = self.tree_cache
+        if not isinstance(tree_cache, (MambaRadixCache, UnifiedRadixCache)):
+            return None
+        if isinstance(tree_cache, UnifiedRadixCache) and (
+            # The unified MAMBA component mirrors MambaRadixCache's insert
+            # semantics (issue #22935): checkpoints land only at chunk and
+            # finish boundaries with leaf-only values, which a fresh n-1
+            # lookup splits away. Arm on its no_buffer strategy only; the
+            # interior insert donates FULL + MAMBA values, so mixed
+            # SWA+MAMBA trees stay off.
+            tree_cache.enable_mamba_extra_buffer
+            or not tree_cache.is_mamba_enabled
+            or tree_cache.is_swa_enabled
+        ):
             return None
         mamba_pool = self.req_to_token_pool.mamba_pool
         if mamba_pool.replayssm_write_pos is not None:
