@@ -227,7 +227,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
-            self._transfer_completion_condition = threading.Condition()
             self.start_prefill_thread()
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
@@ -295,31 +294,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._init_staging_allocator()
                 self._staging_handler = None
             self.start_decode_thread()
-
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        super().update_status(bootstrap_room, status)
-        condition = getattr(self, "_transfer_completion_condition", None)
-        if condition is not None and status in (KVPoll.Success, KVPoll.Failed):
-            with condition:
-                condition.notify_all()
-
-    def wait_for_transfer_rooms(
-        self, bootstrap_rooms: Set[int], timeout_s: float
-    ) -> bool:
-        """Wait briefly for final rooms so the scheduler can poll before forward."""
-        if not bootstrap_rooms or timeout_s <= 0:
-            return False
-
-        def all_terminal() -> bool:
-            return all(
-                self.request_status.get(room) in (None, KVPoll.Success, KVPoll.Failed)
-                for room in bootstrap_rooms
-            )
-
-        with self._transfer_completion_condition:
-            return self._transfer_completion_condition.wait_for(
-                all_terminal, timeout=timeout_s
-            )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -800,6 +774,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.append((src_addr, dst_addr, length))
             return transfer_blocks
 
+        # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
             return self._transfer_data(mooncake_session_id, transfer_blocks)
@@ -816,8 +791,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
             futures = [
-                executor.submit(process_layer, src_ptr, dst_ptr, item_len)
-                for src_ptr, dst_ptr, item_len in layers_params
+                executor.submit(
+                    process_layer,
+                    src_ptr,
+                    dst_ptr,
+                    item_len,
+                )
+                for (src_ptr, dst_ptr, item_len) in layers_params
             ]
             return self._await_transfer_futures(futures)
         else:
