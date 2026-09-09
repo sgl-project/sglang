@@ -75,9 +75,9 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         topk_ids = topk_output.topk_ids
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
-        assert (
-            torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-        ), "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
+        assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
+            "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
+        )
         routed_scaling_factor = runner_config.routed_scaling_factor
 
         M, K = hidden_states.shape

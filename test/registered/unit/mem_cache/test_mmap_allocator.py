@@ -83,9 +83,12 @@ class TestMmapAllocator(unittest.TestCase):
 
         # MAP_POPULATE is unreachable on a 5.14+ kernel, so CI never runs it;
         # force the branch or it ships untested.
-        with self.subTest(path="map_populate"), unittest.mock.patch(
-            "sglang.srt.mem_cache.storage.mmap.mmap_allocator._has_madv_populate_write",
-            return_value=False,
+        with (
+            self.subTest(path="map_populate"),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.storage.mmap.mmap_allocator._has_madv_populate_write",
+                return_value=False,
+            ),
         ):
             mm = _mmap_prefaulted(-1, alloc_bytes, flags)
             try:

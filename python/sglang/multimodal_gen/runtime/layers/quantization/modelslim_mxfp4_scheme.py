@@ -35,7 +35,6 @@ MXFP4_DUAL_LEVEL_RATIO = 16
 
 
 class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
-
     def create_weights(
         self,
         layer: torch.nn.Module,

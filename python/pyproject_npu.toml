@@ -106,6 +106,7 @@ test = [
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
+  "sgl-eval==0.1.0",
   "tabulate",
 ]
 
