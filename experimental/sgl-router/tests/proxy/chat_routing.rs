@@ -950,6 +950,8 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             body,
             None,
             None,
+            None,
+            None,
         )
         .await;
 
@@ -1475,5 +1477,121 @@ async fn non_streaming_error_path_drops_active_load_guard() {
         active_load.inflight_count(),
         0,
         "error path must drop the active-load guard",
+    );
+}
+
+/// Send one streaming chat request through the real router and return the
+/// rendered metrics once `predicate` matches (or the deadline passes).
+async fn stream_chat_and_render(worker_url: &str, predicate: &str) -> (Arc<AppContext>, String) {
+    let ctx = build_ctx_with_worker(worker_url);
+    let app = build_router(ctx.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    // The hooks record from the SSE pump's spawned task — poll briefly.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let m = loop {
+        let m = ctx.metrics.render();
+        if m.contains(predicate) || std::time::Instant::now() > deadline {
+            break m;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    (ctx, m)
+}
+
+/// An engine that commits 200, streams an in-band `data: {"error"...}` event,
+/// and closes cleanly must be classified `inband_error` — without tripping
+/// the circuit breaker (the transport was healthy).
+#[tokio::test]
+async fn streaming_inband_error_records_stream_outcome_without_tripping_breaker() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {\"error\": {\"message\": \"The request queue is full.\", \"code\": 503}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="inband_error"}} 1"#,
+        worker.url,
+    );
+    let (ctx, m) = stream_chat_and_render(&worker.url, &expected).await;
+    assert!(
+        m.contains(&expected),
+        "in-band error must be classified at stream end; got:\n{m}",
+    );
+    // Headers-time counters still (correctly) say 200 — the new metric is
+    // the only place the in-band failure is visible.
+    assert!(m.contains(
+        r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+    ));
+    // Transport was clean: the breaker must still admit requests.
+    for w in ctx.registry.all() {
+        assert!(
+            w.breaker.would_allow(),
+            "in-band error must not trip the circuit breaker",
+        );
+    }
+}
+
+/// The `ok` leg of the stream-outcome classification: a clean streaming
+/// completion records exactly one `outcome="ok"` sample and nothing else.
+#[tokio::test]
+async fn streaming_clean_completion_records_stream_outcome_ok() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="ok"}} 1"#,
+        worker.url,
+    );
+    let (_ctx, m) = stream_chat_and_render(&worker.url, &expected).await;
+    assert!(
+        m.contains(&expected),
+        "clean stream must record outcome=ok; got:\n{m}",
+    );
+    assert!(
+        !m.contains(r#"outcome="inband_error""#),
+        "no in-band error on a clean stream; got:\n{m}",
+    );
+}
+
+/// N streamed chunks record exactly N-1 gaps in `sgl_router_itl_seconds`
+/// (the first chunk is TTFT). End-to-end proof the chat handler installs the
+/// ITL hook; the sse unit tests cover the pump primitive.
+#[tokio::test]
+async fn streaming_2xx_request_records_itl_per_chunk_gap() {
+    // Paced chunks: back-to-back writes can coalesce into one TCP segment
+    // and undercount the gaps.
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(20),
+    )
+    .await;
+    let expected = r#"sgl_router_itl_seconds_count{model_id="tiny"} 2"#;
+    let (_ctx, m) = stream_chat_and_render(&worker.url, expected).await;
+    assert!(
+        m.contains(expected),
+        "3 upstream chunks must record exactly 2 inter-token gaps; got:\n{m}",
     );
 }

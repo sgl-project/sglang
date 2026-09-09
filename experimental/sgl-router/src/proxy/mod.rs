@@ -163,8 +163,17 @@ impl Proxy {
     /// `active_requests` counter and the per-request active-load entry alive
     /// for the full streaming lifetime — without which a long-running SSE
     /// response would under-report load.
+    ///
+    /// `on_stream_end` — fires once at pump completion with the
+    /// [`sse::StreamEnd`] verdict; 2xx-only, since it classifies what
+    /// happened after a committed 200. Breaker recording is separate and
+    /// judges transport health only.
+    ///
+    /// `on_inter_chunk` — fires per non-empty chunk after the first with the
+    /// gap (seconds) since the previous; 2xx-only (an error body's pacing is
+    /// not inter-token latency). Feeds `sgl_router_itl_seconds`.
     // Each parameter is a distinct, required input to a single upstream
-    // forward (target, breaker, path, headers, body, plus the two
+    // forward (target, breaker, path, headers, body, plus the
     // streaming-lifetime callbacks). Bundling them into a struct purely to
     // satisfy the arg-count heuristic would add indirection without clarity.
     #[allow(clippy::too_many_arguments)]
@@ -177,6 +186,8 @@ impl Proxy {
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+        on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
+        on_inter_chunk: Option<Box<dyn Fn(f64) + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -217,17 +228,27 @@ impl Proxy {
         // is recorded as a failure. For 5xx headers we record_failure
         // up front and skip the pump hook (the body we surface is the
         // error response — its stream completing is not a worker win).
-        let on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>> =
+        let caller_end_hook = if status.is_success() {
+            on_stream_end
+        } else {
+            None
+        };
+        let on_complete: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>> =
             if status.is_server_error() {
                 breaker.record_failure();
                 None
             } else {
                 let breaker_for_hook = Arc::clone(breaker);
-                Some(Box::new(move |ok| {
-                    if ok {
+                Some(Box::new(move |end: sse::StreamEnd| {
+                    // Breaker judges transport only; the in-band verdict
+                    // deliberately stays out of routing.
+                    if end.transport_ok {
                         breaker_for_hook.record_success();
                     } else {
                         breaker_for_hook.record_failure();
+                    }
+                    if let Some(hook) = caller_end_hook {
+                        hook(end);
                     }
                 }))
             };
@@ -239,11 +260,18 @@ impl Proxy {
         } else {
             None
         };
+        // Same 2xx gate: an error body's chunk pacing is not a token cadence.
+        let inter_chunk_hook = if status.is_success() {
+            on_inter_chunk
+        } else {
+            None
+        };
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
             stream_guards,
             on_complete,
             first_byte_hook,
+            inter_chunk_hook,
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;

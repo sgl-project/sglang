@@ -11,6 +11,88 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// How the SSE pump ended, reported to the `on_complete` hook. The fields
+/// beyond `transport_ok` separate outcomes that are byte-level identical to
+/// success: an in-band engine error under a committed 200, and a client that
+/// walked away mid-generation.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamEnd {
+    /// No upstream stream error and no pump panic.
+    pub transport_ok: bool,
+    /// An in-band SSE error envelope (`data: {"error"...}`) rode the stream.
+    pub saw_inband_error: bool,
+    /// The client dropped the response body before upstream finished.
+    pub client_disconnect: bool,
+}
+
+/// Carryover cap for the in-band scanner: a single longer line resets the
+/// buffer — its detection is forfeited, but memory stays bounded.
+const INBAND_SCAN_CARRYOVER_CAP: usize = 1 << 20; // 1 MiB
+
+/// Incremental scanner for in-band SSE error envelopes — the shape sglang's
+/// `create_streaming_error_response` emits after a committed 200. Complete
+/// lines are scanned in place; only a trailing partial line is carried over.
+/// The `{"error"` prefix check is parity-safe: inside a JSON string every
+/// quote is escaped, so it cannot start a well-formed content payload.
+#[derive(Default)]
+struct InbandErrorScanner {
+    carry: Vec<u8>,
+    found: bool,
+}
+
+impl InbandErrorScanner {
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.found {
+            return;
+        }
+        let mut rest = chunk;
+        // Finish the carried-over partial line first.
+        if !self.carry.is_empty() {
+            match rest.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    self.carry.extend_from_slice(&rest[..i]);
+                    if Self::line_is_inband_error(&self.carry) {
+                        self.found = true;
+                        self.carry = Vec::new();
+                        return;
+                    }
+                    self.carry.clear();
+                    rest = &rest[i + 1..];
+                }
+                None => {
+                    self.carry.extend_from_slice(rest);
+                    if self.carry.len() > INBAND_SCAN_CARRYOVER_CAP {
+                        self.carry.clear();
+                    }
+                    return;
+                }
+            }
+        }
+        // Scan complete lines in place; keep only the trailing partial.
+        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+            if Self::line_is_inband_error(&rest[..i]) {
+                self.found = true;
+                return;
+            }
+            rest = &rest[i + 1..];
+        }
+        if rest.len() <= INBAND_SCAN_CARRYOVER_CAP {
+            self.carry.extend_from_slice(rest);
+        }
+    }
+
+    fn line_is_inband_error(line: &[u8]) -> bool {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(mut payload) = line.strip_prefix(b"data:") else {
+            return false;
+        };
+        while let Some(p) = payload.strip_prefix(b" ") {
+            payload = p;
+        }
+        payload.starts_with(b"{\"error\"")
+    }
+}
+
 /// Bridge a byte stream into an axum Body that streams chunks unchanged.
 ///
 /// Spawns one tokio task per stream so the handler can return immediately.
@@ -47,14 +129,11 @@ use tokio_stream::wrappers::ReceiverStream;
 /// guard scope).
 ///
 /// # Completion hook
-/// When `on_complete` is `Some`, the closure runs exactly once when the
-/// pump task finishes. The bool argument is `true` on clean stream end
-/// (including a clean client disconnect after at least the headers
-/// landed cleanly), `false` on upstream stream error or pump panic.
-/// `forward_streaming_to` passes a closure that records the worker's
-/// circuit-breaker outcome — without this hook, a worker that returns
-/// 2xx headers and then drops the stream mid-flight would stay credited
-/// as healthy.
+/// When `on_complete` is `Some`, it runs exactly once when the pump task
+/// finishes, receiving a [`StreamEnd`]. `forward_streaming_to` records the
+/// worker's circuit-breaker outcome from `transport_ok` alone — an in-band
+/// error is an application-level verdict, not a transport fault. The in-band
+/// scan runs only when `on_complete` is installed.
 ///
 /// # First-byte hook
 /// When `on_first_byte` is `Some`, the closure runs exactly once, the moment
@@ -62,11 +141,19 @@ use tokio_stream::wrappers::ReceiverStream;
 /// token. It does NOT fire if the stream ends or errors before any `Ok` chunk
 /// arrives. `forward_streaming_to` passes a closure that records
 /// `sgl_router_ttft_seconds` for successful streaming responses.
+///
+/// # Inter-chunk hook
+/// When `on_inter_chunk` is `Some`, it runs once per non-empty `Ok` chunk
+/// after the first with the gap (seconds) since the previous one — inter-token
+/// latency as seen at the router. Gaps are between upstream ARRIVALS, so the
+/// reading is engine pacing, not client drain speed, while the 64-slot
+/// channel has room. Feeds `sgl_router_itl_seconds`.
 pub fn bytes_stream_to_body<S, E>(
     stream: S,
     stream_guards: Option<Box<dyn Send + 'static>>,
-    on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
     on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    on_inter_chunk: Option<Box<dyn Fn(f64) + Send + 'static>>,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
@@ -78,8 +165,15 @@ where
         // Capture the pump's outcome so we can report it through `on_complete`
         // AFTER `pump.catch_unwind()` settles. The closure inside owns
         // `outcome_setter`; the outer scope reads `outcome_holder` once.
-        let outcome_holder = Arc::new(parking_lot::Mutex::new(true));
+        let outcome_holder = Arc::new(parking_lot::Mutex::new(StreamEnd {
+            transport_ok: true,
+            saw_inband_error: false,
+            client_disconnect: false,
+        }));
         let outcome_setter = Arc::clone(&outcome_holder);
+        // The in-band scan exists solely to inform `on_complete`; skip the
+        // per-chunk work entirely when nobody is listening.
+        let mut scanner = on_complete.as_ref().map(|_| InbandErrorScanner::default());
         let pump = AssertUnwindSafe(async move {
             // Hold the guards for the task's lifetime — dropped when this
             // block exits (stream done or client disconnect).  Leading
@@ -87,6 +181,7 @@ where
             // keeping intent explicit.
             let _hold = stream_guards;
             let mut on_first_byte = on_first_byte;
+            let mut prev_chunk_at: Option<std::time::Instant> = None;
             let mut s = stream;
             while let Some(chunk) = s.next().await {
                 let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
@@ -95,17 +190,34 @@ where
                     std::io::Error::other(msg)
                 });
                 let is_err_chunk = item.is_err();
-                // Fire the time-to-first-token hook on the first successful
-                // chunk from upstream. `take()` makes it fire at most once;
-                // an error-first stream never produced a token, so it's left
-                // unfired (and dropped on task end).
-                if !is_err_chunk {
-                    if let Some(hook) = on_first_byte.take() {
-                        hook();
+                match &item {
+                    Ok(bytes) => {
+                        // TTFT hook: at most once (`take()`); an error-first
+                        // stream never produced a token, so it stays unfired.
+                        if let Some(hook) = on_first_byte.take() {
+                            hook();
+                        }
+                        // ITL: gap between non-empty Ok-chunk arrivals; the
+                        // first chunk seeds the clock (its latency is TTFT).
+                        if !bytes.is_empty() {
+                            if let Some(hook) = on_inter_chunk.as_ref() {
+                                let now = std::time::Instant::now();
+                                if let Some(prev) = prev_chunk_at {
+                                    hook(now.duration_since(prev).as_secs_f64());
+                                }
+                                prev_chunk_at = Some(now);
+                            }
+                        }
+                        if let Some(scan) = scanner.as_mut() {
+                            scan.feed(bytes);
+                            if scan.found {
+                                outcome_setter.lock().saw_inband_error = true;
+                                // Verdict is sticky; stop scanning.
+                                scanner = None;
+                            }
+                        }
                     }
-                }
-                if is_err_chunk {
-                    *outcome_setter.lock() = false;
+                    Err(_) => outcome_setter.lock().transport_ok = false,
                 }
                 if tx.send(item).await.is_err() {
                     // Receiver dropped. If we were about to ship an upstream
@@ -114,6 +226,7 @@ where
                     // not a router-side fault.
                     if !is_err_chunk {
                         tracing::debug!("SSE client disconnected mid-stream");
+                        outcome_setter.lock().client_disconnect = true;
                     }
                     break;
                 }
@@ -139,8 +252,9 @@ where
                 .await;
         }
         if let Some(hook) = on_complete {
-            let ok = !panicked && *outcome_holder.lock();
-            hook(ok);
+            let mut end = *outcome_holder.lock();
+            end.transport_ok = end.transport_ok && !panicked;
+            hook(end);
         }
     });
     Body::from_stream(ReceiverStream::new(rx))
@@ -160,7 +274,7 @@ mod tests {
             Ok(Bytes::from_static(b"world")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
     }
@@ -184,6 +298,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            None,
         );
         let _ = body.collect().await.unwrap();
         assert_eq!(
@@ -211,6 +326,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            None,
         );
         let _ = body.collect().await;
         assert_eq!(
@@ -227,7 +343,7 @@ mod tests {
             Err(std::io::Error::other("upstream blew up mid-stream")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         // Collecting a body that terminates with an error must return Err.
         let result = body.collect().await;
         assert!(
@@ -289,7 +405,7 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -312,7 +428,7 @@ mod tests {
         // The pump task panics mid-stream. The client must see a loud Err,
         // NOT a silently-truncated success.
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -371,7 +487,7 @@ mod tests {
             yielded: 0,
             max: 1000, // way more than we'll let it consume
         };
-        let body = bytes_stream_to_body(stream, None, None, None);
+        let body = bytes_stream_to_body(stream, None, None, None, None);
 
         // Read exactly one frame, then drop the body to simulate client disconnect.
         let mut data_stream = body.into_data_stream();
@@ -393,5 +509,193 @@ mod tests {
             final_polls < 1000,
             "pump drained the entire upstream after client disconnect ({final_polls} polls); the break-on-tx.send-err path is dead"
         );
+    }
+
+    #[test]
+    fn inband_scanner_detects_engine_error_event() {
+        // Exact shape sglang's create_streaming_error_response emits.
+        let mut s = InbandErrorScanner::default();
+        s.feed(b"data: {\"choices\": [{\"delta\": {\"content\": \"hi\"}}]}\n\n");
+        assert!(!s.found);
+        s.feed(b"data: {\"error\": {\"message\": \"queue is full\", \"code\": 503}}\n\n");
+        assert!(s.found, "must detect a well-formed in-band error event");
+    }
+
+    #[test]
+    fn inband_scanner_detects_error_split_across_chunks() {
+        // Network chunking can split an SSE event anywhere — including inside
+        // the `data: {"error"` prefix itself.
+        let mut s = InbandErrorScanner::default();
+        s.feed(b"data: {\"err");
+        assert!(!s.found);
+        s.feed(b"or\": {\"code\": 503}}\n\n");
+        assert!(s.found, "must detect an error event split across chunks");
+    }
+
+    #[test]
+    fn inband_scanner_tolerates_no_space_and_crlf() {
+        // SSE permits `data:` with no space; proxies may normalize to CRLF.
+        let mut s = InbandErrorScanner::default();
+        s.feed(b"data:{\"error\": {\"code\": 500}}\r\n");
+        assert!(s.found, "must handle data: without space and CRLF endings");
+    }
+
+    #[test]
+    fn inband_scanner_ignores_error_text_inside_content() {
+        // A model that TALKS about errors must not trip the scanner — escaped
+        // quotes mean `{"error"` cannot start a content payload.
+        let mut s = InbandErrorScanner::default();
+        s.feed(
+            b"data: {\"choices\": [{\"delta\": {\"content\": \"data: {\\\"error\\\" is how it looks\"}}]}\n\n",
+        );
+        assert!(
+            !s.found,
+            "escaped quotes in content must not false-positive"
+        );
+        s.feed(b"data: [DONE]\n\n");
+        assert!(!s.found);
+    }
+
+    #[test]
+    fn inband_scanner_bounds_carryover_on_pathological_line() {
+        // A single line longer than the cap resets the buffer (detection of
+        // that one line is forfeited by design), and scanning recovers after.
+        let mut s = InbandErrorScanner::default();
+        let big = vec![b'x'; INBAND_SCAN_CARRYOVER_CAP + 1024];
+        s.feed(&big);
+        assert!(s.carry.len() <= INBAND_SCAN_CARRYOVER_CAP);
+        assert!(!s.found);
+        s.feed(b"\ndata: {\"error\": {\"code\": 503}}\n");
+        assert!(s.found, "scanner must recover after a pathological line");
+    }
+
+    /// Poll until the completion hook has fired (it runs on the spawned pump
+    /// task, after the body is fully collected).
+    async fn wait_for_stream_end(seen: &Arc<std::sync::Mutex<Option<StreamEnd>>>) -> StreamEnd {
+        for _ in 0..200 {
+            if let Some(end) = *seen.lock().unwrap() {
+                return end;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("on_complete never fired");
+    }
+
+    #[tokio::test]
+    async fn on_complete_reports_inband_error_with_clean_transport() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_c = Arc::clone(&seen);
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\": [{\"delta\": {\"content\": \"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"error\": {\"message\": \"aborted\", \"code\": 503}}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let body = bytes_stream_to_body(
+            stream::iter(chunks),
+            None,
+            Some(Box::new(move |end| {
+                *seen_c.lock().unwrap() = Some(end);
+            })),
+            None,
+            None,
+        );
+        let _ = body.collect().await.unwrap();
+        let end = wait_for_stream_end(&seen).await;
+        assert!(end.transport_ok, "clean close: transport is fine");
+        assert!(end.saw_inband_error, "in-band error must be reported");
+        assert!(!end.client_disconnect);
+    }
+
+    #[tokio::test]
+    async fn on_complete_reports_clean_success() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_c = Arc::clone(&seen);
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\": [{\"delta\": {\"content\": \"hello\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let body = bytes_stream_to_body(
+            stream::iter(chunks),
+            None,
+            Some(Box::new(move |end| {
+                *seen_c.lock().unwrap() = Some(end);
+            })),
+            None,
+            None,
+        );
+        let _ = body.collect().await.unwrap();
+        let end = wait_for_stream_end(&seen).await;
+        assert!(end.transport_ok);
+        assert!(!end.saw_inband_error);
+        assert!(!end.client_disconnect);
+    }
+
+    #[tokio::test]
+    async fn on_complete_reports_client_disconnect() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_c = Arc::clone(&seen);
+        // Enough chunks to outlast the 64-slot channel, so the pump is still
+        // sending when the receiver is dropped.
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            std::iter::repeat_with(|| Ok(Bytes::from_static(b"data: x\n\n")))
+                .take(1000)
+                .collect();
+        let body = bytes_stream_to_body(
+            stream::iter(chunks),
+            None,
+            Some(Box::new(move |end| {
+                *seen_c.lock().unwrap() = Some(end);
+            })),
+            None,
+            None,
+        );
+        let mut data_stream = body.into_data_stream();
+        let _ = data_stream.next().await;
+        drop(data_stream);
+        let end = wait_for_stream_end(&seen).await;
+        assert!(end.transport_ok, "a walk-away client is not a worker fault");
+        assert!(end.client_disconnect, "disconnect must be reported");
+    }
+
+    #[tokio::test]
+    async fn on_inter_chunk_reports_one_gap_per_nonempty_chunk_after_first() {
+        let gaps: Arc<std::sync::Mutex<Vec<f64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gaps_c = Arc::clone(&gaps);
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: a\n\n")),
+            Ok(Bytes::new()), // empty: no token, must not report or reset the clock
+            Ok(Bytes::from_static(b"data: b\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let body = bytes_stream_to_body(
+            stream::iter(chunks),
+            None,
+            None,
+            None,
+            Some(Box::new(move |gap| {
+                gaps_c.lock().unwrap().push(gap);
+            })),
+        );
+        let _ = body.collect().await.unwrap();
+        // The hook fires from the spawned pump task; poll briefly.
+        for _ in 0..200 {
+            if gaps.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let gaps = gaps.lock().unwrap();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "3 non-empty chunks must report exactly 2 gaps; got {gaps:?}",
+        );
+        assert!(gaps.iter().all(|g| g.is_finite() && *g >= 0.0));
     }
 }

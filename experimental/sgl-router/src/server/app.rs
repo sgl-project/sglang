@@ -11,22 +11,40 @@ use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 
+/// Endpoints polled constantly (Prometheus scrape, kubelet probes) — logged
+/// at DEBUG so they don't bury API traffic.
+fn is_infra_path(path: &str) -> bool {
+    matches!(path, "/healthz" | "/readyz" | "/metrics")
+}
+
 /// Edge counters: `requests_total{route,method}` at entry (true intake, incl.
 /// requests parked/shed/cancelled before dispatch), `responses_total{...,
 /// status_code}` on exit (incl. early-exit 400/413/503). Their difference =
 /// received-but-not-answered, invisible to post-dispatch `worker_requests_total`.
 /// `route` is the matched template (not raw URI) to bound label cardinality.
+///
+/// Also the single access-log site: one `http_request` line per request with
+/// the final status, including responses no handler sees (e.g. a 413 from the
+/// body-limit layer). For streams, `duration_ms` is time to response headers.
 async fn count_requests(State(ctx): State<Arc<AppContext>>, req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
     let route = req
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".to_owned());
     ctx.metrics.record_ingress(&route, &method);
+    let start = std::time::Instant::now();
     let resp = next.run(req).await;
-    ctx.metrics
-        .record_response(&route, &method, resp.status().as_u16());
+    let status = resp.status().as_u16();
+    ctx.metrics.record_response(&route, &method, status);
+    let duration_ms = start.elapsed().as_millis() as u64;
+    if is_infra_path(&path) {
+        tracing::debug!(target: "http_request", %method, %path, status, duration_ms);
+    } else {
+        tracing::info!(target: "http_request", %method, %path, status, duration_ms);
+    }
     resp
 }
 
