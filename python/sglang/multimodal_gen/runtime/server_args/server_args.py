@@ -166,6 +166,7 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "black-forest-labs/flux.1-dev",
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
@@ -173,6 +174,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
+        "flux.1-dev",
         "glm-image",
         "ideogram-4",
         "ideogram-4-fp8",
@@ -204,6 +206,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
         "JoyEchoPipelineConfig",
@@ -742,7 +745,7 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, "
+            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
             "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
             "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
             "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
