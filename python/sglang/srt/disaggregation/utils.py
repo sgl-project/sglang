@@ -1394,7 +1394,11 @@ def setup_state_kv_args(
                 else None
             )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens,
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
                 layer_ids=layer_ids,
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
@@ -1465,9 +1469,7 @@ def setup_state_kv_args(
                     )
             # NPU A5 (CYCLE cache_mode): C4 compress state is a request-local
             # ring; register it as its own ascend-only component.
-            if is_npu_arch35() and hasattr(
-                token_to_kv_pool, "get_c4_state_buf_infos"
-            ):
+            if is_npu_arch35() and hasattr(token_to_kv_pool, "get_c4_state_buf_infos"):
                 from sglang.srt.disaggregation.ascend.conn import AscendStateType
 
                 c4_ptrs, c4_lens, c4_item_lens = (
@@ -1601,6 +1603,7 @@ def setup_state_kv_args(
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool) and isinstance(
         draft_token_to_kv_pool, DeepSeekV4TokenToKVPool
     ):
+        draft_layer_ids = None
         if not draft_token_to_kv_pool.compression_ratios or not all(
             ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
         ):
@@ -1657,6 +1660,11 @@ def setup_state_kv_args(
                 draft_token_to_kv_pool.get_state_buf_infos()
             )
             draft_state_type = StateType.SWA
+            draft_layer_ids = (
+                draft_token_to_kv_pool.get_state_layer_ids()
+                if hasattr(draft_token_to_kv_pool, "get_state_layer_ids")
+                else None
+            )
 
         if draft_ptrs:
             append_state_component(
@@ -1665,6 +1673,7 @@ def setup_state_kv_args(
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+                layer_ids=draft_layer_ids,
             )
 
     if (

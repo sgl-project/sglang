@@ -972,6 +972,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
+            for comp in self._components_tuple:
+                effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
@@ -1045,7 +1047,12 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             ranges = [(free_from, len(kv_indices))]
             if tail_free_start is not None:
-                ranges.append((tail_free_start, len(kv_indices_full)))
+                if free_from < len(kv_indices) and tail_free_start <= len(kv_indices):
+                    # The two halves touch at the truncation boundary and share
+                    # that page; free the union as one range.
+                    ranges[0] = (free_from, len(kv_indices_full))
+                else:
+                    ranges.append((tail_free_start, len(kv_indices_full)))
             self.free_kv_row(req.kv, ranges)
         else:
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
@@ -1105,6 +1112,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
+        for comp in self._components_tuple:
+            effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],

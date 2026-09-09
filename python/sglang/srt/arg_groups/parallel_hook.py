@@ -612,10 +612,7 @@ def handle_expert_distribution_metrics(server_args: Any):
 
 
 def validate_prefill_cp_platform(server_args: Any):
-    """Reject deprecated platform CP; NPU prefill CP stays supported.
-
-    See layers/cp/utils.py: enable_cp_v2.
-    """
+    """Reject deprecated platform CP; NPU prefill CP stays supported."""
     cfg = resolving_view(server_args)
     platform = get_platform()
     if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):

@@ -15,11 +15,11 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
 )
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -110,9 +110,9 @@ class AscendKVManager(MooncakeKVManager):
             # NPU main KV layout [C4 KV, index K, index scale]; slice each
             # dst section to the owned range; draft tails pair positionally.
             if state_type is None and self._is_layer_split_kv_transfer():
-                assert (
-                    end_layer is not None
-                ), "prefill_end_layer must be set for layer-split KV transfer"
+                assert end_layer is not None, (
+                    "prefill_end_layer must be set for layer-split KV transfer"
+                )
                 owned_c4 = c4_end - c4_start
                 # Only the last CP rank ships the draft cache, so the src draft
                 # tail may be shorter than (or absent from) the dst tail.
@@ -149,23 +149,16 @@ class AscendKVManager(MooncakeKVManager):
 
             return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
 
-        # src/dst_kv_ptrs: k_data, v_data, index_k_data(optional); the NPU
-        # kv_buf_groups slicing below is state-type agnostic.
-        start_layer = self.kv_args.prefill_start_layer
+        # src_kv_ptrs: k_data, v_data, index_k_data(optional)
+        # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
+        # state_type is accepted for parity with the common disaggregation path;
+        # the NPU kv_buf_groups slicing below is state-type agnostic.
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
         hidden_kv_layers = getattr(self.kv_args, "hidden_kv_layers", 0)
         draft_kv_layers = getattr(self.kv_args, "draft_kv_layers", 0)
         src_layers = len(src_kv_ptrs) // kv_buf_groups
-        total_kv_layers = getattr(self.kv_args, "total_kv_layers", 0)
-        # Decode-only speculative KV has one more layer than prefill; the
-        # draft layer must be skipped.
-        dst_total_layers = (
-            min(len(dst_kv_ptrs) // kv_buf_groups, total_kv_layers)
-            if total_kv_layers
-            else len(dst_kv_ptrs) // kv_buf_groups
-        )
-        end_layer = start_layer + src_layers
-        if src_layers == dst_total_layers:
+        dst_layers = len(dst_kv_ptrs) // kv_buf_groups
+        if src_layers == dst_layers:
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
             sliced_dst_kv_ptrs = []
@@ -240,9 +233,7 @@ class AscendKVManager(MooncakeKVManager):
                 ]
             elif self.is_mla_backend:
                 src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(
-                        self.kv_args.kv_data_ptrs, dst_kv_ptrs
-                    )
+                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
                 )
                 layers_params = [
                     (

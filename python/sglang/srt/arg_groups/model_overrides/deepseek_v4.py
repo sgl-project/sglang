@@ -38,6 +38,11 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         page_size = 128
         overrides["prefill_attention_backend"] = "dsv4"
         overrides["decode_attention_backend"] = "dsv4"
+        if (
+            getattr(cfg, "speculative_algorithm", None) is not None
+            and getattr(cfg, "speculative_draft_attention_backend", None) is None
+        ):
+            overrides["speculative_draft_attention_backend"] = "dsv4"
     overrides["page_size"] = page_size
     logger.info(
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."

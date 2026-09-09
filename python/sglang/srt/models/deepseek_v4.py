@@ -1574,7 +1574,6 @@ class MQALayer(MqaAttentionBase):
                 kv_for_cache = cp_gather_full_sequence_states(
                     kv.contiguous(),
                     forward_batch,
-                    torch.cuda.current_stream(),
                 )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
@@ -2455,8 +2454,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_moe_a2a_backend().is_none()
         )
         _use_tp_attn_a2a_scatter = (
-            False
-            and not _use_cp
+            not _use_cp
+            and not _is_npu  # attn-TP A2A scatter is not enabled on NPU yet.
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -3342,6 +3341,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -3350,6 +3350,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Keep grad off the logits path too: the body's no_grad does not cover
+        # this wrapper (matching deepseek_v2 / llama).
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors

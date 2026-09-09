@@ -477,8 +477,8 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
-    # DSV4 layer-split: owner reads broadcast the selected active pages when
-    # the process group backend is not zbal (whose broadcast is unproven).
+    # DSV4 layer-split: byte budget of the staging operand collectives submit,
+    # and so the chunk size of the zbal all-gather fallback.
     SGLANG_DSV4_LS_CHUNK_BYTES = EnvInt(1024 * 1024)
     # DSV4 layer-split: launch each layer's broadcast on a comm stream right
     # after its owner-side write; the consumer waits the recorded event.

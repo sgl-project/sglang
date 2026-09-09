@@ -1006,8 +1006,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self._spec_infl = 1.0
         # Layer split (prefill CP) stores only the owned layer slice per rank,
         # so the KV/indexer terms shrink and token capacity grows. All CP
-        # ranks must derive the SAME capacity: take the min over ranks' owned
-        # slices. Compress state pools are not sharded (full-layer counts).
+        # ranks must derive the SAME capacity, sized by the heaviest shard.
+        # Compress state pools are not sharded (full-layer counts).
         self.layer_shard_size = 1
         if (
             not kvc.is_draft_worker
@@ -1036,12 +1036,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         per_rank_bytes = [
             self._get_bytes_per_full_token(
-                slice_, scratch_layers=int(self.layer_shard_size > 1)
+                # Two full-layer scratches per family: whole broadcast plus
+                # compact staging.
+                slice_,
+                scratch_layers=2 * int(self.layer_shard_size > 1),
             )
             for slice_ in owned_slices
         ]
-        self._owned_ratio_slice = owned_slices[per_rank_bytes.index(min(per_rank_bytes))]
-        self.bytes_per_full_token = min(per_rank_bytes)
+        heaviest = max(range(len(per_rank_bytes)), key=per_rank_bytes.__getitem__)
+        self._owned_ratio_slice = owned_slices[heaviest]
+        self.bytes_per_full_token = per_rank_bytes[heaviest]
         if self.layer_shard_size > 1:
             logger.info(
                 "DSV4 layer-split capacity: shard_size=%d owned_layers=%d/%d "
@@ -1154,11 +1158,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
             # Ring mode: SWA is a fixed per-request pool (see _fixed_swa_bytes).
-            (
-                0.0
-                if self._unified
-                else self.swa_ratio * kv_bytes * layers_total
-            )
+            (0.0 if self._unified else self.swa_ratio * kv_bytes * layers_total)
             + c4_frac * kv_bytes * layers_ca4
             + 1 / 128 * kv_bytes * layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * layers_ca4

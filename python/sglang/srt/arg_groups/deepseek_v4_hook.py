@@ -257,6 +257,11 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         raise ValueError(
             f"DeepSeekV4 only supports interleave CP strategy, got {cfg.cp_strategy}"
         )
+    if cfg.cp_strategy == "zigzag" and not is_npu():
+        raise ValueError(
+            "DeepSeekV4 zigzag CP requires the NPU backend; the CUDA backend "
+            "reindexes with interleave order."
+        )
 
     declare_resolution(
         server_args,
@@ -280,7 +285,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert cfg.tp_size <= 8, (
             "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
         )
-    supported_a2a_backends = ("none", "deepep", "megamoe", "mori", "ascend_fuseep")
+    supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
