@@ -6,8 +6,13 @@ and the equivalent elsewhere). That load needs free device memory *outside* the
 torch caching allocator. Engines size their pools to leave little post-init
 headroom, and the allocator's high-water mark consumes the rest during early
 serving — so a specialization first used mid-serving (e.g. a new adaptive
-speculative draft length, or a rare batch-size bucket) can die in that load by
-running the device out of memory, minutes or hours in.
+speculative draft length, or a rare batch-size bucket) can reach that load with
+almost nothing free, minutes or hours in.
+
+The cost lands in two ways. The load runs inside the scheduler loop, so a slow
+one delays every queued request's first token for as long as it takes; stalls of
+tens of seconds have been measured on a memory-starved device. Where the
+allocation cannot be satisfied at all, the load fails outright.
 
 Once ``mark_serving_started()`` has been called, this module warns when an
 uncached Triton compilation takes at least one second or a device-load starts
@@ -125,8 +130,9 @@ def _on_kernel_load(module, function, name, metadata_group, hash) -> None:
     free_memory = f"{free_gb:.2f} GiB" if free_gb is not None else "unknown"
     msg = (
         f"Triton kernel '{name}' device-loaded after serving started "
-        f"(free device mem: {free_memory}). Pre-load it during engine init "
-        f"to avoid running the device out of memory."
+        f"(free device mem: {free_memory}). Late loads run inside the "
+        f"scheduler loop and stall serving when memory is tight; pre-load it "
+        f"during engine init."
     )
     if should_crash:
         raise RuntimeError(msg)

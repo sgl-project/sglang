@@ -52,8 +52,9 @@ class TestTritonLoadWatchAcceleratorDispatch(CustomTestCase):
             triton_load_watch._on_kernel_load(None, None, "probe", None, None)
 
         get_memory.assert_called_once_with("xpu", 3, empty_cache=False)
-        self.assertIn("device out of memory", logs.output[0])
-        self.assertNotIn("CUDA OOM", logs.output[0])
+        self.assertIn("stall serving", logs.output[0])
+        # Neutral text: no CUDA-specific wording on a non-CUDA accelerator.
+        self.assertNotIn("CUDA", logs.output[0])
 
     def test_invalid_memory_query_contract_is_not_hidden(self):
         with (
