@@ -193,7 +193,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
     add_chunked_prefix_cache_attention_backend,
-    get_global_server_args,
 )
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Portable full-precision execution for Comfy NVFP4 checkpoints."""
+"""Native execution of serialized Comfy NVFP4 checkpoints."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
+    ComfyInt8EmbeddingMethod,
+    is_comfy_int8_embedding,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizeMethodBase,
 )
@@ -24,8 +28,14 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.dequantization import dequantize_nvfp4
+
+try:
+    from comfy_kitchen import quantize_nvfp4, scaled_mm_nvfp4
+except ImportError:
+    quantize_nvfp4 = scaled_mm_nvfp4 = None
 
 
 def _register_parameter(
@@ -40,55 +50,6 @@ def _register_parameter(
         set_weight_attrs(parameter, parallel_dims)
     set_weight_attrs(parameter, weight_attrs)
     layer.register_parameter(name, parameter)
-
-
-class ComfyRowwiseInt8EmbeddingMethod(QuantizeMethodBase):
-    """Gather and dequantize only selected rows of an INT8 embedding."""
-
-    def create_weights(
-        self,
-        layer: nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs: Any,
-    ) -> None:
-        del input_size, output_size
-        self.output_dtype = params_dtype
-        output_size_per_partition = sum(output_partition_sizes)
-        _register_parameter(
-            layer,
-            "weight",
-            torch.empty(
-                output_size_per_partition,
-                input_size_per_partition,
-                dtype=torch.int8,
-            ),
-            extra_weight_attrs,
-            {"input_dim": 1, "output_dim": 0},
-        )
-        _register_parameter(
-            layer,
-            "weight_scale",
-            torch.empty(output_size_per_partition, 1, dtype=torch.float32),
-            extra_weight_attrs,
-            {"output_dim": 0},
-        )
-
-    def apply(
-        self,
-        layer: nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        raise NotImplementedError("Comfy INT8 embedding weights support lookup only")
-
-    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        weight = F.embedding(input_, layer.weight).to(self.output_dtype)
-        scale = F.embedding(input_, layer.weight_scale).to(self.output_dtype)
-        return weight * scale
 
 
 class ComfyFullPrecisionNvfp4LinearMethod(ModelOptFp4LinearMethod):
@@ -162,8 +123,51 @@ class ComfyFullPrecisionNvfp4LinearMethod(ModelOptFp4LinearMethod):
         return F.linear(x, weight, bias)
 
 
+class ComfyNvfp4LinearMethod(ComfyFullPrecisionNvfp4LinearMethod):
+    """Execute serialized Comfy NVFP4 with dynamic activation quantization."""
+
+    def __init__(self, quant_config: ComfyNvfp4Config, *, has_pre_quant_scale: bool):
+        super().__init__(quant_config, has_pre_quant_scale=has_pre_quant_scale)
+        capability = current_platform.get_device_capability()
+        if (
+            not current_platform.is_cuda()
+            or capability is None
+            or capability.to_int() < 100
+        ):
+            raise ValueError(
+                "Comfy NVFP4 matmul requires NVIDIA compute capability 10.0+"
+            )
+        if quantize_nvfp4 is None or scaled_mm_nvfp4 is None:
+            raise ImportError("Comfy NVFP4 matmul requires comfy-kitchen")
+
+    def apply(self, layer: nn.Module, x: torch.Tensor, bias=None) -> torch.Tensor:
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        if self.has_pre_quant_scale:
+            x = x * layer.pre_quant_scale
+        scale = (
+            (x.abs().amax() / (448 * 6))
+            .float()
+            .clamp_min(torch.finfo(torch.float32).tiny)
+        )
+        packed, block_scale = quantize_nvfp4(x.contiguous(), scale, pad_16x=True)
+        output = scaled_mm_nvfp4(
+            packed,
+            layer.weight,
+            tensor_scale_a=scale,
+            tensor_scale_b=layer.weight_scale_2,
+            block_scale_a=block_scale,
+            block_scale_b=layer.weight_scale,
+            bias=bias,
+            out_dtype=x.dtype,
+        )
+        return output[: x.shape[0], : layer.output_size_per_partition].reshape(
+            *shape[:-1], layer.output_size_per_partition
+        )
+
+
 class ComfyNvfp4Config(ModelOptFp4Config):
-    """Dispatch full-precision Comfy NVFP4 linears and their INT8 embedding."""
+    """Honor each NVFP4 layer's matmul policy and its INT8 embedding companion."""
 
     checkpoint_uses_comfy_quantization = True
 
@@ -178,18 +182,15 @@ class ComfyNvfp4Config(ModelOptFp4Config):
         self.selected: list[str] = []
         for prefix, marker in layer_markers.items():
             marker_format = marker.get("format")
-            if marker_format == "int8_tensorwise" and marker.get("_is_rowwise"):
+            if is_comfy_int8_embedding(marker):
                 continue
             if marker_format != "nvfp4":
                 raise ValueError(
                     f"Unsupported Comfy NVFP4 companion for {prefix!r}: "
                     f"{marker_format!r}"
                 )
-            if marker.get("full_precision_matrix_mult") is not True:
-                raise ValueError(
-                    f"Comfy NVFP4 layer {prefix!r} must request "
-                    "full_precision_matrix_mult"
-                )
+            if marker.get("convrot", False):
+                raise ValueError(f"Rotated NVFP4 weights are not supported: {prefix!r}")
 
     @classmethod
     def get_name(cls) -> str:
@@ -221,14 +222,14 @@ class ComfyNvfp4Config(ModelOptFp4Config):
         if isinstance(layer, VocabParallelEmbedding):
             if marker is None:
                 return None
-            if marker.get("format") != "int8_tensorwise" or not marker.get(
-                "_is_rowwise"
-            ):
+            if not is_comfy_int8_embedding(marker):
                 raise ValueError(
                     f"Unsupported quantized embedding marker for {prefix!r}: {marker}"
                 )
             self.selected.append(prefix)
-            return ComfyRowwiseInt8EmbeddingMethod()
+            return ComfyInt8EmbeddingMethod(
+                tensorwise=bool(marker.get("_is_tensorwise_scalar"))
+            )
         if not isinstance(layer, LinearBase):
             return None
         if marker is None:
@@ -236,22 +237,22 @@ class ComfyNvfp4Config(ModelOptFp4Config):
         if marker.get("format") != "nvfp4":
             raise ValueError(f"Unsupported quantized linear marker for {prefix!r}")
         self.selected.append(prefix)
-        return ComfyFullPrecisionNvfp4LinearMethod(
+        method = (
+            ComfyFullPrecisionNvfp4LinearMethod
+            if marker.get("full_precision_matrix_mult", False)
+            else ComfyNvfp4LinearMethod
+        )
+        return method(
             self,
             has_pre_quant_scale=bool(marker.get("_has_pre_quant_scale")),
         )
 
     def quantizes_embedding(self, prefix: str) -> bool:
-        marker = self.layer_markers.get(prefix)
-        return bool(
-            marker is not None
-            and marker.get("format") == "int8_tensorwise"
-            and marker.get("_is_rowwise")
-        )
+        return is_comfy_int8_embedding(self.layer_markers.get(prefix))
 
 
 __all__ = [
     "ComfyFullPrecisionNvfp4LinearMethod",
     "ComfyNvfp4Config",
-    "ComfyRowwiseInt8EmbeddingMethod",
+    "ComfyNvfp4LinearMethod",
 ]
