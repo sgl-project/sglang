@@ -18,7 +18,7 @@ try:
 except ImportError:
     _HAS_FLASHINFER = False
 
-register_cpu_ci(est_time=1, suite="base-c-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
