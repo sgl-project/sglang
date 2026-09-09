@@ -6,8 +6,13 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import math
 import types
 import unittest
-from unittest.mock import patch
+from collections import deque
+from contextlib import nullcontext
+from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
@@ -15,7 +20,13 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
-from sglang.srt.observability.fpm_timing import capture_fpm_timing
+from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.fpm_timing import (
+    capture_fpm_timing,
+    wrap_forward_with_fpm,
+)
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval
 from sglang.test.test_utils import CustomTestCase
 
@@ -125,6 +136,18 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
         dp_rank=0,
         metrics_collector_context=context,
         metrics_collector=None,
+    )
+
+
+def _ready_interval(milliseconds):
+    return types.SimpleNamespace(
+        observer=None,
+        stream=0,
+        metadata={},
+        end=lambda **_: None,
+        start_event=types.SimpleNamespace(elapsed_time=lambda _: milliseconds),
+        end_event=types.SimpleNamespace(query=lambda: True),
+        elapsed_time=lambda: milliseconds,
     )
 
 
@@ -336,7 +359,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
-        original_forward = scheduler.run_batch = lambda: types.SimpleNamespace()
+        original_forward = scheduler.run_batch = lambda batch: types.SimpleNamespace()
         scheduler.server_args = _publish_server_args(
             self,
             enable_metrics=False,
@@ -358,7 +381,8 @@ class TestForwardPassMetrics(unittest.TestCase):
 
         self.assertTrue(scheduler.enable_fpm)
         self.assertIs(scheduler.run_batch.__wrapped__, original_forward)
-        self.assertEqual(scheduler.run_batch().fpm_timing.num_intervals, 0)
+        batch = types.SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        self.assertEqual(scheduler.run_batch(batch).fpm_timing.num_intervals, 0)
         self.assertEqual(scheduler._fpm_worker_id, "endpoint-42")
         self.assertEqual(scheduler._fpm_dp_rank, 2)
         self.assertEqual(scheduler._fpm_publisher.worker_id, "endpoint-42")
@@ -409,6 +433,105 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertFalse(scheduler.enable_fpm)
         self.assertNotIn("run_batch", vars(scheduler))
         self.assertIs(scheduler.run_batch.__func__, Scheduler.run_batch)
+
+    def test_prebuilt_recursive_idle_forward_owns_timing_once(self):
+        timer = DeviceTimer()
+        scheduler = types.SimpleNamespace()
+        result = GenerationBatchResult()
+
+        def forward(batch):
+            if batch.forward_mode.is_prebuilt():
+                return SchedulerDisaggregationDecodeMixin._run_batch_prebuilt(
+                    scheduler, batch
+                )
+            with timer.wrap({"category": "idle"}):
+                pass
+            return result
+
+        scheduler.run_batch = wrap_forward_with_fpm(forward, timer)
+        batch = types.SimpleNamespace(
+            forward_mode=ForwardMode.PREBUILT,
+            inner_idle_batch=types.SimpleNamespace(forward_mode=ForwardMode.IDLE),
+        )
+        with patch.object(
+            _TimingInterval, "create", return_value=_ready_interval(5)
+        ) as create:
+            actual = scheduler.run_batch(batch)
+        self.assertIs(actual, result)
+        self.assertIsNone(batch.inner_idle_batch)
+        self.assertEqual(actual.fpm_timing.num_intervals, 1)
+        published = []
+        actual.fpm_timing.when_ready(published.append)
+        self.assertEqual(published, [0.005])
+        create.assert_called_once()
+        # A prebuilt with no inner forward does not invent a timing group.
+        self.assertIsNone(scheduler.run_batch(batch).fpm_timing)
+
+    def test_pp_launch_and_output_ring_keep_rank_local_timing(self):
+        timer = self.reporter.forward_pass_device_timer = DeviceTimer()
+        self.scheduler._fpm_uses_device_timer = True
+        scheduler = self.scheduler
+        scheduler.forward_stream_ctx = nullcontext()
+        scheduler.forward_stream = Mock()
+        scheduler.schedule_stream = object()
+        scheduler.pp_group = types.SimpleNamespace(
+            is_last_rank=True, is_first_rank=False
+        )
+        scheduler.device_module = types.SimpleNamespace(
+            Event=Mock, current_stream=lambda: object()
+        )
+        scheduler.future_map = types.SimpleNamespace(stash=Mock())
+        scheduler._pp_prepare_tensor_dict = lambda result, batch: {
+            "next_token_ids": torch.tensor([7])
+        }
+
+        def forward(batch, pp_proxy_tensors):
+            with timer.wrap({"category": "decode"}):
+                pass
+            return GenerationBatchResult(can_run_cuda_graph=True)
+
+        scheduler.run_batch = wrap_forward_with_fpm(forward, timer)
+        batch = self._make_batch(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=[128],
+            reqs=[_FakeReq(128)],
+            return_logprob=False,
+            req_pool_indices=torch.tensor([0]),
+        )
+        metadata, wire_queue = [None], deque()
+        with (
+            patch.object(_TimingInterval, "create", return_value=_ready_interval(9)),
+            patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch"),
+        ):
+            launched, _ = SchedulerPPMixin._pp_launch_batch(
+                scheduler, 0, batch, None, metadata, wire_queue
+            )
+        self.assertIs(metadata[0].fpm_timing, launched.fpm_timing)
+        wire = wire_queue[0][1]
+        self.assertEqual(set(wire.tensors), {"next_token_ids"})
+        rebuilt = SchedulerPPMixin._pp_prep_batch_result(
+            scheduler, batch, metadata[0], wire
+        )
+        self.assertIs(rebuilt.fpm_timing, launched.fpm_timing)
+        self.reporter._emit_forward_pass_metrics(batch, rebuilt)
+        self.assertEqual(len(scheduler._fpm_publisher.metrics), 1)
+        self.assertAlmostEqual(scheduler._fpm_publisher.metrics[0].wall_time, 0.009)
+
+    def test_pp_skipped_output_comm_keeps_timing(self):
+        timing = object()
+        metadata = PPBatchMetadata(can_run_cuda_graph=True, fpm_timing=timing)
+        scheduler = types.SimpleNamespace(
+            device="cpu",
+            device_module=types.SimpleNamespace(
+                Event=Mock, current_stream=lambda: object()
+            ),
+        )
+        wire, result, _ = SchedulerPPMixin._pp_make_skip_output_result(
+            scheduler, types.SimpleNamespace(reqs=[object()]), metadata
+        )
+        self.assertIsNone(wire)
+        self.assertTrue(result.skipped_output_comm)
+        self.assertIs(result.fpm_timing, timing)
 
 
 class TestIdleMetrics(unittest.TestCase):

@@ -1125,7 +1125,7 @@ class SchedulerMetricsReporter:
         if self.scheduler._fpm_uses_device_timer:
             timing = result.fpm_timing
             if timing is None or timing.num_intervals == 0:
-                # Prebuilt/idle iterations have no instrumented forward.
+                # No recorded forward, e.g. a prebuilt without an inner idle batch.
                 return
             self.forward_pass_device_timer._report()
             wall_time = 0.0
