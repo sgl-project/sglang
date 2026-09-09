@@ -985,10 +985,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
-            detector_owns_format = (
-                parser.detector.supports_structural_tag()
-                or parser.detector.parses_required_natively()
-            )
+            detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
             if should_try_native and parser.has_tool_call(content):
                 try:
@@ -1064,6 +1061,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         if last_items:
             output_items.extend(last_items)
         return output_items
+
+    @staticmethod
+    def _tool_parser_owns_format(parser: FunctionCallParser) -> bool:
+        return (
+            parser.detector.supports_structural_tag()
+            or parser.detector.parses_required_natively()
+        )
 
     @staticmethod
     def _chat_tool_choice(tool_choice: Any) -> Any:
@@ -2091,17 +2095,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
-            native_supports_structural_tag = False
+            detector_owns_format = False
             if self.tool_call_parser:
                 probe = FunctionCallParser(
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
-                native_supports_structural_tag = (
-                    probe.detector.supports_structural_tag()
-                )
-            if is_required and not native_supports_structural_tag:
+                detector_owns_format = self._tool_parser_owns_format(probe)
+            if is_required and not detector_owns_format:
                 tool_parser = JsonArrayParser()
             elif self.tool_call_parser:
                 tool_parser = FunctionCallParser(

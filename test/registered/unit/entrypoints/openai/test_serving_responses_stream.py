@@ -143,6 +143,58 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         ]
         self.assertIn("function_call", added_kinds)
 
+    def test_required_native_parser_matches_full_response(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "hunyuan"
+        serving.tokenizer_manager.tokenizer.get_vocab.return_value = {"<tool_sep>": 1}
+        raw = (
+            "<tool_calls><tool_call>get_weather<tool_sep>"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "</tool_call></tool_calls>"
+        )
+        for choice in ("required", {"type": "function", "name": "get_weather"}):
+            with self.subTest(choice=choice):
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    stream=True,
+                    store=False,
+                    tool_choice=choice,
+                    tools=[
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                )
+                (full_item,) = serving._make_response_output_items(
+                    request,
+                    raw,
+                    serving.tokenizer_manager.tokenizer,
+                    require_reasoning=False,
+                )
+                events = StreamFixture(serving, request).run(
+                    [
+                        engine_chunk(raw[:i], i, finish=i == len(raw))
+                        for i in range(1, len(raw) + 1)
+                    ]
+                )
+                (stream_item,) = find_completed_event(events)["response"]["output"]
+                self.assertEqual(stream_item["type"], "function_call")
+                self.assertEqual(stream_item["name"], full_item.name)
+                self.assertEqual(stream_item["arguments"], full_item.arguments)
+                deltas = "".join(
+                    p["delta"]
+                    for p in event_payloads(events)
+                    if p["type"] == "response.function_call_arguments.delta"
+                )
+                self.assertEqual(deltas, full_item.arguments)
+
     def test_final_output_preserves_text_tool_text_order(self):
         from sglang.srt.function_call.core_types import (
             StreamingParseResult,
