@@ -183,7 +183,13 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
-        if is_npu():
+        if is_cpu():
+            if not inplace_update:
+                raise NotImplementedError(
+                    "GDN multi-item scoring is not supported by the CPU chunk kernel"
+                )
+            inplace_update_args = {}
+        elif is_npu():
             if not inplace_update:
                 raise NotImplementedError(
                     "GDN multi-item scoring is not supported by the NPU chunk kernel"
