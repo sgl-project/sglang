@@ -457,6 +457,7 @@ def build_kv_cache(
         dynamo_kv_event_format=dynamo_kv_event_format,
         kv_event_lora_names=kv_event_lora_names,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
+        allow_subagent_keepalive=get_memory().allow_subagent_keepalive,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
