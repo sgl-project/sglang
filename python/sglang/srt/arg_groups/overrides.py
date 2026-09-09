@@ -1143,6 +1143,7 @@ def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
     if (
         view.enable_deterministic_inference
         and view.flashinfer_allreduce_fusion_backend is not None
+        and view.flashinfer_allreduce_fusion_backend != "trtllm"
     ):
         logger.warning(
             "Disable --flashinfer-allreduce-fusion-backend because deterministic inference is enabled."

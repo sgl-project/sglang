@@ -2001,15 +2001,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(_enforce_disable_allreduce_fusion(_view()), {})
 
-        # deterministic inference disables an enabled fusion
+        # Deterministic inference keeps only an explicitly selected TRT-LLM
+        # backend. Auto and MNNVL retain the conservative disable behavior.
+        for backend in ("auto", "mnnvl"):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    _deterministic_allreduce_fusion_disable(
+                        _view(
+                            flashinfer_allreduce_fusion_backend=backend,
+                            enable_deterministic_inference=True,
+                        )
+                    ),
+                    {"flashinfer_allreduce_fusion_backend": None},
+                )
         self.assertEqual(
             _deterministic_allreduce_fusion_disable(
                 _view(
-                    flashinfer_allreduce_fusion_backend="auto",
+                    flashinfer_allreduce_fusion_backend="trtllm",
                     enable_deterministic_inference=True,
                 )
             ),
-            {"flashinfer_allreduce_fusion_backend": None},
+            {},
         )
         self.assertEqual(
             _deterministic_allreduce_fusion_disable(
