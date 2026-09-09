@@ -2107,7 +2107,12 @@ class UnifiedRadixCache(BasePrefixCache):
             self._handle_prefetch_result(operation)
         return True
 
-    def _handle_prefetch_result(self, operation: PrefetchOperation) -> None:
+    def _handle_prefetch_result(
+        self,
+        operation: PrefetchOperation,
+        *,
+        completed_tokens: Optional[int] = None,
+    ) -> None:
         # This function **owns**:
         # - host_indices[0 : completed_tokens]
         # - sidecar pool hits if operation.pool_transfers_done is true
@@ -2116,7 +2121,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # into the radix tree or released to pool.
 
         request = operation.handle
-        completed_tokens = operation.completed_tokens
+        if completed_tokens is None:
+            completed_tokens = operation.completed_tokens
         hash_value = operation.hash_value
 
         (
@@ -2128,8 +2134,8 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         ) = self.ongoing_prefetch[request]
 
-        # All PP/TP ranks will get the same `min_completed_tokens`, because `completed_tokens`
-        # and `pool_hits` in their operations are same.  No need to sync cross-rank here.
+        # The controller's completion ack or the caller must agree on the usable
+        # prefix across ranks before committing it to the tree.
         if not self._check_hybrid_prefetch_result(
             request,
             operation,
@@ -2254,11 +2260,9 @@ class UnifiedRadixCache(BasePrefixCache):
         Returns true if prefetch success, or false when an all-or-nothing prefetch
         was discarded (the caller should then treat the prefetch as finished).
         """
-        # Sync completed tokens and per-pool hit pages across ATTN groups, taking
-        # the minimum so every rank agrees on the same usable prefix length.
-        #
-        # Skip KV-derived pools, which do not report hits in operation.pool_storage_result.
-        # Their hit lengths are stored in completed_tokens.
+        # Keep the caller's agreed completed_tokens; operation progress may
+        # still reflect a longer rank-local transfer. KV-derived pools report
+        # coverage through that prefix rather than independent sidecar hits.
         pool_transfers = [
             transfer
             for transfer in operation.pool_transfers or []
@@ -2268,7 +2272,6 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
         )
         pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
-        completed_tokens = operation.completed_tokens
         # Hybrid cache state is all-or-nothing: every extra pool (SWA / Mamba / ...)
         # must cover the same fetched prefix. If any pool falls short the whole
         # prefetch result is unusable, so discard it and release everything.
