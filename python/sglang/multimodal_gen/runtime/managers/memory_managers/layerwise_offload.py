@@ -1073,19 +1073,35 @@ class LayerwiseOffloadManager:
     def _layer_byte_totals(
         self, layer_groups: Dict
     ) -> Tuple[Dict[int, int], Dict[int, int]]:
-        """Per layer: (all weight bytes, the subset that are checkpoint views)."""
+        """Per layer: (host allocation bytes, checkpoint-view bytes)."""
         totals: Dict[int, int] = {}
         mapped: Dict[int, int] = {}
         for layer_idx, dtype_to_params in layer_groups.items():
             total = 0
             from_mapping = 0
-            for weights in dtype_to_params.values():
+            for dtype, weights in dtype_to_params.items():
+                offset = 0
                 for _, weight in weights:
                     tensor = self._to_local_tensor(weight)
-                    nbytes = tensor.untyped_storage().nbytes()
-                    total += nbytes
+                    if tensor.is_contiguous():
+                        offset = (
+                            self._align_numel_offset(offset, dtype) + tensor.numel()
+                        )
+                    else:
+                        # match empty_strided's allocation, including view holes
+                        total += (
+                            torch.empty_strided(
+                                tensor.shape,
+                                tensor.stride(),
+                                dtype=dtype,
+                                device="meta",
+                            )
+                            .untyped_storage()
+                            .nbytes()
+                        )
                     if self._mapped_regions.holds(tensor):
-                        from_mapping += nbytes
+                        from_mapping += tensor.untyped_storage().nbytes()
+                total += offset * dtype.itemsize
             totals[layer_idx] = total
             mapped[layer_idx] = from_mapping
         return totals, mapped
@@ -1283,6 +1299,8 @@ class LayerwiseOffloadManager:
                         dtype=dtype,
                         pin_memory=pin_this_layer,
                     )
+                    if pin_this_layer:
+                        self._pin_budget.track_storage(cpu_tensor.untyped_storage())
                     cpu_tensor.copy_(local_weight)
                     self._strided_cpu_weights[layer_idx][name] = cpu_tensor
                     self._weight_metadata[layer_idx][name] = {
@@ -1315,6 +1333,8 @@ class LayerwiseOffloadManager:
                 cpu_buffer = torch.empty(
                     total_numel, dtype=dtype, pin_memory=pin_this_layer
                 )
+                if pin_this_layer:
+                    self._pin_budget.track_storage(cpu_buffer.untyped_storage())
 
                 # offload weights to the buffer
                 for name, weight, local_weight in contiguous_weights:
@@ -1942,13 +1962,11 @@ class LayerwiseOffloadManager:
                 "cannot release host stores with mapped copies in flight"
             )
 
-        self._pin_budget.release(self.pinned_host_weight_bytes())
         self._consolidated_cpu_weights.clear()
         self._strided_cpu_weights.clear()
         self._mapped_cpu_weights.clear()
         self._mps_cpu_weights.clear()
         self._weight_metadata.clear()
-        self._layer_hosting.clear()
         self._prefetch_events.clear()
         self._mapped_bytes = 0
         self._configured = False

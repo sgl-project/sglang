@@ -1,7 +1,5 @@
 """CPU weight ownership while a snapshot-offloaded component runs on device."""
 
-import weakref
-
 import torch
 from torch import nn
 
@@ -49,7 +47,7 @@ def capture_weight_snapshot(
                 raise
             # the lease outlives strategy rebuilds, snapshots and LoRA backups;
             # only the last tensor releasing this storage returns its allowance
-            weakref.finalize(pinned_storage, pin_budget.release, size)
+            pin_budget.track_storage(pinned_storage)
             for name in names:
                 tensor = snapshot[name]
                 pinned = torch.empty(0, dtype=tensor.dtype, device="cpu").set_(

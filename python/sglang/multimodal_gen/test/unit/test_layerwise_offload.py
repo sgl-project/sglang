@@ -1,3 +1,4 @@
+import gc
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -510,6 +511,36 @@ def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
     transformer.disable_offload()
     layerwise.release_host_stores()
     assert budget.committed_bytes == 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_layerwise_pin_lease_includes_alignment_and_survives_host_aliases():
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 76
+    )
+    for _ in range(2):
+        model = torch.nn.Module()
+        model.blocks = torch.nn.ModuleList([torch.nn.Linear(3, 3)])
+        manager = LayerwiseOffloadManager(
+            model=model,
+            layers_attr_str="blocks",
+            num_layers=1,
+            enabled=True,
+            pin_cpu_memory=True,
+            pin_budget=budget,
+        )
+        # 36 bytes of weights, 28 bytes of alignment, then a 12-byte bias
+        assert budget.committed_bytes == 76
+        host_alias = manager._consolidated_cpu_weights[0][torch.float32].detach()
+        manager.remove_forward_hooks()
+        manager.load_all_layers()
+        torch.cuda.synchronize()
+        manager.enabled = False
+        manager.release_host_stores()
+        assert budget.committed_bytes == 76
+        del host_alias, manager, model
+        gc.collect()
+        assert budget.committed_bytes == 0
 
 
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):
