@@ -10,8 +10,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
-from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
-from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_register,
@@ -114,7 +112,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
         pool.allocator = object()
         alloc = mock.Mock(return_value=object())
 
-        with mock.patch.dict(mla_pool_host.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
+        with mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
             pool.init_kv_buffer()
 
         self.assertEqual(
@@ -137,7 +135,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
         pool.allocator = object()
         alloc = mock.Mock(return_value=object())
 
-        with mock.patch.dict(mha_pool_host.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
+        with mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
             pool.init_kv_buffer()
 
         self.assertEqual(
@@ -196,7 +194,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         "host_memory_budget_bytes",
                         return_value=1024**3,
                     ),
-                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {torch.device("cpu"): alloc}),
+                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
                     DeepSeekV4PagedHostPool(
                         pool_name="test",
@@ -229,7 +227,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         "host_memory_budget_bytes",
                         return_value=1024**3,
                     ),
-                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {torch.device("cpu"): alloc}),
+                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
                     DeepSeekV4StateHostPool(
                         pool_name="test",

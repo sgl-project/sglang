@@ -214,8 +214,9 @@ class HostKVCache(abc.ABC):
 
         Large cudaHostRegister'd buffers are otherwise unpinned by the kernel
         during SIGKILL reclaim, which can stall teardown in uninterruptible
-        sleep for tens of seconds. Idempotent. (Only the host_register path
-        needs this; npu/musa pin_memory buffers are freed by torch.)
+        sleep for tens of seconds. Idempotent. Only the cudaHostRegister path
+        needs this; every `alloc_with_pin_memory` backend (see
+        `ALLOC_MEMORY_FUNCS`) leaves the unpinning to torch.
         """
         if getattr(self, "_destroyed", False):
             return

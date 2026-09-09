@@ -247,6 +247,16 @@ def alloc_with_pin_memory(
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    if pin_memory and buffer.numel() > 0 and buffer.data_ptr() == 0:
+        # torch 2.13.0+xpu returns data_ptr()==0 from a failed pinned host alloc
+        # instead of raising (measured: 8 GiB ok, 2048 GiB null); drop once that
+        # allocator raises. Callers span KV pools and state_capturer, so state
+        # what failed and leave the remedy to them.
+        n_bytes = buffer.numel() * buffer.element_size()
+        raise RuntimeError(
+            f"Pinned host memory allocation of {n_bytes / (1024**3):.1f} GiB "
+            f"({n_bytes} bytes) returned a null pointer"
+        )
     return buffer
 
 
@@ -255,5 +265,16 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        "xpu": alloc_with_pin_memory,
     },
 )
+
+
+def get_alloc_memory_func(accelerator_device: str | torch.device):
+    """Pick the host-buffer allocator for the accelerator the pool feeds.
+
+    Keys are bare device types, but callers hold anything from `"xpu"` to
+    `"cuda:1"` to a `torch.device` read off a device buffer; normalize so an
+    indexed device never silently falls back to the cudaHostRegister path.
+    """
+    return ALLOC_MEMORY_FUNCS[torch.device(accelerator_device).type]

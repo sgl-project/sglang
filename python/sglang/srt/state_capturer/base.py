@@ -6,9 +6,9 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
     HostTensorAllocator,
     _cuda_host_unregister,
+    get_alloc_memory_func,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda, is_hip
@@ -64,7 +64,7 @@ class BaseHostCache:
     def __init__(
         self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
     ):
-        alloc = ALLOC_MEMORY_FUNCS[device]
+        alloc = get_alloc_memory_func(device)
         self.buffer = alloc(
             (num_tokens, num_layers, topk_size),
             dtype=torch.int32,
