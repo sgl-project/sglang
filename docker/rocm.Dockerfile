@@ -816,14 +816,12 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
-  # Locate ROCm llvm-config. The ROCm 7.0 vLLM base (rocm/sgl-dev:rocm7-vllm-20250904)
-  # puts /opt/rocm/llvm/bin on PATH but ships no llvm-config; newer ROCm layouts
-  # keep it under lib/llvm. Search both before installing a fallback.
-  # Do NOT fall back to apt.llvm.org first: amd-docker-scale runners often cannot
-  # reach it (curl: (7) Couldn't connect to server), which flakes the gfx942/gfx950
-  # ROCm 7.0 nightly. Distro LLVM is already reachable via the Ubuntu HTTPS mirror.
-  # TVM requires LLVM >= 15; jammy has llvm-15, noble has llvm-18. Do not install
-  # unversioned llvm-dev (it ships llvm-config-14/16 and can shadow ROCm's).
+  # Locate ROCm llvm-config. Search the classic /opt/rocm/llvm layout and the
+  # newer lib/llvm layout (ROCm 10). The ROCm 7.0 vLLM base ships
+  # /opt/rocm/llvm/bin on PATH but no llvm-config; amd-docker-scale cannot
+  # reliably reach apt.llvm.org, so that flavor installs Ubuntu llvm-15
+  # (TVM requires >= 15). Other GPU_ARCH values keep the historical
+  # apt.llvm.org llvm-18 fallback. Do not install unversioned llvm-dev.
   LLVM_CONFIG_PATH=""; \
   for p in \
       /opt/rocm/llvm/bin/llvm-config \
@@ -837,28 +835,22 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   if [ -z "$LLVM_CONFIG_PATH" ]; then \
     LLVM_CONFIG_PATH="$(find /opt/rocm /opt/rocm-* -path "*/bin/llvm-config" \( -type f -o -type l \) -print -quit 2>/dev/null || true)"; \
   fi; \
-  if [ -z "$LLVM_CONFIG_PATH" ]; then \
-    echo "[TileLang] ROCm llvm-config not found; installing distro LLVM"; \
-    . /etc/os-release; \
+  # Ubuntu llvm-15 only for unsuffixed GPU_ARCH (ROCm 7.0 gfx942/gfx950).
+  # gfx942-rocm720 / *-rocm724 / *-rocm1000 already build TileLang against
+  # llvm-18 from apt.llvm.org (7.2) or ROCm's own llvm-config (10); do not
+  # switch those flavors to jammy llvm-15.
+  if [ -z "$LLVM_CONFIG_PATH" ] && { [ "$GPU_ARCH" = "gfx942" ] || [ "$GPU_ARCH" = "gfx950" ]; }; then \
+    echo "[TileLang] ROCm 7.0 llvm-config missing; installing Ubuntu llvm-15"; \
     apt-get update; \
-    case "${VERSION_CODENAME}" in \
-      noble|oracular|plucky) \
-        apt-get install -y --no-install-recommends llvm-18 || true; \
-        LLVM_CONFIG_PATH="$(command -v llvm-config-18 || true)"; \
-        ;; \
-      *) \
-        apt-get install -y --no-install-recommends llvm-15 llvm-15-tools || true; \
-        LLVM_CONFIG_PATH="$(command -v llvm-config-15 || true)"; \
-        ;; \
-    esac; \
+    apt-get install -y --no-install-recommends llvm-15 llvm-15-tools || true; \
     rm -rf /var/lib/apt/lists/*; \
+    LLVM_CONFIG_PATH="$(command -v llvm-config-15 || true)"; \
   fi; \
   if [ -z "$LLVM_CONFIG_PATH" ]; then \
-    echo "[TileLang] Distro LLVM unavailable; last-resort apt.llvm.org LLVM 18"; \
+    echo "[TileLang] ROCm llvm-config not found; installing LLVM 18 from apt.llvm.org"; \
     mkdir -p /etc/apt/keyrings; \
-    . /etc/os-release; \
     curl -fsSL --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 20 https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg; \
-    echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] https://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-18 main" > /etc/apt/sources.list.d/llvm.list; \
+    echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" > /etc/apt/sources.list.d/llvm.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends llvm-18; \
     rm -rf /var/lib/apt/lists/*; \
