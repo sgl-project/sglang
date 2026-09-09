@@ -4,6 +4,7 @@
 //! frames (`data: {json}` … `[DONE]`), byte-compatible with Python
 //! `http_server.generate_request`; `/server_info` reuses it for one control result.
 pub mod app;
+pub(crate) mod auth;
 mod common;
 mod disaggregation;
 mod frame;

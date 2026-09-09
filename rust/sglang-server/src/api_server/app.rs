@@ -4,10 +4,11 @@
 
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{Router, http::StatusCode};
 
 use super::disaggregation::bootstrap as pd_bootstrap;
-use super::{common, log, native_api, openai};
+use super::{auth, common, log, native_api, openai};
+use crate::api_server::auth::{AuthConfig, AuthLevel};
 use crate::message::config::ServerArgs;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
@@ -33,6 +34,7 @@ pub async fn serve(
     senders: Senders,
     response_buf: usize,
     server_args: Arc<ServerArgs>,
+    auth_config: Arc<AuthConfig>,
     response_activity: ActivityCounter,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
@@ -49,24 +51,28 @@ pub async fn serve(
         response_activity,
     });
     // Each endpoint module registers its own routes and merges here.
-    let router = Router::new()
+    let public_router = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
-        .merge(openai::routes());
+        .merge(openai::routes())
+        // Python's global ASGI middleware authenticates unknown customer paths
+        // before they become a 404. Register the public fallback before the
+        // AuthZ layer to preserve that observable 401/404 ordering.
+        .fallback(public_not_found)
+        // No body limit, matching the Python server.
+        .layer(axum::extract::DefaultBodyLimit::disable());
 
-    // TODO(auth): no API-key boundary yet. Python gates every route (except
-    // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
-    // a configured `api_key` does NOT protect these routes.
-    //
-    // No body limit, matching the Python server.
-    let mut app = router
-        .layer(axum::extract::DefaultBodyLimit::disable())
-        .with_state(state);
+    // Protect only customer-facing routes. This must happen before the PD
+    // bootstrap router is merged below: Axum layers wrap routes already present
+    // at the call site, which is the structural AuthZ boundary for v1.
+    let mut app = auth::protect(public_router, auth_config, AuthLevel::Normal).with_state(state);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the
     // Router<Arc<AppState>> above — and before `log::apply`, so bootstrap traffic
-    // shows in the access log.
+    // shows in the access log. The bootstrap router must keep Axum's default
+    // fallback: the public router already owns the custom, protected fallback,
+    // and Axum rejects merging two routers that both define one.
     if server_args.enable_pd_bootstrap() {
         let (routes, sweeper) = pd_bootstrap::router_and_sweeper();
         tokio::spawn(sweeper); // cancelled with the runtime on shutdown
@@ -101,4 +107,8 @@ pub async fn serve(
             tracing::info!("shutdown: stopping accepts, aborting in-flight handlers");
         }
     }
+}
+
+async fn public_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }

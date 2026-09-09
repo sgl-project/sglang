@@ -79,11 +79,12 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
+        serving = get_serving()
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
-        listen_port = get_serving().port + (dp_rank or 0)
-        listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
+        listen_port = serving.port + (dp_rank or 0)
+        listen_addr = NetworkAddress(serving.host, listen_port).to_host_port_str()
 
         launch_cores, server_cores = _partition_cores(
             mm_workers=(
@@ -98,6 +99,11 @@ class RustServer:
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
             port_offset=dp_rank,
+            # Keep credentials out of the regular ServerArgs payload: they are
+            # consumed only by the Rust HTTP ingress and must not reach model,
+            # scheduler, or server-info configuration surfaces.
+            api_key=serving.api_key,
+            admin_api_key=serving.admin_api_key,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python

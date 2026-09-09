@@ -360,6 +360,7 @@ pub(crate) fn router_and_sweeper() -> (Router, impl std::future::Future<Output =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_server::auth::AuthConfig;
     use crate::message::config::{
         DisaggregationMode, RuntimeConfig, RustServerServerArgs, ServerArgs,
     };
@@ -375,10 +376,23 @@ mod tests {
         path_query: &str,
         body: Option<&serde_json::Value>,
     ) -> (u16, String) {
+        request_with_authorization(addr, method, path_query, body, None)
+    }
+
+    fn request_with_authorization(
+        addr: SocketAddr,
+        method: &str,
+        path_query: &str,
+        body: Option<&serde_json::Value>,
+        authorization: Option<&str>,
+    ) -> (u16, String) {
         let body = body.map(|b| b.to_string()).unwrap_or_default();
+        let authorization = authorization
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default();
         let mut conn = std::net::TcpStream::connect(addr).expect("connect");
         let req = format!(
-            "{method} {path_query} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+            "{method} {path_query} HTTP/1.1\r\nHost: t\r\n{authorization}Content-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
@@ -440,6 +454,13 @@ mod tests {
     }
 
     fn start_runtime(server_args: ServerArgs) -> (Runtime, SocketAddr) {
+        start_runtime_with_auth(server_args, AuthConfig::default())
+    }
+
+    fn start_runtime_with_auth(
+        server_args: ServerArgs,
+        auth_config: AuthConfig,
+    ) -> (Runtime, SocketAddr) {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -450,6 +471,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            auth_config: Arc::new(auth_config),
         };
         (crate::runtime::start(cfg).expect("start runtime"), addr)
     }
@@ -610,6 +632,121 @@ mod tests {
             "PUT",
             "/route",
             Some(&put_route(serde_json::json!({}))),
+        );
+        assert_eq!(status, 404);
+    }
+
+    /// The v1 trust boundary is structural: customer endpoints (and their
+    /// fallback) require the configured API key, while the prefill bootstrap
+    /// control plane is merged afterwards and remains available to legacy PD
+    /// clients without an Authorization header.
+    #[test]
+    fn api_key_protects_public_routes_but_not_pd_bootstrap() {
+        let mut server_args = test_server_args(DisaggregationMode::Prefill);
+        server_args.served_model_name = "test-model".into();
+        let (_rt, addr) = start_runtime_with_auth(
+            server_args,
+            AuthConfig::new(Some("customer-secret".into()), Some("admin-secret".into())),
+        );
+
+        let (status, body) = request(addr, "GET", "/v1/models", None);
+        assert_eq!(status, 401);
+        assert_eq!(body, r#"{"error":"Unauthorized"}"#);
+
+        let (status, _) = request_with_authorization(
+            addr,
+            "GET",
+            "/v1/models",
+            None,
+            Some("Bearer wrong-secret"),
+        );
+        assert_eq!(status, 401);
+        // The admin credential is deliberately not a super-key for normal APIs.
+        let (status, _) = request_with_authorization(
+            addr,
+            "GET",
+            "/v1/models",
+            None,
+            Some("Bearer admin-secret"),
+        );
+        assert_eq!(status, 401);
+        let (status, _) = request_with_authorization(
+            addr,
+            "GET",
+            "/v1/models",
+            None,
+            Some("Bearer customer-secret"),
+        );
+        assert_eq!(status, 200);
+
+        // Authorization runs before Axum's public MethodRouter decision.
+        let (status, _) = request(addr, "DELETE", "/v1/models", None);
+        assert_eq!(status, 401);
+        let (status, _) = request_with_authorization(
+            addr,
+            "DELETE",
+            "/v1/models",
+            None,
+            Some("Bearer customer-secret"),
+        );
+        assert_eq!(status, 405);
+        // OPTIONS bypasses AuthZ but still receives the downstream method result.
+        let (status, _) = request(addr, "OPTIONS", "/v1/models", None);
+        assert_eq!(status, 405);
+
+        // The public fallback is protected too, except for Python-compatible
+        // health/metrics prefix bypasses.
+        let (status, _) = request(addr, "GET", "/unknown", None);
+        assert_eq!(status, 401);
+        let (status, _) = request_with_authorization(
+            addr,
+            "GET",
+            "/unknown",
+            None,
+            Some("Bearer customer-secret"),
+        );
+        assert_eq!(status, 404);
+        let (status, _) = request(addr, "GET", "/health_unknown", None);
+        assert_eq!(status, 404);
+
+        // Every bootstrap endpoint stays usable without a customer credential.
+        let body = put_route(serde_json::json!({}));
+        let (status, _) = request(addr, "PUT", "/route", Some(&body));
+        assert_eq!(status, 200);
+        let (status, _) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let (status, _) = request(
+            addr,
+            "POST",
+            "/register_dp_rank",
+            Some(&serde_json::json!({"bootstrap_room": 42, "dp_rank": 3})),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = request(
+            addr,
+            "POST",
+            "/query_dp_ranks",
+            Some(&serde_json::json!({"bootstrap_rooms": [42]})),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = request(addr, "DELETE", "/route", None);
+        assert_eq!(status, 405);
+
+        // Off-prefill the same path is not an internal exception because no PD
+        // router owns it: it falls back through the customer boundary, then
+        // becomes a 404 only after a valid customer credential is supplied.
+        let (_null_rt, null_addr) = start_runtime_with_auth(
+            test_server_args(DisaggregationMode::Null),
+            AuthConfig::new(Some("customer-secret".into()), None),
+        );
+        let (status, _) = request(null_addr, "PUT", "/route", Some(&body));
+        assert_eq!(status, 401);
+        let (status, _) = request_with_authorization(
+            null_addr,
+            "PUT",
+            "/route",
+            Some(&body),
+            Some("Bearer customer-secret"),
         );
         assert_eq!(status, 404);
     }

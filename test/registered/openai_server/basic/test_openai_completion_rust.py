@@ -41,6 +41,25 @@ class TestOpenAICompletionRustParity(CustomTestCase):
             ],
         )
         try:
+            for headers in (
+                None,
+                {"Authorization": "Bearer wrong-key"},
+            ):
+                unauthorized = requests.get(
+                    DEFAULT_URL_FOR_TEST + "/v1/models",
+                    headers=headers,
+                    timeout=30,
+                )
+                self.assertEqual(unauthorized.status_code, 401)
+                self.assertEqual(unauthorized.json(), {"error": "Unauthorized"})
+
+            # Health stays probe-friendly even when customer APIs require a key.
+            health = requests.get(
+                DEFAULT_URL_FOR_TEST + "/health",
+                timeout=30,
+            )
+            self.assertNotEqual(health.status_code, 401)
+
             response = requests.post(
                 DEFAULT_URL_FOR_TEST + "/v1/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
