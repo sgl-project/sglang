@@ -19,6 +19,7 @@ from collections import defaultdict
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache import unified_radix_cache as R
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -104,6 +105,147 @@ class TestSwaHostSizing(unittest.TestCase):
         with self.assertRaises(AssertionError):
             with self.assertLogs(A.logger, level="WARNING"):
                 self._pages(stride=1, full_host_pages=100_000, page_bytes=1)
+
+
+class TestStateStagingSlack(unittest.TestCase):
+    """Staging rows hold a tile from capture until BACKUP_HOST promote. Daily
+    load is one 50/100/200k prefix per rank, so the bound is the prefix's
+    strided windows, not durable capacity and not max_running_requests."""
+
+    def _legacy(self, durable):
+        return (durable * 3 + 1) // 2
+
+    def _slack(self, durable, **kw):
+        return A._state_staging_slack_pages(durable, **kw)
+
+    def test_200k_isl_page256_stride1(self):
+        # ceil(200000/256)+1 = 782+1; not 16 and not 16 * num_req_slots.
+        slack = self._slack(33_600)
+        self.assertEqual(slack, 783)
+        self.assertLess(slack, self._legacy(33_600))
+
+    def test_daily_isl_points(self):
+        self.assertEqual(self._slack(33_600, inflight_tokens=50_000), 196 + 1)
+        self.assertEqual(self._slack(33_600, inflight_tokens=100_000), 391 + 1)
+        self.assertEqual(self._slack(33_600, inflight_tokens=200_000), 782 + 1)
+
+    def test_coarser_stride_shrinks_staging(self):
+        self.assertEqual(self._slack(33_600, stride=2), 391 + 1)
+        self.assertLess(self._slack(33_600, stride=2), self._slack(33_600, stride=1))
+
+    def test_durable_capacity_does_not_grow_staging(self):
+        # Halving stride doubles the durable SWA budget; staging follows capture
+        # density (page*stride), not that durable count.
+        self.assertEqual(self._slack(16_800, stride=1), self._slack(33_600, stride=1))
+
+    def test_concurrent_prefills_grow_staging(self):
+        self.assertGreater(
+            self._slack(33_600, concurrent=2), self._slack(33_600, concurrent=1)
+        )
+
+    def test_small_pool_keeps_legacy_bound(self):
+        self.assertEqual(self._slack(10), self._legacy(10))
+
+    def test_floor_applies_when_windows_tiny(self):
+        self.assertEqual(
+            self._slack(10_000, stride=10_000_000), A._STATE_STAGING_MIN_PAGES
+        )
+
+    def test_env_zero_restores_legacy(self):
+        with envs.SGLANG_SWA_HICACHE_STATE_STAGING_PAGES.override(0):
+            self.assertEqual(self._slack(33_600), self._legacy(33_600))
+
+    def test_env_sets_absolute_pages(self):
+        with envs.SGLANG_SWA_HICACHE_STATE_STAGING_PAGES.override(32):
+            self.assertEqual(self._slack(33_600), 32)
+
+    def test_env_override_is_not_clamped_to_the_derived_bound(self):
+        # the knob is the escape hatch for concurrent prefills, so it has to be
+        # able to exceed both the derived value and 1.5x on a small pool
+        with envs.SGLANG_SWA_HICACHE_STATE_STAGING_PAGES.override(4096):
+            self.assertEqual(self._slack(10), 4096)
+
+
+class TestStateStagingPlan(unittest.TestCase):
+    """The live-config wrapper both the DRAM guard and the pool build call."""
+
+    def _from_args(self, durable=33_600, *, page_size=256, stride=1, ctx=None):
+        sargs = _sargs(stride)
+        if ctx is not None:
+            sargs.context_length = ctx
+        return A._state_staging_plan(
+            durable, server_args=sargs, page_size=page_size
+        ).pages
+
+    def test_matches_the_raw_helper_at_the_design_isl(self):
+        self.assertEqual(self._from_args(), 783)
+
+    def test_page_size_comes_from_the_caller(self):
+        # params.page_size, not server_args (whose fields hold raw input and read
+        # None unless --page-size was passed). A finer page means more boundaries.
+        self.assertEqual(self._from_args(page_size=64), math.ceil(200_000 / 64) + 1)
+
+    def test_context_length_only_lowers_the_isl(self):
+        self.assertEqual(self._from_args(ctx=50_000), math.ceil(50_000 / 256) + 1)
+        # a 1M-context launch must not inflate staging past the design ISL
+        self.assertEqual(self._from_args(ctx=1_000_000), self._from_args())
+
+    def test_unset_context_length_falls_back_to_the_design_isl(self):
+        self.assertEqual(self._from_args(ctx=None), self._from_args(ctx=200_000))
+
+    def test_plan_reports_the_inputs_it_sized_from(self):
+        # the launch log prints these; they have to be the values actually used
+        plan = A._state_staging_plan(33_600, server_args=_sargs(2), page_size=64)
+        self.assertEqual(
+            (plan.page_size, plan.stride, plan.inflight_tokens, plan.basis),
+            (64, 2, 200_000, "auto"),
+        )
+        with envs.SGLANG_SWA_HICACHE_STATE_STAGING_PAGES.override(128):
+            self.assertEqual(
+                A._state_staging_plan(
+                    33_600, server_args=_sargs(1), page_size=256
+                )._replace(inflight_tokens=0, page_size=0, stride=0),
+                A._StateStagingPlan(128, 0, 0, 0, "env override"),
+            )
+
+
+class TestSwaHostBudgetGuard(unittest.TestCase):
+    """The guard must weigh the coupled c4/indexer state pools, whose durable rows
+    are forced one-for-one by the SWA page count, not the SWA pool alone."""
+
+    def _check(self, *, swa_gb, state_gb, hard_gb):
+        A._check_swa_host_pool_upper_bound(
+            swa_gb=swa_gb,
+            slow_gb=A._SWA_HICACHE_SLOW_LAUNCH_GB,
+            hard_gb=hard_gb,
+            full_host_pages=26_749,
+            stride=2,
+            page_bytes=4096,
+            avail_gb=2900.0,
+            ranks_per_node=8,
+            state_gb=state_gb,
+        )
+
+    def test_coupled_state_pushes_config_over_hard_limit(self):
+        # The SWA pool alone fits under the ceiling, which is why the SWA-only
+        # guard let this through and the launch instead died deep into pinning,
+        # on the last coupled pool. swa + state is what actually gets pinned.
+        self._check(swa_gb=110.0, state_gb=0.0, hard_gb=270.0)
+        with self.assertRaises(ValueError) as cm:
+            self._check(swa_gb=110.0, state_gb=165.0, hard_gb=270.0)
+        msg = str(cm.exception)
+        self.assertIn("275.0", msg)  # reports the total, not just the SWA pool
+        self.assertIn("165.0", msg)  # and breaks out the coupled share
+
+    def test_state_counted_in_slow_launch_warning(self):
+        with self.assertLogs(A.logger, level="WARNING") as cm:
+            self._check(swa_gb=10.0, state_gb=15.0, hard_gb=1_000.0)
+        self.assertTrue(any("may slow server launch" in m for m in cm.output))
+
+    def test_no_state_layers_behaves_as_before(self):
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(A.logger, level="WARNING"):
+                self._check(swa_gb=1.0, state_gb=0.0, hard_gb=1_000.0)
 
 
 class TestCoEvictWarning(unittest.TestCase):
@@ -817,7 +959,8 @@ class TestSwaL3RoundTrip(unittest.TestCase):
         ]
         comp.tree_core.node_by_id = lambda nid: carrier
         insert_result = types.SimpleNamespace(
-            inserted_host_node=1, total_len=self.RING  # NodeId handle
+            inserted_host_node=1,
+            total_len=self.RING,  # NodeId handle
         )
         # one window (RING=512) covers stride//page = 2 Full pages -> the
         # coupling guard needs kv_hit_pages >= 2 for the window to attach.
@@ -856,7 +999,8 @@ class TestSwaL3RoundTrip(unittest.TestCase):
         ]
         comp.tree_core.node_by_id = lambda nid: carrier
         insert_result = types.SimpleNamespace(
-            inserted_host_node=1, total_len=self.RING  # NodeId handle
+            inserted_host_node=1,
+            total_len=self.RING,  # NodeId handle
         )
         # window needs 2 Full pages but only 1 hit -> guard drops it.
         pool_storage_result = types.SimpleNamespace(
@@ -925,7 +1069,8 @@ class TestSwaStateCommitCouplingGuard(unittest.TestCase):
         ]
         comp.tree_core.node_by_id = lambda nid: carrier
         insert_result = types.SimpleNamespace(
-            inserted_host_node=1, total_len=self.RING  # NodeId handle
+            inserted_host_node=1,
+            total_len=self.RING,  # NodeId handle
         )
         psr = types.SimpleNamespace(extra_pool_hit_pages=extra, kv_hit_pages=kv_hit)
         SWAComponent._commit_prefetch(

@@ -558,6 +558,120 @@ _SWA_HICACHE_SLOW_LAUNCH_GB = 16.0
 # owns only the "would physically exhaust host DRAM (real OOM)" concern -- NOT
 # slow pinning, which is the warn tier above.
 _SWA_HICACHE_HARD_LIMIT_DRAM_FRACTION = 0.9
+# Peak unpromoted c4 tiles: one long prefix (daily ISL 50/100/200k) at
+# per-rank batch 1. write_through ack can lag across chunked-prefill inserts,
+# so occupancy is the prefix's strided windows, not one chunk and not
+# max_running_requests (that is the device pool, often 1024).
+_STATE_STAGING_DESIGN_ISL_TOKENS = 200_000
+_STATE_STAGING_DEFAULT_PAGE_SIZE = 256
+_STATE_STAGING_DEFAULT_CONCURRENT = 1
+# floor so a huge stride still has a few concurrent boundaries
+_STATE_STAGING_MIN_PAGES = 64
+
+
+def _state_staging_windows(*, inflight_tokens: int, page_size: int, stride: int) -> int:
+    page_size = max(1, int(page_size))
+    stride = max(1, int(stride))
+    inflight_tokens = max(1, int(inflight_tokens))
+    # stride-aligned page boundaries plus the true-tail window
+    return -(-inflight_tokens // (page_size * stride)) + 1
+
+
+class _StateStagingPlan(NamedTuple):
+    """What the staging sizing decided, plus the inputs it decided from, so the
+    launch log cannot describe a formula the pools were not built with."""
+
+    pages: int
+    inflight_tokens: int
+    page_size: int
+    stride: int
+    basis: str
+
+
+def _state_staging_plan(
+    durable_pages: int, *, server_args, page_size: int
+) -> _StateStagingPlan:
+    """``_state_staging_slack_pages`` for a live config.
+
+    Both the DRAM guard and the pool build go through here, so the row count the
+    guard weighs cannot drift from the one actually allocated.
+
+    ``page_size`` is the resolved tree page size (``params.page_size``) -- the
+    same quantity the attention backend gates the capture stride on. ServerArgs
+    fields hold the raw input, so ``server_args.page_size`` is None unless
+    --page-size was passed explicitly, and must not be read here.
+    """
+    ctx = int(getattr(server_args, "context_length", 0) or 0)
+    # context_length only lowers the design ISL: a 1M-context launch does not
+    # make a batch-1 prefill hold 1M tokens worth of unpromoted windows.
+    inflight = (
+        min(_STATE_STAGING_DESIGN_ISL_TOKENS, ctx)
+        if ctx > 0
+        else _STATE_STAGING_DESIGN_ISL_TOKENS
+    )
+    stride = max(
+        1, int(getattr(server_args, "hicache_swa_offload_page_stride", 1) or 1)
+    )
+    override = int(envs.SGLANG_SWA_HICACHE_STATE_STAGING_PAGES.get())
+    return _StateStagingPlan(
+        pages=_state_staging_slack_pages(
+            durable_pages,
+            page_size=page_size,
+            stride=stride,
+            inflight_tokens=inflight,
+        ),
+        inflight_tokens=inflight,
+        page_size=page_size,
+        stride=stride,
+        basis="env override"
+        if override > 0
+        else ("legacy 1.5x" if override == 0 else "auto"),
+    )
+
+
+def _state_staging_slack_pages(
+    durable_pages: int,
+    *,
+    page_size: int = _STATE_STAGING_DEFAULT_PAGE_SIZE,
+    stride: int = 1,
+    inflight_tokens: int = _STATE_STAGING_DESIGN_ISL_TOKENS,
+    concurrent: int = _STATE_STAGING_DEFAULT_CONCURRENT,
+) -> int:
+    """Staging rows for the c4/indexer state pools riding the SWA windows.
+
+    A row is occupied from capture until BACKUP_HOST promote. Daily load is
+    ISL 50-200k at per-rank batch 1, so the bound is
+    concurrent * (ceil(ISL / (page*stride)) + 1), not durable cache size and not
+    the req-pool width. At stride 2 the old 1.5x asked for ~20k rows (~99
+    GB/rank). 1.5x stays the bound on the derived value so small pools are
+    unchanged; running out is correctness-safe and _state_alloc_fail counts it.
+    An explicit env override is taken as-is -- it is the escape hatch for
+    concurrent prefills, and _check_swa_host_pool_upper_bound still fails fast
+    if the resulting pools cannot be pinned.
+    """
+    legacy = (durable_pages * 3 + 1) // 2
+    override = int(envs.SGLANG_SWA_HICACHE_STATE_STAGING_PAGES.get())
+    if override == 0:
+        return legacy
+    if override > 0:
+        return override
+    windows = _state_staging_windows(
+        inflight_tokens=inflight_tokens, page_size=page_size, stride=stride
+    )
+    return min(legacy, max(_STATE_STAGING_MIN_PAGES, max(1, concurrent) * windows))
+
+
+def _dsv4_coupled_state_page_bytes(kvcache, global_layers) -> int:
+    """Per-page bytes across the c4 and c4-indexer state pools together, matching
+    the item_bytes _dsv4_unified_state_paged_pool derives per layer."""
+    if not global_layers:
+        return 0
+    ring_size = kvcache.compress_state_pools[global_layers[0]].ring_size
+    total = 0
+    for pools in (kvcache.compress_state_pools, kvcache.indexer_compress_state_pools):
+        buf = pools[global_layers[0]].kv_score_buffer.kv_score
+        total += ring_size * buf.shape[-1] * buf.element_size() * len(global_layers)
+    return total
 
 
 def _swa_host_hard_limit_gb(server_args) -> tuple[float, float | None, int | None]:
@@ -593,61 +707,90 @@ def _check_swa_host_pool_upper_bound(
     page_bytes: int,
     avail_gb: float | None = None,
     ranks_per_node: int | None = None,
+    state_gb: float = 0.0,
 ) -> None:
     """Startup budget guard for the strict SWA offload host pool. The pool is pinned
     host memory. Two tiers, never clamps:
-      * swa_gb in [slow_gb, hard_gb): warn and proceed. A large but feasible pin,
+      * total in [slow_gb, hard_gb): warn and proceed. A large but feasible pin,
         surfaced so slow page-locking is not mistaken for a hang.
-      * swa_gb >= hard_gb: raise ValueError. hard_gb is DRAM-derived, so crossing
+      * total >= hard_gb: raise ValueError. hard_gb is DRAM-derived, so crossing
         it means the pool (summed across ranks on the node) would exhaust host
         DRAM. Fail fast with a breakdown and the one knob that shrinks it: a
         larger --hicache-swa-offload-page-stride.
 
-    Scope is the SWA host pool only; the FP4 c4/c128 host pools are out of scope.
+    ``total`` is SWA plus ``state_gb``, the coupled c4/indexer pools whose durable
+    rows the SWA page count forces one-for-one. Weighing SWA alone understates the
+    pin ~2.5x (stride 2: 110 GB SWA, 275 GB for the three), so a config could clear
+    the ceiling and still die hours into pinning. The ratio-driven FP4 mirrors
+    follow --hicache-ratio, not the SWA page count, and stay out of scope.
     """
     if not page_bytes or swa_gb <= 0:
         return
-    if swa_gb >= hard_gb:
+    total_gb = swa_gb + max(0.0, state_gb)
+    if total_gb >= hard_gb:
         dram_detail = ""
         if avail_gb is not None and ranks_per_node is not None:
             dram_detail = (
-                f" With {ranks_per_node} rank(s)/node each pinning this pool, "
-                f"that is ~{swa_gb * ranks_per_node:.0f} GB of host DRAM against "
+                f" With {ranks_per_node} rank(s)/node each pinning these pools, "
+                f"that is ~{total_gb * ranks_per_node:.0f} GB of host DRAM against "
                 f"{avail_gb:.0f} GB available "
                 f"(hard limit = {_SWA_HICACHE_HARD_LIMIT_DRAM_FRACTION:.0%} of "
                 f"available / rank = {hard_gb:.1f} GB/rank)."
             )
         raise ValueError(
-            f"[SWA-HiCache] SWA offload host pool would need {swa_gb:.1f} GB/rank "
-            f"(>= hard limit {hard_gb:.1f} GB/rank): full_host_pages={full_host_pages}, "
+            f"[SWA-HiCache] strict SWA host pools would need {total_gb:.1f} GB/rank "
+            f"(>= hard limit {hard_gb:.1f} GB/rank): SWA {swa_gb:.1f} GB + coupled "
+            f"c4/indexer state {state_gb:.1f} GB, full_host_pages={full_host_pages}, "
             f"stride={stride}, page_bytes={page_bytes}.{dram_detail} Pinning this "
             f"much host memory would exhaust host DRAM (OOM), not merely slow "
-            f"launch. Raise --hicache-swa-offload-page-stride to shrink this pool "
-            f"~linearly (the only knob that shrinks it); or disable strict reuse "
+            f"launch. Raise --hicache-swa-offload-page-stride to shrink these pools "
+            f"~linearly (the only knob that shrinks them); or disable strict reuse "
             f"entirely (SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE=0)."
         )
-    if swa_gb >= slow_gb:
+    if total_gb >= slow_gb:
         logger.warning(
-            "[SWA-HiCache] SWA host pool is %.1f GB/rank (>%.0f GB); host "
-            "pinning (cudaHostRegister) may slow server launch. Raise "
-            "--hicache-swa-offload-page-stride to shrink it, or use best-effort "
+            "[SWA-HiCache] strict SWA host pools are %.1f GB/rank (SWA %.1f + "
+            "coupled c4/indexer state %.1f, >%.0f GB); host pinning "
+            "(cudaHostRegister) may slow server launch. Raise "
+            "--hicache-swa-offload-page-stride to shrink them, or use best-effort "
             "(SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE=0).",
+            total_gb,
             swa_gb,
+            state_gb,
             slow_gb,
         )
 
 
-def _swa_host_num_pages(*, server_args, full_host_pages, device_ring_pages, page_bytes):
+def _swa_host_num_pages(
+    *,
+    server_args,
+    full_host_pages,
+    device_ring_pages,
+    page_bytes,
+    state_page_bytes: int = 0,
+    token_page_size: int = _STATE_STAGING_DEFAULT_PAGE_SIZE,
+):
     """SWA-ring host pool size in pages: one SWA window every ``stride`` full
     pages, plus one tail window per in-flight request (bounded by the device
     ring), floored at the device ring. _check_swa_host_pool_upper_bound warns
     above _SWA_HICACHE_SLOW_LAUNCH_GB and fails fast above the DRAM-derived hard
-    ceiling; it never clamps."""
+    ceiling; it never clamps. ``state_page_bytes`` covers the coupled c4/indexer
+    pools, whose row count derives from the page count returned here;
+    ``token_page_size`` is the resolved tree page size their staging is sized
+    from, and has to be the value the pool build passes too."""
     stride = max(1, int(getattr(server_args, "hicache_swa_offload_page_stride", 1)))
     strided = -(-full_host_pages // stride)  # ceil(full_host_pages / stride)
     tail_pages = device_ring_pages  # <= max in-flight tail windows
     pages = max(1, device_ring_pages, strided + tail_pages)
     gb = pages * page_bytes / 1e9
+    state_rows = 0
+    if state_page_bytes:
+        state_rows = (
+            pages
+            + _state_staging_plan(
+                pages, server_args=server_args, page_size=token_page_size
+            ).pages
+        )
     hard_gb, avail_gb, ranks_per_node = _swa_host_hard_limit_gb(server_args)
     _check_swa_host_pool_upper_bound(
         swa_gb=gb,
@@ -658,6 +801,7 @@ def _swa_host_num_pages(*, server_args, full_host_pages, device_ring_pages, page
         page_bytes=page_bytes,
         avail_gb=avail_gb,
         ranks_per_node=ranks_per_node,
+        state_gb=state_rows * state_page_bytes / 1e9,
     )
     return pages
 
@@ -846,11 +990,18 @@ def build_deepseek_v4_hicache_stack(
         # Page unit = one sliding window; the ring holds exactly num_slots windows.
         swa_ring_size = kvcache.unified_swa_ring_size
         device_ring_pages = kvcache.unified_kv_pool.swa_pages // swa_ring_size
+        # the state pools below are pinned in the same launch and sized off this
+        # page count, so the guard has to weigh them too
+        _state_page_bytes = _dsv4_coupled_state_page_bytes(
+            kvcache, c4_state_global_layers
+        )
         unified_swa_host_pages = _swa_host_num_pages(
             server_args=server_args,
             full_host_pages=num_host_pages,
             device_ring_pages=device_ring_pages,
             page_bytes=page_bytes,
+            state_page_bytes=_state_page_bytes,
+            token_page_size=page_size,
         )
         logger.info(
             "[SWA-HiCache] SWA host pool: %d pages (%.2f GB), full_host_pages=%d, "
@@ -905,14 +1056,14 @@ def build_deepseek_v4_hicache_stack(
             _ring_size = kvcache.compress_state_pools[
                 c4_state_global_layers[0]
             ].ring_size
-            # Staging slack holds the transient landing rows for in-flight (rid, B)
-            # tiles not yet promoted to their window's durable row. State capture
-            # stages a tile at exactly the strided SWA window boundaries (see
-            # capture_c4_state_windows_unified), so in-flight tiles track the
-            # already-strided durable window budget; 1.5x gives concurrency headroom
-            # and each page is tiny (ring_size * slot_bytes * layers). Running out
-            # only excludes that boundary from reuse, never causes a dirty read.
-            _staging_slack = (unified_swa_host_pages * 3 + 1) // 2
+            # transient landing rows for in-flight (rid, B) tiles not yet promoted
+            # to their window's durable row; sizing rationale in the helper
+            _staging = _state_staging_plan(
+                unified_swa_host_pages,
+                server_args=server_args,
+                page_size=page_size,
+            )
+            _staging_slack = _staging.pages
             kvcache._c4_state_host_pool = _dsv4_unified_state_paged_pool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
                 state_pools=kvcache.compress_state_pools,
@@ -963,12 +1114,18 @@ def build_deepseek_v4_hicache_stack(
                 _hp.page_size = swa_ring_size
             logger.info(
                 "[SWA-HiCache] c4 state riding wired: %d c4 layers, ring_size=%d, "
-                "%d durable + %d staging host pages/pool (independent L3 pool, "
-                "key-coupled to SWA).",
+                "%d durable + %d staging host pages/pool, %.2f GB across both "
+                "pools (staging %s, for ISL %d at page %d x stride %d, per-rank "
+                "batch 1; independent L3 pool, key-coupled to SWA).",
                 len(c4_state_global_layers),
                 _ring_size,
                 unified_swa_host_pages,
                 _staging_slack,
+                (unified_swa_host_pages + _staging_slack) * _state_page_bytes / 1e9,
+                _staging.basis,
+                _staging.inflight_tokens,
+                _staging.page_size,
+                _staging.stride,
             )
         else:
             kvcache._c4_state_host_pool = None
