@@ -36,6 +36,7 @@ def _make_linker(store, *, threshold=10, num_layers=2):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.num_layers = num_layers
     linker.page_wise_load_threshold = threshold
+    linker.enable_page_wise_load = True
     linker.pools = {PoolName.KV: _Pool()}
     linker.storage = SimpleNamespace(
         store=store,
@@ -78,5 +79,57 @@ def test_page_wise_load_threshold(key_count, threshold, expected_calls):
     assert store.calls == expected_calls
     assert linker.layer_done_counter.completed == [(3, 0), (3, 1)]
     assert linker.layer_done_counter.failed == []
+
+
+def test_page_wise_load_fetches_all_pages_in_one_call():
+    class _Store:
+        def __init__(self):
+            self.calls = []
+
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            self.calls.append(list(keys))
+            return [sum(item) for item in sizes]
+
+    store = _Store()
+    linker = _make_linker(store, threshold=1, num_layers=3)
+    keys = [f"key-{index}" for index in range(129)]
+
+    result = linker._load_page_wise(
+        4,
+        [("rid", [])],
+        {PoolName.KV: (keys, list(range(len(keys))))},
+        {PoolName.KV: ["rid"] * len(keys)},
+    )
+
+    assert result == {"rid": True}
+    assert [len(call) for call in store.calls] == [129]
+    assert linker.layer_done_counter.completed == [(4, 0), (4, 1), (4, 2)]
+
+
+def test_page_wise_scalar_error_is_attributed_without_escaping(caplog):
+    class _Store:
+        def batch_get_session_start(self, keys):
+            return [0] * len(keys)
+
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            return 707
+
+        def batch_get_session_end(self, keys):
+            return None
+
+    linker = _make_linker(_Store(), threshold=1)
+    transfer = SimpleNamespace(
+        name=PoolName.KV,
+        keys=["page-a"],
+        host_indices=[0],
+    )
+
+    # Worker-facing load failures are captured by load_layer_wise and published
+    # through the layer counter instead of escaping the background thread.
+    linker.load_layer_wise(5, [("rid", [transfer])])
+
+    assert linker.layer_done_counter.failed
+    assert "'rid': 'rid'" in caplog.text
+    assert "707" in caplog.text
 
 

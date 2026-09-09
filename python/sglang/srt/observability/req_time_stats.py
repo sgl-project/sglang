@@ -391,7 +391,11 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     response_sent_to_client_time: float = 0.0
 
     def __getstate__(self) -> object:
-        state = {}
+        state = {
+            # Needed by the scheduler's request-level TTFT breakdown.
+            "created_time": self.created_time,
+            "tokenize_finish_time": self.tokenize_finish_time,
+        }
         # send to DP controller or Scheduler
         # If necessary, can propagate the timestamp here, for example:
         # state = {
@@ -545,6 +549,7 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
 class DPControllerReqTimeStats(ReqTimeStatsBase):
     # propagated from tokenizer/grpc_server, get by time.perf_counter()
     created_time: float = 0.0
+    tokenize_finish_time: float = 0.0
     api_server_dispatch_time: float = 0.0
 
     # new timestamp, get by time.perf_counter()
@@ -552,7 +557,10 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
     dpc_dispatch_finish_time: float = 0.0
 
     def __getstate__(self) -> object:
-        state = {}
+        state = {
+            "created_time": self.created_time,
+            "tokenize_finish_time": self.tokenize_finish_time,
+        }
         # send to Scheduler
         # If necessary, can propagate the timestamp here, for example:
         # state = {
@@ -600,6 +608,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # Placeholder: not used currently
     # propagated from tokenizer/grpc_server or dp controller
     created_time: float = 0.0
+    tokenize_finish_time: float = 0.0
     api_server_dispatch_time: float = 0.0
     dpc_dispatch_time: float = 0.0
 
@@ -608,6 +617,22 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     forward_entry_time: float = 0.0
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
+
+    # Direct external-linker load (L3 -> L1). Preparation runs while a request
+    # is admitted; the actual transfer can overlap the model forward.
+    direct_load_prepare_start_time: float = 0.0
+    direct_load_prepare_finish_time: float = 0.0
+    direct_load_start_time: float = 0.0
+    direct_load_finish_time: float = 0.0
+    direct_lookup_duration: float = 0.0
+    direct_lookup_count: int = 0
+
+    # Why this request remained in the scheduler waiting queue. Durations are
+    # accumulated between reason transitions; checks count scheduler passes.
+    queue_wait_reason: str = ""
+    queue_wait_reason_start_time: float = 0.0
+    queue_reason_durations: Dict[str, float] = field(default_factory=dict)
+    queue_reason_checks: Dict[str, int] = field(default_factory=dict)
 
     # prefill node, get by time.perf_counter()
     prefill_bootstrap_queue_entry_time: float = 0.0
@@ -652,6 +677,16 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "direct_load_prepare_start_time": self.direct_load_prepare_start_time,
+            "direct_load_prepare_finish_time": self.direct_load_prepare_finish_time,
+            "direct_load_start_time": self.direct_load_start_time,
+            "direct_load_finish_time": self.direct_load_finish_time,
+            "direct_lookup_duration": self.direct_lookup_duration,
+            "direct_lookup_count": self.direct_lookup_count,
+            "queue_wait_reason": self.queue_wait_reason,
+            "queue_wait_reason_start_time": self.queue_wait_reason_start_time,
+            "queue_reason_durations": dict(self.queue_reason_durations),
+            "queue_reason_checks": dict(self.queue_reason_checks),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -660,6 +695,51 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         calibrate_time_diff()
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
+
+    def set_direct_load_prepare_start_time(self, ts=None):
+        self.has_timing_data = True
+        self.direct_load_prepare_start_time = ts or time.perf_counter()
+
+    def set_direct_load_prepare_finish_time(self, ts=None):
+        self.has_timing_data = True
+        self.direct_load_prepare_finish_time = ts or time.perf_counter()
+
+    def set_direct_load_start_time(self, ts=None):
+        self.has_timing_data = True
+        self.direct_load_start_time = ts or time.perf_counter()
+
+    def set_direct_load_finish_time(self, ts=None):
+        self.has_timing_data = True
+        self.direct_load_finish_time = ts or time.perf_counter()
+
+    def add_direct_lookup_duration(self, duration: float):
+        self.has_timing_data = True
+        self.direct_lookup_duration += max(0.0, duration)
+        self.direct_lookup_count += 1
+
+    def set_queue_wait_reason(self, reason: str, ts=None):
+        """Attribute queue residence time to the latest admission blocker."""
+        ts = ts or time.perf_counter()
+        self.queue_reason_checks[reason] = self.queue_reason_checks.get(reason, 0) + 1
+        if reason == self.queue_wait_reason:
+            return
+        if self.queue_wait_reason and self.queue_wait_reason_start_time > 0.0:
+            elapsed = max(0.0, ts - self.queue_wait_reason_start_time)
+            self.queue_reason_durations[self.queue_wait_reason] = (
+                self.queue_reason_durations.get(self.queue_wait_reason, 0.0) + elapsed
+            )
+        self.queue_wait_reason = reason
+        self.queue_wait_reason_start_time = ts
+
+    def finish_queue_wait_reason(self, ts=None):
+        ts = ts or time.perf_counter()
+        if self.queue_wait_reason and self.queue_wait_reason_start_time > 0.0:
+            elapsed = max(0.0, ts - self.queue_wait_reason_start_time)
+            self.queue_reason_durations[self.queue_wait_reason] = (
+                self.queue_reason_durations.get(self.queue_wait_reason, 0.0) + elapsed
+            )
+        self.queue_wait_reason = ""
+        self.queue_wait_reason_start_time = 0.0
 
     def set_spec_draft_start_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -731,12 +811,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.completion_time = 0.0
         self.prefill_transfer_queue_entry_time = 0.0
         self.prefill_kv_transfer_finish_time = 0.0
+        self.direct_lookup_duration = 0.0
+        self.direct_lookup_count = 0
+        self.queue_wait_reason = ""
+        self.queue_wait_reason_start_time = 0.0
+        self.queue_reason_durations.clear()
+        self.queue_reason_checks.clear()
         self.last_forward_entry_time = 0.0
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
+        first_entry = self.wait_queue_entry_time == 0.0
         if self.wait_queue_entry_time == 0.0:
             if self.enable_metrics or self.trace_ctx.tracing_enable:
                 if self.disagg_mode == DisaggregationMode.PREFILL:
@@ -755,9 +842,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             self.set_retract_time(ts)
 
         self.wait_queue_entry_time = ts
+        self.set_queue_wait_reason(
+            "awaiting_scheduler_check" if first_entry else "retracted", ts
+        )
 
     def set_forward_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
+        self.finish_queue_wait_reason(ts)
         if self.forward_entry_time == 0.0:
             self.forward_entry_time = ts
             self.last_forward_entry_time = ts
@@ -1049,6 +1140,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
+            token_preprocess_duration = self.duration_between(
+                self.created_time, self.tokenize_finish_time
+            )
+            request_dispatch_duration = self.duration_between(
+                self.tokenize_finish_time, self.wait_queue_entry_time
+            )
             queue_duration = self.duration_between(
                 self.wait_queue_entry_time, self.forward_entry_time
             )
@@ -1061,7 +1158,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
                 )
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
+            return (
+                "token_preprocess_duration="
+                f"{self.format_duration(token_preprocess_duration)}, "
+                "request_dispatch_duration="
+                f"{self.format_duration(request_dispatch_duration)}, "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"{self._queue_breakdown_fields()}"
+                f"{self._direct_lookup_duration_fields()}"
+                f"{self._direct_load_duration_fields()}"
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
+            )
         elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_queue_duration = self.duration_between(
                 self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
@@ -1169,7 +1277,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             return "Unknown Time Stats"
 
     def convert_to_output_meta_info(self):
-        meta_data = {}
+        meta_data = {
+            "token_preprocess_time": self.duration_between(
+                self.created_time, self.tokenize_finish_time
+            ),
+            "request_dispatch_time": self.duration_between(
+                self.tokenize_finish_time, self.wait_queue_entry_time
+            ),
+        }
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time
@@ -1181,9 +1296,76 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         meta_data.update(
             {
                 "queue_time": self.get_queueing_time(),
+                "queue_reason_durations": dict(self.queue_reason_durations),
+                "queue_reason_checks": dict(self.queue_reason_checks),
+                "direct_lookup_time": self.direct_lookup_duration,
+                "direct_lookup_count": self.direct_lookup_count,
             }
         )
+        if self.direct_load_prepare_start_time > 0.0:
+            meta_data["direct_load_prepare_time"] = self.duration_between(
+                self.direct_load_prepare_start_time,
+                self.direct_load_prepare_finish_time,
+            )
+        if self.direct_load_start_time > 0.0:
+            meta_data["direct_load_time"] = self.duration_between(
+                self.direct_load_start_time,
+                self.direct_load_finish_time,
+            )
+            meta_data["prefill_inference_time"] = self.duration_between(
+                self.forward_entry_time,
+                self.prefill_finished_time,
+            )
         return meta_data
+
+    def _queue_breakdown_fields(self) -> str:
+        if not self.queue_reason_durations:
+            return ""
+        parts = []
+        for reason, duration in sorted(
+            self.queue_reason_durations.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            checks = self.queue_reason_checks.get(reason, 0)
+            parts.append(f"{reason}={self.format_duration(duration)}/checks={checks}")
+        return f"queue_breakdown=[{', '.join(parts)}], "
+
+    def _direct_load_duration_fields(self) -> str:
+        if self.direct_load_prepare_start_time <= 0.0:
+            return ""
+        prepare_duration = self.duration_between(
+            self.direct_load_prepare_start_time,
+            self.direct_load_prepare_finish_time,
+        )
+        load_duration = self.duration_between(
+            self.direct_load_start_time,
+            self.direct_load_finish_time,
+        )
+        prefill_inference_duration = self.duration_between(
+            self.forward_entry_time,
+            self.prefill_finished_time,
+        )
+        return (
+            "direct_load_prepare_duration="
+            f"{self.format_duration(prepare_duration)}, "
+            "mooncake_l3_to_l1_duration="
+            f"{self.format_duration(load_duration)}, "
+            "prefill_inference_duration="
+            f"{self.format_duration(prefill_inference_duration)}, "
+        )
+
+    def _direct_lookup_duration_fields(self) -> str:
+        if self.direct_lookup_count <= 0:
+            return ""
+        average = self.direct_lookup_duration / self.direct_lookup_count
+        return (
+            "mooncake_lookup_duration="
+            f"{self.format_duration(self.direct_lookup_duration)}, "
+            f"mooncake_lookup_count={self.direct_lookup_count}, "
+            "mooncake_lookup_avg_duration="
+            f"{self.format_duration(average)}, "
+        )
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
