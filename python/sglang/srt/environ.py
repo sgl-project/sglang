@@ -1267,6 +1267,18 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Route DFLASH tree width 1 through the tree verify path instead of the chain
+    # path it is otherwise dispatched to. The width-1 tree *is* the chain, so this
+    # is the equivalence gate for the tree wiring: same prompts, same tokens. No
+    # effect at width > 1, which always takes the tree path.
+    SGLANG_DFLASH_FORCE_TREE_VERIFY = EnvBool(False)
+    # Cap on the DFLASH draft-tree node count: the beam is still built at
+    # tree_width per depth, then pruned to the best `max_num_nodes` nodes by
+    # cumulative log-prob, and the target verifies that many. 0 = no cap, i.e.
+    # verify_width stays 1 + (block_size - 1) * tree_width. Must be >= block_size
+    # (the spine is what the draft forward writes) and <= 256 (the prune kernel
+    # ranks all nodes in registers).
+    SGLANG_DFLASH_MAX_NUM_NODES = EnvInt(0)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).

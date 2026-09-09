@@ -282,6 +282,9 @@ class SpeculativeAlgorithm(Enum):
         # Here, we expose this interface to allow the other use cases.
         if self.is_dspark() and is_draft_worker:
             return num_draft_tokens - 1
+        if self.is_dflash() and is_draft_worker:
+            # Draft forward width stays block_size; verify width may be larger.
+            return int(get_spec_config().speculative_dflash_block_size)
         return num_draft_tokens
 
     def get_num_tokens_per_bs_for_target_verify(
@@ -487,6 +490,9 @@ def create_dummy_verify_input(
             draft_token=None,
             positions=None,
             draft_token_num=spec.speculative_num_draft_tokens,
+            # Match live topk so graph capture selects the same verify kernel.
+            topk=spec.speculative_eagle_topk or 1,
+            block_size=spec.speculative_dflash_block_size,
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL

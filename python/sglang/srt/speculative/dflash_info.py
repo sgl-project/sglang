@@ -34,12 +34,17 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
-    # DFLASH verify is linear (non-tree), so this is always 1.
-    topk: int = 1
+    # 1 is a chain; values greater than 1 select tree verification. DSPARK passes 1.
+    topk: int
+    # Longest root-to-leaf chain, used to size accept bookkeeping.
+    block_size: Optional[int] = None
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
+    # Left-child/right-sibling links and flat node indices for tree verification.
+    retrieve_index: Optional[torch.Tensor] = None
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
@@ -55,6 +60,28 @@ class DFlashVerifyInput(SpecInput):
         if self.num_tokens_per_req == -1:
             self.num_tokens_per_req = int(self.draft_token_num)
         self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
+        if self.block_size is None:
+            if self.topk > 1:
+                raise ValueError(
+                    "DFlashVerifyInput with topk > 1 must pass block_size: the verify width "
+                    "1 + (block_size - 1) * topk no longer equals the longest root-to-leaf "
+                    f"chain, so accept_index cannot be sized from draft_token_num. Got "
+                    f"topk={self.topk}, draft_token_num={self.draft_token_num}."
+                )
+            self.block_size = int(self.draft_token_num)
+
+    @property
+    def max_tree_depth(self) -> int:
+        # Longest root-to-leaf chain, NOT the node count: a fixed-width beam over the
+        # selector lattice keeps W nodes per depth but every path is still block_size long.
+        return int(self.block_size)
+
+    @property
+    def tree_topk(self) -> int:
+        # Per-parent fanout. The beam picks its W nodes per depth globally across parents, so
+        # a parent can end up with anywhere from 0 to W children: irregular, hence -1. topk
+        # == 1 keeps reporting 1 so the chain path's callers see today's value.
+        return -1 if self.topk > 1 else int(self.topk)
 
     def prepare_for_verify(
         self,

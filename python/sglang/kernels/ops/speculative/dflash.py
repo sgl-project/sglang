@@ -258,8 +258,7 @@ def _selector_walk_kernel(
     slots: tl.constexpr,
     top_k: tl.constexpr,
 ):
-    """One program per request: a slot's K scores stay in registers and the walk is a
-    loop, so the slot-to-slot dependency costs nothing instead of one kernel each."""
+    """Walk one request's candidate slots in a single program."""
     row = tl.program_id(0)
     offsets = tl.arange(0, top_k)
     temperature = tl.load(temperatures_ptr + row)
@@ -314,3 +313,316 @@ def selector_walk_triton(
         num_warps=1,
     )
     return tokens, q_rows
+
+
+@triton.jit
+def _lane(vector, lanes, index):
+    """Read one lane from a register-resident beam vector."""
+    return tl.sum(tl.where(lanes == index, vector, vector * 0), axis=0)
+
+
+@triton.jit
+def _beam_first_max(tile, flat_index, limit):
+    """Return the first maximum using beam-major flattened indices."""
+    best = tl.max(tl.max(tile, axis=1), axis=0)
+    picked = tl.min(tl.min(tl.where(tile == best, flat_index, limit), axis=1), axis=0)
+    return best, picked
+
+
+@triton.jit
+def _selector_beam_walk_kernel(
+    scores_ptr,
+    candidate_ptr,
+    anchor_ptr,
+    tokens_ptr,
+    parents_ptr,
+    cums_ptr,
+    slots: tl.constexpr,
+    top_k: tl.constexpr,
+    width: tl.constexpr,
+    WIDTH: tl.constexpr,
+):
+    """Build a BFS-ordered beam tree and store cumulative scores."""
+    row = tl.program_id(0)
+    lanes = tl.arange(0, WIDTH)
+    successors = tl.arange(0, top_k)
+    flat_index = lanes[:, None] * top_k + successors[None, :]
+    limit: tl.constexpr = WIDTH * top_k
+    nodes: tl.constexpr = 1 + slots * width
+    neg_inf = float("-inf")
+    live = lanes < width
+
+    tl.store(tokens_ptr + row * nodes, tl.load(anchor_ptr + row))
+    tl.store(parents_ptr + row * nodes, -1)
+    tl.store(cums_ptr + row * nodes, 0.0)
+
+    state = tl.zeros((WIDTH,), dtype=tl.int32)
+    node = tl.zeros((WIDTH,), dtype=tl.int32)
+    cum = tl.where(lanes == 0, 0.0, neg_inf)
+
+    for slot in range(slots):
+        base = 1 + slot * width
+        candidate_row = candidate_ptr + (row * slots + slot) * top_k
+        rows_base = ((row * slots + slot) * top_k + state[:, None]) * top_k
+        transitions = tl.load(
+            scores_ptr + rows_base + successors[None, :],
+            mask=live[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        shifted = transitions - tl.max(transitions, axis=1)[:, None]
+        log_probs = shifted - tl.log(tl.sum(tl.exp(shifted), axis=1))[:, None]
+        scored = tl.where(live[:, None], cum[:, None] + log_probs, neg_inf)
+
+        # Keep beam 0 on the greedy spine so width 1 remains the chain.
+        spine_value, spine = _beam_first_max(
+            tl.where(lanes[:, None] == 0, scored, neg_inf), flat_index, limit
+        )
+        tl.store(
+            tokens_ptr + row * nodes + base,
+            tl.load(candidate_row + spine),
+        )
+        tl.store(parents_ptr + row * nodes + base, _lane(node, lanes, 0))
+        tl.store(cums_ptr + row * nodes + base, spine_value)
+        next_state = tl.where(lanes == 0, spine.to(tl.int32), 0)
+        next_node = tl.where(lanes == 0, base, 0)
+        next_cum = tl.where(lanes == 0, spine_value, neg_inf)
+
+        # Remove each pick so sibling pairs remain distinct.
+        remaining = tl.where(flat_index == spine, neg_inf, scored)
+        for beam in range(1, width):
+            value, picked = _beam_first_max(remaining, flat_index, limit)
+            picked_beam = picked // top_k
+            picked_candidate = picked % top_k
+            tl.store(
+                tokens_ptr + row * nodes + base + beam,
+                tl.load(candidate_row + picked_candidate),
+            )
+            # BFS numbering keeps every parent before its children.
+            tl.store(
+                parents_ptr + row * nodes + base + beam,
+                _lane(node, lanes, picked_beam),
+            )
+            tl.store(cums_ptr + row * nodes + base + beam, value)
+            next_state = tl.where(
+                lanes == beam, picked_candidate.to(tl.int32), next_state
+            )
+            next_node = tl.where(lanes == beam, base + beam, next_node)
+            next_cum = tl.where(lanes == beam, value, next_cum)
+            remaining = tl.where(flat_index == picked, neg_inf, remaining)
+
+        state = next_state
+        node = next_node
+        cum = next_cum
+
+
+@triton.jit
+def _dflash_tree_prune_by_cum_kernel(
+    tokens_ptr,
+    parents_ptr,
+    cums_ptr,
+    out_tokens_ptr,
+    out_parents_ptr,
+    num_nodes: tl.constexpr,
+    max_num_nodes: tl.constexpr,
+    NODES: tl.constexpr,
+):
+    """Keep the anchor and top cumulative-score nodes, preserving BFS order.
+
+    The kernel operates on the built tree without a sort or scratch buffer.
+
+    Ranking counts better rivals, renumbering is order-preserving, and parent remapping
+    uses a register reduction. Cumulative log-probability keeps every kept node's
+    ancestors in the selection.
+
+    NaNs are normalized to `-inf` and stores are masked to keep the output in bounds.
+    """
+    row = tl.program_id(0)
+    idx = tl.arange(0, NODES)
+    valid = idx < num_nodes
+    cum = tl.load(cums_ptr + row * num_nodes + idx, mask=valid, other=float("-inf"))
+    cum = tl.where(cum != cum, float("-inf"), cum)
+
+    rival = valid & (idx > 0)
+    better = (cum[None, :] > cum[:, None]) | (
+        (cum[None, :] == cum[:, None]) & (idx[None, :] < idx[:, None])
+    )
+    rank = tl.sum((better & rival[None, :]).to(tl.int32), axis=1)
+    keep = (idx == 0) | (rival & (rank < max_num_nodes - 1))
+    new = tl.cumsum(keep.to(tl.int32), axis=0) - 1
+
+    tokens = tl.load(tokens_ptr + row * num_nodes + idx, mask=valid, other=0)
+    parents = tl.load(parents_ptr + row * num_nodes + idx, mask=valid, other=0)
+    new_parent = tl.sum(
+        tl.where(parents[:, None] == idx[None, :], new[None, :], 0), axis=1
+    )
+    stored = keep & (new < max_num_nodes)
+    tl.store(out_tokens_ptr + row * max_num_nodes + new, tokens, mask=stored)
+    tl.store(
+        out_parents_ptr + row * max_num_nodes + new,
+        tl.where(idx == 0, -1, new_parent),
+        mask=stored,
+    )
+
+
+_MAX_PRUNE_NODES = 256
+
+
+def _validate_max_num_nodes(*, max_num_nodes, num_nodes: int) -> None:
+    """Validate the optional prune cap for both implementations."""
+    if max_num_nodes is None:
+        return
+    cap = int(max_num_nodes)
+    if cap < 1:
+        raise ValueError(f"DFLASH tree prune needs max_num_nodes >= 1, got {cap}.")
+    if cap > num_nodes:
+        raise ValueError(
+            f"DFLASH tree prune max_num_nodes {cap} exceeds the {num_nodes} nodes the "
+            "beam walk builds: pruning only removes nodes, so it cannot reach a "
+            "larger tree. Raise beam_width instead."
+        )
+    if cap == num_nodes:
+        return
+    if num_nodes > _MAX_PRUNE_NODES:
+        raise ValueError(
+            f"DFLASH tree prune ranks {num_nodes} built nodes with an N x N tile, "
+            f"above the {_MAX_PRUNE_NODES} limit. Lower beam_width or block_size."
+        )
+
+
+def selector_beam_walk_triton(
+    *,
+    candidate_ids,
+    scores,
+    anchor_token_ids,
+    beam_width,
+    max_num_nodes=None,
+):
+    batch, slots, top_k = candidate_ids.shape
+    width = int(beam_width)
+    if width < 1:
+        raise ValueError(f"DFLASH beam walk needs beam_width >= 1, got {width}.")
+    if width > top_k:
+        raise ValueError(
+            f"DFLASH beam walk beam_width {width} exceeds top_k {top_k}: the first "
+            "depth only has top_k candidates, so a wider beam cannot be filled."
+        )
+    num_nodes = 1 + slots * width
+    _validate_max_num_nodes(max_num_nodes=max_num_nodes, num_nodes=num_nodes)
+    tokens = torch.empty((batch, num_nodes), dtype=torch.int64, device=scores.device)
+    parents = torch.empty((batch, num_nodes), dtype=torch.int64, device=scores.device)
+    cums = torch.empty((batch, num_nodes), dtype=torch.float32, device=scores.device)
+    padded = triton.next_power_of_2(width)
+    _selector_beam_walk_kernel[(batch,)](
+        scores.contiguous(),
+        candidate_ids.contiguous(),
+        anchor_token_ids.contiguous(),
+        tokens,
+        parents,
+        cums,
+        slots=slots,
+        top_k=top_k,
+        width=width,
+        WIDTH=padded,
+        num_warps=1,
+    )
+    if max_num_nodes is None or num_nodes <= int(max_num_nodes):
+        return tokens, parents
+
+    cap = int(max_num_nodes)
+    out_tokens = torch.empty((batch, cap), dtype=torch.int64, device=scores.device)
+    out_parents = torch.empty((batch, cap), dtype=torch.int64, device=scores.device)
+    _dflash_tree_prune_by_cum_kernel[(batch,)](
+        tokens,
+        parents,
+        cums,
+        out_tokens,
+        out_parents,
+        num_nodes=num_nodes,
+        max_num_nodes=cap,
+        NODES=triton.next_power_of_2(num_nodes),
+        # The rank and parent-remap tiles are NODES x NODES, so unlike the walk this
+        # one wants threads rather than registers.
+        num_warps=4,
+    )
+    return out_tokens, out_parents
+
+
+@triton.jit
+def _dflash_tree_full_mask_kernel(
+    ancestor_ptr,
+    mask_indptr_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    nodes,
+    PREFIX_BLOCK: tl.constexpr,
+    NODES: tl.constexpr,
+):
+    """One program per (request, node): writes that node's whole attention row.
+
+    Row layout is `seq_len` prefix cells (a draft node sees the entire committed
+    prefix) followed by the node's `nodes`-wide ancestor closure. The prefix span
+    is why this cannot be a fixed-shape store: it is read from device memory, so
+    the host never learns the committed length.
+    """
+    request = tl.program_id(0)
+    node = tl.program_id(1)
+    prefix = tl.load(seq_lens_ptr + request).to(tl.int64)
+    base = tl.load(mask_indptr_ptr + request).to(tl.int64) + node * (prefix + nodes)
+
+    allow = tl.full((PREFIX_BLOCK,), 1, dtype=out_ptr.dtype.element_ty)
+    for start in range(0, prefix, PREFIX_BLOCK):
+        cols = start + tl.arange(0, PREFIX_BLOCK)
+        tl.store(out_ptr + base + cols, allow, mask=cols < prefix)
+
+    lanes = tl.arange(0, NODES)
+    lane_mask = lanes < nodes
+    closure = tl.load(
+        ancestor_ptr + (request * nodes + node) * nodes + lanes,
+        mask=lane_mask,
+        other=0,
+    )
+    tl.store(
+        out_ptr + base + prefix + lanes,
+        closure.to(out_ptr.dtype.element_ty),
+        mask=lane_mask,
+    )
+
+
+def write_dflash_tree_full_mask(
+    *,
+    ancestor_mask: torch.Tensor,
+    mask_indptr: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Write the flat FULL_MASK for a DFLASH beam tree into `out`, in place.
+
+    `out` is normally the attention backend's own verify-mask buffer, so verify
+    reads the mask where the kernel left it and nothing is copied. `mask_indptr`
+    must come from `fill_verify_mask_indptr` -- the writer and the reader share
+    that one formula on purpose.
+
+    Every cell of every live row is written, prefix included: the buffer is reused
+    across steps and a request's rows move as its prefix grows, so last step's
+    closure bits land inside this step's prefix span. Returns `out` for the caller
+    to hand to `custom_mask`.
+    """
+    batch, nodes, nodes_again = ancestor_mask.shape
+    if nodes != nodes_again:
+        raise ValueError(
+            f"ancestor_mask must be [bs, N, N], got {tuple(ancestor_mask.shape)}."
+        )
+    if mask_indptr.shape[0] < batch:
+        raise ValueError(
+            f"mask_indptr holds {mask_indptr.shape[0]} entries for {batch} requests."
+        )
+    _dflash_tree_full_mask_kernel[(batch, nodes)](
+        ancestor_mask.contiguous(),
+        mask_indptr,
+        seq_lens,
+        out,
+        nodes=nodes,
+        PREFIX_BLOCK=1024,
+        NODES=triton.next_power_of_2(nodes),
+    )
+    return out

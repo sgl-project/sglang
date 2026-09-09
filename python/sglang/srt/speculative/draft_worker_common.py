@@ -130,6 +130,8 @@ def make_draft_block_spec_info(
         draft_token=torch.empty((0,), dtype=torch.long, device=device),
         positions=torch.empty((0,), dtype=torch.int64, device=device),
         draft_token_num=int(draft_token_num),
+        # Draft forward remains a block-wide chain.
+        topk=1,
         custom_mask=None,
         capture_hidden_mode=CaptureHiddenMode.NULL,
     )

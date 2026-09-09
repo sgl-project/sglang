@@ -26,6 +26,31 @@ def tree_mask_numel(
     return bs * per_req
 
 
+def fill_verify_mask_indptr(
+    *,
+    mask_indptr: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int,
+    bs: int,
+) -> torch.Tensor:
+    """Flat FULL_MASK start offset of each request, into ``mask_indptr[: bs + 1]``.
+
+    Each request owns ``num_draft_tokens`` rows of ``seq_len + num_draft_tokens``
+    cells. Whoever *writes* the mask and whoever *reads* it must agree cell for cell,
+    and a formula duplicated at the two ends is the bug that produces wrong tokens
+    rather than a crash -- so producers and the triton/flashinfer readers share this.
+    (``FlashAttentionBackend`` still derives its own equivalent from
+    ``speculative_num_draft_tokens``; it does not consume ``mask_indptr``.)
+
+    Stays on device -- ``seq_lens`` is the committed prefix, which the host does
+    not know without a sync. ``mask_indptr[0]`` is left alone: every caller's
+    buffer is zero-initialized and request 0 starts at 0.
+    """
+    seq_mask_len = num_draft_tokens * (seq_lens[:bs] + num_draft_tokens)
+    mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+    return mask_indptr[: bs + 1]
+
+
 class VerifyMask(msgspec.Struct, frozen=True):
     """The target-verify mask.
 

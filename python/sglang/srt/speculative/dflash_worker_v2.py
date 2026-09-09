@@ -20,6 +20,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.verify_mask import TreeMaskMode, tree_mask_numel
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -49,6 +50,13 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_tree_verify import (
+    accept_tree_greedy,
+    build_tree_verify_input,
+    commit_positions,
+    compact_hidden_to_commit_layout,
+    move_accepted_target_kv,
+)
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -56,6 +64,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    dflash_tree_verify_active,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -77,6 +86,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    verify_commit_step_indices,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -333,23 +343,38 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        if get_spec().speculative_num_draft_tokens is None:
-            # Should not happen (ServerArgs should have inferred it), but keep a fallback.
-            self.block_size = int(draft_config.resolve_block_size(default=16))
-        else:
-            self.block_size = int(get_spec().speculative_num_draft_tokens)
-            model_block_size = draft_config.block_size
-            if model_block_size is None:
-                model_block_size = getattr(self.draft_model, "block_size", None)
-            if model_block_size is not None and int(model_block_size) != int(
-                self.block_size
-            ):
-                logger.warning(
-                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
-                    self.block_size,
-                    model_block_size,
-                )
+        self.block_size = int(get_spec().speculative_dflash_block_size)
+        self.tree_width = int(get_spec().speculative_eagle_topk)
+        self.verify_width = int(get_spec().speculative_num_draft_tokens)
+        if (
+            draft_config.block_size is not None
+            and int(draft_config.block_size) != self.block_size
+        ):
+            logger.warning(
+                "DFLASH block size mismatch: using speculative_dflash_block_size=%s but draft "
+                "config block_size=%s.",
+                self.block_size,
+                draft_config.block_size,
+            )
         self.draft_model.set_block_size(self.block_size)
+        # The env override also routes width 1 through tree verification.
+        self._use_tree_verify = dflash_tree_verify_active()
+        if self._use_tree_verify and self.selector is None:
+            raise ValueError(
+                "DFLASH tree verify needs a DFlash 2 draft checkpoint with a "
+                "candidate selector: the tree is a beam over the selector's transition "
+                "lattice, and this checkpoint has none. Run with "
+                "--speculative-dflash-tree-width 1 and "
+                "without SGLANG_DFLASH_FORCE_TREE_VERIFY."
+            )
+        if self._use_tree_verify and SIMULATE_ACC_LEN > 0:
+            # Simulated acceptance uses chain-shaped bookkeeping.
+            raise ValueError(
+                "SGLANG_SIMULATE_ACC_LEN cannot be combined with DFLASH tree verify "
+                f"(got {SIMULATE_ACC_LEN}): the forced accept path is a linear chain and "
+                "cannot address tree nodes. Unset it, or run chain verify."
+            )
+        # Scheduler output remains the accepted chain plus its bonus.
         self.speculative_num_draft_tokens = int(self.block_size)
 
         self._mask_token = draft_config.mask_token
@@ -397,6 +422,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
+        # Tree verify mask scratch and fallback buffer.
+        self._tree_mask_indptr: Optional[torch.Tensor] = None  # [cap_bs + 1]
+        self._tree_mask_buf: Optional[torch.Tensor] = None
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
         )
@@ -418,9 +446,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
-        # The legacy compact-rebuild path host-syncs twice per step (masked
-        # gather's implicit nonzero D2H + lengths.max().item()); keep it only
-        # for platforms without GPU triton.
+        # Keep the host-syncing path for platforms without GPU Triton.
         self._use_triton_compact_rebuild = supports_gpu_triton
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
@@ -432,15 +458,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     @property
     def draft_worker(self):
-        # DFLASH drives the draft model through a plain TpModelWorker: the
-        # draft KV is materialized from target hidden states, so there is no
-        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
-        # Every attn backend a spec_v2 forward touches; consumed by
-        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -452,11 +473,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        # Without draft windowing, the draft worker aliases the target
-        # request->token mapping and allocation state. With draft windowing
-        # enabled, the draft worker keeps a private compact req->token table
-        # over the same global KV index space, so radix-cache/prefix-hit KV
-        # remains reusable while draft attention sees only the recent window.
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=(
@@ -493,8 +509,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     available_mem,
                 )
         if capture_decode_cuda_graph:
-            # Must run before capture so the draft graph folds the head in.
             self._draft_sampler = self._maybe_build_draft_sampler()
+            assert not (self._use_tree_verify and self._draft_sampler is not None), (
+                "DFLASH tree verify reads the selector's transition lattice, which the "
+                "folded draft head does not produce."
+            )
             if self._draft_sampler is not None:
                 self.draft_model_runner.capture_tail_hooks.append(
                     make_draft_sampler_capture_hook(self._draft_sampler)
@@ -624,6 +643,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
+        if self._use_tree_verify:
+            return _eager("tree verify")
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
@@ -663,7 +684,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
-                # No shard metadata to recover per-rank vocab offsets from.
                 return _eager("tp>1 without shard_indices")
             num_org = int(lm_head.weight.shape[0])
             org_vocab_start = 0
@@ -810,6 +830,40 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+        # Zeros, not empty: `fill_verify_mask_indptr` writes [1 : bs + 1] and relies on
+        # entry 0 already being the offset of request 0, which is always 0.
+        self._tree_mask_indptr = torch.zeros(
+            (new_cap + 1,), dtype=torch.int64, device=device
+        )
+
+    def _tree_mask_buffer(
+        self, *, bs: int, target_kv_bound: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Return a backend-owned or fallback full-mask buffer."""
+        width = int(self.verify_width)
+        model_runner = self._target_worker.model_runner
+        max_context_len = int(model_runner.model_config.context_len)
+        verify_mask = model_runner.attn_backend.verify_mask
+        if (
+            verify_mask is not None
+            and verify_mask.mode == TreeMaskMode.FULL_MASK
+            and verify_mask.fits(bs)
+            and verify_mask.buffer.numel()
+            >= tree_mask_numel(TreeMaskMode.FULL_MASK, bs, width, max_context_len)
+        ):
+            return verify_mask.buffer
+
+        need = (
+            width * bs * (max_context_len + width)
+            if target_kv_bound is None
+            else width * int((target_kv_bound[:bs] + width).sum())
+        )
+        held = 0 if self._tree_mask_buf is None else self._tree_mask_buf.numel()
+        if held < need:
+            self._tree_mask_buf = torch.empty(
+                (max(need, 2 * held),), dtype=torch.bool, device=self.device
+            )
+        return self._tree_mask_buf
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
@@ -1131,6 +1185,39 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
         return tokens.view(bs, num_pred)
+
+    def _propose_selector_tree(
+        self,
+        *,
+        draft_logits_output,
+        bs: int,
+        lm_head,
+        anchor_token_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """`(node_tokens, node_parents)`, both `[bs, verify_width]` in BFS order.
+
+        Same lattice `_propose_selector_block` builds; the beam expands it into a
+        fixed-width tree instead of collapsing it to one path. Greedy only -- the
+        beam walk carries no `q`, so there is nothing for a sampling accept to read.
+        """
+        draft_model = self.draft_model
+        if draft_model.lm_head is None:
+            draft_model.lm_head = lm_head
+
+        draft_hidden = draft_logits_output.hidden_states
+        if draft_hidden is None:
+            raise RuntimeError("DFLASH selector draft returned no hidden states.")
+        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+        candidate_ids, scores = _selector_lattice(
+            draft_model, draft_hidden[:, 1:, :], anchor_token_ids
+        )
+        return self.selector.beam_walk(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            anchor_token_ids=anchor_token_ids,
+            beam_width=self.tree_width,
+            max_num_nodes=self.verify_width,
+        )
 
     def _selector_sampling_accept(
         self,
@@ -1663,18 +1750,45 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
         commit_lens: torch.Tensor,
+        accept_index: Optional[torch.Tensor] = None,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
 
         During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
+
+        The step index is a *node* index into the verify window, which is what the
+        per-step cache is keyed by. On a chain that equals the accept length minus
+        one; on a tree it does not, so the tree branch resolves it through
+        `accept_index` (and likewise for the interval-crossing track step).
         """
         if not self._need_mamba_verify_commit:
             return
         attn_backend = self.target_worker.model_runner.attn_backend
 
+        if accept_index is not None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=commit_lens,
+                    draft_token_num=int(self.verify_width),
+                )
+            )
+            model_runner = self.target_worker.model_runner
+            if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+                attn_backend.update_mamba_state_after_mtp_verify(
+                    last_correct_step_indices=last_correct_step_indices,
+                    mamba_track_indices=batch.mamba_track_indices,
+                    mamba_steps_to_track=mamba_steps_to_track,
+                    model=model_runner.model,
+                    req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
+                )
+            return
+
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
+
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
@@ -1843,6 +1957,31 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
+        if self._use_tree_verify and not _is_all_greedy(sampling_info):
+            # Backstop for the per-request rejection in the scheduler: the accept dispatch
+            # below reaches `_selector_sampling_accept` before the greedy branch, and that
+            # path derives gamma from block_size and reads chain-shaped retrieve_* links, so
+            # on a tree it miscomputes silently instead of failing. Callers that build
+            # batches directly (tests, bench scripts) bypass request admission and land here.
+            #
+            # An already-rejected request still reaches this forward: set_finish_with_abort
+            # truncates origin_input_ids to one token to skip the long prefill rather than
+            # dropping the request, and leaves sampling_params non-greedy. Raising on it
+            # would turn a request-level 400 into SIGQUIT for the whole scheduler, so only
+            # a live non-greedy request should trigger this guard.
+            live_sampling = [
+                req
+                for req in batch.reqs
+                if req.sampling_params.top_k > 1
+                and req.to_finish is None
+                and not req.finished()
+            ]
+            if live_sampling:
+                raise ValueError(
+                    "DFLASH tree verify supports greedy sampling only, but this batch has "
+                    "non-greedy requests (top_k > 1). Serve with "
+                    "--speculative-dflash-tree-width 1 for sampling, or send temperature 0."
+                )
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 
@@ -2088,6 +2227,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
+        # The target verifies `verify_width` nodes, so it needs that many slots; the
+        # draft forward keeps writing the block-wide prefix of the same region (both
+        # come from req_to_token at [prefix, prefix + width), so the first block_size
+        # slots are the same ones the chain path would use).
+        verify_token_num = self.verify_width if self._use_tree_verify else block_size
+        tree_cache_loc_2d = None
+        if self._use_tree_verify:
+            tree_cache_loc_2d = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                start_offset=prefix_lens,
+                end_offset=prefix_lens + self.verify_width,
+                batch_size=bs,
+                draft_token_num=self.verify_width,
+                device=device,
+            ).view(bs, self.verify_width)
+
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
@@ -2155,7 +2311,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_logits_output = draft_out.logits_output
 
         folded = self._draft_sampler is not None and draft_out.can_run_graph
-        if folded:
+        if self._use_tree_verify:
+            node_tokens, node_parents = self._propose_selector_tree(
+                draft_logits_output=draft_logits_output,
+                bs=bs,
+                lm_head=lm_head,
+                anchor_token_ids=block_ids[:, 0],
+            )
+        elif folded:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -2188,29 +2351,72 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
             ).view(bs, int(self.block_size) - 1)
 
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
-
-        # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
-        )
-
         # --- 2) Target verify.
-        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
-        custom_mask = None
+        if self._use_tree_verify:
+            draft_tokens = node_tokens
+            # Committed lengths, device-side only: they become both the absolute
+            # positions and the mask's per-request row widths. Read before the
+            # verify-extended override further down.
+            verify_input = build_tree_verify_input(
+                node_tokens=node_tokens,
+                node_parents=node_parents,
+                block_size=block_size,
+                tree_width=self.tree_width,
+                prefix_lens=prefix_lens,
+                mask_buffer=self._tree_mask_buffer(
+                    bs=bs,
+                    # Sizing bound only, and it must dominate the committed target
+                    # lengths -- `seq_lens_cpu` above cannot be reused, since under a
+                    # compact draft cache it holds the draft-local window instead.
+                    target_kv_bound=(
+                        batch.seq_lens_cpu
+                        if batch.seq_lens_cpu is not None
+                        else draft_input.nxt_kv_lens_cpu
+                    ),
+                ),
+                mask_indptr=self._tree_mask_indptr[: bs + 1],
+            )
+            # Must stay ahead of the target verify launch below.
+            grammar_tree = (
+                GrammarTree.from_device(
+                    verify_input.retrieve_next_token,
+                    verify_input.retrieve_next_sibling,
+                    verify_input.draft_token.view(bs, verify_token_num),
+                )
+                if batch.has_grammar
+                else None
+            )
+        else:
+            draft_tokens = self._draft_block_tokens_buf[:bs]
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
 
-        verify_input_ids = draft_tokens.reshape(-1)
-        verify_input = DFlashVerifyInput(
-            draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
-            custom_mask=custom_mask,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            # Must stay ahead of the target verify launch below.
+            grammar_tree = (
+                GrammarTree.from_linear_chain(draft_tokens)
+                if batch.has_grammar
+                else None
+            )
+
+            # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary.
+            custom_mask = None
+
+            verify_input_ids = draft_tokens.reshape(-1)
+            verify_input = DFlashVerifyInput(
+                draft_token=verify_input_ids,
+                positions=positions,
+                draft_token_num=int(self.block_size),
+                topk=self.tree_width,
+                block_size=int(self.block_size),
+                custom_mask=custom_mask,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+
+        batch.out_cache_loc = (
+            tree_cache_loc_2d.reshape(-1)
+            if self._use_tree_verify
+            else verify_out_cache_loc
         )
-
-        batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
         seq_lens_pre_verify = (
@@ -2219,8 +2425,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            # Verify host bound = committed prefix + the verify window (matches draft).
+            verify_host_seq_lens = seq_lens_cpu_backup + verify_token_num
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
@@ -2256,7 +2462,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                draft_token_num=verify_token_num,
             )
 
         # Constrain every chain position before accept picks from it.
@@ -2264,21 +2470,40 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
-        (
-            accept_len,
-            commit_lens,
-            bonus,
-            out_tokens,
-            new_seq_lens,
-            target_predict,
-        ) = self._accept_block(
-            candidates=candidates,
-            next_token_logits=logits_output.next_token_logits,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            prefix_lens=prefix_lens,
-            bs=bs,
-        )
+        tree_accept = None
+        if self._use_tree_verify:
+            tree_accept = accept_tree_greedy(
+                verify_input=verify_input,
+                next_token_logits=logits_output.next_token_logits,
+                bs=bs,
+            )
+            move_accepted_target_kv(
+                batch=batch,
+                accepted=tree_accept,
+                token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+            )
+            out_tokens = tree_accept.out_tokens
+            commit_lens = tree_accept.commit_lens
+            bonus = tree_accept.bonus_tokens
+            accept_len = commit_lens - 1
+            new_seq_lens = None
+            target_predict = None
+        else:
+            (
+                accept_len,
+                commit_lens,
+                bonus,
+                out_tokens,
+                new_seq_lens,
+                target_predict,
+            ) = self._accept_block(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                prefix_lens=prefix_lens,
+                bs=bs,
+            )
 
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
@@ -2309,12 +2534,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens = None
 
         if batch.return_logprob:
-            compute_spec_logprobs(
-                batch,
-                logits_output,
-                out_tokens.reshape(-1),
-                chain_stride=block_size,
-            )
+            if tree_accept is not None:
+                # The accepted run is scattered across nodes, so the chain branch's
+                # identity gather does not hold; index the logits by accept_index.
+                compute_spec_logprobs(
+                    batch,
+                    logits_output,
+                    tree_accept.predict,
+                    accept_index=tree_accept.accept_index,
+                )
+            else:
+                compute_spec_logprobs(
+                    batch,
+                    logits_output,
+                    out_tokens.reshape(-1),
+                    chain_stride=block_size,
+                )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
@@ -2322,6 +2557,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 commit_lens=commit_lens,
+                accept_index=(
+                    tree_accept.accept_index if tree_accept is not None else None
+                ),
             )
 
         if new_seq_lens is None:
@@ -2335,13 +2573,32 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
+        if tree_accept is not None:
+            # Row r of each request becomes the node accepted at depth r, which is what
+            # makes the prefix-valid write below correct without touching it: it commits
+            # row r into cache_loc_2d[i, r], the slot req_to_token maps position
+            # prefix + r to. Positions follow the same compacted layout, so they are the
+            # plain chain again rather than the per-node depths verify ran with.
+            hidden = compact_hidden_to_commit_layout(
+                target_hidden=hidden,
+                accept_index=tree_accept.accept_index,
+                bs=bs,
+                verify_width=verify_token_num,
+            )
+            commit_cache_loc_2d = tree_cache_loc_2d
+            commit_positions_flat = commit_positions(
+                prefix_lens=prefix_lens, verify_width=verify_token_num
+            )
+        else:
+            commit_cache_loc_2d = verify_out_cache_loc_2d
+            commit_positions_flat = positions
+        hidden = hidden.view(bs, verify_token_num, -1)
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
+            cache_loc=commit_cache_loc_2d.reshape(-1),
+            cache_loc_2d=commit_cache_loc_2d,
+            positions=commit_positions_flat,
             commit_lens=commit_lens,
         )
 

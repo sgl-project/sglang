@@ -1556,8 +1556,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 resolve_dflash_verify_mask_policy,
             )
 
-            # Avoid enabling custom-mask modes during graph capture for backends that
-            # can express DFLASH verify via their built-in causal path.
+            # A chain verify is causal, so backends with a built-in causal path capture
+            # without a custom mask; a tree needs one (see the policy helper).
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
@@ -1565,6 +1565,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.captured_req_width,
+                # Mirror the live verify input's shape family: the tree width decides the
+                # per-node visibility the mask encodes, so capturing with the wrong one
+                # would freeze the wrong tree shape into the graph.
+                topk=get_spec().speculative_eagle_topk or 1,
+                block_size=get_spec().speculative_dflash_block_size,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
