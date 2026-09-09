@@ -94,7 +94,6 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -110,7 +109,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import ceil_align, get_num_new_pages, is_cuda, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -128,61 +127,6 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
-
-
-def _load_cuda_runtime():
-    from cuda.bindings import runtime as cuda_rt
-
-    return cuda_rt
-
-
-def _flush_gpudirect_writes_to_cuda_owner() -> None:
-    """Make completed third-party GPU writes visible to CUDA on this device."""
-    try:
-        cuda_rt = _load_cuda_runtime()
-        target_enum = cuda_rt.cudaFlushGPUDirectRDMAWritesTarget
-        scope_enum = cuda_rt.cudaFlushGPUDirectRDMAWritesScope
-        flush_target = target_enum.cudaFlushGPUDirectRDMAWritesTargetCurrentDevice
-        flush_scope = scope_enum.cudaFlushGPUDirectRDMAWritesToOwner
-        (err,) = cuda_rt.cudaDeviceFlushGPUDirectRDMAWrites(flush_target, flush_scope)
-        unsupported = cuda_rt.cudaError_t.cudaErrorNotSupported
-    except (ImportError, AttributeError):
-        logger.warning_once(
-            "CUDA GPUDirect RDMA flush bindings are unavailable; falling back "
-            "to a device synchronization before QSA decode."
-        )
-        torch.cuda.synchronize()
-        return
-
-    if err == unsupported:
-        logger.warning_once(
-            "CUDA GPUDirect RDMA host flush is unsupported on this device; "
-            "falling back to a device synchronization before QSA decode."
-        )
-        torch.cuda.synchronize()
-        return
-
-    if err != cuda_rt.cudaError_t.cudaSuccess:
-        raise RuntimeError(
-            "Failed to flush GPUDirect RDMA writes before QSA decode: "
-            f"CUDA error {int(err)}"
-        )
-
-
-def _requires_qsa_gpudirect_flush(transfer_backend: TransferBackend) -> bool:
-    """Whether QSA needs a CUDA-owner visibility operation for this transport.
-
-    This change is intentionally QSA-scoped. Extending the ordering contract to
-    established state types requires a separate audit of each backend/consumer.
-    """
-    return (
-        transfer_backend
-        in (
-            TransferBackend.MOONCAKE,
-            TransferBackend.NIXL,
-        )
-        and is_cuda()
-    )
 
 
 class DecodeReqToTokenPool:
@@ -2138,9 +2082,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.token_to_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
-        self._needs_qsa_gpudirect_flush = isinstance(
-            self.token_to_kv_pool, QSATokenToKVPool
-        ) and _requires_qsa_gpudirect_flush(scheduler.transfer_backend)
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -2388,8 +2329,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Queue-removed but held for deferred release; excluded from the metadata
         # teardown below.
         deferred_indices = set()
-        qsa_writes_flushed = False
-
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -2454,13 +2393,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
-                if self._needs_qsa_gpudirect_flush and not qsa_writes_flushed:
-                    # Completion comes from a host-side RDMA poll. QSA state is
-                    # consumed directly after this queue releases the request,
-                    # so make it CUDA-visible before the first commit. One
-                    # blocking flush covers every success in this poll.
-                    _flush_gpudirect_writes_to_cuda_owner()
-                    qsa_writes_flushed = True
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
