@@ -19,6 +19,7 @@ class TestFilterLegacyAmdJobRows(unittest.TestCase):
             "nightly-accuracy-2-gpu-rocm720 (rocm724)": {},
             "nightly-accuracy-2-gpu-rocm724": {},
             "nightly-test-1-gpu-unit (rocm724)": {},
+            "nightly-test-1-gpu-unit (rocm700, linux-mi300-1gpu-sglang)": {},
             "call-pr-test-amd-rocm720 / call-pr-test-amd-extra-rocm720 / extra-a-test-1-gpu-small-amd (linux-mi300-1gpu-sglang)": {},
             "wait-for-stage-a-amd": {},
             "call-pr-test-amd-extra / pr-test-amd-extra-finish": {},
@@ -30,14 +31,14 @@ class TestFilterLegacyAmdJobRows(unittest.TestCase):
     def test_keeps_current_flavors_and_nested_callers_separate(self):
         new_success = {"current_streak": 0}
         rows = {
-            "stage-b-test-1-gpu-small-amd (rocm724, linux-mi300-1gpu-sglang, 0)": new_success,
-            "nightly-accuracy-2-gpu (rocm720, linux-mi300-2gpu-sglang)": {
+            "stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 0)": new_success,
+            "nightly-accuracy-2-gpu (rocm10, linux-mi300-2gpu-sglang)": {
                 "current_streak": 1
             },
-            "call-pr-test-amd-rocm720 / stage-c-test-4-gpu-amd (rocm724, linux-mi300-4gpu-sglang, 0)": {
+            "call-pr-test-amd / stage-c-test-4-gpu-amd (rocm10, linux-mi300-4gpu-sglang, 0)": {
                 "current_streak": 0
             },
-            "call-pr-test-amd-rocm720 / call-pr-test-amd-extra / extra-a-test-1-gpu-small-amd (rocm724, linux-mi300-1gpu-sglang)": {
+            "call-pr-test-amd / call-pr-test-amd-extra / extra-a-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang)": {
                 "current_streak": 0
             },
         }
@@ -47,7 +48,7 @@ class TestFilterLegacyAmdJobRows(unittest.TestCase):
         self.assertEqual(set(filtered), set(rows))
         self.assertIs(
             filtered[
-                "stage-b-test-1-gpu-small-amd (rocm724, linux-mi300-1gpu-sglang, 0)"
+                "stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 0)"
             ],
             new_success,
         )

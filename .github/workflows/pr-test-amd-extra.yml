@@ -43,9 +43,6 @@ on:
         default: rocm10
         options:
           - rocm10
-          - rocm724
-          - rocm720
-          - rocm700
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -101,10 +98,9 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
-  # Schedule/dispatch runs key on run_id plus ROCm version so the three
-  # scheduled reusable-workflow matrix calls cannot replace each other's
-  # pending runs. PR runs still share a per-branch group so pushes cancel stale
-  # runs. In a reusable workflow github.event_name is the originating event.
+  # Schedule/dispatch runs key on run_id plus ROCm version. PR runs still share
+  # a per-branch group so pushes cancel stale runs. In a reusable workflow
+  # github.event_name is the originating event.
   group: pr-test-amd-extra-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}-{1}', github.run_id, inputs.rocm_version || 'rocm10') || github.head_ref || github.ref_name || inputs.ref || 'default' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
