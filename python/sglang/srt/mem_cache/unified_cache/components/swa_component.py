@@ -98,12 +98,14 @@ class SWAComponent(TreeComponent):
         if self.tree_core.is_host_memory_buffer_only:
             cd = node.component_data[self.component_type]
             return [node] if cd.value is not None else []
-        return self._dirty_backup_window(node)
+        return self._collect_unbacked_swa_nodes_in_window(node)
 
-    def _dirty_backup_window(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
+    def _collect_unbacked_swa_nodes_in_window(
+        self, node: UnifiedTreeNode
+    ) -> list[UnifiedTreeNode]:
         ct = self.component_type
         covered = 0
-        dirty: list[UnifiedTreeNode] = []
+        unbacked: list[UnifiedTreeNode] = []
         cur = node
         while (
             cur is not self.tree_core.root_node and covered < self.sliding_window_size
@@ -117,9 +119,9 @@ class SWAComponent(TreeComponent):
                 break
             covered += len(value)
             if cd.value is not None and cd.host_value is None:
-                dirty.append(cur)
+                unbacked.append(cur)
             cur = cur.parent
-        return dirty
+        return unbacked
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         return bool(self._collect_unbacked_swa_nodes(node))
@@ -1032,17 +1034,17 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            dirty = self._collect_unbacked_swa_nodes(node)
-            if not dirty:
+            unbacked_swa_nodes = self._collect_unbacked_swa_nodes(node)
+            if not unbacked_swa_nodes:
                 return None
-            dirty.reverse()
+            unbacked_swa_nodes.reverse()
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
                     device_indices=torch.cat(
-                        [n.component_data[ct].value for n in dirty]
+                        [n.component_data[ct].value for n in unbacked_swa_nodes]
                     ).to(torch.int64),
-                    nodes_to_load=[n.id for n in dirty],
+                    nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
             ]
 
