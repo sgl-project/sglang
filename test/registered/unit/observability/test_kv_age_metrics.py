@@ -68,8 +68,10 @@ class _RecordingMetric:
         self.labelnames = tuple(labelnames)
         self.increments = []
         self.observations = []
+        self.labels_calls = 0
 
     def labels(self, *values, **labels):
+        self.labels_calls += 1
         if values:
             labels = dict(zip(self.labelnames, values, strict=True))
         return _BoundRecordingMetric(self, labels)
@@ -202,6 +204,33 @@ class TestObserveKvAge(unittest.TestCase):
             self.collector.kv_lifetime_seconds.name, "sglang:kv_lifetime_seconds"
         )
         self.assertEqual(KV_REUSE_BUCKETS[0], 0.0)
+
+    def test_repeated_observations_reuse_label_children(self):
+        # Regression: the memoized label children were once stored on the
+        # instance under the same name as the helper method that fills them,
+        # so the second eviction on a collector found a dict where the method
+        # should be and the scheduler died with "'dict' object is not callable".
+        for _ in range(3):
+            self.collector.observe_kv_eviction(
+                age_seconds=30.0,
+                lifetime_seconds=900.0,
+                reuses=4,
+                num_tokens=256,
+                tier="device",
+                outcome="dropped",
+            )
+            self.collector.observe_kv_age(
+                5.0, 64, event="hit", tier="device", outcome="hit"
+            )
+        self.assertEqual(len(self.collector.kv_lifetime_seconds.observations), 3)
+        self.assertEqual(len(self.collector.kv_reuses.observations), 3)
+        self.assertEqual(len(self.collector.kv_age_seconds.observations), 6)
+        self.assertEqual(len(self.collector.kv_age_tokens.increments), 6)
+        # One labels() resolution per label combination, then cached.
+        self.assertEqual(self.collector.kv_lifetime_seconds.labels_calls, 1)
+        self.assertEqual(self.collector.kv_reuses.labels_calls, 1)
+        self.assertEqual(self.collector.kv_age_seconds.labels_calls, 2)
+        self.assertEqual(self.collector.kv_age_tokens.labels_calls, 2)
 
 
 class TestRadixCacheEmitsKvAge(unittest.TestCase):
