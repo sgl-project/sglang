@@ -20,7 +20,11 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
-from sglang.srt.runtime_context import get_memory, get_model
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_model,
+    get_parallel,
+)
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
@@ -102,7 +106,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.num_layers = self.pool_group.num_layers
 
         tp_rank = 0
-        tp_size = server_args.tp_size
+        tp_size = get_parallel().tp_size
         tp_group = params.attn_tp_cache_group or params.tp_cache_group
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             tp_rank = torch.distributed.get_rank(group=tp_group)
@@ -242,7 +246,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        return self.pending_loads.pop(rid, None) is not None
+        # Already-published loads cannot be safely canceled without tree rollback.
+        return False
 
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()

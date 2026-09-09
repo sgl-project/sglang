@@ -73,22 +73,40 @@ def _residual_gate_add_custom_op(
     if _is_transposed_dense_residual(residual, update, gate):
         module.residual_gate_add_transposed(out, residual, update, gate)
         return out
-    broadcast_gate = gate.shape != residual.shape
+    gate_mode = _gate_mode(residual, gate)
     module.residual_gate_add(
         out.view(-1),
         residual.view(-1),
         update.view(-1),
         gate.view(-1),
         residual.shape[-1],
-        broadcast_gate,
+        gate_mode,
     )
     return out
+
+
+def _gate_mode(residual: torch.Tensor, gate: torch.Tensor) -> int:
+    """0 = full, 1 = broadcast row (hidden_size), 2 = per-token (rows)."""
+    if gate.shape == residual.shape:
+        return 0
+    if _is_row_broadcast_gate(residual, gate):
+        return 1
+    return 2
 
 
 def _is_row_broadcast_gate(residual: torch.Tensor, gate: torch.Tensor) -> bool:
     if gate.dim() != residual.dim() or gate.shape[-1] != residual.shape[-1]:
         return False
     return all(size == 1 for size in gate.shape[:-1])
+
+
+def _is_per_token_gate(residual: torch.Tensor, gate: torch.Tensor) -> bool:
+    """Gate holds one scalar per token (row), broadcast along the hidden dim."""
+    return (
+        gate.dim() == residual.dim()
+        and gate.shape[-1] == 1
+        and gate.shape[:-1] == residual.shape[:-1]
+    )
 
 
 def _is_transposed_dense_residual(
@@ -121,7 +139,11 @@ def can_use_residual_gate_add_cuda(
         and residual.dim() >= 2
         and residual.numel() > 0
         and update.shape == residual.shape
-        and (gate.shape == residual.shape or _is_row_broadcast_gate(residual, gate))
+        and (
+            gate.shape == residual.shape
+            or _is_row_broadcast_gate(residual, gate)
+            or _is_per_token_gate(residual, gate)
+        )
         and (
             (residual.is_contiguous() and update.is_contiguous())
             or _is_transposed_dense_residual(residual, update, gate)
