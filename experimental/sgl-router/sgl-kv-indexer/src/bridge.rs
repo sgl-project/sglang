@@ -591,14 +591,10 @@ fn decode_event_batch_impl(
 }
 
 fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeError> {
+    // `KVCacheEvent` is a tagged map (`tag=True` without `array_like`).
     match event {
-        // Current publishers: `KVCacheEvent` without `array_like` is a tagged map.
         Value::Map(entries) => decode_event_map(entries, actions),
-        // Older publishers: tagged positional array.
-        Value::Array(fields) => decode_event_array(fields, actions),
-        _ => Err(BridgeError::Decode(
-            "KV event must be a map or an array".to_string(),
-        )),
+        _ => Err(BridgeError::Decode("KV event must be a map".to_string())),
     }
 }
 
@@ -665,64 +661,6 @@ fn decode_event_map(
                 tier,
                 decode_hashes(required_map_field(entries, "block_hashes")?)?,
             );
-        }
-        "AllBlocksCleared" => {
-            actions.clear_all();
-        }
-        other => {
-            debug!(event_type = other, "ignoring unsupported SGLang KV event");
-        }
-    }
-    Ok(())
-}
-
-fn decode_event_array(event: &[Value], actions: &mut EventActions) -> Result<(), BridgeError> {
-    let event_type = expect_str(
-        event
-            .first()
-            .ok_or_else(|| BridgeError::Decode("KV event is empty".to_string()))?,
-        "KV event tag",
-    )?;
-
-    match event_type {
-        "BlockStored" => {
-            // At least 7 fields (the legacy schema); an 8th `component_types`
-            // slot appears with `--enable-kv-events-component-types`. Both
-            // shapes are accepted.
-            if event.len() < 7 {
-                return Err(BridgeError::Decode(
-                    "BlockStored must have at least 7 array fields".to_string(),
-                ));
-            }
-            let tier = medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
-            // `component_types` is the trailing slot: a list of component labels
-            // folded into a bitmask, or nil/absent for a legacy whole-block store.
-            let mask = match event.get(7) {
-                Some(value) => decode_component_mask(value)?,
-                None => None,
-            };
-            // The token count is only carried alongside component-aware stores,
-            // where the query path needs it to accumulate trailing windows.
-            let block_size = match mask {
-                Some(_) => Some(decode_block_size(&event[4])?),
-                None => None,
-            };
-            actions.report(
-                tier,
-                decode_optional_hash(&event[2], "BlockStored.parent_block_hash")?,
-                decode_hashes(&event[1])?,
-                mask,
-                block_size,
-            );
-        }
-        "BlockRemoved" => {
-            if event.len() < 3 {
-                return Err(BridgeError::Decode(
-                    "BlockRemoved must have 3 array fields".to_string(),
-                ));
-            }
-            let tier = medium_to_tier(expect_optional_str(&event[2], "BlockRemoved.medium")?)?;
-            actions.revoke(tier, decode_hashes(&event[1])?);
         }
         "AllBlocksCleared" => {
             actions.clear_all();
@@ -957,19 +895,31 @@ mod tests {
     }
 
     fn stored_with_parent(hashes: &[i64], parent: Option<i64>, medium: &str) -> Value {
-        Value::Array(vec![
-            Value::String("BlockStored".into()),
-            ints(hashes),
-            parent.map_or(Value::Nil, Value::from),
-            ints(&[1]),         // token_ids
-            Value::from(1_i64), // block_size
-            Value::Nil,         // lora_id
-            Value::String(medium.into()),
-        ])
+        stored_with_extra(hashes, parent, medium, vec![])
     }
 
-    /// A component-aware `BlockStored` (8-element schema): trailing
-    /// `component_types` slot plus a concrete `block_size` token count.
+    /// A `BlockStored` map plus `extra` keys the bridge must ignore.
+    fn stored_with_extra(
+        hashes: &[i64],
+        parent: Option<i64>,
+        medium: &str,
+        extra: Vec<(&str, Value)>,
+    ) -> Value {
+        let mut entries = vec![
+            ("type", Value::String("BlockStored".into())),
+            ("block_hashes", ints(hashes)),
+            ("parent_block_hash", parent.map_or(Value::Nil, Value::from)),
+            ("token_ids", ints(&[1])),
+            ("block_size", Value::from(1_i64)),
+            ("lora_id", Value::Nil),
+            ("medium", Value::String(medium.into())),
+        ];
+        entries.extend(extra);
+        map_event(entries)
+    }
+
+    /// A component-aware `BlockStored`: a `component_types` key plus a
+    /// concrete `block_size` token count.
     fn stored_c(hashes: &[i64], medium: &str, block_size: i64, components: Value) -> Value {
         stored_c_with_parent(hashes, None, medium, block_size, components)
     }
@@ -981,15 +931,16 @@ mod tests {
         block_size: i64,
         components: Value,
     ) -> Value {
-        Value::Array(vec![
-            Value::String("BlockStored".into()),
-            ints(hashes),
-            parent.map_or(Value::Nil, Value::from),
-            ints(&[1]), // token_ids
-            Value::from(block_size),
-            Value::Nil, // lora_id
-            Value::String(medium.into()),
-            components, // component_types (Nil or array of strings)
+        map_event(vec![
+            ("type", Value::String("BlockStored".into())),
+            ("block_hashes", ints(hashes)),
+            ("parent_block_hash", parent.map_or(Value::Nil, Value::from)),
+            ("token_ids", ints(&[1])),
+            ("block_size", Value::from(block_size)),
+            ("lora_id", Value::Nil),
+            ("medium", Value::String(medium.into())),
+            // component_types (Nil or array of strings)
+            ("component_types", components),
         ])
     }
 
@@ -1020,19 +971,18 @@ mod tests {
     }
 
     fn removed(hashes: &[i64], medium: &str) -> Value {
-        Value::Array(vec![
-            Value::String("BlockRemoved".into()),
-            ints(hashes),
-            Value::String(medium.into()),
+        map_event(vec![
+            ("type", Value::String("BlockRemoved".into())),
+            ("block_hashes", ints(hashes)),
+            ("medium", Value::String(medium.into())),
         ])
     }
 
     fn cleared() -> Value {
-        Value::Array(vec![Value::String("AllBlocksCleared".into())])
+        map_event(vec![("type", Value::String("AllBlocksCleared".into()))])
     }
 
-    // --- tagged-map event shape (current publishers) ---
-
+    /// A tagged event map: `{"type": ..., field: value, ...}`.
     fn map_event(entries: Vec<(&str, Value)>) -> Value {
         Value::Map(
             entries
@@ -1042,57 +992,14 @@ mod tests {
         )
     }
 
-    fn stored_map(
-        hashes: &[i64],
-        parent: Option<i64>,
-        medium: &str,
-        extra: Vec<(&str, Value)>,
-    ) -> Value {
-        let mut entries = vec![
-            ("type", Value::String("BlockStored".into())),
-            ("block_hashes", ints(hashes)),
-            ("parent_block_hash", parent.map_or(Value::Nil, Value::from)),
-            ("token_ids", ints(&[1])),
-            ("block_size", Value::from(1_i64)),
-            ("lora_id", Value::Nil),
-            ("medium", Value::String(medium.into())),
-        ];
-        entries.extend(extra);
-        map_event(entries)
-    }
-
-    fn removed_map(hashes: &[i64], medium: &str) -> Value {
-        map_event(vec![
-            ("type", Value::String("BlockRemoved".into())),
-            ("block_hashes", ints(hashes)),
-            ("medium", Value::String(medium.into())),
-        ])
-    }
-
-    fn cleared_map() -> Value {
-        map_event(vec![("type", Value::String("AllBlocksCleared".into()))])
+    fn tagged(event_type: &str) -> Value {
+        map_event(vec![("type", Value::String(event_type.into()))])
     }
 
     #[test]
-    fn map_events_decode_like_array_events() {
+    fn attribution_keys_are_ignored() {
         assert_eq!(
-            actions_of(vec![
-                stored_map(&[1, 2], None, "GPU", vec![]),
-                removed_map(&[3], "DISK"),
-                cleared_map(),
-            ]),
-            vec![
-                rep(hbm(), &["1", "2"]),
-                rev(ssd(), &["3"]),
-                Action::ClearAll
-            ]
-        );
-    }
-
-    #[test]
-    fn map_event_keeps_parent_and_ignores_attribution_keys() {
-        assert_eq!(
-            actions_of(vec![stored_map(
+            actions_of(vec![stored_with_extra(
                 &[2, 3],
                 Some(1),
                 "GPU",
@@ -1106,44 +1013,28 @@ mod tests {
     }
 
     #[test]
-    fn component_aware_map_event_carries_mask_and_block_size() {
-        let event = map_event(vec![
-            ("type", Value::String("BlockStored".into())),
-            ("block_hashes", ints(&[1])),
-            ("parent_block_hash", Value::Nil),
-            ("token_ids", ints(&[1])),
-            ("block_size", Value::from(64_i64)),
-            ("lora_id", Value::Nil),
-            ("medium", Value::String("GPU".into())),
-            ("component_types", strv(&["full", "swa"])),
-        ]);
-        assert_eq!(
-            actions_of(vec![event]),
-            vec![Action::Report {
-                tier: hbm(),
-                parent_block_hash: None,
-                hashes: vec![1],
-                masks: vec![Some(
-                    crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
-                )],
-                block_sizes: vec![Some(64)],
-            }]
-        );
-    }
-
-    #[test]
-    fn undecodable_map_events_are_skipped_and_siblings_survive() {
+    fn undecodable_events_are_skipped_and_siblings_survive() {
         assert_eq!(
             actions_of(vec![
                 // no `type`
                 map_event(vec![("block_hashes", ints(&[1]))]),
-                stored_map(&[1], None, "GPU", vec![]),
+                stored(&[1], "GPU"),
                 // no `medium`
                 map_event(vec![
                     ("type", Value::String("BlockStored".into())),
                     ("block_hashes", ints(&[9])),
                 ]),
-                removed_map(&[5], "GPU"),
+                // pre-map publishers encoded events as tagged arrays
+                Value::Array(vec![
+                    Value::String("BlockStored".into()),
+                    ints(&[7]),
+                    Value::Nil,
+                    ints(&[1]),
+                    Value::from(1_i64),
+                    Value::Nil,
+                    Value::String("GPU".into()),
+                ]),
+                removed(&[5], "GPU"),
             ]),
             vec![rep(hbm(), &["1"]), rev(hbm(), &["5"])]
         );
@@ -1354,7 +1245,7 @@ mod tests {
     #[test]
     fn batch_with_only_ignored_events_has_no_actions() {
         let config = test_config(vec![hbm()]);
-        let events = vec![Value::Array(vec![Value::String("BlockUpdated".into())])];
+        let events = vec![tagged("BlockUpdated")];
         assert!(request_of(&config, 0, events).actions.is_empty());
     }
 
@@ -1477,7 +1368,7 @@ mod tests {
 
     #[test]
     fn unknown_event_tag_is_ignored() {
-        let events = vec![Value::Array(vec![Value::String("BlockUpdated".into())])];
+        let events = vec![tagged("BlockUpdated")];
         assert!(actions_of(events).is_empty());
     }
 
@@ -1497,12 +1388,7 @@ mod tests {
     fn python_msgspec_mixed_batch_golden_decodes() {
         // Generated by msgspec.msgpack.Encoder from the authoritative Python
         // KVEventBatch schema in sglang.srt.disaggregation.kv_events.
-        let payload = golden_bytes(concat!(
-            "93cb405edd2f1a9fbe779397ab426c6f636b53746f72656492",
-            "cf0000011f71fb04cbd2c521974f2a940a141e280407a3475055",
-            "93ac426c6f636b52656d6f7665649264ccc8a44449534b",
-            "91b0416c6c426c6f636b73436c656172656402"
-        ));
+        let payload = golden_bytes("93cb405edd2f1a9fbe779387a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657392cf0000011f71fb04cbd2c521974fb1706172656e745f626c6f636b5f686173682aa9746f6b656e5f696473940a141e28aa626c6f636b5f73697a6504a76c6f72615f696407a66d656469756da347505583a474797065ac426c6f636b52656d6f766564ac626c6f636b5f6861736865739264ccc8a66d656469756da44449534b81a474797065b0416c6c426c6f636b73436c656172656402");
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
             vec![
@@ -1517,10 +1403,7 @@ mod tests {
     fn python_msgspec_bigram_tokens_golden_decodes() {
         // token_ids contains Python tuples as nested msgpack arrays; the
         // bridge ignores payload shape and indexes the published hashes.
-        let payload = golden_bytes(concat!(
-            "93cb3ff80000000000009197ab426c6f636b53746f726564916f",
-            "c092920a1492141e02c0a347505503"
-        ));
+        let payload = golden_bytes("93cb3ff80000000000009187a474797065ab426c6f636b53746f726564ac626c6f636b5f686173686573916fb1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f69647392920a1492141eaa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da347505503");
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
             vec![rep(hbm(), &["111"])]
@@ -1529,12 +1412,10 @@ mod tests {
 
     #[test]
     fn python_msgspec_nil_medium_golden_is_safely_skipped() {
-        // The Python schema permits medium=None; such events map to no
-        // Indexer tier, so they are isolated rather than given a placement.
-        let payload = golden_bytes(concat!(
-            "93cb00000000000000009297ab426c6f636b53746f7265649101",
-            "c092050602c0c093ac426c6f636b52656d6f7665649102c0c0"
-        ));
+        // The Python schema permits medium=None (the key is then omitted);
+        // such events map to no Indexer tier, so they are isolated rather
+        // than given a placement.
+        let payload = golden_bytes("93cb00000000000000009286a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739101b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920506aa626c6f636b5f73697a6502a76c6f72615f6964c082a474797065ac426c6f636b52656d6f766564ac626c6f636b5f6861736865739102c0");
         assert!(decode_event_batch(&payload).unwrap().actions.is_empty());
     }
 
