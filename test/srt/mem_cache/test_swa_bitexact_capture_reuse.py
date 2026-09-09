@@ -204,8 +204,8 @@ class TestSwaRestoreWindowMapping(unittest.TestCase):
             ),
             _restore_device_value=lambda n, v: restore_calls.append(v.clone()),
         )
-        me._gather_window_full_indices = (
-            lambda n, nt: SWAComponent._gather_window_full_indices(me, n, nt)
+        me._gather_window_full_indices = lambda n, nt: (
+            SWAComponent._gather_window_full_indices(me, n, nt)
         )
         # node: full value length 4 (page node), SWA host_value == window (2)
         full_val = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
@@ -267,8 +267,8 @@ class TestSwaRestoreSplitWindow(unittest.TestCase):
             ),
             _restore_device_value=lambda n, v: restore_calls.append(v.clone()),
         )
-        me._gather_window_full_indices = (
-            lambda n, nt: SWAComponent._gather_window_full_indices(me, n, nt)
+        me._gather_window_full_indices = lambda n, nt: (
+            SWAComponent._gather_window_full_indices(me, n, nt)
         )
         # parent holds full tokens [B-4, B-2); child holds [B-2, B). The child
         # keeps the whole win=4 window host_value (parent.host_value is None
@@ -397,8 +397,8 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
 
     def _make_full_component(self):
         def create_match_validator(match_device_only=False):
-            return (
-                lambda node: node.component_data[ComponentType.FULL].value is not None
+            return lambda node: (
+                node.component_data[ComponentType.FULL].value is not None
             )
 
         return types.SimpleNamespace(
@@ -411,14 +411,12 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
             if match_device_only:
                 # I2'-required for self-match: trusts the per-request device
                 # ring slot even without a durable host copy.
-                return (
-                    lambda node: node.component_data[ComponentType.SWA].value
-                    is not None
+                return lambda node: (
+                    node.component_data[ComponentType.SWA].value is not None
                 )
             # Host-gated (strict): only a durable host copy extends the match.
-            return (
-                lambda node: node.component_data[ComponentType.SWA].host_value
-                is not None
+            return lambda node: (
+                node.component_data[ComponentType.SWA].host_value is not None
             )
 
         return types.SimpleNamespace(
@@ -573,7 +571,11 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
             _unified_positional_swa=False,
             cache=types.SimpleNamespace(cache_controller=object()),
             tree_core=types.SimpleNamespace(
-                has_swa_host_pool=True, enable_hicache=True
+                has_swa_host_pool=True,
+                enable_hicache=True,
+                # branching-point caching (#34565) aligns the full-KV hit down to
+                # a page; 1 keeps it a no-op for these load_back gate tests
+                page_size=1,
             ),
         )
 
@@ -703,8 +705,8 @@ class TestLoadBackMappingLengths(unittest.TestCase):
             ),
             _restore_device_value=lambda n, v: None,
         )
-        me._gather_window_full_indices = (
-            lambda n, nt: SWAComponent._gather_window_full_indices(me, n, nt)
+        me._gather_window_full_indices = lambda n, nt: (
+            SWAComponent._gather_window_full_indices(me, n, nt)
         )
         return me, root
 
