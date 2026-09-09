@@ -105,21 +105,6 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
         self.is_npu_arch35 = is_npu_arch35()
 
-    def uses_mlaprolog(self) -> bool:
-        pool = get_token_to_kv_pool()
-        if self.is_npu_arch35 and pool.index_head_dim is not None:
-            return True
-        quant_method = self.qkv_a_proj.quant_method
-        if (
-            hasattr(quant_method, "quantization_config")
-            and quant_method.quantization_config.get_name() == "modelslim"
-        ):
-            return False
-        return hasattr(self.quant_config, "ignore") and any(
-            re.fullmatch(r".*kv_b_proj", pattern)
-            for pattern in self.quant_config.ignore
-        )
-
     def preprocess_weights(self, hidden_states):
         self.dummy = torch.zeros(
             (hidden_states.shape[-1]),
@@ -598,8 +583,6 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
-        if self.uses_mlaprolog():
-            return self.forward_mlaprolog(positions, hidden_states, forward_batch)
         # assert self.quant_config and self.quant_config.get_name() == "modelslim"
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
         _is_w8a8 = (
@@ -607,11 +590,15 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             and self.qkv_a_proj.quant_method.quantization_config.get_name()
             == "modelslim"
         )
-        # with the mlaprolog enabled, the kv_b_proj layers are unquantized
-        _is_mlaprolog = hasattr(self.quant_config, "ignore") and any(
-            re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore
+        _is_arch35_dsa = (
+            self.is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
         )
-        if _is_w8a8:
+        # with the mlaprolog enabled, the kv_b_proj layers are unquantized
+        _is_mlaprolog = _is_arch35_dsa or (
+            hasattr(self.quant_config, "ignore")
+            and any(re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore)
+        )
+        if _is_w8a8 and not _is_arch35_dsa:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator
             )
