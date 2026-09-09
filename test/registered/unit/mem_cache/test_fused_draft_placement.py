@@ -210,6 +210,7 @@ class TestFusedEntryPricing(CustomTestCase):
             head_dim=8,
             get_num_kv_heads=lambda *_: 1,
         )
+        cfg.use_mla_backend = False
         cfg.kv_cache_dtype = _DTYPE
         return cfg
 

@@ -212,7 +212,8 @@ class MLASubPoolSpec(SubPoolSpec):
     One latent row (``kv_lora_rank + qk_rope_head_dim``) per token per layer; V
     is a prefix slice of the same row, so there is no separate V region. Not a
     subclass of ``MHASubPoolSpec`` — the K+V byte math and the ``v_head_dim > 0``
-    invariant there do not apply.
+    invariant there do not apply. With `draft_region` set, the draft's K and V
+    parts follow the latent rows inside every slot's entry, as on an MHA host.
     """
 
     kv_lora_rank: int
@@ -227,9 +228,8 @@ class MLASubPoolSpec(SubPoolSpec):
         assert self.qk_rope_head_dim > 0, (
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
-        assert self.draft_region is None, (
-            "MLA sub-pools do not carry a fused draft region yet"
-        )
+        if self.draft_region is not None:
+            self.draft_region.validate()
 
     @property
     def kv_cache_dim(self) -> int:
@@ -238,23 +238,36 @@ class MLASubPoolSpec(SubPoolSpec):
     def row_bytes(self) -> int:
         return self.kv_cache_dim * self.store_dtype.itemsize
 
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot, before any draft parts."""
+        return self.layer_num * self.row_bytes()
+
+    def draft_offset_in_entry(self) -> int:
+        """Byte offset of the fused draft parts inside one slot's entry."""
+        assert self.draft_region is not None
+        return align_part_offset(self.host_entry_bytes())
+
     def entry_bytes(self) -> int:
-        return align_entry_bytes(self.layer_num * self.row_bytes())
+        if self.draft_region is None:
+            return align_entry_bytes(self.host_entry_bytes())
+        return align_entry_bytes(
+            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
+        )
 
     def layout(self) -> DenseEntryLayout:
-        return DenseEntryLayout(
-            entry_bytes=self.entry_bytes(),
-            parts=(
-                DensePart(
-                    name="kv",
-                    offset_bytes=0,
-                    layer_stride_bytes=self.row_bytes(),
-                    layer_num=self.layer_num,
-                    row_shape=(1, self.kv_cache_dim),
-                    dtype=self.store_dtype,
-                ),
+        parts = (
+            DensePart(
+                name="kv",
+                offset_bytes=0,
+                layer_stride_bytes=self.row_bytes(),
+                layer_num=self.layer_num,
+                row_shape=(1, self.kv_cache_dim),
+                dtype=self.store_dtype,
             ),
         )
+        if self.draft_region is not None:
+            parts += self.draft_region.parts(self.draft_offset_in_entry())
+        return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -1370,12 +1383,8 @@ def init_unified_mamba_pools(
             f"qk_rope_head_dim; got {kv_lora_rank} / {qk_rope_head_dim}"
         )
         assert not is_draft_worker, (
-            "init_unified_mamba_pools: draft workers (speculative decoding) are "
-            "not supported with the MLA unified pool"
-        )
-        assert fused_draft is None, (
-            "init_unified_mamba_pools: the MLA full sub-pool does not carry a "
-            "fused draft region yet"
+            "init_unified_mamba_pools: a draft worker binds views over the "
+            "target's buffer instead of building one of its own"
         )
         full_spec = MLASubPoolSpec(
             name="full",
@@ -1384,6 +1393,7 @@ def init_unified_mamba_pools(
             qk_rope_head_dim=qk_rope_head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
+            draft_region=None if fused_draft is None else fused_draft.region,
         )
     else:
         full_spec = MHASubPoolSpec(
