@@ -76,7 +76,17 @@ def causal_conv1d_fn_cpu(
 
 
 def causal_conv1d_update_cpu(
-    mixed_qkv, conv_states, conv_weights, bias, activation, conv_state_indices
+    mixed_qkv,
+    conv_states,
+    conv_weights,
+    bias,
+    activation,
+    conv_state_indices,
+    intermediate_conv_window=None,
+    intermediate_state_indices=None,
+    retrieve_next_token=None,
+    retrieve_next_sibling=None,
+    retrieve_parent_token=None,
 ):
     return torch.ops.sgl_kernel.causal_conv1d_update_cpu(
         mixed_qkv,
@@ -88,6 +98,11 @@ def causal_conv1d_update_cpu(
         conv_state_indices,
         -1,
         True,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        retrieve_parent_token,
     )
 
 

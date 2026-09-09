@@ -771,7 +771,7 @@ class MambaPool:
                             temporal_state_shape[2],
                         ),
                         dtype=ssm_dtype,
-                        device="cuda",
+                        device=device,
                     )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -839,7 +839,7 @@ class MambaPool:
                                 conv_shape[1],
                             ),
                             dtype=conv_dtype,
-                            device="cuda",
+                            device=device,
                         )
                         for conv_shape in dense_conv_shapes
                     ]

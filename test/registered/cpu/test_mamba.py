@@ -438,8 +438,11 @@ def test_fused_sigmoid_gating_delta_rule_update(
             ssm_states_kv[cache_indices].transpose(-1, -2).contiguous()
         )
         atol = rtol = precision[core_attn_out.dtype]
+        # The kernel is layout-preserving like the CUDA Triton kernel (output
+        # shape == v.shape == [1, tokens, HV, V]); the torch reference computes
+        # batch-first [tokens, 1, HV, V].
         torch.testing.assert_close(
-            core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
+            core_attn_out, core_attn_out_ref.transpose(0, 1), atol=atol, rtol=rtol
         )
         torch.testing.assert_close(
             last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
