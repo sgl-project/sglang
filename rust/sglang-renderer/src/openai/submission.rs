@@ -1,9 +1,8 @@
-use axum::{http::StatusCode, response::Response};
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 
 use crate::{GenerateRequest, GenerationOutput, GenerationStream, ResponseError};
 
-use super::{OpenAIHttpFrontend, error::openai_error};
+use crate::engine::HttpGenerateClient;
 
 // Bound one OpenAI request's pending HTTP handshakes without duplicating the
 // engine scheduler's aggregate admission policy.
@@ -13,25 +12,15 @@ const CONCURRENT_ENGINE_SUBMISSIONS: usize = 32;
 ///
 /// All streams are established before either endpoint starts collecting them,
 /// preserving concurrent engine execution.
-pub(super) async fn submit_generate_requests(
-    frontend: &OpenAIHttpFrontend,
+pub(crate) async fn submit_generate_requests(
+    client: &HttpGenerateClient,
     inputs: Vec<GenerateRequest>,
-    stream_response: bool,
-) -> Result<Vec<GenerationStream>, Response> {
-    futures::stream::iter(inputs.into_iter().map(|input| async move {
-        frontend
-            .generate_client
-            .generate(input)
-            .await
-            .map_err(|error| {
-                openai_error(
-                    StatusCode::from_u16(error.status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    error.message,
-                    stream_response,
-                )
-            })
-    }))
+) -> Result<Vec<GenerationStream>, ResponseError> {
+    futures::stream::iter(
+        inputs
+            .into_iter()
+            .map(|input| async move { client.generate(input).await }),
+    )
     .buffered(CONCURRENT_ENGINE_SUBMISSIONS)
     .try_collect()
     .await

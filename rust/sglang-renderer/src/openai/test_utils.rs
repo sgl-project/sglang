@@ -1,3 +1,4 @@
+use crate::{RendererConfig, RendererLimits, SamplingDefaults};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -68,4 +69,26 @@ pub(super) fn chunk(text: &str, done: bool) -> Result<GenerationOutput, Response
         extras: None,
     };
     Ok(output)
+}
+
+pub(crate) fn renderer_config() -> RendererConfig {
+    RendererConfig {
+        served_model_name: "model".into(),
+        tokenizer_path: ".".into(),
+        revision: None,
+        model_path: String::new(),
+        chat_template: Some("chatml".into()),
+        tool_call_parser: None,
+        reasoning_parser: None,
+        default_chat_template_kwargs: Default::default(),
+        stream_response_default_include_usage: false,
+        default_sampling_params: SamplingDefaults::default(),
+        limits: RendererLimits {
+            vocab_size: 128,
+            context_len: 128,
+            num_reserved_tokens: 0,
+            allow_auto_truncate: false,
+            enable_return_hidden_states: false,
+        },
+    }
 }

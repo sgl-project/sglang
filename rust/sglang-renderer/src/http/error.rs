@@ -8,7 +8,7 @@ use axum::{
     },
 };
 
-use crate::{RendererErrorKind, error::RendererError};
+use crate::ResponseError;
 
 pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> serde_json::Value {
     let error_type = if code.is_server_error() {
@@ -45,12 +45,8 @@ pub(super) fn json_rejection_response(rejection: JsonRejection) -> Response {
     openai_error(status, rejection.body_text(), false)
 }
 
-pub(super) fn renderer_status(error: &RendererError) -> StatusCode {
-    match error.kind() {
-        RendererErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
-        RendererErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-        RendererErrorKind::Tokenize | RendererErrorKind::Internal => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-    }
+pub(super) fn response_error(error: ResponseError, stream: bool) -> Response {
+    let status =
+        StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    openai_error(status, error.message, stream)
 }

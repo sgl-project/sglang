@@ -1,128 +1,68 @@
-//! OpenAI Chat Completions endpoint.
+//! OpenAI chat preparation, response aggregation, and typed chunks.
 
-use std::sync::Arc;
-use std::{collections::BTreeMap, convert::Infallible};
+use std::collections::BTreeMap;
 
 use crate::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
     ResponseError,
 };
-use axum::{
-    Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
-    routing::post,
-};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta,
-    ChatCompletionStreamResponseDeltaFunctionCall, ChatCompletionTokenLogprob, CompletionUsage,
+    ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta, ChatCompletionTokenLogprob,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
     ServiceTier as ChatServiceTier, TopLogprobs,
 };
 use futures::StreamExt;
-use serde::Serialize;
 
-use super::{
-    ChatCompletionRequest, OpenAIHttpFrontend, completion_usage,
-    error::{error_payload, json_rejection_response, openai_error, renderer_status},
-    protocol::lower_chat_request,
-    submission::{merge_indexed, submit_generate_requests},
-    unix_seconds_u32,
-};
+use super::protocol::{ChatCompletionRequest, lower_chat_request};
+use super::submission::merge_indexed;
+use super::{completion_usage, renderer_error, unix_seconds_u32};
 
-pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
+pub(crate) struct ChatResponseContext {
+    pub(crate) response_id: String,
+    pub(crate) model: String,
+    pub(crate) created: u32,
+    pub(crate) want_logprobs: bool,
+    pub(crate) include_usage: bool,
+    pub(crate) service_tier: Option<ChatServiceTier>,
 }
 
-struct ChatStreamWireContext {
-    response_id: String,
-    model: String,
-    created: u32,
-    want_logprobs: bool,
-    include_usage: bool,
-    service_tier: Option<ChatServiceTier>,
-}
-
-async fn chat_completions(
-    State(state): State<Arc<OpenAIHttpFrontend>>,
-    body: Result<Json<ChatCompletionRequest>, JsonRejection>,
-) -> Response {
-    let extended = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => return json_rejection_response(rejection),
-    };
-    let stream = extended.stream.unwrap_or(false);
-    let model = extended.model.clone();
-    let want_logprobs = extended.logprobs.unwrap_or(false);
-    let include_usage = extended
+pub(crate) async fn prepare_request(
+    renderer: &crate::RendererService,
+    request: ChatCompletionRequest,
+) -> Result<(crate::PreparedChat, ChatResponseContext), ResponseError> {
+    let model = request.model.clone();
+    let want_logprobs = request.logprobs.unwrap_or(false);
+    let include_usage = request
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage)
-        || state
-            .renderer
-            .config()
-            .stream_response_default_include_usage;
-    let service_tier = extended.service_tier.clone();
-    let (response_id, chat_request) = match lower_chat_request(state.renderer.config(), extended) {
-        Ok(request) => request,
-        Err(error) => {
-            let status = renderer_status(&error);
-            return openai_error(status, error.to_string(), false);
-        }
-    };
-    let chat = match state.renderer.prepare_chat(chat_request).await {
-        Ok(chat) => chat,
-        Err(error) => {
-            let status = renderer_status(&error);
-            return openai_error(status, error.to_string(), false);
-        }
-    };
-    let response_processor = chat.response_processor;
-    let created = unix_seconds_u32();
-    let streams = match submit_generate_requests(&state, chat.requests, stream).await {
-        Ok(streams) => streams,
-        Err(response) => return response,
-    };
-    let submitted = streams.into_iter().enumerate().collect();
-    if stream {
-        let event_stream = chat_event_stream(
-            submitted,
-            response_processor,
-            ChatStreamWireContext {
-                response_id,
-                model,
-                created,
-                want_logprobs,
-                include_usage,
-                service_tier,
-            },
-        )
-        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
-    } else {
-        unary_chat(
-            submitted,
-            response_processor,
+        || renderer.config().stream_response_default_include_usage;
+    let service_tier = request.service_tier.clone();
+    let (response_id, request) =
+        lower_chat_request(renderer.config(), request).map_err(renderer_error)?;
+    let chat = renderer
+        .prepare_chat(request)
+        .await
+        .map_err(renderer_error)?;
+    Ok((
+        chat,
+        ChatResponseContext {
             response_id,
             model,
-            created,
+            created: unix_seconds_u32(),
             want_logprobs,
+            include_usage,
             service_tier,
-        )
-        .await
-    }
+        },
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn unary_chat(
+pub(crate) async fn unary_chat(
     submitted: Vec<(usize, GenerationStream)>,
     response_processor: ChatResponseProcessor,
     response_id: String,
@@ -130,7 +70,7 @@ pub(super) async fn unary_chat(
     created: u32,
     want_logprobs: bool,
     service_tier: Option<ChatServiceTier>,
-) -> Response {
+) -> Result<CreateChatCompletionResponse, ResponseError> {
     let choice_count = submitted.len();
     let mut accumulated = (0..choice_count)
         .map(|_| UnaryChatChoice::default())
@@ -151,11 +91,10 @@ pub(super) async fn unary_chat(
                 logprobs,
             }) => {
                 let Some(choice) = accumulated.get_mut(choice) else {
-                    return openai_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "chat response choice is out of range",
-                        false,
-                    );
+                    return Err(ResponseError {
+                        status_code: 500,
+                        message: "chat response choice is out of range".into(),
+                    });
                 };
                 if let Some(content) = content {
                     choice.content.push_str(&content);
@@ -179,9 +118,7 @@ pub(super) async fn unary_chat(
                 completion_tokens = completion;
             }
             Err(error) => {
-                let status = StatusCode::from_u16(error.status_code)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                return openai_error(status, error.message, false);
+                return Err(error);
             }
         }
     }
@@ -225,7 +162,7 @@ pub(super) async fn unary_chat(
         })
         .collect();
 
-    Json(CreateChatCompletionResponse {
+    Ok(CreateChatCompletionResponse {
         id: response_id,
         choices,
         created,
@@ -238,7 +175,6 @@ pub(super) async fn unary_chat(
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
         )),
     })
-    .into_response()
 }
 
 #[derive(Default)]
@@ -293,11 +229,11 @@ fn merge_chat_logprobs(
     }
 }
 
-fn chat_event_stream(
+pub(crate) fn chat_event_stream(
     submitted: Vec<(usize, GenerationStream)>,
     response_processor: ChatResponseProcessor,
-    context: ChatStreamWireContext,
-) -> impl futures::Stream<Item = String> {
+    context: ChatResponseContext,
+) -> impl futures::Stream<Item = Result<CreateChatCompletionStreamResponse, ResponseError>> {
     let parsed = semantic_chat_stream(submitted, response_processor, context.want_logprobs);
 
     async_stream::stream! {
@@ -305,7 +241,7 @@ fn chat_event_stream(
         while let Some(item) = parsed.next().await {
             match item {
                 Ok(ChatEvent::Role { choice }) => {
-                    yield serialize_chat_stream_response(chat_stream_response(
+                    yield Ok(chat_stream_response(
                         &context.response_id,
                         &context.model,
                         context.created,
@@ -327,7 +263,7 @@ fn chat_event_stream(
                     finish_reason,
                     logprobs,
                 }) => {
-                    yield serialize_chat_stream_response(chat_stream_response(
+                    yield Ok(chat_stream_response(
                         &context.response_id,
                         &context.model,
                         context.created,
@@ -352,7 +288,7 @@ fn chat_event_stream(
                     prompt_tokens,
                     completion_tokens,
                 }) if context.include_usage => {
-                    yield serialize_chat_stream_response(chat_stream_response(
+                    yield Ok(chat_stream_response(
                         &context.response_id,
                         &context.model,
                         context.created,
@@ -363,13 +299,10 @@ fn chat_event_stream(
                 }
                 Ok(ChatEvent::Usage { .. }) => {}
                 Err(error) => {
-                    let status = StatusCode::from_u16(error.status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    yield error_payload(status, error.message).to_string();
+                    yield Err(error);
                 }
             }
         }
-        yield "[DONE]".to_string();
     }
 }
 
@@ -519,95 +452,9 @@ fn openai_tool_call_delta(call: ChatToolCallDelta) -> ChatCompletionMessageToolC
     }
 }
 
-fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {
-    serde_json::to_string(&ChatStreamResponseWire::from(&response))
-        .expect("OpenAI response must serialize")
-}
-
-/// The Dynamo response type omits an absent `reasoning_content`. SGLang's
-/// streaming contract emits it explicitly as `null`, so use a borrowed wire
-/// view instead of building and patching a `serde_json::Value` tree.
-#[derive(Serialize)]
-struct ChatStreamResponseWire<'a> {
-    id: &'a str,
-    choices: Vec<ChatChoiceStreamWire<'a>>,
-    created: u32,
-    model: &'a str,
-    service_tier: &'a Option<ChatServiceTier>,
-    system_fingerprint: &'a Option<String>,
-    object: &'a str,
-    usage: &'a Option<CompletionUsage>,
-}
-
-impl<'a> From<&'a CreateChatCompletionStreamResponse> for ChatStreamResponseWire<'a> {
-    fn from(response: &'a CreateChatCompletionStreamResponse) -> Self {
-        Self {
-            id: &response.id,
-            choices: response
-                .choices
-                .iter()
-                .map(ChatChoiceStreamWire::from)
-                .collect(),
-            created: response.created,
-            model: &response.model,
-            service_tier: &response.service_tier,
-            system_fingerprint: &response.system_fingerprint,
-            object: &response.object,
-            usage: &response.usage,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ChatChoiceStreamWire<'a> {
-    index: u32,
-    delta: ChatDeltaWire<'a>,
-    finish_reason: &'a Option<OpenAIFinishReason>,
-    logprobs: &'a Option<ChatChoiceLogprobs>,
-}
-
-impl<'a> From<&'a ChatChoiceStream> for ChatChoiceStreamWire<'a> {
-    fn from(choice: &'a ChatChoiceStream) -> Self {
-        Self {
-            index: choice.index,
-            delta: ChatDeltaWire::from(&choice.delta),
-            finish_reason: &choice.finish_reason,
-            logprobs: &choice.logprobs,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ChatDeltaWire<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<&'a ChatCompletionMessageContent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    function_call: Option<&'a ChatCompletionStreamResponseDeltaFunctionCall>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<&'a Vec<ChatCompletionMessageToolCallChunk>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<&'a Role>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    refusal: Option<&'a String>,
-    reasoning_content: Option<&'a str>,
-}
-
-impl<'a> From<&'a ChatCompletionStreamResponseDelta> for ChatDeltaWire<'a> {
-    fn from(delta: &'a ChatCompletionStreamResponseDelta) -> Self {
-        Self {
-            content: delta.content.as_ref(),
-            function_call: delta.function_call.as_ref(),
-            tool_calls: delta.tool_calls.as_ref(),
-            role: delta.role.as_ref(),
-            refusal: delta.refusal.as_ref(),
-            reasoning_content: delta.reasoning_content.as_deref(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
+    use super::{ChatResponseContext, chat_event_stream, chat_logprobs, unary_chat};
     use crate::openai::protocol::ChatCompletionRequest;
     use crate::openai::protocol::{chat_sampling_params, lower_chat_request};
     use crate::openai::test_utils::{chat_submitted, chunk};
@@ -615,7 +462,6 @@ mod tests {
         ChatPreprocessor, GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits,
         ResponseError, SamplingDefaults, TokenLogprob,
     };
-    use axum::http::StatusCode;
     use futures::StreamExt;
 
     fn request() -> ChatCompletionRequest {
@@ -665,8 +511,8 @@ mod tests {
         .response_processor
     }
 
-    fn wire_context(include_usage: bool) -> ChatStreamWireContext {
-        ChatStreamWireContext {
+    fn wire_context(include_usage: bool) -> ChatResponseContext {
+        ChatResponseContext {
             response_id: "chatcmpl-test".into(),
             model: "model".into(),
             created: 1,
@@ -783,11 +629,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let value = serde_json::to_value(response.unwrap()).unwrap();
         assert_eq!(value["choices"][0]["message"]["role"], "assistant");
         assert_eq!(value["choices"][0]["message"]["content"], "Paris");
         assert_eq!(value["choices"][1]["index"], 1);
@@ -812,11 +654,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let value = serde_json::to_value(response.unwrap()).unwrap();
         assert_eq!(
             value["choices"][0]["message"]["reasoning_content"],
             "because Paris is famous"
@@ -840,12 +678,15 @@ mod tests {
             wire_context(true),
         );
         futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
-        let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
-        let first_reasoning: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
-        let second_reasoning: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
-        let content: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
-        let terminal: serde_json::Value = serde_json::from_str(&frames[4]).unwrap();
+        let frames: Vec<_> = stream
+            .map(|chunk| serde_json::to_value(chunk.unwrap()).unwrap())
+            .collect()
+            .await;
+        let role = &frames[0];
+        let first_reasoning = &frames[1];
+        let second_reasoning = &frames[2];
+        let content = &frames[3];
+        let terminal = &frames[4];
         assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(
             first_reasoning["choices"][0]["delta"]["reasoning_content"],
@@ -860,11 +701,11 @@ mod tests {
         assert!(content["choices"][0]["delta"]["reasoning_content"].is_null());
         assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
-        assert_eq!(frames.len(), 7);
+        assert_eq!(frames.len(), 6);
     }
 
     #[tokio::test]
-    async fn streaming_chat_emits_role_deltas_usage_and_done() {
+    async fn streaming_chat_emits_role_deltas_and_usage() {
         let (choice, tx) = chat_submitted(0);
         tx.send(chunk("Par", false)).await.unwrap();
         tx.send(chunk("is", true)).await.unwrap();
@@ -875,12 +716,15 @@ mod tests {
             wire_context(true),
         );
         futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
-        assert_eq!(frames.len(), 5);
-        let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
-        let delta: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
-        let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
-        let usage: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
+        let frames: Vec<_> = stream
+            .map(|chunk| serde_json::to_value(chunk.unwrap()).unwrap())
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 4);
+        let role = &frames[0];
+        let delta = &frames[1];
+        let terminal = &frames[2];
+        let usage = &frames[3];
         assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
         assert!(role["choices"][0]["delta"]["reasoning_content"].is_null());
         assert_eq!(delta["choices"][0]["delta"]["content"], "Par");
@@ -889,7 +733,6 @@ mod tests {
         assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
-        assert_eq!(frames[4], "[DONE]");
     }
 
     #[tokio::test]
@@ -904,23 +747,26 @@ mod tests {
         futures::pin_mut!(stream);
 
         // Chat streams announce every choice before polling engine output.
-        stream.next().await.unwrap();
-        stream.next().await.unwrap();
+        stream.next().await.unwrap().unwrap();
+        stream.next().await.unwrap().unwrap();
         tx0.send(Err(ResponseError {
             status_code: 503,
             message: "out of memory".into(),
         }))
         .await
         .unwrap();
-        let error: serde_json::Value = serde_json::from_str(&stream.next().await.unwrap()).unwrap();
-        assert_eq!(error["error"]["code"], 503);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.status_code, 503);
 
         // The other choice may already be ready, but it must not be polled after
         // the aggregate request has emitted an error.
         tx1.send(chunk("late", true)).await.unwrap();
         let remaining = stream.collect::<Vec<_>>().await;
-        assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[1], "[DONE]");
-        assert!(remaining.iter().all(|frame| !frame.contains("late")));
+        assert_eq!(remaining.len(), 1);
+        assert!(
+            remaining
+                .into_iter()
+                .all(|chunk| chunk.unwrap().choices.is_empty())
+        );
     }
 }

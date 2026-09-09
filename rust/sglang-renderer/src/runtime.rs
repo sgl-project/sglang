@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, header};
 use axum::response::IntoResponse;
 
 use crate::engine::HttpGenerateClient;
-use crate::openai::{OpenAIHttpFrontend, hosted_routes, render_only_routes, standalone_routes};
+use crate::http::{OpenAIHttpFrontend, hosted_routes, render_only_routes, standalone_routes};
 
 #[derive(Clone, Debug)]
 pub struct RendererRuntimeConfig {

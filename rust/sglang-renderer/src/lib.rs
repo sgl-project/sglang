@@ -11,6 +11,8 @@ mod config;
 mod engine;
 mod error;
 #[cfg(feature = "http")]
+mod http;
+#[cfg(feature = "http")]
 mod launcher;
 #[cfg(feature = "http")]
 mod openai;
