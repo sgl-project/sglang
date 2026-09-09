@@ -219,6 +219,18 @@ framework-specific optimization workflow.
 - Numerical contract: these are bit-exact data-movement / same-order-add
   replacements and run independently of the request-gated Wan RMSNorm+SiLU
   path. Unsupported layouts or padding fall back to the aten chain.
+- `nearest_upsample_nhwc` (`layout/nearest_upsample_nhwc_triton.py`) is the
+  bit-exact Triton gather behind `GatedChannelsLastUpsample` in
+  `wan_vae_cuda_opt.py`; it runs on the lossless path whenever the 2D
+  upsample input already has canonical NHWC strides (aten's own NHWC nearest
+  kernel is several times slower), while the stride canonicalisation, the
+  channels_last_3d `upsample3d` frame interleave (`_interleave_time_pairs` in
+  `wanvae.py`) and the attention residual operand order (`identity + x`, so
+  the sum keeps channels_last_3d) stay behind the quality gate: the first two
+  change which cuDNN conv2d algorithm runs, and the layout change alters the
+  reduction order of the eager RMSNorm that follows under fp32 autocast
+  (Wan pipelines decode with fp32 VAE weights under bf16 autocast, where this
+  was measured non-bit-exact even though the add itself is commutative).
 - The Qwen-Image VAE (`autoencoder_kl_qwenimage.py`) uses the same
   `cat_pad_channels_last_3d` + compact-cache helper for every causal conv
   slot; single-frame image decodes keep the compact cache at the reference
