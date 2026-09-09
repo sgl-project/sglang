@@ -1,12 +1,6 @@
 name: Release Docker Images Nightly ROCm7.0 (AMD)
 on:
   workflow_dispatch:
-    inputs:
-      skip_push:
-        description: 'Build images but do not push to Docker Hub (PR / debug)'
-        required: false
-        type: boolean
-        default: false
   schedule:
     - cron: '0 12 * * *'
 
@@ -94,24 +88,18 @@ jobs:
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
           docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.skip_push }}" = "true" ]; then
-            echo "skip_push=true: built rocm/sgl-dev:${tag}-${{ env.DATE }} but not pushing"
-          else
-            docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
-          fi
+          docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
       # Persist the tag right after rocm/sgl-dev push succeeds so the local
       # registry mirror can run even if a later step in this job (lmsys push)
       # fails. By default this step only runs when the previous step succeeded,
       # so the artifact only exists when an image actually landed on Docker Hub.
       - name: Save published image tag
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_push != true }}
         run: |
           mkdir -p image-tag
           echo "${{ env.IMAGE_TAG }}" > "image-tag/${{ matrix.gpu_arch }}.txt"
 
       - name: Upload image tag artifact
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_push != true }}
         uses: actions/upload-artifact@v4
         with:
           name: image-tag-${{ matrix.gpu_arch }}
@@ -119,14 +107,12 @@ jobs:
           retention-days: 1
 
       - name: Login to Docker Hub (lmsys)
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_push != true }}
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push to lmsysorg/sglang-rocm
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_push != true }}
         run: |
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
