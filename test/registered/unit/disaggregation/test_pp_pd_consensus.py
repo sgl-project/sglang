@@ -120,7 +120,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.disaggregation.prefill." "poll_and_all_reduce_attn_cp_tp_group",
+            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
             return_value=[
                 KVPoll.Failed,
                 KVPoll.WaitingForInput,
@@ -164,7 +164,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.disaggregation.prefill." "poll_and_all_reduce_attn_cp_tp_group",
+            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
             return_value=[
                 KVPoll.WaitingForInput,
                 KVPoll.Failed,
