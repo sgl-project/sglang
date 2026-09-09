@@ -101,9 +101,24 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif decode_backend == "aiter":
+            # dcp_comm_backend and dcp_replicate_q_proj are deliberately left to
+            # the shared tail below, which sets both unconditionally.
+            prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
+            logger.info(
+                "Kimi-K3 DCP uses aiter MLA decode: "
+                f"prefill={prefill_backend!r} -> {prefill_ab!r}, "
+                f"decode={decode_backend!r} -> 'aiter'."
+            )
+            overrides.update(
+                prefill_attention_backend=prefill_ab,
+                decode_attention_backend="aiter",
+            )
+            if cfg.page_size is None:
+                overrides["page_size"] = 32
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None:

@@ -20,11 +20,16 @@ Consolidated from the two merged DCP implementations:
   - _correct_attn_cp_out_kernel / correct_attn_out / CPTritonContext  (PR #14194)
 """
 
+import math
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+# Natural-log -> base-2 rebase for the DCP LSE merges. mla_gluon returns
+# natural-log LSE while is_mla_dcp_lse_base_on_e() reports base-2 for aiter.
+_LOG2E = math.log2(math.e)
 
 
 # ---------------------------------------------------------------------------
@@ -676,3 +681,52 @@ def _lse_weighted_combine_cpu(
 
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined
+
+
+# ---------------------------------------------------------------------------
+# aiter MLA DCP (Gluon): per-token block table, dense window attention, and the
+# base-2 LSE combine.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dcp_ragged_to_block_table_kernel(
+    kv_indices_ptr,  # [total_local_kv] flat, this-rank round-robin shard
+    kv_indptr_ptr,  # [bs + 1] per-request offsets into kv_indices
+    dest_ptr,  # [bs, MAX_COLS] token table (physical slot per (req, pos))
+    dest_stride0: tl.int64,
+    MAX_COLS: tl.constexpr,
+):
+    req = tl.program_id(0)
+    start = tl.load(kv_indptr_ptr + req)
+    n = tl.load(kv_indptr_ptr + req + 1) - start
+    cols = tl.arange(0, MAX_COLS)
+    mask = cols < n
+    vals = tl.load(kv_indices_ptr + start + cols, mask=mask, other=0)
+    tl.store(dest_ptr + req * dest_stride0 + cols, vals, mask=mask)
+
+
+def build_dcp_block_table(
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    bs: int,
+    max_cols: int,
+):
+    """Scatter a ragged (kv_indptr, kv_indices) shard into a 2D table
+    ``[bs, max_cols]`` with ONE COLUMN PER TOKEN.
+
+    ``mla_gluon`` fixes PAGE_SIZE at 1, so its 2-D view wants a token table
+    rather than a paged one. Unused tail columns stay 0 and are never read
+    (bounded by ``seqused_k``).
+    """
+    block_tables = torch.zeros(
+        bs, max_cols, dtype=torch.int32, device=kv_indices.device
+    )
+    _dcp_ragged_to_block_table_kernel[(bs,)](
+        kv_indices,
+        kv_indptr,
+        block_tables,
+        block_tables.stride(0),
+        MAX_COLS=triton.next_power_of_2(max_cols),
+    )
+    return block_tables

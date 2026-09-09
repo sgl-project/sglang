@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
@@ -22,7 +22,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.common import is_hip, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,39 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
+def validate_aiter_mla_dcp(server_args: Any, *, prefill_backend: Optional[str] = None):
+    """Validate aiter MLA decode-context-parallel (--dcp-size > 1)."""
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.layers.attention.aiter_mla_gluon import _gluon_fn
+
+    model_config = model_config_of(server_args)
+    if model_config.attention_arch != AttentionArch.MLA:
+        return
+
+    # Gluon is the only aiter MLA DCP implementation, so its availability is the
+    # whole gate. _gluon_fn() folds SGLANG_AITER_MLA_GLUON, the aiter import and
+    # the triton >= 3.7 cga_layout check into one cached answer and logs which
+    # of them failed. Refuse here rather than at kernel-compile time.
+    if _gluon_fn() is None:
+        raise ValueError(
+            "The aiter MLA DCP decode path (--dcp-size > 1) requires the aiter "
+            "Gluon MLA kernel, which is unavailable (see the preceding "
+            "'aiter mla gluon is disabled' log line for the reason: "
+            "SGLANG_AITER_MLA_GLUON=0, the aiter import, or triton < 3.7). "
+            "Run decode on another backend (--decode-attention-backend)."
+        )
+
+    # TEMPORARY, lifted by the triton-MLA-DCP fix later in this series:
+    # that path double-filters its MLA KV writes under DCP, silently.
+    if prefill_backend == "triton":
+        raise ValueError(
+            "--prefill-attention-backend triton is not yet supported "
+            "together with the aiter MLA DCP decode path (--dcp-size > 1): "
+            "the triton extend path corrupts its MLA KV writes under DCP. "
+            "Use the default aiter prefill backend."
+        )
+
+
 def handle_dcp_validation(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
@@ -146,6 +179,14 @@ def handle_dcp_validation(server_args: Any):
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
+    # Resolve the decode backend the way the model overrides do: gating on
+    # attention_backend alone misses --decode-attention-backend aiter.
+    if cfg.dcp_size > 1 and is_hip():
+        from sglang.srt.arg_groups.overrides import attention_backends_of
+
+        prefill_backend, decode_backend = attention_backends_of(cfg)
+        if decode_backend == "aiter":
+            validate_aiter_mla_dcp(server_args, prefill_backend=prefill_backend)
 
 
 def handle_data_parallelism(server_args: Any):
