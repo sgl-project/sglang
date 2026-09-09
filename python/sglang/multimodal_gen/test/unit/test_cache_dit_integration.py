@@ -22,7 +22,7 @@ class _FakeForwardPattern:
     Pattern_3 = "Pattern_3"
 
 
-def _install_cache_dit_stub():
+def _install_cache_dit_stub(*, top_level_exports=False):
     cache_dit = types.ModuleType("cache_dit")
     cache_dit.enable_calls = []
     cache_dit.disable_calls = []
@@ -74,6 +74,12 @@ def _install_cache_dit_stub():
     parallelism = types.ModuleType("cache_dit.parallelism")
     parallelism.ParallelismBackend = object
     parallelism.ParallelismConfig = object
+
+    if top_level_exports:
+        cache_dit.BlockAdapterRegister = _FakeBlockAdapterRegister
+        cache_dit.ParallelismBackend = parallelism.ParallelismBackend
+        cache_dit.ParallelismConfig = parallelism.ParallelismConfig
+        return {"cache_dit": cache_dit}
 
     return {
         "cache_dit": cache_dit,
@@ -147,8 +153,8 @@ def _install_torch_stub():
     }
 
 
-def _import_module_with_stub():
-    stub_modules = _install_cache_dit_stub()
+def _import_module_with_stub(*, top_level_exports=False):
+    stub_modules = _install_cache_dit_stub(top_level_exports=top_level_exports)
     stub_modules.update(_install_sglang_dependency_stubs())
     stub_modules.update(_install_torch_stub())
     module_path = (
@@ -165,6 +171,22 @@ def _import_module_with_stub():
         assert spec.loader is not None
         spec.loader.exec_module(module)
     return module
+
+
+class TestCacheDitImportCompatibility(unittest.TestCase):
+    def test_imports_legacy_submodule_exports(self):
+        module = _import_module_with_stub()
+
+        self.assertIsNotNone(module.BlockAdapterRegister)
+        self.assertIsNotNone(module.ParallelismBackend)
+        self.assertIsNotNone(module.ParallelismConfig)
+
+    def test_imports_top_level_exports(self):
+        module = _import_module_with_stub(top_level_exports=True)
+
+        self.assertIsNotNone(module.BlockAdapterRegister)
+        self.assertIsNotNone(module.ParallelismBackend)
+        self.assertIsNotNone(module.ParallelismConfig)
 
 
 class TestCacheDitRefreshContext(unittest.TestCase):
