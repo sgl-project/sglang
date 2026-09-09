@@ -281,7 +281,11 @@ def finalize_all_reduce_push_norm(
     (``sum_k expert_weights[t, k] * gemm2_out[idx[t*16 + k]]``, -1 slots
     skipped) is computed during the multicast staging pass from the
     trtllm-gen deferred-finalize triple (``do_finalize=False``) and never
-    materializes in global memory. top_k is fixed to 16 (K3)."""
+    materializes in global memory. top_k is fixed to 16 (K3).
+
+    ``expert_weights`` may be fp32 or bf16 and is consumed at that precision
+    (the accumulator is fp32 either way): trtllm-gen hands back fp32 weights
+    for the unpacked routing K3 emits, bf16 for the packed form."""
     _finalize_push_norm_op(
         world_size,
         out,
