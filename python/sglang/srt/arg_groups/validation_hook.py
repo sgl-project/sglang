@@ -31,11 +31,17 @@ logger = logging.getLogger(__name__)
 
 def check_watermark_server_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
-    if (cfg.watermark_key is not None or cfg.watermark_config is not None) and not (
-        cfg.enable_watermark
-    ):
+    has_watermark_setting = any(
+        (
+            cfg.watermark_key is not None,
+            cfg.watermark_config is not None,
+            cfg.watermark_default_enabled,
+            cfg.watermark_enforce_all,
+        )
+    )
+    if has_watermark_setting and not cfg.enable_watermark:
         raise ValueError(
-            "--watermark-key and --watermark-config require --enable-watermark"
+            "watermark key, config, and mode arguments require --enable-watermark"
         )
 
     if not cfg.enable_watermark:
@@ -47,6 +53,13 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if cfg.watermark_key is not None:
         parse_watermark_key(cfg.watermark_key)
+    if (
+        cfg.watermark_default_enabled or cfg.watermark_enforce_all
+    ) and cfg.watermark_key is None:
+        raise ValueError(
+            "--watermark-default-enabled and --watermark-enforce-all require "
+            "--watermark-key or --watermark-config"
+        )
     if not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW:
         raise ValueError(
             "--watermark-context-window must be from 1 to 64, "

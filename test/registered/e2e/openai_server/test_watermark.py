@@ -16,13 +16,14 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
 
 _MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 _KEY_A = "0123456789abcdef"
 _KEY_B = "fedcba9876543210"
 _MASK32 = 0xFFFFFFFF
 _UINT32_SCALE = float(1 << 32)
+_OMITTED = object()
 
 
 def _rotl32(value, shift):
@@ -75,8 +76,8 @@ def _watermark_z_score(prompt_token_ids, response_token_ids, key, context_window
     return len(seen), (score - len(seen)) / math.sqrt(len(seen))
 
 
-def _chat_payload(key, *, max_tokens):
-    return {
+def _chat_payload(watermark=_OMITTED, *, max_tokens):
+    payload = {
         "model": _MODEL,
         "messages": [
             {
@@ -92,8 +93,31 @@ def _chat_payload(key, *, max_tokens):
         "max_tokens": max_tokens,
         "ignore_eos": True,
         "return_token_ids": True,
-        "watermark": {"key": key, "context_window": 4},
     }
+    if watermark is not _OMITTED:
+        payload["watermark"] = watermark
+    return payload
+
+
+def _assert_detected(response, key, *, other_key=None):
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    prompt_token_ids = choice["prompt_token_ids"]
+    response_token_ids = choice["response_token_ids"]
+    count, z_score = _watermark_z_score(
+        prompt_token_ids,
+        response_token_ids,
+        int(key, 16),
+    )
+    assert count >= 100
+    assert z_score >= 5.0
+    if other_key is not None:
+        _, other_z = _watermark_z_score(
+            prompt_token_ids,
+            response_token_ids,
+            int(other_key, 16),
+        )
+        assert z_score - other_z >= 4.0
 
 
 class TestWatermarkDisabledEndpoint(CustomTestCase):
@@ -111,16 +135,26 @@ class TestWatermarkDisabledEndpoint(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def test_request_requires_server_enablement(self):
-        response = requests.post(
+        disabled = requests.post(
             f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
-            json=_chat_payload(_KEY_A, max_tokens=1),
+            json=_chat_payload({"enabled": False}, max_tokens=1),
             timeout=60,
         )
-        assert response.status_code == 400
-        assert _KEY_A not in response.text
+        assert disabled.status_code == 200, disabled.text
+
+        for watermark in ({"enabled": True}, {"key": _KEY_A}):
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
+                json=_chat_payload(watermark, max_tokens=1),
+                timeout=60,
+            )
+            assert response.status_code == 400
+            assert _KEY_A not in response.text
 
 
-class TestWatermarkRequestEndpoint(CustomTestCase):
+class WatermarkServerTest(CustomTestCase):
+    mode_args = []
+
     @classmethod
     def setUpClass(cls):
         cls.config_file = tempfile.NamedTemporaryFile(
@@ -137,6 +171,7 @@ class TestWatermarkRequestEndpoint(CustomTestCase):
                 "--enable-watermark",
                 "--watermark-config",
                 cls.config_file.name,
+                *cls.mode_args,
             ],
         )
 
@@ -147,41 +182,80 @@ class TestWatermarkRequestEndpoint(CustomTestCase):
         if hasattr(cls, "config_file"):
             os.unlink(cls.config_file.name)
 
+
+class TestWatermarkRequestEndpoint(WatermarkServerTest):
+    def test_omitted_and_disabled_requests_are_not_rejected(self):
+        for watermark in (_OMITTED, {"enabled": False}):
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
+                json=_chat_payload(watermark, max_tokens=1),
+                timeout=60,
+            )
+            assert response.status_code == 200, response.text
+
     def test_bad_request_key_is_rejected_without_echo(self):
         bad_key = "not-a-hex-key"
         response = requests.post(
             f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
-            json=_chat_payload(bad_key, max_tokens=1),
+            json=_chat_payload({"key": bad_key}, max_tokens=1),
             timeout=60,
         )
         assert response.status_code == 400
         assert bad_key not in response.text
 
     def test_per_request_keys_are_isolated(self):
-        keys = [_KEY_A, _KEY_B]
-        generations = []
-        for key in keys:
+        for key, watermark in (
+            (_KEY_A, {"enabled": True}),
+            (_KEY_B, {"key": _KEY_B}),
+        ):
             response = requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
-                json=_chat_payload(key, max_tokens=512),
+                json=_chat_payload(watermark, max_tokens=512),
                 timeout=180,
             )
-            assert response.status_code == 200, response.text
-            choice = response.json()["choices"][0]
-            generations.append(
-                (choice["prompt_token_ids"], choice["response_token_ids"])
+            _assert_detected(
+                response,
+                key,
+                other_key=_KEY_B if key == _KEY_A else _KEY_A,
             )
 
-        for index, (prompt_token_ids, response_token_ids) in enumerate(generations):
-            own_count, own_z = _watermark_z_score(
-                prompt_token_ids, response_token_ids, int(keys[index], 16)
-            )
-            _, other_z = _watermark_z_score(
-                prompt_token_ids, response_token_ids, int(keys[1 - index], 16)
-            )
-            assert own_count >= 100
-            assert own_z >= 5.0
-            assert own_z - other_z >= 4.0
+
+class TestWatermarkDefaultEnabledEndpoint(WatermarkServerTest):
+    mode_args = ["--watermark-default-enabled"]
+
+    def test_omitted_request_uses_server_key_and_opt_out_is_allowed(self):
+        response = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
+            json=_chat_payload(max_tokens=512),
+            timeout=180,
+        )
+        _assert_detected(response, _KEY_A, other_key=_KEY_B)
+
+        disabled = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
+            json=_chat_payload({"enabled": False}, max_tokens=1),
+            timeout=60,
+        )
+        assert disabled.status_code == 200, disabled.text
+
+
+class TestWatermarkEnforceAllEndpoint(WatermarkServerTest):
+    mode_args = ["--watermark-enforce-all"]
+
+    def test_omitted_request_uses_server_key_and_opt_out_is_rejected(self):
+        response = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
+            json=_chat_payload(max_tokens=512),
+            timeout=180,
+        )
+        _assert_detected(response, _KEY_A, other_key=_KEY_B)
+
+        disabled = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
+            json=_chat_payload({"enabled": False}, max_tokens=1),
+            timeout=60,
+        )
+        assert disabled.status_code == 400
 
 
 if __name__ == "__main__":

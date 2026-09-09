@@ -22,6 +22,7 @@ def test_repeated_context_and_greedy_bypass():
         max_contexts_per_req=8,
         key="0123456789abcdef",
         device=device,
+        default_enabled=True,
     )
     req_pool_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
     state.init_from_prompt(req_pool_indices, [[10, 11], [20, 21]])
@@ -60,6 +61,7 @@ def test_retracted_request_restores_context_history():
         max_contexts_per_req=8,
         key="0123456789abcdef",
         device=device,
+        default_enabled=True,
     )
     req_pool_indices = torch.tensor([1], device=device, dtype=torch.int32)
     request = SimpleNamespace(
@@ -67,7 +69,10 @@ def test_retracted_request_restores_context_history():
         origin_input_ids=[10, 11],
         output_ids=[10, 11],
         sampling_params=SimpleNamespace(
-            watermark=normalize_watermark_request({"context_window": 2}), top_k=64
+            watermark=normalize_watermark_request(
+                {"enabled": True, "context_window": 2}
+            ),
+            top_k=64,
         ),
         get_fill_ids=lambda: [10, 11, 10, 11],
     )

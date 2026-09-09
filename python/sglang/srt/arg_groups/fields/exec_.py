@@ -94,6 +94,14 @@ class ExecFeatures:
         int,
         Arg(help="Default and maximum watermark context window.", resolvable=True),
     ] = 4
+    watermark_default_enabled: A[
+        bool,
+        "Watermark requests that omit the watermark field using the server key.",
+    ] = False
+    watermark_enforce_all: A[
+        bool,
+        "Require watermarking for every request and reject per-request opt-out.",
+    ] = False
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "

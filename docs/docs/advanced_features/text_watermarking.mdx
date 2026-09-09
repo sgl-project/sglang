@@ -32,7 +32,8 @@ chmod 600 /run/secrets/sglang-watermark.json
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-8B \
   --enable-watermark \
-  --watermark-config /run/secrets/sglang-watermark.json
+  --watermark-config /run/secrets/sglang-watermark.json \
+  --watermark-default-enabled
 ```
 
 <Warning>
@@ -50,21 +51,38 @@ The server arguments are:
 | --- | --- | --- |
 | `--enable-watermark` | disabled | Enables watermark state and accepts per-request watermark configuration. |
 | `--watermark-config PATH` | unset | Loads a JSON object containing exactly `key` and `context_window`. |
-| `--watermark-key HEX` | unset | Sets the default 64-bit key from 1 to 16 hexadecimal digits. Prefer the file option. |
+| `--watermark-key HEX` | unset | Makes a server-owned 64-bit key available to opted-in or default-enabled requests. Prefer the file option. |
 | `--watermark-context-window N` | `4` | Sets the default and the maximum window that a request may select, from 1 to 64 tokens. |
+| `--watermark-default-enabled` | disabled | Uses the server key when a request omits the `watermark` field. Requests may still opt out. |
+| `--watermark-enforce-all` | disabled | Uses the server key by default and rejects `{"enabled": false}`. |
 
 `--watermark-config` and `--watermark-key` are mutually exclusive. When a
 configuration file is used, its `context_window` takes precedence over
-`--watermark-context-window`. A default key applies to every sampling request
-that does not provide a different key. Starting with `--enable-watermark` and no
-default key leaves watermarking off until a request supplies one.
+`--watermark-context-window`. A server key does not by itself watermark every
+request. Add `--watermark-default-enabled` for a default-on service or
+`--watermark-enforce-all` for a service that also forbids opt-out. Both modes
+require a server key from `--watermark-key` or `--watermark-config`.
+
+The server modes resolve requests as follows:
+
+| Server mode | No `watermark` field | `{"enabled": false}` | `{"enabled": true}` | `{"key": "HEX"}` |
+| --- | --- | --- | --- | --- |
+| Watermarking disabled | Off | Off | HTTP 400 | HTTP 400 |
+| `--enable-watermark` with a server key | Off | Off | Server key | Request key |
+| Add `--watermark-default-enabled` | Server key | Off | Server key | Request key |
+| Add `--watermark-enforce-all` | Server key | HTTP 400 | Server key | Request key |
+
+With `--enable-watermark` and no server key, only a request that supplies its
+own key can enable watermarking. `{"enabled": true}` then returns HTTP 400
+instead of silently producing unwatermarked text.
 
 ## Configure a request
 
 The native generation API and the OpenAI-compatible completions and chat
-completions APIs accept a `watermark` object. A request key overrides the server
-default for that request. A request context window cannot exceed the server
-maximum.
+completions APIs accept a `watermark` object with optional `enabled`, `key`, and
+`context_window` fields. A request key implicitly enables watermarking and
+overrides the server key for that request. A request context window cannot
+exceed the server maximum.
 
 ```bash
 curl http://127.0.0.1:30000/v1/chat/completions \
@@ -75,15 +93,18 @@ curl http://127.0.0.1:30000/v1/chat/completions \
     "temperature": 1.0,
     "top_p": 0.95,
     "watermark": {
-      "key": "fedcba9876543210",
+      "enabled": true,
       "context_window": 4
     }
   }'
 ```
 
-The key must contain 1 to 16 hexadecimal digits, with an optional `0x` prefix.
-Invalid keys, requests sent to a server without `--enable-watermark`, and
-windows above the server maximum return HTTP 400.
+Use `{"enabled": false}` to opt out when the server allows it. An object that
+sets neither `enabled` nor `key`, a contradictory object that combines a key
+with `enabled: false`, invalid keys, enabled requests sent to a server without
+`--enable-watermark`, missing server keys for `enabled: true`, and windows above
+the server maximum return HTTP 400. Keys contain 1 to 16 hexadecimal digits,
+with an optional `0x` prefix.
 
 Request-level keys are credentials carried in the request body. Use an
 authenticated TLS endpoint whenever they cross a host boundary, and avoid

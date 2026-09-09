@@ -614,6 +614,8 @@ class ModelRunner:
             max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
             key=features.watermark_key,
             device=self.device,
+            default_enabled=features.watermark_default_enabled,
+            enforce_all=features.watermark_enforce_all,
         )
 
     def init_kv_cache_configurator(self):

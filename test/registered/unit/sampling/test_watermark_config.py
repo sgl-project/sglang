@@ -51,6 +51,7 @@ def test_file_config_resolution_contract(tmp_path):
         enable_watermark=True,
         watermark_config=str(config_path),
         watermark_context_window=9,
+        watermark_default_enabled=True,
     )
 
     server_args.resolve_once()
@@ -147,18 +148,53 @@ def test_default_key_source_validation(tmp_path, monkeypatch):
         check_watermark_server_args(server_args)
 
 
+@pytest.mark.parametrize(
+    "mode_flag",
+    ["watermark_default_enabled", "watermark_enforce_all"],
+)
+def test_default_modes_require_server_key(mode_flag):
+    server_args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        **{mode_flag: True},
+    )
+    server_args.resolve_once()
+    with pytest.raises(ValueError, match="require --watermark-key"):
+        check_watermark_server_args(server_args)
+
+
+@pytest.mark.parametrize(
+    "mode_flag",
+    ["watermark_default_enabled", "watermark_enforce_all"],
+)
+def test_default_modes_require_watermark_capability(mode_flag):
+    server_args = ServerArgs(model_path="dummy", **{mode_flag: True})
+    server_args.resolve_once()
+    with pytest.raises(ValueError, match="require --enable-watermark"):
+        check_watermark_server_args(server_args)
+
+
 def test_watermarked_beam_search_is_rejected(monkeypatch):
     features = SimpleNamespace(
         enable_watermark=True,
         watermark_key="0123456789abcdef",
         watermark_context_window=4,
+        watermark_default_enabled=False,
+        watermark_enforce_all=False,
     )
     monkeypatch.setattr(
         "sglang.srt.managers.tokenizer_manager.get_exec",
         lambda: SimpleNamespace(features=features),
     )
     with pytest.raises(ValueError, match="beam search is not supported"):
-        _validate_watermark_request(SamplingParams(beam_width=2))
+        _validate_watermark_request(
+            SamplingParams(beam_width=2, watermark={"enabled": True})
+        )
+
+    with pytest.raises(ValueError, match="requires a server default key"):
+        features.watermark_key = None
+        _validate_watermark_request(SamplingParams(watermark={"enabled": True}))
 
 
 def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):

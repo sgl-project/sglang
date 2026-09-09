@@ -44,6 +44,7 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
         return result
     if isinstance(value, WatermarkRequestConfig):
         return WatermarkRequestConfig(
+            enabled=value.enabled,
             key="<redacted>" if value.key is not None else None,
             context_window=value.context_window,
         )
@@ -93,12 +94,13 @@ def redact_watermark_command_line(argv: Sequence[str]) -> str:
 
 
 class WatermarkRequestConfig(msgspec.Struct, frozen=True, kw_only=True):
+    enabled: Optional[bool] = None
     key: Optional[str] = None
     context_window: Optional[int] = None
 
     def __repr__(self) -> str:
         return (
-            "WatermarkRequestConfig(key=<redacted>, "
+            f"WatermarkRequestConfig(enabled={self.enabled!r}, key=<redacted>, "
             f"context_window={self.context_window!r})"
         )
 
@@ -107,16 +109,20 @@ def normalize_watermark_request(value: Any) -> Optional[WatermarkRequestConfig]:
     if value is None:
         return None
     if isinstance(value, WatermarkRequestConfig):
+        enabled = value.enabled
         key = value.key
         context_window = value.context_window
     else:
         if not isinstance(value, dict):
             raise ValueError("watermark must be an object")
-        unknown = set(value) - {"key", "context_window"}
+        unknown = set(value) - {"enabled", "key", "context_window"}
         if unknown:
             raise ValueError("watermark contains unknown fields")
+        enabled = value.get("enabled")
         key = value.get("key")
         context_window = value.get("context_window")
+    if enabled is not None and type(enabled) is not bool:
+        raise ValueError("watermark enabled must be a boolean")
     if key is not None:
         parse_watermark_key(key)
     if context_window is not None and (
@@ -125,7 +131,67 @@ def normalize_watermark_request(value: Any) -> Optional[WatermarkRequestConfig]:
         or context_window < 1
     ):
         raise ValueError("watermark context_window must be a positive integer")
-    return WatermarkRequestConfig(key=key, context_window=context_window)
+    return WatermarkRequestConfig(
+        enabled=enabled,
+        key=key,
+        context_window=context_window,
+    )
+
+
+def resolve_watermark_request(
+    config: Optional[WatermarkRequestConfig],
+    *,
+    server_enabled: bool,
+    default_key: Optional[str],
+    default_context_window: int,
+    default_enabled: bool,
+    enforce_all: bool,
+) -> tuple[Optional[str], int, bool]:
+    context_window = (
+        config.context_window
+        if config is not None and config.context_window is not None
+        else default_context_window
+    )
+    if config is not None and config.context_window is not None:
+        if config.context_window > default_context_window:
+            raise ValueError(
+                "request watermark context_window cannot exceed the server "
+                "--watermark-context-window"
+            )
+
+    if config is None:
+        enabled = default_enabled or enforce_all
+        request_key = None
+    else:
+        if config.enabled is False:
+            if config.key is not None:
+                raise ValueError(
+                    "request watermark key cannot be combined with enabled=false"
+                )
+            if enforce_all:
+                raise ValueError(
+                    "request watermark enabled=false is not allowed when "
+                    "--watermark-enforce-all is set"
+                )
+            return None, context_window, False
+        enabled = config.enabled is True or config.key is not None
+        request_key = config.key
+        if not enabled:
+            raise ValueError("request watermark must set enabled or key")
+
+    if not enabled:
+        return None, context_window, False
+    if not server_enabled:
+        raise ValueError(
+            "request watermarking requires the server to enable --enable-watermark"
+        )
+    resolved_key = request_key if request_key is not None else default_key
+    if resolved_key is None:
+        raise ValueError(
+            "request watermark enabled=true requires a server default key or "
+            "request key"
+        )
+    return resolved_key, context_window, True
 
 
 def build_watermark_batch_config(
@@ -133,6 +199,8 @@ def build_watermark_batch_config(
     *,
     default_key: Optional[str],
     default_context_window: int,
+    default_enabled: bool,
+    enforce_all: bool,
     device: torch.device | str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     keys = []
@@ -140,17 +208,17 @@ def build_watermark_batch_config(
     enabled = []
     for request in requests:
         config = request.sampling_params.watermark
-        key = (
-            config.key if config is not None and config.key is not None else default_key
-        )
-        context_window = (
-            config.context_window
-            if config is not None and config.context_window is not None
-            else default_context_window
+        key, context_window, request_enabled = resolve_watermark_request(
+            config,
+            server_enabled=True,
+            default_key=default_key,
+            default_context_window=default_context_window,
+            default_enabled=default_enabled,
+            enforce_all=enforce_all,
         )
         keys.append(parse_watermark_key(key) if key is not None else 0)
         context_windows.append(context_window)
-        enabled.append(key is not None)
+        enabled.append(request_enabled)
     return (
         torch.tensor(keys, dtype=torch.int64, device=device),
         torch.tensor(context_windows, dtype=torch.int32, device=device),
@@ -342,8 +410,13 @@ class WatermarkState:
         max_contexts_per_req: int,
         key: Optional[str],
         device: str,
+        default_enabled: bool = False,
+        enforce_all: bool = False,
     ) -> None:
+        self.default_key_source = key
         self.default_key = parse_watermark_key(key) if key is not None else None
+        self.default_enabled = default_enabled
+        self.enforce_all = enforce_all
         self.context_window = context_window
         self.token_ids = torch.zeros(
             (max_num_reqs, context_window), dtype=torch.int32, device=device
@@ -378,6 +451,8 @@ class WatermarkState:
         max_contexts_per_req: int,
         key: Optional[str],
         device: str,
+        default_enabled: bool = False,
+        enforce_all: bool = False,
     ) -> Optional[WatermarkState]:
         if not enabled:
             return None
@@ -387,6 +462,8 @@ class WatermarkState:
             max_contexts_per_req=max_contexts_per_req,
             key=key,
             device=device,
+            default_enabled=default_enabled,
+            enforce_all=enforce_all,
         )
 
     def prompt_tails(self, batch: ScheduleBatch) -> Optional[list[Optional[list[int]]]]:
@@ -425,21 +502,18 @@ class WatermarkState:
 
             has_retracted_request = True
             request_config = req.sampling_params.watermark
-            request_key = (
-                request_config.key
-                if request_config is not None and request_config.key is not None
-                else self.default_key
+            _, context_window, request_enabled = resolve_watermark_request(
+                request_config,
+                server_enabled=True,
+                default_key=self.default_key_source,
+                default_context_window=self.context_window,
+                default_enabled=self.default_enabled,
+                enforce_all=self.enforce_all,
             )
-            if request_key is None or req.sampling_params.top_k <= 1:
+            if not request_enabled or req.sampling_params.top_k <= 1:
                 histories.append([])
                 continue
 
-            context_window = (
-                request_config.context_window
-                if request_config is not None
-                and request_config.context_window is not None
-                else self.context_window
-            )
             token_ids = list(req.origin_input_ids) + list(req.output_ids)
             seen = set()
             history = []
@@ -566,7 +640,8 @@ class WatermarkState:
             ),
             torch.full(
                 (batch_size,),
-                self.default_key is not None,
+                self.default_key is not None
+                and (self.default_enabled or self.enforce_all),
                 dtype=torch.bool,
                 device=device,
             ),

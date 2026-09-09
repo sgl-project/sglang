@@ -148,6 +148,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermark import (
     redact_watermark_command_line,
     redact_watermark_secrets,
+    resolve_watermark_request,
 )
 from sglang.srt.server_args import (
     PortArgs,
@@ -189,22 +190,15 @@ logger = logging.getLogger(__name__)
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     watermark = sampling_params.watermark
     features = get_exec().features
-    if watermark is not None and not features.enable_watermark:
-        raise ValueError(
-            "request watermarking requires the server to enable --enable-watermark"
-        )
-    if (
-        watermark is not None
-        and watermark.context_window is not None
-        and watermark.context_window > features.watermark_context_window
-    ):
-        raise ValueError(
-            "request watermark context_window cannot exceed the server "
-            "--watermark-context-window"
-        )
-    request_key = watermark.key if watermark is not None else None
-    resolved_key = request_key if request_key is not None else features.watermark_key
-    if resolved_key is not None and (sampling_params.beam_width or 1) > 1:
+    _, _, enabled = resolve_watermark_request(
+        watermark,
+        server_enabled=features.enable_watermark,
+        default_key=features.watermark_key,
+        default_context_window=features.watermark_context_window,
+        default_enabled=features.watermark_default_enabled,
+        enforce_all=features.watermark_enforce_all,
+    )
+    if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
 
 

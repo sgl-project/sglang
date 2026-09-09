@@ -160,6 +160,8 @@ class SamplingBatchInfo:
                 reqs,
                 default_key=features.watermark_key,
                 default_context_window=features.watermark_context_window,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
                 device=device,
             )
         else:

@@ -375,7 +375,13 @@ class CompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
-    watermark: Optional[Dict[str, Any]] = None
+    watermark: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-request watermark settings: enabled, key, and context_window. "
+            "A key implicitly enables watermarking."
+        ),
+    )
 
     images_config: Optional[Dict] = None
 
@@ -943,7 +949,13 @@ class ChatCompletionRequest(BaseModel):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
-    watermark: Optional[Dict[str, Any]] = None
+    watermark: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-request watermark settings: enabled, key, and context_window. "
+            "A key implicitly enables watermarking."
+        ),
+    )
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens

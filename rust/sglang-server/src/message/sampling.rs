@@ -97,6 +97,8 @@ fn max_new_tokens_default() -> Option<i64> {
 #[serde(deny_unknown_fields)]
 pub struct WatermarkRequestConfig {
     #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
     pub key: Option<String>,
     #[serde(default)]
     pub context_window: Option<i64>,
@@ -105,6 +107,7 @@ pub struct WatermarkRequestConfig {
 impl fmt::Debug for WatermarkRequestConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WatermarkRequestConfig")
+            .field("enabled", &self.enabled)
             .field("key", &"<redacted>")
             .field("context_window", &self.context_window)
             .finish()
@@ -937,7 +940,7 @@ mod tests {
         let key = "0123456789abcdef";
         let sampling = norm(
             &serde_json::json!({
-                "watermark": {"key": key, "context_window": 4}
+                "watermark": {"enabled": true, "key": key, "context_window": 4}
             })
             .to_string(),
         );
@@ -945,6 +948,7 @@ mod tests {
 
         assert_eq!(watermark.key.as_deref(), Some(key));
         assert_eq!(watermark.context_window, Some(4));
+        assert_eq!(watermark.enabled, Some(true));
         assert!(!format!("{sampling:?}").contains(key));
     }
 
