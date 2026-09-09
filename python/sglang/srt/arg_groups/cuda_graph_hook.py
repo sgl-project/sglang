@@ -280,7 +280,12 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     rules = [
         (
             "KDA hybrid linear attention",
-            lambda: uses_kda_attention(model_config_of(server_args).hf_config),
+            # GLM-5.3 Flash has capture stubs for stateful KDA and pooled DSA.
+            lambda: (
+                uses_kda_attention(model_config_of(server_args).hf_config)
+                and "Glm5NextForConditionalGeneration"
+                not in model_config_of(server_args).hf_config.architectures
+            ),
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
@@ -397,6 +402,77 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
         ),
     )
+
+
+def apply_glm5_chunked_prefill_default(server_args: Any):
+    """Set the GLM CUDA chunk default before memory budgeting consumes it."""
+    cfg = resolving_view(server_args)
+    if (
+        get_platform().is_cuda
+        and cfg.chunked_prefill_size is None
+        and "Glm5NextForConditionalGeneration"
+        in model_config_of(server_args).hf_config.architectures
+    ):
+        declare_resolution(
+            server_args,
+            "_apply_glm5_chunked_prefill_default",
+            chunked_prefill_size=4096,
+        )
+
+
+def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
+    """Resolve GLM eligibility and capture sizes from the effective backends.
+
+    Keep memory budgeting in its existing phase. A fallback to eager may retain
+    the conservative graph reserve in an automatically calculated budget.
+    """
+    cfg = resolving_view(server_args)
+    if (
+        cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE
+        or "Glm5NextForConditionalGeneration"
+        not in model_config_of(server_args).hf_config.architectures
+    ):
+        return
+    locked = server_args._cuda_graph_config_locked
+    validated = (
+        not cfg.enable_memory_saver
+        and (cfg.linear_attn_prefill_backend or cfg.linear_attn_backend) == "triton"
+        and (cfg.linear_attn_decode_backend or cfg.linear_attn_backend) == "triton"
+        and cfg.linear_attn_verify_backend in (None, "triton")
+        and cfg.dsa_prefill_backend == "trtllm"
+        and cfg.dsa_decode_backend == "trtllm"
+        and cfg.kv_cache_dtype == "fp8_e4m3"
+    )
+    if not validated and (Phase.PREFILL, "backend") not in locked:
+        logger.warning(
+            "Disabling GLM-5.3 Flash breakable prefill CUDA graphs by default: "
+            "validated with Triton KDA, TRTLLM DSA prefill/decode, FP8 E4M3 KV "
+            "and memory saver disabled. "
+            "Set --cuda-graph-backend-prefill breakable to opt in explicitly."
+        )
+        declare_resolution(
+            server_args,
+            "_apply_glm5_prefill_cuda_graph_policy",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+        return
+    if any((Phase.PREFILL, key) in locked for key in ("max_bs", "bs")):
+        return
+    # Capacity defaults have already populated buckets. Replace the unlocked
+    # ceiling and its buckets together.
+    declare_resolution(
+        server_args,
+        "_apply_glm5_prefill_cuda_graph_policy",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config,
+            Phase.PREFILL,
+            max_bs=4096,
+            bs=generate_prefill_cuda_graph_batch_sizes(4096),
+        ),
+    )
+    apply_deepep_adjustments(server_args)
 
 
 def apply_deepep_adjustments(server_args: Any):

@@ -177,6 +177,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # resolution (the declarative registry materializes too late to affect
     # it). Inkling opts into full-graph prefill capture here.
     from sglang.srt.arg_groups.cuda_graph_hook import (
+        apply_glm5_chunked_prefill_default,
+        apply_glm5_prefill_cuda_graph_policy,
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
@@ -185,6 +187,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     apply_inkling_prefill_cuda_graph_default(server_args)
     apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args)
+    apply_glm5_chunked_prefill_default(server_args)
 
     # must run before _handle_cuda_graph_config and _handle_data_parallelism
     handle_dwdp(server_args)
@@ -261,6 +264,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_mamba_backend(server_args)
     handle_int8_mamba_checkpoint(server_args)
     handle_linear_attn_backend(server_args)
+    apply_glm5_prefill_cuda_graph_policy(server_args)
     handle_kv4_compatibility(server_args)
     handle_mxfp8_kv_cache_compatibility(server_args)
     run_post_process_pass(server_args, _page_size_default)
