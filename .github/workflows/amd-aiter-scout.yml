@@ -12,7 +12,7 @@ on:
         type: string
         default: 'main'
       job_filter:
-        description: 'Workflows: nightly-amd-rocm720, pr-test-amd-rocm720. Default: all'
+        description: 'Workflows: nightly-amd, pr-test-amd. Default: all'
         required: false
         type: string
         default: 'all'
@@ -37,8 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       aiter_sha: ${{ steps.resolve.outputs.sha }}
-      run_nightly_amd_rocm720: ${{ steps.parse.outputs.run_nightly_amd_rocm720 }}
-      run_pr_test_amd_rocm720: ${{ steps.parse.outputs.run_pr_test_amd_rocm720 }}
+      run_nightly_amd: ${{ steps.parse.outputs.run_nightly_amd }}
+      run_pr_test_amd: ${{ steps.parse.outputs.run_pr_test_amd }}
     steps:
       - name: Resolve AITER commit
         id: resolve
@@ -70,20 +70,20 @@ jobs:
           echo "Job filter: ${FILTER}"
 
           if [[ "$FILTER" == "all" ]]; then
-            echo "run_nightly_amd_rocm720=true" >> $GITHUB_OUTPUT
-            echo "run_pr_test_amd_rocm720=true" >> $GITHUB_OUTPUT
+            echo "run_nightly_amd=true" >> $GITHUB_OUTPUT
+            echo "run_pr_test_amd=true" >> $GITHUB_OUTPUT
           else
             # Wrap with commas for exact substring matching.
             PADDED=",${FILTER// /},"
-            echo "run_nightly_amd_rocm720=$(echo "$PADDED" | grep -q ',nightly-amd-rocm720,' && echo true || echo false)" >> $GITHUB_OUTPUT
-            echo "run_pr_test_amd_rocm720=$(echo "$PADDED" | grep -q ',pr-test-amd-rocm720,' && echo true || echo false)" >> $GITHUB_OUTPUT
+            echo "run_nightly_amd=$(echo "$PADDED" | grep -q ',nightly-amd,' && echo true || echo false)" >> $GITHUB_OUTPUT
+            echo "run_pr_test_amd=$(echo "$PADDED" | grep -q ',pr-test-amd,' && echo true || echo false)" >> $GITHUB_OUTPUT
           fi
 
           echo "### Job Filter" >> $GITHUB_STEP_SUMMARY
           echo "- **Filter:** \`${FILTER}\`" >> $GITHUB_STEP_SUMMARY
 
-  call-nightly-amd-rocm720:
-    if: needs.resolve-aiter.outputs.run_nightly_amd_rocm720 == 'true'
+  call-nightly-amd:
+    if: needs.resolve-aiter.outputs.run_nightly_amd == 'true'
     needs: resolve-aiter
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
@@ -94,8 +94,8 @@ jobs:
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
-  call-pr-test-amd-rocm720:
-    if: needs.resolve-aiter.outputs.run_pr_test_amd_rocm720 == 'true'
+  call-pr-test-amd:
+    if: needs.resolve-aiter.outputs.run_pr_test_amd == 'true'
     needs: resolve-aiter
     uses: ./.github/workflows/pr-test-amd.yml
     secrets: inherit
@@ -110,8 +110,8 @@ jobs:
     if: always()
     needs:
       - resolve-aiter
-      - call-nightly-amd-rocm720
-      - call-pr-test-amd-rocm720
+      - call-nightly-amd
+      - call-pr-test-amd
     runs-on: ubuntu-latest
     steps:
       - name: Summary
@@ -124,8 +124,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Workflow | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Nightly AMD ROCm 10 | \`${{ needs.call-nightly-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| PR Test AMD ROCm 10 Gate | \`${{ needs.call-pr-test-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nightly AMD ROCm 10 | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm 10 Gate | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
 
       - name: Check if any job failed
         run: |

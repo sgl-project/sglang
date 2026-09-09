@@ -129,21 +129,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Parse the default ROCm 7.2 PR gate (exclude utility jobs)
+          # Parse the canonical multi-version AMD PR gate (exclude utility jobs)
           # Excluded: call-gate, check-changes, finish, cancel, check-all-jobs,
           # plus the stage waits -- they run on ubuntu-latest, so the
           # self-hosted-only snapshot has nothing for them. Keep the extra call:
           # its delegated GPU jobs use the explicit caller name as their prefix.
-          # Job ids keep the -rocm720 lane suffix but display names no longer do,
-          # so strip it to get the prefix query_job_status.py matches against.
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd.yml | \
-            grep -v -E '^(call-gate|check-changes|pr-test-amd-rocm720-finish|cancel|check-all-jobs|wait-for-stage-[ab]-amd-rocm720)$' | \
-            sed 's/-rocm720$//' | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs|wait-for-stage-[ab]-amd)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
 
-          # Parse the default ROCm 7.2 nightly (exclude utility jobs)
+          # Parse the canonical multi-version AMD nightly (exclude utility jobs)
           # Excluded: check-all-jobs
           # One nightly run covers every flavor, so ask for each by its full name:
           # a stem-only prefix matches every flavor and merges them into a single
@@ -154,8 +151,7 @@ jobs:
           nightly_jobs=$(yq -r '.jobs | to_entries[] | .key + " " + .value."runs-on"' .github/workflows/nightly-test-amd.yml | \
             grep -v -E '^check-all-jobs ' | \
             while read -r id runner; do
-              stem=${id%-rocm720}
-              for f in $rocm_flavors; do echo "$stem ($f, $runner)"; done
+              for f in $rocm_flavors; do echo "$id ($f, $runner)"; done
             done | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "nightly_jobs=$nightly_jobs" >> $GITHUB_OUTPUT

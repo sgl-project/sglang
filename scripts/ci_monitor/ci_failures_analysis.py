@@ -30,12 +30,18 @@ import requests
 def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
     """Drop pre-cutover AMD names without changing the shared analyzer."""
 
+    legacy_callers = {
+        "call-nightly-amd-rocm720",
+        "call-pr-test-amd-extra-rocm720",
+        "call-pr-test-amd-rocm720",
+    }
     filtered = {}
     for full_name, data in job_data.items():
-        # This caller was renamed by the AMD job-name cutover. Other outer
-        # callers, including AITER's *-rocm720 callers, are still current.
+        # These callers were renamed by the AMD workflow canonicalization. Keep
+        # recognizing their historical spellings so old rows do not merge into
+        # current streaks.
         name_parts = full_name.split(" / ")
-        if "call-pr-test-amd-extra-rocm720" in name_parts[:-1]:
+        if any(part in legacy_callers for part in name_parts[:-1]):
             continue
 
         leaf_name = name_parts[-1]
@@ -49,7 +55,7 @@ def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
             "pr-gate",
             "pr-test-amd-extra-finish",
             "pr-test-amd-finish",
-            "pr-test-amd-rocm720-finish",
+            "pr-test-amd-rocm720-finish",  # Legacy pre-canonicalization teardown
         }:
             continue
 
@@ -65,6 +71,12 @@ def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
         if leaf_name.endswith(")") and " (" in leaf_name:
             details = leaf_name.rsplit(" (", 1)[1][:-1]
             if details.startswith("rocm") and details[4:].isdigit():
+                continue
+
+            # The canonical workflow paths reuse the history of the retired
+            # ROCm 7.0 workflows. Do not let those rows contribute to current
+            # multi-version streaks during the lookback window.
+            if details.split(",", 1)[0] == "rocm700":
                 continue
 
         filtered[full_name] = data
@@ -92,7 +104,7 @@ class SGLangFailuresAnalyzer:
             "check-changes",
             "pr-test-finish",  # Nvidia workflow teardown
             "pr-test-amd-finish",  # AMD workflow teardown
-            "pr-test-amd-rocm720-finish",  # Default AMD ROCm 7.2 teardown
+            "pr-test-amd-rocm720-finish",  # Legacy AMD teardown
             "call-gate",
             "pr-gate",
             "check-all-jobs",

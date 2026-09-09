@@ -1,4 +1,4 @@
-name: PR Test ROCm 7.2 (AMD)
+name: PR Test (AMD)
 # Dynamic run-name for manual stage dispatches to enable URL lookup
 # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
@@ -33,24 +33,24 @@ on:
         default: ''
         options:
           - ''
-          - sgl-kernel-unit-test-amd-rocm720
-          - sgl-kernel-unit-test-2-gpu-amd-rocm720
-          - stage-a-test-1-gpu-small-amd-rocm720
-          - jit-kernel-unit-test-amd-rocm720
-          - jit-kernel-benchmark-test-amd-rocm720
-          - stage-b-test-1-gpu-small-amd-rocm720
-          - stage-b-test-1-gpu-small-amd-nondeterministic-rocm720
-          - stage-b-test-1-gpu-small-amd-mi35x-rocm720
-          - stage-b-test-1-gpu-large-amd-rocm720
-          - stage-b-test-2-gpu-large-amd-rocm720
-          - multimodal-gen-test-1-gpu-amd-rocm720
-          - multimodal-gen-test-2-gpu-amd-rocm720
-          - stage-c-test-4-gpu-amd-rocm720
-          - stage-c-dsv4-flash-fp4-fp8-amd-mi35x-rocm720
-          - stage-c-dsv4-pro-fp4-amd-mi35x-rocm720
-          - stage-c-test-large-8-gpu-amd-rocm720
-          - stage-c-test-large-8-gpu-amd-mi35x-rocm720
-          - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
+          - sgl-kernel-unit-test-amd
+          - sgl-kernel-unit-test-2-gpu-amd
+          - stage-a-test-1-gpu-small-amd
+          - jit-kernel-unit-test-amd
+          - jit-kernel-benchmark-test-amd
+          - stage-b-test-1-gpu-small-amd
+          - stage-b-test-1-gpu-small-amd-nondeterministic
+          - stage-b-test-1-gpu-small-amd-mi35x
+          - stage-b-test-1-gpu-large-amd
+          - stage-b-test-2-gpu-large-amd
+          - multimodal-gen-test-1-gpu-amd
+          - multimodal-gen-test-2-gpu-amd
+          - stage-c-test-4-gpu-amd
+          - stage-c-dsv4-flash-fp4-fp8-amd-mi35x
+          - stage-c-dsv4-pro-fp4-amd-mi35x
+          - stage-c-test-large-8-gpu-amd
+          - stage-c-test-large-8-gpu-amd-mi35x
+          - stage-b-test-large-8-gpu-mi35x-disaggregation-amd
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -127,7 +127,7 @@ on:
         type: boolean
         default: false
 
-# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra-rocm720 ->
+# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra ->
 # pr-test-amd-extra.yml) declares actions: write / issues: read /
 # pull-requests: read. A called reusable workflow can only use scopes the
 # caller already holds, so without this block the call fails workflow
@@ -147,7 +147,7 @@ env:
 concurrency:
   # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).
   # PR runs share a group per branch so new pushes cancel stale runs.
-  group: pr-test-amd-rocm720-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
   cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -244,9 +244,9 @@ jobs:
   # dispatch) the extra suite runs on `main` without needing the
   # `run-ci-extra` label (pr-gate.yml only enforces labels on pull_request
   # events). Targeted stage dispatches (target_stage set) are excluded.
-  # Not added to `pr-test-amd-rocm720-finish` so the base AMD gate never depends on
+  # Not added to `pr-test-amd-finish` so the base AMD gate never depends on
   # the opt-in extra suite.
-  call-pr-test-amd-extra-rocm720:
+  call-pr-test-amd-extra:
     name: call-pr-test-amd-extra
     needs: [check-changes]
     if: |
@@ -267,7 +267,7 @@ jobs:
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
-  sgl-kernel-unit-test-amd-rocm720:
+  sgl-kernel-unit-test-amd:
     name: ${{ format('sgl-kernel-unit-test-amd ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
     strategy:
       fail-fast: false
@@ -277,7 +277,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -329,7 +329,7 @@ jobs:
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
           exit $failures
 
-  sgl-kernel-unit-test-2-gpu-amd-rocm720:
+  sgl-kernel-unit-test-2-gpu-amd:
     name: ${{ format('sgl-kernel-unit-test-2-gpu-amd ({0}, linux-{1}-2gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
     strategy:
       fail-fast: false
@@ -339,7 +339,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -374,7 +374,7 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  stage-a-test-1-gpu-small-amd-rocm720:
+  stage-a-test-1-gpu-small-amd:
     name: ${{ format('stage-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
     strategy:
       fail-fast: false
@@ -384,7 +384,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -415,7 +415,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  jit-kernel-unit-test-amd-rocm720:
+  jit-kernel-unit-test-amd:
     name: ${{ format('jit-kernel-unit-test-amd ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
     strategy:
       fail-fast: false
@@ -425,7 +425,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -456,7 +456,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  jit-kernel-benchmark-test-amd-rocm720:
+  jit-kernel-benchmark-test-amd:
     name: ${{ format('jit-kernel-benchmark-test-amd ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
     strategy:
       fail-fast: false
@@ -466,7 +466,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-benchmark-test-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-benchmark-test-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -502,7 +502,7 @@ jobs:
   # For PR runs: wait jobs run and enforce sequential execution via polling.
   # For scheduled runs: wait jobs are skipped, enabling parallel execution of all stages.
 
-  wait-for-stage-a-amd-rocm720:
+  wait-for-stage-a-amd:
     name: wait-for-stage-a-amd
     needs: [check-changes, call-gate]
     if: |
@@ -524,13 +524,13 @@ jobs:
           jobs: '[{"prefix": "stage-a-test-1-gpu-small-amd", "expected_count": 1}]'
           max-wait-minutes: '240'
 
-  stage-b-test-1-gpu-small-amd-rocm720:
+  stage-b-test-1-gpu-small-amd:
     name: ${{ format('stage-b-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
-    needs: [check-changes, wait-for-stage-a-amd-rocm720]
+    needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -566,17 +566,17 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-small-amd-nondeterministic-rocm720:
+  stage-b-test-1-gpu-small-amd-nondeterministic:
     name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-    needs: [check-changes, wait-for-stage-a-amd-rocm720]
+    needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-nondeterministic,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -606,13 +606,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-small-amd-mi35x-rocm720:
+  stage-b-test-1-gpu-small-amd-mi35x:
     name: ${{ format('stage-b-test-1-gpu-small-amd-mi35x ({0}, {1})', matrix.rocm_version, matrix.runner) }}
-    needs: [check-changes, wait-for-stage-a-amd-rocm720]
+    needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -647,13 +647,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-large-amd-rocm720:
+  stage-b-test-1-gpu-large-amd:
     name: ${{ format('stage-b-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
-    needs: [check-changes, wait-for-stage-a-amd-rocm720]
+    needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-large-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-large-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -689,13 +689,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-2-gpu-large-amd-rocm720:
+  stage-b-test-2-gpu-large-amd:
     name: ${{ format('stage-b-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
-    needs: [check-changes, wait-for-stage-a-amd-rocm720]
+    needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-2-gpu-large-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-2-gpu-large-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -731,13 +731,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 5400 || 2700 }} ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  multimodal-gen-test-1-gpu-amd-rocm720:
+  multimodal-gen-test-1-gpu-amd:
     name: ${{ format('multimodal-gen-test-1-gpu-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -881,13 +881,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  multimodal-gen-test-2-gpu-amd-rocm720:
+  multimodal-gen-test-2-gpu-amd:
     name: ${{ format('multimodal-gen-test-2-gpu-amd ({0}, linux-{1}-2gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -1017,16 +1017,16 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  wait-for-stage-b-amd-rocm720:
+  wait-for-stage-b-amd:
     name: wait-for-stage-b-amd
-    needs: [check-changes, call-gate, wait-for-stage-a-amd-rocm720]
+    needs: [check-changes, call-gate, wait-for-stage-a-amd]
     if: |
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
       !(inputs.target_stage || inputs.target_stage_select) &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-stage-a-amd-rocm720.result == 'success' || needs.wait-for-stage-a-amd-rocm720.result == 'skipped') &&
+      (needs.wait-for-stage-a-amd.result == 'success' || needs.wait-for-stage-a-amd.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
@@ -1045,13 +1045,13 @@ jobs:
             ]
           max-wait-minutes: '480'
 
-  stage-c-test-4-gpu-amd-rocm720:
+  stage-c-test-4-gpu-amd:
     name: ${{ format('stage-c-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd-rocm720]
+    needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1102,13 +1102,13 @@ jobs:
               --retry-timeout-increase 0 \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-c-test-large-8-gpu-amd-rocm720:
+  stage-c-test-large-8-gpu-amd:
     name: ${{ format('stage-c-test-large-8-gpu-amd ({0}, linux-{1}-8gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd-rocm720]
+    needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1152,13 +1152,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-c-test-large-8-gpu-amd-mi35x-rocm720:
+  stage-c-test-large-8-gpu-amd-mi35x:
     name: ${{ format('stage-c-test-large-8-gpu-amd-mi35x ({0}, {1}, {2})', matrix.rocm_version, matrix.runner, matrix.part) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd-rocm720]
+    needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1197,13 +1197,13 @@ jobs:
   # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
   # GSM8K accuracy on the nightly dsv4 suites, ~20min each. Gated as stage-C so
   # every PR that touches the main package covers DeepSeek-V4.
-  stage-c-dsv4-flash-fp4-fp8-amd-mi35x-rocm720:
+  stage-c-dsv4-flash-fp4-fp8-amd-mi35x:
     name: ${{ format('stage-c-dsv4-flash-fp4-fp8-amd-mi35x ({0}, {1})', matrix.rocm_version, matrix.runner) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd-rocm720]
+    needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-dsv4-flash-fp4-fp8-amd-mi35x-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-dsv4-flash-fp4-fp8-amd-mi35x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1225,7 +1225,7 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
-      - name: Setup docker (ROCm 7.2)
+      - name: Setup docker (ROCm)
         run: |
           touch github_summary.md
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
@@ -1239,7 +1239,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP4 + FP8)
+      - name: Accuracy Test MI35x ROCm (8-GPU DeepSeek-V4-Flash FP4 + FP8)
         timeout-minutes: 60
         run: |
           > github_summary.md  # Clear summary file
@@ -1253,13 +1253,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  stage-c-dsv4-pro-fp4-amd-mi35x-rocm720:
+  stage-c-dsv4-pro-fp4-amd-mi35x:
     name: ${{ format('stage-c-dsv4-pro-fp4-amd-mi35x ({0}, {1})', matrix.rocm_version, matrix.runner) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd-rocm720]
+    needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-dsv4-pro-fp4-amd-mi35x-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-dsv4-pro-fp4-amd-mi35x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1281,7 +1281,7 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
-      - name: Setup docker (ROCm 7.2)
+      - name: Setup docker (ROCm)
         run: |
           touch github_summary.md
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
@@ -1295,7 +1295,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP4)
+      - name: Accuracy Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP4)
         timeout-minutes: 60
         run: |
           > github_summary.md  # Clear summary file
@@ -1310,13 +1310,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # =============================================== Disaggregation ====================================================
-  stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720:
+  stage-b-test-large-8-gpu-mi35x-disaggregation-amd:
     name: ${{ format('stage-b-test-large-8-gpu-mi35x-disaggregation-amd ({0}, {1})', matrix.rocm_version, matrix.runner) }}
-    needs: [check-changes, wait-for-stage-a-amd-rocm720]
+    needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-mi35x-disaggregation-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1445,35 +1445,35 @@ jobs:
             -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  pr-test-amd-rocm720-finish:
+  pr-test-amd-finish:
     name: pr-test-amd-finish
     needs:
       [
         call-gate,
         check-changes,
 
-        sgl-kernel-unit-test-amd-rocm720,
-        sgl-kernel-unit-test-2-gpu-amd-rocm720,
-        multimodal-gen-test-1-gpu-amd-rocm720,
-        multimodal-gen-test-2-gpu-amd-rocm720,
+        sgl-kernel-unit-test-amd,
+        sgl-kernel-unit-test-2-gpu-amd,
+        multimodal-gen-test-1-gpu-amd,
+        multimodal-gen-test-2-gpu-amd,
 
-        wait-for-stage-a-amd-rocm720,
-        stage-a-test-1-gpu-small-amd-rocm720,
-        jit-kernel-unit-test-amd-rocm720,
-        jit-kernel-benchmark-test-amd-rocm720,
-        wait-for-stage-b-amd-rocm720,
-        stage-b-test-1-gpu-small-amd-rocm720,
-        stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,
-        stage-b-test-1-gpu-small-amd-mi35x-rocm720,
-        stage-b-test-1-gpu-large-amd-rocm720,
-        stage-b-test-2-gpu-large-amd-rocm720,
-        stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720,
-        stage-c-test-4-gpu-amd-rocm720,
-        stage-c-test-large-8-gpu-amd-rocm720,
-        stage-c-test-large-8-gpu-amd-mi35x-rocm720,
+        wait-for-stage-a-amd,
+        stage-a-test-1-gpu-small-amd,
+        jit-kernel-unit-test-amd,
+        jit-kernel-benchmark-test-amd,
+        wait-for-stage-b-amd,
+        stage-b-test-1-gpu-small-amd,
+        stage-b-test-1-gpu-small-amd-nondeterministic,
+        stage-b-test-1-gpu-small-amd-mi35x,
+        stage-b-test-1-gpu-large-amd,
+        stage-b-test-2-gpu-large-amd,
+        stage-b-test-large-8-gpu-mi35x-disaggregation-amd,
+        stage-c-test-4-gpu-amd,
+        stage-c-test-large-8-gpu-amd,
+        stage-c-test-large-8-gpu-amd-mi35x,
 
-        stage-c-dsv4-flash-fp4-fp8-amd-mi35x-rocm720,
-        stage-c-dsv4-pro-fp4-amd-mi35x-rocm720,
+        stage-c-dsv4-flash-fp4-fp8-amd-mi35x,
+        stage-c-dsv4-pro-fp4-amd-mi35x,
       ]
     if: always()
     runs-on: ubuntu-latest
