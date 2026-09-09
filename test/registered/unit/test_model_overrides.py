@@ -81,6 +81,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "ep_size",
                     "moe_dense_tp_size",
                     "attn_cp_size",
+                    "disable_attn_tp_gather",
                     "dcp_comm_backend",
                     "dcp_replicate_q_proj",
                     "disable_overlap_schedule",
@@ -3004,6 +3005,58 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             with override_platform(is_sm100=False):
                 self.assertEqual(_deepseek_family_overrides(_args(), None), {})
+
+    def test_hyv4_always_disables_attn_tp_gather(self):
+        # HYV4 keeps the full padded sequence at its MoE, so an attn-TP-shard
+        # num_token_non_padded silently zeroes every row past the shard.
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                enable_prefill_cp=False,
+                dcp_size=1,
+                tp_size=8,
+                dp_size=1,
+                enable_dp_attention=False,
+                moe_a2a_backend="deepep",
+                moe_dense_tp_size=None,
+                disable_attn_tp_gather=False,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        def _run(arch, **kw):
+            with patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False
+            ):
+                with override_platform(is_sm100=False):
+                    return _deepseek_family_overrides(
+                        _args(**kw), SimpleNamespace(architectures=[arch])
+                    )
+
+        for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+            # The declaration does not depend on what would have turned the
+            # gather on, because those fields have post-declaration writers.
+            for case, kw in (
+                ("deepep", {}),
+                ("no_a2a_backend", dict(moe_a2a_backend="none")),
+                (
+                    "moe_dense_tp_size",
+                    dict(moe_a2a_backend="none", moe_dense_tp_size=1),
+                ),
+                ("pure_dp_attention", dict(enable_dp_attention=True, dp_size=8)),
+                ("already_disabled", dict(disable_attn_tp_gather=True)),
+            ):
+                with self.subTest(arch=arch, case=case):
+                    self.assertEqual(_run(arch, **kw), {"disable_attn_tp_gather": True})
+
+        # Other members of the family are untouched.
+        self.assertEqual(_run("DeepseekV3ForCausalLM"), {})
 
     def test_qwen3_moe_family_quant_absorption(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
