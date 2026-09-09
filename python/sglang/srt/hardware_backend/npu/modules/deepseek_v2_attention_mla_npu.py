@@ -16,7 +16,17 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.dcp import (
+    all_gather_q_for_mla_decode,
+    cp_lse_ag_out_rs_mla,
+    dcp_a2a_lse_reduce,
+)
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    is_dcp_mla_decode_phase,
+    is_mla_dcp_lse_base_on_e,
+)
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -500,16 +510,69 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
-        q_nope_out.contiguous(),
-        k_nope.contiguous(),
-        k_nope.contiguous(),
-        forward_batch,
-        save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
-        q_rope=q_pe.contiguous(),
-        k_rope=k_pe.contiguous(),
-        topk_indices=topk_indices,
-    )
+    # GLM-5.2 reaches this function, not forward_absorb_core: forward_core
+    # dispatches AttnForwardMethod.DSA_NPU here (deepseek_v2.py:2228). So
+    # forward_mla.py's DCP block never runs for this model on NPU, and decode
+    # context parallelism has to be composed here as well. This mirrors
+    # forward_mla.py:640-809 rather than sharing it -- the two prepare/core
+    # pairs have different shapes -- so the two must be kept in step by hand.
+    if is_dcp_mla_decode_phase(forward_batch):
+        # Every rank attends with the FULL head set against its own KV shard and
+        # keeps only its own share after the merge, so the query is gathered
+        # across the group first and the attention runs on
+        # attn_mqa_for_dcp_decode, which is built at num_local_heads * dcp_size
+        # (deepseek_v2.py:1922-1925). --dcp-replicate-q-proj would compute those
+        # heads locally and skip this collective; it prepares 0 layers on this
+        # checkpoint, so the gather is not optional here.
+        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out=q_nope_out, q_pe=q_pe)
+        attn_output, lse = m.attn_mqa_for_dcp_decode(
+            q_nope_out.contiguous(),
+            k_nope.contiguous(),
+            k_nope.contiguous(),
+            forward_batch,
+            save_kv_cache=True,
+            q_rope=q_pe.contiguous(),
+            k_rope=k_pe.contiguous(),
+            topk_indices=topk_indices,
+        )
+        # The partials are per-head over this rank's tokens; the merge reduces
+        # the head axis back to num_local_heads, which is why the shared view
+        # below is correct for both branches.
+        attn_output = attn_output.view(
+            -1, m.num_local_heads * get_parallel().attn_dcp_size, m.kv_lora_rank
+        )
+        comm_backend = get_parallel().dcp_comm_backend
+        # Not cosmetic: feeding a base-e LSE to the base-2 combine is a monotone
+        # reweighting, so it stays finite and plausible and only acceptance
+        # degrades. "ascend" is a natural-log backend.
+        base_on_e = is_mla_dcp_lse_base_on_e(m.current_attention_backend)
+        if comm_backend in ("a2a", "fi_a2a"):
+            attn_output = dcp_a2a_lse_reduce(
+                attn_output.contiguous(),
+                lse.contiguous(),
+                get_parallel().dcp_group,
+                is_lse_base_on_e=base_on_e,
+                comm_backend=comm_backend,
+            )
+        else:
+            attn_output = cp_lse_ag_out_rs_mla(
+                attn_output,
+                lse,
+                get_parallel().dcp_group,
+                is_lse_base_on_e=base_on_e,
+            )
+            attn_output = attn_output.transpose(0, 1)
+    else:
+        attn_output = m.attn_mqa(
+            q_nope_out.contiguous(),
+            k_nope.contiguous(),
+            k_nope.contiguous(),
+            forward_batch,
+            save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
+            q_rope=q_pe.contiguous(),
+            k_rope=k_pe.contiguous(),
+            topk_indices=topk_indices,
+        )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_bmm_output = torch.empty(
