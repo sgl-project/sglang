@@ -2245,6 +2245,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
+        if is_xpu() and not get_moe_runner_backend().is_triton():
+            # Align expert weights to Column-Major [E, K, N] for Intel Xe2 DPAS VNNI load.
+            # Using _xpu_weights_transposed avoids flawed shape inspection on square matrices (e.g. 2*I == H or I == H).
+            try:
+                from sgl_kernel.utils import is_xe2_arch
+
+                _use_col_major = is_xe2_arch()
+            except Exception:
+                _use_col_major = True
+
+            if _use_col_major and not getattr(layer, "_xpu_weights_transposed", False):
+                if layer.w13_weight.ndim == 3:
+                    copy_or_rebind_param(
+                        layer,
+                        "w13_weight",
+                        layer.w13_weight.data.transpose(1, 2).contiguous(),
+                    )
+                    copy_or_rebind_param(
+                        layer,
+                        "w2_weight",
+                        layer.w2_weight.data.transpose(1, 2).contiguous(),
+                    )
+                    layer._xpu_weights_transposed = True
+                    setattr(layer.w13_weight, "_xpu_weights_transposed", True)
+                    setattr(layer.w2_weight, "_xpu_weights_transposed", True)
+
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 

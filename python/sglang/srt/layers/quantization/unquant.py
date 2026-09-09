@@ -667,6 +667,33 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     layer.w2_weight_bias.float(), requires_grad=False
                 )
 
+        if is_xpu() and not get_moe_runner_backend().is_triton():
+            # Align BF16 expert weights to Column-Major [E, K, N] for Intel Xe2 DPAS VNNI load.
+            # On Xe3 (CRI), plain BF16 GroupGemm expects row-major [E, N, K].
+            # Using _xpu_weights_transposed avoids flawed shape inspection on square matrices (e.g. 2*I == H or I == H).
+            try:
+                from sgl_kernel.utils import is_xe2_arch
+
+                _use_col_major = is_xe2_arch()
+            except Exception:
+                _use_col_major = True
+
+            if _use_col_major and not getattr(layer, "_xpu_weights_transposed", False):
+                if layer.w13_weight.ndim == 3:
+                    copy_or_rebind_param(
+                        layer,
+                        "w13_weight",
+                        layer.w13_weight.data.transpose(1, 2).contiguous(),
+                    )
+                    copy_or_rebind_param(
+                        layer,
+                        "w2_weight",
+                        layer.w2_weight.data.transpose(1, 2).contiguous(),
+                    )
+                    layer._xpu_weights_transposed = True
+                    setattr(layer.w13_weight, "_xpu_weights_transposed", True)
+                    setattr(layer.w2_weight, "_xpu_weights_transposed", True)
+
         if (
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
