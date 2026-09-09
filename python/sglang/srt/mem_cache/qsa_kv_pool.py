@@ -233,6 +233,12 @@ class QSATokenToKVPool(HybridLinearKVPool):
 
     def get_qsa_pending_state_buf_infos(self):
         """Per-request pending key-state and RoPE ring transfer buffers."""
+        # A PP stage without a local QSA layer never writes the shared RoPE
+        # ring.  Do not register it as a transfer source: otherwise that stage
+        # can race with a QSA-owning stage and overwrite valid positions with
+        # its zero-initialized or stale contents.
+        if not self.full_attention_layer_id_mapping:
+            return [], [], []
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
         return (
             [tensor.data_ptr() for tensor in tensors],
@@ -242,6 +248,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
 
     def get_qsa_pending_state_layer_ids(self):
         """Global layer metadata for the compact QSA pending-state list."""
+        if not self.full_attention_layer_id_mapping:
+            return []
         return [
             *self.full_attention_layer_id_mapping.keys(),
             QSA_ROPE_STATE_LAYER_ID,

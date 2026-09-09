@@ -615,19 +615,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_qwen4_pd_support_and_remaining_limits(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode):
-                self._construct(*qwen4, disaggregation_mode=mode)
+        with override_platform(is_cuda=True):
+            for mode in ("prefill", "decode"):
+                with self.subTest(mode=mode):
+                    self._construct(*qwen4, disaggregation_mode=mode)
 
-        with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
-            self._construct(*qwen4, enable_unified_memory=True)
-        with self.assertRaisesRegex(ValueError, "MORI requires --pp-size 1"):
-            self._construct(
-                *qwen4,
-                disaggregation_mode="prefill",
-                disaggregation_transfer_backend="mori",
-                pp_size=2,
-            )
+            with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+                self._construct(*qwen4, enable_unified_memory=True)
+            with self.assertRaisesRegex(ValueError, "MORI requires --pp-size 1"):
+                self._construct(
+                    *qwen4,
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="mori",
+                    pp_size=2,
+                )
 
     def test_qwen4_ple_offload_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")

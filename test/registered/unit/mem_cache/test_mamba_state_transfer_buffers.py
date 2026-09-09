@@ -15,6 +15,8 @@ def _pool(temporal: torch.Tensor, num_conv: int = 2) -> MambaPool:
     """A MambaPool stub carrying only what the transfer accessors read."""
     pool = object.__new__(MambaPool)
     pool.num_mamba_layers = NUM_LAYERS
+    pool.mamba_layer_ids = list(range(NUM_LAYERS))
+    pool._slot_siblings = []
     pool.conv_slice_axis = 0
     pool.mamba_cache = MambaPool.State(
         conv=[torch.zeros(NUM_LAYERS, NUM_SLOTS, 4, 5) for _ in range(num_conv)],

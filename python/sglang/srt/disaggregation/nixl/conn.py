@@ -1612,6 +1612,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
 
+        if not layers_params:
+            return None
+
         src_addrs = []
         src_lens = []
         dst_addrs = []

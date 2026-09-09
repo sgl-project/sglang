@@ -237,6 +237,36 @@ class TestQwen4StateWire(unittest.TestCase):
             [[24, QSA_ROPE_STATE_LAYER_ID], [24]],
         )
 
+    def test_qsa_stage_without_qsa_layers_does_not_register_rope_ring(self):
+        pool = object.__new__(QSATokenToKVPool)
+        pool.full_kv_pool = object()
+        pool.get_state_buf_infos = lambda: ([10], [100], [20])
+        pool.get_state_dim_per_tensor = lambda: [4]
+        pool.get_state_conv_shard_groups = lambda: [None]
+        pool.get_state_slice_outer_counts = lambda: [1]
+        pool.get_state_layer_ids = lambda: [2]
+        pool.page_size = 4
+        pool.qsa_compress_ratio = 2
+        pool.qsa_compressed_page_size = 2
+        pool.full_attention_layer_id_mapping = {}
+        pool.qsa_key_state_buffer_pool = []
+        pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
+        pool.qsa_compressed_k_buffer_pool = []
+
+        kv_args = SimpleNamespace()
+        setup_state_kv_args(kv_args, pool)
+
+        # Keep the component slots aligned across PP stages, but expose no QSA
+        # buffers or layer ids from a stage that cannot produce their contents.
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1:], [[], []])
+        self.assertEqual(kv_args.state_data_lens[1:], [[], []])
+        self.assertEqual(kv_args.state_item_lens[1:], [[], []])
+        self.assertEqual(kv_args.state_layer_ids[1:], [[], []])
+
     def test_compact_qsa_entries_map_by_global_layer_id(self):
         self.assertEqual(
             build_transfer_entry_pairs(
