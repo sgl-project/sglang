@@ -209,6 +209,13 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
+    def test_base_speculative_capability_defaults_are_conservative(self):
+        base = SRTPlatform()
+        self.assertFalse(base.supports_speculative_algorithm("DFLASH"))
+        self.assertFalse(
+            base.supports_speculative_draft_attention_backend("custom_backend")
+        )
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""

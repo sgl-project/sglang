@@ -38,6 +38,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_schedule,
@@ -478,6 +479,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         capture_decode_cuda_graph = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
+        if (
+            capture_decode_cuda_graph
+            and current_platform.is_out_of_tree()
+            and not current_platform.support_cuda_graph()
+        ):
+            capture_decode_cuda_graph = False
+            logger.warning(
+                "Disable DFLASH draft cuda graph because %s does not support "
+                "device graph capture.",
+                type(current_platform).__name__,
+            )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = self._tp_sync.available_memory_gb(
                 SpecTpSyncSite.DFLASH_MEM,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import triton
 import triton.language as tl
@@ -23,6 +25,14 @@ _is_xpu = is_xpu()
 
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu
+
+
+def _get_oot_speculative_cache_locs_fn() -> Callable[..., torch.Tensor] | None:
+    from sglang.srt.platforms import current_platform
+
+    if not current_platform.is_out_of_tree():
+        return None
+    return current_platform.get_speculative_cache_locs_fn()
 
 
 @triton.jit
@@ -438,6 +448,18 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
+    platform_fn = _get_oot_speculative_cache_locs_fn()
+    if platform_fn is not None:
+        return platform_fn(
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            batch_size=batch_size,
+            draft_token_num=draft_token_num,
+            device=device,
+        )
+
     if _is_cuda or _is_hip or _is_musa or _is_xpu:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
