@@ -695,30 +695,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
-                elif self.topk == 1 and (_is_cuda or _is_hip):
-                    # HIP was excluded here because torch.argmax breaks ties
-                    # inconsistently on ROCm and corrupts the draft chain on
-                    # fp8 logits (#26358). That reason does not reach this
-                    # path: draft_topk1_postprocess is a Triton split
-                    # reduction that always keeps the lowest index. Going
-                    # through the softmax instead cost a full-vocab
-                    # cunn_SoftMaxForwardGmem plus its reduction, 68 us per
-                    # draft step at GLM-5.2's 154880-wide vocab, for an argmax
-                    # that softmax cannot change -- it is monotonic, and its
-                    # fp32 rounding can only invent ties that the logits did
-                    # not have.
-                    topk_p, topk_index = draft_topk1_postprocess(
-                        logits_output.next_token_logits,
-                        forward_batch.positions,
-                        draft_tokens_topk1,
-                        i + 1,
-                    )
-                elif self.topk == 1:
-                    topk_index = torch.argmax(
-                        logits_output.next_token_logits, dim=-1, keepdim=True
-                    )
-                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-                    forward_batch.positions.add_(1)
+                elif self.topk == 1 and not _is_hip:
+                    if _is_cuda:
+                        topk_p, topk_index = draft_topk1_postprocess(
+                            logits_output.next_token_logits,
+                            forward_batch.positions,
+                            draft_tokens_topk1,
+                            i + 1,
+                        )
+                    else:
+                        topk_index = torch.argmax(
+                            logits_output.next_token_logits, dim=-1, keepdim=True
+                        )
+                        topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                        forward_batch.positions.add_(1)
                 else:
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
@@ -1059,20 +1049,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
-            ret_draft_probs = None
-        elif self.topk == 1:
-            # Rank the logits directly. softmax is monotonic, so it cannot move
-            # the top-1, and at topk=1 the probability it produces is dead --
-            # every consumer of topk_p on this path multiplies it into scores
-            # that the chain's early return discards. What it does cost is a
-            # full-vocab pass over 154880 logits per step. Ranking the raw
-            # logits also cannot create the ties softmax's fp32 rounding can,
-            # so this does not reopen the tie-break that keeps torch.argmax
-            # out of the branch above.
-            ret_topk_index = fast_topk(
-                draft_logits_output.next_token_logits, self.topk, dim=-1
-            )[1]
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
