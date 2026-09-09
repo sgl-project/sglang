@@ -192,6 +192,13 @@ class TritonAttnBackend(AttentionBackend):
         # Cumulative full sequence lengths addressing the one-shot K/V; built
         # on first use per forward and reset by init_forward_metadata.
         self._dense_one_shot_kv_indptr = None
+        # Tensor-descriptor load path in the extend kernel. Resolved once here so
+        # the per-call env read stays off the forward path: unset -> platform
+        # auto-select, True / False force it on / off.
+        descriptor_override = envs.SGLANG_USE_TRITON_ATTN_TENSOR_DESC.get()
+        self.use_tensor_desc = (
+            _is_xpu if descriptor_override is None else descriptor_override
+        )
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
@@ -1416,6 +1423,7 @@ class TritonAttnBackend(AttentionBackend):
                 page_size=1,
                 extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                 identity_kv_indices=True,
+                use_tensor_desc=self.use_tensor_desc,
             )
             return output
 
@@ -1452,6 +1460,7 @@ class TritonAttnBackend(AttentionBackend):
                 page_size=1,
                 extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                 identity_kv_indices=True,
+                use_tensor_desc=self.use_tensor_desc,
             )
             # Empty ragged rows are returned as output=0, LSE=-inf, so the
             # portable merge_state operation ignores them exactly.
@@ -1477,6 +1486,7 @@ class TritonAttnBackend(AttentionBackend):
                 skip_prefix=True,
                 page_size=1,
                 extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                use_tensor_desc=self.use_tensor_desc,
             )
 
         if forward_batch.mha_return_lse:
@@ -1747,6 +1757,7 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            use_tensor_desc=self.use_tensor_desc,
         )
         return o
 
@@ -1910,6 +1921,7 @@ class TritonAttnBackend(AttentionBackend):
                 xai_temperature_len=layer.xai_temperature_len,
                 lse_extend=current_lse,
                 skip_prefix=True,
+                use_tensor_desc=self.use_tensor_desc,
             )
 
         if kv_indices.numel() == 0:
@@ -1955,6 +1967,7 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
             lse_extend=prefix_lse,
             skip_extend=True,
+            use_tensor_desc=self.use_tensor_desc,
         )
 
         prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(

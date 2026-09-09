@@ -22,6 +22,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
@@ -32,6 +33,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
+    is_xpu,
 )
 
 _is_cuda = is_cuda()
@@ -41,6 +43,7 @@ if _is_cuda:
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+_is_xpu = is_xpu()
 
 try:
     _triton_version_parts = tuple(
@@ -49,6 +52,96 @@ try:
 except (AttributeError, ValueError):
     _triton_version_parts = (0, 0)
 _is_triton_ge_37 = _triton_version_parts >= (3, 7)
+
+
+# Host-side tensor descriptors need a global scratch allocator (unlike the
+# device-side ``tl.make_tensor_descriptor`` path). Set it once per process.
+_SCRATCH_ALLOCATOR_SET = False
+
+
+def _set_triton_scratch_allocator(device: str):
+    global _SCRATCH_ALLOCATOR_SET
+    if _SCRATCH_ALLOCATOR_SET:
+        return
+
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        return torch.empty(size, device=device, dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
+    _SCRATCH_ALLOCATOR_SET = True
+
+
+# ``TensorDescriptor`` asserts (rather than reports) 16-byte alignment of the
+# base pointer and of every non-innermost stride, so the gate below checks them.
+_DESC_ALIGN_BYTES = 16
+
+
+def _flat_descriptor_fits(
+    *, tensor: torch.Tensor, head_dim: int, tile_width: int
+) -> bool:
+    """Whether ``tensor`` can back a rank-2 flattened tensor descriptor.
+
+    The descriptor describes a ``(token, head, head_dim)`` buffer as
+    ``(token, head * head_dim)`` and the kernel selects the head with a runtime
+    column offset. Three preconditions, all of which vary legitimately between
+    models, so a failure falls back to the pointer path instead of raising:
+
+    * the head and head-dim axes must be contiguous, or the flattened view is
+      not the same memory;
+    * the tiling must cover the head dim exactly -- heads are adjacent in the
+      flattened view, so an over-wide tile reads the next head instead of
+      zero-padding (a descriptor only zero-pads past its declared shape);
+    * the base pointer and the row stride must be 16-byte aligned;
+    * 16-bit elements only -- the fp8 prefill paths cast before this point and
+      that combination is unvalidated.
+    """
+    if tensor.element_size() != 2:
+        return False
+    if tile_width != head_dim:
+        return False
+    if tensor.stride(-1) != 1 or tensor.stride(-2) != head_dim:
+        return False
+    if tensor.data_ptr() % _DESC_ALIGN_BYTES != 0:
+        return False
+    return (tensor.stride(0) * tensor.element_size()) % _DESC_ALIGN_BYTES == 0
+
+
+def _flat_tile_descriptor(
+    tensor: torch.Tensor, *, block_rows: int, block_width: int
+) -> TensorDescriptor:
+    """Describe a ``(token, head, head_dim)`` tensor as 2D ``(token, head * dim)``.
+
+    No reshape and no copy: a descriptor needs only a base pointer plus the
+    shape / strides of the view it describes, and those are not required to
+    match the rank of ``tensor`` itself. Callers must have cleared
+    ``_flat_descriptor_fits`` first.
+    """
+    tokens, heads, head_dim = tensor.shape
+    return TensorDescriptor(
+        tensor,
+        (tokens, heads * head_dim),
+        (tensor.stride(0), 1),
+        [block_rows, block_width],
+    )
+
+
+@triton.jit
+def _load_flat_tile(
+    desc,
+    row_off,
+    head_idx,
+    head_dim: tl.constexpr,
+    col_off: tl.constexpr,
+):
+    """Load one head's tile from a rank-2 flattened descriptor.
+
+    ``desc`` describes ``(token, head * head_dim)``; ``head_idx`` selects the
+    head as a runtime column offset and ``col_off`` picks a sub-tile inside it
+    (the rope half). The host gate guarantees the tile covers the head dim
+    exactly, so a load never crosses into the next head. Rows past the current
+    sequence are discarded by the caller's masks.
+    """
+    return desc.load([row_off, head_idx * head_dim + col_off])
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -395,6 +488,17 @@ def _fwd_kernel(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    # Host-side tensor descriptors for the extend tiles, each describing its
+    # (token, head, head_dim) buffer as 2D (token, head * head_dim). ``None``
+    # selects the tensor-of-pointer path for that tile; a descriptor selects 2D
+    # block I/O. Q and the extend K / V tiles are gated independently by
+    # ``extend_attention_fwd``, so a mix is normal. The rope sub-tiles (``*pe``)
+    # are only non-None when BLOCK_DPE > 0.
+    Q_desc=None,
+    Qpe_desc=None,
+    K_desc=None,
+    Kpe_desc=None,
+    V_desc=None,
 ):
     if USE_COMPACT_TILE_GRID:
         output_tile = tl.program_id(0)
@@ -462,25 +566,38 @@ def _fwd_kernel(
             1.0,
         )
 
-    offs_q = (
-        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_qbs
-        + cur_head * stride_qh
-        + offs_d[None, :]
-    )
-    q = tl.load(
-        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
-    )
-
-    if BLOCK_DPE > 0:
-        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-        offs_qpe = (
+    # Descriptor load offsets must be 32-bit; indptr-derived indices are int64,
+    # so cast here (the values fit comfortably in int32).
+    q_row_off = (cur_seq_extend_start_idx + cur_block_m * BLOCK_M).to(tl.int32)
+    if Q_desc is not None:
+        tl.static_assert(
+            BLOCK_DMODEL + BLOCK_DPE == Lq,
+            "Q descriptor needs the tiling to cover the head dim exactly",
+        )
+        q = _load_flat_tile(Q_desc, q_row_off, cur_head, Lq, 0)
+    else:
+        offs_q = (
             (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
             * stride_qbs
             + cur_head * stride_qh
-            + offs_dpe[None, :]
+            + offs_d[None, :]
         )
-        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+        q = tl.load(
+            Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+        )
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        if Qpe_desc is not None:
+            qpe = _load_flat_tile(Qpe_desc, q_row_off, cur_head, Lq, BLOCK_DMODEL)
+        else:
+            offs_qpe = (
+                (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+                * stride_qbs
+                + cur_head * stride_qh
+                + offs_dpe[None, :]
+            )
+            qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
     # stage 1: compute scores with prefix
     offs_n = tl.arange(0, BLOCK_N)
@@ -714,28 +831,58 @@ def _fwd_kernel(
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
-            # load k in transposed way
-            offs_k = (
-                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                + cur_kv_head * stride_kh
-                + offs_d[:, None]
-            )
-            k = tl.load(
-                K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-            )
+            if K_desc is not None:
+                tl.static_assert(
+                    BLOCK_DMODEL + BLOCK_DPE == Lq,
+                    "K descriptor needs the tiling to cover the head dim exactly",
+                )
+                # Load (BLOCK_N, BLOCK_DMODEL) and transpose to the
+                # (BLOCK_DMODEL, BLOCK_N) the dot wants; the backend folds the
+                # transpose into a column-major block load, whereas a descriptor
+                # with a last stride != 1 would leave the fast path altogether.
+                # Out-of-range rows are discarded by final_mask.
+                k = _load_flat_tile(
+                    K_desc,
+                    (cur_seq_extend_start_idx + start_n).to(tl.int32),
+                    cur_kv_head,
+                    Lq,
+                    0,
+                ).T
+            else:
+                # load k in transposed way
+                offs_k = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                    + cur_kv_head * stride_kh
+                    + offs_d[:, None]
+                )
+                k = tl.load(
+                    K_Extend + offs_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=0.0,
+                )
 
             qk = tl.dot(q, k, out_dtype=tl.float32)
             if BLOCK_DPE > 0:
-                offs_kpe = (
-                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                    + cur_kv_head * stride_kh
-                    + offs_dpe[:, None]
-                )
-                kpe = tl.load(
-                    K_Extend + offs_kpe,
-                    mask=mask_n[None, :],
-                    other=0.0,
-                )
+                if Kpe_desc is not None:
+                    kpe = _load_flat_tile(
+                        Kpe_desc,
+                        (cur_seq_extend_start_idx + start_n).to(tl.int32),
+                        cur_kv_head,
+                        Lq,
+                        BLOCK_DMODEL,
+                    ).T
+                else:
+                    offs_kpe = (
+                        (cur_seq_extend_start_idx + start_n + offs_n[None, :])
+                        * stride_kbs
+                        + cur_kv_head * stride_kh
+                        + offs_dpe[:, None]
+                    )
+                    kpe = tl.load(
+                        K_Extend + offs_kpe,
+                        mask=mask_n[None, :],
+                        other=0.0,
+                    )
                 qk += tl.dot(qpe, kpe)
 
             if USE_EXP2:
@@ -779,14 +926,29 @@ def _fwd_kernel(
                 p = tl.exp(qk - n_e_max[:, None])
             deno = deno * re_scale + tl.sum(p, 1)
 
-            offs_v = (
-                (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
-                + cur_kv_head * stride_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-            )
+            if V_desc is not None:
+                tl.static_assert(
+                    BLOCK_DV == Lv,
+                    "V descriptor needs the tiling to cover the head dim exactly",
+                )
+                v = _load_flat_tile(
+                    V_desc,
+                    (cur_seq_extend_start_idx + start_n).to(tl.int32),
+                    cur_kv_head,
+                    Lv,
+                    0,
+                )
+            else:
+                offs_v = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+                    + cur_kv_head * stride_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Extend + offs_v,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
             if USE_FP8_EXTEND:
                 p_dot = (p * FP8_MAX).to(v.dtype)
                 acc = acc * re_scale[:, None] + tl.dot(p_dot, v) * (1.0 / FP8_MAX)
@@ -824,6 +986,12 @@ def _fwd_kernel(
         lse = tl.where(no_kv, float("-inf"), lse)
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
+    # The output store stays on the masked tensor-of-pointer path even when the
+    # loads use descriptors (matching fused_moe, which never issues a descriptor
+    # store). Descriptors zero-pad reads past their declared shape, but stores do
+    # not mask the padded tail, so a descriptor over the full tensor would write
+    # this block's padded rows into the next sequence's rows and race that
+    # sequence's own block-0 store. mask_m bounds the store to valid rows.
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_obs
@@ -876,6 +1044,7 @@ def extend_attention_fwd(
     aux_tensors=None,
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
+    use_tensor_desc: Optional[bool] = None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -890,6 +1059,10 @@ def extend_attention_fwd(
     see triton_ops/score_mod.py for the contract.
     ``identity_kv_indices`` promises that the prefix buffer is densely packed,
     allowing direct addressing instead of loading an index for every token.
+    ``use_tensor_desc`` selects the tensor-descriptor load path; backends resolve
+    it once at construction and pass it in, and ``None`` falls back to reading
+    ``SGLANG_USE_TRITON_ATTN_TENSOR_DESC`` on every call, which is what tests and
+    benchmarks that toggle the env var rely on.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -1024,6 +1197,66 @@ def extend_attention_fwd(
         score_mod, aux_tensors
     )
 
+    # Build host-side tensor descriptors for the extend tiles so the kernel issues
+    # 2D block I/O instead of tensor-of-pointer loads. Each descriptor describes
+    # its (token, head, head_dim) buffer as 2D (token, head * head_dim) -- the
+    # descriptor carries its own shape / strides, so this needs no reshape and no
+    # copy -- and the kernel picks the head with a runtime column offset.
+    #
+    # Q and the extend K / V tiles are gated separately: a tensor whose head dim
+    # the tiling cannot cover exactly (or that is not contiguous, or not aligned)
+    # keeps the pointer path while the others still get block I/O. Those
+    # conditions vary legitimately between models, so they fall back silently;
+    # only an invariant the kernel's own indexing depends on raises, and only
+    # when descriptors were requested.
+    q_desc = qpe_desc = k_desc = kpe_desc = v_desc = None
+    # Descriptor-path enablement (tri-state). ``use_tensor_desc=None`` defers to
+    # the env var: unset -> auto (on for XPU, off elsewhere); True/False force
+    # on/off for A/B-testing on the same device.
+    if use_tensor_desc is None:
+        descriptor_override = envs.SGLANG_USE_TRITON_ATTN_TENSOR_DESC.get()
+        use_tensor_desc = (
+            _is_xpu if descriptor_override is None else descriptor_override
+        )
+    if use_tensor_desc:
+        # Q / K carry the rope sub-tile in the same head, so the pair of tiles is
+        # what has to cover the head dim.
+        qk_tile_width = BLOCK_DMODEL + BLOCK_DPE
+        if _flat_descriptor_fits(
+            tensor=q_extend, head_dim=Lq, tile_width=qk_tile_width
+        ):
+            # device *type* (not index) so scratch follows the current device.
+            _set_triton_scratch_allocator(q_extend.device.type)
+            q_desc = _flat_tile_descriptor(
+                q_extend, block_rows=BLOCK_M, block_width=BLOCK_DMODEL
+            )
+            if BLOCK_DPE > 0:
+                qpe_desc = _flat_tile_descriptor(
+                    q_extend, block_rows=BLOCK_M, block_width=BLOCK_DPE
+                )
+        # The kernel offsets the extend-K tile by Lq, as its pointer-path masks
+        # already do, so a differing Lk would silently read the wrong head.
+        assert Lk == Lq, (
+            f"tensor descriptors require Lk == Lq, got Lk={Lk}, Lq={Lq}; "
+            "set SGLANG_USE_TRITON_ATTN_TENSOR_DESC=0 to use the pointer path"
+        )
+        if _flat_descriptor_fits(
+            tensor=k_extend, head_dim=Lq, tile_width=qk_tile_width
+        ):
+            _set_triton_scratch_allocator(q_extend.device.type)
+            k_desc = _flat_tile_descriptor(
+                k_extend, block_rows=BLOCK_N, block_width=BLOCK_DMODEL
+            )
+            if BLOCK_DPE > 0:
+                kpe_desc = _flat_tile_descriptor(
+                    k_extend, block_rows=BLOCK_N, block_width=BLOCK_DPE
+                )
+        if _flat_descriptor_fits(tensor=v_extend, head_dim=Lv, tile_width=BLOCK_DV):
+            _set_triton_scratch_allocator(q_extend.device.type)
+            v_desc = _flat_tile_descriptor(
+                v_extend, block_rows=BLOCK_N, block_width=BLOCK_DV
+            )
+
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -1094,6 +1327,11 @@ def extend_attention_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        Q_desc=q_desc,
+        Qpe_desc=qpe_desc,
+        K_desc=k_desc,
+        Kpe_desc=kpe_desc,
+        V_desc=v_desc,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
