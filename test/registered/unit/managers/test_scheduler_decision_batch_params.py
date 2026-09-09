@@ -20,7 +20,6 @@ DECISION_METHODS = (
     Scheduler.get_next_batch_to_run,
     Scheduler.get_new_batch_prefill,
     Scheduler._get_new_batch_prefill_raw,
-    Scheduler._abort_on_running_timeout,
     Scheduler.is_disable_overlap_for_batch,
     SchedulerDisaggregationPrefillMixin.get_next_disagg_prefill_batch_to_run,
     SchedulerDisaggregationPrefillMixin.process_prefill_chunk,

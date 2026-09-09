@@ -119,17 +119,16 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
+          DIFFUSION_PARTITION_ID: ${{ matrix.part }}
+          DIFFUSION_TOTAL_PARTITIONS: ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }}
+          DIFFUSION_PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite 1-gpu \
-            --partition-id ${{ matrix.part }} \
-            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }} \
-            --partition-plan-json "$PARTITION_PLAN_JSON" \
-            $CONTINUE_ON_ERROR_FLAG
+          python3 test/run_suite.py \
+            --hw cuda \
+            --suite base-b-test-diffusion-1-gpu-h100 \
+            --timeout-per-file 14400
 
       - name: Upload execution report
         if: always()
@@ -192,13 +191,13 @@ jobs:
         timeout-minutes: 120
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite 1-gpu-5090 \
-            $CONTINUE_ON_ERROR_FLAG
+          python3 test/run_suite.py \
+            --hw cuda \
+            --suite base-b-test-diffusion-1-gpu-5090 \
+            --timeout-per-file 7200
 
       - name: Upload execution report
         if: always()
@@ -261,13 +260,13 @@ jobs:
         timeout-minutes: 60
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-bcg-artifacts
         run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite bcg-diffusion \
-            $CONTINUE_ON_ERROR_FLAG
+          python3 test/run_suite.py \
+            --hw cuda \
+            --suite base-b-test-diffusion-bcg-1-gpu-h100 \
+            --timeout-per-file 3600
 
       - name: Upload BCG diffusion artifacts
         if: always()
@@ -329,17 +328,16 @@ jobs:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
+          DIFFUSION_PARTITION_ID: ${{ matrix.part }}
+          DIFFUSION_TOTAL_PARTITIONS: ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }}
+          DIFFUSION_PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite 2-gpu \
-            --partition-id ${{ matrix.part }} \
-            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }} \
-            --partition-plan-json "$PARTITION_PLAN_JSON" \
-            $CONTINUE_ON_ERROR_FLAG
+          python3 test/run_suite.py \
+            --hw cuda \
+            --suite base-b-test-diffusion-2-gpu-h100 \
+            --timeout-per-file 14400
 
       - name: Upload execution report
         if: always()
@@ -402,12 +400,12 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
         run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite component-accuracy \
-            $CONTINUE_ON_ERROR_FLAG
+          python3 test/run_suite.py \
+            --hw cuda \
+            --suite base-b-test-diffusion-component-2-gpu-h100 \
+            --timeout-per-file 14400
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -453,13 +451,13 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite 1-gpu-b200 \
-            $CONTINUE_ON_ERROR_FLAG
+          python3 test/run_suite.py \
+            --hw cuda \
+            --suite base-b-test-diffusion-1-gpu-b200 \
+            --timeout-per-file 14400
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -519,8 +517,10 @@ jobs:
       - name: Run diffusion unit tests
         timeout-minutes: 60
         run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite unit
+          python3 test/run_suite.py \
+            --hw cuda \
+            --suite base-b-test-diffusion-unit-1-gpu-h100 \
+            --timeout-per-file 3600
 
   diffusion-coverage-check:
     needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]

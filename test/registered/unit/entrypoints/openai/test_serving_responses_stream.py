@@ -11,6 +11,8 @@ from utils import (
 )
 
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -245,6 +247,10 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
 
     def setUp(self):
         from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
         self.serving = make_serving()
         self.serving.tool_call_parser = "qwen3_coder"

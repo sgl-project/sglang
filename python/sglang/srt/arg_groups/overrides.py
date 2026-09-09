@@ -250,7 +250,13 @@ def declare_direct_writes(
         for field in dataclasses.fields(server_args)
     }
     already = len(getattr(server_args, "_resolved_overrides", None) or ())
-    result = resolve(server_args)
+    # The one place the input seal comes off. The plugin writes the record;
+    # the diff below captures what it moved into the stash so the projection
+    # and the bags carry it.
+    from sglang.srt.server_args import record_writable
+
+    with record_writable(server_args):
+        result = resolve(server_args)
     stash = getattr(server_args, "_resolved_overrides", None)
     if stash is None:
         stash = []
@@ -513,6 +519,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -538,6 +545,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForCausalLM",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
@@ -558,6 +566,8 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
+    if get_platform().is_xpu:
+        return False
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
         return view.linear_attn_backend == "triton"
     return False
@@ -1024,6 +1034,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -1410,14 +1421,13 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 @register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
-    _, decode_backend = attention_backends_of(view)
-    if decode_backend == "intel_xpu":
+    prefill_backend, decode_backend = attention_backends_of(view)
+    if "intel_xpu" in (prefill_backend, decode_backend):
+        supported_page_sizes = [64, 128]
+        msg = "Intel XPU attention backend"
         if use_mla_backend(view):
-            supported_page_sizes = [16, 32, 64, 128]
-            msg = "Intel XPU attention backend for MLA Decode"
-        else:
-            supported_page_sizes = [64, 128]
-            msg = "Intel XPU attention backend"
+            supported_page_sizes.extend([16, 32])
+            msg = msg + " for MLA"
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."

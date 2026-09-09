@@ -249,6 +249,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "not translate speculative verify indices to the unified "
             "pool's kernel-facing space yet."
         )
+    assert not cfg.enable_two_batch_overlap, (
+        "--enable-unified-memory does not support --enable-two-batch-overlap: "
+        "TBO's replay split hands each child a view without the pre-translate "
+        "write loc, so a captured decode replay raises. "
+        "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
+    )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
@@ -487,9 +493,9 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "radix cache indexes KV pool slots that no longer hold real data."
         )
 
-    # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
-    # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
-    # raises on writes, so the engine would boot fine but fail on the first request.
+    # Context-parallel prefill writes K/V to the pool via set_kv_buffer.
+    # NoOpMHATokenToKVPool intentionally raises on writes, so the engine would
+    # boot fine but fail on the first request.
     if resolved_view(server_args).attn_cp_size > 1:
         raise ValueError(
             "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "

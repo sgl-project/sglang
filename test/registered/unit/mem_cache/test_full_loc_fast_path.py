@@ -280,6 +280,17 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
     already collapsed -- so there is no single correct translation and refusing
     is the contract."""
 
+    def setUp(self):
+        # `set_kv_buffer` asks the parallel context whether DCP is in play, and
+        # that is a value the configuration decides at publish -- so a case
+        # here states its topology the way a process does, by publishing one.
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
+
     def _bare_mla_pool(self):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
