@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -31,6 +31,10 @@ from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
 )
+from sglang.srt.speculative.dspark_components.dspark_pp import (
+    pack_proposal,
+    unpack_proposal,
+)
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import is_xpu
 
@@ -49,6 +53,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+        and not get_spec().speculative_dspark_pp_replicated_draft
     )
 
 
@@ -422,7 +427,6 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if not cur_batch.forward_mode.is_prebuilt():
-                        self._pp_launch_dspark_draft(cur_batch)
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # early send output if possible
@@ -779,10 +783,15 @@ class SchedulerPPMixin:
         }
 
         if result.pp_dspark_projected_context is not None:
+            tensor_dict["dspark_identities"] = [
+                identity.to_wire()
+                for identity in result.pp_dspark_commit_state.identities
+            ]
             tensor_dict["dspark_projected_context"] = result.pp_dspark_projected_context
             tensor_dict["dspark_new_seq_lens"] = result.new_seq_lens
             tensor_dict["dspark_bonus_tokens"] = result.next_draft_input.bonus_tokens
             if result.accept_lens is not None:
+                tensor_dict.update(pack_proposal(1, result.pp_dspark_next_proposal))
                 tensor_dict["dspark_accept_lens"] = result.accept_lens
                 tensor_dict["dspark_block_accept_lens"] = result.block_accept_lens
                 if result.cap_lens is not None:
@@ -946,6 +955,10 @@ class SchedulerPPMixin:
             from sglang.srt.speculative.dspark_components.dspark_draft import (
                 make_next_draft_input,
             )
+            from sglang.srt.speculative.dspark_components.dspark_pp import (
+                PPDSparkIdentity,
+                validate_identities,
+            )
 
             fwd_batch = mb_metadata.fwd_batch
             commit_state = mb_metadata.dspark_commit_state
@@ -953,6 +966,13 @@ class SchedulerPPMixin:
                 raise RuntimeError(
                     "Replicated PP DSpark output is missing forward metadata."
                 )
+            validate_identities(
+                commit_state.identities, pp_outputs["dspark_identities"]
+            )
+            validate_identities(
+                commit_state.identities,
+                [PPDSparkIdentity.from_req(req).to_wire() for req in batch.reqs],
+            )
             fwd_rids = tuple(req.rid for req in fwd_batch.reqs)
             live_rids = tuple(req.rid for req in batch.reqs)
             if fwd_rids != live_rids:
@@ -963,12 +983,13 @@ class SchedulerPPMixin:
 
             new_seq_lens = pp_outputs["dspark_new_seq_lens"]
             accept_lens = pp_outputs.tensors.get("dspark_accept_lens")
-            self.model_worker.commit_pp_draft_context(
-                state=commit_state,
-                rids=fwd_rids,
-                projected_context=pp_outputs["dspark_projected_context"],
-                commit_lens=accept_lens,
-            )
+            if accept_lens is None or not self.pp_group.is_last_rank:
+                self.model_worker.commit_pp_draft_context(
+                    state=commit_state,
+                    rids=fwd_rids,
+                    projected_context=pp_outputs["dspark_projected_context"],
+                    commit_lens=accept_lens,
+                )
             next_draft_input = make_next_draft_input(
                 bonus_tokens=pp_outputs["dspark_bonus_tokens"],
                 new_seq_lens=new_seq_lens,
@@ -982,6 +1003,25 @@ class SchedulerPPMixin:
             fwd_batch.seq_lens = new_seq_lens
 
             is_decode = accept_lens is not None
+            if is_decode:
+                if self.pp_group.is_first_rank:
+                    # Keep draft execution on the forward stream: it follows the
+                    # current verify, while the peer can verify another batch.
+                    self.forward_stream.wait_stream(self.copy_stream)
+                    with self.forward_stream_ctx:
+                        pp_outputs.tensors.update(
+                            pack_proposal(
+                                0,
+                                self.model_worker.prepare_pp_draft(
+                                    fwd_batch, next_draft_input
+                                ),
+                            )
+                        )
+                    self.copy_stream.wait_stream(self.forward_stream)
+                for owner in range(self.ps.pp_size):
+                    self.model_worker.install_pp_draft(
+                        fwd_batch, owner, unpack_proposal(owner, pp_outputs.tensors)
+                    )
             output_result = GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -1194,7 +1234,7 @@ class SchedulerPPMixin:
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=(
-                        cur_batch.copy()
+                        replace(cur_batch, reqs=cur_batch.reqs[:])
                         if get_spec().speculative_dspark_pp_replicated_draft
                         else None
                     ),
@@ -1214,20 +1254,6 @@ class SchedulerPPMixin:
                         )
                     )
         return result, event
-
-    def _pp_launch_dspark_draft(
-        self: Scheduler,
-        batch: ScheduleBatch,
-    ) -> None:
-        if (
-            not get_spec().speculative_dspark_pp_replicated_draft
-            or not batch.spec_algorithm.is_dspark()
-            or not batch.forward_mode.is_decode()
-        ):
-            return
-        with self.forward_stream_ctx:
-            self.forward_stream.wait_stream(self.schedule_stream)
-            self.model_worker.prepare_pp_draft(batch)
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group

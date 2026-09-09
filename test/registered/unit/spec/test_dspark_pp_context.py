@@ -30,8 +30,12 @@ from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E4
     resolve_single_owner_pp_rank,
     use_empty_draft_model_for_pp_prefill,
 )
+from sglang.srt.speculative.dspark_components.dspark_pp import (  # noqa: E402
+    draft_owner,
+)
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
+    PPDSparkCommitState,
     _is_context_only_pp_prefill_rank,
 )
 
@@ -68,6 +72,43 @@ def _make_deepseek_v4_dspark_projection_model(
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_replicated_commit_writes_only_locally_owned_rows(self):
+        rids = []
+        for owner in range(2):
+            suffix = 0
+            while True:
+                rid = f"owner-{owner}-{suffix}"
+                if draft_owner(rid, 2) == owner:
+                    rids.append(rid)
+                    break
+                suffix += 1
+
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.device = "cpu"
+        worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
+        worker._kv_injector = Mock()
+        state = PPDSparkCommitState(
+            rids=tuple(rids),
+            cache_loc=torch.tensor([10, 11, 20, 21, 22]),
+            cache_loc_2d=None,
+            positions=torch.tensor([0, 1, 7, 8, 9]),
+            state_slot=None,
+            token_counts=(2, 3),
+        )
+        projected = torch.arange(20).view(5, 4)
+
+        worker.commit_pp_draft_context(
+            state=state,
+            rids=tuple(rids),
+            projected_context=projected,
+            commit_lens=None,
+        )
+
+        kwargs = worker._kv_injector.inject_projected_context.call_args.kwargs
+        self.assertTrue(torch.equal(kwargs["projected_context"], projected[:2]))
+        self.assertTrue(torch.equal(kwargs["cache_loc"], torch.tensor([10, 11])))
+        self.assertTrue(torch.equal(kwargs["positions"], torch.tensor([0, 1])))
+
     def test_full_projection_fast_path_requires_final_pp_owner(self):
         with patch.dict(
             os.environ,
@@ -215,6 +256,7 @@ class TestDSparkPPContext(CustomTestCase):
         torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(hidden_size=hidden_size)
         model.num_context_features = 3
+        model.is_nemotron_35_draft = False
         model.fc = torch.nn.Linear(3 * hidden_size, hidden_size, bias=False)
         model.hidden_norm = RMSNorm(hidden_size, eps=1e-6)
 

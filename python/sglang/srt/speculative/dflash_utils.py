@@ -1081,6 +1081,13 @@ def build_dflash_verify_target_probs(
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+    if (
+        get_spec().speculative_dspark_pp_replicated_draft
+        and req.sampling_params.top_k > 1
+    ):
+        return "PP DSpark currently requires greedy sampling (temperature=0)."
+    if get_spec().speculative_dspark_pp_replicated_draft and req.return_hidden_states:
+        return "PP DSpark does not support return_hidden_states yet."
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 

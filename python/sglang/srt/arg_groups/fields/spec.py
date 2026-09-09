@@ -107,9 +107,10 @@ class Spec:
     speculative_dspark_pp_replicated_draft: A[
         bool,
         "Experimental DSPARK mode for PP2. Replicate the TP draft model on both "
-        "pipeline stages so each stage drafts locally while the peer verifies "
-        "another microbatch. Requires PD, greedy sampling, static verify, disabled "
-        "CUDA graphs, and no DP attention.",
+        "pipeline stages, with a fixed owner per request and next-round proposal "
+        "relay. Requires a bundled DeepSeek-V4 checkpoint, PD on both endpoints, "
+        "greedy sampling, static verify, disabled CUDA graphs and radix cache, "
+        "and no mixed chunk, DP attention, or context parallelism.",
     ] = False
     speculative_accept_threshold_single: A[
         float,

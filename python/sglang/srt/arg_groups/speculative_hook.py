@@ -563,6 +563,30 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "--speculative-dspark-pp-replicated-draft currently requires "
                 "PD disaggregation."
             )
+        if (
+            "DeepseekV4ForCausalLM"
+            not in model_config_of(server_args).hf_config.architectures
+            or not _target_checkpoint_bundles_dspark_draft(server_args)
+            or cfg.speculative_draft_model_path not in (None, cfg.model_path)
+        ):
+            raise ValueError(
+                "PP DSpark currently requires a bundled DeepSeek-V4 DSpark "
+                "checkpoint with the same target and draft model path."
+            )
+        if cfg.attn_cp_size != 1:
+            raise ValueError("PP DSpark currently requires attention CP=1.")
+        if not cfg.disable_radix_cache:
+            raise ValueError(
+                "PP DSpark currently requires --disable-radix-cache because "
+                "draft context is owned by a request, not by a shared prefix."
+            )
+        if cfg.enable_mixed_chunk:
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                enable_mixed_chunk=False,
+            )
+            logger.warning("Mixed chunked prefill is disabled for PP DSpark.")
         if cfg.enable_dp_attention:
             raise ValueError(
                 "--speculative-dspark-pp-replicated-draft does not support "

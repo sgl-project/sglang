@@ -624,8 +624,15 @@ def test_pipeline_parallel_dspark_commit_round_trip():
     from sglang.srt.speculative.dspark_components.dspark_draft import (
         make_next_draft_input,
     )
+    from sglang.srt.speculative.dspark_components.dspark_pp import (
+        PPDSparkIdentity,
+        pack_proposal,
+    )
 
-    req = SimpleNamespace(rid="req-0")
+    req = SimpleNamespace(
+        rid="req-0", bootstrap_room=12, retraction_count=0, spec_verify_ct=0
+    )
+    commit_state = SimpleNamespace(identities=(PPDSparkIdentity.from_req(req),))
     batch = SimpleNamespace(
         reqs=[req],
         return_logprob=False,
@@ -649,16 +656,21 @@ def test_pipeline_parallel_dspark_commit_round_trip():
         new_seq_lens=torch.tensor([11]),
         next_draft_input=next_draft_input,
         pp_dspark_projected_context=torch.ones(3, 4),
+        pp_dspark_commit_state=commit_state,
+        pp_dspark_next_proposal={"identities": []},
     )
     tensors = Scheduler._pp_prepare_tensor_dict(
         object.__new__(Scheduler), result, batch
     )
+    tensors.update(pack_proposal(0, {"identities": []}))
 
     receiver = object.__new__(Scheduler)
-    receiver.pp_group = SimpleNamespace(is_first_rank=False)
-    receiver.model_worker = SimpleNamespace(commit_pp_draft_context=Mock())
+    receiver.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
+    receiver.ps = SimpleNamespace(pp_size=2)
+    receiver.model_worker = SimpleNamespace(
+        commit_pp_draft_context=Mock(), install_pp_draft=Mock()
+    )
     receiver.device_module = SimpleNamespace(Event=CopyDone)
-    commit_state = object()
     metadata = PPBatchMetadata(
         can_run_cuda_graph=False,
         fwd_batch=batch,
@@ -673,12 +685,8 @@ def test_pipeline_parallel_dspark_commit_round_trip():
         PPProxyTensors(tensors),
     )
 
-    receiver.model_worker.commit_pp_draft_context.assert_called_once_with(
-        state=commit_state,
-        rids=("req-0",),
-        projected_context=tensors["dspark_projected_context"],
-        commit_lens=tensors["dspark_accept_lens"],
-    )
+    receiver.model_worker.commit_pp_draft_context.assert_not_called()
+    assert receiver.model_worker.install_pp_draft.call_count == 2
     assert torch.equal(batch.seq_lens, torch.tensor([11]))
     assert torch.equal(batch.spec_info.bonus_tokens, torch.tensor([11]))
     assert output_result.next_token_ids.is_cpu
