@@ -56,7 +56,7 @@ GLM_5_2_W4A8_16P_TWO_NODE_OTHER_ARGS = [
     135000,
     "--served-model-name",
     "glm-5.2-w4a8",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     4,
     "--max-running-requests",
     32,

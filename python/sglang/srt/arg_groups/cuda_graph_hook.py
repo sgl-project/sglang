@@ -40,8 +40,8 @@ def parse_cuda_graph_config(server_args: Any):
     Precedence (highest first): explicit JSON > convenience > legacy > defaults.
     Also populates server_args._cuda_graph_config_locked — the set of
     (phase, key) tuples that came from non-default sources; the
-    auto-disable cascade respects this lock (the old
-    --enforce-piecewise-cuda-graph semantics generalized).
+    auto-disable cascade respects this lock (an explicitly supplied prefill
+    backend skips the cascade, whichever value it is).
     """
     cfg = resolving_view(server_args)
     raw_input = cfg.cuda_graph_config
@@ -107,8 +107,8 @@ def apply_cuda_graph_compatibility(server_args: Any):
     """Auto-disable prefill cuda graph for incompatible configs.
     Rules are split per backend — TcPiecewise and Breakable have
     different constraints. Skipped when the user explicitly set the
-    prefill backend (this folds in the old
-    --enforce-piecewise-cuda-graph contract).
+    prefill backend, whichever value they chose (the contract the removed
+    --enforce-piecewise-cuda-graph used to spell).
     """
 
     cfg = resolving_view(server_args)

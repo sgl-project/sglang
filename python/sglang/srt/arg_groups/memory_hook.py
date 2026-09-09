@@ -35,6 +35,19 @@ _DLLM_PREFILL_BUCKET_COUNT_WARN_THRESHOLD = 64
 _DEEPEP_PREFILL_BUCKET_MULTIPLE = 8
 
 
+def handle_offload_compatibility(server_args: Any) -> None:
+    """Flag-only check; re-run after the model overrides fill in the PLE default."""
+    cfg = resolving_view(server_args)
+    if cfg.ple_offload_embedding and (
+        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
+    ):
+        raise ValueError(
+            "--ple-offload-embedding cannot be combined with "
+            "--cpu-offload-gb or --offload-group-size: generic layer offload "
+            "would stage the pinned PLE embedding back to the device."
+        )
+
+
 def dllm_prefill_graph_alignment(
     server_args: Any, *, dllm_config: Any = None
 ) -> Optional[int]:
