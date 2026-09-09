@@ -2260,13 +2260,16 @@ class Scheduler(
             self.rust_server = None
             return
 
-        rust_server = RustServer.launch(self)
+        rust_server = self.get_rust_server_class().launch(self)
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
+    def get_rust_server_class(self) -> type[RustServer]:
+        return RustServer
 
     def rust_server_tokenizer_path(self) -> str:
         return get_serving().tokenizer_path
