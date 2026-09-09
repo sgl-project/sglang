@@ -1,3 +1,11 @@
+"""Accelerator-dispatch tests for triton_load_watch — CPU-only, fully mocked.
+
+Kept separate from test_triton_load_watch.py, which is register_cuda_ci: that
+file launches a real Triton kernel on ``device="cuda"`` and imports ``triton``
+at module scope, so it cannot be collected on the CPU runner. The cases here
+mock the memory query instead and need no accelerator.
+"""
+
 import unittest
 from unittest.mock import patch
 
