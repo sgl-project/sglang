@@ -128,10 +128,10 @@ async fn round_robin_plain_chat_forwards_input_ids() {
     );
 }
 
-/// Even under round-robin, a tool request omits `input_ids` (the safe predicate
-/// is policy-independent too).
+/// Even under round-robin, a tool request forwards `input_ids` (the dsv4
+/// encoder mirrors tool rendering; the predicate is policy-independent too).
 #[tokio::test]
-async fn round_robin_tool_request_omits_input_ids() {
+async fn round_robin_tool_request_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
     let status = send(
@@ -146,9 +146,10 @@ async fn round_robin_tool_request_omits_input_ids() {
     assert_eq!(status, StatusCode::OK);
 
     let body = captured(&mock);
+    let ids = body.get("input_ids").and_then(|v| v.as_array());
     assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids under any policy; got {body}"
+        ids.is_some_and(|a| !a.is_empty()),
+        "tool requests on the dsv4 encoder must forward input_ids; got {body}"
     );
 }
 

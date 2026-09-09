@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod chat_template;
 pub mod dsv4;
+mod pyjson;
 
 use anyhow::Result;
 use chat_template::ChatTemplate;
@@ -25,12 +26,76 @@ pub enum ChatEncoder {
 }
 
 impl ChatEncoder {
-    /// Render `messages` into the engine-equivalent prompt text.
-    fn render(&self, messages: &serde_json::Value) -> Result<String> {
+    /// Render a parsed chat request into the engine-equivalent prompt text,
+    /// plus — when dsv4's `continue_final_message` surgery extracted a trailing
+    /// assistant turn — its content, for the caller to encode and append after
+    /// the prompt ids (the engine's `_append_assistant_prefix_to_prompt_ids`).
+    ///
+    /// The dsv4 encoder threads the request's `tools`, thinking mode, `task`,
+    /// and `continue_final_message`; the Jinja path renders only `messages`
+    /// with the model's default template (threading the rest is future work).
+    fn render(&self, request: &serde_json::Value) -> Result<(String, Option<String>)> {
+        static NO_MESSAGES: serde_json::Value = serde_json::Value::Null;
+        let messages = request.get("messages").unwrap_or(&NO_MESSAGES);
         match self {
-            ChatEncoder::Jinja(t) => t.render(messages),
-            ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages)),
+            ChatEncoder::Jinja(t) => t.render(messages).map(|s| (s, None)),
+            ChatEncoder::DeepSeekV4 => dsv4::render_request(
+                messages,
+                request.get("tools"),
+                dsv4::resolve_render_opts(request),
+                dsv4::RequestParts::resolve(request),
+            )
+            .map_err(anyhow::Error::from),
         }
+    }
+
+    /// Which forwarding predicate this encoder's ids may pass through (see
+    /// [`ForwardParity`]). Stamped onto the ids at production time so the
+    /// provenance travels with the tokens.
+    fn forward_parity(&self) -> ForwardParity {
+        match self {
+            // The Jinja encoder renders no tools/thinking/task, so its ids
+            // need the conservative predicate.
+            ChatEncoder::Jinja(_) => ForwardParity::Conservative,
+            // The dsv4 encoder mirrors the engine's full dsv4 request handling
+            // (`input_ids_safe_to_forward_dsv4`).
+            ChatEncoder::DeepSeekV4 => ForwardParity::Dsv4Full,
+        }
+    }
+}
+
+/// Which `input_ids_safe_to_forward`-family predicate may gate a chat
+/// encoder's ids (see [`ChatEncoder::forward_parity`]). Exhaustive by
+/// construction: a new encoder variant forces a decision here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardParity {
+    /// `input_ids_safe_to_forward`: tools, thinking overrides, multimodal,
+    /// trailing assistant, … all withheld.
+    Conservative,
+    /// `input_ids_safe_to_forward_dsv4`: only genuinely unmirrored engine
+    /// internals withheld.
+    Dsv4Full,
+}
+
+/// Parse a JSON value the way pydantic v2 (lax mode) coerces an OpenAI boolean
+/// field: a bool as-is; numeric `1`/`0` and the strings `true/yes/on/y/t/1` /
+/// `false/no/off/n/f/0` (case-insensitive). Anything else is `None` — pydantic
+/// would 422 the request, so correctness-sensitive callers must treat it as
+/// unknown rather than defaulting it to `false`.
+pub fn openai_bool(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(1.0) => Some(true),
+            Some(0.0) => Some(false),
+            _ => None,
+        },
+        serde_json::Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "y" | "t" | "1" => Some(true),
+            "false" | "no" | "off" | "n" | "f" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -141,37 +206,75 @@ impl TokenizerRegistry {
         self.encoders.contains_key(model_id)
     }
 
-    /// Render `messages` through the model's chat encoder, then tokenize the
-    /// result the same way the engine does (`add_special_tokens = false`, so the
-    /// encoder's literal `bos_token`/role markers carry the specials). Returns
-    /// `None` — caller falls back to raw routing — when the model has no
-    /// encoder, no tokenizer, or rendering/encoding fails or yields no tokens.
-    pub fn encode_chat(&self, model_id: &str, messages: &serde_json::Value) -> Option<Vec<u32>> {
+    /// This model's chat encoder's forwarding parity ([`ForwardParity`]);
+    /// `Conservative` when the model has no encoder at all (whose ids are
+    /// never engine-equivalent anyway).
+    pub fn forward_parity(&self, model_id: &str) -> ForwardParity {
+        self.encoders
+            .get(model_id)
+            .map(|e| e.encoder.forward_parity())
+            .unwrap_or(ForwardParity::Conservative)
+    }
+
+    /// Render the parsed chat `request` through the model's chat encoder, then
+    /// tokenize the result the same way the engine does (`add_special_tokens =
+    /// false`, so the encoder's literal `bos_token`/role markers carry the
+    /// specials). Returns `None` — caller falls back to raw routing — when the
+    /// model has no encoder, no tokenizer, or rendering/encoding fails or
+    /// yields no tokens.
+    pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.encoders.get(model_id)?);
         let tokenizer = self.get(model_id)?;
-        let rendered = entry
+        let (rendered, assistant_prefix) = entry
             .encoder
-            .render(messages)
+            .render(request)
             .inspect_err(|e| {
-                // `{e:#}` prints the full anyhow chain, so the underlying
-                // minijinja cause (e.g. a `raise_exception` message) is
-                // visible, not just the "render chat template" context.
-                entry.log_fallback(model_id, &format!("render failed: {e:#}"))
+                // A dsv4 RenderErr is a REQUEST error the engine also rejects
+                // (invalid task / task without user), not encoder breakage —
+                // it must not consume the model's one-shot WARN latch.
+                if e.downcast_ref::<dsv4::RenderErr>().is_some() {
+                    tracing::debug!(model = %model_id, error = %e,
+                        "dsv4 request-level render error (engine-invalid request)");
+                } else {
+                    // `{e:#}` prints the full anyhow chain, so the underlying
+                    // minijinja cause (e.g. a `raise_exception` message) is
+                    // visible, not just the "render chat template" context.
+                    entry.log_fallback(model_id, &format!("render failed: {e:#}"))
+                }
             })
             .ok()?;
-        match adapter::encode(&tokenizer, &rendered) {
-            Ok(ids) if !ids.is_empty() => Some(ids),
+        let mut ids = match adapter::encode(&tokenizer, &rendered) {
+            Ok(ids) if !ids.is_empty() => ids,
             Ok(_) => {
                 entry.log_fallback(model_id, "rendered prompt tokenized to zero tokens");
-                None
+                return None;
             }
             Err(e) => {
                 entry.log_fallback(model_id, &format!("tokenize failed: {e:#}"));
-                None
+                return None;
+            }
+        };
+        // Mirror `_append_assistant_prefix_to_prompt_ids`: the engine encodes
+        // the extracted prefix and appends it after the generation prompt. The
+        // router's encode never adds specials — and the pinned single-user-turn
+        // engine vector proves the V4 tokenizer adds none either — so this
+        // plain encode is exactly what the engine appends.
+        if let Some(prefix) = assistant_prefix.filter(|p| !p.is_empty()) {
+            match adapter::encode(&tokenizer, &prefix) {
+                Ok(pids) if !pids.is_empty() => ids.extend(pids),
+                Ok(_) => {
+                    entry.log_fallback(model_id, "assistant prefix tokenized to zero tokens");
+                    return None;
+                }
+                Err(e) => {
+                    entry.log_fallback(model_id, &format!("prefix tokenize failed: {e:#}"));
+                    return None;
+                }
             }
         }
+        Some(ids)
     }
 
     pub fn ids(&self) -> Vec<String> {
@@ -420,8 +523,8 @@ mod tests {
         reg.attach_chat_template_for_test("tiny", &cfg);
         assert!(reg.has_chat_encoder("tiny"));
 
-        let messages = serde_json::json!([{"role":"user","content":"hi"}]);
-        let chat_ids = reg.encode_chat("tiny", &messages).expect("encode_chat");
+        let request = serde_json::json!({"messages": [{"role":"user","content":"hi"}]});
+        let chat_ids = reg.encode_chat("tiny", &request).expect("encode_chat");
         assert!(!chat_ids.is_empty());
 
         let tok = reg.get("tiny").unwrap();
@@ -431,13 +534,13 @@ mod tests {
             "chat-templated tokens must differ from raw-content tokens"
         );
 
-        // encode_chat is exactly tokenize(render(messages)).
-        let rendered = reg
+        // encode_chat is exactly tokenize(render(request)).
+        let (rendered, _) = reg
             .encoders
             .get("tiny")
             .unwrap()
             .encoder
-            .render(&messages)
+            .render(&request)
             .unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
     }
@@ -450,7 +553,7 @@ mod tests {
             adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
         );
         assert!(!reg.has_chat_encoder("tiny"));
-        let messages = serde_json::json!([{"role":"user","content":"hi"}]);
+        let messages = serde_json::json!({"messages": [{"role":"user","content":"hi"}]});
         assert!(reg.encode_chat("tiny", &messages).is_none());
     }
 
@@ -472,7 +575,7 @@ mod tests {
             }),
         );
         assert!(reg.has_chat_encoder("tiny"));
-        let messages = serde_json::json!([{"role":"user","content":"hi"}]);
+        let messages = serde_json::json!({"messages": [{"role":"user","content":"hi"}]});
         assert!(
             reg.encode_chat("tiny", &messages).is_none(),
             "a failing render must yield None so routing falls back to raw text"

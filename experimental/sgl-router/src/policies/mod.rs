@@ -35,6 +35,9 @@ pub struct RequestTokens {
     pub ids: Vec<u32>,
     /// Whether the token ids are safe to forward as engine `input_ids`.
     pub engine_equivalent: bool,
+    /// Which forwarding predicate may gate these ids — stamped from the
+    /// encoder that produced them, so the provenance travels with the tokens.
+    pub parity: crate::tokenizer::ForwardParity,
 }
 
 /// External indexer answer prepared by the async ingress path for the
@@ -51,14 +54,19 @@ pub fn request_tokens_for(
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
-    if tokenizers.has_chat_encoder(&model_id.0) {
-        if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
-                return Some(RequestTokens {
-                    ids,
-                    engine_equivalent: true,
-                });
-            }
+    if tokenizers.has_chat_encoder(&model_id.0)
+        && value.get("messages").is_some_and(|m| m.is_array())
+    {
+        // The full request goes down so the encoder can render `tools` and
+        // resolve thinking-mode / task / continue_final_message the way the
+        // engine does (see `dsv4::render_request`) — otherwise such traffic
+        // routes on a tokenization that never matches the engine's blocks.
+        if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
+            return Some(RequestTokens {
+                ids,
+                engine_equivalent: true,
+                parity: tokenizers.forward_parity(&model_id.0),
+            });
         }
     }
     let text = extract_prompt_text_from_value(value)?;
@@ -66,6 +74,8 @@ pub fn request_tokens_for(
     Some(RequestTokens {
         ids,
         engine_equivalent: false,
+        // Raw fallback ids are never forwarded; the marker is inert.
+        parity: crate::tokenizer::ForwardParity::Conservative,
     })
 }
 
