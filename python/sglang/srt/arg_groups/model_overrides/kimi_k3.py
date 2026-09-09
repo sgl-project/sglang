@@ -42,6 +42,16 @@ def _require_kimi_k3_cutedsl_dcp_support() -> None:
         )
 
 
+def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
+    from sglang.srt.layers.attention.aiter_mla_gluon import _gluon_fn
+
+    if _gluon_fn() is None:
+        raise RuntimeError(
+            "Kimi-K3 DCP with decode_attention_backend='aiter' requires the aiter "
+            "gluon mla kernel, which is unavailable. See above aborting reasons."
+        )
+
+
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
@@ -102,8 +112,9 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 kv_cache_dtype="fp8_e4m3",
             )
         elif decode_backend == "aiter":
-            # dcp_comm_backend and dcp_replicate_q_proj are deliberately left to
-            # the shared tail below, which sets both unconditionally.
+            _require_kimi_k3_aiter_gluon_dcp_support()
+            # Override prefill backend to aiter by default
+            # if users don't explicitly specify triton
             prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
             logger.info(
                 "Kimi-K3 DCP uses aiter MLA decode: "
@@ -114,8 +125,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 prefill_attention_backend=prefill_ab,
                 decode_attention_backend="aiter",
             )
-            if cfg.page_size is None:
-                overrides["page_size"] = 32
         else:
             raise AssertionError(
                 f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
