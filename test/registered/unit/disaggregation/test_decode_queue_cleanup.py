@@ -105,6 +105,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="abort-prealloc",
             bootstrap_room=42,
             finished_reason=None,
+            to_finish=None,
             return_logprob=False,
         )
         decode_req = SimpleNamespace(
@@ -162,6 +163,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         req = SimpleNamespace(
             rid="abort-shared",
             finished_reason=FINISH_ABORT("aborted"),
+            to_finish=None,
             return_logprob=False,
         )
         decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
@@ -200,6 +202,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             origin_input_ids=[1, 2, 3],
             output_ids=[],
             finished_reason=None,
+            to_finish=None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=1),
         )
@@ -292,6 +295,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
                     bootstrap_host="127.0.0.1",
                     bootstrap_port=11500,
                     bootstrap_room=room,
+                    finished_reason=None,
+                    to_finish=None,
                 ),
                 kv_receiver=MagicMock(),
             )
