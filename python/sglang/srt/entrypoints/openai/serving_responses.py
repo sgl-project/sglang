@@ -22,6 +22,7 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
+from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.response_reasoning_item import (
@@ -65,6 +66,17 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesResponse,
     Tool,
     UsageInfo,
+)
+from sglang.srt.entrypoints.openai.responses_adapters import (
+    custom_tool_description,
+    custom_tool_names,
+    custom_tool_parameters,
+    decode_custom_tool_input,
+    decode_custom_tool_input_prefix,
+    decode_reasoning_state,
+    encode_custom_tool_input,
+    encode_reasoning_state,
+    label_developer_content,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
@@ -235,6 +247,33 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _request_id_prefix(self) -> str:
         return "resp_"
 
+    def _known_model_names(self) -> set[str]:
+        """Model ids a caller may address, mirroring what ``/v1/models`` lists."""
+        names = {self.tokenizer_manager.served_model_name}
+        registry = getattr(self.tokenizer_manager, "lora_registry", None)
+        if registry is not None:
+            names.update(registry.get_all_adapters().keys())
+        return names
+
+    def _validate_model(self, model: Optional[str]) -> Optional[ORJSONResponse]:
+        """Reject an unknown ``model``, as the Responses API does.
+
+        ``None`` means "whatever is loaded". A LoRA adapter may be addressed
+        either by name or through the ``base-model:adapter`` form.
+        """
+        if model is None:
+            return None
+        base_model, _ = self._parse_model_parameter(model)
+        known = self._known_model_names()
+        if model in known or base_model in known:
+            return None
+        return self.create_error_response(
+            message=f"The model '{model}' does not exist",
+            err_type="invalid_request_error",
+            status_code=HTTPStatus.NOT_FOUND,
+            param="model",
+        )
+
     async def create_responses(
         self,
         request: ResponsesRequest,
@@ -244,16 +283,21 @@ class OpenAIServingResponses(OpenAIServingChat):
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
 
+        model_error = self._validate_model(request.model)
+        if model_error is not None:
+            return model_error
+
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
-        # ``tool_choice="required"`` only works with ``function`` tools.
+        # ``tool_choice="required"`` needs a tool the parser can actually force.
         if request.tool_choice == "required" and not any(
-            tool.type == "function" for tool in (request.tools or [])
+            tool.type in ("function", "custom") for tool in (request.tools or [])
         ):
             return self.create_error_response(
                 'tool_choice="required" requires at least one tool with '
-                'type="function"; other built-in tool types cannot be forced.'
+                'type="function" or type="custom"; other built-in tool types '
+                "cannot be forced."
             )
 
         # harmony emits raw tokens; per-token logprobs aren't wired there.
@@ -764,6 +808,60 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
         return request.reasoning is not None and request.reasoning.summary is not None
 
+    @classmethod
+    def _make_reasoning_item(
+        cls,
+        request: ResponsesRequest,
+        text: str,
+        *,
+        item_id: str,
+        status: Optional[str],
+    ) -> ResponseReasoningItem:
+        """Build a reasoning item, mirroring the trace into ``summary`` when the
+        caller opted in via ``reasoning.summary``; the full trace stays in
+        ``content``."""
+        wants_summary = cls._wants_reasoning_summary(request)
+        return ResponseReasoningItem(
+            id=item_id,
+            type="reasoning",
+            summary=(
+                [ResponseReasoningSummary(type="summary_text", text=text)]
+                if wants_summary
+                else []
+            ),
+            content=[ResponseReasoningTextContent(type="reasoning_text", text=text)],
+            encrypted_content=(
+                encode_reasoning_state(text)
+                if request.is_include_encrypted_reasoning()
+                else None
+            ),
+            status=status,
+        )
+
+    @staticmethod
+    def _make_tool_call_item(
+        name: str, arguments: str, custom_names: set[str]
+    ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
+        """A call against a ``custom`` tool reports its freeform payload rather
+        than the JSON arguments of the shim function tool."""
+        call_id = f"call_{random_uuid()[:24]}"
+        if name in custom_names:
+            return ResponseCustomToolCall(
+                type="custom_tool_call",
+                id=f"ctc_{random_uuid()[:8]}",
+                call_id=call_id,
+                name=name,
+                input=decode_custom_tool_input(arguments),
+            )
+        return ResponseFunctionToolCall(
+            arguments=arguments,
+            call_id=call_id,
+            type="function_call",
+            name=name,
+            id=f"fc_{random_uuid()[:8]}",
+            status="completed",
+        )
+
     @staticmethod
     def _status_from_finish_reason(finish_reason: Any) -> str:
         """Only a length-capped generation is ``incomplete``; anything that got
@@ -849,32 +947,20 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         output_items = []
         if reasoning_content:
-            # Mirror the single parsed blob into ``summary`` when the caller opts
-            # in via ``reasoning.summary``; full trace stays in ``content``.
-            wants_summary = self._wants_reasoning_summary(request)
-            reasoning_item = ResponseReasoningItem(
-                id=f"rs_{random_uuid()}",
-                type="reasoning",
-                summary=(
-                    [
-                        ResponseReasoningSummary(
-                            type="summary_text", text=reasoning_content
-                        )
-                    ]
-                    if wants_summary
-                    else []
-                ),
-                content=[
-                    ResponseReasoningTextContent(
-                        type="reasoning_text", text=reasoning_content
-                    ),
-                ],
-                status=None,
+            output_items.append(
+                self._make_reasoning_item(
+                    request,
+                    reasoning_content,
+                    item_id=f"rs_{random_uuid()}",
+                    status=None,
+                )
             )
-            output_items.append(reasoning_item)
 
         is_required = request.tool_choice == "required"
-        tool_call_items: list[ResponseFunctionToolCall] = []
+        custom_names = custom_tool_names(request.tools)
+        tool_call_items: list[
+            Union[ResponseFunctionToolCall, ResponseCustomToolCall]
+        ] = []
         parsed_via_native = False
         detector_owns_format = False
         if (
@@ -898,13 +984,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     content, call_info_list = parser.parse_non_stream(content)
                     for call_info in call_info_list:
                         tool_call_items.append(
-                            ResponseFunctionToolCall(
-                                arguments=call_info.parameters or "",
-                                call_id=f"call_{random_uuid()[:24]}",
-                                type="function_call",
-                                name=call_info.name,
-                                id=f"fc_{random_uuid()[:8]}",
-                                status="completed",
+                            self._make_tool_call_item(
+                                call_info.name,
+                                call_info.parameters or "",
+                                custom_names,
                             )
                         )
                     parsed_via_native = bool(call_info_list)
@@ -930,13 +1013,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                             tool.get("parameters", {}), ensure_ascii=False
                         )
                         tool_call_items.append(
-                            ResponseFunctionToolCall(
-                                arguments=arguments,
-                                call_id=f"call_{random_uuid()[:24]}",
-                                type="function_call",
-                                name=tool["name"],
-                                id=f"fc_{random_uuid()[:8]}",
-                                status="completed",
+                            self._make_tool_call_item(
+                                tool["name"], arguments, custom_names
                             )
                         )
                     content = ""
@@ -986,18 +1064,24 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
-        # Only ``function`` tools flow to chat; built-ins go through harmony.
+        # ``function`` and ``custom`` tools flow to chat; built-ins go through
+        # harmony. A custom tool is shimmed into a single-string function tool.
         chat_tools = []
         for tool in request.tools:
-            if tool.type != "function":
+            if tool.type == "function":
+                description, parameters = tool.description, tool.parameters
+            elif tool.type == "custom" and tool.name:
+                description = custom_tool_description(tool.description, tool.format)
+                parameters = custom_tool_parameters()
+            else:
                 continue
             chat_tools.append(
                 Tool(
                     type="function",
                     function=Function(
                         name=tool.name,
-                        description=tool.description,
-                        parameters=tool.parameters,
+                        description=description,
+                        parameters=parameters,
                         strict=tool.strict,
                     ),
                 )
@@ -1048,6 +1132,27 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         return content_part
 
+    @staticmethod
+    def _flatten_tool_output(output: Any) -> str:
+        """``output`` may be a string or an array of content parts (OpenAI allows
+        both); the chat tool message needs a string."""
+        if isinstance(output, list):
+            return "".join(p.get("text", "") for p in output if isinstance(p, dict))
+        return output
+
+    @staticmethod
+    def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:
+        return {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": message.get("call_id") or message.get("id"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        }
+
     @classmethod
     def _normalize_response_message_for_chat(cls, message: Any) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
@@ -1056,10 +1161,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         if not isinstance(message, dict):
             return message
 
-        # Most chat templates only recognize system/user/assistant/tool;
-        # collapse ``developer`` to ``system`` at the boundary.
+        # Most chat templates only recognize system/user/assistant/tool; collapse
+        # ``developer`` to ``system`` at the boundary, labelled so the instruction
+        # tier survives the collapse.
         if message.get("role") == "developer":
-            message = {**message, "role": "system"}
+            message = {
+                **message,
+                "role": "system",
+                "content": label_developer_content(message.get("content")),
+            }
 
         msg_type = message.get("type")
         if msg_type == "function_call":
@@ -1078,29 +1188,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 raw = orjson.dumps(raw).decode("utf-8")
             else:
                 raw = "{}"
-            return {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": message.get("call_id") or message.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": message.get("name"),
-                            "arguments": raw,
-                        },
-                    }
-                ],
-            }
-        if msg_type == "function_call_output":
-            # ``output`` may be a string or an array of content parts (OpenAI
-            # allows both); the chat tool message needs a string, so flatten.
-            out = message.get("output", "")
-            if isinstance(out, list):
-                out = "".join(p.get("text", "") for p in out if isinstance(p, dict))
+            return cls._chat_tool_call_message(message, message.get("name"), raw)
+        if msg_type == "custom_tool_call":
+            # Replay through the same single-string shim the tool was offered as.
+            return cls._chat_tool_call_message(
+                message,
+                message.get("name"),
+                encode_custom_tool_input(message.get("input") or ""),
+            )
+        if msg_type in ("function_call_output", "custom_tool_call_output"):
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": out,
+                "content": cls._flatten_tool_output(message.get("output", "")),
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
@@ -1119,6 +1219,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             text_parts = _collect(message.get("summary"))
             if not text_parts:
                 text_parts = _collect(message.get("content"))
+            if not text_parts:
+                # A store=false client may replay only the opaque blob.
+                restored = decode_reasoning_state(message.get("encrypted_content"))
+                if restored:
+                    text_parts = [restored]
             if not text_parts:
                 return None
             return {
@@ -1970,6 +2075,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        custom_names = custom_tool_names(request.tools)
         is_required = request.tool_choice == "required"
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
@@ -2049,17 +2155,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             if not reasoning_state["open"]:
                 return []
             text = reasoning_state["text"]
-            completed_item = ResponseReasoningItem(
-                id=reasoning_state["item_id"],
-                type="reasoning",
-                summary=(
-                    [ResponseReasoningSummary(type="summary_text", text=text)]
-                    if wants_summary
-                    else []
-                ),
-                content=[
-                    ResponseReasoningTextContent(type="reasoning_text", text=text),
-                ],
+            completed_item = self._make_reasoning_item(
+                request,
+                text,
+                item_id=reasoning_state["item_id"],
                 status="completed",
             )
             events: list = []
@@ -2180,25 +2279,67 @@ class OpenAIServingResponses(OpenAIServingChat):
             if state is None or state.get("done"):
                 return []
             arguments = state["arguments"]
-            completed_item = ResponseFunctionToolCall(
-                arguments=arguments,
-                call_id=state["call_id"],
-                name=state["name"] or "",
-                type="function_call",
-                id=state["item_id"],
-                status="completed",
-            )
-            events = [
-                _send_event(
-                    openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
-                        type="response.function_call_arguments.done",
-                        sequence_number=-1,
-                        item_id=state["item_id"],
-                        output_index=state["output_index"],
-                        arguments=arguments,
-                        name=state["name"] or "",
+            events: list = []
+            if state["custom"]:
+                payload = decode_custom_tool_input(arguments)
+                # Deltas cannot be retracted, so a payload that no longer
+                # extends what was already streamed defers to the streamed text.
+                if not payload.startswith(state["payload"]):
+                    payload = state["payload"] or payload
+                remainder = payload[len(state["payload"]) :]
+                if remainder:
+                    state["payload"] = payload
+                    events.append(
+                        _send_event(
+                            openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
+                                type="response.custom_tool_call_input.delta",
+                                sequence_number=-1,
+                                item_id=state["item_id"],
+                                output_index=state["output_index"],
+                                delta=remainder,
+                            )
+                        )
                     )
-                ),
+                completed_item = ResponseCustomToolCall(
+                    type="custom_tool_call",
+                    id=state["item_id"],
+                    call_id=state["call_id"],
+                    name=state["name"] or "",
+                    input=payload,
+                )
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseCustomToolCallInputDoneEvent(
+                            type="response.custom_tool_call_input.done",
+                            sequence_number=-1,
+                            item_id=state["item_id"],
+                            output_index=state["output_index"],
+                            input=payload,
+                        )
+                    )
+                )
+            else:
+                completed_item = ResponseFunctionToolCall(
+                    arguments=arguments,
+                    call_id=state["call_id"],
+                    name=state["name"] or "",
+                    type="function_call",
+                    id=state["item_id"],
+                    status="completed",
+                )
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                            type="response.function_call_arguments.done",
+                            sequence_number=-1,
+                            item_id=state["item_id"],
+                            output_index=state["output_index"],
+                            arguments=arguments,
+                            name=state["name"] or "",
+                        )
+                    )
+                )
+            events.append(
                 _send_event(
                     openai_responses_types.ResponseOutputItemDoneEvent(
                         type="response.output_item.done",
@@ -2206,8 +2347,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         output_index=state["output_index"],
                         item=completed_item,
                     )
-                ),
-            ]
+                )
+            )
             emitted_items.append(completed_item)
             state["done"] = True
             return events
@@ -2357,46 +2498,84 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     for ev in _close_tool_call_state(other_index):
                                         yield ev
                             current_output_index += 1
-                            item_id = f"fc_{random_uuid()[:8]}"
-                            call_id = f"call_{random_uuid()[:24]}"
+                            name = call.name or ""
+                            is_custom = name in custom_names
                             state = {
-                                "item_id": item_id,
-                                "call_id": call_id,
+                                "item_id": (
+                                    f"ctc_{random_uuid()[:8]}"
+                                    if is_custom
+                                    else f"fc_{random_uuid()[:8]}"
+                                ),
+                                "call_id": f"call_{random_uuid()[:24]}",
                                 "output_index": current_output_index,
-                                "name": call.name or "",
+                                "name": name,
                                 "arguments": "",
+                                "custom": is_custom,
+                                "payload": "",
                                 "added": False,
                                 "done": False,
                             }
                             tool_call_states[tool_index] = state
                         if not state["added"]:
                             state["added"] = True
+                            if state["custom"]:
+                                added_item = ResponseCustomToolCall(
+                                    type="custom_tool_call",
+                                    id=state["item_id"],
+                                    call_id=state["call_id"],
+                                    name=state["name"],
+                                    input="",
+                                )
+                            else:
+                                added_item = ResponseFunctionToolCall(
+                                    arguments="",
+                                    call_id=state["call_id"],
+                                    name=state["name"],
+                                    type="function_call",
+                                    id=state["item_id"],
+                                    status="in_progress",
+                                )
                             yield _send_event(
                                 openai_responses_types.ResponseOutputItemAddedEvent(
                                     type="response.output_item.added",
                                     sequence_number=-1,
                                     output_index=state["output_index"],
-                                    item=ResponseFunctionToolCall(
-                                        arguments="",
-                                        call_id=state["call_id"],
-                                        name=state["name"],
-                                        type="function_call",
-                                        id=state["item_id"],
-                                        status="in_progress",
-                                    ),
+                                    item=added_item,
                                 )
                             )
                         if call.parameters:
                             state["arguments"] += call.parameters
-                            yield _send_event(
-                                openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
-                                    type="response.function_call_arguments.delta",
-                                    sequence_number=-1,
-                                    item_id=state["item_id"],
-                                    output_index=state["output_index"],
-                                    delta=call.parameters,
+                            if state["custom"]:
+                                # The payload is a JSON string value inside the
+                                # shim arguments, so un-escape what has arrived
+                                # so far and stream only the new suffix.
+                                decoded = decode_custom_tool_input_prefix(
+                                    state["arguments"]
                                 )
-                            )
+                                if decoded.startswith(state["payload"]) and len(
+                                    decoded
+                                ) > len(state["payload"]):
+                                    delta = decoded[len(state["payload"]) :]
+                                    state["payload"] = decoded
+                                    yield _send_event(
+                                        openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
+                                            type="response.custom_tool_call_input.delta",
+                                            sequence_number=-1,
+                                            item_id=state["item_id"],
+                                            output_index=state["output_index"],
+                                            delta=delta,
+                                        )
+                                    )
+                            else:
+                                yield _send_event(
+                                    openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                        type="response.function_call_arguments.delta",
+                                        sequence_number=-1,
+                                        item_id=state["item_id"],
+                                        output_index=state["output_index"],
+                                        delta=call.parameters,
+                                    )
+                                )
 
                 def _emit_normal_text():
                     if normal_text and _should_emit_normal_text_as_message(

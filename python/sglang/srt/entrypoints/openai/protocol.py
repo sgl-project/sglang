@@ -1581,6 +1581,9 @@ class ResponseTool(BaseModel):
     strict: bool = False
     # Inner schemas for ``namespace`` tools.
     tools: Optional[List[Dict[str, Any]]] = None
+    # Input format of a ``custom`` tool: {"type": "text"} or
+    # {"type": "grammar", "syntax": ..., "definition": ...}.
+    format: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def validate_function_tool(self) -> ResponseTool:
@@ -1765,20 +1768,24 @@ class ResponsesRequest(BaseModel):
     def is_include_output_logprobs(self) -> bool:
         return bool(self.include and "message.output_text.logprobs" in self.include)
 
+    def is_include_encrypted_reasoning(self) -> bool:
+        return bool(self.include and "reasoning.encrypted_content" in self.include)
+
     def has_json_schema_constraint(self) -> bool:
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
         """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` survives, the rest (web_search,
-        mcp, ...) can't be forced through the tool-call parser."""
+        object forms only a named ``function`` / ``custom`` tool survives, the
+        rest (web_search, mcp, ...) can't be forced through the tool-call
+        parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
             return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
         )
-        if tool_choice.get("type") == "function" and name:
+        if tool_choice.get("type") in ("function", "custom") and name:
             return {"type": "function", "name": name}
         return "auto"
 

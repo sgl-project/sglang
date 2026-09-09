@@ -458,11 +458,14 @@ class InputItemNormalizationTestCase(CustomTestCase):
             },
         )
 
-    def test_developer_role_becomes_system(self):
+    def test_developer_role_becomes_labelled_system(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {"role": "developer", "content": "Be terse."}
         )
-        self.assertEqual(normalized, {"role": "system", "content": "Be terse."})
+        self.assertEqual(
+            normalized,
+            {"role": "system", "content": "Developer instructions:\nBe terse."},
+        )
 
     def test_function_call_output_becomes_tool_message(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
