@@ -475,15 +475,23 @@ _install_parallel_properties()
 
 
 def linear_attn_parallel_group() -> str:
-    """The group linear attention partitions its heads over: the attention-TP
-    group, or the TP group under CP-TP group sharing, where the attention-TP
-    group is one rank wide."""
-    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+    """The head partition group, including CP ranks for linear-attention CP."""
+    parallel = get_parallel()
+    return (
+        "tp"
+        if parallel.enable_cp_tp_group_sharing or parallel.enable_linear_attn_cp
+        else "attn_tp"
+    )
 
 
 def linear_attn_tp_size() -> int:
     """The width of ``linear_attn_parallel_group()``."""
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+
+
+def linear_attn_tp_rank() -> int:
+    """The rank within ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_rank")
 
 
 def draft_attn_parallel_group() -> str:
