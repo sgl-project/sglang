@@ -53,6 +53,7 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
@@ -932,7 +933,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
         # Ratio 1/2 kv_source layers keep one FlashMLA-layout latent and one bf16
         # index key per compressed position.
-        low_ratio_kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        low_ratio_kv_bytes = self._get_dsv4_kv_bytes_per_token()
         self.low_ratio_bytes_per_full_token = sum(
             (low_ratio_kv_bytes + 2 * self.indexer_head_dim) / cfg.compress_ratios[l]
             for l in cfg.hf_config.kv_source_layers
@@ -1006,8 +1007,34 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"get_compress_state_ring_size()."
             )
 
+    def _get_dsv4_kv_bytes_per_token(self) -> int:
+        """Return the actual bytes per KV token used by the active backend.
+
+        CUDA uses a uint8 packed layout (nope FP8 + rope BF16 + scale).
+        NPU A5 (arch35) uses FP8 with 128-byte row alignment.
+        NPU A3 uses BF16 with no packing.
+        """
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            if is_npu_arch35():
+                import math
+
+                group = 64
+                align = 128
+                raw = (
+                    self.qk_nope_head_dim
+                    + self.qk_rope_head_dim * 2
+                    + math.ceil(self.qk_nope_head_dim / group)
+                )
+                return math.ceil(raw / align) * align
+            # A3: BF16, no packing
+            return (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
+        # CUDA uint8 packed: nope FP8 + rope BF16 + scale + pad
+        return self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        kv_bytes = self._get_dsv4_kv_bytes_per_token()
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         c4_state_dtype_size, c128_state_dtype_size = (

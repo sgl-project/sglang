@@ -58,7 +58,13 @@ def token_req_indices(forward_batch) -> torch.Tensor:
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend and decode only"
     )
-    return torch.repeat_interleave(req, forward_batch.extend_seq_lens.to(torch.int64))
+    req = torch.repeat_interleave(
+        req, forward_batch.extend_seq_lens.to(torch.int64)
+    )
+    target_len = forward_batch.positions.shape[0]
+    if req.shape[0] < target_len:
+        req = torch.cat([req, req.new_zeros(target_len - req.shape[0])])
+    return req
 
 
 def topk_from_scores(
