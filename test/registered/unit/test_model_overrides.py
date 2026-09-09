@@ -648,6 +648,50 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self._resolved(self._construct(*qwen4), "ple_offload_embedding")
             )
 
+    def test_qwen4_modelopt_config_json_selects_trtllm_moe_runner(self):
+        """`nvidia/Qwen3.8-Flash-Next-NVFP4` is a MIXED_PRECISION ModelOpt
+        checkpoint, which ModelConfig resolves to modelopt_mixed. The family
+        override used to whitelist only fp8 / modelopt_fp4 for
+        `moe_runner_backend=flashinfer_trtllm`, so the FP4 experts fell to the
+        CUTLASS runner, whose weight post-processing pads w13
+        (moe_intermediate_size 640) and asserts on gated activations.
+
+        The raw `--quantization modelopt` (online quantization of a bf16
+        checkpoint) must stay off that whitelist: the trtllm MoE hook rejects
+        it, so whitelisting it turns a working launch into an assertion."""
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        mixed_ckpt = {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.language_model.layers.0.mlp.experts": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    }
+                },
+            }
+        }
+        with override_platform(is_sm100=True):
+            from_config_json = self._construct(*qwen4, config_extra=mixed_ckpt)
+            explicit_fp4 = self._construct(
+                *qwen4, config_extra=mixed_ckpt, quantization="modelopt_fp4"
+            )
+        self.assertEqual(
+            self._resolved(from_config_json, "quantization"), "modelopt_mixed"
+        )
+        for sa in (from_config_json, explicit_fp4):
+            self.assertEqual(
+                self._resolved(sa, "moe_runner_backend"), "flashinfer_trtllm"
+            )
+
+        with override_platform(is_sm100=True):
+            online = self._construct(
+                "Qwen3MoeForCausalLM", "qwen3_moe", quantization="modelopt"
+            )
+        self.assertEqual(self._resolved(online, "quantization"), "modelopt")
+        self.assertEqual(self._resolved(online, "moe_runner_backend"), "auto")
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(self._resolved(sa, "enable_tf32_matmul"))
