@@ -584,6 +584,9 @@ class StreamingSession(BasePrefixCache):
     def take_events(self):
         return self.inner.take_events()
 
+    def bump_session_keepalive(self, session_id: str) -> bool:
+        return self.inner.bump_session_keepalive(session_id)
+
     def supports_swa(self):
         return self.inner.supports_swa()
 
