@@ -46,15 +46,21 @@ class TestPrefillOnlyPrefixCache(PDDisaggregationServerBase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["meta_info"]["cached_tokens"]
 
+    @staticmethod
+    def _unique_prompt() -> str:
+        # The fresh tag comes first so no two prompts share a leading token.
+        return f"{uuid.uuid4().hex} prefill-only cache probe. " * 8
+
     def test_fake_sender_requests_are_cached(self):
-        prompt = f"Prefill-only cache probe {uuid.uuid4().hex}. " * 8
-        self.assertEqual(self._prefill(prompt, room=1), 0)
-        self.assertGreater(self._prefill(prompt, room=2), 0)
+        prompt = self._unique_prompt()
+        first = self._prefill(prompt, room=1)
+        self.assertGreater(self._prefill(prompt, room=2), first)
 
     def test_explicit_opt_out_is_not_cached(self):
-        prompt = f"Prefill-only opt-out probe {uuid.uuid4().hex}. " * 8
-        self.assertEqual(self._prefill(prompt, room=3, skip_cache_insert=True), 0)
-        self.assertEqual(self._prefill(prompt, room=4), 0)
+        prompt = self._unique_prompt()
+        baseline = self._prefill(prompt, room=3, skip_cache_insert=True)
+        self.assertEqual(self._prefill(prompt, room=4), baseline)
+        self.assertGreater(self._prefill(prompt, room=5), baseline)
 
 
 if __name__ == "__main__":

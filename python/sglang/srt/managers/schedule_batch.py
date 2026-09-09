@@ -1274,9 +1274,7 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        # Read existing prefixes, never publish this request's KV to the tree
-        # or any HiCache tier. Explicit per request; the PD fake bootstrap
-        # host only selects the fake KV sender.
+        # May read cached prefixes, never publishes its own KV to any cache tier.
         self.skip_radix_cache_insert = skip_cache_insert
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 

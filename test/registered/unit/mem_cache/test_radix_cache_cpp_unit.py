@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,9 +57,8 @@ class TestRadixCacheCpp(CustomTestCase):
             last_node = object()
             req = SimpleNamespace(
                 cache_salt=None,
-                req_pool_idx=0,
+                kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=2),
                 prefix_indices=kv_indices[0, :2].clone(),
-                cache_protected_len=2,
                 origin_input_ids=array("q", [1, 2, 3, 4, 5, 6]),
                 output_ids=array("q"),
                 extra_key=None,
@@ -69,7 +69,7 @@ class TestRadixCacheCpp(CustomTestCase):
             cache.cache_unfinished_req(req, chunked=True, is_insert=False)
 
             torch.testing.assert_close(req.prefix_indices, kv_indices[0])
-            self.assertEqual(req.cache_protected_len, 2)
+            self.assertEqual(req.kv.cache_protected_len, 2)
             cache._insert.assert_not_called()
 
             cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=6)

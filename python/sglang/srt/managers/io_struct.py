@@ -351,8 +351,7 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
-    # Read existing prefixes but never insert this request's KV into the
-    # prefix cache (any tier). Normalized to bool / List[bool].
+    # Reuse cached prefixes but never insert this request's KV into any cache tier.
     skip_cache_insert: Optional[Union[List[bool], bool]] = None
 
     def regenerate_rid(self):
@@ -1093,7 +1092,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
-    # Read existing prefixes but never insert this request's KV into the prefix cache.
     skip_cache_insert: bool = False
 
     def wrap_pickle_fields(self):

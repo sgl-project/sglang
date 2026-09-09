@@ -12,12 +12,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo  # noqa: E402
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo  # noqa: E402
 from sglang.srt.mem_cache.chunk_cache import ChunkCache  # noqa: E402
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req  # noqa: E402
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache  # noqa: E402
 from sglang.srt.mem_cache.radix_cache import RadixCache  # noqa: E402
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -109,6 +111,32 @@ class TestSkipRadixCacheInsert(CustomTestCase):
                 torch.testing.assert_close(req.prefix_indices, kv_indices[0])
                 self.assertEqual(req.kv.cache_protected_len, 2)
                 cache.insert.assert_not_called()
+
+
+def _make_req(**kwargs) -> Req:
+    sampling_params = SamplingParams(max_new_tokens=1)
+    sampling_params.normalize(None)
+    return Req(
+        rid="req",
+        origin_input_text="",
+        origin_input_ids=array("q", [1, 2, 3]),
+        sampling_params=sampling_params,
+        vocab_size=128,
+        **kwargs,
+    )
+
+
+class TestReqSkipCacheInsertDerivation(CustomTestCase):
+    """The skip flag comes only from the explicit request field. Deriving it
+    from the PD fake bootstrap host kept every fake-sender request (prefill-only
+    deployments, health checks) out of the prefix cache (#38069, #38094)."""
+
+    def test_explicit_field_skips(self):
+        self.assertTrue(_make_req(skip_cache_insert=True).skip_radix_cache_insert)
+
+    def test_fake_bootstrap_host_alone_does_not_skip(self):
+        req = _make_req(bootstrap_host=FAKE_BOOTSTRAP_HOST, bootstrap_room=0)
+        self.assertFalse(req.skip_radix_cache_insert)
 
 
 if __name__ == "__main__":

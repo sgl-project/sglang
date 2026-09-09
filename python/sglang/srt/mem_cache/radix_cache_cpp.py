@@ -198,7 +198,7 @@ class RadixCacheCpp(BasePrefixCache):
         else:
             # Skipped unfinished inserts advance prefix_indices for scheduling,
             # but cache_protected_len remains the tree-owned boundary.
-            old_prefix_len = req.cache_protected_len
+            old_prefix_len = req.kv.cache_protected_len
         page_aligned_overall_len = kv_len_to_handle // self.page_size * self.page_size
 
         if is_insert:
