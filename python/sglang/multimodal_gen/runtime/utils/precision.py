@@ -216,12 +216,12 @@ class MixedPrecisionState:
     mp_policy: MixedPrecisionPolicy | None = None
 
 
-_mixed_precision_state = threading.local()
+_mixed_precision_state = threading.local(state=None)
 
 
 def get_mixed_precision_state() -> MixedPrecisionState:
     """Get the current mixed precision state."""
-    state = vars(_mixed_precision_state).get("state")
+    state = _mixed_precision_state.state
     if state is None:
         raise ValueError("Mixed precision state not set")
     return state
@@ -251,5 +251,5 @@ def set_mixed_precision_policy(
 
 def get_compute_dtype() -> torch.dtype:
     """Get the current compute dtype from mixed precision policy."""
-    state = vars(_mixed_precision_state).get("state")
+    state = _mixed_precision_state.state
     return torch.get_default_dtype() if state is None else state.param_dtype
