@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.staging_buffer import (
+    StagingAllocator,
+)
 from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
     handle_staging_req,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -28,12 +32,14 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    get_dsv4_c4_state_indices,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
@@ -41,7 +47,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
@@ -102,7 +108,7 @@ class TestDisaggregationWire(unittest.TestCase):
 
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
-            req_pool_idx=0,
+            kv=ReqKvInfo(req_pool_idx=0),
             prefix_indices=[0, 1],
             extend_range=SimpleNamespace(length=3),
             origin_input_ids=[0, 1, 2, 3, 4],
@@ -220,6 +226,37 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
 
 
+class TestStagingWatermark(unittest.TestCase):
+    @patch("sglang.srt.disaggregation.common.staging_buffer.StagingBuffer")
+    def test_empty_ring_restarts_at_zero(self, staging_buffer):
+        staging_buffer.return_value.data_ptr = 0
+        allocator = StagingAllocator(100, "cpu", 0)
+        alloc_id, _, _ = allocator.assign(60)
+
+        allocator.free(alloc_id)
+
+        self.assertEqual(allocator.get_watermark(), (1, 0))
+        self.assertEqual(allocator.assign(70)[1:], (0, 1))
+
+    def test_new_watermark_subscriber_receives_current_allocator_state(self):
+        sock = Mock()
+        bootstrap_info = {"host": "prefill", "port": 7200}
+        receiver = Mock(
+            bootstrap_infos=[bootstrap_info],
+        )
+        receiver._connect_to_bootstrap_server.return_value = (sock, threading.Lock())
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = Mock()
+        handler.staging_allocator.get_watermark.return_value = (3, 0)
+        handler._wm_subscribers = {}
+
+        handler.register_wm_subscriber(receiver, "session-new")
+
+        sock.send_multipart.assert_called_once_with(
+            [b"WATERMARK", b"3", b"0", b"session-new"]
+        )
+
+
 class TestMooncakePPStaging(unittest.TestCase):
     def test_staging_response_targets_requesting_pp_rank(self):
         sock = Mock()
@@ -329,7 +366,12 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         buffers.set_buf(self._make_req(seed))
         buffers.set_buf(self._make_req(None, metadata_buffer_index=1))
 
-        self.assertTrue(torch.equal(buffers.output_dsa_topk_indices[0], seed))
+        self.assertTrue(
+            torch.equal(
+                buffers.output_dsa_topk_indices[0],
+                seed.to(buffers.output_dsa_topk_indices.device),
+            )
+        )
         self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [-1, -1, -1])
         ptrs, data_lens, item_lens = buffers.get_buf_infos()
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
@@ -399,20 +441,33 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
 
-        with envs.SGLANG_DSA_FUSE_TOPK.override(True), patch(
-            "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True
+        local_slots = [[309, 101, -1], [801, 990, -1]]
+        unremapped = [[2, 0, -1], [1, 3, -1]]
+        for platform, cuda, hip, fused, expected in (
+            ("cuda", True, False, True, local_slots),
+            ("hip", False, True, True, local_slots),
+            # Everything that is neither CUDA nor ROCm -- NPU in particular --
+            # still declines the seed, so fusion stays off and the wire
+            # positions are passed through unremapped.
+            ("other", False, False, False, unremapped),
         ):
-            self.assertTrue(
-                should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True)
-            )
-            draft_input = build_eagle_disagg_draft_input(
-                batch, torch.tensor([11, 12], dtype=torch.int64), None
-            )
+            with (
+                self.subTest(platform=platform),
+                envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+                ),
+                patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip),
+            ):
+                self.assertEqual(
+                    should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),
+                    fused,
+                )
+                draft_input = build_eagle_disagg_draft_input(
+                    batch, torch.tensor([11, 12], dtype=torch.int64), None
+                )
 
-        self.assertEqual(
-            draft_input.dsa_topk_indices.tolist(),
-            [[309, 101, -1], [801, 990, -1]],
-        )
+                self.assertEqual(draft_input.dsa_topk_indices.tolist(), expected)
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
@@ -433,6 +488,74 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         )
         self.assertEqual(future_map.dsa_topk_indices_buf.shape, (4, 3))
         self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
+
+    @patch(
+        "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+        return_value=False,
+    )
+    def test_future_map_initializes_topk_after_prefill_payload(self, _):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SimpleNamespace(
+            is_some=Mock(return_value=True),
+            need_topk=Mock(return_value=True),
+        )
+        future_map.req_pool_size = 4
+        future_map.device = "cpu"
+        future_map.need_topk = False
+        future_map.need_hidden_states = False
+        future_map.topk_p_buf = None
+        future_map.topk_index_buf = None
+        future_map.hidden_states_buf = None
+        future_map.draft_probs_buf = None
+
+        future_map._maybe_init_forward_bufs(
+            RelayPayload(bonus_tokens=torch.zeros((2,), dtype=torch.int64))
+        )
+        self.assertFalse(future_map.need_topk)
+
+        future_map._maybe_init_forward_bufs(
+            RelayPayload(
+                bonus_tokens=torch.zeros((2,), dtype=torch.int64),
+                topk_p=torch.zeros((2, 3), dtype=torch.float32),
+                topk_index=torch.zeros((2, 3), dtype=torch.int64),
+            )
+        )
+        self.assertTrue(future_map.need_topk)
+        self.assertEqual(future_map.topk_p_buf.shape, (4, 3))
+        self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
+
+
+class TestDSV4C4StateIndices(unittest.TestCase):
+    def test_non_mtp_to_mtp_maps_the_same_logical_positions(self):
+        # seq_len=13 keeps logical positions [8, 13) for the overlap C4 state.
+        src = get_dsv4_c4_state_indices(2, 13, ring_size=8)
+        dst = get_dsv4_c4_state_indices(2, 13, ring_size=16)
+
+        np.testing.assert_array_equal(src, np.array([16, 17, 18, 19, 20]))
+        np.testing.assert_array_equal(dst, np.array([40, 41, 42, 43, 44]))
+        self.assertEqual(src.size, dst.size)
+
+    def test_ring_wrap_preserves_position_order(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c4_state_indices(0, 10, ring_size=8),
+            np.array([4, 5, 6, 7, 0, 1], dtype=np.int32),
+        )
+
+    def test_short_and_empty_sequences(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c4_state_indices(3, 3, ring_size=8),
+            np.array([24, 25, 26], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            get_dsv4_c4_state_indices(3, 0, ring_size=8),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    def test_invalid_ring_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            get_dsv4_c4_state_indices(0, 8, ring_size=4)
+        with self.assertRaises(ValueError):
+            get_dsv4_c4_state_indices(0, 8, ring_size=10)
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):

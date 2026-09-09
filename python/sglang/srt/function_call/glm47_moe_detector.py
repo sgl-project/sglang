@@ -627,9 +627,9 @@ class Glm47MoeDetector(BaseFormatDetector):
                 pairs = self.func_arg_regex.findall(func_args_raw)
                 if pairs:
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
-                    self.prev_tool_call_arr[self.current_tool_id][
-                        "arguments"
-                    ] = arguments
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                        arguments
+                    )
             except Exception as e:
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
 

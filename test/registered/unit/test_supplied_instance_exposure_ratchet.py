@@ -56,7 +56,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 # Also on a CUDA runner: the written set is derived by resolving on the running
 # host, and `is_cuda()` / capability gates only open on real hardware. The pin
 # is split by host so both registrations stay exact: `_EXPOSED` is asserted
@@ -68,7 +68,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 # shift the exact sets in ways none of the pinning hosts can verify; the ROCm
 # resolution surface is covered by `test_resolution_is_reproducible.py`
 # instead, whose assertion is device-agnostic.)
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
 _PACKAGE_ROOT = Path(next(iter(sglang.__path__))) / "srt"
 
@@ -206,17 +206,17 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
         return values
 
     def dict_keys(node) -> set:
-        assert isinstance(
-            node, ast.Dict
-        ), f"non-literal dict in override expansion at {rel}:{call.lineno}"
+        assert isinstance(node, ast.Dict), (
+            f"non-literal dict in override expansion at {rel}:{call.lineno}"
+        )
         keys = set()
         for key in node.keys:
             if isinstance(key, ast.Constant):
                 keys.add(key.value)
                 continue
-            assert isinstance(
-                key, ast.Name
-            ), f"non-literal dict key in override expansion at {rel}:{call.lineno}"
+            assert isinstance(key, ast.Name), (
+                f"non-literal dict key in override expansion at {rel}:{call.lineno}"
+            )
             bound = loop_variable_values(key.id)
             assert bound, (
                 f"dict key {key.id!r} at {rel}:{call.lineno} is not bound by a "
@@ -239,9 +239,9 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
                     f"unresolvable override expansion at {rel}:{call.lineno}"
                 )
         return keys
-    assert isinstance(
-        kw.value, ast.Name
-    ), f"unresolvable override expansion at {rel}:{call.lineno}"
+    assert isinstance(kw.value, ast.Name), (
+        f"unresolvable override expansion at {rel}:{call.lineno}"
+    )
     name = kw.value.id
     enclosing = None
     for fn in ast.walk(tree):
@@ -253,9 +253,9 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
             ):
                 if enclosing is None or fn.lineno > enclosing.lineno:
                     enclosing = fn
-    assert (
-        enclosing is not None
-    ), f"override expansion outside any function at {rel}:{call.lineno}"
+    assert enclosing is not None, (
+        f"override expansion outside any function at {rel}:{call.lineno}"
+    )
     keys = set()
     found = False
     for node in ast.walk(enclosing):
@@ -483,8 +483,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 tgts = [node.target]
             elif (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_declare"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "declare_resolution"
             ):
                 targets |= {
                     kw.arg
@@ -622,7 +622,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(root).as_posix()
             source = path.read_text(encoding="utf-8-sig")
-            if "_late_resolution" not in source:
+            if "declare_late_resolution" not in source:
                 continue
             try:
                 tree = ast.parse(source)

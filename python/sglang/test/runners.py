@@ -935,9 +935,9 @@ def check_close_model_outputs(
     print(f"{srt_outputs.output_strs=}")
     rouge_l_scores = calculate_rouge_l(hf_outputs.output_strs, srt_outputs.output_strs)
     print(f"{rouge_l_scores=}")
-    assert all(
-        score >= rouge_l_tolerance for score in rouge_l_scores
-    ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
+    assert all(score >= rouge_l_tolerance for score in rouge_l_scores), (
+        f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
+    )
 
     if check_logprobs:
         for i in range(len(hf_outputs.output_strs)):
