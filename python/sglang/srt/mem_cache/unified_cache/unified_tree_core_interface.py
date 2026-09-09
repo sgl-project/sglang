@@ -237,26 +237,27 @@ class UnifiedTreeCoreInterface(ABC):
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
-        """Bump the reference count on a node's component locks, leaving any
-        component in skip_lock_components evictable and recorded in the result."""
+        """Bump the reference count on a node's component locks. Components in
+        ``skip_lock_components`` are left untaken; the receipt records the
+        anchor node and the skipped set so the paired release mirrors them."""
         ...
 
     @abstractmethod
     def dec_lock_ref(
         self,
         node_id: NodeId,
-        params: Optional[DecLockRefParams] = None,
+        params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
-        """Decrease the reference count on a node's component locks."""
+        """Decrease the reference count on a node's component locks. The
+        receipt is required: a release must replay its acquire's evidence."""
         ...
 
     @abstractmethod
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
-        swa_uuid_for_lock: Optional[int],
-        skip_lock_node_ids: Optional[dict] = None,
+        params: DecLockRefParams,
     ) -> DecSwaLockOnlyResult:
         """Decrease only the SWA (and lower-priority co-located) reference
         counts; the result carries the freed slots."""
@@ -313,7 +314,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         """Decrease the reference count on a node's host-side component locks."""
         ...
