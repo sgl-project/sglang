@@ -79,20 +79,26 @@ __device__ __forceinline__ void load_int4_tile(
       *reinterpret_cast<__int128_t*>(dest) = *reinterpret_cast<__int128_t*>(&rope);
     }
 
+    // Each feature lane owns a complete G32 group. A single aligned load
+    // supplies four words, and its scale is reused without a warp shuffle.
     CUTE_UNROLL
-    for (int group = 0; group < NOPE_DIM / GROUP_SIZE; ++group) {
-      const int dim = group * GROUP_SIZE + word_in_group * 8;
-      uint32_t word = 0;
-      float scale = 0.0f;
-      if (valid) {
-        word = __ldg(reinterpret_cast<const uint32_t*>(row + dim / 2));
-        if (word_in_group == 0)
+    for (int group_base = 0; group_base < NOPE_DIM / GROUP_SIZE; group_base += 4) {
+      const int group = group_base + word_in_group;
+      if (group < NOPE_DIM / GROUP_SIZE) {
+        uint4 words = {0, 0, 0, 0};
+        float scale = 0.0f;
+        if (valid) {
+          words = __ldg(reinterpret_cast<const uint4*>(row + group * GROUP_SIZE / 2));
           scale = static_cast<float>(reinterpret_cast<const __nv_fp8_e4m3*>(row + HEADER_OFFSET)[group]);
+        }
+        CUTE_UNROLL
+        for (int word = 0; word < GROUP_SIZE / 8; ++word) {
+          const int dim = group * GROUP_SIZE + word * 8;
+          alignas(16) const bf16x8 values = decode_int4_word(reinterpret_cast<const uint32_t*>(&words)[word], scale);
+          bf16* dest = plan.u.k[buf_idx].data() + t * 8 + dim * TILE;
+          *reinterpret_cast<__int128_t*>(dest) = *reinterpret_cast<const __int128_t*>(&values);
+        }
       }
-      scale = __shfl_sync(0xffffffff, scale, token_in_warp);
-      alignas(16) const bf16x8 values = decode_int4_word(word, scale);
-      bf16* dest = plan.u.k[buf_idx].data() + t * 8 + dim * TILE;
-      *reinterpret_cast<__int128_t*>(dest) = *reinterpret_cast<const __int128_t*>(&values);
     }
   }
 }
