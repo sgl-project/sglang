@@ -798,25 +798,13 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     )
                 if sampling_mask_finish_reason is not None:
-                    self.clear_pending_chunk_send(req)
-                    prepare_abort(
-                        req,
-                        sampling_mask_finish_reason.message,
-                        status_code=sampling_mask_finish_reason.status_code,
-                    )
+                    req.to_finish = sampling_mask_finish_reason
                     req.time_stats.trace_ctx.abort(
                         abort_info={"reason": sampling_mask_finish_reason.message}
                     )
-                    req.disagg_kv_sender.abort()
-                    maybe_release_metadata_buffer(
-                        req, self.req_to_metadata_buffer_idx_allocator
-                    )
-                    req.pending_bootstrap = False
-                    if self.enable_hicache_storage:
-                        self.tree_cache.release_aborted_request(req.rid)
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
-                    req.time_stats.set_completion_time()
-                    self.output_streamer.stream_output([req], req.return_logprob)
+                    if self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
                     advance_logprob_pt(i, req)
                     continue
 

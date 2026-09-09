@@ -5,8 +5,13 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -203,6 +208,57 @@ def test_aborted_result_releases_mamba_allocated_before_kv():
     scheduler.tree_cache.req_to_token_pool.mamba_allocator.free.assert_called_once()
     assert req.kv.mamba_pool_idx is None
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+
+
+@pytest.mark.parametrize("transport_error", [False, True])
+@pytest.mark.parametrize(
+    "status,http_status,err_type",
+    [
+        (SamplingMaskStatus.OVERFLOW, 400, "BadRequestError"),
+        (SamplingMaskStatus.INVALID, 500, "InternalServerError"),
+    ],
+)
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_sampling_mask_abort_preserves_error_and_releases_once(
+    release_kv_cache, status, http_status, err_type, transport_error
+):
+    """A failed sender notification must not leak ownership or lose the API error."""
+    scheduler = _Scheduler()
+    scheduler.batch_result_processor.get_sampling_mask_finish_reason = (
+        lambda **kwargs: SchedulerBatchResultProcessor.get_sampling_mask_finish_reason(
+            None, **kwargs
+        )
+    )
+    req = _Req(inflight_middle_chunks=0)
+    req.to_finish = None
+    req.return_sampling_mask = True
+    req.time_stats.trace_ctx = Mock()
+    if transport_error:
+        req.disagg_kv_sender.abort.side_effect = RuntimeError("transport is down")
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([11]),
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=None, next_token_sampling_mask_status=[status]
+        ),
+    )
+
+    with get_context().override_server_args(sampling_mask_max_tokens=64):
+        scheduler.process_batch_result_disagg_prefill(_batch(req), result)
+        scheduler.process_batch_result_disagg_prefill(_batch(req), result)
+
+    assert req.finished_reason.status_code == http_status
+    assert req.finished_reason.err_type == err_type
+    assert req.output_ids == []
+    assert not req.kv.holds_kv and not req.kv.holds_mamba
+    assert req.metadata_buffer_index == -1
+    assert not req.pending_bootstrap
+    assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    req.disagg_kv_sender.abort.assert_called_once_with()
+    scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
+    scheduler.tree_cache.release_aborted_request.assert_called_once_with(req.rid)
+    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+    scheduler.send_kv_chunk.assert_not_called()
 
 
 if __name__ == "__main__":
