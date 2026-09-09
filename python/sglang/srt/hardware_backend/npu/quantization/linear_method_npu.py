@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -256,7 +256,7 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(x, tuple):
