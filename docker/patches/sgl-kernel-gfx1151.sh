@@ -3,14 +3,11 @@
 # Applied at image-build time by docker/rocm-gfx1151.Dockerfile; the repo files are
 # left untouched because gfx1151 is not a supported SGLang target.
 #
-# Three changes:
+# Two changes:
 #   1. Lift the {gfx942, gfx950, gfx1250} allowlist, which otherwise sys.exit(1)s.
-#   2. Fix the TopK dynamic-LDS budget. The upstream expression is keyed on
-#      "am I gfx942", so every other arch falls through to the 128KB branch.
-#      gfx1151 reports lds_size_in_kb 64 and needs the 48KB budget. Re-key it
-#      onto an explicit large-LDS allowlist so gfx950 and gfx1250 keep 128KB
-#      while gfx942 and gfx1151 both get 48KB.
-#   3. Force a single WARP_SIZE across the host and device compiler passes.
+#      Current main gives non-gfx942 targets a 40KB TopK dynamic-LDS budget,
+#      which already fits gfx1151's 64KB workgroup limit.
+#   2. Force a single WARP_SIZE across the host and device compiler passes.
 #      include/utils.h resolves WARP_SIZE to 64 whenever __HIP_DEVICE_COMPILE__
 #      is undefined -- i.e. on the host pass -- and to 32 on a non-__GFX9__
 #      device pass. On CDNA both come out 64 and nothing is wrong, which is why
@@ -38,11 +35,6 @@ UTILS="$(dirname "${FILE}")/include/utils.h"
 GATE_OLD='if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:'
 GATE_NEW='if amdgpu_target not in ["gfx942", "gfx950", "gfx1250", "gfx1151"]:'
 
-LDS_OLD='topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4'
-LDS_NEW='topk_dynamic_smem_bytes = (
-    32 * 1024 * 4 if amdgpu_target in ("gfx950", "gfx1250") else 48 * 1024
-)'
-
 FLAGS_OLD='    f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",'
 FLAGS_NEW='    f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
     # gfx1151 is wave32; pin both compiler passes to it (see utils.h below).
@@ -55,7 +47,7 @@ WARP_NEW='#if defined(SGL_ROCM_WARP_SIZE)
 #elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define WARP_SIZE 64'
 
-for pattern in "${GATE_OLD}" "${LDS_OLD}" "${FLAGS_OLD}"; do
+for pattern in "${GATE_OLD}" "${FLAGS_OLD}"; do
     if ! grep -qF "${pattern}" "${FILE}"; then
         echo "ERROR: expected line not found in ${FILE}:" >&2
         echo "  ${pattern}" >&2
@@ -80,19 +72,19 @@ with open(path, "w") as f:
     f.write(src.replace(old, new, 1))
 PY
 
-python3 - "${FILE}" "${GATE_OLD}" "${GATE_NEW}" "${LDS_OLD}" "${LDS_NEW}" "${FLAGS_OLD}" "${FLAGS_NEW}" <<'PY'
+python3 - "${FILE}" "${GATE_OLD}" "${GATE_NEW}" "${FLAGS_OLD}" "${FLAGS_NEW}" <<'PY'
 import sys
 
-path, gate_old, gate_new, lds_old, lds_new, flags_old, flags_new = sys.argv[1:8]
+path, gate_old, gate_new, flags_old, flags_new = sys.argv[1:6]
 with open(path) as f:
     src = f.read()
-src = src.replace(gate_old, gate_new).replace(lds_old, lds_new)
+src = src.replace(gate_old, gate_new)
 src = src.replace(flags_old, flags_new, 1)
 with open(path, "w") as f:
     f.write(src)
 PY
 
 echo "Patched ${FILE} for gfx1151:"
-grep -nF -e "${GATE_NEW}" -e 'gfx950", "gfx1250")' -e "SGL_ROCM_WARP_SIZE" "${FILE}"
+grep -nF -e "${GATE_NEW}" -e "SGL_ROCM_WARP_SIZE" "${FILE}"
 echo "Patched ${UTILS} for wave32:"
 grep -nF "SGL_ROCM_WARP_SIZE" "${UTILS}"
