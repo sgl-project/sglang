@@ -2311,6 +2311,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
+        if _is_npu and envs.SGLANG_OPT_USE_HC_TRITON.get():
+            # Plan-1 hc kernels (see _hc_mix_and_combine). One gate for both
+            # NPU archs: hc operates on bf16/fp32 activations with no quantized
+            # store, so unlike the indexer there is no A3/A5 data format to
+            # branch on. The arch split lives in the commented npu_hc_post
+            # below -- A3 takes unbatched operands, the A5 build is batched and
+            # needs the unsqueeze/squeeze -- and both are unreachable for V4.1
+            # anyway: that vendor op is instantiated only for the DSv4.0 hidden
+            # sizes {4096, 7168} and rejects 5120.
+            from sglang.kernels.ops.layernorm.dsv41_hc_triton import (
+                dsv41_hc_post as dsv41_hc_post_triton,
+            )
+
+            return dsv41_hc_post_triton(x, residual, post, comb)
+
         # if _is_npu:
         #     if not is_npu_arch35():
         #         return torch.ops.custom.npu_hc_post(x, residual, post, comb)
@@ -2559,6 +2574,34 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         dtype = x.dtype
         x_flat = x.flatten(1)
+        if _is_npu and envs.SGLANG_OPT_USE_HC_TRITON.get():
+            # Plan-1 hc kernels: the whole pre-chain in one launch (the torch
+            # chain below is ~130 launches, the sinkhorn loop alone ~114).
+            # mix3 rows are pre|post|comb; the fold direction in hc_post
+            # follows the reference model (sum_k comb[j,k] * res_k).
+            # This entry is V4.1's: _DeepseekV41ConfigAlias sets
+            # hc_pre_from_prev_sublayer, so the model takes
+            # forward_hc_pre_from_prev and never reaches hc_pre (which on NPU
+            # calls npu_hc_pre, another {4096, 7168}-only vendor op with no
+            # fallback). V4.0 leaves the flag False and goes the other way.
+            from sglang.kernels.ops.layernorm.dsv41_hc_triton import (
+                dsv41_hc_mix_sinkhorn_combine,
+            )
+
+            y, mix3 = dsv41_hc_mix_sinkhorn_combine(
+                x_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                apply_pre,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+            )
+            m = self.hc_mult
+            return y, mix3[:, :m], mix3[:, m : 2 * m], mix3[:, 2 * m :].reshape(
+                -1, m, m
+            )
         if _FUSED_HC_SINKHORN and x.is_cuda and torch.version.cuda is not None:
             # One kernel for the slice reduction and the sinkhorn instead of two.
             # The split-K partial still fixes the reduction order, so the
