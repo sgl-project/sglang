@@ -18,7 +18,7 @@ from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -619,14 +619,13 @@ class SchedulerPPMixin:
             bad_bootstrapped_rids = list(
                 set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
             )
-        # Route locally-aborted reqs through the bad-union consensus so every PP
-        # rank flushes them in the same consensus round, regardless of when the
-        # AbortReq reaches each rank and regardless of whether
-        # disagg_kv_sender.abort() drives the poll to Failed (it is optional).
+        # Completed AbortReqs bypass readiness even if sender.abort() is a no-op.
+        # Pending admission aborts wait for the ready intersection; each stage
+        # retires its rejected request in pop_bootstrapped.
         aborted_rids = {
             req.rid
             for req in self.disagg_prefill_bootstrap_queue.queue
-            if is_aborted(req)
+            if isinstance(req.finished_reason, FINISH_ABORT)
         }
         good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
             good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
