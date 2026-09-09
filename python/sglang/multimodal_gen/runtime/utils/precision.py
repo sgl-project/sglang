@@ -216,7 +216,11 @@ class MixedPrecisionState:
     mp_policy: MixedPrecisionPolicy | None = None
 
 
-_mixed_precision_state = threading.local(state=None)
+class _MixedPrecisionContext(threading.local):
+    state: MixedPrecisionState | None = None
+
+
+_mixed_precision_state = _MixedPrecisionContext()
 
 
 def get_mixed_precision_state() -> MixedPrecisionState:
