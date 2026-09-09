@@ -473,6 +473,11 @@ class PrefillBootstrapQueue:
 
             if is_aborted(req):
                 if poll == KVPoll.Bootstrapping:
+                    if self.pp_size == 1 and not req.finished_output:
+                        req.update_finish_state()
+                        self.scheduler.output_streamer.stream_output(
+                            [req], req.return_logprob
+                        )
                     # Keep the bounded bootstrap wait to learn decode destinations,
                     # but never admit the rejected request to optimistic prefill.
                     continue
