@@ -23,10 +23,13 @@ def _args(algo, topk, dcp_size):
 
 
 class TestDCPSpecTopkGuard(CustomTestCase):
-    def _validate(self, algo, topk, dcp_size):
+    def _validate_args(self, args):
         from sglang.srt.arg_groups.speculative_hook import _validate_dcp_spec
 
-        _validate_dcp_spec(_args(algo, topk, dcp_size))
+        _validate_dcp_spec(args)
+
+    def _validate(self, algo, topk, dcp_size):
+        self._validate_args(_args(algo, topk, dcp_size))
 
     def _assert_rejected(self, algo, topk=2, dcp_size=8):
         with self.assertRaises(ValueError) as ctx:
@@ -57,6 +60,16 @@ class TestDCPSpecTopkGuard(CustomTestCase):
         for topk in (None, 1, 4):
             with self.subTest(topk=topk):
                 self._validate("DSPARK", topk, dcp_size=8)
+
+    def test_reads_the_resolved_topk_not_the_raw_field(self):
+        """The hook declares an auto-chosen topk; the record keeps the raw one."""
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        args = _args("EAGLE3", None, 8)
+        declare_resolution(args, "test_dcp_spec_topk_guard", speculative_eagle_topk=4)
+        with self.assertRaises(ValueError) as ctx:
+            self._validate_args(args)
+        self.assertIn("chain speculative drafts", str(ctx.exception))
 
     def test_algorithm_predicates_the_guard_reads(self):
         """A renamed predicate must break loudly, not silently disable the guard."""
