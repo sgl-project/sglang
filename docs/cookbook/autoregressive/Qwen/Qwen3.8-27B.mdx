@@ -192,10 +192,20 @@ those pins unchanged.
 
 NVIDIA's own export is that same W4A4 body with that same FP4 head: identical
 quantized-layer map (FP8 attention and GDN projections, NVFP4 MLPs), identical
-tensor set, identical 21.9 GB on disk. Its cells therefore reuse the FP4-head
-pins unchanged too. It has been verified on GB300; the RTX PRO 6000, RTX 5090
-and DGX Spark cells have not been re-run against it and carry the
-**Final Verification In Progress** badge.
+tensor set, identical 21.9 GB on disk. On GB300, RTX PRO 6000 and DGX Spark its
+cells reuse the FP4-head pins unchanged, and both SM12x grids have been
+re-measured against this export: all 16 overlay combinations per card serve and
+score 94.09-94.84% on the full 1319-question GSM8K.
+
+The RTX 5090 is the exception. That card's cells pin
+`--max-running-requests 1`, but nothing capped the pools to match, so the KV
+pool sized itself for 127,332 tokens against the 9,216 one 8192-in/1024-out
+request needs and prefill CUDA-graph capture ran out of memory. The cell now
+pins `--max-total-tokens 16384`, and the DSPARK rows additionally pin the
+calculator's balanced `--mamba-full-memory-ratio` — without it the GDN state
+pool is starved to zero slots once the draft model's weights are counted
+against `--mem-fraction-static`. The bfloat16 state rows are measured end to
+end; the float32 rows carry the **Final Verification In Progress** badge.
 
 The two RadixArk checkpoints declare `kv_cache_quant_algo: FP8`, so SGLang's
 default `--kv-cache-dtype auto` already puts their KV pool in `fp8_e4m3`. The

@@ -141,6 +141,22 @@ export const config = {
                   ? "--mem-fraction-static 0.89"
                   : "--mem-fraction-static 0.88"]
               : []),
+            // The NVIDIA export on the 5090 needs the pool split pinned as well
+            // as the cell's KV cap. Left to the engine's default split the GDN
+            // state pool gets ~1/7 of what it needs once the 3.64GB draft model
+            // is counted against --mem-fraction-static (draft weights are
+            // counted as of #38375), and boot fails with
+            // `max_mamba_cache_size=0 ... max_num_reqs=0`. These are the
+            // calculator's balanced ratios: r = S * token_equiv / L, with S = 5
+            // (extra_buffer) or 4 (extra_buffer_lazy), token_equiv = 2398 for a
+            // bf16 state slot against an fp8 KV token, and L = 8192 + 1024.
+            ...(sel.hw === "rtx5090" &&
+                sel.quant === "nvfp4-nvidia" &&
+                sel.ssmDtype === "bfloat16"
+              ? [sel.tier === "low-latency"
+                  ? "--mamba-full-memory-ratio 3.38"
+                  : "--mamba-full-memory-ratio 3.12"]
+              : []),
           ],
         },
         {
@@ -565,10 +581,11 @@ export const config = {
     {
       // NVIDIA's ModelOpt export of the same W4A4 body and FP4 lm_head as the
       // RadixArk FP4-head checkpoint above, so it reuses that recipe verbatim.
-      // The SM120 grid has not been re-run against it, hence the badge.
+      // Re-measured against this export on db272201a2: all 16 overlay
+      // combinations (spec x tier x state dtype) serve at these pins and score
+      // 94.09-94.77% on the full 1319-question GSM8K.
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -694,7 +711,11 @@ export const config = {
       // pins were measured on the RadixArk export, not this one, hence the badge.
       match: { hw: "rtx5090", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
       verified: false,
-      verificationStatus: "in-progress",
+      // bfloat16 GDN state is measured end to end on this card against this
+      // export (full 1319-question GSM8K); the float32 rows are not published
+      // yet and keep the badge.
+      verificationStatus: (sel) =>
+        sel.ssmDtype === "bfloat16" ? "verified" : "in-progress",
       // Rendered with the cell so nobody ships the bs=1 pins into a
       // multi-user deployment unaware.
       warn:
@@ -713,6 +734,14 @@ export const config = {
         "--attention-backend flashinfer",
         "--max-running-requests 1",
         "--cuda-graph-max-bs-decode 1",
+        // The pools size themselves for concurrency this recipe forbids: left
+        // uncapped the KV pool takes 127,332 tokens where one 8192-in/1024-out
+        // request needs 9,216, and prefill CUDA-graph capture then dies with
+        // `num_active_captures_ > 0 INTERNAL ASSERT FAILED` (a
+        // cudaErrorMemoryAllocation inside an open capture). Capping KV to the
+        // single-stream envelope returns ~3.6GB and the cell boots at the same
+        // mem-fraction. Raise this with --max-running-requests, not instead of it.
+        "--max-total-tokens 16384",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -791,8 +820,11 @@ export const config = {
       // checkpoint, on that cell's recipe. It was not part of the 1cf2b8c GB10
       // sweep, so it does not inherit that platform's boot-and-serve coverage.
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      // Re-measured against this export on db272201a2: all 16 overlay
+      // combinations serve at these pins and score 94.16-94.84% on the full
+      // 1319-question GSM8K (float32 and bfloat16 halves run on two separate
+      // GB10 boxes).
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
