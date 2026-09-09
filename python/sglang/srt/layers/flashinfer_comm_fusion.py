@@ -786,7 +786,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
+    fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     residual_out = torch.empty_like(residual)
@@ -806,7 +806,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
+    fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -822,7 +822,8 @@ def flashinfer_allreduce_residual_rmsnorm(
         max_token_num: Maximum token number
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
-        fp32_acc: Whether to use fp32 precision
+        fp32_acc: Accumulate the allreduce in fp32 (trtllm backend only; the
+            mnnvl backends always accumulate in fp32)
         use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
 
     Returns:
@@ -880,8 +881,9 @@ def flashinfer_allreduce_residual_rmsnorm(
         rms_gamma=weight,
         rms_eps=eps,
         use_oneshot=use_oneshot,
-        fp32_acc=fp32_acc,
     )
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = fp32_acc
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = trigger_completion_at_end
     _flashinfer_comm.allreduce_fusion(**kwargs)
@@ -991,9 +993,10 @@ def flashinfer_allreduce(
         workspace=workspace_manager.workspace,
         pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
         launch_with_pdl=True,
-        fp32_acc=False,
         output=output,
     )
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = True
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = False
     _flashinfer_comm.allreduce_fusion(**kwargs)

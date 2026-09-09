@@ -1,10 +1,9 @@
 """Per-scheduler load reporting for load-aware routers.
 
 Each scheduler publishes a periodic `LoadStat` gauge on its own ZMQ PUB
-socket so out-of-process load-aware routers (e.g. sgl-router's
-`cache_aware_zmq` policy) can route on real queue depth instead of a
-router-side in-flight counter. The in-deployment counterpart lives in
-`sglang.srt.managers.load_snapshot` (SHM / PUSH to node 0), which a router
+socket so out-of-process load-aware routers can route on real queue depth
+instead of a router-side in-flight counter. The in-deployment counterpart
+lives in `sglang.srt.managers.load_snapshot` (SHM / PUSH to node 0), which a router
 that only knows the worker URL cannot subscribe to; the port is instead
 advertised via `/server_info` (`runtime_context.describe_kv_events_publisher`).
 The payload is a compact tagged subset of `LoadSnapshot` so the wire
@@ -80,9 +79,12 @@ class LoadStat(
     """Per-scheduler runtime load snapshot.
 
     Wire shape (tag + array_like): ``["LoadStat", num_running_reqs,
-    num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank]``. The
-    router reads the four counts; array_like always emits the trailing field
-    (null when unset), so a decoder must tolerate it.
+    num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank,
+    num_waiting_uncached_tokens, num_total_tokens, max_running_requests,
+    total_prefill_uncached_tokens, total_prefill_busy_us]``.
+
+    The first six positions are the #34608-compatible prefix. Current routers
+    ignore appended fields, so extending the payload preserves compatibility.
     """
 
     num_running_reqs: int
@@ -92,6 +94,11 @@ class LoadStat(
     # attn_dp_rank under DP attention, else the plain dp_rank; informational
     # only (the router keys by socket rank). Name follows EventBatch's.
     attn_dp_rank: Optional[int] = None
+    num_waiting_uncached_tokens: int = 0  # Uncached prompt tokens awaiting prefill
+    num_total_tokens: int = 0  # KV tokens in use plus queued request tokens
+    max_running_requests: int = 0  # Scheduler running-request limit
+    total_prefill_uncached_tokens: int = 0  # Cumulative uncached prefill tokens
+    total_prefill_busy_us: int = 0  # Cumulative prefill step time in microseconds
 
 
 def _open_pub_socket(endpoint: str) -> zmq.Socket:
@@ -228,6 +235,11 @@ class SchedulerLoadPublisher:
                 load.num_waiting_reqs,
                 load.num_used_tokens,
                 load.max_total_num_tokens,
+                load.num_waiting_uncached_tokens,
+                load.num_total_tokens,
+                load.max_running_requests,
+                load.total_prefill_uncached_tokens,
+                load.total_prefill_busy_us,
             )
             if (
                 counts == self._last_counts
@@ -241,6 +253,11 @@ class SchedulerLoadPublisher:
                     num_tokens=counts[2],
                     max_total_num_tokens=counts[3],
                     attn_dp_rank=self._rank,
+                    num_waiting_uncached_tokens=counts[4],
+                    num_total_tokens=counts[5],
+                    max_running_requests=counts[6],
+                    total_prefill_uncached_tokens=counts[7],
+                    total_prefill_busy_us=counts[8],
                 )
             )
             seq = next(self._seq).to_bytes(8, "big")

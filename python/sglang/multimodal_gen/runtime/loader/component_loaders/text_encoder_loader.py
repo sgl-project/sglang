@@ -1,9 +1,6 @@
-import dataclasses
-import glob
 import os
 import re
-from collections.abc import Callable, Generator, Iterable
-from typing import cast
+from collections.abc import Generator
 
 import torch
 import transformers
@@ -67,20 +64,14 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
-    _list_safetensors_files,
     checkpoint_bytes,
     get_param_names_mapping,
+    initialize_model,
+    keep_checkpoint_mapped,
     set_default_torch_dtype,
-    skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    filter_files_not_needed_for_inference,
-    pt_weights_iterator,
-    safetensors_weights_iterator,
-)
-from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
-    host_copies_would_not_fit,
-    host_memory_available_bytes,
+    checkpoint_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
@@ -101,10 +92,10 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
     inspect_comfy_quant_markers,
+    process_model_weights_after_loading,
     resolve_comfy_checkpoint_quantization,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SrtFp8Config
 from sglang.srt.layers.quantization.unquant import (
@@ -113,7 +104,6 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
-from sglang.srt.model_loader.post_load import stage_module_for_post_load
 
 logger = init_logger(__name__)
 
@@ -340,7 +330,7 @@ def _resolve_and_configure_encoder_quantization(
     explicit_quantization: str | None = None,
     ignored_layers: list[str] | None = None,
 ) -> type[nn.Module]:
-    architectures = getattr(model_config, "architectures", [])
+    architectures = model_config.arch_config.architectures
     try:
         model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
     except Exception as resolution_error:
@@ -382,35 +372,6 @@ def _resolve_and_configure_encoder_quantization(
         ignored_layers,
     )
     return model_cls
-
-
-def _process_quantized_encoder_weights(
-    model: nn.Module,
-    process_device: torch.device | None,
-    component_name: str,
-) -> int:
-    processed_layers = 0
-    for module in model.modules():
-        if not isinstance(module, (LinearBase, SrtLinearBase)):
-            continue
-        quant_method = module.quant_method
-        if quant_method is None or isinstance(
-            quant_method,
-            (UnquantizedLinearMethod, SrtUnquantizedLinearMethod),
-        ):
-            continue
-        if process_device is None:
-            quant_method.process_weights_after_loading(module)
-        else:
-            with stage_module_for_post_load(module, process_device):
-                quant_method.process_weights_after_loading(module)
-        processed_layers += 1
-    if processed_layers == 0:
-        raise ValueError(
-            f"The {component_name!r} checkpoint declares quantization, but the "
-            "model did not construct any quantized linear layers"
-        )
-    return processed_layers
 
 
 def _require_quantized_encoder_layers(
@@ -463,21 +424,6 @@ def _require_quantized_encoder_layers(
             )
 
 
-def _keep_this_checkpoint_mapped(model_path: str) -> bool:
-    """Whether this encoder's weights should stay on their file mapping."""
-    weight_bytes = checkpoint_bytes(model_path)
-    if not host_copies_would_not_fit(weight_bytes):
-        return False
-    logger.info(
-        "Text encoder checkpoint is %.2f GiB against %.2f GiB of host memory, "
-        "so its compatible weights stay on the checkpoint mapping instead of "
-        "being copied in.",
-        weight_bytes / 1024**3,
-        host_memory_available_bytes() / 1024**3,
-    )
-    return True
-
-
 class TextEncoderLoader(OnlineQuantizationComponentLoader):
     """Loader for text encoders."""
 
@@ -491,7 +437,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         if override is not None:
             return override
         return server_args.pipeline_config.text_encoder_precisions[
-            self._extract_encoder_index(component_name)
+            self._extract_encoder_index(self.structural_component_name(component_name))
         ]
 
     def should_raise_customized_load_error(
@@ -510,22 +456,6 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     f"no {current_platform.device_type} implementation"
                 )
 
-    @dataclasses.dataclass
-    class Source:
-        """A source for weights."""
-
-        model_or_path: str
-        """The model ID or path."""
-
-        prefix: str = ""
-        """A prefix to prepend to all weights."""
-
-        fall_back_to_pt: bool = True
-        """Whether .pt weights can be used."""
-
-        allow_patterns_overrides: list[str] | None = None
-        """If defined, weights will load exclusively using these patterns."""
-
     def resolve_native_transformers_model_class(self, config: PretrainedConfig) -> type:
         """Resolve the concrete transformers class for a text encoder.
 
@@ -543,149 +473,23 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     return transformers_model_class
         return transformers.AutoModel
 
-    def _prepare_weights(
-        self,
-        model_name_or_path: str,
-        fall_back_to_pt: bool,
-        allow_patterns_overrides: list[str] | None,
-        key_filter: Callable[[str], bool] | None = None,
-    ) -> tuple[str, list[str], bool]:
-        """Prepare weights for the model.
-
-        If the model is not local, it will be downloaded."""
-        # model_name_or_path = (self._maybe_download_from_modelscope(
-        #     model_name_or_path, revision) or model_name_or_path)
-
-        if os.path.isfile(model_name_or_path):
-            if model_name_or_path.endswith(".safetensors"):
-                return os.path.dirname(model_name_or_path), [model_name_or_path], True
-            if fall_back_to_pt and model_name_or_path.endswith((".bin", ".pt")):
-                return os.path.dirname(model_name_or_path), [model_name_or_path], False
-            raise ValueError(
-                "Native encoder weight overrides currently support one "
-                f"safetensors, bin, or pt file, got {model_name_or_path!r}"
-            )
-        if not os.path.isdir(model_name_or_path):
-            raise ValueError(
-                f"Model path must be a local file or directory: {model_name_or_path!r}"
-            )
-
-        use_safetensors = False
-        index_file = SAFE_WEIGHTS_INDEX_NAME
-        allow_patterns = ["*.safetensors", "*.bin"]
-
-        if fall_back_to_pt:
-            allow_patterns += ["*.pt"]
-
-        if allow_patterns_overrides is not None:
-            allow_patterns = allow_patterns_overrides
-
-        hf_folder = model_name_or_path
-
-        hf_weights_files: list[str] = []
-        for pattern in allow_patterns:
-            if pattern == "*.safetensors":
-                hf_weights_files = _list_safetensors_files(
-                    hf_folder,
-                    index_file=index_file,
-                    key_filter=key_filter,
-                )
-            else:
-                hf_weights_files = glob.glob(os.path.join(hf_folder, pattern))
-            if len(hf_weights_files) > 0:
-                if pattern == "*.safetensors":
-                    use_safetensors = True
-                break
-
-        if not use_safetensors:
-            hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
-
-        if len(hf_weights_files) == 0:
-            raise RuntimeError(
-                f"Cannot find any model weights with `{model_name_or_path}`"
-            )
-
-        # Sort weight files when SGLANG_SORT_WEIGHT_FILES >= 0 (default).
-        # Staggering is not applicable to text-encoder loading (no TP split).
-        if envs.SGLANG_SORT_WEIGHT_FILES.get() >= 0:
-            hf_weights_files.sort()
-
-        return hf_folder, hf_weights_files, use_safetensors
-
-    def _get_weights_iterator(
-        self,
-        source: "Source",
-        to_cpu: bool,
-        key_filter: Callable[[str], bool] | None = None,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """get an iterator for the model weights based on the load format."""
-        source_key_filter: Callable[[str], bool] | None
-        if key_filter is None:
-            source_key_filter = None
-        else:
-
-            def include_source_weight(name: str) -> bool:
-                return key_filter(source.prefix + name)
-
-            source_key_filter = include_source_weight
-
-        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path,
-            source.fall_back_to_pt,
-            source.allow_patterns_overrides,
-            key_filter=source_key_filter,
-        )
-        if use_safetensors:
-            weights_iterator = safetensors_weights_iterator(
-                hf_weights_files,
-                to_cpu=to_cpu,
-                key_filter=source_key_filter,
-            )
-        else:
-            weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
-            if source_key_filter is not None:
-                weights_iterator = (
-                    (name, tensor)
-                    for name, tensor in weights_iterator
-                    if source_key_filter(name)
-                )
-
-        # apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
-
     def _get_all_weights(
         self,
         model: EncoderTensorParallelMixin,
         model_path: str,
         to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        key_filter = model.should_materialize_checkpoint_weight
-
         def include_checkpoint_weight(name: str) -> bool:
-            return not name.endswith(".comfy_quant") and key_filter(name)
+            return not name.endswith(
+                ".comfy_quant"
+            ) and model.should_materialize_checkpoint_weight(name)
 
-        primary_weights = TextEncoderLoader.Source(
+        yield from checkpoint_weights_iterator(
             model_path,
-            prefix="",
-            fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
-            allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            to_cpu=to_cpu,
+            key_filter=include_checkpoint_weight,
+            index_file=SAFE_WEIGHTS_INDEX_NAME,
         )
-        yield from self._get_weights_iterator(
-            primary_weights,
-            to_cpu,
-            include_checkpoint_weight,
-        )
-
-        secondary_weights = cast(
-            Iterable[TextEncoderLoader.Source],
-            getattr(model, "secondary_weights", ()),
-        )
-        for source in secondary_weights:
-            yield from self._get_weights_iterator(
-                source,
-                to_cpu,
-                include_checkpoint_weight,
-            )
 
     def load_customized(
         self,
@@ -700,35 +504,13 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             server_args,
             component_name,
         )
-        diffusers_pretrained_config = get_config(
-            component_model_path, trust_remote_code=True
-        )
         model_config = get_diffusers_component_config(
             component_path=component_model_path
         )
-
-        # TODO(mick): had to throw an exception for different text-encoder arch
-        encoder_index = self._extract_encoder_index(
-            self.structural_component_name(component_name)
+        encoder_config = self.build_model_config(
+            component_model_path, model_config, server_args, component_name
         )
-        assert encoder_index < len(
-            server_args.pipeline_config.text_encoder_configs
-        ) and encoder_index < len(server_args.pipeline_config.text_encoder_precisions)
-
-        encoder_config = server_args.pipeline_config.text_encoder_configs[encoder_index]
-        encoder_config.update_model_arch(model_config)
-        encoder_config.generation_config = load_dict(
-            os.path.join(component_model_path, "generation_config.json")
-        )
-
-        if encoder_index == 0:
-            for key, value in diffusers_pretrained_config.__dict__.items():
-                setattr(encoder_config.arch_config, key, value)
-        post_diffusers_config_update = getattr(
-            encoder_config, "post_diffusers_config_update", None
-        )
-        if post_diffusers_config_update is not None:
-            post_diffusers_config_update()
+        encoder_config.post_diffusers_config_update()
         model_cls = _resolve_and_configure_encoder_quantization(
             encoder_config,
             model_config,
@@ -777,6 +559,34 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             raise ComponentCheckpointUnsupportedError(
                 f"Failed to load quantized native {component_name!r}: {error}"
             ) from error
+
+    def build_model_config(
+        self,
+        component_model_path: str,
+        model_config: dict,
+        server_args: ServerArgs,
+        component_name: str,
+    ) -> EncoderConfig:
+        diffusers_pretrained_config = get_config(
+            component_model_path, trust_remote_code=True
+        )
+        encoder_index = self._extract_encoder_index(
+            self.structural_component_name(component_name)
+        )
+        assert encoder_index < len(
+            server_args.pipeline_config.text_encoder_configs
+        ) and encoder_index < len(server_args.pipeline_config.text_encoder_precisions)
+
+        encoder_config = server_args.pipeline_config.text_encoder_configs[encoder_index]
+        encoder_config.update_model_arch(model_config)
+        encoder_config.generation_config = load_dict(
+            os.path.join(component_model_path, "generation_config.json")
+        )
+
+        if encoder_index == 0:
+            for key, value in diffusers_pretrained_config.__dict__.items():
+                setattr(encoder_config.arch_config, key, value)
+        return encoder_config
 
     @staticmethod
     def _extract_encoder_index(component_name: str) -> int:
@@ -872,20 +682,20 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             use_tensor_parallel_group(encoder_tp_group),
             set_default_torch_dtype(PRECISION_TO_TYPE[dtype]),
         ):
-            with model_device, skip_init_modules():
-                architectures = getattr(model_config, "architectures", [])
-                model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                enable_image_understanding = isinstance(
-                    server_args.pipeline_config,
-                    (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
-                )
-                model_config.enable_image_understanding = enable_image_understanding
-                # LongCat feeds its padded body to the DiT, so it must mask
-                # padding on the cache-free path; scoped so others are unchanged.
-                model_config.honor_cache_free_padding_mask = isinstance(
-                    server_args.pipeline_config, LongCatImagePipelineConfig
-                )
-                model = model_cls(model_config)
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                model_config.arch_config.architectures
+            )
+            model_config.enable_image_understanding = isinstance(
+                server_args.pipeline_config,
+                (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
+            )
+            # longcat consumes the padded body without an attention cache
+            model_config.honor_cache_free_padding_mask = isinstance(
+                server_args.pipeline_config, LongCatImagePipelineConfig
+            )
+            model = initialize_model(
+                model_cls, {"config": model_config}, param_dtype, model_device
+            )
 
             if not isinstance(model, EncoderTensorParallelMixin):
                 raise TypeError(
@@ -904,15 +714,11 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 )
 
             if component_starts_on_cpu and (
-                current_platform.is_mps() or _keep_this_checkpoint_mapped(model_path)
+                current_platform.is_mps()
+                or keep_checkpoint_mapped(
+                    weight_bytes=checkpoint_bytes(model_path), component=component_name
+                )
             ):
-                # The encoder is layered immediately after this loader returns,
-                # so compatible CPU safetensors can stay mapped instead of being
-                # copied. On MPS that is always the right call -- the memory is
-                # unified. On any host it becomes the only call once the
-                # checkpoint is larger than host memory, because the copy is
-                # what does not fit: H3's encoder is 62.13 GiB against a 32 GiB
-                # target.
                 model._keep_checkpoint_mapping = True
 
             weights_to_load = {name for name, _ in model.named_parameters()}
@@ -931,6 +737,9 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             if isinstance(quant_config, QuantoInt8Config):
                 checkpoint_weights = normalize_quanto_int8_weights(checkpoint_weights)
             loaded_weights = model.load_weights(checkpoint_weights)
+            self.validate_checkpoint_keys(
+                weights_to_load - loaded_weights, [], component_name
+            )
 
             if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device
@@ -939,10 +748,10 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     and quant_config.is_checkpoint_int8_serialized
                 ):
                     postprocess_device = None
-                processed_layers = _process_quantized_encoder_weights(
+                processed_layers = process_model_weights_after_loading(
                     model,
                     postprocess_device,
-                    component_name,
+                    quantized_only=True,
                 )
                 logger.info(
                     "Processed %d %s linear layers for %s",
@@ -961,39 +770,5 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     model = model.to("cpu")
             else:
                 model = model.to(local_torch_device)
-            # We only enable strict check for non-quantized models
-            # that have loaded weights tracking currently.
-            # if loaded_weights is not None:
-            weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
-                # NOTE:
-                # If we silently continue with uninitialized weights, the text encoder can
-                # produce NaNs/garbage embeddings that later fail stage verification in a
-                # hard-to-debug way (e.g., `prompt_embeds` fails the NaN check).
-                #
-                # We allow a small set of known-optional parameters to be missing, but
-                # default to strict behavior for the rest.
-                allowed_missing_patterns = (
-                    getattr(model, "_allowed_missing_weights_patterns", []) or []
-                )
-                unexpected_missing = {
-                    n
-                    for n in weights_not_loaded
-                    if not any(pat in n for pat in allowed_missing_patterns)
-                }
-                if unexpected_missing:
-                    raise ValueError(
-                        "Following text encoder weights were not initialized from checkpoint: "
-                        f"{sorted(unexpected_missing)}. "
-                        "This usually indicates a checkpoint/model-arch mismatch or a broken "
-                        "weight-name mapping. If these are truly optional, set "
-                        "`model._allowed_missing_weights_patterns` to whitelist patterns."
-                    )
-                logger.warning(
-                    "Following (allowed) text encoder weights were not initialized from "
-                    "checkpoint: %s (allowed patterns: %s)",
-                    sorted(weights_not_loaded),
-                    allowed_missing_patterns,
-                )
 
         return model

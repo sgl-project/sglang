@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
-import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -693,16 +692,15 @@ class TboForwardBatchPreparer:
             )
             output_dict[key] = old_value[start_token_index:end_token_index]
 
+        if batch.out_cache_loc_virtual is not None:
+            output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
+                start_token_index:end_token_index
+            ]
+
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
-        if _is_hip:
-            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-
-            align = math.lcm(attention_tp_size, get_cp_padding_align_size())
-            n_tokens = end_token_index - start_token_index
-            _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
@@ -756,6 +754,7 @@ class TboForwardBatchPreparer:
             "return_logprob",
             "can_run_decode_cuda_graph",
             "can_run_dp_prefill_cuda_graph",
+            "dp_prefill_cuda_graph_max_prefix_len",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
