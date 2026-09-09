@@ -4,14 +4,13 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_parallel,
     get_schedule,
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
-    mamba_extra_buffer_enabled,
-    mamba_extra_buffer_lazy_enabled,
     mamba_track_grid,
 )
 from sglang.srt.utils.common import (
@@ -1004,6 +1003,10 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv = ReqKvInfo()
 
+        # Full-KV-derived boundary whose SWA window should be inserted after
+        # the current prefill pass.
+        self.swa_branching_seqlen: Optional[int] = None
+
         # for cross-encoder model
         self.token_type_ids = token_type_ids
 
@@ -1317,6 +1320,9 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
+        self.arrival_processed_tokens: int = 0
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1515,6 +1521,7 @@ class Req(ReqDllmMixin):
                 self.best_match_node,
                 self.host_hit_length,
                 self.swa_host_hit_length,
+                self.swa_branching_seqlen,
                 self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
@@ -1524,6 +1531,7 @@ class Req(ReqDllmMixin):
                 match_result.best_match_node,
                 match_result.host_hit_length,
                 match_result.swa_host_hit_length,
+                match_result.swa_branching_seqlen,
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
@@ -1817,6 +1825,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.swa_branching_seqlen = None
         self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
@@ -1870,7 +1879,9 @@ class Req(ReqDllmMixin):
         )
         self.kv.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
-                token_indices, mamba_indices=self.kv.mamba_pool_idx
+                token_indices,
+                mamba_indices=self.kv.mamba_pool_idx,
+                req_pool_index=self.kv.req_pool_idx,
             ),
             mamba_cpu=(
                 mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
@@ -1894,6 +1905,7 @@ class Req(ReqDllmMixin):
             self.kv.retraction_backup.cpu_tensors,
             token_indices,
             mamba_indices=self.kv.mamba_pool_idx,
+            req_pool_index=self.kv.req_pool_idx,
         )
         self.kv.retraction_backup = None
 
@@ -2672,7 +2684,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.already_computed = seq_len
             req.is_retracted = False
 
-            if mamba_extra_buffer_enabled():
+            if get_exec().mamba.enable_mamba_extra_buffer:
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
@@ -2777,7 +2789,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        if mamba_extra_buffer_enabled():
+        if get_exec().mamba.enable_mamba_extra_buffer:
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2873,7 +2885,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
             req.kv.mamba_last_track_idx = req.kv.mamba_next_track_idx
-            if not mamba_extra_buffer_lazy_enabled():
+            if not get_exec().mamba.enable_mamba_extra_buffer_lazy:
                 req.kv.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.kv.mamba_next_track_idx
@@ -3336,6 +3348,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
+        self.mamba_clear_indices = None
+
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
@@ -3388,7 +3404,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if mamba_extra_buffer_enabled():
+        if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
             if len(self.reqs) == 0:
@@ -3397,7 +3413,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 self.mamba_track_buffer_indices = []
             else:
-                if mamba_extra_buffer_lazy_enabled():
+                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 

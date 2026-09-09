@@ -17,6 +17,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.helios import (
     HeliosDistilledConfig,
 )
@@ -60,6 +64,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
@@ -69,6 +74,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
     RESIDENT,
+    SNAPSHOT_OFFLOAD,
     normalize_component_residency,
     resolve_component_residency_mode,
     resolve_diffusers_pipeline_offload,
@@ -770,11 +776,6 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa = self._resolve(warmup_mode="server")
         self.assertEqual(sa.warmup_mode, "server")
 
-    def test_defaulted_mode_applies_without_legacy_flags(self):
-        # Bare `sglang serve` defaults to server-based warmup.
-        sa = self._resolve(warmup_mode="server")
-        self.assertEqual(sa.warmup_mode, "server")
-
     def test_resolutions_force_warmup_on(self):
         sa = self._resolve(
             warmup_mode="off",
@@ -823,6 +824,48 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.warmup_resolutions = None
         sa.bcg_text_buckets = None
         sa._validate_breakable_cuda_graph()  # must not raise
+
+    def test_flux_bcg_resolves_hub_and_local_checkpoint_warmup(self):
+        for model_path, model_id in (
+            ("black-forest-labs/FLUX.1-dev", None),
+            ("/models/FLUX.1-dev", None),
+            ("/cache/models--black-forest-labs--FLUX.1-dev/snapshots/revision", None),
+            ("/models/pinned-checkpoint", "black-forest-labs/FLUX.1-dev"),
+        ):
+            with self.subTest(model_path=model_path, model_id=model_id):
+                sa = ServerArgs.__new__(ServerArgs)
+                sa.model_path = model_path
+                sa.model_id = model_id
+                sa.pipeline_class_name = "FluxPipeline"
+                sa.pipeline_config = FluxPipelineConfig()
+                sa.enable_breakable_cuda_graph = True
+                # Resolve native sampling defaults without loading checkpoint
+                # metadata for the synthetic local paths in this unit test.
+                with patch(
+                    "sglang.multimodal_gen.runtime.warmup_request_builder."
+                    "get_model_sampling_defaults",
+                    return_value=FluxSamplingParams(),
+                ):
+                    sa._adjust_breakable_cuda_graph_support()
+                sa._adjust_warmup()
+
+                self.assertTrue(sa.enable_breakable_cuda_graph)
+                self.assertEqual(sa.warmup_resolutions, ["1024x1024"])
+                self.assertEqual(sa.warmup_mode, "server")
+
+    def test_flux_bcg_requires_both_supported_checkpoint_and_pipeline(self):
+        for model_path, config in (
+            ("black-forest-labs/FLUX.2-dev", Flux2PipelineConfig()),
+            ("black-forest-labs/FLUX.1-schnell", FluxPipelineConfig()),
+            ("black-forest-labs/FLUX.1-dev", Flux2PipelineConfig()),
+        ):
+            with self.subTest(model_path=model_path, config=type(config).__name__):
+                sa = ServerArgs.__new__(ServerArgs)
+                sa.model_path = model_path
+                sa.pipeline_config = config
+                sa.enable_breakable_cuda_graph = True
+                sa._adjust_breakable_cuda_graph_support()
+                self.assertFalse(sa.enable_breakable_cuda_graph)
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -1113,6 +1156,50 @@ class TestOffloadDefaults(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid component residency mode"):
             normalize_component_residency(["dit=cpu"])
 
+    def test_snapshot_offload_is_explicit_and_uses_cpu_load_policy(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "component_residency": ["vae=snapshot_offload", "dit=resident"],
+                "vae_cpu_offload": False,
+                "use_fsdp_inference": True,
+            },
+        )
+        self.assertEqual(args.residency_mode("video_vae"), SNAPSHOT_OFFLOAD)
+        self.assertTrue(args.should_cpu_offload_component("video_vae"))
+        self.assertTrue(args.should_start_component_on_cpu("video_vae"))
+        self.assertFalse(args.should_use_fsdp_for_component("video_vae"))
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertTrue(args.should_use_fsdp_for_component("transformer"))
+        self.assertEqual(
+            resolve_component_residency_mode(
+                "video_vae",
+                normalize_component_residency(
+                    "vae=snapshot-offload,video_vae=resident"
+                ),
+            ),
+            RESIDENT,
+        )
+
+    def test_snapshot_offload_rejects_shared_memory_and_captured_dit(self):
+        with patch.object(
+            current_platform, "device_shares_host_memory", return_value=True
+        ):
+            with self.assertRaisesRegex(ValueError, "separate host and device memory"):
+                self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={"component_residency": ["vae=snapshot-offload"]},
+                )
+        with self.assertRaisesRegex(ValueError, "weight addresses change"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={
+                    "component_residency": ["dit=snapshot-offload"],
+                    "enable_breakable_cuda_graph": True,
+                },
+            )
+
     def test_component_residency_resolves_exact_group_and_all_precedence(self):
         assignments = normalize_component_residency(
             [
@@ -1330,6 +1417,8 @@ class TestOffloadDefaults(unittest.TestCase):
             resolve_diffusers_pipeline_offload({"dit": COMPONENT_OFFLOAD})
         with self.assertRaisesRegex(ValueError, "native SGLang backend"):
             resolve_diffusers_pipeline_offload({"all": LAYERWISE_OFFLOAD})
+        with self.assertRaisesRegex(ValueError, "native SGLang backend"):
+            resolve_diffusers_pipeline_offload({"all": SNAPSHOT_OFFLOAD})
 
     def test_memory_mode_layerwise_offloads_vae_on_low_memory_gpu(self):
         args = self._from_dict_with_task_type(

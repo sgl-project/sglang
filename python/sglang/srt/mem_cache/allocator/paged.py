@@ -15,11 +15,6 @@ limitations under the License.
 
 from __future__ import annotations
 
-"""
-Page-aligned memory pool.
-"""
-
-
 from typing import TYPE_CHECKING
 
 import torch
@@ -119,11 +114,8 @@ def alloc_extend_naive(
 
 
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-    """
-    An allocator managing the indices to kv cache data.
-
-    This class has the same interface as `TokenToKVPoolAllocator` but the output
-    of one request is always page-aligned.
+    """Same interface as `TokenToKVPoolAllocator`, but the indices handed to one
+    request are always page-aligned.
 
     TODO: fuse last_loc into the kernel.
     """
@@ -141,18 +133,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
-        # Pre-warm the torch.unique HIP kernel used in free(). When a request
-        # finishes with a prompt that already exists in the radix tree (e.g.
-        # bench_serving sending the same warmup+measured prompt), the radix
-        # cache's _insert_helper frees the duplicate KV indices via
-        # token_to_kv_pool_allocator.free(value[start:prefix_len]). That call
-        # path runs `torch.unique(free_index // self.page_size)` on a
-        # ~prompt_len-sized int64 tensor. The first such call on AMD ROCm
-        # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms, which
-        # shows up as a mysterious "second-request slow" (Run 1) for
-        # repeated-prompt benchmarks. Running it once at init time moves
-        # that JIT cost to startup. This is a ROCm-only JIT cost, so the
-        # warm-up is gated on _is_hip and skipped on other platforms.
+        # Pre-warm the torch.unique used by free(): on ROCm the first call
+        # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms.
         if _is_hip and torch.cuda.is_available():
             try:
                 _warmup = torch.arange(1024, dtype=torch.int64, device=device)
@@ -298,13 +280,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._debug_check_no_duplicate_pages()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Fixed-shape counterpart of free().
-
-        The segment starts on a page boundary and a page's tokens sit
-        consecutively in the kv row, so ``free_index[::page_size]`` is one
-        token from each page the segment covers -- including a partial last
-        page. No torch.unique, whose data-dependent output shape forces a
-        device sync. Contract: see base."""
+        """Fixed-shape free(): page-aligned start plus contiguous per-page tokens
+        make ``free_index[::page_size]`` hit each page once; no torch.unique sync."""
         if free_index.numel() == 0:
             return
 
@@ -319,12 +296,19 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.unique(free_index.cpu() // ps),
             )
 
+        self.free_page_ids(reps // ps)
+
+    def free_page_ids(self, page_ids: torch.Tensor):
+        """Free exactly these pages; no page twice, no dedup."""
+        if page_ids.numel() == 0:
+            return
+
         if self.free_group is None:
-            self._release_page_ids(reps // ps)
+            self._release_page_ids(page_ids)
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
-            self.free_page_reps_group.append(self._copy_for_free_group(reps))
+            self.free_page_ids_group.append(self._copy_for_free_group(page_ids))
 
     def _debug_check_no_duplicate_pages(self):
         pages = self.get_all_free_pages()
@@ -339,15 +323,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_group_begin(self):
         super().free_group_begin()
-        self.free_page_reps_group = []
+        self.free_page_ids_group = []
 
     def free_group_end(self):
         super().free_group_end()
-        if self.free_page_reps_group:
-            self._release_page_ids(
-                torch.cat(self.free_page_reps_group) // self.page_size
-            )
-            self.free_page_reps_group = []
+        if self.free_page_ids_group:
+            self._release_page_ids(torch.cat(self.free_page_ids_group))
+            self.free_page_ids_group = []
         if self.debug_mode:
             # the no-double-free contract can only break across a group's calls
             self._debug_check_no_duplicate_pages()
@@ -358,15 +340,24 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
         )
         self.free_group = None
-        self.free_page_reps_group = []
+        self.free_page_ids_group = []
         # need_sort only: freed pages wait here, unsorted, until an alloc runs short.
         self.staged_pages: list[torch.Tensor] = []
         self.num_staged_pages = 0
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        return self._kvcache.get_cpu_copy(
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         return self._kvcache.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
+            kv_cache_cpu,
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
         )

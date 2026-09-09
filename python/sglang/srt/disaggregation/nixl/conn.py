@@ -41,12 +41,14 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
-    pack_state_types,
+    pack_state_component_types,
     resolve_dcp_dst_entry_indices,
-    resolve_state_component_dst_index,
-    unpack_state_types,
+    resolve_state_component_dst_index_by_type,
+    slice_dsa_tail_dst_ptrs_for_pp,
+    unpack_state_component_types,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_schedule
@@ -237,7 +239,7 @@ class KVArgsRegisterInfo:
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
-    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
+    dst_state_component_types: List[StateType] = dataclasses.field(default_factory=list)
     dst_homogeneous_mem_kind: Optional[str] = None
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
     staging_base_ptr: int = 0
@@ -282,7 +284,9 @@ class KVArgsRegisterInfo:
             if len(msg) > 20 and msg[20] != b""
             else []
         )
-        dst_state_types = unpack_state_types(msg[23]) if len(msg) > 23 else []
+        dst_state_component_types = (
+            unpack_state_component_types(msg[23]) if len(msg) > 23 else []
+        )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -311,7 +315,7 @@ class KVArgsRegisterInfo:
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             dst_state_layer_ids=dst_state_layer_ids,
-            dst_state_types=dst_state_types,
+            dst_state_component_types=dst_state_component_types,
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -1326,7 +1330,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                                 dst_state_layer_ids=dst_info.dst_state_layer_ids,
-                                dst_state_types=dst_info.dst_state_types,
+                                dst_state_component_types=dst_info.dst_state_component_types,
                             )
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
@@ -2107,6 +2111,60 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
+    def _send_slot_state(
+        self,
+        peer_name: str,
+        src_data_ptrs: list[int],
+        src_item_lens: list[int],
+        dst_data_ptrs: list[int],
+        dst_item_lens: list[int],
+        src_indices: list[int],
+        dst_indices: list[int],
+        dst_gpu_id: int,
+        notif: str,
+    ):
+        dst_data_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
+            src_data_ptrs,
+            dst_data_ptrs,
+            self.kv_args.prefill_start_layer,
+            self.kv_args.prefill_end_layer,
+        )
+        dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
+            src_data_ptrs,
+            dst_item_lens,
+            self.kv_args.prefill_start_layer,
+            self.kv_args.prefill_end_layer,
+        )
+        transfer_blocks = build_dsa_tail_transfer_blocks(
+            src_data_ptrs,
+            src_item_lens,
+            dst_data_ptrs,
+            src_indices,
+            dst_indices,
+            dst_item_lens,
+        )
+        if not transfer_blocks:
+            return None
+
+        src_addrs = [
+            (src_addr, length, self.kv_args.gpu_id)
+            for src_addr, _, length in transfer_blocks
+        ]
+        dst_addrs = [
+            (dst_addr, length, dst_gpu_id) for _, dst_addr, length in transfer_blocks
+        ]
+        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        )
+        if not xfer_handle:
+            raise Exception("KVSender failed to create dsa_tail transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("KVSender failed to post dsa_tail transfer")
+        return xfer_handle
+
     def _send_mamba_state(
         self,
         peer_name: str,
@@ -2190,7 +2248,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         accordingly, mirroring Mooncake's _send_mamba_state_slice. GDN
         conv_state is [query | key | value] with each sub-block head-sharded
         independently, so on the scatter path it is sliced per sub-block via
-        ``src_state_conv_shard_groups`` (see compute_mamba_state_slice_blocks).
+        ``src_state_conv_shard_groups`` (see
+        compute_mamba_state_slice_byte_blocks).
         """
         logger.warning_once(
             "Using Mamba state slice transfer for different TP sizes. "
@@ -2305,7 +2364,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
         dst_state_layer_ids: List[List[int]] | None = None,
-        dst_state_types: List[StateType] | None = None,
+        dst_state_component_types: List[StateType] | None = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2324,19 +2383,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
         dst_state_layer_ids = dst_state_layer_ids or []
-        dst_state_types = dst_state_types or []
+        dst_state_component_types = dst_state_component_types or []
 
         handles = []
         for i, st in enumerate(state_types):
-            dst_component_index = resolve_state_component_dst_index(
+            dst_component_index = resolve_state_component_dst_index_by_type(
                 state_types,
-                dst_state_types,
+                dst_state_component_types,
                 i,
             )
             src_indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
-            if src_indices is None or len(src_indices) == 0:
+            if src_indices is None or (
+                len(src_indices) == 0 and st != StateType.DSA_TAIL
+            ):
                 continue
             src_ptrs = src_state_data_ptrs[i] if i < len(src_state_data_ptrs) else []
             src_lens = src_state_item_lens[i] if i < len(src_state_item_lens) else []
@@ -2415,12 +2476,37 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         src_layer_ids=src_lids,
                         dst_layer_ids=dst_lids,
                     )
-            elif st in (
-                StateType.SWA,
-                StateType.DSA,
-                StateType.SWA_RING,
-                StateType.C128_STATE,
-            ):
+            elif st == StateType.DSA_TAIL:
+                h = self._send_slot_state(
+                    peer_name,
+                    src_ptrs,
+                    src_lens,
+                    dst_ptrs,
+                    dst_lens,
+                    list(src_indices),
+                    list(dst_indices),
+                    dst_gpu_id,
+                    comp_notif,
+                )
+            elif st == StateType.DSA:
+                if len(src_indices) != len(dst_indices):
+                    raise RuntimeError(
+                        f"State index length mismatch at component {i}: "
+                        f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+                    )
+                h = self._send_kvcache_generic(
+                    peer_name=peer_name,
+                    src_data_ptrs=src_ptrs,
+                    dst_data_ptrs=dst_ptrs,
+                    item_lens=src_lens,
+                    prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                    dst_data_indices=np.array(dst_indices, dtype=np.int32),
+                    dst_gpu_id=dst_gpu_id,
+                    notif=comp_notif,
+                    state_type=st,
+                    force_flat=True,
+                )
+            elif st in (StateType.SWA, StateType.SWA_RING, StateType.C128_STATE):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
@@ -3100,7 +3186,9 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
-            packed_state_types = pack_state_types(self.kv_mgr.kv_args.state_types)
+            packed_state_component_types = pack_state_component_types(
+                self.kv_mgr.kv_args.state_types
+            )
 
             # Include staging allocator metadata if available
             if (
@@ -3149,7 +3237,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
-                            packed_state_types,
+                            packed_state_component_types,
                         ]
                     )
             except zmq.ZMQError:

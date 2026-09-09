@@ -49,16 +49,34 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        assert (
-            cfg.disable_overlap_schedule
-        ), "Pipeline parallelism is not compatible with overlap schedule"
-        pp_dspark_prefill = (
-            cfg.speculative_algorithm or ""
-        ).upper() == "DSPARK" and cfg.disaggregation_mode == "prefill"
-        assert cfg.speculative_algorithm is None or pp_dspark_prefill, (
-            "Pipeline parallelism with speculative decoding is only supported "
-            "for DSPARK on a PD prefill server"
-        )
+        if get_platform().is_npu:
+            # NPU: allow PP + EAGLE speculative decoding
+            assert cfg.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            if cfg.speculative_algorithm is not None:
+                assert (
+                    cfg.speculative_algorithm.upper() == "EAGLE"
+                    and not cfg.enable_multi_layer_eagle
+                ), (
+                    "Pipeline parallelism currently only supports EAGLE "
+                    "(non-multi-layer) speculative decoding"
+                )
+                assert cfg.disaggregation_mode == "prefill", (
+                    "NPU PP + speculative decoding (MTP) is only supported "
+                    "on prefill nodes (disaggregation-mode=prefill)"
+                )
+        else:
+            assert (
+                cfg.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            pp_dspark_prefill = (
+                cfg.speculative_algorithm or ""
+            ).upper() == "DSPARK" and cfg.disaggregation_mode == "prefill"
+            assert cfg.speculative_algorithm is None or pp_dspark_prefill, (
+                "Pipeline parallelism with speculative decoding is only supported "
+                "for DSPARK on a PD prefill server"
+            )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
             "parallelism: allocatable slots per microbatch are bounded by "
@@ -433,16 +451,10 @@ def check_two_batch_overlap(server_args: Any):
     # there needs no extra opt-in env flag.
     cfg = resolving_view(server_args)
 
-    cp_tbo = (
-        get_platform().is_hip
-        and cfg.enable_dsa_prefill_context_parallel
-        and cfg.dsa_prefill_cp_mode == "round-robin-split"
-    )
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
         and not cfg.enable_dp_attention
-        and not cp_tbo
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "

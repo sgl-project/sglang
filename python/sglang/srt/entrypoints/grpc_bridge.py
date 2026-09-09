@@ -425,6 +425,11 @@ class RuntimeHandle:
 
     def get_server_info(self) -> str:
         result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
+        # `resolved_dict` answers with what resolution decided; the launch
+        # command answers with what was asked for, and the two are not
+        # derivable from each other. The HTTP and in-process readbacks both
+        # carry it, so this one does too.
+        result["launch_command"] = self.tokenizer_manager.server_args.launch_command
         result.update(self.scheduler_info)
         result["kv_events"] = describe_kv_events_publisher(
             self.tokenizer_manager.server_args
