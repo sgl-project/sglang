@@ -16,18 +16,18 @@ independent of the fusion.
 
 ## The fusion refactor
 
-This branch deletes `layers/moe/qwen35_flashinfer_fusion.py`. Its content moves to
-`layers/moe/cutedsl_ar_fusion.py`, which names no model.
+This branch deletes `layers/moe/qwen35_flashinfer_fusion.py`. Its content
+moves to `layers/moe/cutedsl_ar_fusion.py`, which names no model.
 
 The only real difference between model families is the attribute of their
 RMSNorm that holds the gamma value. `fused_norm_gamma()` reads that attribute
 from the norm module itself. GemmaRMSNorm returns its pre-folded weight, and a
 plain RMSNorm returns its weight. The fusion needs no per-architecture subclass.
 
-`--flashinfer-allreduce-fusion-backend cute-dsl` now selects the fusion. This branch
-also deletes the environment variable
-`SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION`, together with the resolution pass that had to suppress the backend argument when
-a user set both switches.
+`--flashinfer-allreduce-fusion-backend cute-dsl` now selects the fusion. This
+branch also deletes the environment variable
+`SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION`, together with the resolution pass
+that had to suppress the backend argument when a user set both switches.
 
 ## Two defects the refactor exposed
 
@@ -55,7 +55,7 @@ of its second matrix multiply. The expanded tensor never reaches GPU memory.
 
 A deferred finalize skips that epilogue. It writes the full expanded tensor to
 GPU memory instead, and a later kernel reads the tensor again. The later kernel
-can absorb the finalize into the all-reduce, which deletes one kernel launch for
+can absorb the finalize into the all-reduce, which saves one kernel launch for
 each layer.
 
 The saving stays about the same at every batch size. The added memory traffic
@@ -71,7 +71,7 @@ capacity limit rather than a measured crossover. TokenSpeed stops above 32
 tokens, and its comment names that number as a measured profit edge.
 
 This branch adds `SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS`, which defaults to
-192. A value of 0 deletes the bound.
+192. A value of 0 turns the bound off.
 
 ## Results
 
