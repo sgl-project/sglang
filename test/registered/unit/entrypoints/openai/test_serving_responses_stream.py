@@ -1,8 +1,10 @@
+import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from utils import (
     StreamFixture,
+    collect_stream_events,
     engine_chunk,
     event_payloads,
     event_types,
@@ -10,7 +12,11 @@ from utils import (
     make_serving,
 )
 
-from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    RequestResponseMetadata,
+    ResponsesRequest,
+    ResponsesResponse,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -96,6 +102,74 @@ class NonHarmonyStreamTestCase(CustomTestCase):
 
         seqs = [p["sequence_number"] for p in event_payloads(events)]
         self.assertEqual(seqs, list(range(len(seqs))))
+
+    def test_truncated_and_aborted_streams_have_matching_terminal_events(self):
+        serving = make_serving()
+        for finish_reason, status in (
+            ({"type": "length"}, "incomplete"),
+            (
+                {"type": "abort", "status_code": 503, "message": "Worker unavailable"},
+                "failed",
+            ),
+        ):
+            with self.subTest(status=status):
+                request = ResponsesRequest(
+                    model="x", input="hi", stream=True, store=True
+                )
+                chunk = engine_chunk("partial answer", finish=True)
+                chunk["meta_info"]["finish_reason"] = finish_reason
+                events = StreamFixture(serving, request).run([chunk])
+                terminal = event_payloads(events)[-1]
+                self.assertEqual(terminal["type"], f"response.{status}")
+                self.assertEqual(terminal["response"]["status"], status)
+                self.assertNotIn("response.completed", event_types(events))
+                stored = serving.response_store[request.request_id]
+                self.assertEqual(stored.status, status)
+                if status == "incomplete":
+                    self.assertEqual(
+                        terminal["response"]["incomplete_details"],
+                        {"reason": "max_output_tokens"},
+                    )
+                else:
+                    self.assertEqual(
+                        terminal["response"]["error"]["message"], "Worker unavailable"
+                    )
+                self.assertEqual(
+                    [p["sequence_number"] for p in event_payloads(events)],
+                    list(range(len(events))),
+                )
+
+    def test_harmony_truncation_uses_incomplete_terminal_event(self):
+        serving = make_serving()
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        final = ResponsesResponse.from_request(
+            request, {}, "x", 123, [], "incomplete", None
+        )
+        serving.responses_full_generator = AsyncMock(return_value=final)
+
+        async def empty():
+            if False:
+                yield
+
+        events = asyncio.run(
+            collect_stream_events(
+                serving.responses_stream_generator(
+                    request,
+                    {},
+                    empty(),
+                    Mock(),
+                    "x",
+                    Mock(),
+                    RequestResponseMetadata(request_id=request.request_id),
+                    require_reasoning=False,
+                )
+            )
+        )
+        self.assertEqual(event_types(events)[-1], "response.incomplete")
+        self.assertEqual(
+            event_payloads(events)[-1]["response"]["incomplete_details"],
+            {"reason": "max_output_tokens"},
+        )
 
     def test_required_tool_choice_emits_function_call_events(self):
         serving = make_serving()

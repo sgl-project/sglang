@@ -712,6 +712,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             return self.create_error_response(str(e))
 
         status = "completed"
+        finish_reason = None
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
@@ -720,7 +721,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             num_generated_tokens = context.num_output_tokens
             num_cached_tokens = context.num_cached_tokens
             num_reasoning_tokens = context.num_reasoning_tokens
-            status = self._status_from_finish_reason(context.finish_reason)
+            finish_reason = context.finish_reason
+            status = self._status_from_finish_reason(finish_reason)
         else:
             assert isinstance(context, SimpleContext)
             final_res = context.last_output
@@ -753,7 +755,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
-                status = self._status_from_finish_reason(meta_info.get("finish_reason"))
+                finish_reason = meta_info.get("finish_reason")
+                status = self._status_from_finish_reason(finish_reason)
             elif isinstance(final_res, dict) and (
                 final_res.get("prompt_token_ids") is not None
                 or final_res.get("output_ids") is not None
@@ -805,6 +808,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=usage,
         )
 
+        response.error = self._error_from_finish_reason(finish_reason)
         if request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
@@ -874,14 +878,37 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _status_from_finish_reason(finish_reason: Any) -> str:
-        """Only a length-capped generation is ``incomplete``; anything that got
-        here otherwise finished normally."""
         reason = None
         if isinstance(finish_reason, dict):
             reason = finish_reason.get("type")
         elif isinstance(finish_reason, str):
             reason = finish_reason
-        return "incomplete" if reason == "length" else "completed"
+        if reason == "length":
+            return "incomplete"
+        if reason in ("abort", "error"):
+            return "failed"
+        return "completed"
+
+    @classmethod
+    def _error_from_finish_reason(cls, finish_reason: Any) -> Optional[dict]:
+        if cls._status_from_finish_reason(finish_reason) != "failed":
+            return None
+        message = (
+            finish_reason.get("message") if isinstance(finish_reason, dict) else None
+        )
+        return {"code": "server_error", "message": message or "Generation aborted"}
+
+    @staticmethod
+    def _terminal_stream_event(response: dict):
+        status = response["status"]
+        event_cls = {
+            "completed": openai_responses_types.ResponseCompletedEvent,
+            "incomplete": openai_responses_types.ResponseIncompleteEvent,
+            "failed": openai_responses_types.ResponseFailedEvent,
+        }[status]
+        return event_cls(
+            type=f"response.{status}", sequence_number=-1, response=response
+        )
 
     def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
         if not self.reasoning_parser:
@@ -2017,13 +2044,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # OpenAI SDK's Tool union may not know extended types; drop echo.
         response_dict["tools"] = []
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
-            )
-        )
+        yield _send_event(self._terminal_stream_event(response_dict))
 
     async def responses_stream_generator_non_harmony(
         self,
@@ -2665,8 +2686,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     yield ev
                 for ev in _emit_tool_calls(opening):
                     yield ev
-        except Exception:
-            logger.exception("Error while streaming /v1/responses")
+        except Exception as e:
+            logger.exception(
+                "Error while streaming /v1/responses %s", request.request_id
+            )
             failed = _sanitize_response_dict(
                 ResponsesResponse.from_request(
                     request,
@@ -2678,6 +2701,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     usage=None,
                 ).model_dump()
             )
+            failed["error"] = {"code": "server_error", "message": str(e)}
             yield _send_event(
                 openai_responses_types.ResponseFailedEvent(
                     type="response.failed",
@@ -2718,6 +2742,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             status=self._status_from_finish_reason(finish_reason),
             usage=usage,
         )
+        final_response.error = self._error_from_finish_reason(finish_reason)
         if request.store:
             async with self.response_store_lock:
                 stored = self.response_store.get(final_response.id)
@@ -2726,13 +2751,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         response_dict = _sanitize_response_dict(final_response.model_dump())
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
-            )
-        )
+        yield _send_event(self._terminal_stream_event(response_dict))
 
     async def _generate_with_builtin_tools(
         self,
