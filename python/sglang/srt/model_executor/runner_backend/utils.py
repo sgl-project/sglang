@@ -37,6 +37,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
     TcPiecewiseCudaGraphBackend,
 )
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -62,6 +63,11 @@ def resolve_decode_backend(
     backend_name = cfg.decode.backend if cfg is not None else Backend.FULL
 
     enable_memory_saver = model_runner.server_args.enable_memory_saver
+    nccl_ep_capacity = None
+    if getattr(getattr(get_exec(), "moe", None), "enable_nccl_ep_cuda_graph", False):
+        if model_runner.device != "cuda" or backend_name != Backend.FULL:
+            raise ValueError("NCCL EP CUDA Graph requires the full CUDA decode backend")
+        nccl_ep_capacity = cuda_graph_runner.max_num_token
 
     if model_runner.device == "npu":
         from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
@@ -97,7 +103,9 @@ def resolve_decode_backend(
             )
             _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = True
     return FullCudaGraphBackend(
-        cuda_graph_runner, enable_memory_saver=enable_memory_saver
+        cuda_graph_runner,
+        enable_memory_saver=enable_memory_saver,
+        nccl_ep_capacity=nccl_ep_capacity,
     )
 
 

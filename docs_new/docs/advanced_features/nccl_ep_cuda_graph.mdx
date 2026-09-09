@@ -1,0 +1,108 @@
+---
+title: "NCCL EP CUDA Graphs"
+description: "Install NCCL EP and opt in to serialized low-latency decode with persistent CUDA Graph resources."
+---
+
+NCCL EP can run low-latency MoE dispatch and combine inside SGLang's full decode
+CUDA Graph backend. Enable it with `--moe-a2a-backend nccl_ep` and
+`--enable-nccl-ep-cuda-graph`. Without the Graph option, NCCL EP runs eagerly.
+
+## Requirements and installation
+
+Use CUDA GPUs with compute capability SM90 or newer, on one node with peer
+access between the participating GPUs. The tested configuration uses Python
+3.12, the official PyTorch `2.11.0+cu130` wheel, CUDA Toolkit 13.0,
+`nccl4py==0.4.1`, `nccl-extensions==0.1.0`, and NCCL 2.30.7.
+`nccl-extensions` provides `nccl.ep`; `nccl4py` alone provides the core binding.
+
+In a dedicated CUDA 13 environment, install from the repository root:
+
+```bash
+python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+python -m pip install -e 'python[nccl_ep]'
+python -m pip install --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7
+```
+
+The last command explicitly overrides PyTorch's NCCL 2.28.9 dependency pin.
+`pip check` will report that single version conflict. The two-GPU synthetic
+validation used this combination; other dependency conflicts need to be resolved
+separately. Repeat the NCCL override if a later PyTorch installation replaces it.
+Installing the optional extra alone does not select this newer runtime.
+
+Set `CUDA_HOME` to the CUDA 13 Toolkit and put its `bin` directory on `PATH`.
+NCCL EP compiles specialized kernels at first use, so `nvcc` and matching CUDA
+headers must be available. Driver compatibility shown by `nvidia-smi`, the
+Toolkit reported by `nvcc --version`, and `torch.version.cuda` describe different
+components.
+
+Check the actual library selected by the binding:
+
+```bash
+python - <<'PY_CHECK'
+import torch
+import nccl.core as core
+import nccl.ep as ep
+
+print("Torch CUDA build:", torch.version.cuda)
+print("Torch NCCL compile-time version:", torch.cuda.nccl.version())
+print("Loaded NCCL:", core.get_version().libnccl)
+print("EP library:", ep.get_lib_version())
+assert callable(getattr(ep.Handle, "update", None))
+PY_CHECK
+```
+
+## Enable decode capture
+
+Add these options to your existing compatible MoE launch configuration:
+
+```bash
+--moe-a2a-backend nccl_ep \
+--nccl-ep-mode low_latency \
+--enable-nccl-ep-cuda-graph
+```
+
+Configure batch-size buckets through the existing
+[CUDA Graph options](/docs/advanced_features/server_arguments).
+The largest decode bucket determines the Graph allocation capacity, which must
+be at most 1024 tokens per rank.
+
+The initial Graph path requires BF16 dispatcher inputs and compatible MoE layers
+with the same communicator, expert count, hidden size, top-k and dtype. Supported
+hidden sizes are 2048, 2560, 4096, 5120, 6144, 7168 and 8192; top-k must be at most
+9. This describes the communication input, not a new expert-compute backend.
+
+Prefill runs eagerly. Prefill Graphs, piecewise or breakable decode Graphs,
+speculative decoding, TBO/SBO, PDMux, EPLB, elastic EP, multiple nodes, Torch
+compile and memory saver are outside this initial scope. Unsupported opt-in
+configurations raise an error during setup.
+
+## Resource ownership
+
+Each capture generation owns one dedicated Graph group and one persistent LL
+handle. Compatible layers and batch-size buckets share those resources in strict
+serial order. This policy controls ownership of the group's shared communication
+state; the external API can create multiple handles.
+
+Capture retains fixed-capacity storage for tokens, routing, weights and receive
+buffers. Bucket descriptors use the same base storage. `Handle.update` runs
+outside capture when preparing a bucket; replay reads the current buffer contents
+without invoking the Python update path. Routing values can change while the
+captured operation structure and buffer addresses remain fixed.
+
+Stream ordering covers input writes, forward execution and already-queued output
+consumers. Concurrent host submissions are rejected. Eager execution uses a
+separate group. Recapture and shutdown wait for device work, release the Graph
+executables, then close their handle and group.
+
+## Validation scope
+
+The model-free tests cover native and SGLang dispatch/combine, changing routing,
+8/16/32-token buckets, two compatible layers, recapture, cross-stream ordering,
+masked padding and controlled host capture failure. They compare against an
+independent CPU oracle using weighted synthetic experts. Full-model accuracy and
+real expert GEMM performance have not been evaluated for this Graph path.
+
+See the [reproduction instructions](https://github.com/sgl-project/sglang/tree/main/test/nccl_ep_test)
+for one-GPU lifecycle tests and the two-GPU correctness, benchmark and profiling
+commands. See [expert parallelism](/docs/advanced_features/expert_parallelism) for
+the surrounding MoE configuration.

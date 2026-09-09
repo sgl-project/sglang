@@ -52,6 +52,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
+    get_resources,
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
@@ -2680,6 +2681,13 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    buffers = get_resources().buffers
+    if "nccl_ep_state" in buffers or "nccl_ep_graph_resources" in buffers:
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep_graph import (
+            destroy_nccl_ep_resources,
+        )
+
+        destroy_nccl_ep_resources()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

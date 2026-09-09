@@ -167,6 +167,11 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep_graph import (
+            require_nccl_ep_eager_session,
+        )
+
+        require_nccl_ep_eager_session()
         if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
@@ -194,14 +199,21 @@ class EagerRunner(BaseRunner):
     def execute(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
-        mode = forward_batch.forward_mode
-        if mode.is_decode():
-            return self._execute_decode(forward_batch, pp_proxy_tensors)
-        if mode.is_idle():
-            return self._execute_idle(forward_batch, pp_proxy_tensors)
-        if mode.is_extend(include_draft_extend_v2=True):
-            return self._execute_extend(forward_batch, pp_proxy_tensors)
-        raise ValueError(f"Invalid forward mode for eager runner: {mode}")
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep_graph import (
+            nccl_ep_eager_session,
+        )
+
+        # Eager and Graph registries can alias. Order the whole forward before
+        # load_batch writes shared inputs, including all non-MoE model work.
+        with nccl_ep_eager_session():
+            mode = forward_batch.forward_mode
+            if mode.is_decode():
+                return self._execute_decode(forward_batch, pp_proxy_tensors)
+            if mode.is_idle():
+                return self._execute_idle(forward_batch, pp_proxy_tensors)
+            if mode.is_extend(include_draft_extend_v2=True):
+                return self._execute_extend(forward_batch, pp_proxy_tensors)
+            raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
     def _resolve_decode_pdmux(
         self,

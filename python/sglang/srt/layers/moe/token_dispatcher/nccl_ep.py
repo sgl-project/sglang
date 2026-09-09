@@ -65,11 +65,10 @@ def _nccl_runtime_version():
     LD_PRELOAD); falls back to torch.
     """
     try:
-        import nccl
+        import nccl.core as nccl_core
 
-        # nccl.get_version() -> VersionInfo with a .nccl LibraryInfo carrying .version.
-        vi = nccl.get_version()
-        lib_info = getattr(vi, "nccl", None)
+        vi = nccl_core.get_version()
+        lib_info = getattr(vi, "libnccl", None)
         ver_obj = getattr(lib_info, "version", None) if lib_info is not None else None
         if ver_obj is not None:
             return _parse_ver_str(str(ver_obj))
@@ -84,9 +83,13 @@ def _nccl_runtime_version():
     return None
 
 
-def nccl_ep_unavailable_reason() -> str | None:
+def nccl_ep_unavailable_reason(*, require_graph: bool = False) -> str | None:
     """Return why NCCL EP is unavailable (None = available), for fallback logs."""
-    if importlib.util.find_spec("nccl.ep") is None:
+    try:
+        installed = importlib.util.find_spec("nccl.ep") is not None
+    except (ModuleNotFoundError, ValueError):
+        installed = False
+    if not installed:
         return "nccl4py (nccl.ep) not importable"
     if not torch.cuda.is_available():
         return "no CUDA device"
@@ -98,6 +101,13 @@ def nccl_ep_unavailable_reason() -> str | None:
         return "could not read NCCL version"
     if (ver[0], ver[1]) < (2, 29):
         return f"NCCL {'.'.join(map(str, ver))} < 2.29 (need Device API/GIN)"
+    if require_graph:
+        try:
+            _, ep = _load_nccl_ep()
+        except ImportError as error:
+            return f"could not load nccl.ep: {error}"
+        if not callable(getattr(ep.Handle, "update", None)):
+            return "the installed nccl.ep binding lacks Handle.update"
     return None
 
 
@@ -140,6 +150,7 @@ class NcclEpBuffer:
         if state is None:
             state = SimpleNamespace(
                 group=None,
+                configuration=None,
                 num_experts=None,
                 num_local_experts=None,
                 hidden_size=None,
@@ -158,13 +169,29 @@ class NcclEpBuffer:
     @classmethod
     def get_buffer(
         cls,
-        ep_group: "GroupCoordinator",
+        ep_group: GroupCoordinator,
         hidden_size: int,
         num_experts: int,
         num_local_experts: int,
         max_dispatch_tokens_per_rank: int,
-    ) -> "NcclEpBuffer":
+    ) -> NcclEpBuffer:
         state = cls._state()
+        pynccl = ep_group.pynccl_comm
+        if pynccl is None or not getattr(pynccl, "available", False):
+            raise RuntimeError("NCCL EP requires a live PyNccl communicator")
+        configuration = (
+            pynccl.comm.value,
+            ep_group.device,
+            ep_group.world_size,
+            hidden_size,
+            num_experts,
+            num_local_experts,
+            max_dispatch_tokens_per_rank,
+        )
+        if state.group is not None and state.configuration != configuration:
+            raise ValueError(
+                "Incompatible MoE layer for the shared NCCL EP eager group"
+            )
         if state.group is None:
             state.num_experts = num_experts
             state.num_local_experts = num_local_experts
@@ -174,10 +201,11 @@ class NcclEpBuffer:
             world_size = ep_group.world_size
             state.max_recv_tokens_per_rank = world_size * max_dispatch_tokens_per_rank
             cls._create_group(state, ep_group)
+            state.configuration = configuration
         return state
 
     @classmethod
-    def _create_group(cls, state, ep_group: "GroupCoordinator"):
+    def _create_group(cls, state, ep_group: GroupCoordinator):
         nccl_core, nccl_ep = _load_nccl_ep()
 
         pynccl = ep_group.pynccl_comm
@@ -235,9 +263,7 @@ class NcclEpBuffer:
         )
         state.recv_total = torch.zeros((1,), dtype=torch.int32, device=device)
         # Upper bound = max dispatch tokens per rank; sliced to [:t] per combine.
-        state.combined = torch.empty(
-            (max_send, h), dtype=torch.bfloat16, device=device
-        )
+        state.combined = torch.empty((max_send, h), dtype=torch.bfloat16, device=device)
 
     @staticmethod
     def _low_latency_rdma_size_hint(nccl_ep, state, world_size: int) -> int:
@@ -274,7 +300,10 @@ class NcclEpBuffer:
         """
         from sglang.srt.environ import envs
 
-        if envs.SGLANG_NCCL_EP_MAX_NUM_SMS.is_set() and envs.SGLANG_NCCL_EP_MAX_NUM_SMS.get() > 0:
+        if (
+            envs.SGLANG_NCCL_EP_MAX_NUM_SMS.is_set()
+            and envs.SGLANG_NCCL_EP_MAX_NUM_SMS.get() > 0
+        ):
             val = envs.SGLANG_NCCL_EP_MAX_NUM_SMS.get()
         else:
             val = 20  # conservative default for H100 (132 SMs)
@@ -297,10 +326,7 @@ class NcclEpBuffer:
         state = cls._state()
         g = state.group
         if g is not None:
-            try:
-                g.destroy()
-            except Exception:
-                pass
+            g.destroy()
             state.group = None
 
 
@@ -323,7 +349,7 @@ class NcclEpDispatcher(BaseDispatcher):
     after dispatch to feed ``apply_deepep_ll``.
     """
 
-    def __init__(self, moe_runner_config: "MoeRunnerConfig", ep_group: "GroupCoordinator"):
+    def __init__(self, moe_runner_config: MoeRunnerConfig, ep_group: GroupCoordinator):
         super().__init__()
         nccl_core, nccl_ep = _load_nccl_ep()
         self._nccl_ep = nccl_ep
@@ -397,6 +423,9 @@ class NcclEpDispatcher(BaseDispatcher):
         )
 
         self.handle = None
+        self._graph_resources = None
+        self._eager_session = None
+        self._active_buffer = self.buffer
 
         # Staged execution state machine (mirrors deepep.py _Stage).
         self._stage = _Stage.INITIAL
@@ -418,9 +447,9 @@ class NcclEpDispatcher(BaseDispatcher):
     # single slot — calling combine(send_only=1) before dispatch_b (complete)
     # would overwrite the dispatch continue_fn.
     def _update_stage(self, old_stage, new_stage):
-        assert self._stage == old_stage, (
-            f"NCCL EP stage mismatch: expected {old_stage}, got {self._stage}"
-        )
+        assert (
+            self._stage == old_stage
+        ), f"NCCL EP stage mismatch: expected {old_stage}, got {self._stage}"
         self._stage = new_stage
 
     def register_deepep_dispatch_hook(self, hook):
@@ -436,7 +465,16 @@ class NcclEpDispatcher(BaseDispatcher):
         return self.dispatch_b()
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+        from .nccl_ep_graph import get_nccl_ep_graph_resources
+
+        owner = get_nccl_ep_graph_resources()
+        graph_owner = owner if owner is not None and owner.capturing else None
+        if torch.cuda.is_current_stream_capturing() and graph_owner is None:
+            raise RuntimeError(
+                "NCCL EP capture requires the opt-in full decode Graph backend"
+            )
+        if self._stage != _Stage.INITIAL:
+            raise RuntimeError("NCCL EP has an incomplete dispatch/combine transaction")
 
         nccl_ep = self._nccl_ep
         topk_weights = topk_output.topk_weights.to(torch.float32)
@@ -450,24 +488,35 @@ class NcclEpDispatcher(BaseDispatcher):
                 f"--nccl-ep-num-max-dispatch-tokens-per-rank or reduce batch."
             )
 
-        if self.handle is not None:
-            try:
-                self.handle.destroy()
-            except Exception:
-                pass
-            self.handle = None
-
-        state = self.buffer
-
         stream = torch.cuda.current_stream()
-
-        handle = state.group.create_handle(
-            layout=nccl_ep.Layout.EXPERT_MAJOR,
-            topk_idx=nccl_ep.Tensor(topk_ids),
-            config=nccl_ep.HandleConfig(),
-            stream=stream.cuda_stream,
-        )
+        if graph_owner is not None:
+            state, handle, hidden_states, topk_ids, topk_weights = graph_owner.prepare(
+                self, hidden_states, topk_ids, topk_weights
+            )
+            self._graph_resources = graph_owner
+        else:
+            if owner is not None:
+                session = owner.submission_session("transaction")
+                session.__enter__()
+                self._eager_session = session
+            try:
+                if self.handle is not None:
+                    self.handle.destroy()
+                state = self.buffer
+                handle = state.group.create_handle(
+                    layout=nccl_ep.Layout.EXPERT_MAJOR,
+                    topk_idx=nccl_ep.Tensor(topk_ids),
+                    config=nccl_ep.HandleConfig(),
+                    stream=stream.cuda_stream,
+                )
+            except BaseException:
+                if self._eager_session is not None:
+                    self._eager_session.__exit__(None, None, None)
+                    self._eager_session = None
+                raise
+        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         self.handle = handle
+        self._active_buffer = state
 
         # Reuse pre-allocated scratch; counters re-zeroed each dispatch.
         recv_tokens = state.recv_tokens
@@ -497,6 +546,11 @@ class NcclEpDispatcher(BaseDispatcher):
             topk_weights,
             t,
             hidden_states,
+            # Native send_only borrows the tensor descriptors until complete.
+            # Retaining the Torch allocations alone does not keep these alive.
+            inputs,
+            outputs,
+            layout_info,
         )
 
     def dispatch_b(self) -> DispatchOutput:
@@ -509,6 +563,9 @@ class NcclEpDispatcher(BaseDispatcher):
             topk_weights,
             t,
             hidden_states,
+            _inputs,
+            _outputs,
+            _layout_info,
         ) = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
 
@@ -567,7 +624,7 @@ class NcclEpDispatcher(BaseDispatcher):
         t = self._dispatched_t  # bounded in dispatch_a.
 
         # Reuse pre-allocated [max_send, H] buffer.
-        combined = self.buffer.combined[:t]
+        combined = self._active_buffer.combined[:t]
 
         stream = torch.cuda.current_stream()
         inputs = nccl_ep.CombineInputs(tokens=nccl_ep.Tensor(expert_outputs))
@@ -582,22 +639,29 @@ class NcclEpDispatcher(BaseDispatcher):
             stream=stream.cuda_stream,
         )
 
-        self._combine_intermediate_state = combined
+        self._combine_intermediate_state = (combined, inputs, outputs)
 
     def combine_b(self) -> torch.Tensor:
-        self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-
-        combined = self._combine_intermediate_state
-        del self._combine_intermediate_state
-
+        if self._stage != _Stage.AFTER_COMBINE_A:
+            raise RuntimeError("NCCL EP combine_b requires a pending combine")
+        combined, _inputs, _outputs = self._combine_intermediate_state
         stream = torch.cuda.current_stream()
-        try:
-            self.handle.complete(config=0, stream=stream.cuda_stream)
-        finally:
-            if self.handle is not None:
-                try:
-                    self.handle.destroy()
-                except Exception:
-                    pass
-                self.handle = None
+        # Release ownership only after successful completion. Native/GPU faults
+        # leave an incomplete transaction and require process restart, rather
+        # than allowing another layer to reuse uncertain communication state.
+        self.handle.complete(config=0, stream=stream.cuda_stream)
+        if self._graph_resources is not None:
+            # Later MoE layers reuse the group's combine scratch. Keep this
+            # layer's live output in the captured graph's allocator pool.
+            combined = combined.clone()
+            self._graph_resources.release(self)
+            self._graph_resources = None
+        else:
+            self.handle.destroy()
+            if self._eager_session is not None:
+                self._eager_session.__exit__(None, None, None)
+                self._eager_session = None
+        self.handle = None
+        del self._combine_intermediate_state
+        self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         return combined

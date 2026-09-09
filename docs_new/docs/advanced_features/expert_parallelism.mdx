@@ -69,6 +69,9 @@ DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode
 
 Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
 
+For the opt-in NCCL EP low-latency decode path, see
+[NCCL EP CUDA Graphs](/docs/advanced_features/nccl_ep_cuda_graph).
+
 ### Backends for MoE Computation
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

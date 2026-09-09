@@ -285,6 +285,7 @@ def _deepep_importable() -> bool:
     """Whether the deep_ep package is importable."""
     return importlib.util.find_spec("deep_ep") is not None
 
+
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
@@ -2294,6 +2295,11 @@ class ServerArgs:
         "NCCL EP dispatch algorithm. Only `low_latency` is implemented; `auto` resolves to it. The high-throughput (prefill) path is a follow-up.",
         NS("exec.moe"),
     ] = "low_latency"
+    enable_nccl_ep_cuda_graph: A[
+        bool,
+        "Enable serialized full decode CUDA Graphs with persistent NCCL EP LL resources.",
+        NS("exec.moe"),
+    ] = False
     nccl_ep_num_max_dispatch_tokens_per_rank: A[
         int,
         "Per-rank dispatch token budget for the NCCL EP group. 0 = use the backend default (capped at 1024).",
@@ -3989,6 +3995,7 @@ class ServerArgs:
         self._apply_cuda_graph_compatibility()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
+        self._validate_nccl_ep_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
         # that path is skipped when the user explicitly sets the backend,
         # which is the only way to get 'full' for prefill today).
@@ -3996,6 +4003,50 @@ class ServerArgs:
             logger.warning(
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
+            )
+
+    def _validate_nccl_ep_cuda_graph_config(self):
+        """Validate the initial serialized LL scope before model-specific setup."""
+        if not self.enable_nccl_ep_cuda_graph:
+            return
+        if self.device != "cuda" or self.moe_a2a_backend != "nccl_ep":
+            raise ValueError(
+                "NCCL EP CUDA Graph requires CUDA and --moe-a2a-backend nccl_ep"
+            )
+        if self.cuda_graph_config.decode.backend != Backend.FULL:
+            raise ValueError("NCCL EP CUDA Graph requires the full decode backend")
+        if (
+            (Phase.PREFILL, "backend") in self._cuda_graph_config_locked
+            and self.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "NCCL EP CUDA Graph does not support prefill Graph capture"
+            )
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+        if self.nccl_ep_mode not in ("low_latency", "auto"):
+            raise ValueError("NCCL EP CUDA Graph supports only low-latency dispatch")
+        if not 0 <= self.nccl_ep_num_max_dispatch_tokens_per_rank <= 1024:
+            raise ValueError("NCCL EP CUDA Graph dispatch budget must be in [0, 1024]")
+        unsupported = [
+            name.replace("_", "-")
+            for name in (
+                "enable_two_batch_overlap",
+                "enable_single_batch_overlap",
+                "enable_pdmux",
+                "enable_eplb",
+                "elastic_ep_backend",
+                "enable_elastic_expert_backup",
+                "speculative_algorithm",
+                "enable_torch_compile",
+                "enable_memory_saver",
+            )
+            if getattr(self, name)
+        ]
+        if self.nnodes != 1:
+            unsupported.append("multiple nodes")
+        if unsupported:
+            raise ValueError(
+                "NCCL EP CUDA Graph does not support: " + ", ".join(unsupported)
             )
 
     def _parse_cuda_graph_config(self):
@@ -6296,6 +6347,12 @@ class ServerArgs:
         # invoked here at the legacy write slots.
         run_post_process_pass(self, _a2a_fusion_adjustments)
 
+        if (
+            self.enable_nccl_ep_cuda_graph
+            and resolved_view(self).moe_a2a_backend != "nccl_ep"
+        ):
+            raise ValueError("NCCL EP CUDA Graph requires the resolved NCCL EP backend")
+
         # NCCL EP capability check + fallback — done early so a 'deepep' fallback
         # flows through the deepep-specific blocks below.
         if resolved_view(self).moe_a2a_backend == "nccl_ep":
@@ -6303,8 +6360,12 @@ class ServerArgs:
                 nccl_ep_unavailable_reason,
             )
 
-            reason = nccl_ep_unavailable_reason()
+            reason = nccl_ep_unavailable_reason(
+                require_graph=self.enable_nccl_ep_cuda_graph
+            )
             if reason is not None:
+                if self.enable_nccl_ep_cuda_graph:
+                    raise ValueError(f"NCCL EP CUDA Graph is unavailable: {reason}")
                 fallback = "deepep" if _deepep_importable() else "none"
                 logger.warning(
                     f"NCCL EP MoE requested but unavailable ({reason}); "
@@ -6399,6 +6460,9 @@ class ServerArgs:
                 )
 
         if a2a_backend == "nccl_ep":
+            if not self.enable_nccl_ep_cuda_graph:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"NCCL EP MoE is enabled. The expert parallel size is adjusted "
                 f"to be the same as the tensor parallel size[{self.tp_size}]. "

@@ -1060,6 +1060,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        # External planning callers must not overwrite EP Graph input buffers
+        # before the backend has ordered the preceding replay and its consumers.
+        require_session = getattr(self.backend, "require_replay_session", None)
+        if require_session is not None:
+            require_session()
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode

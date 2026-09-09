@@ -9,7 +9,7 @@ Usage (on a 4-GPU node with NCCL >= 2.29):
     CUDA_VISIBLE_DEVICES=4,5,6,7 \
     LD_PRELOAD=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 \
     torchrun --nproc_per_node=4 \
-        test/registered/unit/layers/moe/test_nccl_ep_synthetic.py
+        test/manual/test_nccl_ep_synthetic.py
 
 Covers:
     1. NCCL EP group creation (LL, no-IB RDMA buffer init)
@@ -26,22 +26,10 @@ import os
 import sys
 import traceback
 from types import SimpleNamespace
-from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
-from unittest.mock import patch, MagicMock
-
-# ---- sglang imports (must come after env setup) ----
-from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
-    NcclEpDispatcher,
-    is_nccl_ep_available,
-    nccl_ep_unavailable_reason,
-    _nccl_runtime_version,
-)
-from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 # ---- monkey-patch runtime_context: NcclEpDispatcher.__init__ calls
 # get_exec().deterministic.enable_deterministic_inference, but we don't
@@ -49,11 +37,25 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 # reports deterministic=False (the safe default for a synthetic test).
 import sglang.srt.runtime_context as _rtc
 
+# ---- sglang imports (must come after env setup) ----
+from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+    NcclEpDispatcher,
+    _nccl_runtime_version,
+    is_nccl_ep_available,
+    nccl_ep_unavailable_reason,
+)
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+
 class _MockDeterministic:
     enable_deterministic_inference = False
 
+
 class _MockExec:
     deterministic = _MockDeterministic()
+
 
 _original_get_exec = _rtc.get_exec
 
@@ -67,9 +69,9 @@ _rtc.get_exec = _mocked_get_exec
 # ---- test config (mirrors DeepSeek-V3 / GLM-5.2 W4AFP8 constraints) ----
 NUM_EXPERTS = 256
 TOPK = 8
-HIDDEN = 7168          # in LL allowlist; 6144 also works
-NUM_LAYERS = 1         # synthetic: single MoE layer
-BATCH_TOKENS = 128     # per-rank decode tokens (< 1024 budget)
+HIDDEN = 7168  # in LL allowlist; 6144 also works
+NUM_LAYERS = 1  # synthetic: single MoE layer
+BATCH_TOKENS = 128  # per-rank decode tokens (< 1024 budget)
 
 
 def log(rank: int, msg: str):
@@ -116,7 +118,12 @@ def make_moe_runner_config(hidden: int = HIDDEN, topk: int = TOPK):
 
 
 def make_synthetic_inputs(
-    rank: int, batch: int, hidden: int, num_experts: int, topk: int, device: torch.device
+    rank: int,
+    batch: int,
+    hidden: int,
+    num_experts: int,
+    topk: int,
+    device: torch.device,
 ):
     """Create deterministic synthetic hidden_states + topk routing.
 
@@ -138,7 +145,9 @@ def make_synthetic_inputs(
     topk_output = StandardTopKOutput(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        router_logits=torch.zeros(batch, num_experts, dtype=torch.float32, device=device),
+        router_logits=torch.zeros(
+            batch, num_experts, dtype=torch.float32, device=device
+        ),
     )
     return hidden_states, topk_output
 
@@ -203,13 +212,13 @@ def test_3_dispatch(rank: int, dispatcher: NcclEpDispatcher, hidden: int):
     dispatch_output = dispatcher.dispatch(hs, topk_output)
 
     # Check output types/shapes
-    assert dispatch_output.hidden_states.dtype == torch.float8_e4m3fn, (
-        f"expected fp8_e4m3fn, got {dispatch_output.hidden_states.dtype}"
-    )
+    assert (
+        dispatch_output.hidden_states.dtype == torch.float8_e4m3fn
+    ), f"expected fp8_e4m3fn, got {dispatch_output.hidden_states.dtype}"
     assert dispatch_output.hidden_states.is_cuda, "hidden_states not on GPU"
-    assert dispatch_output.hidden_states_scale.dtype == torch.float32, (
-        f"expected float32 scale, got {dispatch_output.hidden_states_scale.dtype}"
-    )
+    assert (
+        dispatch_output.hidden_states_scale.dtype == torch.float32
+    ), f"expected float32 scale, got {dispatch_output.hidden_states_scale.dtype}"
 
     # masked_m should reflect actual recv counts (non-zero in general).
     total_recv = dispatch_output.masked_m.sum().item()
@@ -243,9 +252,7 @@ def test_4_fp8_quant_correctness(
     test_x = torch.randn(4, hidden, dtype=torch.bfloat16, device=device)
 
     # sglang kernel (same one NCCL EP calls)
-    q_kernel, s_kernel = sglang_per_token_group_quant_fp8(
-        test_x, group_size=group_size
-    )
+    q_kernel, s_kernel = sglang_per_token_group_quant_fp8(test_x, group_size=group_size)
     # reference
     q_ref, s_ref = reference_fp8_quant(test_x, group_size=group_size)
 
@@ -255,7 +262,9 @@ def test_4_fp8_quant_correctness(
     # different rounding). Check correlation: dequant should be close.
     # scale is [4, 56] (7168/128=56 groups), need to expand to [4, 7168] for broadcast
     s_kernel_expanded = s_kernel.repeat_interleave(group_size, dim=-1).to(torch.float32)
-    s_ref_expanded = s_ref.to(device).repeat_interleave(group_size, dim=-1).to(torch.float32)
+    s_ref_expanded = (
+        s_ref.to(device).repeat_interleave(group_size, dim=-1).to(torch.float32)
+    )
     dq_kernel = q_kernel.to(torch.float32) * s_kernel_expanded
     dq_ref = q_ref.to(torch.float32) * s_ref_expanded
     max_err = (dq_kernel - dq_ref).abs().max().item()
@@ -269,7 +278,9 @@ def test_4_fp8_quant_correctness(
     log(rank, "[4] PASS: bf16->fp8 post-quant matches reference")
 
 
-def test_5_combine(rank: int, dispatcher: NcclEpDispatcher, dispatch_output, topk_output):
+def test_5_combine(
+    rank: int, dispatcher: NcclEpDispatcher, dispatch_output, topk_output
+):
     """Verify combine A2A: real bf16 send/recv back + handle destroy."""
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', rank))}")
 
@@ -354,7 +365,9 @@ def test_6_roundtrip_identity(rank: int, ep_group, hidden: int):
     assert torch.isfinite(combined).all(), "combined has NaN/Inf"
 
     # Check shape: [batch, hidden]
-    assert combined.shape[0] == batch, f"expected batch={batch}, got {combined.shape[0]}"
+    assert (
+        combined.shape[0] == batch
+    ), f"expected batch={batch}, got {combined.shape[0]}"
     assert combined.shape[1] == hidden
 
     log(
@@ -376,7 +389,9 @@ def test_7_guard_hidden_allowlist(rank: int, ep_group):
         mock_sd.return_value = MagicMock()
         try:
             NcclEpDispatcher(cfg, ep_group)
-            log(rank, "[7] FAIL: expected ValueError for hidden=3072 (not in allowlist)")
+            log(
+                rank, "[7] FAIL: expected ValueError for hidden=3072 (not in allowlist)"
+            )
             assert False, "should have raised"
         except ValueError as e:
             assert "NCCL EP LL only supports hidden" in str(e)
@@ -466,6 +481,7 @@ def main():
         # Cleanup
         try:
             from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
+
             NcclEpBuffer.destroy()
         except Exception:
             pass

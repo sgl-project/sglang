@@ -12,8 +12,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -83,11 +83,11 @@ class TestNcclEpDispatchHooks(unittest.TestCase):
     """Test the DeepEPPDispatchHooks mechanism for SBO."""
 
     def test_dispatch_hooks_initialized(self):
-        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
-            NcclEpDispatcher,
-        )
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
             DeepEPPDispatchHooks,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            NcclEpDispatcher,
         )
 
         dispatcher = object.__new__(NcclEpDispatcher)
@@ -95,20 +95,18 @@ class TestNcclEpDispatchHooks(unittest.TestCase):
         self.assertIsInstance(dispatcher._dispatch_hooks, DeepEPPDispatchHooks)
 
     def test_register_deepep_dispatch_hook(self):
-        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
-            NcclEpDispatcher,
-        )
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
             DeepEPPDispatchHooks,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            NcclEpDispatcher,
         )
 
         dispatcher = object.__new__(NcclEpDispatcher)
         dispatcher._dispatch_hooks = DeepEPPDispatchHooks()
 
         called = []
-        handle = dispatcher.register_deepep_dispatch_hook(
-            lambda d: called.append(d)
-        )
+        handle = dispatcher.register_deepep_dispatch_hook(lambda d: called.append(d))
         self.assertEqual(len(called), 0)
 
         dispatcher._dispatch_hooks(dispatcher)
@@ -118,12 +116,12 @@ class TestNcclEpDispatchHooks(unittest.TestCase):
 
     def test_dispatch_calls_hooks_between_a_and_b(self):
         """dispatch() must call hooks after dispatch_a and before dispatch_b."""
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DeepEPPDispatchHooks,
+        )
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
             NcclEpDispatcher,
             _Stage,
-        )
-        from sglang.srt.layers.moe.token_dispatcher.deepep import (
-            DeepEPPDispatchHooks,
         )
 
         dispatcher = object.__new__(NcclEpDispatcher)
@@ -145,9 +143,7 @@ class TestNcclEpDispatchHooks(unittest.TestCase):
         dispatcher.dispatch_a = mock_dispatch_a.__get__(dispatcher)
         dispatcher.dispatch_b = mock_dispatch_b.__get__(dispatcher)
 
-        dispatcher.register_deepep_dispatch_hook(
-            lambda d: call_order.append("hook")
-        )
+        dispatcher.register_deepep_dispatch_hook(lambda d: call_order.append("hook"))
 
         result = dispatcher.dispatch(
             torch.randn(4, 64, dtype=torch.bfloat16),
@@ -163,9 +159,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
     def test_default_value(self):
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS"
-        ) as mock_env:
+        with patch("sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS") as mock_env:
             mock_env.is_set.return_value = False
             result = NcclEpBuffer._resolve_max_num_sms(256)
             self.assertEqual(result, 20)
@@ -173,9 +167,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
     def test_env_override(self):
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS"
-        ) as mock_env:
+        with patch("sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS") as mock_env:
             mock_env.is_set.return_value = True
             mock_env.get.return_value = 40
             result = NcclEpBuffer._resolve_max_num_sms(256)
@@ -185,9 +177,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
         """256 experts need at least ceil(256/14)=19 SMs (nccl_ep.cc:1305)."""
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS"
-        ) as mock_env:
+        with patch("sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS") as mock_env:
             mock_env.is_set.return_value = True
             mock_env.get.return_value = 1  # too low
             result = NcclEpBuffer._resolve_max_num_sms(256)
@@ -197,9 +187,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
         """64 experts need at least ceil(64/14)=5 SMs."""
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS"
-        ) as mock_env:
+        with patch("sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS") as mock_env:
             mock_env.is_set.return_value = True
             mock_env.get.return_value = 1
             result = NcclEpBuffer._resolve_max_num_sms(64)
@@ -212,10 +200,10 @@ class TestSBOAssertAcceptsNcclEp(unittest.TestCase):
     def test_nccl_ep_dispatcher_is_accepted(self):
         """The assert isinstance(..., (MaybeTboDeepEPDispatcher, NcclEpDispatcher))
         should pass for NcclEpDispatcher instances."""
-        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
         from sglang.srt.batch_overlap.two_batch_overlap import (
             MaybeTboDeepEPDispatcher,
         )
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
 
         # Create a bare NcclEpDispatcher (no __init__)
         dispatcher = object.__new__(NcclEpDispatcher)
@@ -229,8 +217,8 @@ class TestForwardNormalSkipArConsistency(unittest.TestCase):
     """Test skip_ar behavior for nccl_ep backend."""
 
     def test_skip_ar_false_for_nccl_ep(self):
-        from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
         from sglang.srt.layers.moe.moe_runner.base import MoeA2ABackend
+        from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
 
         with patch(
             "sglang.srt.layers.moe.utils.get_moe_a2a_backend",
@@ -248,9 +236,7 @@ class TestForwardNormalSkipArConsistency(unittest.TestCase):
                         "sglang.srt.layers.moe.utils.get_server_args"
                     ) as mock_sa:
                         mock_sa.return_value = SimpleNamespace(dwdp_size=1)
-                        result = should_skip_post_experts_all_reduce(
-                            is_tp_path=True
-                        )
+                        result = should_skip_post_experts_all_reduce(is_tp_path=True)
 
         self.assertFalse(result)
 
@@ -303,7 +289,7 @@ class TestNcclEpDispatcherEpGroupType(unittest.TestCase):
 
 
 class TestNcclRuntimeVersionParsing(unittest.TestCase):
-    """Test _nccl_runtime_version() handles nccl4py 0.3.x VersionInfo format."""
+    """Test the selected nccl4py core VersionInfo API and conservative fallback."""
 
     def test_returns_none_when_no_nccl4py(self):
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
@@ -313,52 +299,36 @@ class TestNcclRuntimeVersionParsing(unittest.TestCase):
         with patch.dict("sys.modules", {"nccl": None, "nccl.core": None}):
             with patch("torch.cuda.nccl.version", side_effect=Exception):
                 result = _nccl_runtime_version()
-                # Should return None or fall through gracefully
-                # (may still return torch's version if import fails silently)
-                self.assertTrue(result is None or isinstance(result, tuple))
+                self.assertIsNone(result)
 
     def test_parses_versioninfo_namedtuple(self):
-        """nccl4py 0.3.x returns VersionInfo(nccl=LibraryInfo(version=<Version('2.30.7')>...))."""
+        """Prefer core.get_version().libnccl over Torch's build-time version."""
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
             _nccl_runtime_version,
         )
 
-        mock_version_info = SimpleNamespace(
-            nccl=SimpleNamespace(
-                version="2.30.7"
-            )
+        mock_core = ModuleType("nccl.core")
+        mock_core.get_version = MagicMock(
+            return_value=SimpleNamespace(libnccl=SimpleNamespace(version="2.30.7"))
         )
-
-        with patch.dict("sys.modules", {"nccl": MagicMock(), "nccl.core": MagicMock()}):
-            import sys
-            mock_nccl = MagicMock()
-            mock_nccl.get_version.return_value = mock_version_info
-            sys.modules["nccl"] = mock_nccl
-
-            mock_core = MagicMock()
-            mock_core.get_version.return_value = ""
-            sys.modules["nccl.core"] = mock_core
-
+        mock_nccl = ModuleType("nccl")
+        mock_nccl.core = mock_core
+        with patch.dict("sys.modules", {"nccl": mock_nccl, "nccl.core": mock_core}):
             with patch("torch.cuda.nccl.version", return_value=(2, 28, 9)):
                 result = _nccl_runtime_version()
                 self.assertEqual(result, (2, 30, 7))
 
     def test_falls_back_to_torch_version(self):
-        """When nccl4py returns unparseable data, fall back to torch.cuda.nccl.version."""
+        """When nccl4py returns unparsable data, fall back to torch.cuda.nccl.version."""
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
             _nccl_runtime_version,
         )
 
-        with patch.dict("sys.modules", {"nccl": MagicMock(), "nccl.core": MagicMock()}):
-            import sys
-            mock_nccl = MagicMock()
-            mock_nccl.get_version.return_value = None
-            sys.modules["nccl"] = mock_nccl
-
-            mock_core = MagicMock()
-            mock_core.get_version.return_value = None
-            sys.modules["nccl.core"] = mock_core
-
+        mock_core = ModuleType("nccl.core")
+        mock_core.get_version = MagicMock(return_value=None)
+        mock_nccl = ModuleType("nccl")
+        mock_nccl.core = mock_core
+        with patch.dict("sys.modules", {"nccl": mock_nccl, "nccl.core": mock_core}):
             with patch("torch.cuda.nccl.version", return_value=(2, 28, 9)):
                 result = _nccl_runtime_version()
                 self.assertEqual(result, (2, 28, 9))
