@@ -1,9 +1,8 @@
 # NEO-Unify GPU attention
 
-The feature includes SenseNova support from SGLang PR #36606, head
-`d9a2188f52027485c73b10ab578cd3453893f400`. Its model entry point currently
-serves T2I; the attention adapter also covers the model's reference-image
-prefill helper. This does not add an image-editing serving endpoint.
+The model entry point currently serves T2I; the attention adapter also covers
+the model's reference-image prefill helper. This does not add an image-editing
+serving endpoint.
 
 ## Backends and semantics
 
@@ -36,8 +35,8 @@ generation stage dispatches one request at a time.
 
 ## FA3 dependency
 
-Ordinary SGLang FA3 is sufficient for denoising and pure-text prefill.
-Image-aware FA3 additionally requires the upstream-linked fork:
+SGLang's built-in FA3 handles denoising on SM90. Image-aware FA3, and explicit
+FA3 selection on SM80-SM89 in this adapter, require the upstream-linked fork:
 
 - https://github.com/WANDY666/flash-attention/tree/support_neo
 - Reference commit: `e2077ee6e568e64d0d01c6b44d8ce4ee24e7932b`
@@ -46,6 +45,9 @@ Image-aware FA3 additionally requires the upstream-linked fork:
 
 Use that fork's build instructions in a separate Linux CUDA environment. Both
 its Python interface and compiled extension must come from the same revision.
+With PyTorch 2.9 or newer, wrap the `std::array<int64_t, 1>{total_q}` shape
+expression at `hopper/flash_api_stable.cpp:1220` outside `STD_TORCH_CHECK` to
+prevent its template comma from being parsed as a macro argument.
 The fork contains image-aware forward kernels for SM80-SM90. `auto` remains
 limited to SM90; explicit `fa3` enables target-device validation on Ampere and
 Ada. Importing the model does not import this optional extension. The actual
@@ -64,8 +66,8 @@ python test/registered/kernel/attention/test_neo_unify.py
 
 The GPU suite compares each path to FP32 attention, including tile-crossing
 image spans, GQA, strided tensors and unequal Q/KV lengths. Optional FA3
-cases skip when its build or Hopper is unavailable; that skip is not FA3
-validation. The model tests compare prefix outputs/cache and repeated
+cases skip when the extension is unavailable or the GPU is outside SM80-SM90;
+that skip is not FA3 validation. The model tests compare prefix outputs/cache and repeated
 denoising steps against the original implementation using a tiny randomly
 initialized attention layer, without downloading a checkpoint.
 
@@ -104,8 +106,9 @@ sglang generate --model-path sensenova/SenseNova-U1.5-8B-MoT \
 ```
 
 Repeat for `triton/legacy`, `legacy/triton`, and `triton/triton`; then FA3
-combinations on Hopper. Compare output images and denoising trajectories,
-not bitwise image equality across attention implementations. Reuse
+combinations on SM80-SM90 with the optional extension. Compare output images
+and denoising trajectories, not bitwise image equality across attention
+implementations. Reuse
 `python -m sglang.multimodal_gen.benchmarks.bench_offline_throughput` and
 `bench_serving` for end-to-end measurements. Record checkpoint/revisions,
 software versions, prefill time, denoising time, latency and peak memory.
