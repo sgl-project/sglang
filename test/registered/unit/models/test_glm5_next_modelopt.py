@@ -11,6 +11,27 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+NVIDIA_EXCLUDE_MODULES = [
+    "model.language_model.embed_tokens",
+    "model.language_model.layers.11.self_attn*",
+    "model.language_model.layers.11.mlp.gate",
+    "model.language_model.layers.11.mlp.shared_experts*",
+    "model.visual*",
+]
+
+RADIXARK_EXCLUDE_MODULES = [
+    "model.language_model.embed_tokens",
+    "model.language_model.layers.11.self_attn*",
+    "model.language_model.layers.11.mlp.gate",
+    "model.visual*",
+    "model.embed_tokens",
+    "model.layers.11.self_attn*",
+    "model.layers.11.mlp.gate",
+    "model.language_model.layers.45*",
+    "model.layers.45*",
+    "visual*",
+]
+
 
 class TestGlm5NextModelOpt(CustomTestCase):
     def _config(self, exclude_modules):
@@ -34,30 +55,25 @@ class TestGlm5NextModelOpt(CustomTestCase):
         )
 
     def test_checkpoint_exclusions_match_sglang_module_names(self):
-        config = self._config(
-            [
-                "model.language_model.embed_tokens",
-                "model.language_model.layers.11.self_attn*",
-                "model.language_model.layers.11.mlp.shared_experts*",
-                "model.visual*",
-            ]
-        )
+        checkpoints = {
+            "nvidia/GLM-5.3-Flash-NVFP4": NVIDIA_EXCLUDE_MODULES,
+            "RadixArk/GLM-5.3-Flash-NVFP4": RADIXARK_EXCLUDE_MODULES,
+        }
 
-        self.assertTrue(config.is_layer_excluded("model.embed_tokens"))
-        self.assertTrue(
-            config.is_layer_excluded("model.layers.11.self_attn.kv_b_proj")
-        )
-        self.assertTrue(
-            config.is_layer_excluded(
-                "model.layers.11.mlp.shared_experts.gate_up_proj"
-            )
-        )
-        self.assertTrue(config.is_layer_excluded("visual.blocks.0.attn.qkv_proj"))
+        for checkpoint, exclude_modules in checkpoints.items():
+            with self.subTest(checkpoint=checkpoint):
+                config = self._config(exclude_modules)
+                self.assertTrue(config.is_layer_excluded("model.embed_tokens"))
+                self.assertTrue(
+                    config.is_layer_excluded("model.layers.11.self_attn.kv_b_proj")
+                )
+                self.assertTrue(config.is_layer_excluded("model.layers.11.mlp.gate"))
+                self.assertTrue(
+                    config.is_layer_excluded("visual.blocks.0.attn.qkv_proj")
+                )
 
-    def test_mixed_precision_shared_experts_disable_fusion(self):
-        config = self._config(
-            ["model.language_model.layers.3.mlp.shared_experts*"]
-        )
+    def test_nvidia_mixed_precision_shared_experts_disable_fusion(self):
+        config = self._config(NVIDIA_EXCLUDE_MODULES)
 
         reason = Glm5NextForConditionalGeneration.shared_experts_fusion_disable_reason(
             self._hf_config(), config
@@ -65,16 +81,14 @@ class TestGlm5NextModelOpt(CustomTestCase):
 
         self.assertIn("shared experts unquantized", reason)
 
-    def test_uniform_modelopt_fp4_does_not_disable_fusion(self):
-        config = self._config([])
+    def test_radixark_uniform_fp4_shared_experts_keep_fusion(self):
+        config = self._config(RADIXARK_EXCLUDE_MODULES)
         a2a_backend = SimpleNamespace(is_deepep=lambda: False)
 
         with (
             patch.object(glm5_next, "_is_cuda", True),
             patch.object(glm5_next, "_device_sm", 100),
-            patch.object(
-                glm5_next, "get_moe_a2a_backend", return_value=a2a_backend
-            ),
+            patch.object(glm5_next, "get_moe_a2a_backend", return_value=a2a_backend),
             get_parallel().override(moe_ep_size=1),
         ):
             reason = (
