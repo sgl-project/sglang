@@ -107,6 +107,12 @@ class TestXPUFP8Linear(CustomTestCase):
         out_3d = torch_w8a8_block_fp8_linear(x_3d, weight, block_size, weight_scale)
         self.assertEqual(out_3d.shape, (2, 4, N))
 
+        x_3d_noncontiguous = x_3d.transpose(0, 1)
+        out_3d_noncontiguous = torch_w8a8_block_fp8_linear(
+            x_3d_noncontiguous, weight, block_size, weight_scale
+        )
+        self.assertEqual(out_3d_noncontiguous.shape, (4, 2, N))
+
     def test_torch_w8a8_block_fp8_linear_prequantized(self):
         """Test pre-quantized input branch (input_scale is not None)."""
         M, K, N = 16, 256, 256

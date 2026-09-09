@@ -599,12 +599,12 @@ def torch_w8a8_block_fp8_linear(
         if block_n == 1
         else torch.nn.functional.ScalingType.BlockWise128x128
     )
-    input_2d = input.view(-1, input.shape[-1])
+    input_2d = input.reshape(-1, input.shape[-1])
     if input_scale is None:
         q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
     else:
         q_input = input_2d
-        activation_scale = input_scale.view(-1, input_scale.shape[-1])
+        activation_scale = input_scale.reshape(-1, input_scale.shape[-1])
 
     if q_input.stride(-1) != 1:
         q_input = q_input.contiguous()
