@@ -14,8 +14,6 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     w4a8_int8_linear = None
 
-_OUTPUT_DTYPE_CODE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
-
 
 def _register_weight(
     layer: torch.nn.Module,
@@ -148,62 +146,4 @@ class KitchenW4A8LinearMethod(LinearMethodBase):
         return output
 
 
-class KitchenInt8EmbeddingMethod(LinearMethodBase):
-    """Gather and dequantize only the selected rows of a tensorwise INT8 table."""
-
-    def __init__(self) -> None:
-        try:
-            torch.ops.comfy_kitchen.dequantize_int8_embedding
-        except AttributeError as exc:
-            raise ImportError(
-                "Tensorwise INT8 embeddings require comfy-kitchen>=0.2.27 "
-                "(`pip install -U comfy-kitchen`)."
-            ) from exc
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        del input_size, output_size
-        self.output_dtype = params_dtype
-        _register_weight(
-            layer,
-            "weight",
-            (sum(output_partition_sizes), input_size_per_partition),
-            torch.int8,
-            extra_weight_attrs,
-            {"input_dim": 1, "output_dim": 0},
-        )
-        _register_weight(
-            layer,
-            "weight_scale",
-            (),
-            torch.float32,
-            extra_weight_attrs,
-        )
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        raise NotImplementedError("Kitchen INT8 embedding weights support lookup only")
-
-    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return torch.ops.comfy_kitchen.dequantize_int8_embedding(
-            layer.weight,
-            layer.weight_scale,
-            input_,
-            0,
-            _OUTPUT_DTYPE_CODE[self.output_dtype],
-        )
-
-
-__all__ = ["KitchenInt8EmbeddingMethod", "KitchenW4A8LinearMethod"]
+__all__ = ["KitchenW4A8LinearMethod"]
