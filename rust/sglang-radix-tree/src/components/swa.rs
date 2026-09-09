@@ -1056,7 +1056,13 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                         .arena
                         .resolve(target_id)
                         .expect("backup transfers must reference live nodes");
-                    let size = tree_core.arena.device_value_len(target_idx, SWA) as i64;
+                    let target = tree_core.arena.node(target_idx);
+                    assert!(
+                        target.has_device_value(SWA) && !target.has_host_value(SWA),
+                        "SWA backup target {} is not device-only",
+                        target.id
+                    );
+                    let size = target.device_value_len(SWA) as i64;
                     tree_core.arena.set_host_value(
                         target_idx,
                         SWA,

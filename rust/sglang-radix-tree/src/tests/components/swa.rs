@@ -3634,6 +3634,7 @@ fn backup_host_build_wraps_the_device_value_as_int64() {
 #[test]
 fn backup_host_build_returns_none_for_a_tombstone() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.set_has_swa_host_pool();
     let [a] = chain::<1>(&mut tc);
     let transfers = swa_component(4)
         .build_hicache_transfers(
@@ -3944,12 +3945,21 @@ fn backup_host_commit_sets_the_host_value() {
 }
 
 #[test]
-#[should_panic(expected = "slot already set")]
+#[should_panic(expected = "is not device-only")]
 fn backup_host_commit_rejects_a_target_that_is_already_backed_up() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
     set_swa_device(&mut tc, a);
     set_swa_host(&mut tc, a);
+    let a_id = tc.arena.node(a).id;
+    commit_backup(&mut tc, a, &[30i64], Some(vec![a_id]));
+}
+
+#[test]
+#[should_panic(expected = "is not device-only")]
+fn backup_host_commit_rejects_a_target_without_a_device_value() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
     let a_id = tc.arena.node(a).id;
     commit_backup(&mut tc, a, &[30i64], Some(vec![a_id]));
 }

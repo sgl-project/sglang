@@ -1370,15 +1370,17 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)
     }
 
-    /// Mark the host tier (HiCache) as wired.
+    /// Mark the host tier as buffer-only; wired after the host pools are built.
     fn set_host_memory_buffer_only(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().set_host_memory_buffer_only());
     }
 
+    /// Whether the host tier runs as a storage staging buffer, not a cache.
     fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
         py.allow_threads(|| self.core().is_host_memory_buffer_only)
     }
 
+    /// Mark the host tier (HiCache) as wired.
     fn set_hicache_enabled(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().set_hicache_enabled());
     }
@@ -2578,15 +2580,17 @@ macro_rules! tree_core_binding {
                 self.inner.is_full_device_evicted(py, node_id)
             }
 
-            /// Mark the host tier (HiCache) as wired.
+            /// Mark the host tier as buffer-only; wired after the host pools are built.
             fn set_host_memory_buffer_only(&self, py: Python<'_>) {
                 self.inner.set_host_memory_buffer_only(py)
             }
 
+            /// Whether the host tier runs as a storage staging buffer, not a cache.
             fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
                 self.inner.is_host_memory_buffer_only(py)
             }
 
+            /// Mark the host tier (HiCache) as wired.
             fn set_hicache_enabled(&self, py: Python<'_>) {
                 self.inner.set_hicache_enabled(py)
             }
