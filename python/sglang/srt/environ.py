@@ -1648,6 +1648,9 @@ class Envs:
     # Opt into the direct MXFP4 W4A16 MMA weight layout instead of VALU.  # codespell:ignore
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
+    # Fused SiLU+Mul + per-token fp8 quant JIT kernel in the channel-wise
+    # masked DeepGEMM path. Set =0 to fall back to the Triton implementation.
+    SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA = EnvBool(True)
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)

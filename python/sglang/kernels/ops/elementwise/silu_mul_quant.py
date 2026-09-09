@@ -174,3 +174,87 @@ def silu_and_mul_masked_post_quant_mxfp4(
     module.run(input, out_quant, out_scale, masked_m, limit_val, max_masked_m)
 
     return out_quant, out_scale[:, :S_valid, :]
+
+
+@cache_once
+def _jit_fp8_masked_module(
+    apply_clamp: bool, apply_gemm1_alpha: bool, scale_ue8m0: bool
+) -> Module:
+    if not is_ppu():
+        raise RuntimeError(
+            _PPU_ONLY_MSG.format(name="silu_and_mul_masked_post_per_token_quant_fp8")
+        )
+    clamp_str = "true" if apply_clamp else "false"
+    alpha_str = "true" if apply_gemm1_alpha else "false"
+    ue8m0_str = "true" if scale_ue8m0 else "false"
+    return load_jit(
+        "silu_and_mul_masked_post_per_token_quant_fp8",
+        clamp_str,
+        alpha_str,
+        ue8m0_str,
+        cuda_files=["elementwise/silu_and_mul_masked_post_per_token_quant_fp8.cuh"],
+        cuda_wrappers=[
+            (
+                "run",
+                f"SiluMulFp8MaskedEP<{_FP8_BLOCK_THREADS},{clamp_str},"
+                f"{alpha_str},{ue8m0_str}>::run",
+            ),
+        ],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+def silu_and_mul_masked_post_per_token_quant_fp8(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
+    expected_m: Optional[int] = None,
+    scale_ue8m0: bool = False,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_clamp_limit: Optional[float] = None,
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert input.ndim == 3, "input must be 3D (E, T, 2H)"
+    assert input.dtype == torch.bfloat16, "input must be bfloat16"
+    assert masked_m.dtype == torch.int32, "masked_m must be int32"
+    assert input.shape[0] == masked_m.shape[0]
+
+    E, T, two_H = input.shape
+    H = two_H // 2
+    assert H > 0 and H % 8 == 0, f"H must be positive and multiple of 8, got H={H}"
+
+    apply_clamp = swiglu_limit is not None
+    apply_gemm1_alpha = gemm1_alpha is not None
+    assert not (apply_clamp and apply_gemm1_alpha), (
+        "swiglu_limit (DeepSeek V4) and gemm1_alpha (oai-swiglu) are "
+        "mutually exclusive"
+    )
+    if apply_gemm1_alpha:
+        assert gemm1_clamp_limit is not None, "gemm1_alpha requires gemm1_clamp_limit"
+
+    out_quant = torch.empty((E, T, H), dtype=torch.float8_e4m3fn, device=input.device)
+    out_scale = torch.empty((E, T, 1), dtype=torch.float32, device=input.device)
+
+    if E == 0 or T == 0:
+        return out_quant, out_scale
+
+    limit_val = float(swiglu_limit) if apply_clamp else 0.0
+    alpha_val = float(gemm1_alpha) if apply_gemm1_alpha else 0.0
+    clamp_val = float(gemm1_clamp_limit) if apply_gemm1_alpha else 0.0
+
+    max_masked_m = int(expected_m) if expected_m is not None else int(T)
+
+    module = _jit_fp8_masked_module(apply_clamp, apply_gemm1_alpha, scale_ue8m0)
+    module.run(
+        input,
+        out_quant,
+        out_scale,
+        masked_m,
+        limit_val,
+        alpha_val,
+        clamp_val,
+        float(eps),
+        max_masked_m,
+    )
+
+    return out_quant, out_scale
