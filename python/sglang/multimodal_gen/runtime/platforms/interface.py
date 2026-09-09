@@ -435,6 +435,16 @@ class Platform:
         return True
 
     @classmethod
+    def device_shares_host_memory(cls) -> bool:
+        """Whether the accelerator draws from the same physical pool as the host.
+
+        On such a part (DGX Spark's GB10, Jetson) a device allocation is host
+        memory the kernel no longer has, and a host copy of a mapped weight is
+        a second copy of bytes the page cache already holds.
+        """
+        return False
+
+    @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
@@ -442,6 +452,10 @@ class Platform:
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
         return resolve_obj_by_qualname(attention_cls_str)
+
+    def tensor_on_device(self, t: torch.Tensor) -> bool:
+        """Check if a tensor is on the current platform's device."""
+        return t.is_cuda
 
 
 class UnspecifiedPlatform(Platform):
