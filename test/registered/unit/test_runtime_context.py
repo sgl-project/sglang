@@ -473,7 +473,6 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
             override.install()
 
 
-@dataclasses.dataclass
 class _FakeCaptureGroup(_FlagGroupBase):
     gamma: int = 0
 

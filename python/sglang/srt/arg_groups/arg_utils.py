@@ -53,12 +53,13 @@ from typing import (
     get_type_hints,
 )
 
+import msgspec
+
 A = Annotated
 
 
-@dataclasses.dataclass(frozen=True)
-class Arg:
-    """CLI argument metadata attached to a dataclass field via ``Annotated``."""
+class Arg(msgspec.Struct, frozen=True):
+    """CLI argument metadata attached to a field via ``Annotated``."""
 
     help: str = ""
     choices: list | None = None
@@ -90,8 +91,7 @@ class Arg:
     fallback: Any = None
 
 
-@dataclasses.dataclass(frozen=True)
-class Derived:
+class Derived(msgspec.Struct, frozen=True):
     """Metadata for a field the configuration implies, not one anyone types.
 
     The other half of a namespace. An ``Arg`` field is the operator's input and
@@ -118,8 +118,7 @@ class Derived:
     fn: str = ""
 
 
-@dataclasses.dataclass(frozen=True)
-class NS:
+class NS(msgspec.Struct, frozen=True):
     """Namespace-path marker for a ServerArgs field, attached alongside the
     field's metadata in ``Annotated``:
 
