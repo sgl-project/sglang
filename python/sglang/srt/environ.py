@@ -411,6 +411,11 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
     # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
+    # External-cache linker: fail this fraction of layer-wise load batches.
+    SGLANG_TEST_LINKER_LOAD_FAILURE_PROB = EnvFloat(0.0)
+    # Ranks honouring the above: unset/"all", or e.g. "0,3". An asymmetric
+    # case is what exercises the MIN-reduce into a group-wide abort.
+    SGLANG_TEST_LINKER_LOAD_FAILURE_RANKS = EnvStr(None)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
 

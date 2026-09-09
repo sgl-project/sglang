@@ -296,6 +296,44 @@ class UnifiedTreeCoreInterface(ABC):
         under host pressure; declines (is_dropped=False) if any node is locked."""
         ...
 
+    # The external-linker load-failure surface. Not abstract: every caller is
+    # behind a linker check, so a backend without it stays usable, and making
+    # it abstract would leave every other backend -- the Rust TreeCore, and any
+    # registered out of tree -- impossible to construct at all.
+
+    def _no_external_load_recovery(self) -> str:
+        return (
+            f"{type(self).__name__} does not implement external-linker "
+            "load-failure recovery. Run the external cache linker on a TreeCore "
+            "backend that does (SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python)."
+        )
+
+    def detach_external_load_chain(
+        self, endpoint_id: NodeId, anchor_id: NodeId
+    ) -> list[NodeId]:
+        """Cut the chain an external-linker load published before failing out
+        of the tree, so nothing can match or extend pages that hold no KV.
+        Returns the detached node ids, endpoint first, for the purge."""
+        raise NotImplementedError(self._no_external_load_recovery())
+
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        """Whether the arena still holds this node, so a declined reclaim can
+        tell "still owned, retry" from "already gone, drop it"."""
+        raise NotImplementedError(self._no_external_load_recovery())
+
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        """Whether this node, or any ancestor of it, is on a chain a failed
+        external-linker load left detached -- i.e. whether a request pointing
+        here is pointing at KV that never arrived."""
+        raise NotImplementedError(self._no_external_load_recovery())
+
+    def invalidate_external_load_chain(
+        self, node_id: NodeId
+    ) -> DropSubtreeNoHostResult:
+        """Free a detached chain's slots; declines (is_dropped=False) for any
+        node something else still owns, leaving it for the caller to retry."""
+        raise NotImplementedError(self._no_external_load_recovery())
+
     @abstractmethod
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Demote a backed-up node: drop its device value after a successful backup."""

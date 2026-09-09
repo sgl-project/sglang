@@ -89,6 +89,7 @@ from sglang.srt.disaggregation.prefill import (
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
+    EXTERNAL_KV_LOAD_ERR_TYPE,
     DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -1297,6 +1298,9 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # Failed external-linker rids that matched no scheduled request on the
+        # pass that drained them; retried once, see _mark_failed_linker_loads.
+        self._deferred_linker_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3434,9 +3438,14 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
-        req.to_finish = None
+        # A caller that already staged a reason keeps it: the client needs to
+        # tell an external-linker load failure from a routine abort.
+        if req.to_finish is not None:
+            req.finished_reason = req.to_finish
+            req.to_finish = None
+        else:
+            prepare_abort(req, "Aborted")
+            req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
@@ -3449,7 +3458,11 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+        # Without the reason the tokenizer falls back to its generic "Abort in
+        # waiting queue", which loses both the message and the status code.
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4550,6 +4563,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if self.enable_unified_cache_external_linker and batch.forward_mode.is_extend():
+            self._mark_failed_linker_loads(batch)
+
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4587,6 +4603,71 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _mark_failed_linker_loads(self, batch: ScheduleBatch) -> None:
+        """Mark requests whose external-linker KV load failed for this batch.
+
+        Runs before the result processing that would otherwise stream their
+        output: the forward consumed the published pages before the transfer
+        could be verified, so those requests ran against KV that never arrived.
+        Granularity is the load batch, not the request -- the linker merges
+        every rid in a batch into shared plans.
+        """
+        deferred = self._deferred_linker_rids
+        self._deferred_linker_rids = set()
+        failed = set(self.tree_cache.drain_linker_loads()) | deferred
+        # A request that matched the chain while the load was in flight holds
+        # its pages too, and issued no load of its own -- so it is in no rid
+        # list and has to be found by where it points.
+        sweep_chains = self.tree_cache.has_outstanding_failed_linker_chains()
+        if not failed and not sweep_chains:
+            return
+        message = "Aborted: external KV cache load failed."
+        # The MIN-reduced verdict can arrive a batch late on a lagging rank,
+        # by which point the request is already decoding. Sweep both lists.
+        candidates = list(batch.reqs)
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            candidates.extend(self.running_batch.reqs)
+        for req in candidates:
+            if req.rid in failed:
+                failed.discard(req.rid)
+            elif not (
+                sweep_chains
+                and self.tree_cache.is_on_failed_linker_chain(
+                    getattr(req, "last_node", None)
+                )
+            ):
+                continue
+            if req.finished() or req.to_finish is not None:
+                continue
+            # Never finished_reason here: a request finished ahead of the
+            # result processors is skipped by all of them, so it would leak its
+            # KV and never answer. update_finish_state promotes it instead.
+            req.skip_radix_cache_insert = True
+            req.to_finish = FINISH_ABORT(
+                message,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+            )
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            self._release_aborted_request(req.rid)
+            if req is self.chunked_req:
+                # A mid-chunk request never reaches update_finish_state, and
+                # freeing it here would leave self.chunked_req pointing at a
+                # freed request for the next step to stash and re-prefill.
+                self._pending_chunked_abort_req = req
+        if not failed:
+            return
+        # Under overlap the next batch is launched but not yet merged into
+        # running_batch, so its requests are in neither list. One retry is
+        # enough: a batch launched at step k is merged by step k + 1.
+        self._deferred_linker_rids = failed - deferred
+        if lost := failed & deferred:
+            logger.error(
+                "External linker load failed for %s, which never matched a "
+                "scheduled request; they were not aborted",
+                sorted(lost),
+            )
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

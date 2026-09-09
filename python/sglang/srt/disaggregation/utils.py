@@ -1644,3 +1644,26 @@ def is_aborted(req: Req) -> bool:
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
     )
+
+
+# Tags an abort raised because the external KV linker could not load the pages
+# the forward had already consumed. Such a request must never have its KV sent
+# to the decode side, and unlike a user abort -- which reaches the decode node
+# through its own AbortReq -- nothing else propagates this one.
+EXTERNAL_KV_LOAD_ERR_TYPE = "ExternalKVLoadError"
+
+
+def is_external_kv_load_failure(req: Req) -> bool:
+    """Whether this request was aborted by a failed external-linker KV load.
+
+    Narrower than is_aborted() on purpose: the prefill-side drop this gates
+    would otherwise also change what happens to a user abort racing the same
+    forward, which is a separate concern.
+    """
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    reason = req.to_finish or req.finished_reason
+    return (
+        isinstance(reason, FINISH_ABORT)
+        and reason.err_type == EXTERNAL_KV_LOAD_ERR_TYPE
+    )
