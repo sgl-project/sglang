@@ -1335,10 +1335,11 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertTrue(cache.tree_core.is_full_device_evicted(node))
         self.assertTrue(cache.tree_core.is_backuped(node))
 
-        self._insert(cache, allocator, seq)
+        self._insert(cache, allocator, seq, session_id="session-a")
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(cache.tree_core.is_full_device_evicted(node))
         self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
+        self.assertEqual(restored_gpu[0].metadata.session_id, "session-a")
 
 
 class UnifiedRadixCacheSuite:
