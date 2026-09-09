@@ -263,7 +263,7 @@ def use_rowwise_torch_scaled_mm():
         # are time consuming.
         return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
     if _is_xpu:
-        return torch_release >= (2, 13)
+        return True
     return False
 
 
@@ -2095,26 +2095,25 @@ def apply_fp8_linear(
     # When the number of token is 1,
     # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-    rowwise_torch_scaled_mm = USE_ROWWISE_TORCH_SCALED_MM and (
-        not _is_xpu
-        or (
+    dynamic_rowwise_scaling = (
+        use_per_token_if_dynamic
+        and not per_tensor_weights
+        and not per_tensor_activations
+    )
+    rowwise_torch_scaled_mm = USE_ROWWISE_TORCH_SCALED_MM
+    if _is_xpu:
+        # XPU's rowwise fused kernel requires these scale layouts and is
+        # beneficial from M=8 for representative projection shapes.
+        rowwise_torch_scaled_mm = rowwise_torch_scaled_mm and (
             x_scale.ndim == 2
             and x_scale.shape[1] == 1
             and x_scale.is_contiguous()
             and weight_scale.ndim == 2
             and weight_scale.shape[1] == 1
             and weight_scale.t().is_contiguous()
-            # Keep the decode M=1 fallback; on B60, fused rowwise scaled_mm
-            # wins from M=8 onward for representative projection shapes.
             and qinput.shape[0] >= 8
         )
-    )
-    if (
-        use_per_token_if_dynamic
-        and not per_tensor_weights
-        and not per_tensor_activations
-        and (rowwise_torch_scaled_mm or _use_aiter)
-    ):
+    if dynamic_rowwise_scaling and (rowwise_torch_scaled_mm or _use_aiter):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
         # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
