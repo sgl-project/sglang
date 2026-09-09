@@ -59,7 +59,8 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    notes: "2×GB300, TP=2, auto-detected compressed-tensors int4 (group_size 32). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split into reasoning_content. Full accuracy suite pending.",
+    accuracy: { mmmu_pro_pct: 77.51, gsm8k_pct: 96.97 },
+    notes: "2×GB300, TP=2, auto-detected compressed-tensors int4 (group_size 32). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split into reasoning_content. Accuracy measured on 2×B300, TP=2 (sgl-eval, single-shot, thinking on): MMMU-Pro 77.51% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.97% (stop 100%).",
   },
   { match: { hw: "b300", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" } },
@@ -96,6 +97,7 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 32 },
         ttft_ms: 173008.14, tpot_ms: 66.22, tokens_per_sec_per_gpu: 549.63 },
     ],
-    notes: "DGX Spark GB10, TP=1, auto-detected compressed-tensors int4. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Speed: bench_serving --flush-cache, temperature 0, TTFT/TPOT are P50; tok/s = total (input + output) token throughput on one GPU. Image workload (one 720p JPEG per request, 883 vision tokens, in/out=1024/1024): conc 1 (8 prompts): TTFT 1137.64 ms, TPOT 43.92 ms, 65.14 tok/s; conc 16 (32 prompts): TTFT 137419.53 ms, TPOT 60.71 ms, 214.28 tok/s. conc-16 TTFT is queue-dominated (two waves of 16; GB10 prefill runs at ~2.8k tok/s). Full accuracy suite pending.",
+    accuracy: { mmmu_pro_pct: 77.51, gsm8k_pct: 96.97 },
+    notes: "DGX Spark GB10, TP=1, auto-detected compressed-tensors int4. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Speed: bench_serving --flush-cache, temperature 0, TTFT/TPOT are P50; tok/s = total (input + output) token throughput on one GPU. Image workload (one 720p JPEG per request, 883 vision tokens, in/out=1024/1024): conc 1 (8 prompts): TTFT 1137.64 ms, TPOT 43.92 ms, 65.14 tok/s; conc 16 (32 prompts): TTFT 137419.53 ms, TPOT 60.71 ms, 214.28 tok/s. conc-16 TTFT is queue-dominated (two waves of 16; GB10 prefill runs at ~2.8k tok/s). Accuracy measured on 2×B300, TP=2 (sgl-eval, single-shot, thinking on): MMMU-Pro 77.51% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.97% (stop 100%).",
   },
 ];
