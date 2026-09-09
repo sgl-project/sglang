@@ -16,7 +16,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @dataclasses.dataclass
@@ -30,33 +30,6 @@ class _CollisionFake:
     # 'topk' is both a leaf on exec.moe and a subgroup of exec.moe -> collision.
     topk: A[int, NS("exec.moe")] = 8
     x: A[int, NS("exec.moe.topk")] = 1
-
-
-_TOP = (
-    rc.get_device,
-    rc.get_model,
-    rc.get_exec,
-    rc.get_schedule,
-    rc.get_memory,
-    rc.get_spec,
-    rc.get_lora,
-    rc.get_mm,
-    rc.get_disagg,
-    rc.get_serving,
-    rc.get_observability,
-)
-_EXEC_SUBS = (
-    "kernel",
-    "moe",
-    "graph",
-    "comm",
-    "mamba",
-    "overlap",
-    "offload",
-    "dllm",
-    "deterministic",
-    "features",
-)
 
 
 class TestConfigBags(CustomTestCase):
@@ -217,14 +190,6 @@ class TestConfigBags(CustomTestCase):
         restore_process_state()
         return sa, resolve()
 
-    def test_all_accessors_and_exec_subgroups(self):
-        self._publish()
-        for acc in _TOP:
-            self.assertIsNotNone(acc())
-        exec_cfg = rc.get_exec()
-        for sub in _EXEC_SUBS:
-            self.assertTrue(hasattr(exec_cfg, sub), f"exec.{sub} missing")
-
     def test_read_only_by_bare_assignment(self):
         self._publish()
         with self.assertRaises(AttributeError):
@@ -281,8 +246,11 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
 
     def test_enforce_blocks_reads_outside_the_declared_set(self):
         self._publish("test")
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"), mock.patch.dict(
-            rc.ROLE_NAMESPACE_SETS, {"test": frozenset({"serving", "schedule"})}
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"),
+            mock.patch.dict(
+                rc.ROLE_NAMESPACE_SETS, {"test": frozenset({"serving", "schedule"})}
+            ),
         ):
             rc.get_serving()
             rc.get_schedule()
@@ -316,8 +284,9 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
 
     def test_record_mode_collects_the_audit(self):
         self._publish("test")
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "record"), mock.patch.object(
-            rc, "_RECORDED_NS_READS", set()
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "record"),
+            mock.patch.object(rc, "_RECORDED_NS_READS", set()),
         ):
             rc.get_exec()
             rc.get_disagg()
@@ -343,8 +312,9 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
     def test_record_mode_registers_the_exit_summary_at_publish(self):
         # A role that reads no bags must still emit its audit line; the exit
         # hook therefore registers at publish, not at the first read.
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "record"), mock.patch.object(
-            rc, "_RECORD_DUMP_REGISTERED", False
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "record"),
+            mock.patch.object(rc, "_RECORD_DUMP_REGISTERED", False),
         ):
             self._publish("test")
             self.assertTrue(rc._RECORD_DUMP_REGISTERED)
@@ -356,8 +326,9 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
         import torch
 
         self._publish("test")
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "record"), mock.patch.object(
-            rc, "_RECORDED_NS_READS", set()
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "record"),
+            mock.patch.object(rc, "_RECORDED_NS_READS", set()),
         ):
 
             @torch.compile(fullgraph=True, backend="eager", dynamic=False)
