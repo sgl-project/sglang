@@ -16,8 +16,12 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
@@ -292,11 +296,11 @@ class TestDreamCudaGraphPath(CustomTestCase):
         args.pp_size = 1
         args.disable_radix_cache = False
         args.disable_cuda_graph = disable_cuda_graph
-        args.cuda_graph_config = SimpleNamespace(
-            decode=SimpleNamespace(
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(
                 backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL
             ),
-            prefill=SimpleNamespace(
+            prefill=PhaseConfig(
                 backend=Backend.DISABLED if disable_cuda_graph else Backend.BREAKABLE
             ),
         )
@@ -494,6 +498,106 @@ class TestDreamSchedulerAdmission(CustomTestCase):
 
 
 class TestDreamFDFOResultProcessing(CustomTestCase):
+    def _scheduler(self, config):
+        return SimpleNamespace(
+            dllm_config=config,
+            metrics_reporter=SimpleNamespace(
+                num_generated_tokens=0,
+                report_prefill_stats=MagicMock(),
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=MagicMock(),
+                free_group_end=MagicMock(),
+            ),
+            tree_cache=MagicMock(),
+            output_streamer=SimpleNamespace(stream_output=MagicMock()),
+        )
+
+    def _batch(self, req):
+        return SimpleNamespace(
+            batch_size=lambda: 1,
+            reqs=[req],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+
+    def _zero_token_req(self, config):
+        sampling_params = SamplingParams(max_new_tokens=0)
+        sampling_params.normalize(None)
+        req = Req(
+            rid="req",
+            origin_input_text="prompt",
+            origin_input_ids=array("q", [10]),
+            sampling_params=sampling_params,
+            dllm_config=config,
+        )
+        req.init_next_round_input()
+        return req
+
+    def test_no_fdfo_zero_token_dream_request_finishes_and_releases_kv(self):
+        config = _config(first_done_first_out_mode=False)
+        req = self._zero_token_req(config)
+        scheduler = self._scheduler(config)
+        result = SimpleNamespace(
+            copy_done=None,
+            next_token_ids=[torch.empty(0, dtype=torch.long)],
+            dllm_algo_state=None,
+            can_run_cuda_graph=False,
+        )
+
+        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+            SchedulerDllmMixin.process_batch_result_dllm(
+                scheduler, self._batch(req), result
+            )
+
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_len, 0)
+        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+
+    def test_no_fdfo_zero_token_dream_request_preserves_abort(self):
+        config = _config(first_done_first_out_mode=False)
+        req = self._zero_token_req(config)
+        req.to_finish = FINISH_ABORT("cancelled")
+        scheduler = self._scheduler(config)
+        result = SimpleNamespace(
+            copy_done=None,
+            next_token_ids=[torch.empty(0, dtype=torch.long)],
+            dllm_algo_state=None,
+            can_run_cuda_graph=False,
+        )
+
+        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+            SchedulerDllmMixin.process_batch_result_dllm(
+                scheduler, self._batch(req), result
+            )
+
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+
+    def test_fdfo_zero_token_dream_request_preserves_abort(self):
+        config = _config(first_done_first_out_mode=True)
+        req = self._zero_token_req(config)
+        req.to_finish = FINISH_ABORT("cancelled")
+        scheduler = self._scheduler(config)
+        result = SimpleNamespace(
+            copy_done=None,
+            next_token_ids=[[]],
+            dllm_done_per_req_cpu=[True],
+            dllm_algo_state=[None],
+            can_run_cuda_graph=False,
+        )
+
+        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+            SchedulerDllmMixin.process_batch_result_dllm(
+                scheduler, self._batch(req), result
+            )
+
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+
     def test_unresolved_canvas_and_state_survive_scheduler_round(self):
         config = _config(
             algorithm_config={"steps": 3},

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -86,9 +86,9 @@ class SchedulerDllmMixin:
                 if self.dllm_config.needs_full_prefill
                 else "accept lengths"
             )
-            assert (
-                fdfo_signal is not None
-            ), f"FDFO dLLM result is missing {signal_name}."
+            assert fdfo_signal is not None, (
+                f"FDFO dLLM result is missing {signal_name}."
+            )
 
         # FDFO also commits unresolved blocks so their KV can be reused.
         if fdfo_mode or result.next_token_ids:
@@ -111,13 +111,7 @@ class SchedulerDllmMixin:
                         self.metrics_reporter.num_generated_tokens += len(
                             req.output_ids
                         )
-                        if req.output_ids:
-                            req.update_finish_state(
-                                new_accepted_len=len(req.output_ids)
-                            )
-                        else:
-                            req.finished_reason = FINISH_LENGTH(length=0)
-                            req.finished_len = 0
+                        req.update_finish_state(new_accepted_len=len(req.output_ids))
                         if req.finished():
                             release_kv_cache(req, self.tree_cache, is_insert=False)
                             req.time_stats.set_completion_time()
@@ -130,6 +124,11 @@ class SchedulerDllmMixin:
                     next_token_ids = result.next_token_ids[idx].tolist()
                     new_tokens = len(next_token_ids)
                     if new_tokens == 0:
+                        if self.dllm_config.needs_full_prefill:
+                            req.update_finish_state(new_accepted_len=0)
+                            if req.finished():
+                                release_kv_cache(req, self.tree_cache, is_insert=False)
+                                req.time_stats.set_completion_time()
                         continue
 
                     req.full_untruncated_fill_ids[

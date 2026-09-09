@@ -118,8 +118,6 @@ class DllmAlgorithm:
             start_list = self._block_start_list(forward_batch)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        # No mask to denoise: return empty so process_batch_result_dllm skips the
-        # stream branch (matches the pre-refactor behavior).
         if all(start == length for start, length in zip(start_list, sequence_lengths)):
             return out.logits_output, [], None, None, out.can_run_graph, None
 
