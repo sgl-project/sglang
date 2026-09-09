@@ -13,7 +13,7 @@ from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import override_platform
@@ -120,7 +120,9 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
             calls.append("init_new")
             return fake_forward_batch
 
+        # This test covers the generic/CUDA hook ordering, not NPU DSV4 bundle setup.
         with (
+            mock.patch.object(dflash_info, "_is_npu", False),
             mock.patch(
                 "sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify",
                 side_effect=fake_hook,

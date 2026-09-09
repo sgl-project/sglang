@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -350,7 +351,11 @@ class MoriKVManager(CommonKVManager):
             f"{uuid.uuid4().hex[:8]}"
         )
 
-        engine = IOEngine(engine_key, config)
+        engine = run_with_deadline(
+            lambda: IOEngine(engine_key, config),
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=f"Mori IOEngine({engine_key!r}, host={self.local_ip!r})",
+        )
         poll_mode = PollCqMode.POLLING
 
         qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
