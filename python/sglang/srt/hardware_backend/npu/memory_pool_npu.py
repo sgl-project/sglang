@@ -355,7 +355,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     # NPUMHATokenToKVPool stores buffers as
     #   (num_pages, page_size, head_num, head_dim)            # use_fia=False
     #   (num_pages*page_size, 1, head_num, head_dim)          # use_fia=True
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
         buf_of_layers = []
         for local_layer_id in range(self.layer_num):
@@ -370,7 +370,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
@@ -743,7 +745,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             out.append(layer_chunks)
         return out
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
         buf_of_layers = []
         has_ik = self.index_head_dim is not None
@@ -761,7 +763,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         torch.npu.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None
