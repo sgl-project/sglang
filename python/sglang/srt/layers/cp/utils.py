@@ -17,6 +17,7 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -36,9 +37,16 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel, uses_mla_backend
+from sglang.srt.runtime_context import (
+    get_parallel,
+    max_prefill_buffer_tokens,
+    uses_mla_backend,
+)
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+        TorchSymmMemCommunicator,
+    )
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -311,6 +319,82 @@ def _to_int_list(values) -> Optional[list[int]]:
     return [int(x) for x in values]
 
 
+def dsa_prefill_cp_fused_symm_mem_eligible(
+    mlp: Any,
+    forward_batch: Any,
+    hidden_states: torch.Tensor,
+    comm: Optional["TorchSymmMemCommunicator"],
+) -> bool:
+    """Eligibility gate for the fused CP AG/RS prefill path: when True the
+    caller skips the standalone dsa_cp gather / reduce-scatter, so this must
+    be rank-consistent and run before any collective."""
+    from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+        MOE_RS_CHUNK_WIDTH,
+    )
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_use_prefill_cp,
+        is_dsa_prefill_cp_round_robin_split,
+    )
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    if comm is None or comm.disabled:
+        return False
+    if not envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get():
+        return False
+    if get_is_capture_mode():
+        return False
+    if not dsa_use_prefill_cp(forward_batch):
+        return False
+    if not get_moe_a2a_backend().is_none():
+        return False
+    if not is_dsa_prefill_cp_round_robin_split():
+        # AG places rank r at offset r * M_local; only equal round-robin
+        # shards keep that arithmetic exact.
+        return False
+    parallel = get_parallel()
+    if parallel.attn_dp_size != 1 or parallel.attn_tp_size != 1:
+        # Same layout the dsa_cp_* collectives assert.
+        return False
+    if not mlp.cp_fused_symm_mem_eligible:
+        return False
+    if hidden_states.shape[-1] % MOE_RS_CHUNK_WIDTH != 0:
+        return False
+    # AG kernel and its symm buffer are bf16-only.
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+    # hidden_states is the CP shard here; symm buffers size global tokens.
+    m_global = hidden_states.shape[0] * parallel.attn_cp_size
+    return 0 < m_global <= max_prefill_buffer_tokens()
+
+
+@contextmanager
+def dsa_prefill_cp_fused_symm_mem(
+    mlp: Any,
+    forward_batch: Any,
+    hidden_states: torch.Tensor,
+):
+    """Hold comm.use_cp_fused_symm_mem around the non-TBO prefill layer loop.
+
+    While held, the MoE path replaces the standalone dsa_cp gather /
+    reduce-scatter with the fused AG/RS symm-mem kernels; the hold decision
+    comes from dsa_prefill_cp_fused_symm_mem_eligible and is rank-consistent.
+    """
+    from sglang.srt.distributed import get_tp_group
+
+    comm = get_tp_group().torch_symm_mem_comm
+    held = comm is not None and dsa_prefill_cp_fused_symm_mem_eligible(
+        mlp, forward_batch, hidden_states, comm
+    )
+    if held:
+        comm.set_use_cp_fused_symm_mem(True)
+    try:
+        yield
+    finally:
+        if held:
+            comm.set_use_cp_fused_symm_mem(False)
+
+
 __all__ = [
     "BaseContextParallelMetadata",
     "CPAttentionBackendKind",
@@ -332,6 +416,8 @@ __all__ = [
     "cp_shard_model_inputs",
     "cp_shard_position_ids",
     "cp_split_before_forward",
+    "dsa_prefill_cp_fused_symm_mem",
+    "dsa_prefill_cp_fused_symm_mem_eligible",
     "prepare_cp_forward",
     "is_glm_dsa_cache_layer_split_enabled",
     "get_glm_dsa_cp_layer_shard_info",
