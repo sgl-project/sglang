@@ -68,22 +68,26 @@ class TestDcpTokenTransferPlan(CustomTestCase):
         self.assertEqual(sorted(seen_src), sorted(expected_draft_src))
 
     def test_second_chunk_crosses_dest_pages(self):
-        # Prefix already filled one virtual page (P*N=4). This chunk's 4 tokens
-        # start at dest pos 4 and spill from virtual page 4 onto page 6.
+        # P=2, N=2 (virtual page = 4). Decode already holds a 4-token prefix;
+        # dst=[4, 6] is the full send-range page list. This chunk is the second
+        # prefill page of the send range (src_page_offset=1), so its 4 tokens
+        # sit at send-range pos 2..5 (absolute 6..9) and straddle virtual page
+        # 4 (rows 16..19) and virtual page 6 (rows 24..27).
         plan = _plan(
             src=[9, 3],
             dst=[4, 6],
             page_size=2,
             dcp_size=2,
             dcp_rank=0,
-            src_page_offset=2,
+            src_page_offset=1,
             decode_prefix_len=4,
             num_kv_tokens=4,
         )
         np.testing.assert_array_equal(plan.draft_src_token_indices, [18, 19, 6, 7])
-        np.testing.assert_array_equal(plan.draft_dst_token_indices, [16, 17, 26, 27])
+        np.testing.assert_array_equal(plan.draft_dst_token_indices, [18, 19, 24, 25])
+        # rank 0 owns absolute pos 6, 8 -> per-rank slots 1, 2 -> pages 4, 6.
         np.testing.assert_array_equal(plan.target_src_token_indices, [18, 6])
-        np.testing.assert_array_equal(plan.target_dst_token_indices, [12, 13])
+        np.testing.assert_array_equal(plan.target_dst_token_indices, [9, 12])
 
         plan_r1 = _plan(
             src=[9, 3],
@@ -91,13 +95,14 @@ class TestDcpTokenTransferPlan(CustomTestCase):
             page_size=2,
             dcp_size=2,
             dcp_rank=1,
-            src_page_offset=2,
+            src_page_offset=1,
             decode_prefix_len=4,
             num_kv_tokens=4,
         )
         np.testing.assert_array_equal(plan_r1.draft_src_token_indices, [18, 19, 6, 7])
+        np.testing.assert_array_equal(plan_r1.draft_dst_token_indices, [18, 19, 24, 25])
         np.testing.assert_array_equal(plan_r1.target_src_token_indices, [19, 7])
-        np.testing.assert_array_equal(plan_r1.target_dst_token_indices, [12, 13])
+        np.testing.assert_array_equal(plan_r1.target_dst_token_indices, [9, 12])
 
     def test_rejects_unaligned_prefix(self):
         with self.assertRaisesRegex(ValueError, "align"):
