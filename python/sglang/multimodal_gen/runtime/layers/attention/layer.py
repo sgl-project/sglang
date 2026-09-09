@@ -748,7 +748,7 @@ class LocalAttention(nn.Module):
                 v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
             sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
@@ -1185,7 +1185,7 @@ class USPAttention(nn.Module):
                 v_ = v.transpose(1, 2)
                 mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
-                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                     if self.allow_cudnn_sdp and q_.device.type == "cuda"
                     else nullcontext()
                 )
@@ -1357,7 +1357,7 @@ class USPAttention(nn.Module):
             v_ = v.transpose(1, 2)
             mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
             sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
@@ -1644,7 +1644,7 @@ class USPAttention(nn.Module):
             v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
         sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
             else nullcontext()
         )
@@ -1863,7 +1863,7 @@ class USPAttention(nn.Module):
         v_ = v.transpose(1, 2)
         mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
             else nullcontext()
         )
