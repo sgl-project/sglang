@@ -1,6 +1,8 @@
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -60,3 +62,7 @@ def test_qsa_allocations_follow_parent_mooncake_scope(monkeypatch):
     )
 
     assert allocations == 4
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
