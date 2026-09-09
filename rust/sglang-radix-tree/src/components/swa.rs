@@ -927,22 +927,23 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
         Ok(match phase {
             CacheTransferPhase::BackupHost => {
-                let unbacked = self.collect_unbacked_swa_nodes_(tree_core, node_id);
-                if unbacked.is_empty() {
+                let unbacked_swa_nodes = self.collect_unbacked_swa_nodes_(tree_core, node_id);
+                if unbacked_swa_nodes.is_empty() {
                     return Ok(None);
                 }
                 // Ancestors first: the host span is contiguous and the commit
                 // scatters it back in this order. Device values already hold
                 // SWA-pool indices (translated at insert time); host pool
                 // indexing wants int64.
-                let (device_indices, backup_node_ids): (Vec<Tensor>, Vec<NodeId>) = unbacked
-                    .iter()
-                    .rev()
-                    .map(|&idx| {
-                        let node = tree_core.arena.node(idx);
-                        (node.device_value(SWA).to_kind(Kind::Int64), node.id)
-                    })
-                    .unzip();
+                let (device_indices, backup_node_ids): (Vec<Tensor>, Vec<NodeId>) =
+                    unbacked_swa_nodes
+                        .iter()
+                        .rev()
+                        .map(|&idx| {
+                            let node = tree_core.arena.node(idx);
+                            (node.device_value(SWA).to_kind(Kind::Int64), node.id)
+                        })
+                        .unzip();
                 Some(vec![PoolTransfer {
                     name: PoolName::Swa,
                     device_indices: Some(Tensor::cat(&device_indices, 0)),
