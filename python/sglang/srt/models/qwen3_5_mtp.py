@@ -59,12 +59,7 @@ def _mtp_quant_config(quant_config):
     # BF16. Disable quantization for those checkpoints; non-serialized
     # modelopt_fp4 still converts MoE expert weights on load.
     if quant_config and quant_config.get_name() == "modelopt_mixed":
-        # A MIXED_PRECISION checkpoint may still quantize the MTP module
-        # (Qwen3.8-Flash-Next-NVFP4 ships `mtp.*.experts` as block-FP8).
-        # Building the draft unquantized would cast the fp8 expert values to
-        # bf16 without their block scales (weight_scale_inv is silently
-        # skipped by the loader), leaving the draft numerically wrong but
-        # the server running.
+        # Qwen3.8-Flash-Next-NVFP4 ships `mtp.*.experts` as block-FP8
         quantized_layers = getattr(quant_config, "quantized_layers", {}) or {}
         if any(
             isinstance(layer, str) and layer.startswith("mtp.")

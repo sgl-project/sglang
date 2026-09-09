@@ -417,11 +417,9 @@ def _ple_table_is_fp8(
 ) -> bool:
     """Whether the PLE n-gram table should be stored as fp8.
 
-    True when the config pins it (``ple_embedding_dtype``), when the whole
-    checkpoint is fp8, or when a mixed-precision (ModelOpt) checkpoint lists
-    the table itself as FP8. The last case matters because the storage dtype
-    is fixed at construction: with ``ple_offload_embedding`` the pinned host
-    table cannot be swapped to fp8 later in ``load_weights``.
+    True when the config pins it, or when the whole checkpoint
+    is fp8, or when a mixed-precision checkpoint lists the table
+    itself as FP8.
     """
     if getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn":
         return True
