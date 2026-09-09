@@ -2821,6 +2821,37 @@ class ServingChatTestCase(unittest.TestCase):
             chunks.append(chunk)
         return chunks
 
+    def test_multitoken_stream_preserves_top_logprob_rows(self):
+        content = {
+            "meta_info": {
+                "output_token_logprobs": [
+                    (-0.1, 10, "answer"),
+                    (-0.2, 11, '":'),
+                    (-0.3, 12, "42"),
+                ],
+                "output_top_logprobs": [
+                    [(-0.1, 10, "answer"), (-1.1, 20, "réponse")],
+                    [(-0.2, 11, '":'), (-1.2, 21, "=")],
+                    [(-0.3, 12, "42"), (-1.3, 22, "43")],
+                ],
+            },
+        }
+        streamed = self.chat._process_streaming_logprobs(content, 0, 3)
+        nonstreamed = self.chat._process_response_logprobs(content)
+
+        self.assertEqual(streamed, nonstreamed)
+        self.assertEqual(
+            [
+                [(top.token, top.logprob) for top in row.top_logprobs]
+                for row in streamed.content
+            ],
+            [
+                [("answer", -0.1), ("réponse", -1.1)],
+                [('":', -0.2), ("=", -1.2)],
+                [("42", -0.3), ("43", -1.3)],
+            ],
+        )
+
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""
         self.chat.reasoning_parser = "qwen3"
