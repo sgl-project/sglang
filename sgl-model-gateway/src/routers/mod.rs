@@ -126,6 +126,28 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// Route with the original JSON body for lossless HTTP forwarding.
+    async fn route_chat_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        _original_json: Option<&serde_json::Value>,
+    ) -> Response {
+        self.route_chat(headers, body, model_id).await
+    }
+
+    /// Route with the original JSON body for lossless HTTP forwarding.
+    async fn route_completion_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        _original_json: Option<&serde_json::Value>,
+    ) -> Response {
+        self.route_completion(headers, body, model_id).await
+    }
+
     /// Retrieve a stored/background response by id
     async fn get_response(
         &self,

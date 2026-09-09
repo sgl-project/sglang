@@ -7,7 +7,8 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    body::{Body, Bytes},
+    extract::{FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -181,25 +182,58 @@ async fn generate(
         .await
 }
 
+/// Preserve JSON numbers and extension fields alongside the validated routing view.
+struct ForwardedJson<T> {
+    typed: T,
+    original: Value,
+}
+
+impl<S, T> FromRequest<S> for ForwardedJson<T>
+where
+    S: Send + Sync,
+    T: FromRequest<S> + Send,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let typed = T::from_request(Request::from_parts(parts, Body::from(bytes.clone())), state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let original = serde_json::from_slice(&bytes)
+            .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()).into_response())?;
+        Ok(Self { typed, original })
+    }
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ForwardedJson {
+        typed: ValidatedJson(body),
+        original,
+    }: ForwardedJson<ValidatedJson<ChatCompletionRequest>>,
 ) -> Response {
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_with_json(Some(&headers), &body, Some(&body.model), Some(&original))
         .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    ForwardedJson {
+        typed: Json(body),
+        original,
+    }: ForwardedJson<Json<CompletionRequest>>,
 ) -> Response {
     state
         .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
+        .route_completion_with_json(Some(&headers), &body, Some(&body.model), Some(&original))
         .await
 }
 
@@ -1147,4 +1181,59 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod forwarded_json_tests {
+    use super::*;
+    use http::header::CONTENT_TYPE;
+
+    #[tokio::test]
+    async fn preserves_original_sampling_values() {
+        for top_p in [0.95, 0.9, 1.0] {
+            let original = serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_p": top_p,
+                "custom_extension": {"value": 0.123456789012345}
+            });
+            let request = Request::builder()
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(original.to_string()))
+                .unwrap();
+            let extracted =
+                ForwardedJson::<ValidatedJson<ChatCompletionRequest>>::from_request(request, &())
+                    .await
+                    .unwrap();
+            assert_eq!(extracted.original, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_completion_sampling_values() {
+        let original = serde_json::json!({"model": "test-model", "prompt": "hello", "top_p": 0.95});
+        let request = Request::builder()
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(original.to_string()))
+            .unwrap();
+        let extracted = ForwardedJson::<Json<CompletionRequest>>::from_request(request, &())
+            .await
+            .unwrap();
+        assert_eq!(extracted.original, original);
+    }
+
+    #[tokio::test]
+    async fn preserves_json_rejections() {
+        for (content_type, body, expected) in [
+            ("text/plain", "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("application/json", "{", StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder()
+                .header(CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap();
+            let result = ForwardedJson::<Json<CompletionRequest>>::from_request(request, &()).await;
+            assert_eq!(result.err().unwrap().status(), expected);
+        }
+    }
 }
