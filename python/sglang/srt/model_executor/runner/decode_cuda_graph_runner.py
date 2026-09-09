@@ -407,14 +407,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
         # --- buffers ---------------------------------------------------
+        from sglang.srt.speculative.compact_verify.config import sharded_graph_output
+
+        logits_buffer = (
+            self.model_runner.graph_shared_output.get_compact_logits_buffer(
+                rows=self.max_num_token
+            )
+            if sharded_graph_output(self.model_runner)
+            else self.model_runner.graph_shared_output.get_logits_buffer(
+                self.model_runner.model_config.vocab_size, rows=self.max_num_token
+            )
+        )
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
-            next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
-                self.model_runner.model_config.vocab_size, rows=self.max_num_token
-            ),
+            next_token_logits_buffer=logits_buffer,
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
             pp_size=self.pp_size,
@@ -1503,6 +1512,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
+                compact_verify_sharded=output.compact_verify_sharded,
                 full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]

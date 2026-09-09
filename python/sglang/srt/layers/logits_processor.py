@@ -232,6 +232,7 @@ class LogitsProcessorOutput:
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
+    compact_verify_sharded: bool = False
 
 
 @dataclasses.dataclass
@@ -239,6 +240,7 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
+    compact_verify_sharded: bool = False
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -506,6 +508,7 @@ class LogitsProcessor(nn.Module):
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
+                compact_verify_sharded=logits_metadata.compact_verify_sharded,
                 hidden_states=hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
@@ -810,6 +813,52 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+
+        if (
+            envs.SGLANG_ENABLE_COMPACT_SPEC_VERIFY.get()
+            and logits_metadata.forward_mode.is_target_verify()
+        ):
+            from sglang.srt.speculative.compact_verify.config import configured
+
+            if (
+                configured()
+                and self.vocab_size == 154880
+                and self.do_tensor_parallel_all_gather
+                and not self.do_tensor_parallel_all_gather_dp_attn
+                and not self.use_attn_tp_group
+                and not self.final_logit_softcapping
+                and isinstance(lm_head, VocabParallelEmbedding)
+                and getattr(lm_head, "enable_tp", False)
+                and lm_head.org_vocab_size == lm_head.num_embeddings == 154880
+                and logits.dtype == torch.bfloat16
+                and logits.shape[-1] == 38720
+                and not hasattr(lm_head, "apply_lora")
+            ):
+                shard = lm_head.shard_indices
+                if (
+                    shard.org_vocab_start_index == get_parallel().tp_rank * 38720
+                    and shard.org_vocab_end_index - shard.org_vocab_start_index == 38720
+                ):
+                    logits_metadata.compact_verify_sharded = True
+                    if not getattr(self, "_logged_compact_verify", False):
+                        logger.info(
+                            "COMPACT_SPEC_LOGITS owner_sharded=True local_vocab=38720 rows=%d",
+                            logits.shape[0],
+                        )
+                        self._logged_compact_verify = True
+                    buffer = (
+                        logits_metadata.next_token_logits_buffer
+                        if use_logits_buffer
+                        else None
+                    )
+                    if (
+                        buffer is not None
+                        and buffer.shape == logits.shape
+                        and buffer.dtype == logits.dtype
+                    ):
+                        buffer.copy_(logits)
+                        return buffer
+                    return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:

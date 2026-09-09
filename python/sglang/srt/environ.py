@@ -1200,6 +1200,9 @@ class Envs:
     # Logits and log-probability processing
     # ===================================================================
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    # Opt-in TP4 linear rejection verifier for the qualified GB200 runtime.
+    SGLANG_ENABLE_COMPACT_SPEC_VERIFY = EnvBool(False)
+    SGLANG_COMPACT_SPEC_VERIFY_SHADOW = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)

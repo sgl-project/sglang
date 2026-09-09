@@ -2928,6 +2928,11 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    import sys
+
+    compact = sys.modules.get("sglang.srt.speculative.compact_verify.engine")
+    if compact is not None:
+        compact.close_all()
     get_parallel().clear_derived_widths()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
@@ -2982,6 +2987,11 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
+    import sys
+
+    compact = sys.modules.get("sglang.srt.speculative.compact_verify.engine")
+    if compact is not None:
+        compact.close_all()
     global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT
     if _WORLD:
         _WORLD.destroy()
