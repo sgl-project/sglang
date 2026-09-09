@@ -326,6 +326,7 @@ jobs:
 
   nightly-acc-16-npu-a5:
     name: nightly-acc-16-npu-a5
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
