@@ -8,6 +8,12 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_direct,
+    transfer_kv_per_layer_direct_pf_lf,
+    transfer_kv_per_layer_mla,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
     host_memory_budget_bytes,
@@ -15,20 +21,13 @@ from sglang.srt.mem_cache.pool_host.base import (
     synchronized,
 )
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
+    get_alloc_memory_func,
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-    )
 if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
@@ -56,6 +55,19 @@ class MambaPoolHost(HostKVCache):
             "page_first",
             "page_first_direct",
         ], f"Unsupported layout: {layout}"
+
+        # transfer_kv_mamba_* is JIT-built from CUDA source, so no accelerator
+        # wheel can supply it -- unlike the kvcacheio ops, this stays keyed on the
+        # device rather than on _kvcacheio.unavailable_reason. There is no dummy
+        # mode here; add one and this guard has to move below its early return.
+        if not (_is_cuda or _is_hip):
+            raise ValueError(
+                "HiCache does not support hybrid Mamba models on this device: the "
+                "Mamba KV transfer kernels are JIT-built from CUDA source and exist "
+                "only on CUDA/ROCm. Launch without HiCache host offload "
+                "(--enable-hierarchical-cache, "
+                "--disaggregation-decode-retraction-backup=host_pool)."
+            )
 
         self.layout = layout
         self.pin_memory = pin_memory
@@ -133,7 +145,7 @@ class MambaPoolHost(HostKVCache):
         self.clear()
 
     def init_kv_buffer(self):
-        _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        _host_alloc = get_alloc_memory_func(self.device_pool.device)
 
         def alloc_func(dims, *, dtype, device, pin_memory, allocator):
             # conv-only linear attention has no ssm state: mmap can't map the
