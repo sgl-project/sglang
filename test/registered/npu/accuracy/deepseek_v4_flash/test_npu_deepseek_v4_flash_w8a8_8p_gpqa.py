@@ -39,8 +39,11 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_DSPARK_FAST_KERNEL": "0",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "HCCL_BUFFSIZE": "1400",
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    # war barrier
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
 }
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
@@ -90,7 +93,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--speculative-dspark-block-size",
     5,
     "--skip-server-warmup",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,

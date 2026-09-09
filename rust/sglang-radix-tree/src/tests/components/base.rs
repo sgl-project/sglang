@@ -119,6 +119,8 @@ fn finalize_match_result_default_returns_result_unchanged() {
     let out = DefaultComponentForTest.finalize_match_result_in_tree_core(
         &tc,
         result,
+        tc.arena.root(),
+        tc.arena.root(),
         &MatchPrefixParams {
             key: &Vec::new(),
             namespace: Default::default(),
