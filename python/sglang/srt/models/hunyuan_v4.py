@@ -7,6 +7,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
@@ -670,6 +671,17 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         return "HYV4 applies the SwiGLU limit only to routed experts."
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        # HYV4's sparse layers are DeepseekV2MoE, but the class inherits only
+        # the weight loader mixin, so it does not get DeepseekV3ForCausalLM's
+        # hook and the expert-location metadata would stay None.
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=config.n_group,
+        )
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
