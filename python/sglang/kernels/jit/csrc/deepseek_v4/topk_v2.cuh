@@ -638,6 +638,10 @@ struct TopKKernel {
           page_table.has_value(),
           "topk_transform_paged: row_starts requires page_table "
           "(raw-index output does not carry the residue correction)");
+      // `mask_head` writes the residue columns back into `scores`, so rows that
+      // overlap would let one row clobber its neighbour's tail. Only the packed
+      // path writes, so the check stays here rather than covering every caller.
+      RuntimeCheck(S.unwrap() >= L.unwrap(), "scores rows must not overlap");
       TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_starts.value());
       row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
     }
