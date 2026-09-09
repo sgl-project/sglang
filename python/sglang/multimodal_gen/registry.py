@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
     Cosmos3Config,
+    Cosmos3MultiviewConfig,
     CosmosDreamsConfig,
     CosmosDreamsTransferConfig,
     FastH3PipelineConfig,
@@ -117,6 +118,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
+    Cosmos3MultiviewSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.cosmos_dreams import (
     CosmosDreamsSamplingParams,
 )
@@ -1258,6 +1262,17 @@ def _register_configs():
         hf_model_paths=["nvidia/Cosmos3-Nano-Sim-Transfer"],
         # Matches the ``CosmosDreamsTransferPipeline`` ``_class_name`` of the checkpoint.
         model_detectors=[lambda hf_id: "cosmosdreamstransferpipeline" in hf_id.lower()],
+    )
+
+    # Cosmos3 Multiview-AV: 11-camera WSM transfer with block-sparse cross-camera
+    # attention. The hf path is the pre-release folder name, which must sort
+    # before the shorter "nvidia/Cosmos3-Nano" in the partial-path match.
+    register_configs(
+        sampling_param_cls=Cosmos3MultiviewSamplingParams,
+        pipeline_config_cls=Cosmos3MultiviewConfig,
+        hf_model_paths=["nvidia/Cosmos3-Nano-Transfer-Auto"],
+        # Matches the ``Cosmos3MultiviewPipeline`` ``_class_name`` of the checkpoint.
+        model_detectors=[lambda hf_id: "cosmos3multiviewpipeline" in hf_id.lower()],
     )
 
     # SANA

@@ -219,6 +219,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
     ),
+    # Cosmos3 Multiview-AV sparse attention kernel: "triton" or "fa4". Wins over
+    # the checkpoint's multiview.backend; an explicit pipeline-config
+    # multiview_attention_backend wins over both.
+    "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
+    ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(

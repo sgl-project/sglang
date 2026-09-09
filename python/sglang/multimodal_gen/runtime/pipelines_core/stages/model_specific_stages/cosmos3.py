@@ -1096,6 +1096,10 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.vae = vae
         self._logged_parallel_config = False
         self._logged_cfg_split = False
+        # Extra transformer kwargs a variant hands over per request through
+        # ``batch.extra["transformer_extra_kwargs"]`` (e.g. the Cosmos3
+        # multiview attention layout and temporal wrap period).
+        self._extra_transformer_kwargs: dict[str, Any] = {}
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1230,6 +1234,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 transfer_share_vision_temporal_positions=getattr(
                     self, "_share_vision_temporal_positions", True
                 ),
+                **self._extra_transformer_kwargs,
             )
 
     @staticmethod
@@ -1446,6 +1451,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "share_vision_temporal_positions",
                 True,
             )
+        )
+        self._extra_transformer_kwargs = dict(
+            batch.extra.get("transformer_extra_kwargs") or {}
         )
         latents = batch.latents
         sound_latents = batch.audio_latents
