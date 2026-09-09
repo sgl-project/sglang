@@ -1643,6 +1643,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(
         self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
+        # A never-consumed interior checkpoint (issue #22935) is always a bf16
+        # mamba_allocator slot: the track builder refuses to arm when the int8
+        # checkpoint pool is enabled.
+        interior_ckpt_idx = req.kv.mamba_interior_ckpt_idx
+        if interior_ckpt_idx is not None:
+            self.mamba_allocator.free(interior_ckpt_idx.unsqueeze(0))
+            req.kv.mamba_interior_ckpt_idx = None
+            req.kv.mamba_interior_ckpt_seqlen = None
+
         mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_allocator.free(mamba_index.unsqueeze(0))

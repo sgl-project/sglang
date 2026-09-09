@@ -612,6 +612,9 @@ class MambaRadixCache(BasePrefixCache):
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
+            prev_prefix_len = self._insert_interior_checkpoint(
+                req, token_ids, page_aligned_kv_indices
+            )
             if self.enable_mamba_extra_buffer:
                 mamba_ping_pong_track_buffer_to_keep = (
                     self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
@@ -652,7 +655,7 @@ class MambaRadixCache(BasePrefixCache):
                     ),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
-                    prev_prefix_len=req.kv.cache_protected_len,
+                    prev_prefix_len=prev_prefix_len,
                 )
             )
             mamba_exist = result.mamba_exist
@@ -762,6 +765,9 @@ class MambaRadixCache(BasePrefixCache):
                 translate(mamba_value_donated),
             )
 
+        prev_prefix_len = self._insert_interior_checkpoint(
+            req, page_aligned_token_ids, page_aligned_kv_indices, chunked=chunked
+        )
         result = self.insert(
             InsertParams(
                 key=RadixKey(
@@ -771,7 +777,7 @@ class MambaRadixCache(BasePrefixCache):
                 ),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
-                prev_prefix_len=req.kv.cache_protected_len,
+                prev_prefix_len=prev_prefix_len,
                 chunked=chunked,
             )
         )
@@ -1101,6 +1107,50 @@ class MambaRadixCache(BasePrefixCache):
             self.int8_ckpt_pool.free(mamba_value)
         else:
             self.req_to_token_pool.mamba_allocator.free(mamba_value)
+
+    def _insert_interior_checkpoint(
+        self,
+        req: Req,
+        token_ids: List[int],
+        kv_indices: torch.Tensor,
+        chunked: bool = False,
+    ) -> int:
+        """Insert the no_buffer interior checkpoint tracked during the last extend
+        (issue #22935) as its own tree node, and return the prefix depth the caller
+        must pass as the main insert's prev_prefix_len: after this insert the tree
+        owns KV up to the checkpoint, so a smaller prev would make the main insert
+        free the segment this node just took ownership of."""
+        interior_len = req.kv.mamba_interior_ckpt_seqlen
+        interior_idx = req.kv.mamba_interior_ckpt_idx
+        req.kv.mamba_interior_ckpt_idx = None
+        req.kv.mamba_interior_ckpt_seqlen = None
+        if interior_idx is None or interior_len is None:
+            return req.kv.cache_protected_len
+
+        if not (req.kv.cache_protected_len < interior_len <= len(kv_indices)):
+            # Stale checkpoint beyond what this request still holds; drop the
+            # slot and leave the main insert unchanged.
+            self._free_mamba_value(interior_idx.unsqueeze(0))
+            return req.kv.cache_protected_len
+
+        result = self.insert(
+            InsertParams(
+                key=RadixKey(
+                    token_ids[:interior_len],
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                ),
+                value=kv_indices[:interior_len].to(dtype=torch.int64, copy=True),
+                mamba_value=interior_idx.unsqueeze(0),
+                prev_prefix_len=req.kv.cache_protected_len,
+                chunked=chunked,
+            )
+        )
+        if result.mamba_exist:
+            # A checkpointed node already covers this depth; the tracked slot
+            # is a duplicate.
+            self._free_mamba_value(interior_idx.unsqueeze(0))
+        return interior_len
 
     def _match_prefix_helper(
         self, key: RadixKey

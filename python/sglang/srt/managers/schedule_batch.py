@@ -54,6 +54,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import math
 import re
 import sys
 from array import array
@@ -896,6 +897,11 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
+    # no_buffer interior checkpoint (issue #22935): slot + depth of the grid-boundary
+    # state tracked during a prefill extend; donated to the radix cache at
+    # cache_finished/cache_unfinished time, or freed with the request.
+    mamba_interior_ckpt_idx: Optional[torch.Tensor] = None  # shape: (1,)
+    mamba_interior_ckpt_seqlen: Optional[int] = None
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -1845,6 +1851,8 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
+        self.kv.mamba_interior_ckpt_idx = None
+        self.kv.mamba_interior_ckpt_seqlen = None
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
@@ -2689,6 +2697,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
+            elif self.spec_algorithm.is_none():
+                # no_buffer: one interior grid-boundary checkpoint per prefill
+                # extend (issue #22935). Rows append one entry per req so the
+                # tensors below always see the full batch shape.
+                v1_entry = self._mamba_radix_cache_v1_interior_track_entry(req)
+                if v1_entry is None:
+                    mamba_track_mask_cpu.append(False)
+                    mamba_track_indices_cpu.append(0)
+                    mamba_track_seqlens_cpu.append(-1)
+                else:
+                    mamba_track_mask_cpu.append(True)
+                    mamba_track_indices_cpu.append(v1_entry[0])
+                    mamba_track_seqlens_cpu.append(v1_entry[1])
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -2789,7 +2810,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        if get_exec().mamba.enable_mamba_extra_buffer:
+        if get_exec().mamba.enable_mamba_extra_buffer or any(mamba_track_mask_cpu):
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2805,6 +2826,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
+        elif self.mamba_track_mask is not None:
+            # Stale tensors from an earlier batch would re-arm backend tracking.
+            self.mamba_track_indices = None
+            self.mamba_track_mask = None
+            self.mamba_track_seqlens = None
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.kv.holds_mamba for req in reqs):
@@ -2914,6 +2940,74 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
         )
+
+    def _mamba_radix_cache_v1_interior_track_entry(
+        self,
+        req: Req,
+    ) -> Optional[Tuple[int, int]]:
+        """no_buffer counterpart of the V2 track entry: snapshot one interior
+        grid-boundary state per prefill extend into a fresh mamba slot, donated
+        to the radix cache at cache time. This is the O(1)-memory fix for
+        #22935: the default strategy otherwise checkpoints only the extend end,
+        which an n-1 fresh-prefill lookup can never reach after a split.
+
+        Returns (mamba_slot, track_seqlen), or None when this extend has no
+        usable interior boundary or tracking is not applicable."""
+        if not req.kv.holds_mamba:
+            return None
+        # Local import: mamba_radix_cache only imports Req under TYPE_CHECKING,
+        # so there is no runtime cycle, but schedule_batch stays import-light.
+        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+        if not isinstance(self.tree_cache, MambaRadixCache):
+            return None
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        if mamba_pool.replayssm_write_pos is not None:
+            # ReplaySSM donate depth lags the live state; the interior h
+            # snapshot is unvalidated there, so keep the fix off that config.
+            return None
+        if getattr(self.req_to_token_pool, "mamba_ckpt_pool", None) is not None:
+            # int8 checkpoints store radix states in the quantized pool; the h
+            # snapshot lands in the active bf16 pool and cannot be donated there.
+            return None
+        # Self-heal: a slot left over from an unconsumed earlier extend (e.g. a
+        # skipped cache_unfinished_req) must not leak when we re-arm here.
+        if req.kv.mamba_interior_ckpt_idx is not None:
+            self.req_to_token_pool.mamba_allocator.free(
+                req.kv.mamba_interior_ckpt_idx.unsqueeze(0)
+            )
+            req.kv.mamba_interior_ckpt_idx = None
+            req.kv.mamba_interior_ckpt_seqlen = None
+
+        prefix_len = len(req.prefix_indices)
+        state_chunk_size = getattr(
+            self.model_config.hf_text_config, "mamba_chunk_size", 64
+        )
+        # The snapshot must sit on both the radix page grid and a model-state
+        # boundary, or no h state exists at that depth to snapshot.
+        grid = math.lcm(
+            mamba_checkpoint_grid(self.tree_cache.page_size), state_chunk_size
+        )
+        # Largest grid boundary strictly below the extend end: at the end the
+        # donated last_recurrent_state already covers the boundary, and a node
+        # at the full length would just be re-split away by the n-1 lookup.
+        interior_len = prefix_len + ((req.extend_range.length - 1) // grid) * grid
+        if interior_len <= prefix_len:
+            return None
+
+        slot = self.req_to_token_pool.mamba_allocator.alloc(1)
+        if slot is None:
+            # Best effort: skipping the checkpoint only costs cache hits.
+            return None
+
+        # interior_len is state-aligned, so last_recurrent_state cannot serve
+        # it; the +1 routes the read to h (same convention as _force_track_h,
+        # and the +1 cancels under mamba_track_aligned_lens's floor).
+        track_seqlen = interior_len + 1
+
+        req.kv.mamba_interior_ckpt_idx = slot[0]
+        req.kv.mamba_interior_ckpt_seqlen = interior_len
+        return slot[0].item(), track_seqlen
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
         """Collect deferred COW/clear info from requests."""
