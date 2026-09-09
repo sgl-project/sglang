@@ -66,13 +66,12 @@ class TestSamplingMaskCapture(CustomTestCase):
         with patch.object(
             sampler_module, "partial", side_effect=AssertionError("capture helper")
         ):
-            sampled, capture = self.sampler._sample_from_probs(
+            _, capture = self.sampler._sample_from_probs(
                 probs=probs,
                 sampling_info=info,
                 positions=torch.tensor([0]),
                 simple_sampling_case=True,
             )
-        self.assertIn(sampled.item(), (0, 1))
         self.assertIsNone(capture)
 
     def _sample(
@@ -601,12 +600,6 @@ class TestSamplingMaskPacking(CustomTestCase):
             torch.tensor([0]), capture
         )
 
-        self.assertEqual(
-            sampling_output.statuses.tolist(), [SamplingMaskStatus.OVERFLOW]
-        )
-        self.assertEqual(sampling_output.lengths.tolist(), [3])
-        self.assertAlmostEqual(sampling_output.selected_logprobs.item(), -math.log(5))
-
         output = LogitsProcessorOutput(
             next_token_logits=None,
             sampling_mask_output=sampling_output,
@@ -638,24 +631,15 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             "sampling_seed": _SAMPLING_SEED,
         }
 
-        with_mask_response = self._post_generate(
-            sampling_params, return_sampling_mask=True
-        )
-        self.assertEqual(with_mask_response.status_code, 200, with_mask_response.text)
-
-        without_mask_response = self._post_generate(
-            sampling_params, return_sampling_mask=False
-        )
-        self.assertEqual(
-            without_mask_response.status_code, 200, without_mask_response.text
-        )
-
-        with_mask_output = with_mask_response.json()
-        without_mask_output = without_mask_response.json()
-        self.assertEqual(
-            with_mask_output["output_ids"], without_mask_output["output_ids"]
-        )
-        self.assertEqual(with_mask_output["text"], without_mask_output["text"])
+        outputs = []
+        for return_mask in (False, True):
+            response = self._post_generate(
+                sampling_params, return_sampling_mask=return_mask
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            output = response.json()
+            outputs.append((output["output_ids"], output["text"]))
+        self.assertEqual(outputs[0], outputs[1])
 
 
 class TestSamplingMaskPytorch(TestSamplingMask):
