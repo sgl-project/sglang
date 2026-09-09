@@ -19,6 +19,7 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
@@ -84,6 +85,9 @@ class UnifiedCacheLinker(ABC):
         The transfer is executed by the next ``start_layer_wise_loading`` call,
         not here.
         """
+
+    def set_request_time_stats(self, rid: str, time_stats) -> None:
+        """Associate request timing state with a subsequently queued load."""
 
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
@@ -212,8 +216,16 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        lookup_started = time.perf_counter()
+        try:
+            restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        finally:
+            time_stats = getattr(req, "time_stats", None)
+            timing_adder = getattr(time_stats, "add_direct_lookup_duration", None)
+            if timing_adder is not None:
+                timing_adder(time.perf_counter() - lookup_started)
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
@@ -316,6 +328,9 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
+        time_stats = getattr(req, "time_stats", None)
+        if time_stats is not None:
+            time_stats.set_direct_load_prepare_start_time()
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -385,7 +400,15 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
+        self._queue_load(
+            req.rid,
+            insert_result.last_device_node,
+            load_transfers,
+            time_stats=time_stats,
+        )
+
+        if time_stats is not None:
+            time_stats.set_direct_load_prepare_finish_time()
 
         cache.tree_core.mark_external_cache_stored_path(
             insert_result.last_device_node, req.last_node
@@ -393,7 +416,12 @@ class UnifiedCacheLinkerWrapper:
         return canonical_tail, insert_result.last_device_node
 
     def _queue_load(
-        self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
+        self,
+        rid: str,
+        node_id: NodeId,
+        transfers: list[PoolTransfer],
+        *,
+        time_stats=None,
     ) -> None:
         if not transfers:
             return
@@ -407,6 +435,8 @@ class UnifiedCacheLinkerWrapper:
         if not queued:
             self.cache.dec_lock_ref(node_id, lock_params)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
+        if time_stats is not None:
+            self.cache_linker.set_request_time_stats(rid, time_stats)
         self.pending_loads[rid] = (node_id, lock_params)
 
     def _update_load(

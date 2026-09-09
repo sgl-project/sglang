@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from concurrent.futures import Future
 from queue import Empty, Queue
 
@@ -173,6 +174,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self.request_time_stats: dict[str, object] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -213,6 +215,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        started = time.perf_counter()
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -225,12 +228,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.stats["lookup"] += 1
         if restorable:
             logger.info(
-                "Mooncake direct linker lookup hit: rid=%s pages=%d candidates=%d",
+                "Mooncake direct linker lookup hit: rid=%s pages=%d "
+                "candidates=%d duration=%.2fms",
                 rid,
                 restorable[-1],
                 len(restorable),
+                (time.perf_counter() - started) * 1000,
             )
         return restorable
+
+    def set_request_time_stats(self, rid: str, time_stats) -> None:
+        self.request_time_stats[rid] = time_stats
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
@@ -271,6 +279,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         pending = self.pending_loads
         self.pending_loads = {}
 
+        started = time.perf_counter()
+        for rid in pending:
+            time_stats = getattr(self, "request_time_stats", {}).get(rid)
+            if time_stats is not None:
+                time_stats.set_direct_load_start_time(started)
+
         counter_index = self.layer_done_counter.update_producer()
         ready_event = device_module.Event()
         ready_event.record()
@@ -292,6 +306,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
+                    finished = time.perf_counter()
+                    for rid in pending:
+                        time_stats = getattr(self, "request_time_stats", {}).pop(
+                            rid, None
+                        )
+                        if time_stats is not None:
+                            time_stats.set_direct_load_finish_time(finished)
                     self.completed_loads.put(list(pending))
             finally:
                 self.load_queue.task_done()
@@ -352,6 +373,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
+                    rids = batch_rids.get(name, [None] * len(keys))
                     result = self.storage.store.batch_get_into_multi_buffer_ranges(
                         keys,
                         ptrs,
@@ -364,10 +386,45 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         or isinstance(result, int)
                         or list(result) != expected
                     ):
+                        transferred = (
+                            None
+                            if result is None or isinstance(result, int)
+                            else list(result)
+                        )
+                        failed_objects = []
+                        for index, key in enumerate(keys):
+                            actual = (
+                                result
+                                if result is None or isinstance(result, int)
+                                else transferred[index]
+                                if index < len(transferred)
+                                else None
+                            )
+                            wanted = expected[index]
+                            if actual != wanted:
+                                failed_objects.append(
+                                    {
+                                        "key": key,
+                                        "rid": (
+                                            rids[index]
+                                            if index < len(rids)
+                                            else None
+                                        ),
+                                        "transferred": actual,
+                                        "expected": wanted,
+                                    }
+                                )
+                        logger.error(
+                            "Mooncake lookup/session succeeded but range get "
+                            "failed: rids=%s pool=%s layer=%d failed_objects=%s",
+                            [rid for rid, _ in request_transfers],
+                            name,
+                            layer,
+                            failed_objects,
+                        )
                         raise RuntimeError(
                             f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
+                            f"layer={layer}, failed_objects={len(failed_objects)}."
                         )
                 self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
@@ -380,6 +437,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+            finished = time.perf_counter()
+            for rid, _ in request_transfers:
+                time_stats = getattr(self, "request_time_stats", {}).pop(rid, None)
+                if time_stats is not None:
+                    time_stats.set_direct_load_finish_time(finished)
 
     def _load_page_wise(
         self,
@@ -465,15 +527,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             str(name): len(keys) for name, (keys, _) in batches.items()
         }
         unique_rids = sorted({rid for rid in all_rids if rid is not None})
-        logger.debug(
-            "01 Mooncake range get start: counter=%d rids=%s rids_size=%d "
-            "pools=%s complete_page objects=%d",
-            counter_index,
-            unique_rids,
-            len(all_rids),
-            pool_counts,
-            len(all_keys),
-        )
         result = self.storage.store.batch_get_into_multi_buffer_ranges(
             all_keys, all_ptrs, all_sizes, all_offsets
         )
@@ -517,11 +570,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 failed_objects,
             )
 
-        # Page-wise loading intentionally gives up layer overlap: sessions must
-        # be released only after every page is complete, and before any layer is
-        # made visible to the model.
-        for rid, _ in request_transfers:
-            self.abort_prepared_load(rid)
+        # Page-wise loading intentionally gives up layer overlap: no layer is
+        # made visible to the model until every complete-page read succeeds.
         if all(request_success.values()):
             for layer in range(self.num_layers):
                 self.layer_done_counter.complete(counter_index, layer)
@@ -583,6 +633,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.completed_loads.get_nowait()
             except Empty:
                 break
+        self.request_time_stats.clear()
         self.layer_done_counter.reset()
 
     def close(self) -> None:
