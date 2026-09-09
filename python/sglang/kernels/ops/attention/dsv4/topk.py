@@ -159,6 +159,12 @@ def topk_transform_paged_v2(
     indices stay row-local either way, so the output meaning is unchanged.
     ``row_to_batch`` entries are not range-checked against ``page_tables``.
 
+    Passing ``row_starts`` makes this call MODIFY ``scores`` IN PLACE. The
+    kernel rounds each row's read window down to a 16-byte boundary and masks
+    the columns it pulls in that way (at most three, and always inside the same
+    row, before ``row_starts[i]``) to ``-inf``. Callers must therefore not reuse
+    ``scores`` afterwards, and must not pass a view whose rows overlap.
+
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
     values. The kernel reads lengths as ``uint32_t``: a negative entry
