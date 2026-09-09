@@ -463,7 +463,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if self._is_domino:
                 logger.info(
-                    "DFLASH Domino rollout enabled (eager BF16, TP=1, block-shared candidate pool size=%s).",
+                    "DFLASH Domino rollout enabled (BF16, TP=1, block-shared candidate pool size=%s).",
                     self.domino_candidate_pool_size,
                 )
             logger.info(

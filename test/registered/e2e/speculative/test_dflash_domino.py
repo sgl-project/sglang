@@ -71,7 +71,7 @@ class TestDFlashDominoFullVocab(CustomTestCase):
         )
         log = Path(self.server_log.name).read_text()
         self.assertIn(
-            "DFLASH Domino rollout enabled (eager BF16, TP=1, "
+            "DFLASH Domino rollout enabled (BF16, TP=1, "
             f"block-shared candidate pool size={self.candidate_pool_size}).",
             log,
         )
