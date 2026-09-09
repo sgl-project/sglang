@@ -295,6 +295,11 @@ def _resolve_ffmpeg_exe() -> str:
     return ffmpeg_exe
 
 
+# ffmpeg's implicit libx264 default is `medium`. On diffusion output `fast` is
+# both quicker and measurably closer to the frames the model produced.
+X264_PRESET = "fast"
+
+
 def _x264_auto_thread_count(height: int) -> int:
     """Match x264's auto frame-thread count for progressive video."""
     try:
@@ -402,6 +407,8 @@ def _try_save_cuda_video_direct(
         command += [
             "-vcodec",
             "libx264",
+            "-preset",
+            X264_PRESET,
             "-pix_fmt",
             "yuv420p",
             "-crf",
@@ -710,6 +717,7 @@ def _try_save_video_with_audio(
             quality=quality,
             audio_path=tmp_wav_path,
             audio_codec="aac",
+            output_params=["-preset", X264_PRESET],
         )
         return True
     except Exception as e:
@@ -943,6 +951,7 @@ def save_materialized_output(
                 format=output_format,
                 codec="libx264",
                 quality=quality,
+                output_params=["-preset", X264_PRESET],
             )
 
             _maybe_mux_audio_into_mp4(
