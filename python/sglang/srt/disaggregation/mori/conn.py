@@ -1480,8 +1480,13 @@ class MoriKVManager(CommonKVManager):
             )
         if state_type in ("qsa_pending", "qsa_compressed", "minimax_index_k"):
             if self.pp_size is not None and self.pp_size > 1:
+                # MORI registration does not exchange state_layer_ids. Compact
+                # sparse-state lists therefore cannot be paired safely across
+                # pipeline stages until that metadata is added to its protocol.
                 raise RuntimeError(
-                    f"PD disagg: PP>1 not supported for {state_type} yet."
+                    f"MORI PD disaggregation requires PP=1 for {state_type}; "
+                    "PP>1 needs peer state_layer_ids for global-layer descriptor "
+                    "pairing."
                 )
             if peer_info.decode_tp_size != self.attn_tp_size:
                 raise RuntimeError(

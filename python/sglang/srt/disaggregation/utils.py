@@ -127,6 +127,14 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
+    """Return the request-pool row that owns a QSA pending-state ring."""
+    req_pool_idx = req.kv.req_pool_idx
+    if req_pool_idx is None:
+        raise ValueError("QSA pending-state transfer requires an allocated request row")
+    return np.array([int(req_pool_idx)], dtype=np.int32)
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"

@@ -12,7 +12,7 @@ from sglang.srt.disaggregation.decode import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
@@ -423,6 +423,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             enable_decode_hicache=False,
             enable_hisparse=False,
             metrics_reporter=SimpleNamespace(enable_metrics=False),
+            transfer_backend=TransferBackend.MOONCAKE,
         )
         queue.token_to_kv_pool = object.__new__(QSATokenToKVPool)
         queue.enable_staging = False
@@ -439,6 +440,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
             patch(
                 "sglang.srt.disaggregation.decode._flush_gpudirect_writes_to_cuda_owner"
             ) as flush,
+            patch(
+                "sglang.srt.disaggregation.decode._requires_qsa_gpudirect_flush",
+                return_value=True,
+            ),
             patch.object(torch.cuda, "synchronize") as synchronize,
         ):
             transferred = queue.pop_transferred()
@@ -446,6 +451,70 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual([req.rid for req in transferred], ["req-0", "req-1"])
         flush.assert_called_once_with()
         synchronize.assert_not_called()
+
+    def test_qsa_mori_success_does_not_run_cuda_flush(self):
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [
+            SimpleNamespace(
+                req=SimpleNamespace(rid="req", finished_reason=None),
+                hicache_restore_status=None,
+                metadata_buffer_index=0,
+            )
+        ]
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            transfer_backend=TransferBackend.MORI,
+        )
+        queue.token_to_kv_pool = object.__new__(QSATokenToKVPool)
+        queue.enable_staging = False
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[1])
+        queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(free=MagicMock())
+
+        with (
+            patch.object(
+                DecodeTransferQueue,
+                "_poll_with_metadata_gate",
+                return_value=[KVPoll.Success],
+            ),
+            patch.object(DecodeTransferQueue, "_commit_transfer_to_req"),
+            patch(
+                "sglang.srt.disaggregation.decode._flush_gpudirect_writes_to_cuda_owner"
+            ) as flush,
+            patch("sglang.srt.disaggregation.decode.is_cuda", return_value=True),
+        ):
+            transferred = queue.pop_transferred()
+
+        self.assertEqual([req.rid for req in transferred], ["req"])
+        flush.assert_not_called()
+
+    def test_qsa_gpudirect_flush_falls_back_when_unsupported(self):
+        cuda_rt = SimpleNamespace(
+            cudaFlushGPUDirectRDMAWritesTarget=SimpleNamespace(
+                cudaFlushGPUDirectRDMAWritesTargetCurrentDevice=1
+            ),
+            cudaFlushGPUDirectRDMAWritesScope=SimpleNamespace(
+                cudaFlushGPUDirectRDMAWritesToOwner=2
+            ),
+            cudaError_t=SimpleNamespace(cudaSuccess=0, cudaErrorNotSupported=801),
+            cudaDeviceFlushGPUDirectRDMAWrites=MagicMock(return_value=(801,)),
+        )
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode._load_cuda_runtime",
+                return_value=cuda_rt,
+            ),
+            patch.object(torch.cuda, "synchronize") as synchronize,
+        ):
+            from sglang.srt.disaggregation.decode import (
+                _flush_gpudirect_writes_to_cuda_owner,
+            )
+
+            _flush_gpudirect_writes_to_cuda_owner()
+
+        synchronize.assert_called_once_with()
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)

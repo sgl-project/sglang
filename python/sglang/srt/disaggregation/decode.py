@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_qsa_pending_state_indices,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -109,7 +110,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_cuda, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -129,20 +130,55 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
-def _flush_gpudirect_writes_to_cuda_owner() -> None:
-    """Make completed third-party GPU writes visible to CUDA on this device."""
+def _load_cuda_runtime():
     from cuda.bindings import runtime as cuda_rt
 
-    target_enum = cuda_rt.cudaFlushGPUDirectRDMAWritesTarget
-    scope_enum = cuda_rt.cudaFlushGPUDirectRDMAWritesScope
-    flush_target = target_enum.cudaFlushGPUDirectRDMAWritesTargetCurrentDevice
-    flush_scope = scope_enum.cudaFlushGPUDirectRDMAWritesToOwner
-    (err,) = cuda_rt.cudaDeviceFlushGPUDirectRDMAWrites(flush_target, flush_scope)
+    return cuda_rt
+
+
+def _flush_gpudirect_writes_to_cuda_owner() -> None:
+    """Make completed third-party GPU writes visible to CUDA on this device."""
+    try:
+        cuda_rt = _load_cuda_runtime()
+        target_enum = cuda_rt.cudaFlushGPUDirectRDMAWritesTarget
+        scope_enum = cuda_rt.cudaFlushGPUDirectRDMAWritesScope
+        flush_target = target_enum.cudaFlushGPUDirectRDMAWritesTargetCurrentDevice
+        flush_scope = scope_enum.cudaFlushGPUDirectRDMAWritesToOwner
+        (err,) = cuda_rt.cudaDeviceFlushGPUDirectRDMAWrites(flush_target, flush_scope)
+    except (ImportError, AttributeError):
+        logger.warning_once(
+            "CUDA GPUDirect RDMA flush bindings are unavailable; falling back "
+            "to a device synchronization before QSA decode."
+        )
+        torch.cuda.synchronize()
+        return
+
+    unsupported = getattr(cuda_rt.cudaError_t, "cudaErrorNotSupported", None)
+    if unsupported is not None and err == unsupported:
+        logger.warning_once(
+            "CUDA GPUDirect RDMA host flush is unsupported on this device; "
+            "falling back to a device synchronization before QSA decode."
+        )
+        torch.cuda.synchronize()
+        return
+
     if err != cuda_rt.cudaError_t.cudaSuccess:
         raise RuntimeError(
             "Failed to flush GPUDirect RDMA writes before QSA decode: "
             f"CUDA error {int(err)}"
         )
+
+
+def _requires_qsa_gpudirect_flush(transfer_backend: TransferBackend) -> bool:
+    """Whether this transport writes QSA state through NVIDIA GPUDirect."""
+    return (
+        transfer_backend
+        in (
+            TransferBackend.MOONCAKE,
+            TransferBackend.NIXL,
+        )
+        and is_cuda()
+    )
 
 
 class DecodeReqToTokenPool:
@@ -1453,7 +1489,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _qsa_pending_payload():
                 # Match the prefill request-pool row positionally; the two
                 # req_pool_idx values need not be equal.
-                return np.array([decode_req.req.req_pool_idx], dtype=np.int32)
+                return get_qsa_pending_state_indices(decode_req.req)
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -2355,7 +2391,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 and decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
             )
         }
-        if isinstance(self.token_to_kv_pool, QSATokenToKVPool) and qsa_success_indices:
+        if (
+            isinstance(self.token_to_kv_pool, QSATokenToKVPool)
+            and qsa_success_indices
+            and _requires_qsa_gpudirect_flush(self.scheduler.transfer_backend)
+        ):
             # A single blocking flush covers every QSA request completed by this
             # poll. The CUDA visibility operation is sufficient; a subsequent
             # device-wide synchronize would unnecessarily wait on unrelated work.
