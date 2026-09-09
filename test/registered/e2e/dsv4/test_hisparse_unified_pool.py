@@ -1,4 +1,4 @@
-"""Unit tests for the unified-KV HiSparse device pool.
+"""Tests for the unified-KV HiSparse device pool.
 
 These tests cover ``HiSparseUnifiedC4DevicePool`` — the HiSparse C4 device hot
 pool used in unified-KV mode (ROCm). Unlike separate-KV, the compressed C4 KV
