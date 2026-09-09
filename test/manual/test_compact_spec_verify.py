@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,7 +47,6 @@ def fixture(b, k, v, rank, tp, kind):
     return Verify(local, q, candidates, coins, final)
 
 
-
 def compare(a, b):
     for actual, expected in zip(a[:3], b[:3]):
         torch.testing.assert_close(actual.flatten(), expected.flatten(), atol=0, rtol=0)
@@ -56,7 +56,9 @@ def main():
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
-    result = {"tests": [], "status": "FAIL"}
+    root = Path(__file__).resolve().parents[2]
+    assert Path(engine.__file__).resolve().is_relative_to(root / "python")
+    result = {"tests": [], "status": "FAIL", "source": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()}
     runner = None
     try:
         assert engine.runtime_supported()

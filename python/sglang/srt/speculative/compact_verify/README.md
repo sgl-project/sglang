@@ -60,3 +60,15 @@ their communication groups are destroyed; the distributed cleanup hooks do so.
 
 `SGLANG_COMPACT_SPEC_VERIFY_SHADOW=1` enables the expensive same-logits reference
 comparison. Use it for validation only, not performance measurements.
+
+## Tests
+
+```bash
+PYTHONPATH=python pytest test/registered/unit/sampling/test_compact_verify_config.py
+CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=python COMPACT_TEST_OUTPUT=/tmp/compact_verify.json \
+  torchrun --standalone --nproc-per-node=4 test/manual/test_compact_spec_verify.py
+```
+
+The manual test requires the qualified runtime and four GPUs. Acquire their
+lease before running it. It covers live q-pointer changes, index permutation,
+the source NaN-q rule, repair overflow, actual `eagle_sample`, and clean shutdown.
