@@ -680,9 +680,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
     ):
-        if request.tool_choice != "auto":
-            raise NotImplementedError(
-                "Only 'auto' tool_choice is supported in response API"
+        tool_choice = request.effective_tool_choice()
+        if tool_choice != "auto":
+            requirement = (
+                "restrict the recipient to the named tool"
+                if isinstance(tool_choice, dict)
+                else "require a tool recipient"
+                if tool_choice == "required"
+                else "exclude tool recipients"
+            )
+            raise ValueError(
+                f"Harmony tool_choice={request.tool_choice!r} cannot {requirement}: "
+                "recipient-header decoding constraints are not implemented; "
+                "use tool_choice='auto'."
             )
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
@@ -1470,7 +1480,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 prev_outputs = []
             for response_msg in request.input:
                 messages.append(parse_response_input(response_msg, prev_outputs))
-                if isinstance(response_msg, ResponseFunctionToolCall):
+                item_type = (
+                    response_msg.get("type")
+                    if isinstance(response_msg, dict)
+                    else response_msg.type
+                )
+                if item_type in ("function_call", "custom_tool_call"):
                     prev_outputs.append(response_msg)
         return messages
 

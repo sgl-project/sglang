@@ -47,6 +47,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponseInputOutputItem,
     ResponseOutputMessage,
 )
+from sglang.srt.entrypoints.openai.responses_adapters import (
+    decode_reasoning_state,
+    encode_custom_tool_input,
+)
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
@@ -166,7 +170,9 @@ def parse_response_input(
             # text chunk always carries the system→developer text_prefix even if
             # earlier parts were non-text (image/audio) and got dropped.
             text_chunks = [
-                c for c in content if c.get("type") in ("text", "input_text")
+                c
+                for c in content
+                if c.get("type") in ("text", "input_text", "output_text")
             ]
             contents = [
                 TextContent(text=(text_prefix if i == 0 else "") + c.get("text", ""))
@@ -177,28 +183,53 @@ def parse_response_input(
             msg = msg.with_channel(
                 "final" if response_msg["phase"] == "final_answer" else "commentary"
             )
-    elif response_msg["type"] == "function_call_output":
+    elif response_msg["type"] in ("function_call_output", "custom_tool_call_output"):
         call_id = response_msg["call_id"]
-        call_response: Optional[ResponseFunctionToolCall] = None
-        for prev_response in reversed(prev_responses):
+        call_response = None
+        for previous in reversed(prev_responses):
+            if not isinstance(previous, dict):
+                previous = previous.model_dump()
             if (
-                isinstance(prev_response, ResponseFunctionToolCall)
-                and prev_response.call_id == call_id
+                previous.get("type") in ("function_call", "custom_tool_call")
+                and previous.get("call_id") == call_id
             ):
-                call_response = prev_response
+                call_response = previous
                 break
         if call_response is None:
             raise ValueError(f"No call message found for {call_id}")
+        output = response_msg.get("output", "")
+        if isinstance(output, list):
+            output = "".join(
+                part.get("text", "") for part in output if isinstance(part, dict)
+            )
         msg = Message.from_author_and_content(
-            Author.new(Role.TOOL, f"functions.{call_response.name}"),
-            response_msg["output"],
+            Author.new(Role.TOOL, f"functions.{call_response['name']}"),
+            output,
         )
     elif response_msg["type"] == "reasoning":
-        content = response_msg["content"]
-        assert len(content) == 1
-        msg = Message.from_role_and_content(Role.ASSISTANT, content[0]["text"])
-    elif response_msg["type"] == "function_call":
-        msg = Message.from_role_and_content(Role.ASSISTANT, response_msg["arguments"])
+        text = ""
+        for field in ("summary", "content"):
+            text = "\n".join(
+                part.get("text", "")
+                for part in response_msg.get(field) or []
+                if isinstance(part, dict)
+            )
+            if text:
+                break
+        if not text:
+            text = decode_reasoning_state(response_msg.get("encrypted_content")) or ""
+        msg = Message.from_role_and_content(Role.ASSISTANT, text).with_channel(
+            "analysis"
+        )
+    elif response_msg["type"] in ("function_call", "custom_tool_call"):
+        arguments = (
+            encode_custom_tool_input(response_msg.get("input") or "")
+            if response_msg["type"] == "custom_tool_call"
+            else response_msg.get("arguments") or "{}"
+        )
+        if isinstance(arguments, dict):
+            arguments = orjson.dumps(arguments).decode()
+        msg = Message.from_role_and_content(Role.ASSISTANT, arguments)
         msg = msg.with_channel("commentary")
         msg = msg.with_recipient(f"functions.{response_msg['name']}")
         msg = msg.with_content_type("json")

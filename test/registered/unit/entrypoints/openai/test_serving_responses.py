@@ -193,6 +193,57 @@ class InputMessageConstructionTestCase(CustomTestCase):
             self.assertEqual(actual[:2], expected[:2])
             self.assertEqual(actual[2:], messages[2:] + expected[2:])
 
+    def test_harmony_replays_output_text_and_encoded_reasoning(self):
+        from sglang.srt.entrypoints.harmony_utils import parse_response_input
+        from sglang.srt.entrypoints.openai.responses_adapters import (
+            encode_reasoning_state,
+        )
+
+        message = parse_response_input(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "assistant-only secret 42"},
+                ],
+                "phase": "final_answer",
+            },
+            [],
+        )
+        self.assertEqual(message.content[0].text, "assistant-only secret 42")
+        reasoning = parse_response_input(
+            {
+                "type": "reasoning",
+                "encrypted_content": encode_reasoning_state("private plan"),
+            },
+            [],
+        )
+        self.assertEqual(reasoning.content[0].text, "private plan")
+        self.assertEqual(reasoning.channel, "analysis")
+
+    def test_harmony_replays_dict_tool_calls_and_results_in_one_input(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "function_call",
+                    "name": "lookup",
+                    "call_id": "call_1",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [{"type": "output_text", "text": "result"}],
+                },
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages_with_harmony(request, None)
+        self.assertEqual(messages[-1].author.name, "functions.lookup")
+        self.assertEqual(messages[-1].content[0].text, "result")
+
     def test_harmony_message_channels_map_to_phases(self):
         from sglang.srt.entrypoints.harmony_utils import (
             parse_output_message,
@@ -341,6 +392,23 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(seen["tool_choice"], "required")
         self.assertFalse(seen["parallel_tool_calls"])
         self.assertEqual(processed.tool_call_constraint[0], "json_schema")
+
+    def test_harmony_forced_choices_explain_missing_routing_constraints(self):
+        serving = make_serving()
+        serving.use_harmony = True
+        for choice in ("none", "required", {"type": "function", "name": "lookup"}):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                tool_choice=choice,
+                tools=[{"type": "function", "name": "lookup"}],
+                store=False,
+            )
+            response = asyncio.run(serving.create_responses(request))
+            self.assertEqual(response.status_code, 400)
+            self.assertIn(b"recipient", response.body)
+            self.assertIn(b"tool_choice", response.body)
+        serving.tokenizer_manager.generate_request.assert_not_called()
 
     def test_required_tool_choice_without_function_tool_returns_400(self):
         serving = make_serving()
