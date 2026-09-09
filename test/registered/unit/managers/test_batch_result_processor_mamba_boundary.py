@@ -96,12 +96,9 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
 
                 scheduler = Scheduler.__new__(Scheduler)
                 scheduler.gracefully_exit = False
-                scheduler.request_receiver = MagicMock()
-                scheduler.request_receiver.recv_requests.side_effect = [
-                    [],
-                    [],
-                    StopIteration,
-                ]
+                scheduler.ingest_requests = MagicMock(
+                    side_effect=[[], [], StopIteration]
+                )
                 scheduler.process_input_requests = MagicMock()
                 scheduler._engine_paused = False
                 scheduler.running_batch = batch

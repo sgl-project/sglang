@@ -4,7 +4,7 @@ Two test classes:
 - TestBreakableCUDAGraphBasic / TestCopyOutput / TestBreakGraphHelper:
   unit tests for the core capture / replay mechanism (simple tensor ops).
 - TestBreakableCudaGraph: integration test — spin up Qwen3-8B with
-  --enable-breakable-cuda-graph and check mgsm_en accuracy.
+  --cuda-graph-backend-prefill=breakable and check mgsm_en accuracy.
 """
 
 import unittest
@@ -364,7 +364,7 @@ class TestBreakGraphHelper(CustomTestCase):
 
 
 class TestBreakableCudaGraph(CustomTestCase):
-    """Integration: Qwen3-8B with --enable-breakable-cuda-graph on mgsm_en."""
+    """Integration: Qwen3-8B with --cuda-graph-backend-prefill=breakable on mgsm_en."""
 
     @classmethod
     def setUpClass(cls):
