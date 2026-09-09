@@ -17,11 +17,49 @@ def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
     return timer.wrap(metadata={"category": category})
 
 
+class DeviceTiming:
+    """One closed group of existing GPU timing intervals, measured in seconds.
+
+    Completion is driven by DeviceTimer's nonblocking event queries. The callback
+    may be registered after completion (e.g. when CPU result processing catches up).
+    """
+
+    def __init__(self):
+        self.num_intervals = 0
+        self._pending = 0
+        self._sealed = False
+        self._elapsed = 0.0
+        self._callback = None
+
+    def when_ready(self, callback: Callable[[float], None]):
+        self._callback = callback
+        self._notify()
+
+    def _notify(self):
+        if self._sealed and self._pending == 0 and self._callback is not None:
+            callback, self._callback = self._callback, None
+            callback(self._elapsed)
+
+
 class DeviceTimer:
-    def __init__(self, reporter: Callable):
+    def __init__(self, reporter: Optional[Callable] = None):
         self._intervals: Deque[_TimingInterval] = deque()
-        self._reporters: List[Callable] = [reporter]
+        self._reporters: List[Callable] = [] if reporter is None else [reporter]
         self._in_wrap = False
+        self._capture: Optional[DeviceTiming] = None
+
+    @contextmanager
+    def capture(self):
+        """Group intervals launched in this scope without recording new events."""
+        assert self._capture is None, "DeviceTimer.capture is not re-entrant"
+        timing = DeviceTiming()
+        self._capture = timing
+        try:
+            yield timing
+        finally:
+            self._capture = None
+            timing._sealed = True
+            timing._notify()
 
     def add_reporter(self, reporter: Callable):
         self._reporters.append(reporter)
@@ -32,6 +70,10 @@ class DeviceTimer:
         # an un-ended one at the head of the queue for _report() to trip over.
         assert not self._in_wrap, "DeviceTimer.wrap is not re-entrant"
         interval = _TimingInterval.create()
+        interval.capture = self._capture
+        if interval.capture is not None:
+            interval.capture.num_intervals += 1
+            interval.capture._pending += 1
         self._intervals.append(interval)
         self._in_wrap = True
         try:
@@ -51,6 +93,11 @@ class DeviceTimer:
             elapsed = interval.elapsed_time() / 1000.0
             for reporter in self._reporters:
                 reporter(t=elapsed, **interval.metadata)
+            if interval.capture is not None:
+                timing = interval.capture
+                timing._elapsed += elapsed
+                timing._pending -= 1
+                timing._notify()
 
 
 class GapTimer(DeviceTimer):
@@ -87,6 +134,7 @@ class _TimingInterval:
     start_event: torch.cuda.Event
     end_event: Optional[torch.cuda.Event] = None
     metadata: Optional[Dict] = None
+    capture: Optional[DeviceTiming] = None
 
     @staticmethod
     def create():
