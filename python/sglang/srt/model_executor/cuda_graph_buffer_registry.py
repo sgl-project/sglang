@@ -14,10 +14,9 @@
 """FB-shared slot registry for the CUDA graph forward paths.
 
 ``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
-used by capture / replay. It replaces the per-runner ``DecodeInputBuffers`` /
-``PrefillInputBuffers`` dataclasses and their hand-written
-``populate_from_forward_batch`` methods with a single ``GraphSlot``-driven
-registry.
+used by capture / replay. It replaces the hand-written per-runner buffer
+population logic with a single ``GraphSlot``-driven registry while adopting
+the storage allocated by ``DecodeInputBuffers`` / ``PrefillInputBuffers``.
 
 Backend-private buffers (kernel workspaces, derived page tables, etc.) stay
 on ``AttentionBackend.cuda_graph_*`` — the registry only owns FB-shared
@@ -656,7 +655,11 @@ def build_decode_registry(
             # init_new -- they leave the GLOBAL None and set the replicated LOCAL
             # count directly, so carry that through.
             if fb.global_num_token_non_padded is None:
-                buf.copy_(fb.num_token_non_padded)
+                # DFLASH's dense draft can omit both optional counts, even
+                # when EP on the target enables this slot. Preserve the
+                # registry's skip-missing-field behavior for that path.
+                if fb.num_token_non_padded is not None:
+                    buf.copy_(fb.num_token_non_padded)
                 return
             sharded = not enable_prefill_cp and attn_tp_sharded_fn(
                 ctx.padded_num_tokens
