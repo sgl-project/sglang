@@ -76,7 +76,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         phase: LRURefreshPhase,
         node_id: NodeIdx_,
     ) {
-        // Python reference — tree_component.py::TreeComponent.refresh_lru:
+        // Python reference — base.py::TreeComponent.refresh_lru:
         //     def refresh_lru(
         //         self,
         //         phase: LRURefreshPhase,
@@ -104,7 +104,7 @@ pub trait TreeComponent<K: ChildKeyType> {
 
     /// Return a per-match stateful predicate deciding whether a node is a valid
     /// match boundary for this component.
-    // Python reference — tree_component.py::TreeComponent.create_match_validator:
+    // Python reference — base.py::TreeComponent.create_match_validator:
     //     @abstractmethod
     //     def create_match_validator(
     //         self, match_device_only: bool = False
@@ -130,6 +130,8 @@ pub trait TreeComponent<K: ChildKeyType> {
         &self,
         tree_core: &UnifiedTreeCore<K>,
         result: MatchResult,
+        _last_device_node_idx: NodeIdx_,
+        _best_match_node_idx: NodeIdx_,
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[Tensor],
         best_value_len: usize,
@@ -209,7 +211,7 @@ pub trait TreeComponent<K: ChildKeyType> {
 
     /// Redistribute component data between `new_parent` and `child` when a node is
     /// split; `new_parent` is the newly created prefix node.
-    // Python reference — tree_component.py::TreeComponent.redistribute_on_node_split:
+    // Python reference — base.py::TreeComponent.redistribute_on_node_split:
     //     @abstractmethod
     //     def redistribute_on_node_split(
     //         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -232,7 +234,7 @@ pub trait TreeComponent<K: ChildKeyType> {
 
     /// Free this component's KV resources on a node being evicted; returns
     /// (device_freed, host_freed) token counts.
-    // Python reference — tree_component.py::TreeComponent.evict_component:
+    // Python reference — base.py::TreeComponent.evict_component:
     //     @abstractmethod
     //     def evict_component(
     //         self,
@@ -287,7 +289,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>);
 
     /// Increment component lock refs, protecting nodes from eviction.
-    // Python reference — tree_component.py::TreeComponent.acquire_component_lock:
+    // Python reference — base.py::TreeComponent.acquire_component_lock:
     //     @abstractmethod
     //     def acquire_component_lock(
     //         self,
@@ -319,7 +321,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     ) -> IncLockRefResult;
 
     /// Decrement component lock refs, un-protecting nodes.
-    // Python reference — tree_component.py::TreeComponent.release_component_lock:
+    // Python reference — base.py::TreeComponent.release_component_lock:
     //     @abstractmethod
     //     def release_component_lock(
     //         self,
@@ -372,7 +374,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         prefetch_tokens: usize,
         last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
-        // Python reference — tree_component.py::TreeComponent.build_hicache_transfers:
+        // Python reference — base.py::TreeComponent.build_hicache_transfers:
         //     def build_hicache_transfers(
         //         self,
         //         node: UnifiedTreeNode,
@@ -401,7 +403,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
-        // Python reference — tree_component.py::TreeComponent.commit_hicache_transfer:
+        // Python reference — base.py::TreeComponent.commit_hicache_transfer:
         //     def commit_hicache_transfer(
         //         self,
         //         node: UnifiedTreeNode,

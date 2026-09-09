@@ -25,7 +25,6 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         component_name: str = "vision_language_encoder",
     ) -> Any:
         if self.structural_component_type(component_name) == "vision_language_encoder":
-
             if server_args.srt_encoder_url is not None:
                 health_url = server_args.srt_encoder_url.rstrip("/") + "/health"
                 try:

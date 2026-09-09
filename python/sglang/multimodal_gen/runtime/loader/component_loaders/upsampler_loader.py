@@ -1,4 +1,3 @@
-import glob
 import json
 import os
 import re
@@ -10,6 +9,7 @@ from safetensors.torch import load_file as safetensors_load_file
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PlainStateDictComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
     LatentUpsampler,
 )
@@ -59,7 +59,7 @@ def _find_safetensors_file(path: str) -> str:
         return path
 
     if os.path.isdir(path):
-        files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+        files = _list_safetensors_files(path)
         if len(files) == 1:
             return files[0]
         elif len(files) > 1:
@@ -75,7 +75,7 @@ def _find_safetensors_file(path: str) -> str:
     try:
         maybe_downloaded = maybe_download_model(path)
         if os.path.isdir(maybe_downloaded):
-            files = sorted(glob.glob(os.path.join(maybe_downloaded, "*.safetensors")))
+            files = _list_safetensors_files(maybe_downloaded)
             if len(files) == 1:
                 return files[0]
             elif len(files) > 1:
