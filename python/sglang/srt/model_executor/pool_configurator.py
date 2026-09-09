@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
@@ -294,9 +295,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
+                from sglang.srt.mem_cache.kv_cache_configurator import (
+                    dcp_index_buf_widening_factor,
+                )
+
+                # Under DCP the latent KV shards but the indexer is replicated
+                # over the whole virtual loc space, so its per-token cost is
+                # dcp_size times what one rank's share would suggest. Counting
+                # it once here derives a max_total the pool cannot honour, and
+                # the symptom is an unexplained OOM during pool construction.
                 cell_size += self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
+                ) * dcp_index_buf_widening_factor(
+                    dcp_size,
+                    index_buf_is_replicated=self._is_ascend_mla_pool(kvc),
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
@@ -366,6 +379,39 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         return cell_size
 
+    @staticmethod
+    def _is_ascend_mla_pool(kvc: KVCacheConfigurator) -> bool:
+        """Will ``NPUMLATokenToKVPool`` be the pool for this model?
+
+        Mirrors the gate on ``_build_ascend_mla_kv_pool``. Two budget terms
+        depend on it, and both were wrong before this predicate existed,
+        because that pool differs from the CUDA ``DSATokenToKVPool`` twice over:
+
+        1. **It widens index-K under DCP.** It is the only builder that passes
+           ``index_buf_size=dcp_virtual_loc_extent(...)``, spanning the whole
+           virtual loc space rather than one rank's shard.
+        2. **It stores index-K unquantized.** Plain ``index_head_dim`` at the
+           pool's own dtype, where the CUDA pool packs k-with-scale into uint8.
+
+        **Keep this in step with the builder.** If another backend adopts either
+        behaviour without teaching this predicate, it gets the same unexplained
+        load-time OOM Ascend did -- and CI will not catch it, because every
+        configuration CI runs has ``dcp_size == 1`` and a CUDA pool.
+
+        On CUDA the indexer is not widened today (``_build_dsa_kv_pool`` omits
+        ``index_buf_size`` entirely), so this returns False there and the CUDA
+        budget is untouched. That omission is a separate, known under-allocation
+        on the CUDA side; this predicate describes what the code does, not what
+        it should do.
+        """
+        return (
+            get_exec().kernel.attention_backend == "ascend"
+            and kvc.use_mla_backend
+            and not kvc.is_hybrid_swa
+            and not is_minimax_sparse(kvc.model_config.hf_config)
+            and mambaish_config(kvc.model_config) is None
+        )
+
     def _compute_dsa_indexer_cell_size(
         self,
         *,
@@ -374,12 +420,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        indexer_size_per_token = (
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-        )
-        element_size = torch._utils._element_size(
-            DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        )
+        if self._is_ascend_mla_pool(kvc):
+            # NPUMLATokenToKVPool allocates index-K as
+            #   (pages, page_size, 1, index_head_dim) at store_dtype
+            # -- plain, unquantized, no scale columns. Pricing it with the CUDA
+            # pool's k-with-scale layout under-counts it by nearly 2x on a bf16
+            # cache (256 B/token/layer actual against 132 B budgeted), which
+            # compounds with the DCP widening above.
+            indexer_size_per_token = index_head_dim
+            element_size = torch._utils._element_size(kvc.kv_cache_dtype)
+        else:
+            indexer_size_per_token = (
+                index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+            )
+            element_size = torch._utils._element_size(
+                DSATokenToKVPool.index_k_with_scale_buffer_dtype
+            )
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
