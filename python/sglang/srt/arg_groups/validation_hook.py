@@ -108,9 +108,9 @@ def check_server_args(server_args: Any):
                 "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
             )
         else:
-            assert (
-                cfg.disable_overlap_schedule
-            ), "Pipeline parallelism is not compatible with overlap schedule"
+            assert cfg.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
             pp_dspark_prefill = (
                 cfg.speculative_algorithm or ""
             ).upper() == "DSPARK" and cfg.disaggregation_mode == "prefill"
