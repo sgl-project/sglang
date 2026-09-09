@@ -545,14 +545,25 @@ def generate_decode_cuda_graph_batch_sizes(server_args: Any, max_bs: int):
             + list(range(512, max_bs + 1, 32))
         )
     else:
-        # Spec decoding case: less padding for smaller batch sizes
-        capture_bs = (
-            list(range(1, 9, 1))
-            + list(range(10, 33, 2))
-            + list(range(40, 65, 4))
-            + list(range(72, 257, 8))
-            + list(range(272, max_bs + 1, 16))
-        )
+        if cfg.speculative_algorithm == "DFLASH_CONFIDENCE":
+            # Compact verification packs variable-length rows into token
+            # buckets. Capture denser request-count tiers so replay does not
+            # pay excessive packed-token padding at larger batch sizes.
+            capture_bs = (
+                list(range(1, 17))
+                + list(range(18, 65, 2))
+                + list(range(68, 257, 4))
+                + list(range(264, max_bs + 1, 8))
+            )
+        else:
+            # Spec decoding case: less padding for smaller batch sizes.
+            capture_bs = (
+                list(range(1, 9))
+                + list(range(10, 33, 2))
+                + list(range(40, 65, 4))
+                + list(range(72, 257, 8))
+                + list(range(272, max_bs + 1, 16))
+            )
 
     capture_bs = [bs for bs in capture_bs if bs <= max_bs]
 

@@ -55,6 +55,10 @@ class DFlashDraftInputV2(SpecInput):
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
 
+    # Prepared by the overlap scheduler from an asynchronously relayed N-2
+    # snapshot. This is the DSpark-style number of optional positions above
+    # the per-request verify floor; the worker allocates it with current GPU
+    # confidence. `None` falls back to lossless full verification.
     verify_token_budget: Optional[int] = None
 
     def __post_init__(self):

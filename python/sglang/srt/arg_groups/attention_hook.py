@@ -409,14 +409,14 @@ def handle_linear_attn_backend(server_args: Any):
             # refusing those combinations.
             _algo = (cfg.speculative_algorithm or "").upper()
             verify = cfg.linear_attn_verify_backend
-            if _algo not in ("DSPARK", "DFLASH") or verify not in (
+            if _algo not in ("DSPARK", "DFLASH", "DFLASH_CONFIDENCE") or verify not in (
                 "triton",
                 "nv_cutedsl",
             ):
                 raise ValueError(
                     "--enable-linear-replayssm-spec with "
                     f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
-                    "KDA fold-every-commit family (DSPARK/DFLASH) and a "
+                    "KDA fold-every-commit family (DSPARK/DFLASH/DFLASH_CONFIDENCE) and a "
                     "ring-writing verify kernel (--linear-attn-verify-backend "
                     "triton or nv_cutedsl); got "
                     f"algorithm={cfg.speculative_algorithm!r}, "

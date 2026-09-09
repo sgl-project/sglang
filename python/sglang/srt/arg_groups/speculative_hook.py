@@ -141,7 +141,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "handle_speculative_decoding",
             speculative_draft_window_size=window_size,
         )
-        if cfg.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if cfg.speculative_algorithm not in (
+            "EAGLE3",
+            "DFLASH",
+            "DFLASH_CONFIDENCE",
+        ):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
                 "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
@@ -314,6 +318,48 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={cfg.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    if cfg.speculative_algorithm == "DFLASH_CONFIDENCE":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+            logger.warning(
+                "DFLASH_CONFIDENCE needs compact ragged target verification; "
+                "SGLANG_RAGGED_VERIFY_MODE=static captures no token-keyed CUDA "
+                "Graph buckets, so every verify step falls back to the "
+                "lossless full-width path and no dynamic scheduling happens. "
+                "Set SGLANG_RAGGED_VERIFY_MODE=compact to enable it."
+            )
+        threshold = float(cfg.speculative_dflash_confidence_threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                "--speculative-dflash-confidence-threshold must be in [0, 1], "
+                f"got {threshold}."
+            )
+        target_tokens = int(cfg.speculative_dflash_confidence_target_verify_tokens)
+        if target_tokens < 0:
+            raise ValueError(
+                "--speculative-dflash-confidence-target-verify-tokens must be "
+                f"non-negative, got {target_tokens}."
+            )
+        sps_table_path = cfg.speculative_dflash_confidence_sps_table_path
+        if sps_table_path and not os.path.isfile(sps_table_path):
+            raise ValueError(
+                "--speculative-dflash-confidence-sps-table-path must point to an "
+                f"existing SPS table JSON file, got {sps_table_path!r}."
+            )
+        if (
+            cfg.speculative_dflash_confidence_align_verify_tokens_to_graph_tier
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+        ):
+            logger.warning(
+                "--speculative-dflash-confidence-align-verify-tokens-to-graph-tier "
+                "only takes effect with SGLANG_RAGGED_VERIFY_MODE=compact (got %r); "
+                "it will be a no-op.",
+                read_ragged_verify_mode().value,
+            )
     _resolve_dflash_draft_attention_backend(server_args)
 
     if cfg.max_running_requests is None:

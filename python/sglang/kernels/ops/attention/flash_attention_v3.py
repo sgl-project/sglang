@@ -17,14 +17,25 @@ DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
 def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
-    if out is None:
-        return kernel(*args, **kwargs)
+    call_kwargs = dict(kwargs)
+    if out is not None:
+        call_kwargs["out"] = out
     try:
-        return kernel(*args, **kwargs, out=out)
+        return kernel(*args, **call_kwargs)
     except TypeError as exc:
+        # Older installed sgl-kernel FA3 bindings do not expose every optional
+        # API argument supported by the kernels-community wrapper. Qwen3 uses
+        # only_qv=False, so dropping that unsupported no-op preserves behavior.
+        if (
+            "unexpected keyword argument 'only_qv'" in str(exc)
+            and call_kwargs.get("only_qv") is False
+        ):
+            call_kwargs.pop("only_qv")
+            return kernel(*args, **call_kwargs)
         if "unexpected keyword argument 'out'" not in str(exc):
             raise
-        return kernel(*args, **kwargs)
+        call_kwargs.pop("out", None)
+        return kernel(*args, **call_kwargs)
 
 
 @cache_once

@@ -5010,10 +5010,19 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
-        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+        if (
+            self.spec_algorithm.is_dspark()
+            or self.spec_algorithm.is_dflash_confidence()
+        ) and self.draft_worker is not None:
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
-                ret["dspark_info_record"] = info_record
+                ret[
+                    (
+                        "dspark_info_record"
+                        if self.spec_algorithm.is_dspark()
+                        else "dflash_confidence_info_record"
+                    )
+                ] = info_record
 
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
             ret["env_vars"] = exportable_env_vars()
@@ -5032,7 +5041,9 @@ class Scheduler(
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
+                "dflash_confidence_force_budget_frac",
                 "dspark_clear_info_records",
+                "dflash_confidence_clear_info_records",
             ]
         )
 
@@ -5065,12 +5076,39 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "dflash_confidence_force_budget_frac":
+                if not self.spec_algorithm.is_dflash_confidence() or not hasattr(
+                    self.draft_worker, "set_dflash_confidence_forced_budget_frac"
+                ):
+                    logging.warning(
+                        "dflash_confidence_force_budget_frac requires a "
+                        "DFLASH_CONFIDENCE draft worker."
+                    )
+                    if_success = False
+                    break
+                if v is not None and not (0.0 < float(v) <= 1.0):
+                    logging.warning(
+                        "dflash_confidence_force_budget_frac must be in (0, 1] "
+                        f"or null, got {v}."
+                    )
+                    if_success = False
+                    break
             elif k == "dspark_clear_info_records":
                 if not self.spec_algorithm.is_dspark() or not hasattr(
                     self.draft_worker, "clear_info_records"
                 ):
                     logging.warning(
                         "dspark_clear_info_records requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
+            elif k == "dflash_confidence_clear_info_records":
+                if not self.spec_algorithm.is_dflash_confidence() or not hasattr(
+                    self.draft_worker, "clear_info_records"
+                ):
+                    logging.warning(
+                        "dflash_confidence_clear_info_records requires a "
+                        "DFLASH_CONFIDENCE draft worker."
                     )
                     if_success = False
                     break
@@ -5096,7 +5134,16 @@ class Scheduler(
                 self.draft_worker.set_dspark_forced_budget_frac(
                     None if frac is None else float(frac)
                 )
+            confidence_frac = remaining.pop(
+                "dflash_confidence_force_budget_frac", None
+            )
+            if "dflash_confidence_force_budget_frac" in server_args_dict:
+                self.draft_worker.set_dflash_confidence_forced_budget_frac(
+                    None if confidence_frac is None else float(confidence_frac)
+                )
             if remaining.pop("dspark_clear_info_records", None):
+                self.draft_worker.clear_info_records()
+            if remaining.pop("dflash_confidence_clear_info_records", None):
                 self.draft_worker.clear_info_records()
             if remaining:
                 get_context().override(source="update_server_args", **remaining)
