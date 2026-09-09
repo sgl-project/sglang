@@ -6,11 +6,16 @@ import ast
 import enum
 import hashlib
 import logging
+import multiprocessing
 import random
 import sys
+import tempfile
+import time
+import traceback
 import unittest
 from collections import deque
 from contextlib import nullcontext
+from datetime import timedelta
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,7 +53,205 @@ load_definitions(
     ROOT / "python/sglang/test/ci/ci_register.py", ["register_cpu_ci"], _ci
 )
 register_cpu_ci = _ci["register_cpu_ci"]
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
+
+def run_hicache_rank(rank, init_method, results, step_barrier):
+    case = TestTransferSequenceLength()
+    phase = "initialization"
+    calls = []
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method=init_method,
+            rank=rank,
+            world_size=2,
+            timeout=timedelta(seconds=5),
+        )
+        case.setUp()
+        case.all_reduce.stop()
+        all_reduce = dist.all_reduce
+
+        def tracked_reduce(tensor, op, group):
+            calls.append(tensor.tolist())
+            return all_reduce(tensor, op=op, group=group)
+
+        restore = case.ns["HiCacheRestoreResult"]
+        scenarios = [
+            ("pending", restore.READY, restore.PENDING, "success", 9, False, False),
+            ("failed", restore.READY, restore.FAILED, "success", 9, False, True),
+            (
+                "failed_pending",
+                restore.FAILED,
+                restore.PENDING,
+                "success",
+                9,
+                False,
+                True,
+            ),
+            (
+                "failed_rdma",
+                restore.FAILED,
+                restore.READY,
+                "transferring",
+                9,
+                False,
+                True,
+            ),
+            ("failed_scatter", restore.FAILED, restore.READY, "success", 9, True, True),
+            (
+                "network_failed_pending",
+                restore.READY,
+                restore.PENDING,
+                "failed",
+                9,
+                False,
+                True,
+            ),
+            (
+                "length_pending",
+                restore.READY,
+                restore.PENDING,
+                "success",
+                1,
+                False,
+                True,
+            ),
+        ]
+        observations = []
+        with patch.object(dist, "all_reduce", side_effect=tracked_reduce):
+            for staging in (False, True):
+                for (
+                    name,
+                    left,
+                    right,
+                    network,
+                    length,
+                    scatter_pending,
+                    fails,
+                ) in scenarios:
+                    if scatter_pending and not staging:
+                        continue
+                    case.ns["release_kv_cache"].reset_mock()
+                    queue, dr, receiver = case.make_queue(
+                        case.make_req(), length if rank == 0 else 9, staging
+                    )
+                    queue.gloo_group = dist.group.WORLD
+                    queue.tp_rank = rank
+                    queue.metadata_buffers.get_buf = Mock(
+                        wraps=queue.metadata_buffers.get_buf
+                    )
+                    queue.scheduler.enable_decode_hicache = True
+                    dr.hicache_restore_status = (left, right)[rank]
+                    dr.prefix_match = SimpleNamespace(needs_local_restore=True)
+                    dr.hicache_restored_node = object()
+                    dr.hicache_load_consumer_index = 0
+                    queue.tree_cache = SimpleNamespace(
+                        is_load_back_event_done=Mock(return_value=False),
+                        cache_controller=SimpleNamespace(
+                            layer_done_counter=SimpleNamespace(
+                                producer_index=0, num_counters=2
+                            )
+                        ),
+                    )
+                    network_rank = 1 if network == "transferring" else 0
+                    receiver.poll.return_value = (
+                        {
+                            "success": case.poll.Success,
+                            "transferring": case.poll.Transferring,
+                            "failed": case.poll.Failed,
+                        }[network]
+                        if rank == network_rank
+                        else case.poll.Success
+                    )
+                    queue.staging_handler.is_done.return_value = not (
+                        scatter_pending and rank == 1
+                    )
+                    waits = (
+                        restore.PENDING in (left, right)
+                        or network == "transferring"
+                        or scatter_pending
+                    )
+                    for tick in range(2 if waits else 1):
+                        phase = (name, staging, tick)
+                        calls.clear()
+                        if tick:
+                            queue.tree_cache.is_load_back_event_done.return_value = True
+                            if network != "failed":
+                                receiver.poll.return_value = case.poll.Success
+                            queue.staging_handler.is_done.return_value = True
+                        transferred = queue.pop_transferred()
+                        waiting = waits and tick == 0
+                        expected_outcome = (
+                            "waiting" if waiting else "failed" if fails else "committed"
+                        )
+                        outcome = (
+                            "waiting"
+                            if queue.queue
+                            else "failed"
+                            if dr.req.finished_reason is not None
+                            else "committed"
+                        )
+                        state = (name, staging, tick, outcome, len(calls))
+                        # Keep the next tick from matching an omitted collective.
+                        step_barrier.wait(timeout=10)
+                        case.assertEqual(outcome, expected_outcome)
+                        if waiting:
+                            restore_gate = network == "failed" or (
+                                staging and network == "success" and not scatter_pending
+                            )
+                            expected_shapes = [1, 2] if restore_gate else [1]
+                        else:
+                            expected_shapes = (
+                                [1, 2, 1]
+                                if not fails or name == "length_pending"
+                                else [1, 2]
+                            )
+                        case.assertEqual([len(call) for call in calls], expected_shapes)
+                        if waiting:
+                            case.assertEqual(transferred, [])
+                            case.assertEqual(dr.req.output_ids, [])
+                            case.assertIsNone(dr.req.finished_reason)
+                            receiver.clear.assert_not_called()
+                            case.ns["release_kv_cache"].assert_not_called()
+                            queue._commit_hicache_local_restore_to_req.assert_not_called()
+                            queue.metadata_buffers.get_buf.assert_not_called()
+                            case.assertEqual(
+                                queue.req_to_metadata_buffer_idx_allocator.available_size(),
+                                0,
+                            )
+                        else:
+                            receiver.clear.assert_called_once()
+                            case.assertIsNone(dr.kv_receiver)
+                            case.assertEqual(
+                                queue.req_to_metadata_buffer_idx_allocator.available_size(),
+                                1,
+                            )
+                            if fails:
+                                case.assertEqual(transferred, [])
+                                case.assertEqual(dr.req.output_ids, [])
+                                case.assertEqual(
+                                    dr.req.finished_reason.status_code,
+                                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                                )
+                                case.ns["release_kv_cache"].assert_called_once_with(
+                                    dr.req, queue.tree_cache, is_insert=False
+                                )
+                                queue._commit_hicache_local_restore_to_req.assert_not_called()
+                            else:
+                                case.assertEqual(transferred, [dr.req])
+                                case.assertEqual(dr.req.output_ids, [17])
+                                case.ns["release_kv_cache"].assert_not_called()
+                        observations.append(state)
+        results.put((rank, observations, None))
+    except Exception:
+        results.put(
+            (rank, None, f"{phase=}, collectives={calls}\n{traceback.format_exc()}")
+        )
+    finally:
+        case.doCleanups()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 class TestTransferSequenceLength(unittest.TestCase):
@@ -73,10 +276,15 @@ class TestTransferSequenceLength(unittest.TestCase):
                 SGLANG_TEST_DISAGG_FAILURE_PROB=Mock(get=lambda: 0),
             ),
             release_kv_cache=Mock(),
-            HiCacheRestoreResult=SimpleNamespace(READY=0, PENDING=1, FAILED=2),
+            Enum=enum.Enum,
         )
         load_definitions(
             SRT / "disaggregation/base/conn.py", ["KVPoll", "StateType"], self.ns
+        )
+        load_definitions(
+            SRT / "disaggregation/decode_hicache_mixin.py",
+            ["HiCacheRestoreResult", "HiCacheRestoreGatedKVReceiver"],
+            self.ns,
         )
         load_definitions(
             SRT / "managers/schedule_batch.py",
@@ -145,6 +353,15 @@ class TestTransferSequenceLength(unittest.TestCase):
             "pop_transferred",
         ):
             methods[name] = self.ns[name]
+        load_definitions(
+            SRT / "disaggregation/decode_hicache_mixin.py",
+            ["_process_hicache_local_restores"],
+            self.ns,
+            class_name="DecodeHiCacheTransferMixin",
+        )
+        methods["_process_hicache_local_restores"] = self.ns[
+            "_process_hicache_local_restores"
+        ]
         self.queue_type = type("DecodeTransferQueue", (), methods)
         self.poll = self.ns["KVPoll"]
         self.all_reduce = patch.object(
@@ -201,7 +418,7 @@ class TestTransferSequenceLength(unittest.TestCase):
             kv_receiver=receiver,
             metadata_buffer_index=0,
             is_rebootstrap=req.pd_rebootstrap_in_progress,
-            hicache_restore_status=0,
+            hicache_restore_status=self.ns["HiCacheRestoreResult"].READY,
         )
         queue = self.queue_type()
         queue.queue = [dr]
@@ -419,6 +636,44 @@ class TestTransferSequenceLength(unittest.TestCase):
                     self.reduce.side_effect = consensus
                     self.assert_rejected(queue, dr, receiver)
                     self.assertEqual(len(calls), 2)
+
+    @unittest.skipUnless(dist.is_gloo_available(), "requires CPU Gloo")
+    def test_two_rank_hicache_collective_order(self):
+        ctx = multiprocessing.get_context("spawn")
+        results = ctx.Queue()
+        step_barrier = ctx.Barrier(2)
+        with tempfile.TemporaryDirectory() as directory:
+            init_method = f"file://{directory}/gloo"
+            processes = [
+                ctx.Process(
+                    target=run_hicache_rank,
+                    args=(rank, init_method, results, step_barrier),
+                )
+                for rank in range(2)
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                deadline = time.monotonic() + 45
+                reports = [
+                    results.get(timeout=max(0.1, deadline - time.monotonic()))
+                    for _ in processes
+                ]
+                for process in processes:
+                    process.join(timeout=5)
+                    self.assertEqual(process.exitcode, 0)
+                self.assertEqual({rank for rank, _, _ in reports}, {0, 1})
+                for _, _, error in reports:
+                    self.assertIsNone(error, error)
+                self.assertEqual(reports[0][1], reports[1][1])
+                self.assertEqual(len(reports[0][1]), 24)
+            finally:
+                for process in processes:
+                    if process.is_alive():
+                        process.kill()
+                    process.join(timeout=5)
+                results.close()
+                results.join_thread()
 
 
 if __name__ == "__main__":
