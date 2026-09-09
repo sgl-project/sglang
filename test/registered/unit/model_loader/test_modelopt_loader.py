@@ -757,12 +757,6 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         return quant_config.get_quant_method(layer, "mtp.layers.0.mlp.experts")
 
     def test_block_fp8_moe_dispatches_under_both_algo_names(self):
-        """Regression: `nvidia/Qwen3.8-Flash-Next-NVFP4` lists its MTP experts as
-        block-FP8 (`FP8_BLOCK_SCALES` in hf_quant_config.json, the canonical
-        `FP8_PB_WO` in config.json). The FusedMoE branch had no entry for
-        either, so the experts were built unquantized: the fp8 values were
-        cast to bf16 without their scales and `weight_scale_inv` was dropped
-        by the loader, with no error."""
         for algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
             with self.subTest(algo=algo):
                 method = self._block_fp8_moe_method(algo)

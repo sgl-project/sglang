@@ -779,9 +779,9 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
         return out.view(*index_shape, hidden).to(self.params_dtype)
 
 
-# ``FP8_PB_WO`` is ModelOpt's canonical 2D block-FP8 name. Early composed
-# Qwen3.8-Flash-Next checkpoints label the same tensor layout (fp8 weight +
-# per-block ``weight_scale_inv``) ``FP8_BLOCK_SCALES``; keep it as an alias.
+# FP8_PB_WO is ModelOpt's canonical 2D block-FP8 name.
+# Qwen3.8-Flash-Next-NVFP4 used FP8_BLOCK_SCALES for the same tensor layout.
+# Keep it as an alias.
 _BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
 
 
@@ -881,9 +881,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         if group_size is None:
             group_size = 16
 
-        # Block-FP8 layers carry their block size as ``group_size``
-        # (default 128). One Fp8Config serves every such layer, so they must
-        # all agree.
+        # Block-FP8 layers carry their block size as group_size
+        # (default 128). One Fp8Config serves every such layer.
         block_sizes = {
             int(layer_info.get("group_size", 128))
             for layer_info in quantized_layers.values()
@@ -1050,8 +1049,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
-                # Block-scaled fp8 experts with per-block weight_scale_inv
-                # (e.g. the MTP experts of Qwen3.8-Flash-Next-NVFP4).
                 return Fp8MoEMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
