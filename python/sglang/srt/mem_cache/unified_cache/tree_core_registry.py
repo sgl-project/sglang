@@ -106,6 +106,13 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     return None
 
 
+def _rust_unported_feature(params: CacheInitParams) -> Optional[str]:
+    """The flag of an enabled opt-in feature only the Python TreeCore implements."""
+    if params.hicache_serialize_load_back:
+        return "--hicache-serialize-load-back"
+    return None
+
+
 def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     """Resolve known Rust capability gaps before loading a backend.
 
@@ -117,6 +124,13 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     reason = _rust_fallback_reason(params)
     if reason is not None:
         logger.info("Using the Python TreeCore: %s", reason)
+        return "python"
+    feature = _rust_unported_feature(params)
+    if feature is not None:
+        logger.warning(
+            "Using the Python TreeCore: %s is not yet supported by the Rust TreeCore",
+            feature,
+        )
         return "python"
     return name
 
