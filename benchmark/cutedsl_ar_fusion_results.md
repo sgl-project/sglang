@@ -79,62 +79,65 @@ Model: `nvidia/GLM-5.2-NVFP4`, hidden size 6144, top-k 8, 75 MoE layers.
 Hardware: 8x B300, single node. Workload: 1024 input and 1024 output tokens,
 every request the same length.
 
-The numbers are decode throughput in output tokens for each second. Higher is
-better. Each number divides the batch size by the median inter-token latency,
-so it excludes the prefill time. The speedup column divides the stock
-inter-token latency by the cute-dsl-plus-bound inter-token latency.
+The stock column holds decode throughput in output tokens for each second. It
+divides the batch size by the median inter-token latency, so it excludes the
+prefill time.
+
+The other three columns hold the gain of that arm over stock, as a percentage.
+Higher is better. Each percentage comes from the median inter-token latency
+rather than from the rounded throughput.
 
 ### TP8
 
-| batch | stock | stock + bound | cute-dsl | cute-dsl + bound | speedup |
-|---|---|---|---|---|---|
-| 1 | 169 | 169 | 177 | 177 | **1.047x** |
-| 2 | 326 | 326 | 343 | 343 | **1.054x** |
-| 4 | 592 | 592 | 623 | 622 | **1.051x** |
-| 8 | 1021 | 1021 | 1073 | 1071 | **1.050x** |
-| 16 | 1665 | 1665 | 1699 | 1703 | **1.023x** |
-| 32 | 2659 | 2659 | 2709 | 2716 | **1.021x** |
-| 64 | 4256 | 4256 | 4366 | 4362 | **1.025x** |
-| 128 | 7176 | 7176 | 7348 | 7348 | **1.024x** |
-| 256 | 10667 | 11120 | 10797 | 11142 | **1.045x** |
-| 384 | 12629 | 13666 | 12851 | 13643 | **1.080x** |
-| 512 | 13978 | 15678 | 14431 | 15769 | **1.128x** |
+| batch | stock (tok/s) | stock + bound | cute-dsl | cute-dsl + bound |
+|---|---|---|---|---|
+| 1 | 169 | +0.0% | +4.6% | **+4.7%** |
+| 2 | 326 | +0.0% | +5.4% | **+5.4%** |
+| 4 | 592 | +0.0% | +5.2% | **+5.1%** |
+| 8 | 1021 | +0.0% | +5.1% | **+5.0%** |
+| 16 | 1665 | +0.0% | +2.1% | **+2.3%** |
+| 32 | 2659 | +0.0% | +1.9% | **+2.1%** |
+| 64 | 4256 | +0.0% | +2.6% | **+2.5%** |
+| 128 | 7176 | +0.0% | +2.4% | **+2.4%** |
+| 256 | 10667 | +4.2% | +1.2% | **+4.5%** |
+| 384 | 12629 | +8.2% | +1.8% | **+8.0%** |
+| 512 | 13978 | +12.2% | +3.2% | **+12.8%** |
 
-Range 1.021x to 1.128x. Mean 1.050x.
+The last column ranges from +2.1% to +12.8%. The mean is +5.0%.
 
 ### TP4
 
-| batch | stock | stock + bound | cute-dsl | cute-dsl + bound | speedup |
-|---|---|---|---|---|---|
-| 1 | 150 | 150 | 157 | 157 | **1.047x** |
-| 2 | 286 | 286 | 296 | 296 | **1.037x** |
-| 4 | 503 | 503 | 523 | 523 | **1.040x** |
-| 8 | 842 | 842 | 875 | 875 | **1.040x** |
-| 16 | 1312 | 1312 | 1331 | 1330 | **1.014x** |
-| 32 | 2008 | 2008 | 2032 | 2034 | **1.013x** |
-| 64 | 3174 | 3174 | 3226 | 3235 | **1.019x** |
-| 128 | 5336 | 5336 | 5392 | 5394 | **1.011x** |
-| 256 | 8249 | 8501 | 8309 | 8453 | **1.025x** |
-| 384 | 10163 | 10744 | 10278 | 10733 | **1.056x** |
-| 512 | 11365 | 12664 | 11575 | 12625 | **1.111x** |
+| batch | stock (tok/s) | stock + bound | cute-dsl | cute-dsl + bound |
+|---|---|---|---|---|
+| 1 | 150 | +0.0% | +4.7% | **+4.7%** |
+| 2 | 286 | +0.0% | +3.6% | **+3.7%** |
+| 4 | 503 | +0.0% | +3.9% | **+4.0%** |
+| 8 | 842 | +0.0% | +3.9% | **+4.0%** |
+| 16 | 1312 | +0.0% | +1.4% | **+1.4%** |
+| 32 | 2008 | +0.0% | +1.2% | **+1.3%** |
+| 64 | 3174 | +0.0% | +1.6% | **+1.9%** |
+| 128 | 5336 | +0.0% | +1.0% | **+1.1%** |
+| 256 | 8249 | +3.1% | +0.7% | **+2.5%** |
+| 384 | 10163 | +5.7% | +1.1% | **+5.6%** |
+| 512 | 11365 | +11.4% | +1.8% | **+11.1%** |
 
-Range 1.011x to 1.111x. Mean 1.037x.
+The last column ranges from +1.1% to +11.1%. The mean is +3.7%.
 
 ### The bound, measured on cute-dsl at TP8
 
-| batch | defer on | defer off | effect of turning defer off |
-|---|---|---|---|
-| 8 | 1017 | 979 | -3.75% |
-| 16 | 1698 | 1556 | -8.40% |
-| 32 | 2713 | 2534 | -6.60% |
-| 64 | 4369 | 4177 | -4.41% |
-| 96 | 5958 | 5601 | -6.01% |
-| 128 | 7372 | 7106 | -3.61% |
-| 160 | 7832 | 7776 | -0.71% |
-| 192 | 8938 | 9037 | +1.11% |
-| 256 | 10899 | 11192 | +2.68% |
-| 384 | 12850 | 13682 | +6.47% |
-| 512 | 14439 | 15790 | +9.36% |
+| batch | defer on (tok/s) | defer off |
+|---|---|---|
+| 8 | 1017 | -3.75% |
+| 16 | 1698 | -8.40% |
+| 32 | 2713 | -6.60% |
+| 64 | 4369 | -4.41% |
+| 96 | 5958 | -6.01% |
+| 128 | 7372 | -3.61% |
+| 160 | 7832 | -0.71% |
+| 192 | 8938 | +1.11% |
+| 256 | 10899 | +2.68% |
+| 384 | 12850 | +6.47% |
+| 512 | 14439 | +9.36% |
 
 ## Where the gain comes from
 
