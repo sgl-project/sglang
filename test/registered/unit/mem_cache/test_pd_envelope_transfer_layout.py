@@ -26,11 +26,11 @@ from sglang.srt.mem_cache.layout.page_major import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestMLAEnvelopeTransferAddressing(CustomTestCase):
-    def test_page_envelope_matches_dense_views(self):
+    def test_page_envelope_matches_per_layer_views(self):
         """Every (page, layer, slot) row written through the MLA views
         must land at raw_ptr + page * page_envelope_bytes + layer-block offset,
         i.e. inside the page's transfer envelope."""
@@ -62,9 +62,9 @@ class TestMLAEnvelopeTransferAddressing(CustomTestCase):
         for page in range(num_pages):
             for layer in range(layer_num):
                 for off in range(page_size):
-                    dense_id = page * layer_num * page_size + off
+                    kernel_id = page * layer_num * page_size + off
                     val = torch.randn(kv_dim, dtype=store_dtype)
-                    views[layer][dense_id, 0] = val
+                    views[layer][kernel_id, 0] = val
                     start = (
                         page * page_bytes
                         + layer * page_size * row_bytes

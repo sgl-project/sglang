@@ -14,7 +14,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
 
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
@@ -30,7 +30,7 @@ _GROUP_SIZE = 32
 
 
 class Mxfp4FlashinferCutlassMoEMethod:
-    """FlashInfer MXFP4 MoE: W4A16 on SM90 and W4A8 on SM120."""
+    """FlashInfer MXFP4 MoE: W4A16/W4A8 on SM90 and W4A8 on SM120."""
 
     fuse_routed_scaling_factor_in_topk = True
 
@@ -38,6 +38,11 @@ class Mxfp4FlashinferCutlassMoEMethod:
         if not is_flashinfer_available():
             raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")
         self._use_mxfp8_act_scaling = get_platform().is_sm120
+        precision = get_exec().moe.flashinfer_mxfp4_moe_precision
+        # precision=fp8 is an SM90 knob (Humming W4A8); on SM120 the MXFP8
+        # activation path already computes in FP8, so the flag is simply inert
+        # there rather than an error -- one config can move across hardware.
+        self._use_sm90_humming = not self._use_mxfp8_act_scaling and precision == "fp8"
         self._fp8 = fp8_method
         self.prefix = prefix
         self._swiglu_limit_tensor: torch.Tensor | None = None
@@ -124,9 +129,12 @@ class Mxfp4FlashinferCutlassMoEMethod:
             return
 
         arch = "SM120" if self._use_mxfp8_act_scaling else "SM90"
+        precision = (
+            "W4A8" if self._use_sm90_humming or self._use_mxfp8_act_scaling else "W4A16"
+        )
         log_info_on_rank0(
             logger,
-            f"Preparing DSv4 MXFP4 experts for FlashInfer {arch} CUTLASS "
+            f"Preparing DSv4 MXFP4 experts for FlashInfer {arch} CUTLASS {precision} "
             f"(layer: {self.prefix})...",
         )
 
@@ -152,23 +160,51 @@ class Mxfp4FlashinferCutlassMoEMethod:
             for scale_u8 in (w13_scale_u8, w2_scale_u8):
                 scale_u8.copy_(block_scale_interleave(scale_u8).reshape_as(scale_u8))
         else:
-            from flashinfer.fused_moe import (
-                interleave_moe_scales_for_sm90_mixed_gemm,
-                interleave_moe_weights_for_sm90_mixed_gemm,
-            )
+            if self._use_sm90_humming:
+                from flashinfer.fused_moe import (
+                    preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+                )
 
-            w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
-                layer.w13_weight.data.view(torch.uint8).contiguous(), "fp4"
-            )
-            w2_il = interleave_moe_weights_for_sm90_mixed_gemm(
-                layer.w2_weight.data.view(torch.uint8).contiguous(), "fp4"
-            )
-            w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
-                w13_scale_u8, group_size=_GROUP_SIZE
-            )
-            w2_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
-                w2_scale_u8, group_size=_GROUP_SIZE
-            )
+                w13_il, w13_s_il, w13_residual = (
+                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                        layer.w13_weight.data.view(torch.uint8).contiguous(),
+                        w13_scale_u8,
+                    )
+                )
+                w2_il, w2_s_il, w2_residual = (
+                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                        layer.w2_weight.data.view(torch.uint8).contiguous(),
+                        w2_scale_u8,
+                    )
+                )
+                layer.w13_humming_residual_scale = Parameter(
+                    (w13_residual * 64.0).contiguous(), requires_grad=False
+                )
+                layer.w2_humming_residual_scale = Parameter(
+                    (w2_residual * 64.0).contiguous(), requires_grad=False
+                )
+                layer.humming_fc2_act_scale = Parameter(
+                    torch.ones((), dtype=torch.float32, device=w13_scale_u8.device),
+                    requires_grad=False,
+                )
+            else:
+                from flashinfer.fused_moe import (
+                    interleave_moe_scales_for_sm90_mixed_gemm,
+                    interleave_moe_weights_for_sm90_mixed_gemm,
+                )
+
+                w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
+                    layer.w13_weight.data.view(torch.uint8).contiguous(), "fp4"
+                )
+                w2_il = interleave_moe_weights_for_sm90_mixed_gemm(
+                    layer.w2_weight.data.view(torch.uint8).contiguous(), "fp4"
+                )
+                w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
+                    w13_scale_u8, group_size=_GROUP_SIZE
+                )
+                w2_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
+                    w2_scale_u8, group_size=_GROUP_SIZE
+                )
             layer.w13_weight = Parameter(w13_il, requires_grad=False)
             layer.w2_weight = Parameter(w2_il, requires_grad=False)
             layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
@@ -177,7 +213,11 @@ class Mxfp4FlashinferCutlassMoEMethod:
         layer._dsv4_mxfp4_backend = (
             "flashinfer_cutlass_sm120"
             if self._use_mxfp8_act_scaling
-            else "flashinfer_cutlass_sm90"
+            else (
+                "flashinfer_cutlass_sm90_fp8"
+                if self._use_sm90_humming
+                else "flashinfer_cutlass_sm90"
+            )
         )
         # SM90 creates full-size interleaved copies; release old layouts per layer.
         if not self._use_mxfp8_act_scaling:
@@ -198,6 +238,11 @@ class Mxfp4FlashinferCutlassMoEMethod:
             w13_weight_scale=layer.w13_weight_scale_inv,
             w2_weight_scale=layer.w2_weight_scale_inv,
             mxfp4_weight_global_scale=self._mxfp4_weight_global_scale_tensor,
+            w13_humming_residual_scale=getattr(
+                layer, "w13_humming_residual_scale", None
+            ),
+            w2_humming_residual_scale=getattr(layer, "w2_humming_residual_scale", None),
+            humming_fc2_act_scale=getattr(layer, "humming_fc2_act_scale", None),
             w13_bias=None,
             w2_bias=None,
             swiglu_alpha=None,

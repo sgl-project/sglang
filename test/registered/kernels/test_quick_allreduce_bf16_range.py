@@ -63,9 +63,9 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
                     dist.barrier()
                     out = quick_all_reduce.quick_all_reduce(inp)
                     torch.cuda.synchronize()
-                    assert (
-                        torch.isfinite(out).all().item()
-                    ), f"{quant_mode=} {case_name=} produced non-finite output"
+                    assert torch.isfinite(out).all().item(), (
+                        f"{quant_mode=} {case_name=} produced non-finite output"
+                    )
                     if quant_mode == "FP" or case_name in ("low", "ordinary"):
                         torch.testing.assert_close(
                             out,
