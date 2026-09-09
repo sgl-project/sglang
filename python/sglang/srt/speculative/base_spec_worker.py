@@ -34,8 +34,6 @@ class HiCacheDraftMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class HiCacheDraftPlan:
-    """Draft-cache layout shared by HiCache and the direct external linker."""
-
     mode: HiCacheDraftMode = HiCacheDraftMode.NONE
     device_pools: tuple[object, ...] = ()
 
@@ -277,6 +275,11 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
+            )
+
+        if get_memory().enable_unified_cache_external_linker:
+            raise NotImplementedError(
+                "The external linker only supports packed draft KV caches."
             )
 
         return HiCacheDraftPlan(

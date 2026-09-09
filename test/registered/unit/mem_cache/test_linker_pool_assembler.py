@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -15,7 +16,6 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -258,21 +258,21 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_dsa_uses_hybrid_assembler_strategy(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-        def dsa_pool(kv_width, index_width, *, index_rows=4):
+        def dsa_pool(kv_width, index_width):
             pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
             pool.page_size = 2
             pool.layer_num = 1
             pool.kv_buffer = [torch.zeros((8, kv_width), dtype=torch.uint8)]
             pool.index_key_cache = SimpleNamespace(
-                buffer=[torch.zeros((index_rows, index_width), dtype=torch.uint8)]
+                buffer=[torch.zeros((4, index_width), dtype=torch.uint8)]
             )
             return pool
 
         kvcache = dsa_pool(3, 7)
         kvcache.layer_num = 2
         kvcache.kv_buffer.append(torch.zeros((8, 5), dtype=torch.uint8))
-        kvcache.index_key_cache.buffer.append(torch.zeros((0, 11), dtype=torch.uint8))
-        draft_pools = (dsa_pool(13, 17), dsa_pool(19, 23, index_rows=0))
+        kvcache.index_key_cache.buffer.append(torch.zeros((4, 11), dtype=torch.uint8))
+        draft_pools = (dsa_pool(13, 17), dsa_pool(19, 23))
 
         group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
@@ -300,56 +300,67 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             PoolName.INDEXER
         ].get_prepared_layer_range_meta([0], 0)
         self.assertEqual(sizes, [[7, 17]])
-        self.assertEqual(offsets, [[0, 7]])
-        self.assertIsNone(
-            group.entry_map[PoolName.INDEXER].get_prepared_layer_range_meta([0], 1)
-        )
+        self.assertEqual(offsets, [[0, 18]])
+        _, sizes, offsets = group.entry_map[
+            PoolName.INDEXER
+        ].get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(sizes, [[11, 23]])
+        self.assertEqual(offsets, [[7, 35]])
 
-    def test_mha_draft_uses_rank_sharded_sidecar(self):
-        from sglang.srt.mem_cache.memory_pool import (
-            DSATokenToKVPool,
-            MHATokenToKVPool,
-        )
+    def test_linker_requires_packed_draft(self):
+        """Do not accept draft state that the linker would omit from storage."""
+        from sglang.srt.speculative import base_spec_worker as spec
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
-        kvcache.page_size = 2
-        kvcache.layer_num = 1
-        kvcache.kv_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
-        kvcache.index_key_cache = SimpleNamespace(
-            buffer=[torch.zeros((4, 7), dtype=torch.uint8)]
-        )
-        draft_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
-        draft_pool.page_size = 2
-        draft_pool.layer_num = 1
-        draft_pool.kv_cache_layout = "nhd"
-        draft_pool.k_scale_buffer = None
-        draft_pool.k_buffer = [torch.zeros((8, 13), dtype=torch.uint8)]
-        draft_pool.v_buffer = [torch.zeros((8, 17), dtype=torch.uint8)]
-
-        group = resolve_hybrid_device_pool_group(
-            kvcache=kvcache,
-            page_size=2,
-            params=SimpleNamespace(
-                mtp_draft_device_pools=(),
-                direct_linker_draft_device_pools=(draft_pool,),
+        draft = SimpleNamespace(
+            token_to_kv_pool=object(),
+            model_config=SimpleNamespace(
+                num_nextn_predict_layers=0,
+                hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             ),
-            components={ComponentType.FULL},
         )
-
-        draft_entry = group.entry_map[PoolName.DRAFT]
-        self.assertEqual(draft_entry.indices_from_pool, PoolName.KV)
-        self.assertEqual(len(draft_entry.components), 2)
-        self.assertFalse(draft_entry.packed)
-
-        store = MooncakeStore.__new__(MooncakeStore)
-        store.registered_pools = {PoolName.DRAFT: draft_entry}
-        store.mla_suffix = "shared"
-        store.mha_suffix = "tp3"
-        keys, multiplier = store._get_hybrid_page_component_keys(
-            ["page"], PoolTransfer(name=PoolName.DRAFT)
+        target = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.EAGLE)
+        worker = SimpleNamespace(
+            target_worker=SimpleNamespace(model_runner=target),
+            _draft_model_runners=lambda: (draft,),
         )
-        self.assertEqual(keys, ["page_tp3_draft_k", "page_tp3_draft_v"])
-        self.assertEqual(multiplier, 2)
+        for linker_enabled, nextn_layers in (
+            (False, 0),
+            (True, 0),
+            (False, 1),
+            (True, 1),
+        ):
+            draft.model_config.num_nextn_predict_layers = nextn_layers
+            with (
+                self.subTest(linker=linker_enabled, nextn=nextn_layers),
+                patch.object(
+                    spec,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        enable_hierarchical_cache=not linker_enabled,
+                        enable_unified_cache_external_linker=linker_enabled,
+                    ),
+                ),
+            ):
+                if linker_enabled and not nextn_layers:
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "only supports packed"
+                    ):
+                        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+                    self.assertEqual(target.mtp_draft_device_pools, ())
+                else:
+                    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+                    self.assertEqual(
+                        plan.mode,
+                        spec.HiCacheDraftMode.PACKED
+                        if nextn_layers
+                        else spec.HiCacheDraftMode.SIDECAR,
+                    )
+                    self.assertEqual(plan.device_pools, (draft.token_to_kv_pool,))
+                    self.assertEqual(
+                        target.mtp_draft_device_pools,
+                        plan.device_pools if nextn_layers else (),
+                    )
 
     def test_unsupported_strategy_fails_with_context(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
