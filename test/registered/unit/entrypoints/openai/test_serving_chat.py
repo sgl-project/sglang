@@ -28,7 +28,9 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
+    Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -4276,6 +4278,47 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         )
 
         self.assertIsNone(tool_calls)
+
+
+class TestProcessToolCallsWithNonObjectEntry(unittest.TestCase):
+    """A non-object entry in a model-emitted tool-call array must not discard the
+    well-formed calls beside it, nor suppress the tool_calls finish_reason
+    (sglang#37283)."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = "mistral"
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+        self.tools = [
+            Tool(
+                function=Function(
+                    name="get_weather", parameters={"type": "object", "properties": {}}
+                )
+            )
+        ]
+
+    def _process(self, text):
+        return self.chat._process_tool_calls(
+            text=text,
+            tools=self.tools,
+            finish_reason={"type": "stop", "matched": None},
+        )
+
+    def test_mixed_array_keeps_the_valid_call(self):
+        tool_calls, _, finish_reason = self._process(
+            '[TOOL_CALLS] [{"name": "get_weather", "arguments": {"city": "Paris"}}, "junk"]'
+        )
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual([c.function.name for c in tool_calls], ["get_weather"])
+        self.assertEqual(finish_reason["type"], "tool_calls")
+
+    def test_all_non_object_array_reports_no_tool_calls(self):
+        tool_calls, _, finish_reason = self._process('[TOOL_CALLS] ["junk", 42, null]')
+        self.assertIsNone(tool_calls)
+        self.assertEqual(finish_reason["type"], "stop")
 
 
 class TestNormalizeToolContent(unittest.TestCase):

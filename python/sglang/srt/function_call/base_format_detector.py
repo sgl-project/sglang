@@ -81,6 +81,14 @@ class BaseFormatDetector(ABC):
 
         results = []
         for act in action:
+            if not isinstance(act, dict):
+                # A non-object entry carries no name to forward, so it is skipped even
+                # under SGLANG_FORWARD_UNKNOWN_TOOLS; valid entries beside it survive.
+                logger.warning(
+                    f"Skipping non-object tool call entry of type {type(act).__name__}"
+                )
+                continue
+
             name = act.get("name")
             if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
