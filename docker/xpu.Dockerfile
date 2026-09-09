@@ -97,4 +97,9 @@ ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
 RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
     git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
 
+# nixl hard-requires the CUDA wheels and nixl-cu12 requires torch, so --no-deps
+# keeps the XPU torch; the NIXL-POSIX plugin HiCache uses needs no CUDA.
+ARG NIXL_VERSION=1.4.1
+RUN pip install --no-cache-dir --no-deps nixl==${NIXL_VERSION} nixl-cu12==${NIXL_VERSION}
+
 CMD ["bash"]

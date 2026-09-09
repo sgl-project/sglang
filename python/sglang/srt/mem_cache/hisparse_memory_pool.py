@@ -14,7 +14,8 @@ from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
 
-# sgl_kernel.kvcacheio is only available in CUDA/ROCm/XPU sgl-kernel builds (not MPS/NPU/CPU).
+# sgl_kernel.kvcacheio ships in the CUDA/ROCm sgl-kernel builds and in the
+# out-of-tree sgl-kernel-xpu wheel.
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()

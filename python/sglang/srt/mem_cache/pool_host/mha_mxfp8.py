@@ -25,8 +25,8 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
+    get_alloc_memory_func,
 )
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
@@ -103,7 +103,7 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         return payload + scales * self.layer_num
 
     def _init_scale_buffers(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         # Host: page-first like the payload, one contiguous scale block per
         # (page, layer) so a page's layers are a single memcpy span.
         self.k_scale_host = alloc_func(

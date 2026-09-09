@@ -63,6 +63,7 @@ jobs:
               - "python/pyproject_xpu.toml"
               - "test/registered/xpu/**/!(*.md)"
               - "test/registered/disaggregation/test_disaggregation_xpu.py"
+              - "test/registered/e2e/hicache/test_hicache_xpu_no_storage.py"
               - "test/registered/attention/test_chunk_gated_delta_rule.py"
               - "test/registered/attention/test_deterministic.py"
               - "test/registered/lora/test_moe_lora_info.py"
