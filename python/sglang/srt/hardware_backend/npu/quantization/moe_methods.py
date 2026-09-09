@@ -224,11 +224,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         weight_scale.data = scale
 
         if weight_prefix == "w13":
-            from sglang.srt.layers.moe import get_moe_a2a_backend
-
-            # DeepEP can supply MXFP8 activations; other backends keep BF16.
-            dispatcher_dtype = "mxfp8" if get_moe_a2a_backend().is_deepep() else "bf16"
-            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
+            self._set_dispatcher_output_dtype(layer, "mxfp8")
 
     def apply(
         self,
@@ -307,11 +303,7 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         weight_scale.data = scale
 
         if weight_prefix == "w13":
-            from sglang.srt.layers.moe import get_moe_a2a_backend
-
-            # DeepEP can supply MXFP4 activations; other backends keep BF16.
-            dispatcher_dtype = "mxfp4" if get_moe_a2a_backend().is_deepep() else "bf16"
-            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
+            self._set_dispatcher_output_dtype(layer, "mxfp4")
 
     def apply(
         self,

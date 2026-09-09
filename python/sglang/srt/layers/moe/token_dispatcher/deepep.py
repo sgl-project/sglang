@@ -41,6 +41,9 @@ from sglang.srt.utils import (
 _is_npu = is_npu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
@@ -490,9 +493,9 @@ class _DeepEPDispatcherImplBase:
             DispatcherOutputDtype.MXFP8,
             DispatcherOutputDtype.MXFP4,
         ):
-            if not _is_npu:
+            if not _is_npu or not is_npu_arch35():
                 raise RuntimeError(
-                    "MXFP8/MXFP4 DeepEP dispatch is supported only on NPU."
+                    "MXFP8/MXFP4 DeepEP dispatch is supported only on arch35 NPU."
                 )
 
             deep_use_mode = os.environ.get("DEEP_USE_MODE", "default").lower()
