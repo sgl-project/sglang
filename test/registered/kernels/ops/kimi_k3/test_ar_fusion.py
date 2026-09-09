@@ -254,9 +254,7 @@ def _build_permuted_layout(
     """trtllm-gen permuted gemm2 layout (rows grouped by expert, per-expert
     tile padding). Deterministic on CPU: idx/weights are identical on every
     rank (TP semantics — same routing), gemm2 values are per-rank.
-
-    ``w_dtype`` is the routing-weight precision the deferred finalize hands
-    back: fp32 for the unpacked routing K3 emits, bf16 for the packed form."""
+    ``w_dtype`` is the routing-weight dtype the deferred finalize hands back."""
     num_experts, tile = 896, 8
     gen = torch.Generator(device="cpu").manual_seed(seed)
     topk_ids = torch.stack(
@@ -284,9 +282,7 @@ def _build_permuted_layout(
 def _finalize_norm_ref(gemm2, idx, weights, norm_w, eps: float) -> torch.Tensor:
     """Replicates the fused kernel numerics: fp32 ascending-k local finalize
     cast to bf16 (the staged push value), rank-ordered fp32 cross-rank sum,
-    fp32 RMSNorm. The kernel consumes the routing weights at their own dtype
-    into an fp32 accumulator, which `weights.float()` matches for both fp32
-    and bf16 weights. Only the rsqrt may differ from the kernel by ulps."""
+    fp32 RMSNorm. Only the rsqrt may differ from the kernel by ulps."""
     num_tokens = weights.shape[0]
     idx2 = idx.view(num_tokens, FIN_TOPK).long()
     acc = torch.zeros(num_tokens, NORM_DIM, dtype=torch.float32, device=gemm2.device)

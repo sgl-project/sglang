@@ -366,9 +366,7 @@ def finalize_all_reduce_push_norm(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Deferred MoE finalize fused into the 1shot push AR + RMSNorm; ``out`` is
-    output-only. ``expert_weights`` keeps whatever precision the deferred
-    finalize handed back (fp32 or bf16). Caller checked
-    :func:`finalize_push_fits`."""
+    output-only. Caller checked :func:`finalize_push_fits`."""
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
     state = _get_state()

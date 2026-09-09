@@ -78,7 +78,7 @@ struct FusionParams {
   // deferred finalize path); `input` is then output-only ([T, kNormDim])
   const uint8_t* fin_gemm2;    // [P, kNormDim] bf16, permuted rows
   const uint8_t* fin_idx;      // [T * kFinTopK] int32, -1 = dropped slot
-  const uint8_t* fin_weights;  // [T, kFinTopK] bf16 or fp32 (kernel-templated)
+  const uint8_t* fin_weights;  // [T, kFinTopK] bf16 or fp32
 };
 
 // The *_norm variants view the input as rows of the K3 latent width (3584
@@ -161,11 +161,8 @@ constexpr uint32_t kFinTopK = 16;
 // One 16B vector of the deferred MoE finalize (latent width fixed to kNormDim):
 //   local[t] = sum_k fin_weights[t, k] * fin_gemm2[fin_idx[t*16 + k]]
 // All 16 gathers issue before the FMA chain; threads of the same token
-// broadcast-load the same routing rows. `W` is the routing-weight dtype the
-// trtllm-gen deferred finalize handed back -- fp32 for the unpacked routing
-// the K3 router emits, bf16 for the packed form -- consumed at its native
-// precision (the accumulator is fp32 either way, so fp32 weights only ever
-// drop a rounding step).
+// broadcast-load the same routing rows. `W` is the routing-weight dtype
+// (bf16 or fp32; see finalize_push_norm).
 template <typename W>
 SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const FusionParams& params, uint32_t vid) {
   using namespace device;
@@ -780,7 +777,6 @@ struct AllReduceFusionKernel {
   /// `out` (flattened [num_tokens * kNormDim] bf16) is output-only: each
   /// rank's partial latent is computed from the trtllm-gen deferred-finalize
   /// triple during the staging pass and never materializes in global memory.
-  /// `expert_weights` may be fp32 or bf16 and is consumed as given.
   static void finalize_push_norm(
       CommunicatorRef ref,
       TensorView out,
@@ -805,8 +801,8 @@ struct AllReduceFusionKernel {
     SymbolicDevice device;
     device.set_options<kDLCUDA>();
     TensorMatcher({P, kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(gemm2_out);
-    // the routing weights ride at whatever precision trtllm-gen handed back:
-    // fp32 for the unpacked routing K3 emits, bf16 for the packed form
+    // trtllm-gen returns the routing weights at the dtype the routing form
+    // carries -- fp32 for unpacked, bf16 for packed -- consumed as given
     TensorMatcher({T, K}).with_dtype<fp32_t, bf16_t>().with_device<kDLCUDA>(device).verify(expert_weights);
     TensorMatcher({TK}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(permuted_idx);
     CHECK_HOST(K.unwrap() == kFinTopK) << "finalize_push_norm is specialized for top_k = " << kFinTopK;

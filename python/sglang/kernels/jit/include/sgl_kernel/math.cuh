@@ -107,8 +107,7 @@ SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
 }
 
 // bf16 x fp32 -> fp32 fused multiply-add: same one-rounding contract as the
-// overload above (the bf16 -> f32 convert is exact), for the callers whose
-// scale operand stays fp32 (ar_fusion's fp32 routing weights).
+// overload above (the bf16 -> f32 convert is exact).
 SGL_DEVICE float fma_f32_bf16(bf16_t a, float b, float acc) {
   return fmaf(cast<fp32_t>(a), b, acc);
 }
