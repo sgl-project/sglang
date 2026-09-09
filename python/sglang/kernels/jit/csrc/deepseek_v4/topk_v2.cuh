@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <iterator>
 #include <limits>
+#include <mutex>
 
 namespace sglang {
 
@@ -321,7 +322,6 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
 
 constexpr uint32_t kNumPersistentClusters = SGL_TOPK_V2_MAX_C8_OCC2;
 constexpr uint32_t kMaxCluster16BatchSize = SGL_TOPK_V2_MAX_C16_OCC1;
-static_assert(kNumPersistentClusters > 0 && kMaxCluster16BatchSize > 0);
 constexpr uint32_t kClusterMaxBatch = 512;
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 
@@ -633,37 +633,41 @@ struct TopKKernel {
 #if SUPPORT_CLUSTER
       const bool use_cluster = (max_seq_len > params.static_cluster_floor) && (batch_size <= kClusterMaxBatch);
       if (use_cluster) {
-        if (batch_size <= kMaxCluster16BatchSize) {
-          constexpr uint32_t kClusterSize = 16;
-          // Widths above 8 are non-portable; the launch is rejected without this.
-          static const bool once = [] {
-            RuntimeDeviceCheck(
-                ::cudaFuncSetAttribute(
-                    reinterpret_cast<const void*>(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>),
-                    ::cudaFuncAttributeNonPortableClusterSizeAllowed,
-                    1));
-            return true;
-          }();
-          static_cast<void>(once);
-          LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
-              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-              .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>, params);
-        } else if (batch_size <= kNumPersistentClusters) {
-          constexpr uint32_t kClusterSize = 8;
-          LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
-              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-              .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>, params);
-        } else {
-          constexpr uint32_t kClusterSize = 8;
-          const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
-          LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
-              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-              .launch(topk_persistent_cluster_kernel<kUsePDL, kClusterSize>, params);
-          LaunchKernel(batch_size, kBlockSize, device)
-              .config({.use_pdl = kUsePDL})
-              .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
+        if constexpr (kMaxCluster16BatchSize > 0) {
+          if (batch_size <= kMaxCluster16BatchSize) {
+            constexpr uint32_t kClusterSize = 16;
+            // Widths above 8 are non-portable; the launch is rejected without this.
+            const auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>;
+            [[maybe_unused]]
+            static const bool _ = [&kernel] {
+              const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
+              CHECK_CUDA(::cudaFuncSetAttribute(kernel_ptr, ::cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+              return true;
+            }();
+            return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+                .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+                .launch(kernel, params);
+          }
         }
-        return;
+
+        if constexpr (kNumPersistentClusters > 0) {
+          if (batch_size <= kNumPersistentClusters) {
+            constexpr uint32_t kClusterSize = 8;
+            return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+                .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+                .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>, params);
+          } else {
+            constexpr uint32_t kClusterSize = 8;
+            const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
+            LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
+                .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+                .launch(topk_persistent_cluster_kernel<kUsePDL, kClusterSize>, params);
+            LaunchKernel(batch_size, kBlockSize, device)
+                .config({.use_pdl = kUsePDL})
+                .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
+            return void();
+          }
+        }
       }
 #endif
       if (max_seq_len <= kReg2MaxSeqLen) {

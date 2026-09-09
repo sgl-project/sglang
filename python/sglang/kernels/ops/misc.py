@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
-
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -29,9 +27,7 @@ def _jit_probe_module() -> Module:
 
 
 @cache_once
-def _get_max_active_clusters(cluster_size: int, occupancy: int, device: int) -> int:
-    # In the cache key only: the answer is per device, the query reads the current one.
-    del device
+def _get_max_active_clusters(cluster_size: int, occupancy: int) -> int:
     return int(_jit_probe_module().get_max_active_clusters(cluster_size, occupancy))
 
 
@@ -56,9 +52,7 @@ def get_max_active_clusters(cluster_size: int, occupancy: int) -> int:
     :raises ValueError: If nothing is schedulable, which a real device should
                         never report for a cluster width it supports.
     """
-    result = _get_max_active_clusters(
-        cluster_size, occupancy, torch.cuda.current_device()
-    )
+    result = _get_max_active_clusters(cluster_size, occupancy)
     if result == 0:
         raise ValueError(
             f"no cluster of {cluster_size} fits at occupancy {occupancy}; "

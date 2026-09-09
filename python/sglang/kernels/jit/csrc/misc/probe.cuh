@@ -29,8 +29,8 @@ uint32_t get_max_active_clusters(uint32_t cluster_size, uint32_t num_waves) {
   // driver cannot round it back up and squeeze out a block.
   const auto reserved = static_cast<uint32_t>(smem_per_sm - smem_per_block);
   const auto budget = static_cast<uint32_t>(smem_per_sm) / num_waves;
-  const auto smem = (min(budget - min(budget, reserved), static_cast<uint32_t>(smem_per_block))) & ~uint32_t{1023};
-  const auto num_warps = max(1u, min(1024u, static_cast<uint32_t>(max_threads_per_sm) / num_waves) / 32);
+  const auto smem = (std::min(budget - std::min(budget, reserved), static_cast<uint32_t>(smem_per_block))) & ~1023u;
+  const auto num_warps = std::max(1u, std::min(1024u, static_cast<uint32_t>(max_threads_per_sm) / num_waves) / 32);
 
   // Widths above 8 are non-portable and the query rejects them without this.
   CHECK_CUDA(cudaFuncSetAttribute(

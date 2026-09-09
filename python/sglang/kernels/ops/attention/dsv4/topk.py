@@ -36,13 +36,17 @@ def _jit_topk_v2_module():
     # defaults, and a 0 would size the persistent pool to an empty grid.
     extra_cuda_cflags = []
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
+        occ_8_2, occ_16_1 = 0, 0
         try:
-            extra_cuda_cflags = [
-                f"-DSGL_TOPK_V2_MAX_C8_OCC2={get_max_active_clusters(8, occupancy=2)}",
-                f"-DSGL_TOPK_V2_MAX_C16_OCC1={get_max_active_clusters(16, occupancy=1)}",
-            ]
+            occ_8_2 = get_max_active_clusters(8, occupancy=2)
+            # NOTE: cluster 16 might fail, but at least cluster 8 is ok
+            occ_16_1 = get_max_active_clusters(16, occupancy=1)
         except Exception:
             pass
+        extra_cuda_cflags = [
+            f"-DSGL_TOPK_V2_MAX_C8_OCC2={occ_8_2}",
+            f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}",
+        ]
     kernel = f"TopKKernel<{args}>"
     return load_jit(
         make_name("topk_v2"),
