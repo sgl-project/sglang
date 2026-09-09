@@ -1896,6 +1896,311 @@
           "format": "time_series"
         }
       ]
+    },
+    {
+      "type": "row",
+      "title": "KV tree vs engine (storage-tier coverage)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 58,
+        "w": 24,
+        "h": 1
+      },
+      "id": 28,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "KV event blocks by medium",
+      "description": "Blocks/s the router tree consumes, by event kind and the storage-medium tag the engine put on the event, per deployment. On a hierarchical-cache fleet block_stored/CPU_PINNED runs at roughly the block_removed/GPU rate; they are not equal, because the engine also evicts device blocks it never backed up. A CPU_PINNED line at 0 while the engines report hicache backups means the tier stream is not reaching the router. Both the busiest and the quietest replica are plotted: every replica receives the full stream, so a quietest-replica line at 0 while the busiest is healthy means one replica has lost its subscription and is routing blind.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 12,
+        "h": 8
+      },
+      "id": 29,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (namespace, event, medium) (rate(sgl_router_kv_event_blocks_total[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{namespace}} {{event}}/{{medium}}",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "min by (namespace, event, medium) (rate(sgl_router_kv_event_blocks_total[$__rate_interval]))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "{{namespace}} {{event}}/{{medium}} (quietest replica)",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "KV tree blocks by tier (fleet)",
+      "description": "Blocks the router tree attributes to the fleet, by the tier the worker holds them on (a block held on device and host counts under both). Absolute counts, so summing across workers is valid. host should sit at roughly hicache-ratio times device on a fleet with a full host tier; host at 0 means routing cannot see the L2 tier at all. max per worker across replicas, then summed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 59,
+        "w": 12,
+        "h": 8
+      },
+      "id": 30,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (tier) (max by (worker_url, dp_rank, tier) (sgl_router_kv_tree_blocks))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{tier}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tree coverage of engine host tier",
+      "description": "Router-attributed host-tier tokens / engine hicache host tokens in use, per deployment. ~1: every block the engines hold on host is routable. ~0 with a full host tier: the L2 tier is invisible to routing and repeats of anything evicted from device land on random pods -- this is the ratio that separates a retention problem (the engines really evicted it) from a visibility problem (the engines still hold it, the router forgot). Above 1: the tree holds tiers a worker already released, so check sgl_router_kv_event_batches_lost_total -- a tagged removal clears only its own tier, and a batch lost in transit strands the rest. Both sides are grouped by namespace because the ratio is not additive across deployments.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 67,
+        "w": 24,
+        "h": 8
+      },
+      "id": 31,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum by (namespace) (max by (namespace, worker_url, dp_rank) (sgl_router_kv_tree_blocks{tier=\"host\"})) * on(namespace) group_left() max by (namespace) (sgl_router_kv_block_size)) / sum by (namespace) (sglang_hicache_host_used_tokens{tp_rank=\"0\"})",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{namespace}}",
+          "format": "time_series"
+        }
+      ]
     }
   ],
   "refresh": "30s",
