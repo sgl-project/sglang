@@ -23,7 +23,7 @@ from sglang.test.lora_utils import (
     run_lora_batch_splitting_equivalence_test,
     run_lora_multiple_batch_on_model_cases,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_amd_ci, is_in_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
@@ -34,10 +34,7 @@ class TestMultiLoRABackend(CustomTestCase):
         run_lora_batch_splitting_equivalence_test(CI_MULTI_LORA_MODELS)
 
     def test_ci_lora_models_multi_batch(self):
-        run_lora_multiple_batch_on_model_cases(
-            CI_MULTI_LORA_MODELS,
-            no_lora_rouge_l_tolerance=0.9 if is_in_amd_ci() else None,
-        )
+        run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
 
     def test_all_lora_models(self):
         if is_in_ci():
