@@ -11,8 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MoE LoRA under the breakable prefill CUDA graph must match eager prefill."""
+"""MoE LoRA prefill graphs must replay adapters and match eager prefill."""
 
+import os
 import unittest
 
 import torch
@@ -26,7 +27,7 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=240, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=360, stage="extra-a", runner_config="1-gpu-large")
 
 # Measured graph noise is <=0.25; a missing adapter changes logprobs by 7-17.
 PROMPT_LOGPROB_THRESHOLD = 1.0
@@ -36,30 +37,40 @@ PREFILL_GRAPH_BATCH_SIZES = [32, 64, 128, 256, 512, 1024]
 
 
 class TestMoELoRAPrefillCudaGraph(CustomTestCase):
-    def test_breakable_prefill_graph_matches_eager(self):
+    def test_prefill_graph_matches_eager(self):
+        from prometheus_client import REGISTRY
+
         prompts = MOE_LORA_TEST_PROMPTS
         lora_paths = ["moe_lora"] * len(prompts)
         results = {}
-        for prefill_graph in (False, True):
+        for backend in ("disabled", "breakable", "full"):
+            prefill_graph = backend != "disabled"
+            if prefill_graph:
+                # Isolate replay counts between engines.
+                os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
             kwargs = dict(
                 model_path=MOE_BASE_MODEL_PATH,
                 enable_lora=True,
                 lora_paths={"moe_lora": MOE_LORA_PATH},
                 max_loras_per_batch=1,
                 lora_backend="triton",
+                attention_backend="flashinfer",
                 trust_remote_code=True,
                 enable_tokenizer_batch_encode=True,
                 enable_metrics=prefill_graph,
                 disable_radix_cache=True,
                 mem_fraction_static=0.8,
                 cuda_graph_max_bs_decode=4,
-                cuda_graph_backend_prefill="breakable" if prefill_graph else "disabled",
+                cuda_graph_backend_prefill=backend,
+                cuda_graph_config={"prefill": {"full_prefill_max_req": len(prompts)}},
             )
             if prefill_graph:
                 kwargs["cuda_graph_bs_prefill"] = PREFILL_GRAPH_BATCH_SIZES
 
-            engine = sgl.Engine(**kwargs)
+            collectors_before = set(REGISTRY._collector_to_names)
+            engine = None
             try:
+                engine = sgl.Engine(**kwargs)
                 # Compare prefill outputs before decoding.
                 prompt_out = engine.generate(
                     prompts,
@@ -91,7 +102,7 @@ class TestMoELoRAPrefillCudaGraph(CustomTestCase):
                     self.assertGreaterEqual(
                         replays,
                         1,
-                        "MoE LoRA fell back to eager prefill",
+                        f"{backend}: MoE LoRA fell back to eager prefill",
                     )
                 gen_out = engine.generate(
                     prompts,
@@ -101,31 +112,35 @@ class TestMoELoRAPrefillCudaGraph(CustomTestCase):
                     },
                     lora_path=lora_paths,
                 )
-                results[prefill_graph] = {
+                results[backend] = {
                     "prompt_logprobs": prompt_logprobs,
                     "texts": [o["text"] for o in gen_out],
                 }
             finally:
-                engine.shutdown()
-            if not prefill_graph:
+                if engine is not None:
+                    engine.shutdown()
+                for collector in set(REGISTRY._collector_to_names) - collectors_before:
+                    REGISTRY.unregister(collector)
                 torch.cuda.empty_cache()
 
-        eager, graph = results[False], results[True]
-        for i, prompt in enumerate(prompts):
-            e_lp, g_lp = eager["prompt_logprobs"][i], graph["prompt_logprobs"][i]
-            self.assertEqual(e_lp.numel(), g_lp.numel(), f"prompt {i}: token count")
-            max_diff = (e_lp - g_lp).abs().max().item()
-            self.assertLess(
-                max_diff,
-                PROMPT_LOGPROB_THRESHOLD,
-                f"prompt {i} ({prompt[:40]!r}): prefill graph logprobs drift "
-                f"{max_diff:.2e} from eager",
-            )
-            self.assertEqual(
-                eager["texts"][i],
-                graph["texts"][i],
-                f"prompt {i}: greedy continuation differs under the prefill graph",
-            )
+        eager = results["disabled"]
+        for backend in ("breakable", "full"):
+            graph = results[backend]
+            for i, prompt in enumerate(prompts):
+                e_lp, g_lp = eager["prompt_logprobs"][i], graph["prompt_logprobs"][i]
+                self.assertEqual(e_lp.numel(), g_lp.numel(), f"prompt {i}: token count")
+                max_diff = (e_lp - g_lp).abs().max().item()
+                self.assertLess(
+                    max_diff,
+                    PROMPT_LOGPROB_THRESHOLD,
+                    f"{backend}, prompt {i} ({prompt[:40]!r}): logprobs drift "
+                    f"{max_diff:.2e} from eager",
+                )
+                self.assertEqual(
+                    eager["texts"][i],
+                    graph["texts"][i],
+                    f"{backend}, prompt {i}: greedy continuation differs",
+                )
 
 
 if __name__ == "__main__":

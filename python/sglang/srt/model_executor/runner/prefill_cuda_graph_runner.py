@@ -42,7 +42,7 @@ import dataclasses
 import inspect
 import logging
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -120,6 +120,7 @@ from sglang.srt.model_executor.runner_utils import (
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
@@ -1505,7 +1506,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
-            return self._run_forward(forward_batch, num_tokens)
+            # Record LoRA kernels even when capture uses base-model requests.
+            with (
+                model_capture_mode()
+                if self._is_full_backend and self._capture_lora
+                else nullcontext()
+            ):
+                return self._run_forward(forward_batch, num_tokens)
 
         # Main's monolithic BCG runner never invokes
         # on_after_cuda_graph_warmup between warmup iterations — the BCG

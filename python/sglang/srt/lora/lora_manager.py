@@ -166,7 +166,7 @@ class LoRAManager:
 
     @property
     def supports_prefill_cuda_graph(self) -> bool:
-        """MoE LoRA needs breakable capture's hook flag; DP attention is unsupported."""
+        """MoE LoRA supports full and breakable capture; DP attention is unsupported."""
         from sglang.srt.model_executor.cuda_graph_config import (
             Backend,
             Phase,
@@ -179,7 +179,9 @@ class LoRAManager:
         ):
             return False
         if self.lora_backend.is_moe_lora:
-            return check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+            return check_cuda_graph_backend(
+                Phase.PREFILL, Backend.BREAKABLE
+            ) or check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
         return True
 
     @property
