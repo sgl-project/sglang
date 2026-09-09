@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#pragma once
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -71,8 +73,8 @@ __global__ void mxfp4_matvec_kernel(
     scalar_t* __restrict__ output) {
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  const int output_row_base = (blockIdx.x * kWarpsPerBlock + warp) * kRowsPerWarp;
-  const int record = blockIdx.y;
+  const int output_row_base = (blockIdx.y * kWarpsPerBlock + warp) * kRowsPerWarp;
+  const int record = blockIdx.x;
   if (record >= records || output_row_base >= output_size) {
     return;
   }
@@ -151,8 +153,8 @@ __global__ void mxfp4_matvec_dual_kernel(
     scalar_t* __restrict__ output_b) {
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  const int output_row_base = (blockIdx.x * kWarpsPerBlock + warp) * kRowsPerWarp;
-  const int record = blockIdx.y;
+  const int output_row_base = (blockIdx.y * kWarpsPerBlock + warp) * kRowsPerWarp;
+  const int record = blockIdx.x;
   if (record >= records || output_row_base >= output_size) {
     return;
   }
@@ -430,10 +432,23 @@ void verify_role_range(int64_t role_offset, int64_t role_bytes, int64_t cache_by
       << ") not within [0, " << cache_bytes << ")";
 }
 
-/// \brief The launch geometry both matvec kernels use: one warp group per row tile, one block row per record.
+/// \brief The launch geometry both matvec kernels use: one block column per record, one warp group per row tile.
+///
+/// `records` scales with the tokens in a forward pass and is the dimension that
+/// grows without a useful bound, so it takes `grid.x` (capped at 2^31-1). The
+/// row tiles take `grid.y`, whose 65535 cap only a matrix with more than a
+/// million rows could reach -- checked rather than assumed.
 auto matvec_launch_shape(int64_t output_size, int64_t records) -> std::pair<dim3, dim3> {
   constexpr uint32_t kRowsPerBlock = kWarpsPerBlock * kRowsPerWarp;
-  const dim3 grid(host::div_ceil(static_cast<uint32_t>(output_size), kRowsPerBlock), static_cast<uint32_t>(records));
+  constexpr int64_t kMaxGridX = 2147483647;
+  constexpr int64_t kMaxGridY = 65535;
+
+  const int64_t row_tiles = host::div_ceil(output_size, static_cast<int64_t>(kRowsPerBlock));
+  CHECK_HOST(records <= kMaxGridX) << "records exceeds the CUDA grid limit: " << records << " > " << kMaxGridX;
+  CHECK_HOST(row_tiles <= kMaxGridY) << "output_size needs " << row_tiles << " row tiles, over the CUDA grid limit of "
+                                     << kMaxGridY;
+
+  const dim3 grid(static_cast<uint32_t>(records), static_cast<uint32_t>(row_tiles));
   const dim3 block(kWarpsPerBlock * device::kWarpThreads);
   return {grid, block};
 }
@@ -639,10 +654,26 @@ inline void mxfp4_marlin_repack(
     tvm::ffi::TensorView w2_scale) {
   using namespace host;
 
-  CHECK_HOST(hidden_size > 0 && hidden_size % kQuantBlock == 0)
-      << "MXFP4 dimensions must be divisible by 32, got hidden_size=" << hidden_size;
+  // The Marlin layout tiles the n dimension by `kMarlinTileN`, so a size that is
+  // only a multiple of `kQuantBlock` leaves a partial tile: the scale
+  // permutation then maps columns outside the role slice and the weight tile
+  // span collapses to zero. `w2` takes its n from `hidden_size`, which is
+  // therefore the stricter of the two; `w13` takes `2 * intermediate_size`, so
+  // the quant-block check already makes it a whole number of tiles.
+  // Not an OOB read -- memcheck is clean; the partial tile reads a neighbouring
+  // slot from inside the tensor, and the collapsed span divides by zero on the
+  // device, which is undefined rather than trapping. Both are silent.
+  CHECK_HOST(hidden_size > 0 && hidden_size % kMarlinTileN == 0)
+      << "hidden_size must be divisible by " << kMarlinTileN << ", got " << hidden_size;
   CHECK_HOST(intermediate_size > 0 && intermediate_size % kQuantBlock == 0)
       << "MXFP4 dimensions must be divisible by 32, got intermediate_size=" << intermediate_size;
+
+  // Every role holds one matrix of `intermediate_size x hidden_size` MXFP4
+  // blocks -- transposed for the down projection, which is the same byte count
+  // -- so the dimensions pin `role_bytes` exactly, the way they do for matvec.
+  const int64_t expected_role_bytes = intermediate_size * (hidden_size / kQuantBlock) * kBlockBytes;
+  CHECK_HOST(role_bytes == expected_role_bytes)
+      << "role byte count does not match matrix dimensions: " << role_bytes << " != " << expected_role_bytes;
 
   const int64_t w13_n = 2 * intermediate_size;
   const int64_t w2_n = hidden_size;
