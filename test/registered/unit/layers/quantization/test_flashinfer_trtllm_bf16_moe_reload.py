@@ -34,6 +34,8 @@ from sglang.srt.model_executor.model_runner_components import weight_updater
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _repack_weights_after_hot_update,
 )
+from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.test.test_utils import CustomTestCase
 
 NUM_EXPERTS = 2
 HIDDEN_SIZE = 128
@@ -302,7 +304,7 @@ class TestFlashInferTrtllmBf16MoEReload(unittest.TestCase):
             self._restore_for_load(method, layer, param_names=("w13",))
 
 
-class TestRepackRunsOnFailedUpdate(unittest.TestCase):
+class TestRepackRunsOnFailedUpdate(CustomTestCase):
     """The layout must be re-derived even when a weight update fails.
 
     With the re-derive on the success path only, a `load_weights` that raised
@@ -327,9 +329,7 @@ class TestRepackRunsOnFailedUpdate(unittest.TestCase):
             get_model=lambda: model,
             update_model_fields=lambda **kwargs: None,
             recapture_cuda_graph=lambda: None,
-            get_model_runner=lambda: SimpleNamespace(
-                server_args=SimpleNamespace(weight_cache_mode="off")
-            ),
+            get_model_runner=lambda: SimpleNamespace(server_args=get_server_args()),
         )
 
     def test_repack_runs_when_load_weights_raises(self):
@@ -337,6 +337,7 @@ class TestRepackRunsOnFailedUpdate(unittest.TestCase):
         repacked = []
 
         with (
+            get_context().override_server_args(weight_cache_mode="off"),
             patch.object(
                 weight_updater,
                 "_repack_weights_after_hot_update",
