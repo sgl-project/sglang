@@ -479,10 +479,8 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
-        # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # cached_tokens slots: 0=cached 1=device 2=host 3=storage 4=image
+        # 5=audio 6=video 7=logical KV sequence length. Slots 8-15 remain spare.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -497,6 +495,10 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        # Total coverage includes the decode cached prefix, not just the sent delta.
+        self.cached_tokens[req.metadata_buffer_index][7] = min(
+            req.extend_range.end, len(req.origin_input_ids)
+        )
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

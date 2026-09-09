@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _all_reduce_polls,
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
@@ -2137,6 +2138,36 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
+
+        transferred_seq_len = cached_tokens[7].item()
+        expected_seq_len = decode_req.req.kv.kv_committed_len
+        # Zero is unknown for older prefill workers and intentionally fails open.
+        length_valid = _is_fake_transfer(decode_req.req) or transferred_seq_len in (
+            0,
+            expected_seq_len,
+        )
+        # Readiness consensus has completed; agree on length before any TP rank
+        # commits, without freeing pages while another rank is still transferring.
+        length_poll = _all_reduce_polls(
+            [KVPoll.Success if length_valid else KVPoll.Failed], self.gloo_group
+        )[0]
+        if length_poll == KVPoll.Failed:
+            logger.error(
+                "KV transfer sequence length mismatch on at least one TP rank: "
+                "request=%s bootstrap_room=%s received=%s expected=%s",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                transferred_seq_len,
+                expected_seq_len,
+            )
+            prepare_abort(
+                decode_req.req,
+                "KV transfer sequence length mismatch",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
