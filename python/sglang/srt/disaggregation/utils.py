@@ -37,11 +37,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.schedule_batch import Req
 
-if is_npu():
-    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
-        DSV4NPUTokenToKVPool,
-    )
-
 #########################
 # Constants & Enums
 #########################
@@ -1009,9 +1004,7 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if not hasattr(token_to_kv_pool, "get_kv_layer_ids"):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1336,6 +1329,7 @@ def setup_state_kv_args(
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import (
@@ -1392,8 +1386,16 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            # Pools that report per-entry layer ids (DSV4 NPU) pair by id on
+            # the wire; the rest stay positional.
+            layer_ids = (
+                token_to_kv_pool.get_state_layer_ids()
+                if hasattr(token_to_kv_pool, "get_state_layer_ids")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens,
+                layer_ids=layer_ids,
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
@@ -1439,6 +1441,45 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_c128_layer_ids()
+                            if hasattr(token_to_kv_pool, "get_c128_layer_ids")
+                            else None
+                        ),
+                    )
+            # NPU c128 KV buffers ride as their own ascend-only component.
+            if hasattr(token_to_kv_pool, "get_c128_kv_buf_infos"):
+                from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+                c128_ptrs, c128_lens, c128_item_lens = (
+                    token_to_kv_pool.get_c128_kv_buf_infos()
+                )
+                if c128_ptrs:
+                    append_state_component(
+                        kv_args,
+                        AscendStateType.DSV4_C128,
+                        c128_ptrs,
+                        c128_lens,
+                        c128_item_lens,
+                        layer_ids=token_to_kv_pool.get_c128_layer_ids(),
+                    )
+            # NPU A5 (CYCLE cache_mode): C4 compress state is a request-local
+            # ring; register it as its own ascend-only component.
+            if is_npu_arch35() and hasattr(
+                token_to_kv_pool, "get_c4_state_buf_infos"
+            ):
+                from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+                c4_ptrs, c4_lens, c4_item_lens = (
+                    token_to_kv_pool.get_c4_state_buf_infos()
+                )
+                if c4_ptrs:
+                    append_state_component(
+                        kv_args,
+                        AscendStateType.DSV4_C4_STATE,
+                        c4_ptrs,
+                        c4_lens,
+                        c4_item_lens,
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
@@ -1552,35 +1593,6 @@ def setup_state_kv_args(
                         tail_lens,
                         tail_item_lens,
                     )
-
-    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
-        from sglang.srt.disaggregation.ascend.conn import AscendStateType
-
-        c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
-        if c128_ptrs:
-            append_state_component(
-                kv_args,
-                AscendStateType.DSV4_C128,
-                c128_ptrs,
-                c128_lens,
-                c128_item_lens,
-            )
-
-        # On A5 (CYCLE cache_mode), C4 state uses request-local ring rows rather
-        # than SWA pages.  Register it separately so P and D can independently
-        # map logical positions when their local ring sizes differ.
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-        if is_npu_arch35():
-            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-            if c4_ptrs:
-                append_state_component(
-                    kv_args,
-                    AscendStateType.DSV4_C4_STATE,
-                    c4_ptrs,
-                    c4_lens,
-                    c4_item_lens,
-                )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

@@ -16,6 +16,11 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
 )
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    build_transfer_entry_pairs,
+)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,13 @@ class AscendKVManager(MooncakeKVManager):
             or st in _DSV4_KVCACHE_STATE_TYPES
         )
 
+    def _is_layer_split_kv_transfer(self) -> bool:
+        """Layer split registers only owned layers, so the positional
+        pp_size == 1 send path cannot be used."""
+        return self.disaggregation_mode == DisaggregationMode.PREFILL and (
+            get_parallel().enable_dsa_cache_layer_split
+        )
+
     def init_engine(self):
         # TransferEngine initialized on ascend.
         local_ip = get_local_ip_auto()
@@ -51,9 +63,8 @@ class AscendKVManager(MooncakeKVManager):
         )
 
     def register_buffer_to_engine(self):
-        # MemFabric aligns registered buffers to 2 MiB. Register everything in
-        # one batch so overlapping aligned ranges from small tensors are merged
-        # before they are published to the peer.
+        # MemFabric aligns registered buffers to 2 MiB; one batch merges
+        # overlapping aligned ranges from small tensors before publish.
         ptrs = list(self.kv_args.kv_data_ptrs)
         lens = list(self.kv_args.kv_data_lens)
         ptrs.extend(self.kv_args.aux_data_ptrs)
@@ -96,6 +107,28 @@ class AscendKVManager(MooncakeKVManager):
                     dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
+            # NPU main KV layout [C4 KV, index K, index scale]; slice each
+            # dst section to the owned range; draft tails pair positionally.
+            if state_type is None and self._is_layer_split_kv_transfer():
+                assert (
+                    end_layer is not None
+                ), "prefill_end_layer must be set for layer-split KV transfer"
+                owned_c4 = c4_end - c4_start
+                # Only the last CP rank ships the draft cache, so the src draft
+                # tail may be shorter than (or absent from) the dst tail.
+                n_draft_src = len(src_kv_ptrs) - 3 * owned_c4
+                n_draft_dst = len(dst_kv_ptrs) - 3 * c4_full
+                assert 0 <= n_draft_src <= n_draft_dst, (
+                    "Layer-split KV entry mismatch: src has "
+                    f"{len(src_kv_ptrs)} entries ({n_draft_src} draft), dst has "
+                    f"{len(dst_kv_ptrs)} ({n_draft_dst} draft)."
+                )
+                dst = []
+                for offset in (0, c4_full, 2 * c4_full):
+                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
+                dst.extend(dst_kv_ptrs[3 * c4_full : 3 * c4_full + n_draft_src])
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
             # NPU main KV layout: [C4 KV, index K, index scale].
             if state_type is None and len(dst_kv_ptrs) == 3 * c4_full:
                 dst = []
@@ -116,16 +149,23 @@ class AscendKVManager(MooncakeKVManager):
 
             return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
 
-        # src_kv_ptrs: k_data, v_data, index_k_data(optional)
-        # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
-        # state_type is accepted for parity with the common disaggregation path;
-        # the NPU kv_buf_groups slicing below is state-type agnostic.
+        # src/dst_kv_ptrs: k_data, v_data, index_k_data(optional); the NPU
+        # kv_buf_groups slicing below is state-type agnostic.
+        start_layer = self.kv_args.prefill_start_layer
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
         hidden_kv_layers = getattr(self.kv_args, "hidden_kv_layers", 0)
         draft_kv_layers = getattr(self.kv_args, "draft_kv_layers", 0)
         src_layers = len(src_kv_ptrs) // kv_buf_groups
-        dst_layers = len(dst_kv_ptrs) // kv_buf_groups
-        if src_layers == dst_layers:
+        total_kv_layers = getattr(self.kv_args, "total_kv_layers", 0)
+        # Decode-only speculative KV has one more layer than prefill; the
+        # draft layer must be skipped.
+        dst_total_layers = (
+            min(len(dst_kv_ptrs) // kv_buf_groups, total_kv_layers)
+            if total_kv_layers
+            else len(dst_kv_ptrs) // kv_buf_groups
+        )
+        end_layer = start_layer + src_layers
+        if src_layers == dst_total_layers:
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
             sliced_dst_kv_ptrs = []
@@ -179,10 +219,30 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        if self.pp_size > 1:
-            if self.is_mla_backend:
+        if self.pp_size > 1 or self._is_layer_split_kv_transfer():
+            if self._is_layer_split_kv_transfer():
+                # Layer split registers only owned layers, so entries must pair
+                # by global layer id; a positional fallback would misroute bytes.
+                pairs = build_transfer_entry_pairs(
+                    self.kv_args.kv_layer_ids,
+                    dst_layer_ids or [],
+                    len(self.kv_args.kv_data_ptrs),
+                    len(dst_kv_ptrs),
+                    allow_positional_fallback=False,
+                )
+                layers_params = [
+                    (
+                        self.kv_args.kv_data_ptrs[src],
+                        dst_kv_ptrs[dst],
+                        self.kv_args.kv_item_lens[src],
+                    )
+                    for src, dst in pairs
+                ]
+            elif self.is_mla_backend:
                 src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                    self.get_mla_kv_ptrs_with_pp(
+                        self.kv_args.kv_data_ptrs, dst_kv_ptrs
+                    )
                 )
                 layers_params = [
                     (

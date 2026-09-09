@@ -19,6 +19,9 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_cache_layer_split import (
+    LayerSplitDSV4NPUTokenToKVPool,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -622,6 +625,18 @@ class C4IndexerAscendBackendMixin:
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
 
+    def _layersplit_pool(self) -> Optional["LayerSplitDSV4NPUTokenToKVPool"]:
+        """The pool under cache layer split, else None (plain pool)."""
+        pool = self.token_to_kv_pool
+        return pool if isinstance(pool, LayerSplitDSV4NPUTokenToKVPool) else None
+
+    def _ls_page_table(self, family: str, layer_id: int, table):
+        """Layer-split pools may serve a compact remote copy: remap the table."""
+        pool = self._layersplit_pool()
+        if pool is None or table is None:
+            return table
+        return pool.page_table_for_read(family, layer_id, table)
+
     def _forward_prepare(
         self,
         c4_indexer,
@@ -857,7 +872,9 @@ class C4IndexerAscendBackendMixin:
             key_dequant_scale=k_scale.squeeze(-2).to(q_scale.dtype),
             actual_seq_lengths_query=fm.actual_seq_lengths_q,
             actual_seq_lengths_key=fm.actual_seq_lengths_kv,
-            block_table=fm.c4_page_table,
+            block_table=self._ls_page_table(
+                "index_k", c4_indexer.layer_id, fm.c4_page_table
+            ),
             layout_query="TND",
             layout_key="PA_BSND",
             weights=weights.to(q_scale.dtype),
@@ -1170,6 +1187,18 @@ class DeepseekV4AscendAttnBackend(
             fm.c4_page_table = _select_rows(full_fields["c4_page_table"])
         if self._dsv4_has_c128:
             fm.c128_page_table = _select_rows(full_fields["c128_page_table"])
+
+        # Layer split plans on the FULL-batch tables (identical on both CP
+        # ranks) so the active-page plan stays symmetric at zero-token ranks.
+        pool = self._layersplit_pool()
+        if pool is not None:
+            pool.begin_forward_staging(
+                {
+                    "swa": full_fields["swa_page_table"],
+                    "c4": full_fields["c4_page_table"],
+                    "c128": full_fields["c128_page_table"],
+                }
+            )
 
         local_t = int(local_positions.shape[0])
         fm.actual_seq_lengths_q = torch.arange(
@@ -2101,7 +2130,9 @@ class DeepseekV4AscendAttnBackend(
             layout_kv="PA_ND",
             q=q,
             ori_kv=ori_kv,
-            ori_block_table=fm.swa_page_table,
+            ori_block_table=self._ls_page_table(
+                "swa", layer.layer_id, fm.swa_page_table
+            ),
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
@@ -2146,7 +2177,11 @@ class DeepseekV4AscendAttnBackend(
 
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
-        cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
+        cmp_block_table = self._ls_page_table(
+            f"c{compress_ratio}",
+            layer.layer_id,
+            getattr(fm, f"c{compress_ratio}_page_table"),
+        )
         expected_cmp_page_size = (
             ori_page_size // 4
             if compress_ratio == 4
@@ -2170,7 +2205,9 @@ class DeepseekV4AscendAttnBackend(
             layout_kv="PA_ND",
             q=q,
             ori_kv=ori_kv,
-            ori_block_table=fm.swa_page_table,
+            ori_block_table=self._ls_page_table(
+                "swa", layer.layer_id, fm.swa_page_table
+            ),
             sinks=attn_sink,
             metadata=metadata,
             softmax_scale=layer.scaling,
