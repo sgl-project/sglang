@@ -1,10 +1,11 @@
 """Compare fixed-work DiffusionGemma serving through the completions API.
 
 Both servers must use the same checkpoint, canvas length, denoising limit and
-stopping settings. Set stability_threshold above max_denoising_steps on both
-servers so early convergence cannot shorten work. Run them sequentially on the
-same physical GPUs, using the same run ID and arguments. Each request has a
-unique prompt prefix to avoid prefix-cache reuse.
+stopping settings. Set confidence_threshold=0.0 and stability_threshold=1 on
+both servers so early convergence cannot shorten work. This keeps the normal
+history size instead of adding history work to enforce the step count. Run them
+sequentially on the same physical GPUs, using the same run ID and arguments.
+Each request has a unique prompt prefix to avoid prefix-cache reuse.
 
 This measures complete canvas computation with EOS stopping disabled. Canvas
 tokens per second include tokens after EOS and are not useful-text throughput.
@@ -70,6 +71,10 @@ async def benchmark(args):
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status}: {payload}")
             elapsed = time.perf_counter() - start
+            if not payload["choices"][0]["text"].strip():
+                raise RuntimeError(
+                    "Empty completion; check the chat template and model"
+                )
             usage = payload["usage"]
             if usage["completion_tokens"] != args.output_length:
                 raise RuntimeError(f"Unexpected output length: {usage}")
