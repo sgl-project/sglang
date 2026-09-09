@@ -981,7 +981,15 @@ class PipelineConfig:
 
     def update_config_from_dict(self, args: dict[str, Any], prefix: str = "") -> None:
         prefix_with_dot = f"{prefix}." if (prefix.strip() != "") else ""
-        update_config_from_args(self, args, prefix, pop_args=True)
+        # Flat task_type is a request field; configure a different default in
+        # the nested pipeline_config. Capabilities belong to the model class.
+        update_config_from_args(
+            self,
+            args,
+            prefix,
+            pop_args=True,
+            exclude=("task_type", "supported_task_types"),
+        )
         update_config_from_args(
             self.vae_config, args, f"{prefix_with_dot}vae_config", pop_args=True
         )

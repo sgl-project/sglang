@@ -560,6 +560,10 @@ The declaration must be nonempty, contain no duplicates, and include the
 configured default. Existing pipelines that omit it retain the singleton
 `(task_type,)`. Override `get_supported_task_types()` if capabilities depend
 on the loaded checkpoint or configuration, preserving these invariants.
+Flat CLI/Python `task_type` arguments select the request. To change the
+configured default, use `pipeline_config={"task_type": ModelTaskType.I2V}`
+(or its serialized configuration), choosing a supported task.
+
 Capabilities describe implemented execution paths; declaring a task does not
 load additional components or implement conditioning and decoding for it.
 
