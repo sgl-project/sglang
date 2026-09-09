@@ -63,6 +63,7 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    check_pipeline_parallelism,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -105,6 +106,33 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_cuda_pipeline_parallel_mtp_allows_pd_prefill(self):
+        args = ServerArgs(
+            model_path="dummy",
+            pp_size=2,
+            disable_overlap_schedule=True,
+            speculative_algorithm="EAGLE",
+            disaggregation_mode="prefill",
+        )
+
+        with override_platform(is_cuda=True, is_npu=False):
+            check_pipeline_parallelism(args)
+
+    def test_cuda_pipeline_parallel_mtp_rejects_decode(self):
+        args = ServerArgs(
+            model_path="dummy",
+            pp_size=2,
+            disable_overlap_schedule=True,
+            speculative_algorithm="EAGLE",
+            disaggregation_mode="decode",
+        )
+
+        with (
+            override_platform(is_cuda=True, is_npu=False),
+            self.assertRaisesRegex(AssertionError, "only supported on prefill"),
+        ):
+            check_pipeline_parallelism(args)
+
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},

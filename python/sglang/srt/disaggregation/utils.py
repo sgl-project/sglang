@@ -1037,10 +1037,12 @@ def build_kv_layer_ids(
     draft_ids = _draft_entry_layer_ids(
         pool=draft_token_to_kv_pool, num_entries=num_draft_entries
     )
-    # Rank the draft's own ids by first appearance, so the band stays dense and
-    # contiguous whatever the draft config numbers its layers.
-    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
-    return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
+    return layer_ids + _remap_draft_layer_ids(draft_ids, num_hidden_layers)
+
+
+def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List[int]:
+    band_index = {layer_id: i for i, layer_id in enumerate(dict.fromkeys(layer_ids))}
+    return [num_hidden_layers + band_index[layer_id] for layer_id in layer_ids]
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
@@ -1511,16 +1513,50 @@ def setup_state_kv_args(
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
                 )
+                qsa_layer_ids = token_to_kv_pool.get_qsa_pending_state_layer_ids()
+                compressed_ptrs, compressed_lens, compressed_item_lens = (
+                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                )
+                compressed_layer_ids = (
+                    token_to_kv_pool.get_qsa_compressed_state_layer_ids()
+                )
+                if isinstance(draft_token_to_kv_pool, QSATokenToKVPool):
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "QSA draft state transfer requires total_kv_layers"
+                        )
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_token_to_kv_pool.get_qsa_pending_state_buf_infos()
+                    )
+                    draft_layer_ids = _remap_draft_layer_ids(
+                        draft_token_to_kv_pool.get_qsa_pending_state_layer_ids(),
+                        total_kv_layers,
+                    )
+                    qsa_ptrs += draft_ptrs
+                    qsa_lens += draft_lens
+                    qsa_item_lens += draft_item_lens
+                    qsa_layer_ids += draft_layer_ids
+
+                    (
+                        draft_compressed_ptrs,
+                        draft_compressed_lens,
+                        draft_compressed_item_lens,
+                    ) = draft_token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                    draft_compressed_layer_ids = _remap_draft_layer_ids(
+                        draft_token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                        total_kv_layers,
+                    )
+                    compressed_ptrs += draft_compressed_ptrs
+                    compressed_lens += draft_compressed_lens
+                    compressed_item_lens += draft_compressed_item_lens
+                    compressed_layer_ids += draft_compressed_layer_ids
                 append_state_component(
                     kv_args,
                     StateType.QSA_PENDING,
                     qsa_ptrs,
                     qsa_lens,
                     qsa_item_lens,
-                    layer_ids=token_to_kv_pool.get_qsa_pending_state_layer_ids(),
-                )
-                compressed_ptrs, compressed_lens, compressed_item_lens = (
-                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                    layer_ids=qsa_layer_ids,
                 )
                 append_state_component(
                     kv_args,
@@ -1528,7 +1564,7 @@ def setup_state_kv_args(
                     compressed_ptrs,
                     compressed_lens,
                     compressed_item_lens,
-                    layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                    layer_ids=compressed_layer_ids,
                 )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []

@@ -1759,6 +1759,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+    def get_embed_and_head(self):
+        embed = (
+            self.model.language_model.embed_tokens.weight
+            if self.pp_group.is_first_rank
+            else None
+        )
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
+
     @torch.no_grad()
     def forward(
         self,

@@ -16,6 +16,7 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpModel,
     Qwen4ExpVLModel,
 )
+from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,6 +71,21 @@ class TestQwen4ExpPipelineParallel(CustomTestCase):
         signature = inspect.signature(Qwen4ExpForConditionalGeneration.forward)
 
         self.assertIn("pp_proxy_tensors", signature.parameters)
+
+    def test_last_stage_exposes_head_without_first_stage_embedding(self):
+        model = Qwen4ExpForConditionalGeneration.__new__(
+            Qwen4ExpForConditionalGeneration
+        )
+        nn.Module.__init__(model)
+        model.model = nn.Module()
+        model.model.language_model = nn.Module()
+        model.lm_head = nn.Linear(3, 4, bias=False)
+        model.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
+
+        embed, head = model.get_embed_and_head()
+
+        self.assertIsNone(embed)
+        self.assertIs(head, model.lm_head.weight)
 
     def test_nonfirst_stage_does_not_allocate_token_embedding(self):
         model = Qwen4ExpModel.__new__(Qwen4ExpModel)
@@ -211,6 +227,22 @@ class TestQwen4ExpPipelineParallel(CustomTestCase):
         self.assertEqual(nonowner_kwargs["short_conv_layer_ids"], [])
         self.assertIsNone(nonowner_kwargs["short_conv_state_shape"])
         self.assertEqual(nonowner_kwargs["ngram_context_len"], 0)
+
+    def test_mtp_loads_target_embedding_on_last_pipeline_stage(self):
+        model = Qwen4ExpForCausalLMMTP.__new__(Qwen4ExpForCausalLMMTP)
+        nn.Module.__init__(model)
+        model.model = nn.Module()
+        model.model.embed_tokens = nn.Embedding(4, 3)
+        model.config = SimpleNamespace(num_experts=None)
+        model.quant_config = None
+        expected = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+        loaded = model.load_weights(
+            [("model.language_model.embed_tokens.weight", expected)]
+        )
+
+        self.assertEqual(loaded, {"model.embed_tokens.weight"})
+        torch.testing.assert_close(model.model.embed_tokens.weight, expected)
 
 
 if __name__ == "__main__":
