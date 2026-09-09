@@ -93,6 +93,11 @@ SGL_DEVICE uint32_t extract_coarse_bin(float x) {
   return (b ^ (s | 0x80000000u)) >> (32 - kBits);
 }
 
+SGL_DEVICE uint16_t coarse_bin_to_bits_finite(uint32_t bin) {
+  const uint16_t ob = static_cast<uint16_t>(bin);
+  return (ob & 0x8000) ? static_cast<uint16_t>(ob ^ 0x8000) : static_cast<uint16_t>(~ob);
+}
+
 // Smallest fp32 `v` for which `extract_coarse_bin<kBits>(v) >= bin`, i.e. the
 // lower fp32 boundary of coarse bin `bin`. The collect pass classifies with two
 // comparisons against these instead of recomputing the fp16 bin per element, so
@@ -106,13 +111,8 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   constexpr uint32_t kInfBin = 0xFC00u >> kShift;  // bin holding the +inf key
   const uint32_t key = bin << kShift;              // ordered16 key at the low edge
   // ordered16 -> fp16 value (inverse of the transform in extract_coarse_bin);
-  // finite keys only.
-  constexpr auto to_finite_bits = [](uint32_t okey) -> uint16_t {
-    const uint16_t ob = static_cast<uint16_t>(okey);
-    return (ob & 0x8000) ? static_cast<uint16_t>(ob ^ 0x8000) : static_cast<uint16_t>(~ob);
-  };
   constexpr auto to_finite_val = [](uint32_t okey) -> float {
-    const uint16_t hb = to_finite_bits(okey);
+    const uint16_t hb = coarse_bin_to_bits_finite(okey);
     return cast<float>(*reinterpret_cast<const fp16_t*>(&hb));
   };
   constexpr auto step_up = [](float v) -> float {
@@ -129,7 +129,7 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
     const float mid = 0.5f * (to_finite_val(key) + to_finite_val(key - 1));
     // fp32 -> fp16 rounds to nearest EVEN, so on the ~half of bins whose fp16
     // value has an odd significand the midpoint still bins as `bin - 1`.
-    return (to_finite_bits(key) & 1u) ? step_up(mid) : mid;
+    return (coarse_bin_to_bits_finite(key) & 1u) ? step_up(mid) : mid;
   }
   // Slow path: an edge of `bin` touches the +/-inf keys or NaN key space. The
   // ordered-key line is: [0, 0x03FF) negative-NaN space, 0x03FF = -inf,
