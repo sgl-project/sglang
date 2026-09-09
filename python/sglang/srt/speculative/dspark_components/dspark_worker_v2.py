@@ -1,4 +1,6 @@
+import copy
 import logging
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Callable, Optional, Protocol, runtime_checkable
@@ -48,6 +50,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    DraftBlockResult,
     DraftProposal,
     make_next_draft_input,
 )
@@ -67,6 +70,13 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+)
+from sglang.srt.speculative.dspark_components.dspark_pp import (
+    PPDSparkCandidate,
+    PPDSparkIdentity,
+    draft_owner,
+    owned_token_rows,
+    validate_identities,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -142,15 +152,8 @@ class PPDSparkCommitState:
     positions: torch.Tensor
     state_slot: Optional[torch.Tensor]
     final_pos: Optional[torch.Tensor] = None
-
-
-@dataclass(frozen=True)
-class PPDSparkDraftState:
-    rids: tuple[str, ...]
-    draft_input: DFlashDraftInputV2
-    prefix_lens: torch.Tensor
-    verify_window: VerifyWindow
-    proposal: DraftProposal
+    identities: tuple[PPDSparkIdentity, ...] = ()
+    token_counts: tuple[int, ...] = ()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -186,7 +189,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._replicated_pp_decode = (
             self._replicated_pp_draft and disaggregation_mode == "decode"
         )
-        self._pp_draft_state: Optional[PPDSparkDraftState] = None
+        self._pp_candidates = weakref.WeakKeyDictionary()
         self._is_context_only_pp_prefill_rank = (
             _is_context_only_pp_prefill_rank(
                 disaggregation_mode=disaggregation_mode,
@@ -879,6 +882,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 positions=positions,
                 state_slot=state_slot,
                 final_pos=final_pos,
+                identities=tuple(PPDSparkIdentity.from_req(req) for req in batch.reqs),
+                token_counts=tuple(batch.extend_lens),
             )
             if self._replicated_pp_draft
             else None
@@ -1081,29 +1086,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise ValueError(
                 "Replicated PP DSpark currently supports greedy sampling only."
             )
-        prepared = self._pp_draft_state
-        self._pp_draft_state = None
-        if prepared is not None:
-            rids = tuple(req.rid for req in batch.reqs)
-            if prepared.rids != rids:
-                raise RuntimeError(
-                    "Replicated PP DSpark draft does not match the verify batch: "
-                    f"draft_rids={prepared.rids}, verify_rids={rids}."
-                )
-            draft_input = prepared.draft_input
-            prefix_lens = prepared.prefix_lens
-            verify_window = prepared.verify_window
-            proposal = prepared.proposal
+        self._observers.begin_step()
+        verify_window = alloc_verify_window(
+            batch=batch,
+            bs=bs,
+            device=device,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+        )
+        if self._replicated_pp_decode:
+            proposal = self.consume_pp_draft(batch)
         else:
-            self._observers.begin_step()
-            verify_window = alloc_verify_window(
-                batch=batch,
-                bs=bs,
-                device=device,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                block_pos_offsets=self._block_pos_offsets,
-                model_runner=self.model_runner,
-            )
             with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
                 proposal = self._proposer.propose(
                     batch=batch,
@@ -1119,7 +1113,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_tokens = draft_block.draft_tokens
 
         confidence = proposal.confidence
-        if confidence is None:
+        if confidence is None and not self._replicated_pp_decode:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
                 anchor_tokens=draft_block_ids[:, 0],
@@ -1322,6 +1316,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
+        pp_next_proposal = None
+        if self._replicated_pp_decode:
+            self.commit_pp_draft_context(
+                state=pp_commit_state,
+                rids=pp_commit_state.rids,
+                projected_context=pp_projected_context,
+                commit_lens=accept.commit_lens,
+            )
+            pp_next_proposal = self.prepare_pp_draft(batch, next_draft_input)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
@@ -1336,56 +1339,139 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=accept.new_seq_lens,
             pp_dspark_commit_state=pp_commit_state,
             pp_dspark_projected_context=pp_projected_context,
+            pp_dspark_next_proposal=pp_next_proposal,
         )
 
-    def prepare_pp_draft(self, batch: ScheduleBatch) -> None:
-        if not self._replicated_pp_decode or not batch.forward_mode.is_decode():
-            return
-        if self._pp_draft_state is not None:
-            raise RuntimeError("Replicated PP DSpark already has a prepared draft.")
-        if batch.spec_info is None:
-            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
-        draft_input = batch.spec_info
-        if not isinstance(draft_input, DFlashDraftInputV2):
-            raise RuntimeError(
-                "DSpark spec-v2 expected DFlashDraftInputV2 state on the running batch."
-            )
-        sampling_info = batch.sampling_info
-        if sampling_info is not None and not sampling_info.is_all_greedy:
-            raise ValueError(
-                "Replicated PP DSpark currently supports greedy sampling only."
-            )
-
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+    def prepare_pp_draft(
+        self, batch: ScheduleBatch, draft_input: DFlashDraftInputV2
+    ) -> dict:
         bs = len(batch.seq_lens)
-        prefix_lens = batch.seq_lens
+        prefix_lens = draft_input.new_seq_lens
+        next_batch = copy.copy(batch)
+        next_batch.seq_lens = prefix_lens
         verify_window = alloc_verify_window(
-            batch=batch,
+            batch=next_batch,
             bs=bs,
             device=self.device,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
         )
-        self._observers.begin_step()
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            proposal = self._proposer.propose(
-                batch=batch,
-                draft_input=draft_input,
-                verify_window=verify_window,
-                bs=bs,
-                device=self.device,
-                target_model=self.target_worker.model_runner.model,
-                sampling_info=sampling_info,
+        identities = tuple(
+            PPDSparkIdentity.from_req(req).next_round() for req in batch.reqs
+        )
+        rows = [
+            i
+            for i, req in enumerate(batch.reqs)
+            if draft_owner(req.rid, self.ps.pp_size) == self.ps.pp_rank
+        ]
+        payload = {"identities": [identities[i].to_wire() for i in rows]}
+        if rows:
+            from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+            index = torch.tensor(rows, dtype=torch.int64, device=self.device)
+            owned = copy.copy(next_batch)
+            owned.forward_mode = ForwardMode.DECODE
+            owned.reqs = [batch.reqs[i] for i in rows]
+            owned.req_pool_indices = batch.req_pool_indices[index]
+            owned.req_pool_indices_cpu = batch.req_pool_indices_cpu[rows]
+            owned.seq_lens = prefix_lens[index]
+            owned.seq_lens_cpu = owned.seq_lens.to("cpu")
+            owned.orig_seq_lens = batch.orig_seq_lens[index]
+            owned.seq_lens_sum = None
+            owned.spec_info = make_next_draft_input(
+                bonus_tokens=draft_input.bonus_tokens[index],
+                new_seq_lens=owned.seq_lens,
             )
-        self._pp_draft_state = PPDSparkDraftState(
-            rids=tuple(req.rid for req in batch.reqs),
-            draft_input=draft_input,
-            prefix_lens=prefix_lens,
-            verify_window=verify_window,
-            proposal=proposal,
+            owned.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                owned, self.model_runner.model_config.vocab_size
+            ).copy_for_forward()
+            owned_window = VerifyWindow(
+                positions_2d=verify_window.positions_2d[index],
+                verify_cache_loc=verify_window.verify_cache_loc_2d[index].reshape(-1),
+                verify_cache_loc_2d=verify_window.verify_cache_loc_2d[index],
+            )
+            with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+                proposal = self._proposer.propose(
+                    batch=owned,
+                    draft_input=owned.spec_info,
+                    verify_window=owned_window,
+                    bs=len(rows),
+                    device=self.device,
+                    target_model=self.target_worker.model_runner.model,
+                    sampling_info=owned.sampling_info,
+                )
+                confidence = proposal.confidence
+                if confidence is None:
+                    confidence = self._verify_planner.compute_confidence_tensor(
+                        draft_hidden=proposal.draft_hidden,
+                        anchor_tokens=proposal.draft_block_ids[:, 0],
+                        draft_tokens=proposal.draft_block.draft_tokens,
+                        confidence_tap=proposal.confidence_tap,
+                    )
+            payload["draft_block_ids"] = proposal.draft_block_ids.clone()
+            payload["draft_tokens"] = proposal.draft_block.draft_tokens.clone()
+            if confidence is not None:
+                payload["confidence"] = confidence.clone()
+        return payload
+
+    def install_pp_draft(self, batch: ScheduleBatch, owner: int, payload: dict) -> None:
+        expected = [
+            PPDSparkIdentity.from_req(req).next_round()
+            for req in batch.reqs
+            if draft_owner(req.rid, self.ps.pp_size) == owner
+        ]
+        validate_identities(expected, payload["identities"])
+        row = 0
+        for req in batch.reqs:
+            if draft_owner(req.rid, self.ps.pp_size) != owner:
+                continue
+            self._pp_candidates[req] = PPDSparkCandidate(
+                identity=expected[row],
+                draft_block_ids=payload["draft_block_ids"][row],
+                draft_tokens=payload["draft_tokens"][row],
+                confidence=payload["confidence"][row]
+                if "confidence" in payload
+                else None,
+            )
+            row += 1
+
+    def consume_pp_draft(self, batch: ScheduleBatch) -> DraftProposal:
+        blocks, tokens, confidences = [], [], []
+        stream = torch.get_device_module(self.device).current_stream()
+        for i, req in enumerate(batch.reqs):
+            candidate = self._pp_candidates.pop(req, None)
+            if candidate is None:
+                # Bootstrap/retraction: a deterministic warmup verify seeds the
+                # owner pipeline without an extra reverse-PP communication round.
+                anchor = batch.spec_info.bonus_tokens[i]
+                blocks.append(anchor.expand(self.query_token_num))
+                tokens.append(anchor.expand(self.gamma))
+                continue
+            validate_identities(
+                [PPDSparkIdentity.from_req(req)], [candidate.identity.to_wire()]
+            )
+            candidate.draft_block_ids.record_stream(stream)
+            candidate.draft_tokens.record_stream(stream)
+            blocks.append(candidate.draft_block_ids)
+            tokens.append(candidate.draft_tokens)
+            if candidate.confidence is not None:
+                candidate.confidence.record_stream(stream)
+                confidences.append(candidate.confidence)
+        return DraftProposal(
+            draft_block_ids=torch.stack(blocks),
+            draft_block=DraftBlockResult(
+                draft_tokens=torch.stack(tokens),
+                corrected_logits=None,
+                greedy_mask=torch.ones(
+                    len(batch.reqs), dtype=torch.bool, device=self.device
+                ),
+                temperatures=torch.ones(len(batch.reqs), device=self.device),
+            ),
+            draft_hidden=None,
+            confidence=torch.stack(confidences)
+            if len(confidences) == len(batch.reqs)
+            else None,
         )
 
     def _build_pp_commit_state(
@@ -1405,6 +1491,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             cache_loc_2d=verify_window.verify_cache_loc_2d,
             positions=verify_window.positions_2d.reshape(-1),
             state_slot=state_slot,
+            identities=tuple(PPDSparkIdentity.from_req(req) for req in batch.reqs),
+            token_counts=(verify_window.positions_2d.shape[1],) * len(batch.reqs),
         )
 
     def commit_pp_draft_context(
@@ -1420,14 +1508,24 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "Replicated PP DSpark result does not match the forward batch: "
                 f"forward_rids={state.rids}, result_rids={rids}."
             )
+        rows, token_rows = owned_token_rows(
+            rids, state.token_counts, self.ps.pp_rank, self.ps.pp_size
+        )
+        if not rows:
+            return
+        index = torch.tensor(token_rows, dtype=torch.int64, device=self.device)
         self._kv_injector.inject_projected_context(
-            projected_context=projected_context,
-            cache_loc=state.cache_loc,
-            cache_loc_2d=state.cache_loc_2d,
-            positions=state.positions,
-            commit_lens=commit_lens,
-            state_slot=state.state_slot,
-            final_pos=state.final_pos,
+            projected_context=projected_context[index],
+            cache_loc=state.cache_loc[index],
+            cache_loc_2d=(
+                state.cache_loc_2d[rows] if state.cache_loc_2d is not None else None
+            ),
+            positions=state.positions[index],
+            commit_lens=commit_lens[rows] if commit_lens is not None else None,
+            state_slot=state.state_slot[index]
+            if state.state_slot is not None
+            else None,
+            final_pos=state.final_pos[index] if state.final_pos is not None else None,
         )
 
     def _commit_target_mamba_states_after_verify(
