@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
     RESIDENT,
+    SNAPSHOT_OFFLOAD,
     normalize_component_residency,
     resolve_component_residency_mode,
     resolve_diffusers_pipeline_offload,
@@ -1108,6 +1109,50 @@ class TestOffloadDefaults(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid component residency mode"):
             normalize_component_residency(["dit=cpu"])
 
+    def test_snapshot_offload_is_explicit_and_uses_cpu_load_policy(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "component_residency": ["vae=snapshot_offload", "dit=resident"],
+                "vae_cpu_offload": False,
+                "use_fsdp_inference": True,
+            },
+        )
+        self.assertEqual(args.residency_mode("video_vae"), SNAPSHOT_OFFLOAD)
+        self.assertTrue(args.should_cpu_offload_component("video_vae"))
+        self.assertTrue(args.should_start_component_on_cpu("video_vae"))
+        self.assertFalse(args.should_use_fsdp_for_component("video_vae"))
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertTrue(args.should_use_fsdp_for_component("transformer"))
+        self.assertEqual(
+            resolve_component_residency_mode(
+                "video_vae",
+                normalize_component_residency(
+                    "vae=snapshot-offload,video_vae=resident"
+                ),
+            ),
+            RESIDENT,
+        )
+
+    def test_snapshot_offload_rejects_shared_memory_and_captured_dit(self):
+        with patch.object(
+            current_platform, "device_shares_host_memory", return_value=True
+        ):
+            with self.assertRaisesRegex(ValueError, "separate host and device memory"):
+                self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={"component_residency": ["vae=snapshot-offload"]},
+                )
+        with self.assertRaisesRegex(ValueError, "weight addresses change"):
+            self._from_dict_with_task_type(
+                ModelTaskType.T2V,
+                kwargs={
+                    "component_residency": ["dit=snapshot-offload"],
+                    "enable_breakable_cuda_graph": True,
+                },
+            )
+
     def test_component_residency_resolves_exact_group_and_all_precedence(self):
         assignments = normalize_component_residency(
             [
@@ -1325,6 +1370,8 @@ class TestOffloadDefaults(unittest.TestCase):
             resolve_diffusers_pipeline_offload({"dit": COMPONENT_OFFLOAD})
         with self.assertRaisesRegex(ValueError, "native SGLang backend"):
             resolve_diffusers_pipeline_offload({"all": LAYERWISE_OFFLOAD})
+        with self.assertRaisesRegex(ValueError, "native SGLang backend"):
+            resolve_diffusers_pipeline_offload({"all": SNAPSHOT_OFFLOAD})
 
     def test_memory_mode_layerwise_offloads_vae_on_low_memory_gpu(self):
         args = self._from_dict_with_task_type(
