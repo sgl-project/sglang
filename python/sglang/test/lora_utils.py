@@ -151,7 +151,6 @@ CI_MULTI_LORA_MODELS = [
                 rouge_l_tolerance=0.9,
             ),
         ],
-        rouge_l_tolerance=0.9,
         max_loras_per_batch=2,
         max_loaded_loras=4,
     ),
@@ -764,6 +763,7 @@ def run_lora_multiple_batch_on_model_cases(
     enable_deterministic_inference: bool = False,
     disable_radix_cache: bool = True,
     enable_lora_overlap_loading: Optional[bool] = None,
+    no_lora_rouge_l_tolerance: Optional[float] = None,
 ):
     for model_case in model_cases:
         for torch_dtype in TORCH_DTYPES:
@@ -835,12 +835,19 @@ def run_lora_multiple_batch_on_model_cases(
                     print("SRT outputs:", [s for s in srt_outputs.output_strs])
                     print("HF outputs:", [s for s in hf_outputs.output_strs])
 
-                    for srt_out, hf_out in zip(
-                        srt_outputs.output_strs, hf_outputs.output_strs
+                    for srt_out, hf_out, lora_path in zip(
+                        srt_outputs.output_strs,
+                        hf_outputs.output_strs,
+                        lora_paths,
                     ):
                         srt_str = srt_out.strip()
                         hf_str = hf_out.strip()
-                        rouge_tol = model_case.rouge_l_tolerance
+                        rouge_tol = (
+                            no_lora_rouge_l_tolerance
+                            if lora_path is None
+                            and no_lora_rouge_l_tolerance is not None
+                            else model_case.rouge_l_tolerance
+                        )
                         rouge_score = calculate_rouge_l([srt_str], [hf_str])[0]
                         if rouge_score < rouge_tol:
                             raise AssertionError(
