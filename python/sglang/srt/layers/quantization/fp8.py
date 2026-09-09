@@ -95,12 +95,12 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
-    use_intel_xpu_backend,
 )
 
 if TYPE_CHECKING:
@@ -1274,7 +1274,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if fp4_scale_dtype is None:
                 fp4_scale_dtype = (
                     torch.float8_e8m0fnu
-                    if _use_aiter or use_intel_xpu_backend()
+                    if _use_aiter or is_xpu()
                     else torch.float32
                 )
             w13_weight_scale = torch.nn.Parameter(
