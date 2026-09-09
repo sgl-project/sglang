@@ -492,7 +492,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests-cann910:
     name: multi-node-mix-poc-cann910
-    needs: [set-image-config, nightly-poc-multi-node-tests-cann910]
+    needs: [set-image-config]
     strategy:
       fail-fast: false
       max-parallel: 1
