@@ -9,9 +9,133 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
 
-# FlashKDA's max sequence length, Batches whose longest sequence exceeds this
-# fall back to Triton for the whole batch.
+# Legacy/default policy ceiling.  Validated device/shape profiles below may
+# use a different crossover; this is not a hard limit of the FlashKDA kernel.
 _FLASHKDA_MAX_SEQ_LEN = 2048
+
+# H200 serving measurements show that FlashKDA's head-parallel K2 is a win for
+# wide local-head shards, while Triton's time-parallel kernel is substantially
+# faster at Q=2048 for narrow TP shards.  The wider shard also keeps enough K2
+# CTAs resident to extend the useful FlashKDA window through the largest GLM
+# chunk-prefill bucket we validate.
+#
+# Do not use the reported device name for this profile: some environments
+# report H200 hardware under a different name.  The tight memory window, exact
+# Hopper capability, and SM count distinguish the measured ~140 GiB H200 from
+# H100 variants while avoiding extrapolation to other devices.
+_GIB = 1 << 30
+_FLASHKDA_H200_COMPUTE_CAPABILITY = (9, 0)
+_FLASHKDA_H200_SM_COUNT = 132
+_FLASHKDA_H200_MIN_TOTAL_MEMORY = 135 * _GIB
+_FLASHKDA_H200_MAX_TOTAL_MEMORY = 145 * _GIB
+_FLASHKDA_H200_LONG_HEADS = 64
+_FLASHKDA_H200_TRITON_HEADS = frozenset({8, 12, 16, 32})
+_FLASHKDA_H200_LONG_MAX_SEQ_LEN = 8192
+
+
+def _is_h200_profile(
+    *,
+    compute_capability: tuple[int, int],
+    multi_processor_count: int,
+    total_memory: int,
+) -> bool:
+    return (
+        compute_capability == _FLASHKDA_H200_COMPUTE_CAPABILITY
+        and multi_processor_count == _FLASHKDA_H200_SM_COUNT
+        and _FLASHKDA_H200_MIN_TOTAL_MEMORY
+        <= total_memory
+        <= _FLASHKDA_H200_MAX_TOTAL_MEMORY
+    )
+
+
+def _prefer_flashkda_for_shape(
+    *,
+    compute_capability: tuple[int, int],
+    multi_processor_count: int,
+    total_memory: int,
+    state_dtype: torch.dtype,
+    num_heads: int,
+    num_sequences: int,
+    min_seq_len: int,
+    max_seq_len: int,
+) -> bool:
+    """Pure performance policy; semantic eligibility is checked separately."""
+    if min_seq_len < _FLASHKDA_CHUNK_SIZE:
+        return False
+    if (
+        _is_h200_profile(
+            compute_capability=compute_capability,
+            multi_processor_count=multi_processor_count,
+            total_memory=total_memory,
+        )
+        and num_sequences == 1
+        and state_dtype == torch.float32
+    ):
+        if num_heads == _FLASHKDA_H200_LONG_HEADS:
+            return max_seq_len <= _FLASHKDA_H200_LONG_MAX_SEQ_LEN
+        if num_heads in _FLASHKDA_H200_TRITON_HEADS:
+            # Preserve existing behavior below the measured Q=2048 bucket,
+            # but do not select the under-filled K2 at or above that crossover.
+            return max_seq_len < _FLASHKDA_MAX_SEQ_LEN
+        # Do not extrapolate the profile to unmeasured head counts.
+        return max_seq_len <= _FLASHKDA_MAX_SEQ_LEN
+    return max_seq_len <= _FLASHKDA_MAX_SEQ_LEN
+
+
+def _flashkda_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+) -> bool:
+    """Check the external kernel's static tensor contract."""
+    if A_log is None or dt_bias is None:
+        return False
+    if not (q.ndim == k.ndim == v.ndim == g.ndim == 4 and beta.ndim == 3):
+        return False
+    batch, tokens, heads, key_dim = q.shape
+    tensors = (
+        k,
+        v,
+        g,
+        beta,
+        ssm_states,
+        cache_indices,
+        query_start_loc,
+        A_log,
+        dt_bias,
+    )
+    return (
+        batch == 1
+        and key_dim == 128
+        and k.shape == q.shape
+        and v.shape == (batch, tokens, heads, 128)
+        and g.shape == q.shape
+        and beta.shape == (batch, tokens, heads)
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and g.dtype == torch.bfloat16
+        and beta.dtype in (torch.bfloat16, torch.float32)
+        and ssm_states.ndim == 4
+        and ssm_states.shape[1:] == (heads, 128, 128)
+        and ssm_states.dtype in (torch.bfloat16, torch.float32)
+        and cache_indices.ndim == 1
+        and cache_indices.dtype in (torch.int32, torch.int64)
+        and cache_indices.numel() > 0
+        and cache_indices.numel() == query_start_loc.numel() - 1
+        and query_start_loc.ndim == 1
+        and query_start_loc.dtype in (torch.int32, torch.int64)
+        and A_log.numel() == heads
+        and dt_bias.numel() == heads * key_dim
+        and all(tensor.device == q.device for tensor in tensors)
+    )
 
 
 def _load_flash_kda():
@@ -79,7 +203,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
     kernel, so we pass RAW tensors plus ``A_log``/``dt_bias``/``lower_bound``.
     It is prefill-only, bf16, K == V == 128, HV == H (no GVA), and requires the
     safe (bounded) gate (``lower_bound`` set). The non-safe path and sequences
-    outside [chunk_size, max_seq_len] fall back to Triton ``chunk_kda``.
+    outside the selected device/shape performance window fall back to Triton
+    ``chunk_kda``.
     Requires an SM90+ GPU with the ``flash_kda`` package.
     """
 
@@ -119,13 +244,46 @@ class FlashKDAKernel(LinearAttnKernelBase):
         beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        if q.device.type == "cuda":
+            device_properties = torch.cuda.get_device_properties(q.device)
+            device_profile = (
+                (device_properties.major, device_properties.minor),
+                device_properties.multi_processor_count,
+                device_properties.total_memory,
+            )
+        else:
+            # CPU wrapper tests replace the external CUDA kernel with a stub.
+            device_profile = ((-1, -1), 0, 0)
         # The fused kernel cannot expose per-chunk states (h), which the mamba
         # radix extra_buffer track path needs; route tracked batches through
         # the Triton chunk_kda fallback instead of silently skipping the
         # snapshot (that would corrupt prefix-cache restores).
-        if return_intermediate_states or self._should_fall_back(
-            lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
+        if (
+            return_intermediate_states
+            or not _flashkda_supported(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states,
+                cache_indices,
+                query_start_loc,
+                A_log,
+                dt_bias,
+            )
+            or self._should_fall_back(
+                lower_bound,
+                is_spec_decode,
+                query_start_loc,
+                extend_seq_lens_cpu,
+                num_heads=q.shape[2],
+                state_dtype=ssm_states.dtype,
+                compute_capability=device_profile[0],
+                multi_processor_count=device_profile[1],
+                total_memory=device_profile[2],
+            )
         ):
             return _triton_fallback(
                 q,
@@ -143,22 +301,19 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 return_intermediate_states=return_intermediate_states,
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                beta_is_raw=beta_is_raw,
-            ),
-            None,
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
         )
 
     @staticmethod
@@ -167,6 +322,12 @@ class FlashKDAKernel(LinearAttnKernelBase):
         is_spec_decode: bool,
         query_start_loc: torch.Tensor,
         extend_seq_lens_cpu: Optional[list],
+        *,
+        num_heads: int,
+        state_dtype: torch.dtype,
+        compute_capability: tuple[int, int],
+        multi_processor_count: int,
+        total_memory: int,
     ) -> bool:
         """Whether to use the Triton chunk_kda path instead of the fused kernel."""
         # Safe-gate only: the fused kernel does not support the unbounded gate
@@ -191,11 +352,22 @@ class FlashKDAKernel(LinearAttnKernelBase):
             else:
                 lo = min(extend_seq_lens_cpu)
                 hi = max(extend_seq_lens_cpu)
+            num_sequences = len(extend_seq_lens_cpu)
         else:
             seq_lens = query_start_loc[1:] - query_start_loc[:-1]
             lo_t, hi_t = torch.aminmax(seq_lens)
             lo, hi = int(lo_t), int(hi_t)
-        return lo < _FLASHKDA_CHUNK_SIZE or hi > _FLASHKDA_MAX_SEQ_LEN
+            num_sequences = query_start_loc.numel() - 1
+        return not _prefer_flashkda_for_shape(
+            compute_capability=compute_capability,
+            multi_processor_count=multi_processor_count,
+            total_memory=total_memory,
+            state_dtype=state_dtype,
+            num_heads=num_heads,
+            num_sequences=num_sequences,
+            min_seq_len=lo,
+            max_seq_len=hi,
+        )
 
     def _flashkda_extend(
         self,

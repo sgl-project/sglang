@@ -401,8 +401,11 @@ class TestKDAPackedDecode(unittest.TestCase):
         b = (torch.randn(B, HV, dtype=dtype, device=device) * 0.5).contiguous()
         A_log = torch.randn(HV, dtype=torch.float32, device=device) * 0.2
         dt_bias = torch.randn(HV * K, dtype=torch.float32, device=device) * 0.1
+        # Production KDA stores the recurrent matrix in FP32.  Keeping this
+        # realistic also ensures SM10 CI actually exercises the native packed
+        # path instead of silently falling back to Triton on dtype support.
         ssm_states = (
-            torch.randn(pool_size, HV, V, K, dtype=dtype, device=device) * 0.01
+            torch.randn(pool_size, HV, V, K, dtype=torch.float32, device=device) * 0.01
         ).contiguous()
         cache_indices = torch.arange(B, device=device, dtype=torch.int32)
         return mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices

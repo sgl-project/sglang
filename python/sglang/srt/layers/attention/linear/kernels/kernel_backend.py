@@ -43,7 +43,7 @@ class LinearAttnKernelBase(ABC):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> tuple: ...
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]: ...
 
     def target_verify(
         self,

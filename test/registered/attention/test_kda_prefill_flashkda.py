@@ -80,7 +80,7 @@ def _chunk_kda_ref(d, lower_bound):
     """Triton chunk_kda reference. chunk_kda mutates g/v and the state in place,
     so feed clones; returns (output, updated_state_slots)."""
     st = d["pool"].clone()
-    out, _ = chunk_kda(
+    out = chunk_kda(
         q=d["q"].clone(),
         k=d["k"].clone(),
         v=d["v"].clone(),
@@ -105,7 +105,7 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     ref_out, ref_state = _chunk_kda_ref(d, LOWER_BOUND)
 
     st_fk = d["pool"].clone()
-    out, h = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -121,7 +121,6 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     )
     torch.cuda.synchronize()
 
-    assert h is None
     assert torch.isfinite(out).all(), "FlashKDA output has non-finite values"
     assert torch.isfinite(st_fk).all(), "FlashKDA final state has non-finite values"
     # bf16 cross-implementation noise (chunk=16 CUTLASS vs chunk=64 Triton);
@@ -141,7 +140,7 @@ def test_flashkda_falls_back_without_lower_bound():
     ref_out, _ = _chunk_kda_ref(d, None)
 
     st_fk = d["pool"].clone()
-    out, _ = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -171,7 +170,7 @@ def test_flashkda_spec_verify_falls_back():
     ref_out, _ = _chunk_kda_ref(d, LOWER_BOUND)
 
     st_fk = d["pool"].clone()
-    out, _ = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
