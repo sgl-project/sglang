@@ -8,11 +8,14 @@ import time
 from abc import ABC
 from array import array
 from collections import defaultdict
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import Mock
 
+import msgspec
 import pytest
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -43,7 +46,7 @@ def _load(namespace, path, selections):
                 child.decorator_list = [
                     d
                     for d in child.decorator_list
-                    if isinstance(d, ast.Name) and d.id == "staticmethod"
+                    if isinstance(d, ast.Name) and d.id in ("staticmethod", "property")
                 ]
                 # FINISH_ABORT is supplied from the real schedule_batch AST.
                 child.body = [
@@ -91,7 +94,13 @@ def code():
         {
             "BaseFinishReason": None,
             "FINISH_ABORT": None,
-            "Req": {"set_finish_with_abort", "update_finish_state", "finished"},
+            "Req": {
+                "set_finish_with_abort",
+                "update_finish_state",
+                "finished",
+                "output_ids_through_stop",
+                "init_incremental_detokenize",
+            },
         },
     )
     _load(
@@ -418,6 +427,137 @@ def test_prefill_pending_abort_does_not_enter_optimistic_prefill(code):
     assert queue.queue == [req]
     queue.ensure_metadata_buffer.assert_not_called()
     sender.kv_mgr.sync_status_to_decode_endpoint.assert_not_called()
+
+
+@pytest.fixture
+def real_streamer(code):
+    ns = code.Req.finished.__globals__
+    ns.update(
+        __name__=__name__,
+        dataclass=dataclass,
+        field=field,
+        ClassVar=ClassVar,
+        msgspec=msgspec,
+        wrap_as_pickle=lambda value: value,
+        INIT_INCREMENTAL_DETOKENIZATION_OFFSET=5,
+        DEFAULT_FORCE_STREAM_INTERVAL=50,
+        get_serving=lambda: SimpleNamespace(stream_interval=1, weight_version="test"),
+        get_observability=lambda: SimpleNamespace(
+            enable_request_time_stats_logging=False
+        ),
+        envs=SimpleNamespace(
+            SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS=SimpleNamespace(get=lambda: 0)
+        ),
+    )
+    _load(
+        ns, "managers/io_struct.py", {"BaseBatchReq": None, "BatchTokenIDOutput": None}
+    )
+    _load(
+        ns,
+        "utils/weight_versions.py",
+        {"WeightVersionSpan": None, "compute_weight_version_spans": None},
+    )
+    _load(
+        ns,
+        "managers/scheduler_components/output_streamer.py",
+        {"SchedulerOutputStreamer": None, "_GenerationStreamAccumulator": None},
+    )
+    payloads = []
+    streamer = ns["SchedulerOutputStreamer"](
+        send_to_detokenizer=SimpleNamespace(send_output=payloads.append),
+        tree_cache=None,
+        ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
+        server_args=SimpleNamespace(),
+        is_generation=True,
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        disaggregation_mode="prefill",
+        enable_hicache_storage=lambda: False,
+    )
+    return streamer, payloads
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+@pytest.mark.parametrize("cleanup", ["metadata", "timeout"])
+def test_prefill_admission_response_precedes_cleanup(
+    code, real_streamer, monkeypatch, pp_size, cleanup
+):
+    req = _req(code)
+    original = req.to_finish
+    req.output_ids = array("q")
+    req.origin_input_ids_unpadded = array("q", [1, 2, 3])
+    req.finished_len = req.surr_offset = req.read_offset = None
+    req.beam_group = req.http_worker_ipc = req.customized_info = None
+    req.decoded_text = ""
+    req.weight_version_events = []
+    req.sampling_params = SimpleNamespace(
+        skip_special_tokens=True, spaces_between_special_tokens=True, no_stop_trim=False
+    )
+    req.return_hidden_states = req.return_routed_experts = False
+    req.return_indexer_topk = req.return_sampling_mask = False
+    req.send_token_offset = req.send_output_token_logprobs_offset = 0
+    req.send_decode_id_offset = req.reasoning_tokens = req.retraction_count = 0
+    req.cached_tokens = req.cached_tokens_device = 0
+    req.cached_tokens_host = req.cached_tokens_storage = 0
+    req.mm_image_tokens = req.mm_audio_tokens = req.mm_video_tokens = 0
+    queue, sender = _prefill_queue(code, req, code.KVPoll.Bootstrapping)
+    queue.pp_size = pp_size
+    queue.scheduler.output_streamer, payloads = real_streamer
+    sender.kv_mgr.transfer_infos.clear()
+    sender.kv_mgr.req_to_decode_prefix_len.clear()
+
+    waiting = {"pp_good_rids": [], "pp_bad_rids": []} if pp_size > 1 else {}
+    for _ in range(2):
+        assert queue.pop_bootstrapped(**waiting) == []
+        assert queue.queue == [req]
+        assert req.pending_bootstrap
+        assert req.finished_output is (pp_size == 1)
+        assert req.finished_reason is (original if pp_size == 1 else None)
+        assert req.to_finish is (None if pp_size == 1 else original)
+        assert len(payloads) == (1 if pp_size == 1 else 0)
+        sender.kv_mgr.sync_status_to_decode_endpoint.assert_not_called()
+        queue.scheduler.tree_cache.release_aborted_request.assert_not_called()
+        assert 42 in sender.kv_mgr.request_status
+
+    if cleanup == "metadata":
+        _deliver_prefill_metadata(sender.kv_mgr, monkeypatch)
+    else:
+        sender.init_time -= sender.kv_mgr.bootstrap_timeout + 1
+        monkeypatch.setattr(
+            code.logger, "warning_once", code.logger.warning, raising=False
+        )
+    kwargs = (
+        {
+            "pp_good_rids": [req.rid] if cleanup == "metadata" else [],
+            "pp_bad_rids": [req.rid] if cleanup == "timeout" else [],
+        }
+        if pp_size > 1
+        else {}
+    )
+    assert queue.pop_bootstrapped(return_failed_reqs=True, **kwargs) == ([], [req])
+    assert queue.pop_bootstrapped(**kwargs) == []
+    assert queue.queue == []
+    assert not req.pending_bootstrap
+    assert req.finished_reason is original
+    assert req.finished_output
+    assert len(req.output_ids) == 0
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload.rids == [req.rid]
+    assert payload.finished_reasons == [original.to_json()]
+    assert payload.finished_reasons[0]["status_code"] == 400
+    assert payload.output_ids == [array("q")]
+    assert payload.completion_tokens == [0]
+    assert payload.decode_ids == [req.origin_input_ids_unpadded]
+    assert not sender._send_started
+    queue.ensure_metadata_buffer.assert_not_called()
+    queue.finalize_bootstrap.assert_not_called()
+    queue.scheduler.tree_cache.release_aborted_request.assert_called_once_with(req.rid)
+    code.release_kv_cache.assert_not_called()
+    assert sender.kv_mgr.request_status == sender.kv_mgr.transfer_infos == {}
+    assert sender.kv_mgr.failure_records == sender.kv_mgr.req_to_decode_prefix_len == {}
+    assert sender.kv_mgr.sync_status_to_decode_endpoint.call_count == (
+        cleanup == "metadata"
+    )
 
 
 def test_prefill_notification_failure_still_cleans_up(code):
