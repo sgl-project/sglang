@@ -2544,6 +2544,7 @@ class MMReceiverBase(ABC):
             ),
             extra_key=recv_req.extra_key,
             cache_salt=recv_req.cache_salt,
+            skip_cache_insert=recv_req.skip_cache_insert,
             http_worker_ipc=recv_req.http_worker_ipc,
             dllm_config=self.scheduler.dllm_config,
         )

@@ -1958,6 +1958,7 @@ class Req(ReqDllmMixin):
             "priority": self.priority,
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,
+            "skip_cache_insert": self.skip_radix_cache_insert,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
