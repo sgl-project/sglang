@@ -119,7 +119,14 @@ class DllmAlgorithm:
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         if all(start == length for start, length in zip(start_list, sequence_lengths)):
-            return out.logits_output, [], None, None, out.can_run_graph, None
+            return (
+                out.logits_output,
+                [[] for _ in range(batch_size)],
+                None,
+                None,
+                out.can_run_graph,
+                None,
+            )
 
         # NPU: attention metadata is stable across a block's denoise steps (the
         # first forward above already planned it), so mark it ready once and let

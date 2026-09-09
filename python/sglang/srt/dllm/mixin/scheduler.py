@@ -121,7 +121,9 @@ class SchedulerDllmMixin:
                     continue
 
                 if not fdfo_mode:
-                    next_token_ids = result.next_token_ids[idx].tolist()
+                    next_token_ids = result.next_token_ids[idx]
+                    if hasattr(next_token_ids, "tolist"):
+                        next_token_ids = next_token_ids.tolist()
                     new_tokens = len(next_token_ids)
                     if new_tokens == 0:
                         if self.dllm_config.needs_full_prefill:

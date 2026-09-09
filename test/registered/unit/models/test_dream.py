@@ -134,6 +134,23 @@ class TestDreamAlgorithm(CustomTestCase):
         self.assertEqual(forward_batch.input_ids.tolist(), [10, 11, 2, 2, 20, 2, 2])
         self.assertEqual([state["step"] for state in states], [1, 1])
 
+    def test_dream_sync_empty_canvas_returns_one_result_per_request(self):
+        dream = Dream(_config(first_done_first_out_mode=False))
+        forward_batch = self._forward_batch(torch.tensor([10, 20]), [1, 1])
+        model_runner = MagicMock()
+        model_runner.forward.return_value = SimpleNamespace(
+            logits_output=SimpleNamespace(full_logits=torch.zeros((2, 5))),
+            can_run_graph=False,
+        )
+
+        result = dream._run_sync(
+            model_runner,
+            forward_batch,
+            [{"prompt_len": 1, "step": 0}, {"prompt_len": 1, "step": 0}],
+        )
+
+        self.assertEqual(result[1], [[], []])
+
     def test_dream_fdfo_carries_each_request_until_done(self):
         dream = Dream(_config(algorithm_config={"steps": 2, "alg": "origin"}))
         model_runner = MagicMock()
@@ -541,7 +558,7 @@ class TestDreamFDFOResultProcessing(CustomTestCase):
         scheduler = self._scheduler(config)
         result = SimpleNamespace(
             copy_done=None,
-            next_token_ids=[torch.empty(0, dtype=torch.long)],
+            next_token_ids=[[]],
             dllm_algo_state=None,
             can_run_cuda_graph=False,
         )
@@ -562,7 +579,7 @@ class TestDreamFDFOResultProcessing(CustomTestCase):
         scheduler = self._scheduler(config)
         result = SimpleNamespace(
             copy_done=None,
-            next_token_ids=[torch.empty(0, dtype=torch.long)],
+            next_token_ids=[[]],
             dllm_algo_state=None,
             can_run_cuda_graph=False,
         )
