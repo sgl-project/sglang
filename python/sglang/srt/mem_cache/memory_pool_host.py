@@ -12,6 +12,17 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    require_kvcacheio_ops,
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_pf,
+    transfer_kv_direct,
+    transfer_kv_per_layer_direct_pf_lf,
+    transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+    unavailable_stub,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -20,19 +31,17 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
 if _is_xpu:
-    from sgl_kernel import transfer_cache_dsv4_mla
+    try:
+        from sgl_kernel import transfer_cache_dsv4_mla
+    except ImportError as e:
+        # Only DSV4 needs this op; a wheel without it must not break scheduler import.
+        transfer_cache_dsv4_mla = unavailable_stub(
+            "transfer_cache_dsv4_mla",
+            f"sgl_kernel.transfer_cache_dsv4_mla failed to import ({e}); XPU "
+            "takes it from the out-of-tree sgl-kernel-xpu wheel",
+        )
 else:
     from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
-if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-    )
 
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
@@ -47,7 +56,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     synchronized,
 )
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
+    get_alloc_memory_func,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -219,6 +228,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         allocator_type: str = "default",
         page_aligned_only: bool = False,
     ):
+        require_kvcacheio_ops(
+            pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+        )
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
@@ -253,15 +265,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
-        # not torch.device objects; a torch.device key silently falls back to
-        # cudaHostRegister, which fails on NPU. Resolve the alloc func by type str.
-        _alloc_key = (
-            self.gpu_device.type
-            if isinstance(self.gpu_device, torch.device)
-            else str(self.gpu_device)
-        )
-        alloc_func = ALLOC_MEMORY_FUNCS[_alloc_key]
+        alloc_func = get_alloc_memory_func(self.gpu_device)
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -447,6 +451,25 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.release_slots.append(indices_cpu)
         self.num_release_slots += len(indices_cpu)
         return len(indices)
+
+    # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+    # checked at construction; keep in step with their branches.
+    _kvcacheio_ops = {
+        "kernel": {
+            "layer_first": ("transfer_kv_per_layer_mla", "transfer_kv_all_layer_mla"),
+            "page_first": (
+                "transfer_kv_per_layer_mla_pf_lf",
+                "transfer_kv_all_layer_mla_lf_pf",
+            ),
+        },
+        "direct": {
+            "layer_first": ("transfer_kv_direct",),
+            "page_first_direct": (
+                "transfer_kv_per_layer_direct_pf_lf",
+                "transfer_kv_all_layer_direct_lf_pf",
+            ),
+        },
+    }
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -727,6 +750,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
     ):
         if any(pool is None for pool in state_pools):
             raise ValueError(f"{pool_name} state_pools must not contain None")
+        require_kvcacheio_ops(
+            pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+        )
 
         self.pool_name = pool_name
         self.state_pools = state_pools
@@ -760,14 +786,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
-        # not torch.device objects; resolve the key the same way PagedHostPool does.
-        _state_alloc_key = (
-            self.gpu_device.type
-            if isinstance(self.gpu_device, torch.device)
-            else str(self.gpu_device)
-        )
-        alloc_func = ALLOC_MEMORY_FUNCS[_state_alloc_key]
+        alloc_func = get_alloc_memory_func(self.gpu_device)
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -945,6 +964,25 @@ class DeepSeekV4StateHostPool(HostKVCache):
         raise NotImplementedError(
             f"{self.pool_name} reuses SWA transfer indices and has no free list"
         )
+
+    # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+    # checked at construction; keep in step with their branches.
+    _kvcacheio_ops = {
+        "kernel": {
+            "layer_first": ("transfer_kv_per_layer_mla", "transfer_kv_all_layer_mla"),
+            "page_first": (
+                "transfer_kv_per_layer_mla_pf_lf",
+                "transfer_kv_all_layer_mla_lf_pf",
+            ),
+        },
+        "direct": {
+            "layer_first": ("transfer_kv_direct",),
+            "page_first_direct": (
+                "transfer_kv_per_layer_direct_pf_lf",
+                "transfer_kv_all_layer_direct_lf_pf",
+            ),
+        },
+    }
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend

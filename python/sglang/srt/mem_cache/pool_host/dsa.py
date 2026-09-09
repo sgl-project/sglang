@@ -16,33 +16,33 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    require_kvcacheio_ops,
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_pf,
+    transfer_kv_direct,
+    transfer_kv_per_layer_direct_pf_lf,
+    transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+    unavailable_reason,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
     host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
+    get_alloc_memory_func,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,19 @@ class DSAIndexerPoolHost(HostKVCache):
         allocator_type: str = "default",
         is_dummy: bool = False,
     ):
+        # Fail at construction, not first transfer; a dummy pool never transfers.
+        if not is_dummy and unavailable_reason is not None:
+            raise ValueError(
+                f"HiCache cannot offload the DSA indexer here: {unavailable_reason}. "
+                "Launch without HiCache host offload "
+                "(--enable-hierarchical-cache, "
+                "--disaggregation-decode-retraction-backup=host_pool)."
+            )
+        if not is_dummy:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
+
         self._is_dummy = is_dummy
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
@@ -150,7 +163,7 @@ class DSAIndexerPoolHost(HostKVCache):
         return self.get_size_per_token()
 
     def init_kv_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         device_pools = (self.device_pool, *self.mtp_draft_device_pools)
         self.packed_device_index_buffers = [
             buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
@@ -232,6 +245,25 @@ class DSAIndexerPoolHost(HostKVCache):
             device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
         )
         return host_page_indices, device_page_indices
+
+    # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+    # checked at construction; keep in step with their branches.
+    _kvcacheio_ops = {
+        "kernel": {
+            "layer_first": ("transfer_kv_per_layer_mla", "transfer_kv_all_layer_mla"),
+            "page_first": (
+                "transfer_kv_per_layer_mla_pf_lf",
+                "transfer_kv_all_layer_mla_lf_pf",
+            ),
+        },
+        "direct": {
+            "layer_first": ("transfer_kv_direct",),
+            "page_first_direct": (
+                "transfer_kv_per_layer_direct_pf_lf",
+                "transfer_kv_all_layer_direct_lf_pf",
+            ),
+        },
+    }
 
     def load_to_device_per_layer(
         self,
