@@ -283,6 +283,10 @@ class HostPinBudget:
         )
         return False
 
+    def release(self, weight_bytes: int) -> None:
+        """Return an allowance when its pinned storage is no longer owned."""
+        self.committed_bytes -= weight_bytes
+
 
 def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:
     """Host-to-device bytes a pin would cover for one request.

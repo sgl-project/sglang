@@ -23,7 +23,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
     ComponentUse,
+    ResidencyState,
     build_component_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -468,6 +470,46 @@ def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
         "so the stepped DiT must claim the pin budget before the "
         "once-per-request encoder"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
+    transformer = _NestedDummyModel()
+    vae = torch.nn.Linear(4, 4, bias=False)
+    encoder = torch.nn.Linear(32, 32, bias=False)
+    modules = {"transformer": transformer, "vae": vae, "text_encoder": encoder}
+    pipeline = SimpleNamespace(
+        modules=modules, _stage_name_mapping={}, component_residency_strategies={}
+    )
+    args = _server_args(
+        component_residency={
+            "transformer": "layerwise-offload",
+            "vae": "snapshot-offload",
+            "text_encoder": "snapshot-offload",
+        },
+        pin_cpu_memory=True,
+    )
+    manager = ComponentResidencyManager(pipeline, args)
+    budget = manager.host_pin_budget
+    budget.available_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
+    budget.reserve_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES
+    configured = configure_layerwise_offload_modules(modules, args, pin_budget=budget)
+    assert configured == ["transformer"]
+    layerwise = transformer.layerwise_offload_managers[0]
+    assert layerwise._pin_budget is budget
+    booked = budget.committed_bytes
+    assert 0 < booked < 1024 - 64
+    for name in ("vae", "text_encoder"):
+        module = modules[name]
+        strategy = manager.strategy_for(name, module)
+        use = ComponentUse("encode", name)
+        strategy.prepare_for_use(module, use, ResidencyState())
+        strategy.finish_use(module, use, ResidencyState())
+        assert budget.committed_bytes == booked + 64
+        assert module.weight.is_pinned() == (name == "vae")
+    transformer.disable_offload()
+    layerwise.release_host_stores()
+    assert budget.committed_bytes == 64
 
 
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):

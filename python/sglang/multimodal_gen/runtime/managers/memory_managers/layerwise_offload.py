@@ -2730,6 +2730,8 @@ def configure_layerwise_offload_modules(
     server_args: ServerArgs,
     component_names: Sequence[str] | None = None,
     warn_missing: bool = True,
+    *,
+    pin_budget: HostPinBudget | None = None,
 ) -> list[str]:
     """Configure layerwise offload for the given modules, from the given component_names
 
@@ -2907,7 +2909,8 @@ def configure_layerwise_offload_modules(
         key=_h2d_bytes_a_pin_would_save,
         reverse=True,
     )
-    pin_budget = HostPinBudget()
+    if pin_budget is None:
+        pin_budget = HostPinBudget()
     logger.info("Layerwise offload host memory: %s", describe_host_memory())
 
     for component_name in selected_pipeline_component_names:

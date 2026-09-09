@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     SnapshotOffloadStrategy,
     is_fsdp_managed_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
@@ -89,6 +92,8 @@ def build_component_residency_strategy(
     component_name: str,
     module: nn.Module,
     server_args: ServerArgs,
+    *,
+    pin_budget: HostPinBudget | None = None,
 ) -> ComponentResidencyStrategy:
     residency_mode = server_args.residency_mode(component_name)
     if is_layerwise_offloaded_module(module):
@@ -107,7 +112,7 @@ def build_component_residency_strategy(
             "was loaded as an FSDP-managed module"
         )
     if residency_mode == SNAPSHOT_OFFLOAD:
-        return SnapshotOffloadStrategy()
+        return SnapshotOffloadStrategy(pin_budget=pin_budget)
     if (
         not current_platform.is_mps()
         and not is_fsdp_managed_module(module)
@@ -126,6 +131,7 @@ class ComponentResidencyManager:
         self.pipeline = pipeline
         self.server_args = server_args
         self.state = ResidencyState()
+        self._host_pin_budget: HostPinBudget | None = None
         self._stage_names_by_id: dict[int, str] = {}
         self._stage_uses_by_index: list[tuple[ComponentUse, ...]] = []
         self._ordered_uses: tuple[ComponentUse, ...] = ()
@@ -153,9 +159,17 @@ class ComponentResidencyManager:
         self._warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
         self._completed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
 
+    @property
+    def host_pin_budget(self) -> HostPinBudget:
+        # measure headroom after loading, when the first offload path needs it
+        if self._host_pin_budget is None:
+            self._host_pin_budget = HostPinBudget()
+        return self._host_pin_budget
+
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
         if pipeline is not self.pipeline:
+            self._host_pin_budget = None
             self._remove_nvtx_hooks()
             self._strategy_cache.clear()
             self._active_use = None
@@ -828,6 +842,13 @@ class ComponentResidencyManager:
                 component_name,
                 module,
                 self.server_args,
+                pin_budget=(
+                    self.host_pin_budget
+                    if self.server_args.residency_mode(component_name)
+                    == SNAPSHOT_OFFLOAD
+                    and self.server_args.pin_cpu_memory
+                    else None
+                ),
             )
         else:
             strategy = custom_strategy

@@ -10,6 +10,7 @@ from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
     shared_pool_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -221,6 +222,10 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
 class SnapshotOffloadStrategy(ComponentOffloadStrategy):
     """Keep CPU weights during device use; restore them without weight D2H."""
 
+    def __init__(self, *, pin_budget: HostPinBudget | None = None) -> None:
+        super().__init__()
+        self._pin_budget = pin_budget
+
     def _load_component(self, module: nn.Module, use: ComponentUse) -> None:
         if weight_snapshot(module) is not None and not _module_ready_on_local_device(
             module, dtype=use.target_dtype
@@ -229,7 +234,9 @@ class SnapshotOffloadStrategy(ComponentOffloadStrategy):
         if weight_snapshot(module) is None:
             if use.target_dtype is not None:
                 module.to(dtype=use.target_dtype)
-            capture_weight_snapshot(module)
+            capture_weight_snapshot(
+                module, pin_budget=self._pin_budget, component_name=use.component_name
+            )
         super()._load_component(module, use)
 
     def finish_use(
