@@ -154,6 +154,8 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
 
 
 def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) -> bool:
+    # Rank replies include pre-existing adapters, not only the attempted ID.
+    # Callers must exclude registered names before checking for partial loads.
     return any(
         result.success or lora_name in (result.loaded_adapters or {})
         for result in results
@@ -651,7 +653,10 @@ class TokenizerControlMixin:
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
-                elif _lora_load_needs_cleanup(rank_results, obj.lora_name):
+                elif (
+                    obj.lora_name not in self.lora_registry.get_all_adapters()
+                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
+                ):
                     self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
 
                 if get_lora().max_loaded_loras is not None:
@@ -734,7 +739,10 @@ class TokenizerControlMixin:
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
-                elif _lora_load_needs_cleanup(rank_results, obj.lora_name):
+                elif (
+                    obj.lora_name not in self.lora_registry.get_all_adapters()
+                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
+                ):
                     self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
 
                 if get_lora().max_loaded_loras is not None:
