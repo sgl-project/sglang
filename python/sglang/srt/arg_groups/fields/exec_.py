@@ -847,6 +847,16 @@ class ExecOffload:
         "Steps to prefetch in offloading.",
     ] = 1
     offload_mode: A[str, "Mode of offloading."] = "cpu"
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
+            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "--no-ple-offload-embedding to disable.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
 
 
 @dataclasses.dataclass

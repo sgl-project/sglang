@@ -21,7 +21,7 @@ class TestQwen35FP4(CustomTestCase):
             "4",
             "--chunked-prefill-size",
             "2048",
-            "--mamba-scheduler-strategy",
+            "--mamba-radix-cache-strategy",
             "extra_buffer",
             "--mamba-track-interval",
             "128",
