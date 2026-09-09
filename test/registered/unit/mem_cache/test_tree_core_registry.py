@@ -488,6 +488,18 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
         params.tree_components = (ComponentType.FULL, ComponentType.C128)
         self.assertEqual(select_tree_core_backend(params), "python")
 
+    def test_python_only_features_use_python_with_a_warning(self):
+        for field, flag in (
+            ("hicache_serialize_load_back", "--hicache-serialize-load-back"),
+        ):
+            with self.subTest(flag=flag):
+                with self.assertLogs(tree_core_registry.logger, "WARNING") as logs:
+                    backend = select_tree_core_backend(
+                        _cache_init_params(**{field: True})
+                    )
+                self.assertEqual(backend, "python")
+                self.assertIn(flag, "\n".join(logs.output))
+
     def test_unsupported_platform_and_torch_use_python(self):
         for platform in ("darwin", "win32"):
             with (
