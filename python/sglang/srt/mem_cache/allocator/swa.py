@@ -485,6 +485,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 ), "swa pages do not match the mapped pages"
         self.clear_full_to_swa_mapping(mapping_indices)
 
+        if self._swa_req_ring:
+            # Ring slots are owned by the req slot, never lent by the paged
+            # allocator; returning them over-credits its available_size().
+            return
+
         if self.free_group is not None:
             # Resolve ownership now, as above.
             self.swa_page_ids_group.append(swa_pages)
@@ -547,7 +552,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.swa_page_ids_group:
             swa_page_ids_group = self.swa_page_ids_group
             self.swa_page_ids_group = []
-            self.swa_attn_allocator.free_page_ids(torch.cat(swa_page_ids_group))
+            if not self._swa_req_ring:
+                self.swa_attn_allocator.free_page_ids(torch.cat(swa_page_ids_group))
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
