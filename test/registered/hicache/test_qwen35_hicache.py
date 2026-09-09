@@ -51,7 +51,7 @@ class TestQwen35WithHiCache(CustomTestCase):
                 "120000",
                 "--chunked-prefill-size",
                 "2048",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 "128",

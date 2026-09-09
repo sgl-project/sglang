@@ -59,7 +59,7 @@ QWEN3_32B_OTHER_ARGS = [
     16,
     "--mem-fraction-static",
     0.72,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     64,
     "--dtype",
     "bfloat16",

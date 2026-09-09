@@ -29,6 +29,7 @@ from sglang.kernels.ops.diffusion import (
     mount_hunyuan_qknorm,
     mount_lingbot_video_gated_residual,
     mount_lingbot_video_rmsnorm,
+    mount_ltx2_qknorm_split_rope,
     mount_ltx2_rms_norm_modulate,
     mount_nvfp4_bias_gelu,
     mount_qwen_image_added_qkv,
@@ -41,6 +42,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_hunyuan_qknorm,
     unmount_lingbot_video_gated_residual,
     unmount_lingbot_video_rmsnorm,
+    unmount_ltx2_qknorm_split_rope,
     unmount_ltx2_rms_norm_modulate,
     unmount_nvfp4_bias_gelu,
     unmount_qwen_image_added_qkv,
@@ -203,6 +205,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "fused LN+modulate (affine folding)",
         mount_fused_ln_modulate,
         unmount_fused_ln_modulate,
+    ),
+    (
+        "LTX-2 Hopper QKNorm+split-RoPE",
+        mount_ltx2_qknorm_split_rope,
+        unmount_ltx2_qknorm_split_rope,
     ),
     (
         "LTX-2 fused RMSNorm+modulate",
