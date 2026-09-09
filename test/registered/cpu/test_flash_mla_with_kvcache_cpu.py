@@ -11,7 +11,7 @@ from sglang.test.cpu_test_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu-intel")
 
 try:
     from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu

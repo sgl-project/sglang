@@ -588,22 +588,6 @@ at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& po
 at::Tensor hc_head_fused_cpu(
     at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps);
 
-#else
-// fused moe
-at::Tensor fused_experts_cpu(
-    at::Tensor& hidden_states,
-    at::Tensor& w1,
-    at::Tensor& w2,
-    at::Tensor& topk_weights,
-    at::Tensor& topk_ids,
-    bool inplace,
-    int64_t moe_comp_method,
-    const std::optional<at::Tensor>& w1_scale,
-    const std::optional<at::Tensor>& w2_scale,
-    const std::optional<at::Tensor>& w1_zero,
-    const std::optional<at::Tensor>& w2_zero,
-    const std::optional<std::vector<int64_t>> block_size,
-    bool is_vnni);
 #endif
 
 // conv3d fast path for patch embedding
@@ -960,7 +944,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
 
-#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
@@ -969,6 +952,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // quant
   m.def("act_quant_cpu(Tensor x, int block_size=128, str? scale_fmt=None) -> (Tensor, Tensor)");
   m.impl("act_quant_cpu", torch::kCPU, &act_quant_cpu);
@@ -1110,13 +1094,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "hc_head_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
       "float hc_eps, float norm_eps) -> Tensor");
   m.impl("hc_head_fused_cpu", torch::kCPU, &hc_head_fused_cpu);
-#else
-  // moe
-  m.def(
-      "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
-      "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
-  m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 #endif
 
   // conv3d fast path for patch embedding
