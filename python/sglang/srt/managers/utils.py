@@ -22,11 +22,11 @@ from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_token
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
-from sglang.srt.utils.device_timer import DeviceTiming
 
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.observability.fpm_timing import FpmTiming
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -139,7 +139,7 @@ class GenerationBatchResult:
     # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
-    fpm_timing: Optional[DeviceTiming] = None
+    fpm_timing: Optional[FpmTiming] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
@@ -379,7 +379,7 @@ class EmbeddingBatchResult:
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
-    fpm_timing: Optional[DeviceTiming] = None
+    fpm_timing: Optional[FpmTiming] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):

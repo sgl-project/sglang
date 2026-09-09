@@ -17,6 +17,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.observability.fpm_timing import capture_fpm_timing
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -92,6 +93,8 @@ def _publish_server_args(test, **fields):
 
 
 def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
+    if not hasattr(scheduler, "run_batch"):
+        scheduler.run_batch = lambda *args, **kwargs: types.SimpleNamespace()
     if not hasattr(scheduler, "server_args"):
         scheduler.server_args = _publish_server_args(
             test,
@@ -203,7 +206,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler._fpm_uses_device_timer = True
         timer = self.reporter.forward_pass_device_timer = DeviceTimer()
         interval = types.SimpleNamespace(
-            capture=None,
+            observer=None,
             stream=0,
             start_event=types.SimpleNamespace(elapsed_time=lambda _: 42.0),
             end=lambda **_: None,
@@ -212,7 +215,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             metadata={},
         )
         with patch.object(_TimingInterval, "create", return_value=interval):
-            with timer.capture() as timing:
+            with capture_fpm_timing(timer) as timing:
                 with timer.wrap({}):
                     pass
         batch = self._make_batch()
@@ -229,7 +232,7 @@ class TestForwardPassMetrics(unittest.TestCase):
     def test_emit_skips_uninstrumented_iteration(self):
         self.scheduler._fpm_uses_device_timer = True
         timer = self.reporter.forward_pass_device_timer = DeviceTimer()
-        with timer.capture() as timing:
+        with capture_fpm_timing(timer) as timing:
             pass
         batch = self._make_batch()
 
@@ -244,7 +247,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         timer = self.reporter.forward_pass_device_timer = DeviceTimer()
         ready = [False]
         interval = types.SimpleNamespace(
-            capture=None,
+            observer=None,
             stream=0,
             start_event=types.SimpleNamespace(elapsed_time=lambda _: 7.0),
             end=lambda **_: None,
@@ -253,7 +256,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             metadata={},
         )
         with patch.object(_TimingInterval, "create", return_value=interval):
-            with timer.capture() as timing:
+            with capture_fpm_timing(timer) as timing:
                 with timer.wrap({}):
                     pass
         batch = self._make_batch(seq_lens_cpu=[100, 200])
@@ -335,6 +338,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
+        original_forward = scheduler.run_batch = lambda: types.SimpleNamespace()
         scheduler.server_args = _publish_server_args(
             self,
             enable_metrics=False,
@@ -355,6 +359,8 @@ class TestForwardPassMetrics(unittest.TestCase):
             reporter = _make_reporter(self, scheduler)
 
         self.assertTrue(scheduler.enable_fpm)
+        self.assertIs(scheduler.run_batch.__wrapped__, original_forward)
+        self.assertEqual(scheduler.run_batch().fpm_timing.num_intervals, 0)
         self.assertEqual(scheduler._fpm_worker_id, "endpoint-42")
         self.assertEqual(scheduler._fpm_dp_rank, 2)
         self.assertEqual(scheduler._fpm_publisher.worker_id, "endpoint-42")
@@ -372,6 +378,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_fpm_disabled_on_non_last_pp_rank(self):
         scheduler = types.SimpleNamespace()
+        original_forward = scheduler.run_batch = lambda: types.SimpleNamespace()
         scheduler.server_args = _publish_server_args(
             self,
             enable_metrics=False,
@@ -392,6 +399,18 @@ class TestForwardPassMetrics(unittest.TestCase):
             reporter = _make_reporter(self, scheduler)
 
         self.assertFalse(scheduler.enable_fpm)
+        self.assertIs(scheduler.run_batch, original_forward)
+
+    def test_fpm_off_keeps_original_forward(self):
+        class Scheduler:
+            def run_batch(self):
+                return types.SimpleNamespace()
+
+        scheduler = Scheduler()
+        _make_reporter(self, scheduler)
+        self.assertFalse(scheduler.enable_fpm)
+        self.assertNotIn("run_batch", vars(scheduler))
+        self.assertIs(scheduler.run_batch.__func__, Scheduler.run_batch)
 
 
 class TestIdleMetrics(CustomTestCase):
