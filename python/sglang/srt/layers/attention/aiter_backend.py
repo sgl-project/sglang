@@ -341,10 +341,14 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
 
-        # sliding window attention
+        # sliding window attention. Resolve the SWA pool rather than reading it
+        # straight off the active pool: a frozen-KV MTP draft worker's active
+        # pool is its own draft pool, but its draft path reads target KV, so the
+        # SWA mapping must still come from the target allocator. Mirrors
+        # TRTLLMHAAttnBackend._resolve_swa_kv_pool.
+        self.swa_kv_pool = self._resolve_swa_kv_pool(model_runner)
         self.use_sliding_window_kv_pool = (
-            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
-            and model_runner.token_to_kv_pool.swa_layer_nums > 0
+            self.swa_kv_pool is not None and self.swa_kv_pool.swa_layer_nums > 0
         )
 
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
@@ -775,7 +779,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         if self.use_sliding_window_kv_pool:
-            swa_slot_mapping = self.token_to_kv_pool.full_to_swa_index_mapping.long()
+            swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
 
             if swa_dest_buf is not None:
                 swa_page_table = swa_dest_buf
@@ -837,7 +841,7 @@ class AiterAttnBackend(AttentionBackend):
             page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
 
         if self.use_sliding_window_kv_pool:
-            swa_slot_mapping = self.token_to_kv_pool.full_to_swa_index_mapping.long()
+            swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
 
             if swa_page_table_dest is not None:
                 swa_page_table = swa_page_table_dest
@@ -1191,7 +1195,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    self.swa_kv_pool.translate_loc_from_full_to_swa(
                         forward_batch.out_cache_loc
                     )
                 )
@@ -1221,7 +1225,7 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            swa_out_cache_loc = self.swa_kv_pool.translate_loc_from_full_to_swa(
                 forward_batch.out_cache_loc
             )
         max_kv_len = forward_batch.seq_lens_cpu.max().item()
@@ -1269,7 +1273,7 @@ class AiterAttnBackend(AttentionBackend):
                         # AITER attention kernels require int32 page indices;
                         # full_to_swa_index_mapping is stored as int64.
                         swa_page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            self.swa_kv_pool.translate_loc_from_full_to_swa(
                                 kv_indices
                             ).to(torch.int32)
                         )
@@ -1674,11 +1678,9 @@ class AiterAttnBackend(AttentionBackend):
                     # AITER attention kernels (e.g. mha_batch_prefill_func)
                     # require int32 page indices; full_to_swa_index_mapping is
                     # stored as int64.
-                    swa_page_table = (
-                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                            self.indices_updater_prefill.kv_indices
-                        ).to(torch.int32)
-                    )
+                    swa_page_table = self.swa_kv_pool.translate_loc_from_full_to_swa(
+                        self.indices_updater_prefill.kv_indices
+                    ).to(torch.int32)
 
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
@@ -1889,7 +1891,7 @@ class AiterAttnBackend(AttentionBackend):
                             # AITER attention kernels require int32 page indices;
                             # full_to_swa_index_mapping is stored as int64.
                             swa_page_indices = (
-                                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                self.swa_kv_pool.translate_loc_from_full_to_swa(
                                     page_indices
                                 ).to(torch.int32)
                             )
@@ -2279,6 +2281,45 @@ class AiterAttnBackend(AttentionBackend):
                 "(speculative_eagle_topk=1 and SGLANG_AITER_UNIFIED_VERIFY=1)."
             )
 
+    @staticmethod
+    def _resolve_swa_kv_pool(model_runner):
+        """Return the SWAKVPool to translate against, or None for non-SWA models.
+
+        EAGLE draft workers share the target allocator for token bookkeeping but
+        own a separate draft KV pool, so the target allocator's SWA mapping must
+        not be used for them. FROZEN_KV MTP is the exception: its draft path reads
+        target KV directly, so it still needs the allocator pool when the active
+        pool is not itself an SWAKVPool. Mirrors
+        ``TRTLLMHAAttnBackend._resolve_swa_kv_pool``.
+        """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, SWAKVPool):
+            return active_pool
+        if getattr(model_runner, "is_draft_worker", False):
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
+                return None
+        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+        return kvcache if isinstance(kvcache, SWAKVPool) else None
+
+    @staticmethod
+    def _reject_paged_decode_sliding_window(layer):
+        """Reject sliding-window layers on the aiter paged-decode path.
+
+        ``paged_attention_ragged`` takes no sliding-window argument, so a
+        sliding-window layer routed to it would attend over the full context and
+        silently return wrong results. Raise instead of silently dropping the
+        window. Layers with ``sliding_window_size`` unset or -1 are unaffected.
+        """
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            raise ValueError(
+                "aiter paged decode cannot honor sliding-window "
+                f"attention (layer {layer.layer_id} has "
+                f"sliding_window_size={layer.sliding_window_size}). "
+                "Enable the unified attention path "
+                "(SGLANG_USE_AITER_UNIFIED_ATTN=1) or select a "
+                "different attention backend."
+            )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2334,7 +2375,7 @@ class AiterAttnBackend(AttentionBackend):
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
-                    slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
+                    slot_mapping_swa = self.swa_kv_pool.full_to_swa_index_mapping
 
                     launch_reshape_and_cache_flash(
                         k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
@@ -3285,6 +3326,7 @@ class AiterAttnBackend(AttentionBackend):
                     sinks=sinks,
                 )
             else:
+                self._reject_paged_decode_sliding_window(layer)
                 # Drop FP8 KV upcast: keep paged cache in native FP8 and use ``fp8_e4m3`` for
                 # in-kernel dequant in ``paged_attention_ragged``. (HIP maps CLI e5m2/e4m3 to
                 # ``fp8_dtype``; aiter has no ``fp8_e5m2`` string.)
