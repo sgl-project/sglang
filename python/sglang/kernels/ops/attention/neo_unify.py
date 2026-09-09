@@ -141,9 +141,10 @@ def neo_unify_attention(
                 "image_token_end must be int32 [S_q] or [B, S_q] on the Q device"
             )
         image_token_end = image_token_end.expand(batch, qlen)
-    resolved = resolve_neo_backend(
-        q, image_aware=image_token_end is not None, backend=backend
-    )
+    # A single suffix query already attends to every KV token, so image
+    # boundaries cannot relax its causal mask any further.
+    use_image_token_end = image_token_end is not None and qlen > 1
+    resolved = resolve_neo_backend(q, image_aware=use_image_token_end, backend=backend)
     if batch == 0 or qlen == 0:
         return torch.empty_like(q)
     if klen == 0:
@@ -170,7 +171,7 @@ def neo_unify_attention(
 
         return neo_unify_attention_triton(q, k, v, image_token_end, causal, scale)
     cu_q, kv_lengths = _fa3_lengths(batch, qlen, klen, q.device)
-    if image_token_end is not None:
+    if use_image_token_end:
         fn = _neo_fa3()
         extra = {"image_token_end": image_token_end.reshape(-1).contiguous()}
     elif torch.cuda.get_device_capability(q.device)[0] == 8:

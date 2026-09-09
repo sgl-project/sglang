@@ -88,6 +88,31 @@ class TestNeoUnify(CustomTestCase):
             )
         torch.testing.assert_close(actual, expected)
 
+    def test_fa3_omits_redundant_single_query_image_metadata(self):
+        q = torch.randn(1, 1, 4, 32)
+        kv = torch.randn(1, 8, 2, 32)
+        ends = torch.tensor([8], dtype=torch.int32)
+
+        def extension(**kwargs):
+            self.assertNotIn("image_token_end", kwargs)
+            return kwargs["q"]
+
+        module = "sglang.kernels.ops.attention.neo_unify"
+        with (
+            patch(f"{module}.resolve_neo_backend", return_value="fa3"),
+            patch.object(torch.cuda, "get_device_capability", return_value=(8, 9)),
+            patch(f"{module}._neo_fa3", return_value=extension),
+        ):
+            actual = neo_unify_attention(
+                q,
+                kv,
+                kv,
+                image_token_end=ends,
+                causal=True,
+                backend="fa3",
+            )
+        torch.testing.assert_close(actual, q)
+
     def test_backend_config(self):
         self.assertEqual(
             get_neo_attention_backends({"neo_prefill_backend": "triton"}),
