@@ -296,6 +296,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             if isinstance(self.stop_strs, str):
                 self.stop_strs = [self.stop_strs]
+            if "" in self.stop_strs:
+                # An empty stop string matches every position ("x" in any
+                # tail is True), causing generation to stop after one token
+                # and the detokenizer to return an empty string.
+                raise ValueError("stop cannot contain an empty string.")
             if len(self.stop_strs) > MAX_STOP_COUNT:
                 raise ValueError(
                     f"at most {MAX_STOP_COUNT} stop strings are allowed, "
