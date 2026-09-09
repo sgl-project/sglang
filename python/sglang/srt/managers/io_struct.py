@@ -351,6 +351,10 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Read existing prefixes but never insert this request's KV into the
+    # prefix cache (any tier). Normalized to bool / List[bool].
+    skip_cache_insert: Optional[Union[List[bool], bool]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -536,6 +540,10 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        if self.skip_cache_insert is None:
+            self.skip_cache_insert = False
+        elif not isinstance(self.skip_cache_insert, bool):
+            raise ValueError("skip_cache_insert should be a bool for a single request.")
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -560,6 +568,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        self._normalize_skip_cache_insert(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -783,43 +792,59 @@ class GenerateReqInput:
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
-    def _normalize_extra_key(self, num):
-        """Normalize extra_key for batch processing."""
-        if self.extra_key is None:
-            return
-        if isinstance(self.extra_key, str):
-            value = self.extra_key or None
-            self.extra_key = [value] * num
-        elif isinstance(self.extra_key, list):
-            if len(self.extra_key) != self.batch_size:
+    def _normalize_per_item(
+        self, value, num, *, name, elem_type, type_name, empty_to_none=False
+    ):
+        """Expand a scalar-or-list request field to one entry per expanded request."""
+        if isinstance(value, elem_type):
+            if empty_to_none:
+                value = value or None
+            return [value] * num
+        if isinstance(value, list):
+            if len(value) != self.batch_size:
                 raise ValueError(
-                    "The length of extra_key should be equal to the batch size."
+                    f"The length of {name} should be equal to the batch size."
                 )
-            if any(not isinstance(value, str) for value in self.extra_key):
-                raise ValueError("Every extra_key should be a string.")
-            self.extra_key = [value or None for value in self.extra_key]
-            self.extra_key = self.extra_key * self.parallel_sample_num
-        else:
-            raise ValueError("extra_key should be a list or a string.")
+            if any(not isinstance(item, elem_type) for item in value):
+                raise ValueError(f"Every {name} should be a {type_name}.")
+            if empty_to_none:
+                value = [item or None for item in value]
+            return value * self.parallel_sample_num
+        raise ValueError(f"{name} should be a list or a {type_name}.")
+
+    def _normalize_extra_key(self, num):
+        if self.extra_key is not None:
+            self.extra_key = self._normalize_per_item(
+                self.extra_key,
+                num,
+                name="extra_key",
+                elem_type=str,
+                type_name="string",
+                empty_to_none=True,
+            )
 
     def _normalize_cache_salt(self, num):
-        """Normalize cache_salt for batch processing."""
-        if self.cache_salt is None:
-            return
-        if isinstance(self.cache_salt, str):
-            value = self.cache_salt or None
-            self.cache_salt = [value] * num
-        elif isinstance(self.cache_salt, list):
-            if len(self.cache_salt) != self.batch_size:
-                raise ValueError(
-                    "The length of cache_salt should be equal to the batch size."
-                )
-            if any(not isinstance(value, str) for value in self.cache_salt):
-                raise ValueError("Every cache_salt should be a string.")
-            self.cache_salt = [value or None for value in self.cache_salt]
-            self.cache_salt = self.cache_salt * self.parallel_sample_num
+        if self.cache_salt is not None:
+            self.cache_salt = self._normalize_per_item(
+                self.cache_salt,
+                num,
+                name="cache_salt",
+                elem_type=str,
+                type_name="string",
+                empty_to_none=True,
+            )
+
+    def _normalize_skip_cache_insert(self, num):
+        if self.skip_cache_insert is None:
+            self.skip_cache_insert = [False] * num
         else:
-            raise ValueError("cache_salt should be a list or a string.")
+            self.skip_cache_insert = self._normalize_per_item(
+                self.skip_cache_insert,
+                num,
+                name="skip_cache_insert",
+                elem_type=bool,
+                type_name="bool",
+            )
 
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
@@ -952,6 +977,7 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+            skip_cache_insert=self.skip_cache_insert[i],
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,

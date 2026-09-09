@@ -923,6 +923,45 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "batch size"):
             req.normalize_batch_and_arguments()
 
+    def test_skip_cache_insert_normalization(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            skip_cache_insert=[True, False],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.skip_cache_insert, [True, False])
+        self.assertTrue(req[0].skip_cache_insert)
+        self.assertFalse(req[1].skip_cache_insert)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            skip_cache_insert=True,
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.skip_cache_insert, [True] * 4)
+
+        req = GenerateReqInput(text="Hello")
+        req.normalize_batch_and_arguments()
+        self.assertFalse(req.skip_cache_insert)
+
+        req = GenerateReqInput(text=["Hello", "World"], sampling_params=[{}, {}])
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.skip_cache_insert, [False, False])
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            skip_cache_insert=[True],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+        req = GenerateReqInput(text="Hello", skip_cache_insert=[True])
+        with self.assertRaisesRegex(ValueError, "bool"):
+            req.normalize_batch_and_arguments()
+
     def test_cache_key_normalization_rejects_invalid_types(self):
         for field_name in ("extra_key", "cache_salt"):
             with self.subTest(field_name=field_name, mode="single"):
