@@ -51,7 +51,7 @@ class TestDeepseek(CustomTestCase):
                 "dynamic",
                 "--eplb-algorithm",
                 "deepseek",
-                "--cuda-graph-bs",
+                "--cuda-graph-bs-decode",
                 "256",
                 "--max-running-requests",
                 "2048",
@@ -112,7 +112,7 @@ class TestDeepseekMTP(CustomTestCase):
                 "dynamic",
                 "--eplb-algorithm",
                 "deepseek",
-                "--cuda-graph-bs",
+                "--cuda-graph-bs-decode",
                 "64",  # TODO: increase it to 128 when TBO is supported in draft_extend
                 "--max-running-requests",
                 "512",

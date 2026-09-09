@@ -130,6 +130,8 @@ pub trait TreeComponent<K: ChildKeyType> {
         &self,
         tree_core: &UnifiedTreeCore<K>,
         result: MatchResult,
+        _last_device_node_idx: NodeIdx_,
+        _best_match_node_idx: NodeIdx_,
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[Tensor],
         best_value_len: usize,
