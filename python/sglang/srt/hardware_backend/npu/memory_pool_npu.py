@@ -700,7 +700,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_kv_buffer_shape(self):
-        """The shape of ONE TOKEN's KV, not of the paged buffer.
+        """One layer's KV as CUDA lays it out: ``(rows, 1, nope + rope)``.
 
         The inherited implementation returns ``get_kv_buffer(start_layer)``'s
         shapes, which on this pool are two *separate* paged tensors of
@@ -716,13 +716,22 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         than how this pool happens to store it, and reports it in CUDA's fused
         form because that is the layout the gather writes and reads.
 
+        Note what the caller consumes: ``shape[0][1:]``, i.e. it drops the row
+        axis and keeps the rest as the per-token shape. So the row axis must be
+        PRESENT and leading even though its value is unused -- returning the
+        per-token shape directly makes the buffer 2-D and the gather then fails
+        on a rank with an empty prefix, which is where this was caught.
+
         Both halves of the tuple are the same fused shape. The caller takes
         ``[0]``; there is no separate v-shape to report once the two are fused,
         and returning the rope-only shape as ``[1]`` would invite exactly the
         per-half reading this override exists to prevent.
         """
-        per_token = torch.Size((1, self.kv_lora_rank + self.qk_rope_head_dim))
-        return per_token, per_token
+        pages, page_size = self.k_buffer[0].shape[0], self.k_buffer[0].shape[1]
+        fused = torch.Size(
+            (pages * page_size, 1, self.kv_lora_rank + self.qk_rope_head_dim)
+        )
+        return fused, fused
 
     def get_mla_kv_buffer(
         self,
