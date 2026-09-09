@@ -961,11 +961,16 @@ def apply_custom_logit_processor(
             f"sampling_batch_info ({len(sampling_batch_info)})"
         )
         batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
+        custom_params = [
+            sampling_batch_info.custom_params[i]
+            for i in batch_indices
+            for _ in range(num_tokens_in_batch)
+        ]
 
         # Apply the processor to the logits
         logits[batch_mask] = processor(
             logits[batch_mask],
-            [sampling_batch_info.custom_params[i] for i in batch_indices],
+            custom_params,
         )
 
         logger.debug(
