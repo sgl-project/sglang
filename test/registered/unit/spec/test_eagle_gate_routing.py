@@ -12,6 +12,9 @@ sampling, would turn a case here red. Pure-boolean logic, so it runs on CPU CI.
 import itertools
 import unittest
 
+from sglang.srt.arg_groups.speculative_hook import (
+    _should_auto_enable_hip_rejection_sampling,
+)
 from sglang.srt.speculative.eagle_utils import _verify_uses_greedy
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -85,6 +88,39 @@ class TestEagleGateRouting(CustomTestCase):
                         self._gate(is_all_greedy, platform, use_rej),
                         f"{platform} must force greedy",
                     )
+
+
+def _hip_auto_enable(**overrides):
+    kwargs = dict(
+        is_hip=True,
+        use_rejection_sampling=False,
+        algorithm="EAGLE",
+        token_map=None,
+        eagle_topk=1,
+        accept_threshold_single=1.0,
+        accept_threshold_acc=1.0,
+        enable_deterministic_inference=False,
+    )
+    kwargs.update(overrides)
+    return _should_auto_enable_hip_rejection_sampling(**kwargs)
+
+
+class TestHipAutoEnableRejectionSampling(CustomTestCase):
+    def test_same_vocab_eagle_on_hip(self):
+        self.assertTrue(_hip_auto_enable())
+
+    def test_eagle3_stays_off(self):
+        # Reduced hot-token vocab; stage-a test_basic_sanity_eagle3.
+        self.assertFalse(_hip_auto_enable(algorithm="EAGLE3"))
+
+    def test_token_map_stays_off(self):
+        self.assertFalse(_hip_auto_enable(token_map="d2t.pt"))
+
+    def test_cuda_never_flips(self):
+        self.assertFalse(_hip_auto_enable(is_hip=False))
+
+    def test_already_on_is_a_no_op(self):
+        self.assertFalse(_hip_auto_enable(use_rejection_sampling=True))
 
 
 if __name__ == "__main__":
