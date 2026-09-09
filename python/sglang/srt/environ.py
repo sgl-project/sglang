@@ -1415,6 +1415,11 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Physical stride only; both retain G32 E4M3-nearest and BF16 RoPE.
+    # aos_384 is an unbenchmarked alignment experiment. Set before startup.
+    SGLANG_DSV4_INT4_LAYOUT = EnvStr("aos_368")
+    # Opt-in until the strided Triton norm/RoPE path has GPU conformance data.
+    SGLANG_DSV4_INT4_STRIDED_NORM_ROPE = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

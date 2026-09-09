@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
     clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
+    fused_norm_rope_inplace,
     fused_store_cache,
 )
 from sglang.kernels.ops.attention.dsv4 import (
@@ -20,6 +21,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.kvbit_dsv4 import DSV4KVBitPackedSWAPool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
@@ -70,6 +72,9 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
 
 
 class DeepSeekV4SingleKVPool(KVCache):
+    is_dsv4_kvbit_packed_swa = False
+    is_dsv4_kvbit_packed = False
+
     def __init__(
         self,
         size: int,
@@ -542,6 +547,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        enable_kvbit_swa: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -601,6 +607,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c128_state_dtype = c128_state_dtype
         self.compression_ratios = compression_ratios
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
+        self.enable_kvbit_swa = enable_kvbit_swa
         self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
         if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
@@ -639,6 +646,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
 
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        self._unified_kv = is_unified_kv_triton()
+        if self.enable_kvbit_swa and self._unified_kv:
+            raise RuntimeError(
+                "DSV4 KVBit packed SWA is incompatible with unified_kv; "
+                "native/scratch fallback is disabled."
+            )
+
         if self._unified_kv:
             self.swa_kv_pool = None
             self.c4_kv_pool = None
@@ -665,7 +683,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
-            self.swa_kv_pool = self._make_kv_pool(
+            self.swa_kv_pool = self._make_swa_kv_pool(
                 size=swa_size,
                 page_size=swa_page_size,
                 dtype=dtype,
@@ -678,7 +696,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_kv_pool_type = DeepSeekV4SingleKVPool
             if enable_hisparse:
                 c4_kv_pool_type = HiSparseC4DevicePool
-            self.c4_kv_pool = self._make_kv_pool(
+            self.c4_kv_pool = self._make_compressed_kv_pool(
                 size=c4_size,
                 page_size=c4_page_size,
                 dtype=dtype,
@@ -689,7 +707,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 cls=c4_kv_pool_type,
             )
 
-            self.c128_kv_pool = self._make_kv_pool(
+            self.c128_kv_pool = self._make_compressed_kv_pool(
                 size=c128_size,
                 page_size=c128_page_size,
                 dtype=dtype,
@@ -913,6 +931,73 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+        )
+
+    def _make_swa_kv_pool(
+        self,
+        *,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        global_page_size: int,
+    ) -> KVCache:
+        if not self.enable_kvbit_swa:
+            return self._make_kv_pool(
+                size=size,
+                page_size=page_size,
+                dtype=dtype,
+                layer_num=layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=global_page_size,
+            )
+        return DSV4KVBitPackedSWAPool(
+            size=size,
+            page_size=global_page_size,
+            dtype=dtype,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+
+    def _make_compressed_kv_pool(
+        self,
+        *,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        global_page_size: int,
+        cls: type = DeepSeekV4SingleKVPool,
+    ) -> KVCache:
+        if not self.enable_kvbit_swa:
+            return self._make_kv_pool(
+                size=size,
+                page_size=page_size,
+                dtype=dtype,
+                layer_num=layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=global_page_size,
+                cls=cls,
+            )
+        assert cls is DeepSeekV4SingleKVPool
+        return DSV4KVBitPackedSWAPool(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
         )
 
     def _make_indexer_pool(
@@ -1286,6 +1371,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if self.swa_kv_pool.is_dsv4_kvbit_packed_swa:
+            if envs.SGLANG_DSV4_INT4_STRIDED_NORM_ROPE.get():
+                from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                    fused_norm_rope_inplace_triton,
+                )
+
+                # Both this kernel and the packed writer honor the WQKV tail stride.
+                fused_norm_rope_inplace_triton(kv, kv_weight, eps, freqs_cis, positions)
+            else:
+                kv = kv.contiguous()
+                fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
+            return self.swa_kv_pool.set_key_buffer_fused(
+                self._swa_local_layer_id(layer_id), swa_loc, kv
+            )
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,

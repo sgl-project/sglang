@@ -154,6 +154,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
         handle_kv4_compatibility,
+        handle_kvbit_kv_cache_compatibility,
         handle_mxfp8_kv_cache_compatibility,
         handle_page_major_kv_layout,
         handle_prefill_only_disable_kv_cache,
@@ -233,6 +234,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_model_specific_adjustments,
     )
 
+    handle_kvbit_kv_cache_compatibility(server_args)
     handle_model_specific_adjustments(server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     handle_offload_compatibility(server_args)

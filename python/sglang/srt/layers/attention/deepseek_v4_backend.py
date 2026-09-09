@@ -68,6 +68,7 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.kvbit_dsv4_codec import layout_for_row_bytes
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
@@ -1663,6 +1664,93 @@ class DeepseekV4AttnBackend(
             cache_k=swa_k,
         )
 
+    def _forward_kvbit(
+        self,
+        *,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        packed_swa_cache: torch.Tensor,
+        core_attn_metadata: DSV4AttnMetadata,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend packed SWA and compressed KV in one FlashMLA sparse decode."""
+
+        def match_num_queries(x: Optional[torch.Tensor], value: int):
+            if x is None or x.shape[0] == q.shape[0]:
+                return x
+            if x.shape[0] > q.shape[0]:
+                return x[: q.shape[0]]
+            return _pad_tensor_to_size(x, q.shape[0], value=value)
+
+        if q.ndim == 3:
+            q = q.unsqueeze(1)
+        swa_indices = match_num_queries(core_attn_metadata.swa_page_indices, value=0)
+        swa_lengths = match_num_queries(core_attn_metadata.swa_topk_lengths, value=1)
+        if swa_indices.ndim == 2:
+            swa_indices = swa_indices.unsqueeze(1)
+
+        layout = layout_for_row_bytes(packed_swa_cache.shape[1] // self.page_size)
+        swa_shape_carrier = packed_swa_cache.view(
+            packed_swa_cache.shape[0],
+            self.page_size,
+            1,
+            layout.row_bytes,
+        )
+
+        extra_shape_carrier = None
+        extra_indices = None
+        extra_lengths = None
+        if compress_ratio != 0:
+            if compress_ratio == 4:
+                extra_indices = core_attn_metadata.c4_sparse_page_indices
+                extra_lengths = core_attn_metadata.c4_sparse_topk_lengths
+            else:
+                extra_indices = core_attn_metadata.c128_page_indices
+                extra_lengths = core_attn_metadata.c128_topk_lengths_clamp1
+            extra_indices = match_num_queries(extra_indices, value=-1)
+            extra_lengths = match_num_queries(extra_lengths, value=1)
+            if extra_indices.ndim == 2:
+                extra_indices = extra_indices.unsqueeze(1)
+
+            extra_cache = self.token_to_kv_pool.get_extra_key_buffer(layer_id)
+            extra_page_size = self.token_to_kv_pool.get_extra_key_page_size(layer_id)
+            extra_shape_carrier = extra_cache.view(
+                extra_cache.shape[0],
+                extra_page_size,
+                1,
+                layout.row_bytes,
+            )
+        assert swa_indices.shape[-1] % 64 == 0
+        if extra_indices is not None:
+            assert extra_indices.shape[-1] % 64 == 0
+
+        common_kwargs = {
+            "q": q.contiguous(),
+            "k_cache": swa_shape_carrier,
+            "head_dim_v": self.head_dim_v,
+            "sched_meta": core_attn_metadata.get_flashmla_metadata(compress_ratio),
+            "softmax_scale": self.softmax_scale,
+            "indices": swa_indices,
+            "attn_sink": attn_sink,
+            "extra_k_cache": extra_shape_carrier,
+            "extra_indices_in_kvcache": extra_indices,
+            "topk_length": swa_lengths,
+            "extra_topk_length": extra_lengths,
+        }
+        from sgl_kernel.kvbit_flash_mla import kvbit_int4_flash_mla_with_kvcache
+
+        output, _ = kvbit_int4_flash_mla_with_kvcache(
+            **common_kwargs,
+            packed_kcache=packed_swa_cache.view(-1, layout.row_bytes),
+            extra_packed_kcache=(
+                None
+                if extra_shape_carrier is None
+                else extra_shape_carrier.view(-1, layout.row_bytes)
+            ),
+        )
+        return output.squeeze(1)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1691,6 +1779,16 @@ class DeepseekV4AttnBackend(
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+            if token_to_kv_pool.swa_kv_pool.is_dsv4_kvbit_packed_swa:
+                assert attn_sink is not None
+                return self._forward_kvbit(
+                    q=q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    packed_swa_cache=swa_k_cache,
+                    core_attn_metadata=core_attn_metadata,
+                    attn_sink=attn_sink,
+                )
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio == 4:

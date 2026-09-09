@@ -203,7 +203,11 @@ class Model:
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                'recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "int4" '
+                "enables the target-only DeepSeek V4 368-byte signed INT4 cache "
+                "with group size 32, E4M3-nearest scales, BF16 RoPE, and no rotation. "
+                "It requires CUDA SM90, the INT4 AOT extension, and 64 local query "
+                "heads after model TP padding, and resolves its backing dtype as auto."
             ),
             choices=[
                 "auto",
@@ -215,6 +219,7 @@ class Model:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                "int4",
             ],
             resolvable=True,
         ),
