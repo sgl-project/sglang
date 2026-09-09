@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
+    EncoderDispatchErrorReq,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -142,6 +143,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -588,6 +590,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -1257,6 +1260,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+            if (
+                obj.return_sampling_mask
+                and obj.custom_logit_processor
+                and not supports_sampling_mask(obj.custom_logit_processor)
+            ):
+                # Reject before scheduling so aborted requests cannot execute
+                # unsupported processors during sampling batch preparation.
+                raise ValueError(
+                    "return_sampling_mask only supports DisallowedTokensLogitsProcessor "
+                    "among custom logit processors."
+                )
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1579,6 +1593,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._dispatch_to_scheduler(tokenized_obj)
             self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
+            dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
+            if dispatch_ready is not None:
+                dispatch_ready.set()
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
@@ -2477,11 +2494,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_first_token_time()
 
             if state.finished:
-                if state.time_stats.trace_ctx.tracing_enable:
-                    state.time_stats.trace_ctx.trace_set_root_attrs(
-                        self.convert_to_span_attrs(state, recv_obj, i)
-                    )
-                state.time_stats.set_finished_time()
+                span_attrs = (
+                    self.convert_to_span_attrs(state, recv_obj, i)
+                    if state.time_stats.trace_ctx.tracing_enable
+                    else None
+                )
+                state.time_stats.set_finished_time(span_attrs=span_attrs)
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
                 if get_spec().speculative_algorithm:
@@ -3495,15 +3513,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """
         for rid in rids:
             state = self.rid_to_state.get(rid)
-            if state is None:
-                continue
-            if state.dispatched:
-                try:
-                    self.abort_request(rid)
-                except Exception:
-                    logger.exception("Failed to abort request %s during cleanup", rid)
-            else:
-                del self.rid_to_state[rid]
+            if state is not None:
+                if state.dispatched:
+                    try:
+                        self.abort_request(rid)
+                    except Exception:
+                        logger.exception(
+                            "Failed to abort request %s during cleanup", rid
+                        )
+                else:
+                    del self.rid_to_state[rid]
+            dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
+            if dispatch_ready is not None:
+                dispatch_ready.set()
+
+    def _forward_encoder_dispatch_error(self, error: EncoderDispatchErrorReq) -> None:
+        if error.rid in self.rid_to_state:
+            self._dispatch_to_scheduler(error)
+
+    def _schedule_encoder_dispatch_error(self, error: EncoderDispatchErrorReq) -> None:
+        self.event_loop.call_soon_threadsafe(
+            self._forward_encoder_dispatch_error, error
+        )
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -3554,9 +3585,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if state is not None:
                             time_stats_json = state.time_stats.encode_json()
 
-                    self.mm_receiver.send_encode_request(
-                        obj, time_stats_json=time_stats_json
+                    dispatch_ready = self.mm_receiver.send_encode_request(
+                        obj,
+                        time_stats_json=time_stats_json,
+                        on_dispatch_error=self._schedule_encoder_dispatch_error,
                     )
+                    if dispatch_ready is not None:
+                        self.encoder_dispatch_ready[obj.rid] = dispatch_ready
             else:
                 obj.need_wait_for_mm_inputs = False
 
@@ -3624,8 +3659,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 [finish_reason]
             )
 
-        # Latency attributes
-        span_attrs.update(state.time_stats.convert_to_gen_ai_span_attrs())
+        # Latency attributes are added by set_finished_time(), which stamps
+        # finished_time before deriving them.
 
         return span_attrs
 

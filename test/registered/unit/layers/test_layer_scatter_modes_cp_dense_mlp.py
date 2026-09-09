@@ -6,7 +6,7 @@ from sglang.srt.layers.communicator import LayerScatterModes, ScatterMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestDenseMlpScatterModeUnderPrefillCP(CustomTestCase):
@@ -18,7 +18,7 @@ class TestDenseMlpScatterModeUnderPrefillCP(CustomTestCase):
         with (
             patch.object(comm, "_generic_prefill_cp_shards_tokens", return_value=True),
             patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
-            patch.object(comm, "is_mla_prefill_cp_enabled", return_value=False),
+            patch.object(comm, "is_mla_cp_enabled", return_value=False),
             patch.object(comm, "enable_moe_dense_fully_dp", return_value=False),
         ):
             modes = LayerScatterModes.init_new(

@@ -15,8 +15,6 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl import (
     Qwen2_5_VLAttention,
     Qwen2_5_VLForConditionalGeneration,
     _apply_repetition_penalty,
-    _make_column_linear,
-    _make_row_linear,
     _select_next_token,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
@@ -29,14 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines.longcat_image import LongCatImagePi
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
-    RowParallelLinear,
 )
-from sglang.srt.models.qwen2_5_vl import (
-    Qwen2_5_VisionPatchEmbed,
-    Qwen2_5_VisionPatchMerger,
-    Qwen2_5_VLMLP,
-)
-from sglang.srt.runtime_context import get_parallel
 
 
 class _StubQwen2_5VL(Qwen2_5_VLForConditionalGeneration):
@@ -77,49 +68,6 @@ class _AttentionRecorder(nn.Module):
     def forward(self, query, key, value, attn_mask=None):
         self.masks.append(attn_mask)
         return query
-
-
-def test_native_vision_reuses_srt_modules():
-    config = SimpleNamespace(
-        hidden_size=16,
-        intermediate_size=24,
-        hidden_act="silu",
-        num_heads=2,
-        depth=0,
-        patch_size=2,
-        temporal_patch_size=1,
-        in_channels=3,
-        spatial_merge_size=2,
-        out_hidden_size=12,
-        fullatt_block_indexes=[],
-        window_size=8,
-    )
-    with get_parallel().override(tp_size=1, tp_rank=0):
-        model = Qwen2_5VLVisionTransformer(config)
-        mlp = Qwen2_5_VLMLP(
-            16,
-            24,
-            fuse_gate_up=False,
-        )
-        fused_mlp = Qwen2_5_VLMLP(16, 24)
-
-    assert isinstance(model.patch_embed, Qwen2_5_VisionPatchEmbed)
-    assert isinstance(model.merger, Qwen2_5_VisionPatchMerger)
-    assert not mlp.fuse_gate_up
-    assert isinstance(mlp.gate_proj, ColumnParallelLinear)
-    assert isinstance(mlp.up_proj, ColumnParallelLinear)
-    assert mlp.gate_proj.tp_size == mlp.up_proj.tp_size == 1
-    assert isinstance(mlp.down_proj, ReplicatedLinear)
-    assert isinstance(fused_mlp.down_proj, RowParallelLinear)
-    assert mlp.act is not None
-    assert isinstance(
-        _make_column_linear(16, 24, bias=False, use_tensor_parallel=False),
-        ReplicatedLinear,
-    )
-    assert isinstance(
-        _make_row_linear(24, 16, bias=False, use_tensor_parallel=False),
-        ReplicatedLinear,
-    )
 
 
 def test_text_mlp_uses_single_rank_when_intermediate_size_is_not_tp_divisible(

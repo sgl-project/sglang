@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
     RESIDENT,
+    SNAPSHOT_OFFLOAD,
     normalize_component_residency,
     resolve_component_residency_mode,
     resolve_diffusers_pipeline_offload,
@@ -180,6 +181,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "jdopensource/joyai-echo",
+        "joyai-echo",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
         "meituan-longcat/longcat-image",
@@ -203,6 +206,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "JoyEchoPipelineConfig",
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
         "LongCatImagePipelineConfig",
@@ -451,6 +455,10 @@ class ServerArgs(DisaggServerArgsMixin):
     warmup_resolutions: list[str] = None
     warmup_num_frames: int | None = None
     warmup_steps: int = 1
+    # JSON overrides for the representative request shape used by synthetic
+    # warmup and automatic residency planning. Execution remains bounded by
+    # warmup_steps and the server warmup frame/area caps.
+    warmup_sampling_params: dict[str, Any] | str | None = None
 
     disable_autocast: bool | None = None
 
@@ -735,10 +743,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Ideogram-4, "
-            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
-            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
-            "currently supported.",
+            "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
+            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
+            "zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
@@ -908,6 +916,23 @@ class ServerArgs(DisaggServerArgsMixin):
         self.component_residency = normalize_component_residency(
             self.component_residency
         )
+        if SNAPSHOT_OFFLOAD in (self.component_residency or {}).values():
+            if (
+                not current_platform.is_cuda()
+                or current_platform.device_shares_host_memory()
+            ):
+                raise ValueError(
+                    "snapshot-offload requires CUDA with separate host and device memory; "
+                    "use component-offload or layerwise-offload on this platform"
+                )
+            if self.enable_breakable_cuda_graph and any(
+                self.canonical_residency_mode(name) == SNAPSHOT_OFFLOAD
+                for name in ("transformer", "transformer_2")
+            ):
+                raise ValueError(
+                    "snapshot-offload for DiT is incompatible with "
+                    "--enable-breakable-cuda-graph because weight addresses change"
+                )
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -935,7 +960,7 @@ class ServerArgs(DisaggServerArgsMixin):
             component_name: residency_mode
             for component_name in ("transformer", "transformer_2")
             if (residency_mode := self.explicit_residency_mode(component_name))
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
         }
         if mode == "resident" and explicit_nonresident_dits:
             configured = ", ".join(
@@ -1637,11 +1662,15 @@ class ServerArgs(DisaggServerArgsMixin):
         return RESIDENT
 
     def should_cpu_offload_component(self, component_name: str) -> bool:
-        return self.residency_mode(component_name) == COMPONENT_OFFLOAD
+        return self.residency_mode(component_name) in (
+            COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
+        )
 
     def should_start_component_on_cpu(self, component_name: str) -> bool:
         return self.residency_mode(component_name) in (
             COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
             LAYERWISE_OFFLOAD,
         )
 
@@ -1738,7 +1767,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         has_explicit_dit_offload = bool(
             self.canonical_residency_mode("transformer")
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
             or self.is_explicit_layerwise_offload_component("transformer")
             or (
                 self.is_arg_explicitly_set("cpu_offload_components")
@@ -2381,6 +2410,18 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
         )
+        parser.add_argument(
+            "--warmup-sampling-params",
+            type=str,
+            default=ServerArgs.warmup_sampling_params,
+            help=(
+                "JSON object overriding model sampling defaults for synthetic "
+                "warmup and auto residency planning, for example "
+                '\'{"width":832,"height":480,"num_frames":9,'
+                '"num_inference_steps":4}\'. Warmup still applies its '
+                "bounded execution caps."
+            ),
+        )
         # component residency and legacy offload controls
         parser.add_argument(
             "--component-residency",
@@ -2389,7 +2430,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.component_residency,
             metavar="COMPONENT=MODE",
             help=(
-                "Select resident, component-offload, or layerwise-offload for "
+                "Select resident, component-offload, snapshot-offload, or layerwise-offload for "
                 "pipeline components. Exact model_index.json component keys override "
                 "the dit, text_encoder, image_encoder, vae, and all groups. "
                 "Components without an assignment keep their automatic placement."
