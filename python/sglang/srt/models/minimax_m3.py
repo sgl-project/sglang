@@ -1545,8 +1545,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        # MiniMax-M3 DSA disables the index value projection, so the checkpoint
-        # has no index_v_proj weight; fuse only q/k (matches the NPU path).
+        # no index_v_proj in the M3 checkpoint
         "index_qkv_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
