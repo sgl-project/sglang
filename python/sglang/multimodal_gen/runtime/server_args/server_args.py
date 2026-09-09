@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
     RESIDENT,
+    SNAPSHOT_OFFLOAD,
     normalize_component_residency,
     resolve_component_residency_mode,
     resolve_diffusers_pipeline_offload,
@@ -915,6 +916,23 @@ class ServerArgs(DisaggServerArgsMixin):
         self.component_residency = normalize_component_residency(
             self.component_residency
         )
+        if SNAPSHOT_OFFLOAD in (self.component_residency or {}).values():
+            if (
+                not current_platform.is_cuda()
+                or current_platform.device_shares_host_memory()
+            ):
+                raise ValueError(
+                    "snapshot-offload requires CUDA with separate host and device memory; "
+                    "use component-offload or layerwise-offload on this platform"
+                )
+            if self.enable_breakable_cuda_graph and any(
+                self.canonical_residency_mode(name) == SNAPSHOT_OFFLOAD
+                for name in ("transformer", "transformer_2")
+            ):
+                raise ValueError(
+                    "snapshot-offload for DiT is incompatible with "
+                    "--enable-breakable-cuda-graph because weight addresses change"
+                )
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -942,7 +960,7 @@ class ServerArgs(DisaggServerArgsMixin):
             component_name: residency_mode
             for component_name in ("transformer", "transformer_2")
             if (residency_mode := self.explicit_residency_mode(component_name))
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
         }
         if mode == "resident" and explicit_nonresident_dits:
             configured = ", ".join(
@@ -1644,11 +1662,15 @@ class ServerArgs(DisaggServerArgsMixin):
         return RESIDENT
 
     def should_cpu_offload_component(self, component_name: str) -> bool:
-        return self.residency_mode(component_name) == COMPONENT_OFFLOAD
+        return self.residency_mode(component_name) in (
+            COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
+        )
 
     def should_start_component_on_cpu(self, component_name: str) -> bool:
         return self.residency_mode(component_name) in (
             COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
             LAYERWISE_OFFLOAD,
         )
 
@@ -1745,7 +1767,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         has_explicit_dit_offload = bool(
             self.canonical_residency_mode("transformer")
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
             or self.is_explicit_layerwise_offload_component("transformer")
             or (
                 self.is_arg_explicitly_set("cpu_offload_components")
@@ -2408,7 +2430,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.component_residency,
             metavar="COMPONENT=MODE",
             help=(
-                "Select resident, component-offload, or layerwise-offload for "
+                "Select resident, component-offload, snapshot-offload, or layerwise-offload for "
                 "pipeline components. Exact model_index.json component keys override "
                 "the dit, text_encoder, image_encoder, vae, and all groups. "
                 "Components without an assignment keep their automatic placement."
