@@ -629,6 +629,15 @@ struct TopKKernel {
 #ifdef USE_ROCM
     const int32_t* row_starts_ptr = nullptr;
     if (row_starts.has_value()) {
+      // The residue correction lives in `index_shift`, which only
+      // `transform_output` applies; `emit` writes the raw index untouched. So
+      // INDICES mode would silently return window-relative indices that are off
+      // by up to kVecSize-1. No caller needs that combination, so reject it
+      // here rather than leave it unguarded.
+      RuntimeCheck(
+          page_table.has_value(),
+          "topk_transform_paged: row_starts requires page_table "
+          "(raw-index output does not carry the residue correction)");
       TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_starts.value());
       row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
     }
