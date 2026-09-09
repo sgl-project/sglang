@@ -68,7 +68,7 @@ def _capture_via_unified(
         )
     )
     state_pool = types.SimpleNamespace(
-        translate_from_swa_loc_to_state_loc=lambda x: x,
+        translate_from_req_position_to_state_loc=lambda req, pos: pos,
         get_state_by_state_loc=lambda loc: types.SimpleNamespace(kv_score=pre_state),
     )
     fb = types.SimpleNamespace(
@@ -96,7 +96,7 @@ _CAPTURE = _capture_via_unified
 _CAPTURE_DECODE = DeepseekV4HipRadixBackend.capture_compress_state_windows_decode
 
 
-_TRANSLATE = CompressStatePool.translate_from_swa_loc_to_state_loc
+_TRANSLATE = CompressStatePool.translate_from_req_position_to_state_loc
 
 
 def _fake_host_pool(*, ring_size, slot_bytes, num_pages):
@@ -252,7 +252,7 @@ class TestUnifiedCaptureEquivalence(unittest.TestCase):
         # identity translates; get_state_by_state_loc returns the fixed phantom
         # pre-state (loc-indexed count == pre_state rows) as a KVAndScore-like.
         return types.SimpleNamespace(
-            translate_from_swa_loc_to_state_loc=lambda x: x,
+            translate_from_req_position_to_state_loc=lambda req, pos: pos,
             get_state_by_state_loc=lambda loc: types.SimpleNamespace(
                 kv_score=pre_state_kv
             ),

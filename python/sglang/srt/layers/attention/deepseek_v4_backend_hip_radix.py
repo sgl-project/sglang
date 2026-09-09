@@ -1617,9 +1617,9 @@ class DeepseekV4HipRadixBackend(
             win = pool.unified_swa_ring_size
             page = self.page_size
             slot_page = host_pool.slot_page_size
-            assert (
-                win == slot_page
-            ), f"SWA tile geometry mismatch: ring={win} slot_page={slot_page}"
+            assert win == slot_page, (
+                f"SWA tile geometry mismatch: ring={win} slot_page={slot_page}"
+            )
             # The two `.tolist()` calls below are the only device->host syncs; by
             # gating this whole block on `swa_layer == 0` they run once per
             # forward instead of once per layer.
@@ -1906,7 +1906,6 @@ class DeepseekV4HipRadixBackend(
             return
 
         page = self.page_size
-        ring = pool.unified_swa_ring_size
         stride = max(1, int(getattr(pool, "_swa_offload_page_stride", 1)))
         seqs_l = seqs.tolist()
         # Lazy for the same reason as the SWA decode capture: this is a device
@@ -1949,11 +1948,10 @@ class DeepseekV4HipRadixBackend(
                     pos = torch.arange(
                         B - ratio, B, device=dev.device, dtype=torch.int64
                     )
-                    swa_loc = r * ring + (pos % ring)
-                    state_locs = sp.translate_from_swa_loc_to_state_loc(swa_loc)
+                    state_locs = sp.translate_from_req_position_to_state_loc(r, pos)
                     # pack at tile start (matches capture/restore); host tile
                     # layout is geometry-independent since device rows are
-                    # addressed via translate_from_swa_loc_to_state_loc.
+                    # addressed by (req slot, position).
                     off0 = 0
                     win = dev[state_locs].contiguous().view(torch.uint8).reshape(-1)
                     if win.numel() != ratio * slot_bytes:

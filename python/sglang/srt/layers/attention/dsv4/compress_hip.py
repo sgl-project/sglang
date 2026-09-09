@@ -37,20 +37,12 @@ from sglang.kernels.ops.attention.dsv4.rms_normalize_hip import rms_normalize_tr
 logger = logging.getLogger(__name__)
 
 
-def _c4_state_overlap_prefix(
-    state_pool, token_to_kv_pool, req_to_token, rid, cs, ratio, device
-):
+def _c4_state_overlap_prefix(state_pool, rid, cs, ratio, device):
     """The overlap prefix rows ``[cs - (cs % ratio + ratio), cs)`` of the request's
     state ring -- the head of the per-request buffer compress reads. Positions
     before 0 clamp to the pool's cleared sentinel row, matching that buffer."""
     positions = torch.arange(cs - (cs % ratio + ratio), cs, device=device).clamp(min=-1)
-    raw_loc = torch.where(
-        positions < 0,
-        torch.full_like(positions, -1),
-        req_to_token[rid, positions],
-    )
-    swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc)
-    state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_loc)
+    state_loc = state_pool.translate_from_req_position_to_state_loc(rid, positions)
     return state_pool.get_state_by_state_loc(state_loc).kv_score
 
 
@@ -100,7 +92,6 @@ def capture_c4_state_windows_unified(
         return
 
     req_pool_indices = forward_batch.req_pool_indices
-    req_to_token = backend.req_to_token_pool.req_to_token
     device = kv_score_input.device
     # The capture runs once per c4 layer but these two are identical across
     # layers, and both come off device tensors, so reading them per layer costs a
@@ -119,9 +110,9 @@ def capture_c4_state_windows_unified(
     page = backend.page_size
     slot_page = hp.slot_page_size  # == ring_size
     # off0=0 tile packing: the host state tile is packed at tile start; device
-    # state rows are addressed independently via translate_from_swa_loc_to_state_loc,
-    # so the host layout need not mirror the spec-padded SWA ring
-    # (swa_ring = sliding_window + spec_extra may not divide page under EAGLE).
+    # state rows are addressed by (req slot, position), so the host layout need
+    # not mirror the spec-padded SWA ring (swa_ring = sliding_window + spec_extra
+    # may not divide page under EAGLE).
     win = ratio
     slot_bytes = hp.item_bytes // slot_page
     staging = hp._capture_staging
@@ -217,13 +208,7 @@ def capture_c4_state_windows_unified(
             else:
                 if pre_kv_state is None:
                     pre_kv_state = _c4_state_overlap_prefix(
-                        state_pool,
-                        token_to_kv_pool,
-                        req_to_token,
-                        rid,
-                        cs,
-                        ratio,
-                        device,
+                        state_pool, rid, cs, ratio, device
                     )
                 if buf_hi <= pre_len:
                     win_slice = pre_kv_state[buf_lo:buf_hi]
@@ -391,9 +376,8 @@ class CompressorHip(_CompressorBase):
         page = backend.page_size
         slot_page = hp.slot_page_size  # == ring_size
         # off0=0 tile packing: host tile is packed at tile start; device state
-        # rows are addressed via translate_from_swa_loc_to_state_loc, so the host
-        # layout need not mirror the spec-padded SWA ring (see
-        # capture_c4_state_windows_unified).
+        # rows are addressed by (req slot, position), so the host layout need not
+        # mirror the spec-padded SWA ring (see capture_c4_state_windows_unified).
         win = self.ratio  # compute_state_len(B, 4) == 4 at a page boundary
         slot_bytes = hp.item_bytes // slot_page
         staging = hp._capture_staging

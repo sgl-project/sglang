@@ -281,25 +281,17 @@ def _free_state_bindings(component, node) -> None:
             setattr(node, host_value_attr + "_crc", None)
 
 
-def _state_locs_for_window(sp, swa_chunk, swa_ring, B, ratio):
-    """Device state rows holding the boundary group ``[B-ratio, B)`` of a restored
-    ring block.
+def _state_locs_for_window(sp, r, B, ratio, device):
+    """Device state rows holding the boundary group ``[B-ratio, B)`` for request
+    slot ``r``.
 
-    These must be the rows the compressor will read, and it addresses c4 state
-    from the SWA slot (see ``_c4_state_overlap_prefix``: req_to_token -> full to
-    swa -> swa_loc to state_loc). At restore time the reusing request's
-    req_to_token is not populated for these positions yet, so the slot comes from
-    the restored block instead. The block is in ring order, so it must be indexed
-    by position rather than by taking its trailing ``ratio`` slots: those coincide
-    only when ``B % swa_ring == 0``, which speculative decode breaks by sizing the
-    ring as sliding_window + num_draft_tokens - 1.
-
-    If the base ever re-addresses c4 state by (request, position) -- the contract
-    c128 already uses -- this is the one place to switch, and the address-contract
-    test fails until it is.
+    Has to match how the compressor addresses c4 state under unified-kv, which is
+    request-scoped since #35494: ``r * ring_size + position % ring_size``. Going
+    through the SWA slot instead aliases requests that share a radix prefix onto
+    the same rows, and inherits whatever the previous occupant of ``r`` left.
     """
-    pos = torch.arange(B - ratio, B, dtype=torch.int64, device=swa_chunk.device)
-    return sp.translate_from_swa_loc_to_state_loc(swa_chunk[pos % swa_ring])
+    pos = torch.arange(B - ratio, B, dtype=torch.int64, device=device)
+    return sp.translate_from_req_position_to_state_loc(r, pos)
 
 
 def _restore_state_ride_per_layer(
@@ -308,8 +300,7 @@ def _restore_state_ride_per_layer(
     pools,
     layers,
     host_value_attr,
-    swa_chunk,
-    swa_ring,
+    r,
     B,
     page_row,
     slot_bytes,
@@ -321,8 +312,8 @@ def _restore_state_ride_per_layer(
         ratio = sp.ratio
         if B < ratio:
             continue
-        state_locs = _state_locs_for_window(sp, swa_chunk, swa_ring, B, ratio)
         dev = sp.kv_score_buffer.kv_score
+        state_locs = _state_locs_for_window(sp, r, B, ratio, dev.device)
         host_tile = hp.data_refs[li][page_row]
         flat = host_tile[off0 * slot_bytes : (off0 + ratio) * slot_bytes]
         # the blocking .to() is load-bearing: an all-layer non_blocking transfer
@@ -337,24 +328,17 @@ def _restore_state_ride_per_layer(
             )
 
 
-def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
+def _restore_state_windows(component, node, r: int) -> None:
     """Restore the c4 / c4-indexer overlap state for the reused window onto the
     device state ring, so the reusing request's boundary read is bit-exact.
 
-    swa_chunk is the whole restored ring block for this request, in ring order:
-    swa_chunk[j] is the slot holding every position p with p % swa_ring == j. The
-    host tile packs the boundary group [B-ratio, B) in token order at off0=0, so
-    the destination rows must be looked up by position, not taken from the tail of
-    the block -- those coincide only when B % swa_ring == 0, which speculative
-    decode breaks (it sizes the ring as sliding_window + num_draft_tokens - 1, so
-    the ring no longer divides the page). Each slot's device state row is
-    translate_from_swa_loc_to_state_loc(slot), so the captured window lands on the
-    exact rows the compressor will read regardless of the reusing request's base.
+    The host tile packs the boundary group [B-ratio, B) in token order at off0=0;
+    the destination rows are request-scoped (r, position) -- the same contract the
+    compressor reads under unified-kv.
     """
     rides = _state_rides(component)
     if not rides:
         return
-    swa_ring = swa_chunk.numel()
     B = getattr(node, "_swa_state_B", None)
     for hp, pools, host_value_attr, _pending_attr, li_map in rides:
         host_value = getattr(node, host_value_attr, None)
@@ -388,8 +372,7 @@ def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
             pools,
             layers,
             host_value_attr,
-            swa_chunk,
-            swa_ring,
+            r,
             B,
             page_row,
             slot_bytes,
@@ -2354,15 +2337,16 @@ class SWAComponent(TreeComponent):
             for li in range(hp.layer_num):
                 hp.load_to_device_per_layer(None, host_idx, device_idx, li, io_backend)
         # Ride the c4/c4-indexer overlap state back onto the device state ring for
-        # this reused window; device_idx is the restored ring block, indexed by
-        # position to find the boundary group. Wait on each state pool's own
-        # capture-done event first, mirroring the SWA wait above. No-op when state
-        # offload is unwired or the node carries no state host value.
+        # this reused window; the destination rows are keyed by (req slot r,
+        # position), independent of the restored SWA block. Wait on each state
+        # pool's own capture-done event first, mirroring the SWA wait above.
+        # No-op when state offload is unwired or the node carries no state host
+        # value.
         for _shp, _spools, _shv, _spend, _sli in _state_rides(self):
             if hasattr(_shp, "wait_capture_done"):
                 _shp.wait_capture_done()
         for _wnode, _ in windows:
-            _restore_state_windows(self, _wnode, device_idx)
+            _restore_state_windows(self, _wnode, r)
         if _SWA_DBG_CHECKSUM:
             if hasattr(self, "_dbg_verify_restore"):
                 for node, _ in windows:
