@@ -224,10 +224,8 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
 ):
     """A failed sender notification must not leak ownership or lose the API error."""
     scheduler = _Scheduler()
-    scheduler.batch_result_processor.get_sampling_mask_finish_reason = (
-        lambda **kwargs: SchedulerBatchResultProcessor.get_sampling_mask_finish_reason(
-            None, **kwargs
-        )
+    scheduler.batch_result_processor.get_sampling_mask_finish_reason = lambda **kwargs: (
+        SchedulerBatchResultProcessor.get_sampling_mask_finish_reason(None, **kwargs)
     )
     req = _Req(inflight_middle_chunks=0)
     req.to_finish = None

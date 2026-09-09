@@ -479,8 +479,8 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                     ),
                     patch(
                         "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache",
-                        side_effect=lambda req, *args, **kwargs: manager._release_finished_req(
-                            req
+                        side_effect=lambda req, *args, **kwargs: (
+                            manager._release_finished_req(req)
                         ),
                     ),
                 ):
