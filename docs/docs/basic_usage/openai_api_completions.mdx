@@ -317,6 +317,8 @@ The chat completions API accepts OpenAI Chat Completions API's parameters. Refer
 
 SGLang extends the standard API with the `extra_body` parameter, allowing for additional customization. One key option within `extra_body` is `chat_template_kwargs`, which can be used to pass arguments to the chat template processor.
 
+Two `extra_body` options control the prefix cache per request. `cache_salt` (string) namespaces the cache, so a request only reuses prefixes inserted under the same salt. `skip_cache_insert` (bool) lets the request reuse existing cached prefixes but never inserts its own KV into the prefix cache or any HiCache tier; the KV is freed when the request finishes. Use `skip_cache_insert` for prompts that must not be retained after the response.
+
 ```python Example
 response = client.chat.completions.create(
     model="qwen/qwen2.5-0.5b-instruct",
@@ -405,6 +407,8 @@ print_highlight(f"Response: {response}")
 ### Parameters
 
 The completions API accepts OpenAI Completions API's parameters.  Refer to [OpenAI Completions API](https://platform.openai.com/docs/api-reference/completions/create) for more details.
+
+The `extra_body` options `cache_salt` and `skip_cache_insert` described under Chat Completions apply here as well.
 
 Here is an example of a detailed completions request:
 
