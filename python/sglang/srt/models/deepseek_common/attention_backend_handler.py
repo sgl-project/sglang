@@ -1,6 +1,6 @@
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -114,7 +114,7 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
 
     # Strategy CP gathers latent KV in the backend's absorbed MLA path;
     # normal MHA would write rank-local KV against full cache locations.
-    if is_cp_v2_active(forward_batch):
+    if is_cp_active(forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
