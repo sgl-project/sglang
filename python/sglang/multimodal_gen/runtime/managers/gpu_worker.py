@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     resolve_default_workload,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    get_global_component_residency_manager,
     peek_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -417,6 +418,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
+                pin_budget=get_global_component_residency_manager(
+                    self.pipeline, self.server_args
+                ).host_pin_budget,
                 component_names=(
                     None
                     if self.server_args.component_residency is not None
