@@ -18,7 +18,6 @@ import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from openai.types.responses import (
-    ResponseOutputMessage,
     ResponseOutputText,
     ResponseReasoningItem,
 )
@@ -62,6 +61,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ResponseOutputMessage,
     ResponsesRequest,
     ResponsesResponse,
     Tool,
@@ -1080,6 +1080,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 logprobs=output_logprobs,
             )
             message = ResponseOutputMessage(
+                phase="commentary" if tool_call_items else "final_answer",
                 id=f"msg_{random_uuid()}",
                 content=[output_text],
                 role="assistant",
@@ -1325,6 +1326,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged
                 and isinstance(merged[-1], dict)
                 and merged[-1].get("role") == "assistant"
+                and merged[-1].get("phase") == msg.get("phase")
             ):
                 prev = merged[-1] = dict(merged[-1])
                 # Lift mixed str/list content to list parts so non-text parts
@@ -1607,9 +1609,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             # Get event type from the event's type field if it exists
             event_type = getattr(event, "type", "unknown")
-            return (
-                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
-            )
+            payload = event.model_dump()
+            if isinstance(getattr(event, "item", None), ResponseOutputMessage):
+                payload["item"] = event.item.model_dump()
+            return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
 
         current_content_index = 0
         current_output_index = 0
@@ -2015,6 +2018,61 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
     ) -> AsyncGenerator[str, None]:
+        pending: list[dict] = []
+        can_call_tools = (
+            bool(self._response_tools_to_chat_tools(request))
+            and request.effective_tool_choice() != "none"
+        )
+        async for event in self._responses_stream_generator_non_harmony(
+            request,
+            sampling_params,
+            result_generator,
+            model_name,
+            tokenizer,
+            request_metadata,
+            created_time,
+            require_reasoning=require_reasoning,
+        ):
+            if not can_call_tools:
+                yield event
+                continue
+            payload = orjson.loads(event.split("data: ", 1)[1])
+            event_type = payload["type"]
+            item_type = payload.get("item", {}).get("type")
+            opens_item = event_type == "response.output_item.added"
+            if pending or (opens_item and item_type == "message"):
+                pending.append(payload)
+                tool_follows = opens_item and item_type in (
+                    "function_call",
+                    "custom_tool_call",
+                )
+                terminal = event_type in (
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                )
+                if tool_follows or terminal:
+                    phase = "commentary" if tool_follows else "final_answer"
+                    for buffered in pending:
+                        if buffered.get("item", {}).get("type") == "message":
+                            buffered["item"]["phase"] = phase
+                        yield f"event: {buffered['type']}\ndata: {orjson.dumps(buffered).decode()}\n\n"
+                    pending.clear()
+            else:
+                yield event
+
+    async def _responses_stream_generator_non_harmony(
+        self,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        result_generator: AsyncIterator[Any],
+        model_name: str,
+        tokenizer: Any,
+        request_metadata: RequestResponseMetadata,
+        created_time: Optional[int] = None,
+        *,
+        require_reasoning: bool,
+    ) -> AsyncGenerator[str, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
         and function-call parsers; leftover text becomes
@@ -2030,9 +2088,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 event.sequence_number = sequence_number
             sequence_number += 1
             event_type = getattr(event, "type", "unknown")
-            return (
-                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
-            )
+            payload = event.model_dump()
+            if isinstance(getattr(event, "item", None), ResponseOutputMessage):
+                payload["item"] = event.item.model_dump()
+            return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
 
         # The streaming Response* event models echo ``tools`` through a
         # narrower OpenAI SDK Tool union; strip it to avoid pydantic
@@ -2230,6 +2289,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role="assistant",
                 content=[text_content],
                 status="completed",
+                phase="final_answer",
             )
             events = [
                 _send_event(
@@ -2479,6 +2539,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                             for ev in _close_message_item():
                                 yield ev
 
+                    if calls:
+                        for item in emitted_items:
+                            if isinstance(item, ResponseOutputMessage):
+                                item.phase = "commentary"
+
                     for call in calls:
                         tool_index = call.tool_index
                         state = tool_call_states.get(tool_index)
@@ -2595,6 +2660,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                         role="assistant",
                                         content=[],
                                         status="in_progress",
+                                        phase="final_answer",
                                     ),
                                 )
                             )

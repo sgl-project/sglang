@@ -193,6 +193,39 @@ class InputMessageConstructionTestCase(CustomTestCase):
             self.assertEqual(actual[:2], expected[:2])
             self.assertEqual(actual[2:], messages[2:] + expected[2:])
 
+    def test_harmony_message_channels_map_to_phases(self):
+        from sglang.srt.entrypoints.harmony_utils import (
+            parse_output_message,
+            parse_response_input,
+        )
+
+        for phase in ("commentary", "final_answer"):
+            message = parse_response_input(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "phase": phase,
+                },
+                [],
+            )
+            (item,) = parse_output_message(message)
+            self.assertEqual(item.phase, phase)
+            self.assertEqual(item.content[0].text, "answer")
+
+    def test_replay_preserves_different_assistant_phases(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "assistant", "content": "working", "phase": "commentary"},
+                {"role": "assistant", "content": "answer", "phase": "final_answer"},
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages(request)
+        self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
+        self.assertEqual([m["content"] for m in messages], ["working", "answer"])
+
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
         request = ResponsesRequest(
@@ -812,6 +845,7 @@ class OutputItemsTestCase(CustomTestCase):
 
         types = [type(item).__name__ for item in output_items]
         self.assertEqual(types, ["ResponseOutputMessage", "ResponseFunctionToolCall"])
+        self.assertEqual(output_items[0].phase, "commentary")
 
     def test_required_tool_choice_parses_json_array_without_native_parser(self):
         serving = self.serving

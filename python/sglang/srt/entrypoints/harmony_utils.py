@@ -10,7 +10,9 @@ from typing import Optional, Union
 import orjson
 from openai.types.responses import (
     ResponseOutputItem,
-    ResponseOutputMessage,
+)
+from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
+from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
@@ -43,6 +45,7 @@ from openai_harmony import (
 from sglang.srt.entrypoints.openai.protocol import (
     ReasoningEffortTier,
     ResponseInputOutputItem,
+    ResponseOutputMessage,
 )
 from sglang.srt.utils import random_uuid
 
@@ -170,6 +173,10 @@ def parse_response_input(
                 for i, c in enumerate(text_chunks)
             ]
             msg = Message.from_role_and_contents(role, contents)
+        if role == "assistant" and response_msg.get("phase") is not None:
+            msg = msg.with_channel(
+                "final" if response_msg["phase"] == "final_answer" else "commentary"
+            )
     elif response_msg["type"] == "function_call_output":
         call_id = response_msg["call_id"]
         call_response: Optional[ResponseFunctionToolCall] = None
@@ -201,10 +208,13 @@ def parse_response_input(
 
 
 def parse_response_output(output: ResponseOutputItem) -> Message:
-    if isinstance(output, ResponseOutputMessage):
+    if isinstance(output, OpenAIResponseOutputMessage):
         role = output.role
         contents = [TextContent(text=c.text) for c in output.content]
         msg = Message.from_role_and_contents(role, contents)
+        phase = getattr(output, "phase", None)
+        if phase is not None:
+            msg = msg.with_channel("final" if phase == "final_answer" else "commentary")
         return msg
     elif isinstance(output, ResponseFunctionToolCall):
         msg = Message.from_role_and_content(Role.ASSISTANT, output.arguments)
@@ -296,7 +306,7 @@ def parse_output_message(message: Message):
                 status=None,
             )
             output_items.append(reasoning_item)
-    elif message.channel == "commentary":
+    elif message.channel == "commentary" and message.recipient is not None:
         if message.recipient.startswith("functions."):
             function_name = message.recipient.split(".")[-1]
             for content in message.content:
@@ -327,7 +337,9 @@ def parse_output_message(message: Message):
                 output_items.append(reasoning_item)
         else:
             raise ValueError(f"Unknown recipient: {message.recipient}")
-    elif message.channel == "final":
+    elif message.channel == "final" or (
+        message.channel == "commentary" and message.recipient is None
+    ):
         contents = []
         for content in message.content:
             output_text = ResponseOutputText(
@@ -338,6 +350,7 @@ def parse_output_message(message: Message):
             )
             contents.append(output_text)
         text_item = ResponseOutputMessage(
+            phase="final_answer" if message.channel == "final" else "commentary",
             id=f"msg_{random_uuid()}",
             content=contents,
             role=message.author.role,
@@ -372,7 +385,9 @@ def parse_remaining_state(parser: StreamableParser):
             status=None,
         )
         return [reasoning_item]
-    elif parser.current_channel == "final":
+    elif parser.current_channel == "final" or (
+        parser.current_channel == "commentary" and current_recipient is None
+    ):
         output_text = ResponseOutputText(
             text=parser.current_content,
             annotations=[],  # TODO
@@ -380,6 +395,7 @@ def parse_remaining_state(parser: StreamableParser):
             logprobs=None,  # TODO
         )
         text_item = ResponseOutputMessage(
+            phase="final_answer" if parser.current_channel == "final" else "commentary",
             id=f"msg_{random_uuid()}",
             content=[output_text],
             role="assistant",

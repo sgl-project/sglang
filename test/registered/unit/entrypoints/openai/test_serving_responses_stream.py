@@ -171,6 +171,23 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             {"reason": "max_output_tokens"},
         )
 
+    def test_text_only_stream_emits_final_phase(self):
+        serving = make_serving()
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        events = StreamFixture(serving, request).run(
+            [engine_chunk("answer", finish=True)]
+        )
+        for payload in event_payloads(events):
+            if payload["type"] in (
+                "response.output_item.added",
+                "response.output_item.done",
+            ):
+                self.assertEqual(payload["item"]["phase"], "final_answer")
+        self.assertEqual(
+            find_completed_event(events)["response"]["output"][0]["phase"],
+            "final_answer",
+        )
+
     def test_required_tool_choice_emits_function_call_events(self):
         serving = make_serving()
         serving.reasoning_parser = None
@@ -337,6 +354,17 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         self.assertEqual(output[0]["content"][0]["text"], "I'll check.")
         self.assertEqual(output[1]["name"], "get_weather")
         self.assertEqual(output[2]["content"][0]["text"], "It's sunny.")
+        self.assertEqual(output[0]["phase"], "commentary")
+        self.assertEqual(output[2]["phase"], "final_answer")
+        for payload in event_payloads(events):
+            if (
+                payload["type"]
+                in ("response.output_item.added", "response.output_item.done")
+                and payload["item"]["type"] == "message"
+            ):
+                self.assertEqual(
+                    payload["item"]["phase"], output[payload["output_index"]]["phase"]
+                )
 
     def test_reasoning_parser_flushed_at_stream_end(self):
         """Bug regression: the stream loop never drained text the reasoning
