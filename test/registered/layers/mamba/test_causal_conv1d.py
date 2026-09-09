@@ -445,9 +445,7 @@ def test_causal_conv1d_update_uses_tail_of_oversized_state():
     bias = torch.randn(dim, device=device)
 
     conv_state_ref = conv_state.clone()
-    out = causal_conv1d_update(
-        x.clone(), conv_state, weight, bias, activation="silu"
-    )
+    out = causal_conv1d_update(x.clone(), conv_state, weight, bias, activation="silu")
     out_ref = causal_conv1d_update_ref(
         x.clone(), conv_state_ref, weight, bias, activation="silu"
     )

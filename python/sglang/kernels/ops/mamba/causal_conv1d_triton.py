@@ -719,9 +719,9 @@ def _causal_conv1d_update_kernel(
         # A cache can be longer than the convolution window. Its logical
         # history is tail-aligned, so the first tap comes from the last
         # ``KERNEL_WIDTH - 1`` entries rather than cache entry zero.
-        prior_tokens = conv_states_base + (
-            state_len - (KERNEL_WIDTH - 1)
-        ) * stride_conv_state_tok
+        prior_tokens = (
+            conv_states_base + (state_len - (KERNEL_WIDTH - 1)) * stride_conv_state_tok
+        )
     if IS_CIRCULAR_BUFFER:
         # Normalize every tap independently; the base offset can wrap when the
         # ring cursor is near zero (especially when state_len == width - 1).
@@ -781,9 +781,10 @@ def _causal_conv1d_update_kernel(
             + (conv_state_batch_coord * stride_conv_state_seq)
             + conv_state_token_offset * stride_conv_state_tok
             + (idx_feats * stride_conv_state_dim)[None, :]
-            + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
-                :, None
-            ]
+            + (
+                (idx_tokens + (1 if IS_SPEC_DECODING else seqlen))
+                * stride_conv_state_tok
+            )[:, None]
         )  # [BLOCK_M, BLOCK_N]
         mask = (
             (conv_state_batch_coord < num_cache_lines)
@@ -1045,9 +1046,7 @@ def _causal_conv1d_update_kernel(
             # `matrix_x` is the current input token in the dense path. Reload
             # explicitly for tree-shaped verification, where the convolution
             # walks parent links and leaves `matrix_x` on a parent token.
-            current_x = tl.load(
-                x_base_1d + idx_token * stride_x_token, mask=mask_x_1d
-            )
+            current_x = tl.load(x_base_1d + idx_token * stride_x_token, mask=mask_x_1d)
             update_idx = (cache_seqlen + idx_token) % state_len
             tl.store(
                 conv_states_base + update_idx * stride_conv_state_tok,
