@@ -60,9 +60,7 @@ def _make_self(*, swa_req_ring: bool, page_size: int = PAGE_SIZE):
 
     mapping = torch.zeros(64, dtype=torch.int64)
     # Peer pages for the rows under test; page 2 of the paged SWA pool.
-    mapping[0:page_size] = torch.arange(
-        2 * page_size, 3 * page_size, dtype=torch.int64
-    )
+    mapping[0:page_size] = torch.arange(2 * page_size, 3 * page_size, dtype=torch.int64)
     alloc.full_to_swa_index_mapping = mapping
 
     alloc.swa_attn_allocator = _CountingPagedAllocator(size=page_size * POOL_PAGES)
