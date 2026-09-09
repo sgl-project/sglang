@@ -104,6 +104,13 @@ class Spec:
         "it into extra real verification at the same step time. Off by default; when "
         "off the schedule is byte-for-byte unchanged.",
     ] = False
+    speculative_dspark_pp_replicated_draft: A[
+        bool,
+        "Experimental DSPARK mode for PP2. Replicate the TP draft model on both "
+        "pipeline stages so each stage drafts locally while the peer verifies "
+        "another microbatch. Requires PD, greedy sampling, static verify, disabled "
+        "CUDA graphs, and no DP attention.",
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

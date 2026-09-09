@@ -275,6 +275,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_dspark_sps_table_path",
     "speculative_dspark_confidence_sts_path",
     "speculative_dspark_align_verify_tokens_to_graph_tier",
+    "speculative_dspark_pp_replicated_draft",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "speculative_use_rejection_sampling",

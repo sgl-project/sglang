@@ -60,6 +60,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_platform,
+    get_spec,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -319,7 +320,6 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         if _is_npu and forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
 
@@ -796,14 +796,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         else:
             pp_rank = 0
             pp_size = 1
-        self.is_lifecycle_only = use_empty_draft_model_for_pp_prefill(
-            disaggregation_mode=get_disagg().disaggregation_mode,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-            target_layer_ids=[
-                int(layer_id) for layer_id in (dspark_config.target_layer_ids or [])
-            ],
-            num_hidden_layers=target_num_layers,
+        self.uses_own_vocab_modules = _is_npu or (
+            pp_size > 1 and get_spec().speculative_dspark_pp_replicated_draft
+        )
+        self.is_lifecycle_only = (
+            not get_spec().speculative_dspark_pp_replicated_draft
+            and use_empty_draft_model_for_pp_prefill(
+                disaggregation_mode=get_disagg().disaggregation_mode,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
+                target_layer_ids=[
+                    int(layer_id) for layer_id in (dspark_config.target_layer_ids or [])
+                ],
+                num_hidden_layers=target_num_layers,
+            )
         )
         self.hc_mult = int(config.hc_mult)
         self.norm_eps = float(config.rms_norm_eps)
@@ -903,8 +909,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         torch.cuda.empty_cache()
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
-        projected, _ = self.stages[0].main_proj(main_hidden)
+        projected = self.project_target_hidden_for_transfer(main_hidden)
         return self.stages[0].main_norm(projected)
+
+    def project_target_hidden_for_transfer(
+        self, main_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        projected, _ = self.stages[0].main_proj(main_hidden)
+        return projected
 
     def prepare_target_hidden_partial(self, feature_indices: List[int]) -> None:
         feature_indices = [int(index) for index in feature_indices]
@@ -1085,7 +1097,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
     def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
         x_post_hc = self.collapse_hc_head(x)
         return self._logits_from_x_post_hc(x_post_hc), x_post_hc
 
@@ -1229,7 +1240,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
-        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+        if self.uses_own_vocab_modules:
+            if name in (
+                "model.embed_tokens.weight",
+                "embed.weight",
+                "embed_tokens.weight",
+            ):
+                return "embed_tokens.weight"
+            if name in ("head.weight", "lm_head.weight"):
+                return "lm_head.weight"
+        if name.startswith(
+            ("model.embed_tokens.", "embed.", "embed_tokens.", "head.", "lm_head.")
+        ):
             return None
         if "rotary_emb.inv_freq" in name:
             return None
@@ -1240,6 +1262,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if len(parts) < 3:
             return None
         stage_id, rest = parts[1], parts[2]
+        if not stage_id.isdigit():
+            return None
+        stage_idx = int(stage_id)
+        if rest in ("embed.weight", "embed_tokens.weight"):
+            return (
+                "embed_tokens.weight"
+                if self.uses_own_vocab_modules and stage_idx == 0
+                else None
+            )
+        if rest in ("head.weight", "lm_head.weight"):
+            return (
+                "lm_head.weight"
+                if self.uses_own_vocab_modules and stage_idx == self.num_stages - 1
+                else None
+            )
 
         if rest.startswith("markov_head."):
             return f"markov_head.{rest[len('markov_head.') :]}"

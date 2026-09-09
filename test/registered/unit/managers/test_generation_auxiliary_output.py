@@ -620,6 +620,72 @@ def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
     assert any("sampling_observer_output" in key for key in tensors)
 
 
+def test_pipeline_parallel_dspark_commit_round_trip():
+    from sglang.srt.speculative.dspark_components.dspark_draft import (
+        make_next_draft_input,
+    )
+
+    req = SimpleNamespace(rid="req-0")
+    batch = SimpleNamespace(
+        reqs=[req],
+        return_logprob=False,
+        return_hidden_states=False,
+        req_pool_indices=torch.tensor([3]),
+        input_ids=torch.tensor([5]),
+        seq_lens=torch.tensor([9]),
+        seq_lens_cpu=torch.tensor([9]),
+        seq_lens_sum=9,
+        spec_info=None,
+    )
+    next_draft_input = make_next_draft_input(
+        bonus_tokens=torch.tensor([11]),
+        new_seq_lens=torch.tensor([11]),
+    )
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([10, 11]),
+        accept_lens=torch.tensor([2], dtype=torch.int32),
+        block_accept_lens=torch.tensor([2], dtype=torch.int32),
+        cap_lens=torch.tensor([3], dtype=torch.int32),
+        new_seq_lens=torch.tensor([11]),
+        next_draft_input=next_draft_input,
+        pp_dspark_projected_context=torch.ones(3, 4),
+    )
+    tensors = Scheduler._pp_prepare_tensor_dict(
+        object.__new__(Scheduler), result, batch
+    )
+
+    receiver = object.__new__(Scheduler)
+    receiver.pp_group = SimpleNamespace(is_first_rank=False)
+    receiver.model_worker = SimpleNamespace(commit_pp_draft_context=Mock())
+    receiver.device_module = SimpleNamespace(Event=CopyDone)
+    commit_state = object()
+    metadata = PPBatchMetadata(
+        can_run_cuda_graph=False,
+        fwd_batch=batch,
+        dspark_commit_state=commit_state,
+        speculative_num_draft_tokens=2,
+    )
+
+    output_result = Scheduler._pp_prep_batch_result(
+        receiver,
+        batch,
+        metadata,
+        PPProxyTensors(tensors),
+    )
+
+    receiver.model_worker.commit_pp_draft_context.assert_called_once_with(
+        state=commit_state,
+        rids=("req-0",),
+        projected_context=tensors["dspark_projected_context"],
+        commit_lens=tensors["dspark_accept_lens"],
+    )
+    assert torch.equal(batch.seq_lens, torch.tensor([11]))
+    assert torch.equal(batch.spec_info.bonus_tokens, torch.tensor([11]))
+    assert output_result.next_token_ids.is_cpu
+    assert output_result.accept_lens.is_cpu
+    assert output_result.speculative_num_draft_tokens == 2
+
+
 def test_pipeline_parallel_auxiliary_output_requires_receiver_observer():
     device_output = DeviceOutput(torch.tensor([1.0]))
     result = GenerationBatchResult(

@@ -73,9 +73,19 @@ def check_server_args(server_args: Any):
             pp_dspark_prefill = (
                 cfg.speculative_algorithm or ""
             ).upper() == "DSPARK" and cfg.disaggregation_mode == "prefill"
-            assert cfg.speculative_algorithm is None or pp_dspark_prefill, (
+            pp_dspark_decode = (
+                (cfg.speculative_algorithm or "").upper() == "DSPARK"
+                and cfg.disaggregation_mode == "decode"
+                and cfg.speculative_dspark_pp_replicated_draft
+            )
+            assert (
+                cfg.speculative_algorithm is None
+                or pp_dspark_prefill
+                or pp_dspark_decode
+            ), (
                 "Pipeline parallelism with speculative decoding is only supported "
-                "for DSPARK on a PD prefill server"
+                "for DSPARK on a PD prefill server, or on a PD decode server with "
+                "--speculative-dspark-pp-replicated-draft"
             )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "

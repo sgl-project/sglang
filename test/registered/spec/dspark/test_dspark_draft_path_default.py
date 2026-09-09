@@ -120,5 +120,30 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
                 _handle_dspark(server_args)
 
 
+class TestDsparkReplicatedPPDraft(CustomTestCase):
+    def _replicated_args(self, mode: str) -> ServerArgs:
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.pp_size = 2
+        server_args.disaggregation_mode = mode
+        server_args.speculative_dspark_pp_replicated_draft = True
+        server_args.disable_cuda_graph = True
+        server_args.pp_async_batch_depth = 0
+        server_args.enable_dp_attention = False
+        server_args.speculative_use_rejection_sampling = False
+        return server_args
+
+    def test_prefill_and_decode_are_admitted(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(self._replicated_args("prefill"))
+            _handle_dspark(self._replicated_args("decode"))
+
+    def test_non_pd_mode_is_rejected(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+                _handle_dspark(self._replicated_args("null"))
+
+
 if __name__ == "__main__":
     unittest.main()

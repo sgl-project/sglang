@@ -546,13 +546,61 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {cfg.speculative_moe_a2a_backend!r})."
             )
 
-    if cfg.pp_size != 1 and cfg.disaggregation_mode not in (
-        "prefill",
-        "decode",
-    ):
+    replicated_pp_draft = cfg.speculative_dspark_pp_replicated_draft
+    if replicated_pp_draft:
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if cfg.pp_size != 2:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "--pp-size 2."
+            )
+        if cfg.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "PD disaggregation."
+            )
+        if cfg.enable_dp_attention:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft does not support "
+                "--enable-dp-attention."
+            )
+        if not cfg.disable_cuda_graph:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "--disable-cuda-graph."
+            )
+        if cfg.pp_async_batch_depth != 0:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "--pp-async-batch-depth 0."
+            )
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+        if cfg.speculative_use_rejection_sampling:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft does not support "
+                "rejection sampling."
+            )
+
+    if cfg.pp_size != 1 and cfg.disaggregation_mode not in ("prefill", "decode"):
         raise ValueError(
             "Currently DSpark speculative decoding with pp_size > 1 is only "
             "supported under PD disaggregation."
+        )
+    if (
+        cfg.pp_size > 1
+        and cfg.disaggregation_mode == "decode"
+        and not replicated_pp_draft
+    ):
+        raise ValueError(
+            "DSpark PP decode requires --speculative-dspark-pp-replicated-draft."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -806,7 +854,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
-
     cfg = resolving_view(server_args)
 
     if (

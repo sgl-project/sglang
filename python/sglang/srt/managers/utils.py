@@ -99,6 +99,11 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
 
+    # Replicated PP DSpark keeps the local draft KV commit layout with the
+    # in-flight microbatch and relays only the projected target context.
+    pp_dspark_commit_state: Optional[Any] = None
+    pp_dspark_projected_context: Optional[torch.Tensor] = None
+
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
@@ -251,7 +256,6 @@ def validate_input_length(
 
 
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
-
     logits_output = result.logits_output
     assert logits_output is not None
 
