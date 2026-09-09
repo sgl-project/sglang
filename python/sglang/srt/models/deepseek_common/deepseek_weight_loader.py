@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -58,6 +59,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
+    enable_glm_nextn_moe_ptpc,
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
@@ -227,6 +229,7 @@ class DeepseekV2WeightLoaderMixin:
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
         )
+        weights = self._maybe_quant_glm_nextn_moe_to_ptpc(weights, nextn_conf)
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -884,6 +887,67 @@ class DeepseekV2WeightLoaderMixin:
             self._mark_nextn_moe_weights_as_ue8m0()
 
         return list(weights_dict.items())
+
+    def _maybe_quant_glm_nextn_moe_to_ptpc(self, weights, nextn_conf: NextNConfig):
+        """Cast the GLM NextN fused-expert weights from bf16 to per-channel FP8.
+
+        The GLM-5.2 MXFP4 checkpoint ships the draft layer's routed and shared
+        experts in bf16. This pairs with the QuarkW8A8FP8MoE scheme that
+        GlmMoeDsaForCausalLMNextN injects for that module.
+
+        Args:
+            weights: Iterable of (weight_name, weight_tensor) pairs
+            nextn_conf: NextN configuration
+
+        Returns:
+            weights unchanged when the cast is off, otherwise a generator that
+            also emits a ``.weight_scale`` next to each cast weight.
+        """
+        if not isinstance(nextn_conf, NextNEnabledConfig):
+            return weights
+        if not enable_glm_nextn_moe_ptpc(self.quant_config):
+            return weights
+        # DeepSeek shares this mixin but gets no matching scheme, so the cast
+        # weights would have nowhere to load.
+        if "glm" not in self.config.model_type.lower():
+            return weights
+
+        layer_prefix = nextn_conf.nextn_layer_prefix
+        # Only routed experts get QuarkW8A8FP8MoE; shared_experts stay bf16.
+        expert_proj_re = re.compile(
+            r"mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$"
+        )
+        # e4m3fn even on MI300; QuarkW8A8FP8MoE converts to fnuz where needed.
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        log_info_on_rank0(
+            logger,
+            "GLM NextN MoE PTPC: casting draft expert weights under "
+            f"{layer_prefix}.mlp to fp8_e4m3 per-channel",
+        )
+
+        def _cast() -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, tensor in weights:
+                if not (
+                    name.startswith(layer_prefix + ".") and expert_proj_re.search(name)
+                ):
+                    yield name, tensor
+                    continue
+                if tensor.ndim != 2:
+                    raise ValueError(
+                        f"{name}: PTPC cast expects a 2D expert weight, "
+                        f"got {tuple(tensor.shape)}"
+                    )
+                weight = tensor.to(torch.float32)
+                # One scale per output channel, matching the "per_channel" qscheme.
+                scale = weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+                scale /= fp8_max
+                yield (
+                    name,
+                    (weight / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn),
+                )
+                yield name[: -len("weight")] + "weight_scale", scale.squeeze(-1)
+
+        return _cast()
 
     def _mark_nextn_moe_weights_as_ue8m0(self):
         """Mark NextN MoE weight scales as UE8M0 format to avoid requantization."""
