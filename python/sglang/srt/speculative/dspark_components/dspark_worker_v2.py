@@ -1,6 +1,6 @@
 import logging
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -20,6 +20,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    PPProxyTensors,
     compute_position,
 )
 from sglang.srt.runtime_context import (
@@ -47,6 +48,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    DraftProposal,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -61,6 +63,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
+    VerifyWindow,
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
@@ -131,6 +134,25 @@ def _is_context_only_pp_prefill_rank(
     return disaggregation_mode == "prefill" and pp_size > 1 and pp_rank < pp_size - 1
 
 
+@dataclass(frozen=True)
+class PPDSparkCommitState:
+    rids: tuple[str, ...]
+    cache_loc: torch.Tensor
+    cache_loc_2d: Optional[torch.Tensor]
+    positions: torch.Tensor
+    state_slot: Optional[torch.Tensor]
+    final_pos: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class PPDSparkDraftState:
+    rids: tuple[str, ...]
+    draft_input: DFlashDraftInputV2
+    prefix_lens: torch.Tensor
+    verify_window: VerifyWindow
+    proposal: DraftProposal
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     def __init__(
         self,
@@ -158,13 +180,28 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         disaggregation_mode = get_disagg().disaggregation_mode
         self._is_pd_prefill = disaggregation_mode == "prefill"
-        self._is_context_only_pp_prefill_rank = _is_context_only_pp_prefill_rank(
-            disaggregation_mode=disaggregation_mode,
-            pp_rank=ps.pp_rank,
-            pp_size=ps.pp_size,
+        self._replicated_pp_draft = (
+            get_spec().speculative_dspark_pp_replicated_draft and ps.pp_size > 1
+        )
+        self._replicated_pp_decode = (
+            self._replicated_pp_draft and disaggregation_mode == "decode"
+        )
+        self._pp_draft_state: Optional[PPDSparkDraftState] = None
+        self._is_context_only_pp_prefill_rank = (
+            _is_context_only_pp_prefill_rank(
+                disaggregation_mode=disaggregation_mode,
+                pp_rank=ps.pp_rank,
+                pp_size=ps.pp_size,
+            )
+            and not self._replicated_pp_draft
         )
         self._use_full_projection_prefill = False
-        if self._is_pd_prefill and self._draft_is_moe and ps.pp_size > 1:
+        if (
+            self._is_pd_prefill
+            and self._draft_is_moe
+            and ps.pp_size > 1
+            and not self._replicated_pp_draft
+        ):
             target_layer_ids = [
                 int(layer_id)
                 for layer_id in (
@@ -179,6 +216,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._use_full_projection_prefill = (
                 owner_pp_rank == ps.pp_size - 1 and ps.pp_rank == owner_pp_rank
             )
+        if self._replicated_pp_draft:
+            target_layer_ids = [
+                int(layer_id)
+                for layer_id in (
+                    self.model_runner.spec_aux_config.dflash_target_layer_ids or []
+                )
+            ]
+            owner_pp_rank = resolve_single_owner_pp_rank(
+                target_layer_ids=target_layer_ids,
+                num_hidden_layers=self.model_runner.model_config.num_hidden_layers,
+                pp_size=ps.pp_size,
+            )
+            if owner_pp_rank != ps.pp_size - 1:
+                raise ValueError(
+                    "Replicated PP DSpark requires all target context layers on "
+                    f"the final PP stage, got target_layer_ids={target_layer_ids} "
+                    f"and owner_pp_rank={owner_pp_rank}."
+                )
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -195,10 +250,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         with self._draft_context():
+            draft_ps = (
+                replace(ps, pp_rank=0, pp_size=1) if self._replicated_pp_draft else ps
+            )
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=ps,
+                ps=draft_ps,
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -345,6 +403,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            force_draft_embedding=self._replicated_pp_draft,
         )
         self._verify_epilogue = None
         if (
@@ -696,7 +755,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        return self._forward_decode(
+            batch,
+            on_publish,
+            grammar_barrier,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
     def _forward_lifecycle_only_prefill(
         self, *, batch: ScheduleBatch, on_publish, pp_proxy_tensors
@@ -807,6 +871,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos = torch.repeat_interleave(
                 (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
             )
+        pp_commit_state = (
+            PPDSparkCommitState(
+                rids=tuple(req.rid for req in batch.reqs),
+                cache_loc=batch.out_cache_loc,
+                cache_loc_2d=None,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
+            if self._replicated_pp_draft
+            else None
+        )
+        pp_projected_context = None
         if self._use_full_projection_prefill:
             if not has_local_target_hidden or output_pp_proxy_tensors is not None:
                 raise RuntimeError(
@@ -853,13 +930,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if ctx_acc is not None:
                     output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
             elif ctx_acc is not None:
-                self._kv_injector.inject_projected_context(
-                    projected_context=ctx_acc,
-                    cache_loc=batch.out_cache_loc,
-                    positions=positions,
-                    state_slot=state_slot,
-                    final_pos=final_pos,
-                )
+                if self._replicated_pp_draft:
+                    pp_projected_context = ctx_acc
+                else:
+                    self._kv_injector.inject_projected_context(
+                        projected_context=ctx_acc,
+                        cache_loc=batch.out_cache_loc,
+                        positions=positions,
+                        state_slot=state_slot,
+                        final_pos=final_pos,
+                    )
             elif has_local_target_hidden and not (
                 self.ps.pp_size > 1 and not self._draft_is_moe
             ):
@@ -871,6 +951,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     final_pos=final_pos,
                     target_hidden_is_projected=target_hidden_is_projected,
                 )
+        if (
+            self._replicated_pp_draft
+            and output_pp_proxy_tensors is None
+            and pp_projected_context is None
+        ):
+            raise RuntimeError(
+                "Replicated PP DSpark prefill produced no projected context on "
+                "the final PP stage."
+            )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         if logits_output is not None:
             logits_output.hidden_states = None
@@ -880,6 +969,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bonus_tokens=next_token_ids,
                 new_seq_lens=new_seq_lens,
             )
+        batch_output.pp_dspark_commit_state = pp_commit_state
+        batch_output.pp_dspark_projected_context = pp_projected_context
         return batch_output
 
     def _forward_idle_prefill(
@@ -949,7 +1040,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _forward_decode(
-        self, batch: ScheduleBatch, on_publish, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -976,29 +1071,49 @@ class DSparkWorkerV2(BaseSpecWorker):
         device = self.device
         prefix_lens = batch.seq_lens
 
-        self._observers.begin_step()
-
         target_model = self.target_worker.model_runner.model
-        verify_window = alloc_verify_window(
-            batch=batch,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
-            model_runner=self.model_runner,
-        )
-
         sampling_info = batch.sampling_info
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            proposal = self._proposer.propose(
+        if (
+            self._replicated_pp_decode
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+        ):
+            raise ValueError(
+                "Replicated PP DSpark currently supports greedy sampling only."
+            )
+        prepared = self._pp_draft_state
+        self._pp_draft_state = None
+        if prepared is not None:
+            rids = tuple(req.rid for req in batch.reqs)
+            if prepared.rids != rids:
+                raise RuntimeError(
+                    "Replicated PP DSpark draft does not match the verify batch: "
+                    f"draft_rids={prepared.rids}, verify_rids={rids}."
+                )
+            draft_input = prepared.draft_input
+            prefix_lens = prepared.prefix_lens
+            verify_window = prepared.verify_window
+            proposal = prepared.proposal
+        else:
+            self._observers.begin_step()
+            verify_window = alloc_verify_window(
                 batch=batch,
-                draft_input=draft_input,
-                verify_window=verify_window,
                 bs=bs,
                 device=device,
-                target_model=target_model,
-                sampling_info=sampling_info,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
             )
+            with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
@@ -1060,6 +1175,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
+        pp_commit_state = (
+            self._build_pp_commit_state(batch, verify_window)
+            if self._replicated_pp_decode
+            else None
+        )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1071,6 +1191,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     device=device,
                     sampling_info=sampling_info,
                     inject_gate=fold_eligible,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
             else:
                 target_verify = self._verify_executor.run_non_compact(
@@ -1079,10 +1200,24 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        if self._replicated_pp_decode and logits_output is None:
+            return GenerationBatchResult(
+                pp_hidden_states_proxy_tensors=(
+                    target_verify.pp_hidden_states_proxy_tensors
+                ),
+                can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=make_next_draft_input(
+                    bonus_tokens=draft_input.bonus_tokens,
+                    new_seq_lens=prefix_lens,
+                ),
+                speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
+                pp_dspark_commit_state=pp_commit_state,
+            )
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
@@ -1132,7 +1267,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         folded_commit = folded_accept and epilogue.folds_commit
-        if not folded_commit:
+        pp_projected_context = None
+        if self._replicated_pp_decode:
+            if run_compact:
+                raise RuntimeError(
+                    "Replicated PP DSpark does not support compact verify."
+                )
+            hidden = logits_output.hidden_states
+            if hidden is None:
+                raise RuntimeError(
+                    "Replicated PP DSpark requires target hidden states on the "
+                    "final PP stage."
+                )
+            pp_projected_context = self.draft_model.project_target_hidden_for_transfer(
+                hidden
+            )
+        elif not folded_commit:
             self._verify_executor.commit_hidden(
                 batch=batch,
                 layout=layout,
@@ -1184,6 +1334,100 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            pp_dspark_commit_state=pp_commit_state,
+            pp_dspark_projected_context=pp_projected_context,
+        )
+
+    def prepare_pp_draft(self, batch: ScheduleBatch) -> None:
+        if not self._replicated_pp_decode or not batch.forward_mode.is_decode():
+            return
+        if self._pp_draft_state is not None:
+            raise RuntimeError("Replicated PP DSpark already has a prepared draft.")
+        if batch.spec_info is None:
+            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
+        draft_input = batch.spec_info
+        if not isinstance(draft_input, DFlashDraftInputV2):
+            raise RuntimeError(
+                "DSpark spec-v2 expected DFlashDraftInputV2 state on the running batch."
+            )
+        sampling_info = batch.sampling_info
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            raise ValueError(
+                "Replicated PP DSpark currently supports greedy sampling only."
+            )
+
+        batch.seq_lens.record_stream(
+            torch.get_device_module(self.device).current_stream()
+        )
+        bs = len(batch.seq_lens)
+        prefix_lens = batch.seq_lens
+        verify_window = alloc_verify_window(
+            batch=batch,
+            bs=bs,
+            device=self.device,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+        )
+        self._observers.begin_step()
+        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            proposal = self._proposer.propose(
+                batch=batch,
+                draft_input=draft_input,
+                verify_window=verify_window,
+                bs=bs,
+                device=self.device,
+                target_model=self.target_worker.model_runner.model,
+                sampling_info=sampling_info,
+            )
+        self._pp_draft_state = PPDSparkDraftState(
+            rids=tuple(req.rid for req in batch.reqs),
+            draft_input=draft_input,
+            prefix_lens=prefix_lens,
+            verify_window=verify_window,
+            proposal=proposal,
+        )
+
+    def _build_pp_commit_state(
+        self, batch: ScheduleBatch, verify_window
+    ) -> PPDSparkCommitState:
+        state_slot = None
+        if is_unified_kv_triton():
+            verify_len = verify_window.verify_cache_loc_2d.shape[1]
+            state_slot = (
+                batch.req_pool_indices.view(-1, 1)
+                .expand(len(batch.reqs), verify_len)
+                .reshape(-1)
+            )
+        return PPDSparkCommitState(
+            rids=tuple(req.rid for req in batch.reqs),
+            cache_loc=verify_window.verify_cache_loc,
+            cache_loc_2d=verify_window.verify_cache_loc_2d,
+            positions=verify_window.positions_2d.reshape(-1),
+            state_slot=state_slot,
+        )
+
+    def commit_pp_draft_context(
+        self,
+        *,
+        state: PPDSparkCommitState,
+        rids: tuple[str, ...],
+        projected_context: torch.Tensor,
+        commit_lens: Optional[torch.Tensor],
+    ) -> None:
+        if state.rids != rids:
+            raise RuntimeError(
+                "Replicated PP DSpark result does not match the forward batch: "
+                f"forward_rids={state.rids}, result_rids={rids}."
+            )
+        self._kv_injector.inject_projected_context(
+            projected_context=projected_context,
+            cache_loc=state.cache_loc,
+            cache_loc_2d=state.cache_loc_2d,
+            positions=state.positions,
+            commit_lens=commit_lens,
+            state_slot=state.state_slot,
+            final_pos=state.final_pos,
         )
 
     def _commit_target_mamba_states_after_verify(
