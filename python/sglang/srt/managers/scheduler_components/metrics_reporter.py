@@ -350,7 +350,39 @@ class SchedulerMetricsReporter:
                 self.scheduler._fpm_uses_device_timer,
             )
 
-    def _build_scheduled_request_metrics(self, batch: ScheduleBatch):
+    def snapshot_spec_decode_metrics(self, batch, result):
+        if not self.scheduler.enable_fpm:
+            return
+
+        from sglang.srt.observability.forward_pass_metrics import (
+            ScheduledRequestMetrics,
+            WelfordAccumulator,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if batch.spec_algorithm not in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DSPARK,
+        ):
+            return
+
+        # Before settling this result, token history includes one pending token
+        # outside KV. Unlike kv_committed_len, it survives in-flight retraction.
+        decode_kv = WelfordAccumulator()
+        for req in batch.reqs:
+            decode_kv.add(req.seqlen - 1)
+        result.fpm_scheduled_requests = ScheduledRequestMetrics(
+            num_decode_requests=decode_kv.count,
+            sum_decode_kv_tokens=decode_kv.total,
+            var_decode_kv_tokens=decode_kv.variance(),
+        )
+
+    def _build_scheduled_request_metrics(self, batch: ScheduleBatch, result=None):
+        snapshot = getattr(result, "fpm_scheduled_requests", None)
+        if snapshot is not None:
+            return snapshot
+
         from sglang.srt.observability.forward_pass_metrics import (
             ScheduledRequestMetrics,
             WelfordAccumulator,
@@ -1136,7 +1168,7 @@ class SchedulerMetricsReporter:
             worker_id=self.scheduler._fpm_worker_id,
             dp_rank=self.scheduler._fpm_dp_rank,
             wall_time=wall_time,
-            scheduled_requests=self._build_scheduled_request_metrics(batch),
+            scheduled_requests=self._build_scheduled_request_metrics(batch, result),
             queued_requests=self._build_queued_request_metrics(),
         )
         publisher = self.scheduler._fpm_publisher
