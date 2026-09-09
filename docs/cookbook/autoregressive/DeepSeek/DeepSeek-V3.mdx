@@ -392,7 +392,7 @@ python3 -m sglang.launch_server \
 The default configuration is `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. Find the best values for your workload with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py). The minimum viable config is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`.
 
 <Note>
-For large batch sizes (>48), increase `--max-running-requests` beyond the default of 48 for MTP. Also set `--cuda-graph-bs` to include your target batch sizes (default captured sizes for speculative decoding: 48).
+For large batch sizes (>48), increase `--max-running-requests` beyond the default of 48 for MTP. Also set `--cuda-graph-bs-decode` to include your target batch sizes (default captured sizes for speculative decoding: 48).
 </Note>
 
 <Tip>
