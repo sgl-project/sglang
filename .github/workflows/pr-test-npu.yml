@@ -356,6 +356,41 @@ jobs:
       use_run_selected_tests: true
 
 
+  setup-covstub:
+    needs:
+      [
+        set-image-config,
+        base-a-test-1-npu-a2,
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
+        base-c-test-acc-2-npu-a3,
+        base-c-test-acc-16-npu-a3,
+        base-c-test-perf-2-npu-a3,
+        base-c-test-perf-16-npu-a3,
+      ]
+    if: always()
+    runs-on: linux-aarch64-a3-800t-2
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Copy sglang source and archive outputs
+        run: |
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          COVSTUB="${RUN_DIR}/outputs/covstub"
+          mkdir -p "${COVSTUB}"
+          cp -r python/sglang "${COVSTUB}/"
+          tar -czf "${RUN_DIR}/outputs.tar.gz" -C "${RUN_DIR}" outputs
+
   pr-test-npu-finish:
     needs:
       [

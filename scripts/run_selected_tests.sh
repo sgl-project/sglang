@@ -10,10 +10,32 @@ RUN_ID="${GITHUB_RUN_ID:-local}"
 RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
 RUN_DIR="${RUN_ID}-attempt-${RUN_ATTEMPT}"
 
-LOG_DIR="${CACHE_ROOT}/logs/${RUN_DIR}"
-COV_ROOT="${CACHE_ROOT}/coverage/${RUN_DIR}"
+# Date tag for grouping coverage data. In CI, prefer GITHUB_RUN_STARTED_AT
+# (same value across all jobs in one run, immune to midnight rollover).
+# Fall back to local date for non-CI execution.
+if [ -n "${GITHUB_RUN_STARTED_AT:-}" ]; then
+  COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
+  COV_DATE_TAG="${COV_DATE_TAG//-/}"
+else
+  COV_DATE_TAG="$(date +%Y%m%d)"
+fi
+COV_ROOT="${CACHE_ROOT}/${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
 
-mkdir -p "${LOG_DIR}" "${COV_ROOT}"
+mkdir -p "${COV_ROOT}"
+
+# --- Subprocess coverage wiring -------------------------------------------
+# Tests launch sglang servers via subprocess.Popen; the parent's tracer cannot
+# see them. Two things make Popen'd processes (and their mp children) measured:
+#   1. COVERAGE_PROCESS_START: read by the .pth hook below in every child
+#      python process to auto-start coverage. No-op in processes where the
+#      variable is absent, so the hook is safe to leave installed.
+#   2. The .pth hook in site-packages: coverage.process_startup().
+# popen_launch_server merges os.environ into the child env, so both the
+# variable and COVERAGE_FILE propagate to the server.
+export COVERAGE_PROCESS_START="${SCRIPT_DIR}/coveragerc"
+site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')"
+echo 'import coverage; coverage.process_startup()' \
+  > "${site_packages}/sglang_coverage_startup.pth"
 
 targets=("$@")
 if [ "${#targets[@]}" -eq 0 ]; then
@@ -25,9 +47,20 @@ overall_status=0
 
 results=()
 
+# Derive a filesystem-safe directory name from a test target:
+#   1. strip the CI workspace prefix (/__w/sglang/sglang)
+#   2. strip the trailing ".py"
+#   3. flatten path separators:  /  ->  __
+#   4. flatten pytest separators: ::  ->  --
+#   5. replace any remaining unsafe character with "_"
+# Example:
+#   /__w/sglang/sglang/test/registered/npu/basic_function/HiCache/test_npu_hicache_mha.py
+#     -> __test__registered__npu__basic_function__HiCache__test_npu_hicache_mha
+# Each test gets its own COVERAGE_FILE so results never collide.
 setup_coverage() {
   local target="$1"
-  local name="${target%.py}"
+  local name="${target#/__w/sglang/sglang}"
+  name="${name%.py}"
   name="${name//\//__}"
   name="${name//::/--}"
   name="${name//[^a-zA-Z0-9_.-]/_}"
@@ -38,29 +71,29 @@ setup_coverage() {
 
 run_one() {
   local target="$1"
-  local name="${target%.py}"
-  name="${name//\//__}"
-  name="${name//::/--}"
-  name="${name//[^a-zA-Z0-9_.-]/_}"
-  local log_file="${LOG_DIR}/${name}.log"
 
   echo "=== Running: ${target} ==="
   setup_coverage "${target}"
 
   set +e
-  python -m coverage run --rcfile="${SCRIPT_DIR}/coveragerc" -m pytest -sv --color=yes "${target}" 2>&1 | tee "${log_file}"
+  python -m coverage run --rcfile="${SCRIPT_DIR}/coveragerc" -m pytest -sv --color=yes "${target}" 2>&1
   local status=$?
   set -e
 
   if [ "${status}" -ne 0 ]; then
     echo "1" > "$(dirname "${COVERAGE_FILE}")/FAILED"
-    echo "=== FAILED: ${target} (log: ${log_file}) ==="
+    echo "=== FAILED: ${target} ==="
     overall_status=1
     results+=("${target}|FAILED")
   else
     echo "=== PASSED: ${target} ==="
     results+=("${target}|PASSED")
   fi
+
+  # Merge parallel data files (main + server + mp children) into one.
+  set +e
+  python -m coverage combine --rcfile="${SCRIPT_DIR}/coveragerc" 2>/dev/null
+  set -e
 }
 
 for target in "${targets[@]}"; do
@@ -112,7 +145,6 @@ echo "============================================================"
 if [ "${failed_count}" -gt 0 ]; then
   echo "ERROR: Some tests failed."
 fi
-echo "Logs: ${LOG_DIR}/"
 echo "Coverage: ${COV_ROOT}/"
 
 exit "${overall_status}"
