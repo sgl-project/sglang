@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -1738,11 +1739,15 @@ class AscendAttnBackend(AttentionBackend):
 
             k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-            kv_cached = torch.index_select(
-                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+            kv_cached = gather_mla_cache_pages(
+                k_buffer,
+                self.forward_metadata.flatten_prefix_block_tables,
+                is_nz=is_fia_nz(),
             )
-            k_rope_cached = torch.index_select(
-                v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+            k_rope_cached = gather_mla_cache_pages(
+                v_buffer,
+                self.forward_metadata.flatten_prefix_block_tables,
+                is_nz=is_fia_nz(),
             ).flatten(0, 1)
 
             assert layer.kv_b_proj is not None

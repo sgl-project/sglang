@@ -22,6 +22,34 @@ if is_npu():
     import torch_npu
 
 
+def _mla_fia_nz_scatter_indices(
+    loc: torch.Tensor, head_dim: int, page_size: int
+) -> torch.Tensor:
+    """Return physical rows for token-wise writes into an MLA NZ cache.
+
+    The storage allocation remains page-major ``[page, slot, 1, D]`` for
+    transfer and bookkeeping compatibility. FIA reads that storage as
+    ``[page, 1, D / 16, page_size, 16]``. A token-major scatter would therefore
+    write the wrong physical rows, so every logical token expands to its
+    ``D / 16`` NZ tiles.
+    """
+    if head_dim % 16:
+        raise ValueError(
+            "FIA NZ MLA cache requires a head dimension divisible by 16, "
+            f"got {head_dim}."
+        )
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}.")
+
+    num_tiles = head_dim // 16
+    page = torch.div(loc, page_size, rounding_mode="floor")
+    slot = torch.remainder(loc, page_size)
+    tiles = torch.arange(num_tiles, dtype=loc.dtype, device=loc.device)
+    # Flatten [token, tile] in the same order as source.view(T, tiles, 16).
+    rows = ((page[:, None] * num_tiles + tiles) * page_size) + slot[:, None]
+    return rows.reshape(-1, 1)
+
+
 def _init_npu_conv_state(
     conv_state_in,
     conv_state_shape,
@@ -540,6 +568,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
     ):
+        # MLAPO historically owned NZ writes. Keep the allocation unchanged and
+        # write into the NZ-addressed view below so ordinary MLA (including
+        # Kimi-K3 MTP) can use FIA NZ without MLAPO.
+        self.use_fia_nz = get_bool_env_var("SGLANG_USE_FIA_NZ")
         super(MLATokenToKVPool, self).__init__(
             size=size,
             page_size=page_size,
@@ -829,6 +861,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 packed.view(-1, 1, self.kv_cache_dim),
             )
             return
+
+        if cache_v is None:
+            cache_k, cache_v = cache_k.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -837,10 +875,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if cache_v is None:
-            cache_k, cache_v = cache_k.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
+        if self.use_fia_nz:
+            self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
+            return
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
@@ -854,6 +891,28 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
+
+    def _set_fia_nz_kv_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        """Store MLA latent and RoPE KV tensors in FIA's NZ tile order."""
+
+        def scatter(cache: torch.Tensor, values: torch.Tensor, head_dim: int):
+            num_tiles = head_dim // 16
+            indices = _mla_fia_nz_scatter_indices(loc, head_dim, self.page_size)
+            # Destination rows are ordered [page, tile, slot]. Source rows use
+            # the matching [token, tile] order after this reshape.
+            dst = cache.view(-1, 1, num_tiles, self.page_size, 16).view(-1, 16)
+            src = values.contiguous().view(-1, num_tiles, 16).view(-1, 16)
+            torch_npu.npu_scatter_nd_update_(dst, indices, src)
+
+        offset = layer_id - self.start_layer
+        scatter(self.k_buffer[offset], cache_k, self.kv_lora_rank)
+        scatter(self.v_buffer[offset], cache_v, self.qk_rope_head_dim)
 
     def set_index_k_buffer(
         self,
