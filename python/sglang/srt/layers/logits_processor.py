@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
+    fused_softcap_cpu,
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
@@ -845,7 +846,9 @@ class LogitsProcessor(nn.Module):
         )
 
         if self.final_logit_softcapping:
-            if not (_is_npu or _is_cpu):
+            if _is_cpu:
+                fused_softcap_cpu(logits, self.final_logit_softcapping)
+            elif not _is_npu:
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
                 logits = self.final_logit_softcapping * torch.tanh(
