@@ -1751,9 +1751,9 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             self._validate_prefill_only_args(enable_hisparse=True)
 
     def test_rejects_fp4_kv_cache(self):
-        for kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+        for kv_cache_dtype in ("nvfp4", "fp4_mx_block16", "mxfp4"):
             with self.subTest(kv_cache_dtype=kv_cache_dtype):
-                with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
+                with self.assertRaisesRegex(ValueError, "FP4 pool"):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 

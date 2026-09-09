@@ -407,14 +407,40 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-                k = model_config.head_dim
-                cell_size = (cell_size // 2) + (
-                    (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
-                )
-                # FP4 prefill uses one shared FP8 dequant workspace across layers.
-                cell_size += n * k * 2 * kv_size
+                if kvc.kv_cache_dtype_str == "mxfp4":
+                    k_dim = model_config.head_dim
+                    v_dim = model_config.v_head_dim
+                    # OCP MXFP4 physical storage: packed E2M1 data plus one
+                    # E8M0 byte per 32 values, independently for every head.
+                    cell_size = (
+                        n
+                        * (ceil_div(k_dim, 2) + ceil_div(v_dim, 2))
+                        * effective_num_layers
+                        * kv_size
+                    )
+                    cell_size += (
+                        n
+                        * (ceil_div(k_dim, 32) + ceil_div(v_dim, 32))
+                        * effective_num_layers
+                        * kv_size
+                    )
+                    # The validation-only PLAIN path materializes one layer's
+                    # full K and V pools as BF16 at the same time. Account for
+                    # that transient allocation so sizing leaves enough headroom.
+                    cell_size += (
+                        n
+                        * (k_dim + v_dim)
+                        * torch.empty((), dtype=torch.bfloat16).element_size()
+                    )
+                else:
+                    # Existing block-16 recipes: packed FP4 + uint8 scales and
+                    # one shared FP8 dequant-workspace reserve.
+                    scale_block_size = 16
+                    k = model_config.head_dim
+                    cell_size = (cell_size // 2) + (
+                        (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
+                    )
+                    cell_size += n * k * 2 * kv_size
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 cell_size += (

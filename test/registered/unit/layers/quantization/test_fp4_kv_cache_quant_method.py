@@ -31,6 +31,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertIn("nvfp4", KV_CACHE_QUANT_REGISTRY)
         self.assertIn("fp4_mx_block16", KV_CACHE_QUANT_REGISTRY)
         self.assertIn("cpu_fp8_e4m3", KV_CACHE_QUANT_REGISTRY)
+        self.assertIn("mxfp4", KV_CACHE_QUANT_REGISTRY)
 
     def test_factory_nvfp4(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -59,6 +60,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
 
         self.assertEqual(resolve_kv_cache_quant("nvfp4"), "nvfp4")
         self.assertEqual(resolve_kv_cache_quant("fp4_mx_block16"), "fp4_mx_block16")
+        self.assertEqual(resolve_kv_cache_quant("mxfp4"), "mxfp4")
         self.assertIsNone(resolve_kv_cache_quant("fp8_e4m3"))
 
     def test_resolve_legacy_fp4_alias_raises(self):
@@ -86,13 +88,14 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "fp4_mx_block16"):
             runner.configure_kv_cache_dtype()
 
-    def test_resolve_mxfp4_name_raises(self):
+    def test_factory_mxfp4(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            resolve_kv_cache_quant,
+            MXFP4KVCacheMethod,
+            get_kv_cache_quant_method,
         )
 
-        with self.assertRaises(ValueError):
-            resolve_kv_cache_quant("mxfp4")
+        method = get_kv_cache_quant_method("mxfp4")
+        self.assertIsInstance(method, MXFP4KVCacheMethod)
 
     def test_factory_unknown_raises(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -349,6 +352,92 @@ class TestFP4MXBlock16KVCacheMethod(CustomTestCase):
         self.assertEqual(v_out.shape, (4, heads, dim))
         self.assertEqual(k_out.dtype, torch.bfloat16)
         self.assertEqual(v_out.dtype, torch.bfloat16)
+
+
+class TestMXFP4KVCacheMethod(CustomTestCase):
+    """Test strict OCP MXFP4 buffer, access, and PLAIN-read contracts."""
+
+    def test_properties_and_qwen_capacity(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            KVCacheAttentionAccessKind,
+            MXFP4KVCacheMethod,
+        )
+
+        method = MXFP4KVCacheMethod()
+        self.assertEqual(method.name, "mxfp4")
+        self.assertEqual(method.SCALE_BLOCK_SIZE, 32)
+        self.assertFalse(method.needs_dequant_workspace())
+        self.assertTrue(method.needs_plain_kv_dequant_read())
+        self.assertFalse(method.needs_global_scale())
+        self.assertEqual(method.plain_attention_kv_dtype(), torch.bfloat16)
+        self.assertEqual(method.scale_buffer_view_dtype(), torch.float8_e8m0fnu)
+        self.assertEqual(
+            method.resolve_attention_access("prefill", "flashinfer").kind,
+            KVCacheAttentionAccessKind.PLAIN,
+        )
+        self.assertEqual(
+            method.resolve_attention_access("decode", "flashinfer").kind,
+            KVCacheAttentionAccessKind.PLAIN,
+        )
+        # Native decode for the triton backend (kernel reads packed E2M1 +
+        # E8M0 scales inline); triton prefill stays unsupported (PLAIN reads
+        # are flashinfer-only).
+        self.assertEqual(
+            method.resolve_attention_access("decode", "triton").kind,
+            KVCacheAttentionAccessKind.NATIVE_FP4,
+        )
+        self.assertIsNone(method.resolve_attention_access("prefill", "triton"))
+        # 16 layers: 16 KiB packed + 1 KiB E8M0 scales + 4 KiB
+        # one-layer BF16 PLAIN scratch reserve.
+        self.assertEqual(method.compute_cell_size(4, 256, 16, 1), 21 * 1024)
+
+    def test_buffer_shapes_and_plain_roundtrip(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            MXFP4KVCacheMethod,
+        )
+        from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
+
+        method = MXFP4KVCacheMethod()
+        buffers = method.create_buffers(12, 4, 33, 2, "cpu")
+        self.assertEqual(buffers["k_buffer"][0].shape, (12, 4, 17))
+        self.assertEqual(buffers["k_scale_buffer"][0].shape, (12, 4, 2))
+        self.assertIsNone(buffers["dq_k_buffer"])
+        self.assertIsNone(buffers["dq_v_buffer"])
+
+        torch.manual_seed(20260902)
+        k = torch.randn(3, 4, 33, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        loc = torch.tensor([0, 3, 9])
+        k0, v0 = k.clone(), v.clone()
+        method.quantize_and_store(
+            buffers["k_buffer"][0],
+            buffers["v_buffer"][0],
+            buffers["k_scale_buffer"][0],
+            buffers["v_scale_buffer"][0],
+            loc,
+            k,
+            v,
+        )
+        expected_k, expected_ks = MXFP4KVQuantizeUtil.batched_quantize(k0[1:])
+        expected_v, expected_vs = MXFP4KVQuantizeUtil.batched_quantize(v0[1:])
+        self.assertTrue(torch.equal(buffers["k_buffer"][0][loc[1:]], expected_k))
+        self.assertTrue(torch.equal(buffers["v_buffer"][0][loc[1:]], expected_v))
+        self.assertTrue(torch.equal(buffers["k_scale_buffer"][0][loc[1:]], expected_ks))
+        self.assertTrue(torch.equal(buffers["v_scale_buffer"][0][loc[1:]], expected_vs))
+        self.assertEqual(buffers["k_buffer"][0][0].sum().item(), 0)
+        self.assertEqual(buffers["k_scale_buffer"][0][0].sum().item(), 0)
+        self.assertTrue(torch.equal(k, k0))
+        self.assertTrue(torch.equal(v, v0))
+
+        actual = method.dequantize_kv_tensor(
+            buffers["k_buffer"][0][loc[1:]],
+            buffers["k_scale_buffer"][0][loc[1:]],
+            0,
+        )
+        expected = MXFP4KVQuantizeUtil.batched_dequantize(
+            expected_k, expected_ks, logical_dim=33, dtype=torch.bfloat16
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 class TestFP4MXBlock16KVQuantizeUtil(CustomTestCase):

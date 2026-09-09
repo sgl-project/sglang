@@ -2137,6 +2137,11 @@ class MHATokenToKVPool(KVCache):
         self._init_data_ptrs_and_strides()
 
     def _create_quantized_buffers(self):
+        if self.quant_method.name == "mxfp4" and self.v_head_dim != self.head_dim:
+            raise ValueError(
+                "MXFP4 KV cache currently requires v_head_dim == head_dim, got "
+                f"{self.v_head_dim} != {self.head_dim}."
+            )
         # Quantized recipes own packed-data, scale, and workspace shapes.
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (

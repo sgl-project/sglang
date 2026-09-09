@@ -39,12 +39,43 @@ def handle_kv4_compatibility(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
-    if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
+    if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16", "mxfp4"):
         return
 
     uses_mla = use_mla_backend(server_args)
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     attention_backend = resolved_view(server_args).attention_backend
+
+    if cfg.kv_cache_dtype == "mxfp4":
+        if not get_platform().is_cuda:
+            raise RuntimeError("--kv-cache-dtype=mxfp4 is currently CUDA-only.")
+        if uses_mla:
+            raise ValueError(
+                "--kv-cache-dtype=mxfp4 currently supports MHA only, not MLA."
+            )
+        # Prefill/extend always runs on FlashInfer (BF16 PLAIN read). Decode may
+        # stay on FlashInfer (PLAIN, validation path) or use triton (native MXFP4
+        # kernel reading packed data + scales inline).
+        allowed_backend_pairs = (("flashinfer", "flashinfer"), ("flashinfer", "triton"))
+        if (prefill_backend, decode_backend) not in allowed_backend_pairs:
+            raise ValueError(
+                "--kv-cache-dtype=mxfp4 requires prefill=flashinfer with decode "
+                "flashinfer (BF16 PLAIN read) or triton (native MXFP4 kernel), "
+                f"got {prefill_backend!r}/{decode_backend!r}."
+            )
+        # CUDA graph capture is graph-safe only with the native triton decode
+        # (fused write kernel + native decode kernel, no host sync, verified by
+        # capture/replay tests). The flashinfer PLAIN decode materializes a
+        # full-layer BF16 temporary per step and stays validation-only.
+        if decode_backend == "flashinfer" and not cfg.disable_cuda_graph:
+            raise ValueError(
+                "--kv-cache-dtype=mxfp4 with the flashinfer PLAIN decode path "
+                "requires --disable-cuda-graph (it materializes a full-layer "
+                "BF16 temporary per decode step); use "
+                "--decode-attention-backend triton (native kernel, "
+                "graph-safe) to run with CUDA graphs."
+            )
+        return
 
     if get_platform().is_cuda:
         if cfg.kv_cache_dtype == "nvfp4" and not (
@@ -462,11 +493,12 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "Other prefill-only workloads may be supported in a future change once "
             "their attention paths stop reading or writing the paged KV cache."
         )
-    if cfg.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+    if cfg.kv_cache_dtype in ("nvfp4", "fp4_mx_block16", "mxfp4"):
         raise ValueError(
             "--prefill-only-disable-kv-cache does not currently support "
-            "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
-            "the FP4 pool uses a separate allocation path."
+            "--kv-cache-dtype=nvfp4, --kv-cache-dtype=fp4_mx_block16, or "
+            "--kv-cache-dtype=mxfp4 because the FP4 pool uses a separate "
+            "allocation path."
         )
     if cfg.kv_cache_dtype == "mxfp8":
         raise ValueError(

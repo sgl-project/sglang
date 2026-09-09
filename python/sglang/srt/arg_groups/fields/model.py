@@ -202,8 +202,10 @@ class Model:
                 '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
-                "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "selects the MX-style block-size-16 FP4 E2M1 KV cache recipe; "
+                '"mxfp4" selects strict OCP block-size-32 E2M1 + E8M0 storage '
+                "with a validation-only FlashInfer BF16 PLAIN path. FP4 recipes "
+                "require CUDA 12.8+ and PyTorch 2.8.0+"
             ),
             choices=[
                 "auto",
@@ -214,6 +216,7 @@ class Model:
                 "bfloat16",
                 "nvfp4",
                 "fp4_mx_block16",
+                "mxfp4",
                 "fp4_e2m1",
             ],
             resolvable=True,

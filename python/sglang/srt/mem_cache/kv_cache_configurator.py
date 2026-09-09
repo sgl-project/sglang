@@ -633,7 +633,7 @@ class KVCacheConfigurator:
                 "Supported configurations today: plain MHA models on CUDA with the FA "
                 "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
-                "and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
+                "and --kv-cache-dtype not in {nvfp4, fp4_mx_block16, mxfp4}."
             )
         return _InitializedPools(
             req_to_token_pool=req_to_token_pool,
@@ -979,7 +979,7 @@ class KVCacheConfigurator:
                 f"{unsupported_pool_family}. Supported configurations today: plain MHA "
                 "models on CUDA with the FA (fa3/fa4) prefill backend, --is-embedding, "
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
-                "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
+                "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16, mxfp4}."
             )
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:

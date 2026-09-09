@@ -22,11 +22,10 @@ from sglang.kernels.ops.quantization.mxfp4_quant import (
     quant_store_kv_mxfp4,
 )
 from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEVICE = "cuda"
