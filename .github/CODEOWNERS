@@ -47,10 +47,11 @@
 /python/sglang/srt/layers/quantization/quark @HaiShaw @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
+/python/sglang/srt/managers/hisparse_coordinator.py @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @ispobock @alphabetc1 @huangtingwei9988
 /python/sglang/srt/managers/scheduler_pp_mixin.py @ShangmingCai @XucSh
 /python/sglang/srt/managers/tokenizer_manager_score_mixin.py @sundar24295s @chanh @fortunecookiee
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077 @hzh0425 @ispobock @alphabetc1 @huangtingwei9988
-/python/sglang/srt/mem_cache/allocator @hnyls2002 @ispobock @alphabetc1
+/python/sglang/srt/mem_cache/allocator @hnyls2002 @ispobock @alphabetc1 @huangtingwei9988
 /python/sglang/srt/mem_cache/rust_tree_core @Jialin @ispobock @alphabetc1
 /python/sglang/srt/mem_cache/storage/mooncake_store @huangtingwei9988 @stmatengss
 /python/sglang/srt/mem_cache/embedding_*.py @liusy58
@@ -101,3 +102,9 @@
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator
 /tools/sglang-simulator @littlefatfat @hzh0425 @zhuzi-z @LinSiyuan814
+
+/python/sglang/srt/arg_groups/hisparse_hook.py @ispobock @alphabetc1 @huangtingwei9988
+/python/sglang/kernels/ops/kvcache/hisparse.py @DarkSharpness @HaiShaw @BBuf @celve @HydraQYH @yuan-luo @ispobock @alphabetc1 @huangtingwei9988
+/python/sglang/kernels/jit/csrc/kvcacheio/hisparse*.cuh @DarkSharpness @HaiShaw @BBuf @celve @HydraQYH @yuan-luo @ispobock @alphabetc1 @huangtingwei9988
+/test/**/*hisparse* @ispobock @alphabetc1 @huangtingwei9988
+/docs/docs/advanced_features/hisparse_guide.mdx @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323 @sogalin @ispobock @alphabetc1 @huangtingwei9988
