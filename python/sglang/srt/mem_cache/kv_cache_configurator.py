@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
+    is_swa_req_ring,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
@@ -336,6 +337,18 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
+        swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
+        alloc = pools.token_to_kv_pool_allocator
+        if not self.is_draft_worker and is_swa_req_ring(alloc):
+            # Per-request SWA ring: the sizer's swa token count describes the
+            # vestigial paged pool; the allocator knows the real ring total.
+            swa_max_total_num_tokens = alloc.size_swa
+            logger.info(
+                "SWA ring: swa_max_total_num_tokens "
+                f"{sizes.swa_max_total_num_tokens} -> {swa_max_total_num_tokens} "
+                "(fixed per-request SWA ring capacity)."
+            )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -345,7 +358,7 @@ class KVCacheConfigurator:
             max_total_num_tokens=sizes.max_total_num_tokens,
             max_running_requests=sizes.max_running_requests,
             full_max_total_num_tokens=sizes.full_max_total_num_tokens,
-            swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
             req_to_token_pool=pools.req_to_token_pool,
             token_to_kv_pool=pools.token_to_kv_pool,
             token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
@@ -1093,6 +1106,20 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        ple_kwargs = {}
+        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            ple_kwargs = dict(
+                short_conv_layer_ids=[
+                    i
+                    for i in self.mambaish_config.short_conv_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ],
+                short_conv_state_shape=self.mambaish_config.short_conv_state_shape,
+                ngram_context_len=self.mambaish_config.ngram_context_len,
+                ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
+            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -1104,6 +1131,7 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            **ple_kwargs,
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
             # case above: None => the pool skips SpeculativeState).
@@ -1233,7 +1261,7 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
-                max_running_requests=sizes.max_running_requests,
+                max_running_requests=req_to_token_pool.req_to_token.shape[0],
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -1348,6 +1376,12 @@ class KVCacheConfigurator:
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
         )
+        if not self.is_draft_worker and token_to_kv_pool._unified_kv:
+            # The draft pool has no C4 layers and shares this req pool, so only
+            # the target registers the per-slot C4 reset.
+            req_to_token_pool.register_on_alloc_rows(
+                token_to_kv_pool.clear_c4_req_states
+            )
         return token_to_kv_pool
 
     def _build_oot_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -1821,7 +1855,36 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
-        token_to_kv_pool = HybridLinearKVPool(
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_TOKENWISE,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
+
+        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if qsa_profile is None:
+            pool_class = HybridLinearKVPool
+            extra_args["use_mla"] = self.use_mla_backend
+        elif qsa_profile.variant == QSA_VARIANT_TOKENWISE:
+            pool_class = QwenDSATokenToKVPool
+            extra_args.update(
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_token_budget=qsa_profile.budget,
+            )
+        else:
+            pool_class = QSATokenToKVPool
+            extra_args.update(
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_compress_ratio=qsa_profile.compress_ratio,
+                qsa_token_topk=qsa_profile.budget,
+                num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            )
+        token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
@@ -1835,7 +1898,6 @@ class KVCacheConfigurator:
             mamba_pool=req_to_token_pool.mamba_pool,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
-            use_mla=self.use_mla_backend,
             start_layer=self.layer_info.start_layer,
             full_kv_pool_class=full_pool_class,
             quant_method=quant_method,
@@ -1979,6 +2041,7 @@ class KVCacheConfigurator:
                         device=self.device,
                         kvcache=token_to_kv_pool,
                         need_sort=need_sort,
+                        req_to_token_pool=req_to_token_pool,
                     )
                 else:
                     if get_memory().enable_hisparse:
@@ -2275,6 +2338,12 @@ class KVCacheConfigurator:
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
+        # calculate_pool_sizes_from_max_tokens takes a token count, not a byte
+        # budget; it cannot re-subtract the fixed pools, so capacity must not rise.
+        assert max_tokens <= config.max_total_num_tokens, (
+            f"token constraints must not raise capacity: {max_tokens} > "
+            f"{config.max_total_num_tokens}"
+        )
         if max_tokens != config.max_total_num_tokens:
             # Token-capped re-derivation: the profiled budget no longer
             # applies; the recalced config's unified_total_bytes stays None

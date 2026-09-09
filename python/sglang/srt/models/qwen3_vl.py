@@ -1029,6 +1029,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
 
+        attention_layout_key = (tuple(cu_seqlens.tolist()), None)
         cu_seqlens = cu_seqlens.to("cpu")
         return self.graph_runners.run(
             x=x,
@@ -1036,6 +1037,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             cu_seqlens=cu_seqlens,
             output_indices=None,
+            attention_layout_key=attention_layout_key,
         )
 
     def forward_with_cuda_graph(
@@ -1365,7 +1367,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 config.vision_config.deepstack_visual_indexes
             )
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+            # Only enable deepstack when the checkpoint declares deepstack
+            # capture layers (Qwen4-Exp ships an empty list).
+            self.use_deepstack = (
+                {Modality.IMAGE: True, Modality.VIDEO: True}
+                if self.num_deepstack_embeddings > 0
+                else {}
+            )
         else:
             self.deepstack_visual_indexes = []
             self.num_deepstack_embeddings = 0
