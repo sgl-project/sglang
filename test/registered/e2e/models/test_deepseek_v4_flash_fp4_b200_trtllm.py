@@ -199,7 +199,7 @@ class TestDSV4FlashFP4BreakableCudaGraphB200Trtllm(
                 DEEPEP_CONFIG,
                 "--chunked-prefill-size",
                 "4096",
-                "--piecewise-cuda-graph-max-tokens",
+                "--cuda-graph-max-bs-prefill",
                 "1024",
                 "--mem-fraction-static",
                 "0.80",
