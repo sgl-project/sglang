@@ -39,6 +39,7 @@ class TestDSAChoicesAndFields(unittest.TestCase):
         choices = self.actions["--dsa-prefill-backend"].choices
         self.assertIn("fa3", choices)
         self.assertIn("tilelang", choices)
+        self.assertIn("triton", choices)
         self.assertIn("flashinfer_sparse_mla", choices)
 
     def test_serverargs_has_dsa_fields(self):
@@ -78,6 +79,10 @@ class TestCLICanonicalFlags(unittest.TestCase):
     def test_dsa_decode_backend_canonical(self):
         args = self._parse(["--dsa-decode-backend", "tilelang"])
         self.assertEqual(args.dsa_decode_backend, "tilelang")
+
+    def test_dsa_prefill_backend_triton(self):
+        args = self._parse(["--dsa-prefill-backend", "triton"])
+        self.assertEqual(args.dsa_prefill_backend, "triton")
 
     def test_defaults_are_none_or_false(self):
         args = self._parse([])
