@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     attention_backends_of,
-    declare_direct_writes,
+    capture_foreign_writes,
     declare_resolution,
     model_config_of,
     resolved_view,
@@ -157,7 +157,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
         # TODO: move the per-algorithm validation below into spec module hooks.
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
-            declare_direct_writes(
+            capture_foreign_writes(
                 server_args,
                 "handle_speculative_decoding.custom_validate",
                 algo.validate_server_args,
@@ -177,7 +177,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         # A registered algorithm's callback lives outside this tree and sets
         # fields on the record, so the writes are captured around the call.
-        declare_direct_writes(
+        capture_foreign_writes(
             server_args,
             "handle_speculative_decoding.custom_algo",
             algo.handle_server_args,

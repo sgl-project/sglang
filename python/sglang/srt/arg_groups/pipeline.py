@@ -15,7 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
-    declare_direct_writes,
+    capture_foreign_writes,
     resolving_view,
     run_post_process_pass,
 )
@@ -214,7 +214,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # OOT platform plugins set fields directly (an interface this tree
     # does not own); the diff records what they applied.
-    declare_direct_writes(
+    capture_foreign_writes(
         server_args,
         f"platform:{current_platform.device_name}",
         current_platform.apply_server_args_defaults,

@@ -87,7 +87,7 @@ _DECLARERS = frozenset(
     {
         "declare_resolution",
         "declare_late_resolution",
-        "declare_direct_writes",
+        "capture_foreign_writes",
     }
 )
 

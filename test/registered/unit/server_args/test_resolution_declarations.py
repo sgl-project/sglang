@@ -738,7 +738,7 @@ class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
 
         The property is about the stash, so the seam is the stash: a list that
         snapshots on append. Every declaration path -- `declare_resolution`,
-        `declare_late_resolution`, `declare_direct_writes` and the passes --
+        `declare_late_resolution`, `capture_foreign_writes` and the passes --
         reaches it through `.append`, whatever it was imported as.
         """
         recorded = []

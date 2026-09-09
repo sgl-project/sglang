@@ -18,7 +18,7 @@ appended to the record's declaration stash (gate order, last writer wins).
 Nothing here writes back onto ``ServerArgs``: the record holds the user's raw
 input, and a decision is read through ``resolution_result`` or the published
 config bags — model code never mutates ``ServerArgs`` fields imperatively. The
-one channel that still leaves a field changed is ``declare_direct_writes``,
+one channel that still leaves a field changed is ``capture_foreign_writes``,
 which does not perform the write: it captures one an out-of-tree plugin already
 made, and undoing it would surprise the plugin's own reads.
 
@@ -201,10 +201,16 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
     declare_resolution(server_args, source, **fields)
 
 
-def declare_direct_writes(
+def capture_foreign_writes(
     server_args: Any, source: str, resolve: Callable[[Any], Any]
 ) -> Any:
     """Run a resolver that writes the fields directly, and declare what it moved.
+
+    Not a declaration channel -- the writer is not ours. Out-of-tree platform
+    plugins and registered speculative algorithms are handed the record and set
+    fields on it, an interface this tree does not own, so the write is observed
+    rather than requested. Every in-tree implementation declares properly and
+    this captures nothing for them.
 
     Returns whatever the resolver returned, so a provider with a return value
     can go through the same capture.

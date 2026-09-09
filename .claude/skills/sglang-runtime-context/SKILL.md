@@ -92,7 +92,11 @@ with what the operator typed, not with what resolution decided.**
   `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
   tokenizer/chat-template load. They are resolution, not mutation, and they
   **declare** via `arg_groups.overrides.declare_late_resolution(server_args,
-  source, **fields)`, which refuses the published instance. The declaration lands
+  source, **fields)` — a two-line delegator to `declare_resolution`, kept as a
+  separate name because the name is the only marker of *when* the declaration is
+  made and two guardrails scan for it (location cannot substitute: `lora_hook`
+  is late and sits inside `arg_groups/`, while the NPU default helper and the
+  expert-pack loader are not late and sit outside it). The declaration lands
   in the stash on that very object, so every holder of it carries the decision —
   the HTTP server, the multi-tokenizer workers it is serialized for, the
   schedulers it forks — and each of them publishes bags projected from it. The
@@ -408,9 +412,39 @@ derivation cannot enumerate.
 
 One consequence worth knowing: because the fields are the raw input, resolving a
 bare `dataclasses.replace` copy lands in the same place as the parent — the
-pipeline reads only its own input. `replace_resolved` is the way to copy a
-resolved record (it carries the declarations and the `model_config` memo, so the
-copy does not re-resolve at all).
+pipeline reads only its own input. **So a resolved record is not copied at
+all.** A caller that needs one field different for the process it is about to
+hand the record to — the Ray paths and their `dist_init_addr` — declares it on
+the record it holds (`declare_resolution`) and hands that over: the declaration
+travels inside the object, the receiving process projects its bags from it, and
+nothing re-resolves. There is no `ServerArgs.replace_resolved` any more, and the
+`model_config`-memo bug that copying used to cause (a copy marked resolved but
+arriving without the memo cannot refill it, because the guard refuses the write)
+is gone by construction rather than guarded.
+
+A bag `override` cannot stand in for this. It is *not* because overriding needs
+a publish — `set_server_args` is what projects the bags and `override` works as
+soon as the context holds a record — but because `override` writes bag leaves
+and by contract never touches the record, so its effect cannot travel inside an
+object to another process.
+
+### The declaration stash has one writer
+
+Everything that decides configuration goes through
+`declare_resolution(server_args, source, **fields)`. It validates the names,
+refuses the published config (the stash is projected at publish and never
+again, so a later declaration is a silent no-op), and appends. The other names
+around it are spellings, not mechanisms:
+
+| name | what it adds |
+|---|---|
+| `declare_late_resolution` | nothing but the name, which marks launcher-stage so the guardrails can scan for it |
+| `run_post_process_pass` | runs a pass at its slot and validates its return; declares through `declare_resolution`. A pass returning an **empty** dict is a validation, not a declaration, and stays legal on the published instance — `Engine(server_args=sa)` after `Engine.shutdown()` re-runs `check_server_args` on the very instance the context holds |
+| `capture_foreign_writes` | not a declaration channel: it hands the record to a writer this tree does not own (an out-of-tree platform plugin, a registered speculative algorithm), lifts the write seal for that call, and declares the diff. Every in-tree implementation declares properly, so it captures nothing for them |
+
+`resolution_projection` is gone; the whole-object readback is
+`ServerArgs.resolved_dict()`, which is what `/server_info` and its gRPC and
+in-process twins report.
 
 ### Adding a model-specific config adjustment
 
@@ -621,7 +655,7 @@ Never module-skip a test "until the migration settles" — seed the context inst
 Key source files: `python/sglang/srt/runtime_context.py` (the container, every tier,
 `publish`, `_ConfigBag`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
-`declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
+`declare_resolution` and the spellings around it), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
 `test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
 `test_global_config_read_ratchet.py`,

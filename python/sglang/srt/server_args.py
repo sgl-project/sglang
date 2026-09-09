@@ -271,7 +271,7 @@ class ServerArgs:
 
         # Sealed for the duration, not just afterwards: everything below this
         # line reads the input and declares against it, and the one channel
-        # that still writes the record (`declare_direct_writes`, for
+        # that still writes the record (`capture_foreign_writes`, for
         # out-of-tree platform plugins) asks for the seal to be lifted by name.
         self._input_frozen = True
         try:
@@ -637,7 +637,7 @@ def get_global_server_args() -> NoReturn:
 def record_writable(server_args: Any):
     """Lift the input seal for a resolver that genuinely writes the record.
 
-    There is exactly one: `declare_direct_writes`, which hands the record to an
+    There is exactly one: `capture_foreign_writes`, which hands the record to an
     out-of-tree platform plugin that sets fields on it. Those implementations
     live outside this tree and cannot be converted by editing a resolver here,
     so the write stays and is captured into the stash afterwards. Naming the

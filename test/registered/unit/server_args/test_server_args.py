@@ -2887,7 +2887,7 @@ class TestTheInputIsSealedDuringResolution(CustomTestCase):
             server_args.tp_size = 4
 
     def test_the_named_exception_lifts_it(self):
-        """`declare_direct_writes` hands the record to an out-of-tree platform
+        """`capture_foreign_writes` hands the record to an out-of-tree platform
         plugin that sets fields on it; that is the only channel."""
         from sglang.srt.server_args import record_writable
 
