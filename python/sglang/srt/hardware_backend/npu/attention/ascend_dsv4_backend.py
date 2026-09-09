@@ -29,6 +29,12 @@ from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+    low_ratio_compress_triton,
+)
+from sglang.kernels.ops.attention.dsv4.low_ratio_compress_decode import (
+    low_ratio_compress_decode,
+)
 from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
     last_token_per_request,
 )
@@ -2573,6 +2579,28 @@ class DeepseekV4AscendAttnBackend(
             group_pos = pos
             pooled = kv
         else:
+            use_triton = (
+                os.environ.get("SGLANG_COMPRESSOR_PREFILL_USE_TRITON", "0") == "1"
+            )
+            if use_triton:
+                print(f"[prefill] 111111111111111111")
+                pooled, compacted_out_loc, compacted_group_pos = (
+                    low_ratio_compress_triton(
+                        kv,
+                        score,
+                        pos,
+                        req,
+                        out_loc,
+                        pool.c2_pair_kv_state[layer.layer_id],
+                        pool.c2_pair_score_state[layer.layer_id],
+                    )
+                )
+                if pooled.shape[0] == 0:
+                    return
+                self._low_ratio_write_group(
+                    layer, pooled, compacted_out_loc, compacted_group_pos
+                )
+                return
             odd = pos % 2 == 1
             is_pad = forward_batch.out_cache_loc == 0
             req_safe = torch.where(
@@ -2657,6 +2685,48 @@ class DeepseekV4AscendAttnBackend(
         ratio = layer.compress_ratio
         kv, score = layer.compressor.project(x)
         out_loc_raw = forward_batch.out_cache_loc.to(torch.int64)
+
+        use_triton = (
+            os.environ.get("SGLANG_COMPRESSOR_DECODE_USE_TRITON", "0") == "1"
+        )
+        if use_triton:
+            if ratio == 1:
+                out_loc = out_loc_raw
+                raw_out_loc = None
+                pair_kv_state = None
+                pair_score_state = None
+                pad_row = 0
+            else:
+                completes = pos % 2 == 1
+                out_loc = torch.where(
+                    completes,
+                    out_loc_raw // 2,
+                    torch.full_like(out_loc_raw, -1),
+                )
+                raw_out_loc = forward_batch.out_cache_loc
+                pair_kv_state = pool.c2_pair_kv_state[layer.layer_id]
+                pair_score_state = pool.c2_pair_score_state[layer.layer_id]
+                pad_row = pool.c2_pair_pad_row
+            print(f"[decode] 111111111111111111")
+            latent, group_pos, slots = low_ratio_compress_decode(
+                kv,
+                score,
+                req,
+                pos,
+                out_loc,
+                layer.compressor.norm.weight,
+                layer.compressor.norm.eps,
+                ratio=ratio,
+                raw_out_loc=raw_out_loc,
+                pair_kv_state=pair_kv_state,
+                pair_score_state=pair_score_state,
+                pad_row=pad_row,
+            )
+            self._low_ratio_write_group(
+                layer, latent, slots, group_pos
+            )
+            return
+
         if ratio == 1:
             pooled, group_pos = kv, pos
             out_loc = out_loc_raw
