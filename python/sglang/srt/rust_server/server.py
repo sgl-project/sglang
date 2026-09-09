@@ -87,13 +87,22 @@ class RustServer:
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         listen_port = get_serving().port + (dp_rank or 0)
-        public_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
-        renderer_sidecar = cls.initialize_renderer(scheduler, public_addr)
+        public_addr = NetworkAddress(get_serving().host, listen_port)
+        renderer_sidecar = None
+        if envs.SGLANG_RUST_RENDERER.get():
+            from sglang.srt.managers.rust_renderer import RustRendererSidecar
+
+            renderer_sidecar = RustRendererSidecar(
+                resolving_view(server_args),
+                scheduler.model_config,
+                public_addr,
+                compute_num_reserved_tokens(),
+            )
 
         if renderer_sidecar is None:
             rust_server_args = _build_server_args(scheduler)
             port_offset = dp_rank
-            listen_addr = public_addr
+            listen_addr = public_addr.to_host_port_str()
         else:
             internal_addr = renderer_sidecar.internal_server_addr
             rust_server_args = _build_server_args(
@@ -183,22 +192,6 @@ class RustServer:
             server,
             mm_spec=mm_spec,
             renderer_sidecar=renderer_sidecar,
-        )
-
-    @staticmethod
-    def initialize_renderer(
-        scheduler: Scheduler, public_addr: str
-    ) -> Optional[RustRendererSidecar]:
-        if not envs.SGLANG_RUST_RENDERER.get():
-            return None
-
-        from sglang.srt.managers.rust_renderer import RustRendererSidecar
-
-        return RustRendererSidecar(
-            resolving_view(scheduler.server_args),
-            scheduler.model_config,
-            public_addr,
-            compute_num_reserved_tokens(),
         )
 
     def wait_request(self, timeout_ms: int) -> None:

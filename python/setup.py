@@ -139,14 +139,16 @@ def _discovered_rust_extensions():
     ):
         sglang_meta = (package["metadata"] or {}).get("sglang", {})
         if "python-bin" in sglang_meta:
-            extensions.append(
-                RustBin(
-                    target=sglang_meta["python-bin"],
-                    path=package["manifest_path"],
-                    debug=sglang_meta.get("debug"),
-                    features=sglang_meta.get("features"),
-                )
+            binary = RustBin(
+                target=sglang_meta["python-bin"],
+                path=package["manifest_path"],
+                debug=sglang_meta.get("debug"),
+                features=sglang_meta.get("features"),
+                cargo_manifest_args=["--locked"],
             )
+            binary._sglang_metadata = sglang_meta
+            binary._sglang_manifest_path = package["manifest_path"]
+            extensions.append(binary)
         if "python-module" not in sglang_meta:
             continue
         extension = RustExtension(

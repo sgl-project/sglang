@@ -161,11 +161,11 @@ class RustRendererSidecar:
         self,
         server_args,
         model_config,
-        public_addr: str,
+        public_addr: NetworkAddress,
         num_reserved_tokens: int,
     ):
         validate_embedded_renderer(server_args, model_config)
-        self.public_addr = NetworkAddress.parse(public_addr)
+        self.public_addr = public_addr
         self.internal_server_addr = NetworkAddress("127.0.0.1", get_free_port())
         self.args = build_renderer_args(
             server_args=server_args,

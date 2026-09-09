@@ -72,11 +72,67 @@ def flag_values(args):
 
 
 class TestRustRendererSidecar(unittest.TestCase):
-    def test_disabled_renderer_does_not_initialize_sidecar(self):
-        with envs.SGLANG_RUST_RENDERER.override(False):
-            self.assertIsNone(
-                RustServer.initialize_renderer(mock.Mock(), "0.0.0.0:30000")
-            )
+    def test_launch_preserves_public_dp_address_and_uses_internal_engine_address(self):
+        scheduler = SimpleNamespace(
+            server_args=server_args(),
+            model_config=model_config(),
+            ps=SimpleNamespace(dp_size=2, attn_dp_rank=1),
+        )
+        for enabled in (False, True):
+            with (
+                self.subTest(renderer=enabled),
+                envs.SGLANG_RUST_RENDERER.override(enabled),
+                mock.patch(
+                    "sglang.srt.rust_server.server.get_serving",
+                    return_value=SimpleNamespace(host="0.0.0.0", port=30000),
+                ),
+                mock.patch(
+                    "sglang.srt.rust_server.server.resolving_view",
+                    return_value=scheduler.server_args,
+                ),
+                mock.patch(
+                    "sglang.srt.rust_server.server.compute_num_reserved_tokens",
+                    return_value=32,
+                ),
+                mock.patch(
+                    "sglang.srt.rust_server.server._partition_cores",
+                    return_value=(None, None),
+                ),
+                mock.patch("sglang.srt.rust_server.server._build_server_args") as build,
+                mock.patch(
+                    "sglang.srt.rust_extensions.load_rust_extension"
+                ) as extension,
+                mock.patch(
+                    "sglang.srt.managers.rust_renderer.RustRendererSidecar"
+                ) as sidecar,
+            ):
+                sidecar.return_value.internal_server_addr = NetworkAddress(
+                    "127.0.0.1", 31000
+                )
+                server = RustServer.launch(scheduler)
+                if enabled:
+                    sidecar.assert_called_once_with(
+                        scheduler.server_args,
+                        scheduler.model_config,
+                        NetworkAddress("0.0.0.0", 30001),
+                        32,
+                    )
+                    build.assert_called_once_with(
+                        scheduler, host="127.0.0.1", port=31000
+                    )
+                    sidecar.return_value.start.assert_called_once_with(None)
+                else:
+                    sidecar.assert_not_called()
+                    build.assert_called_once_with(scheduler)
+                extension.return_value.Server.assert_called_once_with(
+                    build.return_value,
+                    cores=None,
+                    port_offset=None if enabled else 1,
+                )
+                server.close()
+                extension.return_value.Server.return_value.shutdown.assert_called_once()
+                if enabled:
+                    sidecar.return_value.stop.assert_called_once()
 
     def test_sidecar_owns_topology_and_process_lifecycle(self):
         process = mock.Mock(pid=123, exitcode=0)
@@ -106,7 +162,7 @@ class TestRustRendererSidecar(unittest.TestCase):
             sidecar = RustRendererSidecar(
                 server_args(),
                 model_config(),
-                "0.0.0.0:30000",
+                NetworkAddress("0.0.0.0", 30000),
                 32,
             )
             sidecar.start([2, 3])
@@ -196,7 +252,7 @@ class TestRustRendererSidecar(unittest.TestCase):
             mock.patch("sglang.srt.managers.rust_renderer.time.sleep"),
         ):
             sidecar = RustRendererSidecar(
-                server_args(), model_config(), "0.0.0.0:30000", 32
+                server_args(), model_config(), NetworkAddress("0.0.0.0", 30000), 32
             )
             sidecar.process = mock.Mock()
             sidecar.process.is_alive.return_value = True
