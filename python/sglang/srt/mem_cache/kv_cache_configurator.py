@@ -1521,17 +1521,14 @@ class KVCacheConfigurator:
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-        architectures = getattr(self.model_config.hf_config, "architectures", ()) or ()
-        primary_arch = architectures[0] if architectures else None
         is_arch35 = is_npu_arch35()
-        is_glm_compact_rollout = (
+        use_compact_indexer_layout = (
             is_dsa_model
-            and primary_arch == "GlmMoeDsaForCausalLM"
             and is_arch35
             and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
         )
         indexer_layer_ids = None
-        if is_glm_compact_rollout:
+        if use_compact_indexer_layout:
             indexer_layer_ids = tuple(
                 layer_id
                 for layer_id in range(
