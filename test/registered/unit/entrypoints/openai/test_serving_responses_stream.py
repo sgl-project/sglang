@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 from utils import (
     StreamFixture,
@@ -16,7 +16,6 @@ from utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     RequestResponseMetadata,
     ResponsesRequest,
-    ResponsesResponse,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -104,6 +103,17 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         seqs = [p["sequence_number"] for p in event_payloads(events)]
         self.assertEqual(seqs, list(range(len(seqs))))
 
+        for payload in event_payloads(events):
+            if payload["type"] in (
+                "response.output_item.added",
+                "response.output_item.done",
+            ):
+                self.assertEqual(payload["item"]["phase"], "final_answer")
+        self.assertEqual(
+            find_completed_event(events)["response"]["output"][0]["phase"],
+            "final_answer",
+        )
+
     def test_truncated_and_aborted_streams_have_matching_terminal_events(self):
         serving = make_serving()
         for finish_reason, status in (
@@ -139,55 +149,6 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                     [p["sequence_number"] for p in event_payloads(events)],
                     list(range(len(events))),
                 )
-
-    def test_harmony_truncation_uses_incomplete_terminal_event(self):
-        serving = make_serving()
-        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
-        final = ResponsesResponse.from_request(
-            request, {}, "x", 123, [], "incomplete", None
-        )
-        serving.responses_full_generator = AsyncMock(return_value=final)
-
-        async def empty():
-            if False:
-                yield
-
-        events = asyncio.run(
-            collect_stream_events(
-                serving.responses_stream_generator(
-                    request,
-                    {},
-                    empty(),
-                    Mock(),
-                    "x",
-                    Mock(),
-                    RequestResponseMetadata(request_id=request.request_id),
-                    require_reasoning=False,
-                )
-            )
-        )
-        self.assertEqual(event_types(events)[-1], "response.incomplete")
-        self.assertEqual(
-            event_payloads(events)[-1]["response"]["incomplete_details"],
-            {"reason": "max_output_tokens"},
-        )
-
-    def test_text_only_stream_emits_final_phase(self):
-        serving = make_serving()
-        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
-        events = StreamFixture(serving, request).run(
-            [engine_chunk("answer", finish=True)]
-        )
-        for payload in event_payloads(events):
-            if payload["type"] in (
-                "response.output_item.added",
-                "response.output_item.done",
-            ):
-                self.assertEqual(payload["item"]["phase"], "final_answer")
-        self.assertEqual(
-            find_completed_event(events)["response"]["output"][0]["phase"],
-            "final_answer",
-        )
 
     def test_required_tool_choice_emits_function_call_events(self):
         serving = make_serving()
@@ -439,6 +400,10 @@ class HarmonyStreamLifecycleTestCase(CustomTestCase):
         )
         payloads = event_payloads(events)
         self.assertEqual(payloads[-1]["type"], "response.incomplete")
+        self.assertEqual(
+            payloads[-1]["response"]["incomplete_details"],
+            {"reason": "max_output_tokens"},
+        )
         output = payloads[-1]["response"]["output"]
         self.assertEqual(output[0]["arguments"], '{"city":')
         self.assertEqual(output[0]["status"], "incomplete")
