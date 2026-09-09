@@ -1325,6 +1325,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 TransferTier.L1_TO_L2_WRIT,
                 "host_alloc_failed",
             )
+        else:
+            self._account_transfer_outcome(
+                self._write_outcome_stats,
+                TransferTier.L1_TO_L2_WRIT,
+                "issued",
+            )
         return host_indices
 
     def _track_write_through_node(
@@ -1513,6 +1519,10 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
+
+        self._account_transfer_outcome(
+            self._load_outcome_stats, TransferTier.L2_TO_L1_LOAD, "issued"
+        )
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
         self._apply_cache_actions(
@@ -2346,7 +2356,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         result="revoke",
                         reason="insufficient_hit",
                         rid=req_id,
-                        tokens=operation.storage_hit_count,
+                        tokens=len(operation.token_ids),
                         extra=f"storage_hit_count={operation.storage_hit_count}, prefetch_threshold={self.prefetch_threshold}",
                     )
                     self._account_prefetch_outcome(operation, revoked=True)
@@ -2407,18 +2417,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         operation.completed_tokens
                     )
                 # L2->L3 outcome: write_storage_failed is set by the backup IO
-                # thread on a page-set failure or exception; otherwise acked.
-                if operation.write_storage_failed:
+                if not operation.write_storage_failed:
                     self._account_transfer_outcome(
                         self._write_outcome_stats,
                         TransferTier.L2_TO_L3_WRIT,
-                        "write_failed",
-                    )
-                    self._account_transfer_outcome(
-                        self._write_outcome_stats,
-                        TransferTier.L2_TO_L3_WRIT,
-                        "l3_write_failed_tokens",
-                        len(operation.token_ids),
+                        "completed",
                     )
 
             return drained
@@ -2667,6 +2670,11 @@ class UnifiedRadixCache(BasePrefixCache):
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
+                self._account_transfer_outcome(
+                    self._write_outcome_stats,
+                    TransferTier.L1_TO_L2_WRIT,
+                    "completed",
+                )
             self._log_write_ack_metrics(ack)
             finish_count -= 1
 
@@ -2722,6 +2730,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node, host_lock_params)
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
                 self.tree_core.finish_load_back(node)
+                self._account_transfer_outcome(
+                    self._load_outcome_stats, TransferTier.L2_TO_L1_LOAD, "completed"
+                )
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():

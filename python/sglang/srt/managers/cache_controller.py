@@ -1280,24 +1280,6 @@ class HiCacheController:
                 prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
-    def _safe_page_backup(self, operation) -> None:
-        # _page_backup runs L2->L3 I/O and may raise (storage backend error,
-        # a bad batch). The backup loop must not die on one failing op -- a
-        # dead thread would silently stall every future L2->L3 backup, so
-        # swallow, log, and let the loop ack and continue.
-        try:
-            self._page_backup(operation)
-        except Exception as e:
-            operation.write_storage_failed = True
-            log_hicache_event(
-                event="backup",
-                tier="l2_to_l3",
-                result="failed",
-                reason="error",
-                tokens=len(operation.token_ids),
-                extra=f"op_id={operation.id} {e!r}",
-            )
-
     def backup_thread_func(self):
         """
         Manage backup operations from host memory to storage backend.
@@ -1309,7 +1291,7 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._safe_page_backup(operation)
+                    self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
