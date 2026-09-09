@@ -52,8 +52,8 @@ enum MatchedStopWire {
 #[derive(Debug, PartialEq, Serialize)]
 struct CompletionLogprobsWire {
     tokens: Vec<String>,
-    token_logprobs: Vec<Option<f32>>,
-    top_logprobs: Vec<Option<BTreeMap<String, f32>>>,
+    token_logprobs: Vec<Option<f64>>,
+    top_logprobs: Vec<Option<BTreeMap<String, f64>>>,
     text_offset: Vec<i32>,
 }
 
@@ -387,7 +387,8 @@ fn append_logprobs(result: &mut CompletionLogprobsWire, positions: &[crate::Posi
                 .clone()
                 .unwrap_or_else(|| format!("token_id:{}", selected.token_id)),
         );
-        result.token_logprobs.push(selected.logprob);
+        // Python exposes the engine's f32 values as double-precision JSON numbers.
+        result.token_logprobs.push(selected.logprob.map(f64::from));
         result.text_offset.push(-1);
         if position.top.is_empty() {
             result.top_logprobs.push(None);
@@ -403,7 +404,7 @@ fn append_logprobs(result: &mut CompletionLogprobsWire, positions: &[crate::Posi
                     .text
                     .clone()
                     .unwrap_or_else(|| format!("token_id:{}", candidate.token_id)),
-                logprob,
+                f64::from(logprob),
             );
         }
         result.top_logprobs.push(Some(top));
@@ -417,6 +418,38 @@ mod tests {
     use crate::openai::test_utils::{chunk, submitted};
     use crate::{PositionLogprobs, ResponseError, TokenLogprob};
     use futures::StreamExt;
+
+    #[test]
+    fn serialized_logprobs_preserve_python_float_values() {
+        let selected = -1.586831_f32;
+        let alternative = -2.7182817_f32;
+        let extras = GenerationOutputExtras {
+            output_logprobs: vec![PositionLogprobs {
+                token: TokenLogprob {
+                    logprob: Some(selected),
+                    token_id: 7,
+                    text: Some("x".into()),
+                },
+                top: vec![TokenLogprob {
+                    logprob: Some(alternative),
+                    token_id: 8,
+                    text: Some("y".into()),
+                }],
+            }],
+            ..Default::default()
+        };
+        // Exercise the wire serializer: to_value widens f32 before encoding it.
+        let json = serde_json::to_string(&completion_logprobs(Some(&extras), false)).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            wire["token_logprobs"][0].as_f64(),
+            Some(f64::from(selected))
+        );
+        assert_eq!(
+            wire["top_logprobs"][0]["y"].as_f64(),
+            Some(f64::from(alternative))
+        );
+    }
 
     #[test]
     fn zero_top_logprobs_keeps_selected_token_and_empty_top_map() {
