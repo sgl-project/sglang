@@ -321,6 +321,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
 
 constexpr uint32_t kNumPersistentClusters = SGL_TOPK_V2_MAX_C8_OCC2;
 constexpr uint32_t kMaxCluster16BatchSize = SGL_TOPK_V2_MAX_C16_OCC1;
+static_assert(kNumPersistentClusters > 0 && kMaxCluster16BatchSize > 0);
 constexpr uint32_t kClusterMaxBatch = 512;
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 
@@ -638,8 +639,7 @@ struct TopKKernel {
           static const bool once = [] {
             RuntimeDeviceCheck(
                 ::cudaFuncSetAttribute(
-                    reinterpret_cast<const void*>(
-                        topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>),
+                    reinterpret_cast<const void*>(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>),
                     ::cudaFuncAttributeNonPortableClusterSizeAllowed,
                     1));
             return true;
