@@ -259,6 +259,17 @@ class TestCudaDeviceMixin(CustomTestCase):
         self.assertTrue(base.support_cuda_graph())
         self.assertTrue(base.support_piecewise_cuda_graph())
 
+    @patch(
+        "sglang.srt.layers.quantization.fp8_utils.cutlass_fp8_supported",
+        return_value=False,
+    )
+    def test_cuda_supports_fp8_follows_cutlass_on_ampere_86(self, _cutlass_fp8):
+        # RTX 3050 / sm86: cutlass_fp8_supported() is False; supports_fp8 must
+        # not stay hard-coded True (pre-fix main advertised FP8 TC it lacks).
+        base = CudaSRTPlatform()
+        self.assertFalse(base.supports_fp8())
+        self.assertTrue(base.support_cuda_graph())
+
 
 class TestXpuDeviceMixin(CustomTestCase):
     """Tests for XPU device operation defaults."""
