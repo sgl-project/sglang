@@ -460,6 +460,7 @@ def build_kv_cache(
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
+        hicache_serialize_load_back=get_memory().hicache_serialize_load_back,
         pp_rank=parallel.pp_rank,
         pp_size=parallel.pp_size,
         attn_cp_rank=parallel.attn_cp_rank,
