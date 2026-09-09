@@ -542,9 +542,12 @@ def forward_dsa_core_npu(
         topk_indices=topk_indices,
     )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
-    attn_output = attn_output.contiguous()
 
-    if m._npu_is_arch35:
+    if m._npu_is_arch35 or (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_draft_extend_v2()
+        and not forward_batch.forward_mode.is_target_verify()
+    ):
         attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
@@ -558,6 +561,7 @@ def forward_dsa_core_npu(
             dtype=attn_output.dtype,
             device=attn_output.device,
         )
+        attn_output = attn_output.contiguous()
         torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
