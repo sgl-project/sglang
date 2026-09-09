@@ -366,11 +366,12 @@ impl PDRouter {
         Ok((prefill_request, decode_request))
     }
 
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
+    async fn execute_dual_dispatch<T: Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
         context: PDRequestContext<'_>,
+        original_json: Option<&Value>,
     ) -> Response {
         let start_time = Instant::now();
 
@@ -387,9 +388,15 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
+        // Preserve the forwarding payload across retries; each attempt adds its own bootstrap fields.
+        let json_request = match original_json {
+            Some(value) => value.clone(),
+            None => match serde_json::to_value(original_request) {
+                Ok(value) => value,
+                Err(e) => return Self::handle_serialization_error(e),
+            },
+        };
+        let shared_request = Arc::new(json_request);
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
@@ -419,10 +426,7 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+                        let mut json_request = shared_request.as_ref().clone();
                         // ResponsesRequest serializes an absent stream as null, which SRT rejects.
                         if context.route == "/v1/responses" {
                             json_request["stream"] = Value::Bool(context.is_stream);
@@ -1592,7 +1596,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
     }
 
     async fn route_chat(
@@ -1600,6 +1605,17 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+    ) -> Response {
+        self.route_chat_with_json(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_chat_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        original_json: Option<&Value>,
     ) -> Response {
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
@@ -1623,7 +1639,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, original_json)
+            .await
     }
 
     async fn route_completion(
@@ -1631,6 +1648,17 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+    ) -> Response {
+        self.route_completion_with_json(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_completion_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        original_json: Option<&Value>,
     ) -> Response {
         let is_stream = body.stream;
         let return_logprob = body.logprobs.is_some();
@@ -1657,7 +1685,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, original_json)
+            .await
     }
 
     async fn route_responses(
@@ -1727,7 +1756,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
     }
 
     async fn route_embeddings(
@@ -1789,6 +1819,77 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[tokio::test]
+    async fn forwards_original_json_to_both_workers() {
+        use std::sync::Mutex;
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = received.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    let valid = body["top_p"].as_f64().unwrap() >= 0.95;
+                    captured.lock().unwrap().push(body);
+                    (
+                        if valid {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        },
+                        axum::Json(json!({"choices": []})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let router = create_test_pd_router();
+        for worker_type in [
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            WorkerType::Decode,
+        ] {
+            router
+                .worker_registry
+                .register(Arc::from(create_test_worker(
+                    if matches!(worker_type, WorkerType::Decode) {
+                        url.replace("127.0.0.1", "localhost")
+                    } else {
+                        url.clone()
+                    },
+                    worker_type,
+                    true,
+                )));
+        }
+        for (top_p, expected) in [(0.95, StatusCode::OK), (0.9, StatusCode::BAD_REQUEST)] {
+            let original = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_p": top_p,
+                "custom_extension": 0.123456789012345
+            });
+            let typed: ChatCompletionRequest = serde_json::from_value(original.clone()).unwrap();
+            let response = router
+                .route_chat_with_json(None, &typed, None, Some(&original))
+                .await;
+            assert_eq!(response.status(), expected);
+        }
+        let bodies = received.lock().unwrap();
+        assert!(
+            bodies.len() >= 3,
+            "both workers must receive the valid request"
+        );
+        for body in bodies.iter() {
+            assert!([0.95, 0.9].contains(&body["top_p"].as_f64().unwrap()));
+            assert_eq!(body["custom_extension"], json!(0.123456789012345));
+            assert!(body.get("bootstrap_room").is_some());
+        }
+        server.abort();
     }
 
     #[test]

@@ -530,40 +530,16 @@ impl RouterTrait for RouterManager {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // In IGW mode, resolve model_id and fail fast if not resolvable
-        // In non-IGW mode, pass through to router (router handles validation)
-        let effective_model_id = if self.enable_igw {
-            // Use provided model_id or fall back to body.model
-            let model = model_id.or(Some(&body.model));
-            match self.resolve_model_id(model) {
-                Ok(id) => Some(id),
-                Err(err_response) => return *err_response,
-            }
-        } else {
-            None
-        };
-
-        let router =
-            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
-
-        if let Some(router) = router {
-            router
-                .route_chat(headers, body, effective_model_id.as_deref().or(model_id))
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
-        }
+        self.route_chat_with_json(headers, body, model_id, None)
+            .await
     }
 
-    async fn route_completion(
+    async fn route_chat_with_json(
         &self,
         headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
+        body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        original_json: Option<&Value>,
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
@@ -583,7 +559,63 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router
-                .route_completion(headers, body, effective_model_id.as_deref().or(model_id))
+                .route_chat_with_json(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    original_json,
+                )
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_completion_with_json(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_completion_with_json(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        original_json: Option<&Value>,
+    ) -> Response {
+        // In IGW mode, resolve model_id and fail fast if not resolvable
+        // In non-IGW mode, pass through to router (router handles validation)
+        let effective_model_id = if self.enable_igw {
+            // Use provided model_id or fall back to body.model
+            let model = model_id.or(Some(&body.model));
+            match self.resolve_model_id(model) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let router =
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_completion_with_json(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    original_json,
+                )
                 .await
         } else {
             (
