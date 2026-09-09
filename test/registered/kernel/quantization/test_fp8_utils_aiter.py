@@ -21,7 +21,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=5, stage="jit-kernel-unit", runner_config="amd")
 
 
 @unittest.skipUnless(is_hip(), "requires ROCm AITER")
