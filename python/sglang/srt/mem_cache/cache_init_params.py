@@ -47,6 +47,8 @@ class CacheInitParams:
     enable_mamba_extra_buffer_lazy: bool = False
     request_mamba_only: bool = False
 
+    hicache_serialize_load_back: bool = False
+
     pp_rank: int = 0
     pp_size: int = 1
     # Rounds the PP loop lets a rank run ahead of the next (its pp_loop_size is
