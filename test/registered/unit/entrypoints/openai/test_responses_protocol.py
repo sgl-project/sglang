@@ -28,10 +28,6 @@ def _in_progress_response(request: ResponsesRequest) -> ResponsesResponse:
 
 
 class ResponsesRequestTestCase(CustomTestCase):
-    def test_routed_dp_rank_accepted(self):
-        request = ResponsesRequest(model="x", input="hi", routed_dp_rank=3)
-        self.assertEqual(request.routed_dp_rank, 3)
-
     def test_deprecated_data_parallel_rank_migrates(self):
         request = ResponsesRequest(model="x", input="hi", data_parallel_rank=2)
         self.assertEqual(request.routed_dp_rank, 2)

@@ -268,4 +268,6 @@ class OpenAIServingBase(ABC):
         """
         if raw_request is None:
             return body_routed_dp_rank
-        return extract_routed_dp_rank(raw_request.headers, body_routed_dp_rank)
+        return extract_routed_dp_rank(
+            headers=raw_request.headers, body_routed_dp_rank=body_routed_dp_rank
+        )
