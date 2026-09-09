@@ -9,13 +9,12 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-from msgspec.structs import replace
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.observability.fpm_timing import wrap_forward_with_fpm
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -341,6 +340,9 @@ class SchedulerMetricsReporter:
                 self.forward_pass_device_timer = DeviceTimer()
             self.scheduler._fpm_uses_device_timer = True
             self.scheduler.enable_fpm = True
+            self.scheduler.run_batch = wrap_forward_with_fpm(
+                self.scheduler.run_batch, self.forward_pass_device_timer
+            )
             logger.info(
                 "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s)",
                 endpoint,
@@ -1139,16 +1141,7 @@ class SchedulerMetricsReporter:
         )
         publisher = self.scheduler._fpm_publisher
         if self.scheduler._fpm_uses_device_timer:
-            # Frozen scalar stats only; never retain a mutable batch/request.
-            def publish(elapsed):
-                if elapsed is None:
-                    logger.warning(
-                        "FPM timing spans multiple CUDA streams; skipping ambiguous span"
-                    )
-                    return
-                publisher.publish(replace(fpm, wall_time=elapsed))
-
-            timing.when_ready(publish)
+            timing.publish_when_ready(fpm, publisher)
         else:
             publisher.publish(fpm)
 
