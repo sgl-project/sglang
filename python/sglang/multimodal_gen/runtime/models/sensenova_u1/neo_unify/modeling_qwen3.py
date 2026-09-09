@@ -1,6 +1,7 @@
 # Modified for SGLang; see this directory's README.md for upstream source.
 
 import copy
+from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
@@ -28,6 +29,11 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
+
+from sglang.kernels.ops.attention.neo_unify import (
+    build_image_token_end,
+    neo_unify_attention,
+)
 
 from .transformers_compat import (
     causal_mask_kwargs,
@@ -167,6 +173,20 @@ def _flash_or_sdpa(
     return _sdpa_attn_func(
         q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal
     )
+
+
+@dataclass(frozen=True)
+class NeoUnifyAttentionMask:
+    image_token_end: Optional[torch.Tensor]
+    backend: str
+
+
+def create_neo_attention_mask(index: torch.Tensor, backend: str = "auto"):
+    # Preserve the existing non-CUDA path and allow an exact legacy baseline.
+    if backend == "legacy" or (backend == "auto" and index.device.type != "cuda"):
+        return create_block_causal_mask(index)
+    ends = build_image_token_end(index)
+    return NeoUnifyAttentionMask(ends if ends.any().item() else None, backend)
 
 
 def create_block_causal_mask(index: torch.Tensor):
@@ -570,6 +590,20 @@ class Qwen3Attention(nn.Module):
                     )  # concat on seq_len
                     value_states = torch.cat([past_v, value_states], dim=2)
 
+        if isinstance(attention_mask, NeoUnifyAttentionMask):
+            if self.training:
+                raise RuntimeError("NEO optimized attention is inference-only")
+            attn_output = neo_unify_attention(
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                image_token_end=attention_mask.image_token_end,
+                causal=True,
+                softmax_scale=self.scaling,
+                backend=attention_mask.backend,
+            ).reshape(*input_shape, -1)
+            return self.o_proj(attn_output), None
+
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[
@@ -799,14 +833,29 @@ class Qwen3Attention(nn.Module):
             assert k.shape[2] == v.shape[2], (k.shape, v.shape)
             assert q.shape[3] == k.shape[3] == v.shape[3], (q.shape, k.shape, v.shape)
 
-            attn_output = _flash_or_sdpa(
-                q,
-                k,
-                v,
-                dropout_p=0.0 if not self.training else self.attention_dropout,
-                softmax_scale=self.scaling,
-                causal=False,
-            )  # [B, S_q, H_q, D]
+            neo_backend = getattr(self.config, "neo_denoise_backend", "auto")
+            if (
+                self.training
+                or neo_backend == "legacy"
+                or (neo_backend == "auto" and q.device.type != "cuda")
+            ):
+                attn_output = _flash_or_sdpa(
+                    q,
+                    k,
+                    v,
+                    dropout_p=0.0 if not self.training else self.attention_dropout,
+                    softmax_scale=self.scaling,
+                    causal=False,
+                )
+            else:
+                attn_output = neo_unify_attention(
+                    q,
+                    k,
+                    v,
+                    causal=False,
+                    softmax_scale=self.scaling,
+                    backend=neo_backend,
+                )
 
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = self.o_proj_mot_gen(attn_output)

@@ -511,6 +511,17 @@ def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
         config.validate_server_args(SimpleNamespace(**args))
 
 
+def test_sensenova_u1_accepts_neo_attention_options():
+    options = {"neo_prefill_backend": "triton", "neo_denoise_backend": "legacy"}
+    args = SimpleNamespace(
+        num_gpus=1,
+        attention_backend_config=options.copy(),
+        is_arg_explicitly_set=lambda name: name == "attention_backend_config",
+    )
+    SenseNovaU1PipelineConfig().validate_server_args(args)
+    assert args.attention_backend_config == options
+
+
 def test_sensenova_u1_rejects_direct_server_args_quantization():
     config = SenseNovaU1PipelineConfig()
 
