@@ -131,7 +131,9 @@ class LiLiCorrDraftSampler:
         # candidate_out). Sized by max_bs like every other buffer here, and allocated
         # unconditionally at ~90 KiB total so the greedy and sampled paths differ only
         # in whether they are consumed, not in the object graph.
-        self.temperatures = torch.ones((self.max_bs,), dtype=torch.float32, device=device)
+        self.temperatures = torch.ones(
+            (self.max_bs,), dtype=torch.float32, device=device
+        )
         self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
         self.uniforms = torch.empty(
             (self.max_bs, self.slots), dtype=torch.float32, device=device
