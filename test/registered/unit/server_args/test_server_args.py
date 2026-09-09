@@ -2,6 +2,8 @@ import argparse
 import dataclasses
 import json
 import os
+import pickle
+import shutil
 import socket
 import tempfile
 import unittest
@@ -47,7 +49,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
-    handle_legacy_cp_arguments,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
@@ -93,8 +94,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=11, suite="base-c-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="stage-b-test-cpu-intel")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch(
@@ -104,6 +105,23 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_ple_embedding_offload_rejects_generic_weight_offload(self):
+        for generic_offload in (
+            {"cpu_offload_gb": 1},
+            {"offload_group_size": 1},
+        ):
+            with (
+                self.subTest(generic_offload=generic_offload),
+                self.assertRaisesRegex(
+                    ValueError, "ple-offload-embedding cannot be combined"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    ple_offload_embedding=True,
+                    **generic_offload,
+                ).resolve_once()
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",
@@ -236,12 +254,19 @@ class TestPrepareServerArgs(CustomTestCase):
             resolution_result(inherited, "speculative_draft_model_quantization"),
             "modelopt_fp4",
         )
+        # The provenance bit, not the public field: `from_server_args` reads
+        # `cfg._speculative_draft_quantization_explicitly_set` to tell an
+        # inherited draft quantization from one the operator asked for, and
+        # resolution decided the value without consuming that evidence.
         self.assertFalse(
             resolution_result(
                 inherited, "_speculative_draft_quantization_explicitly_set"
             )
         )
 
+        # And across the hop that matters: the scheduler and the draft worker
+        # rebuild the record from its fields and resolve again, so the bit has
+        # to survive `asdict` and come back the same the second time.
         reconstructed = ServerArgs(**dataclasses.asdict(inherited))
         handle_missing_default_values(reconstructed)
 
@@ -1023,19 +1048,16 @@ class TestContextParallelServerArgs(CustomTestCase):
     def _new_cp_args(self, **overrides):
         server_args = object.__new__(ServerArgs)
         defaults = dict(
-            enable_prefill_context_parallel=False,
-            enable_dsa_prefill_context_parallel=False,
             enable_prefill_cp=False,
             cp_strategy=None,
             model_path="instance://127.0.0.1:8000/dummy",
-            dsa_prefill_cp_mode="round-robin-split",
-            prefill_cp_mode="in-seq-split",
             attn_cp_size=1,
             tp_size=1,
             dp_size=1,
             moe_dp_size=1,
             ep_size=1,
             pp_size=1,
+            dcp_size=1,
             enable_aiter_allreduce_fusion=False,
         )
         defaults.update(overrides)
@@ -1056,53 +1078,34 @@ class TestContextParallelServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "--cp-strategy"):
             handle_context_parallelism(server_args)
 
-    def test_deprecated_dsa_cp_mode_maps_to_unified_strategy(self):
-        args = self.parser.parse_args(
-            [
-                "--model",
-                "dummy",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
-            ]
-        )
+    @override_platform(is_hip=False, is_npu=False)
+    def test_deepseek_v32_prefill_cp_rejects_zigzag(self):
         server_args = self._new_cp_args(
-            enable_dsa_prefill_context_parallel=(
-                resolution_result(args, "enable_dsa_prefill_context_parallel")
-            ),
-            dsa_prefill_cp_mode=resolution_result(args, "dsa_prefill_cp_mode"),
-        )
-
-        handle_legacy_cp_arguments(server_args)
-
-        self.assertTrue(resolution_result(server_args, "enable_prefill_cp"))
-        self.assertEqual(resolution_result(server_args, "cp_strategy"), "interleave")
-        self.assertEqual(
-            resolution_result(server_args, "dsa_prefill_cp_mode"), "round-robin-split"
-        )
-
-    def test_canonical_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
-        server_args = self._new_cp_args(
+            model_path="deepseek-ai/DeepSeek-V3.2",
             enable_prefill_cp=True,
-            cp_strategy="interleave",
-            attention_backend="dsa",
+            cp_strategy="zigzag",
+        )
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
+            is_multimodal=False,
         )
 
-        handle_legacy_cp_arguments(server_args)
-        handle_context_parallelism(server_args)
+        with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
+            handle_context_parallelism(server_args)
 
-        self.assertTrue(
-            resolution_result(server_args, "enable_dsa_prefill_context_parallel")
+    def test_generic_v1_cp_options_are_not_public_cli(self):
+        removed_options = (
+            ("--enable-prefill-context-parallel", []),
+            ("--enable-nsa-prefill-context-parallel", []),
+            ("--nsa-prefill-cp-mode", ["round-robin-split"]),
+            ("--enable-dsa-prefill-context-parallel", []),
+            ("--dsa-prefill-cp-mode", ["round-robin-split"]),
+            ("--prefill-cp-mode", ["in-seq-split"]),
         )
-        self.assertFalse(
-            resolution_result(server_args, "enable_prefill_context_parallel")
-        )
-        self.assertEqual(
-            resolution_result(server_args, "dsa_prefill_cp_mode"), "round-robin-split"
-        )
-        self.assertEqual(
-            resolution_result(server_args, "prefill_cp_mode"), "round-robin-split"
-        )
+
+        for option, values in removed_options:
+            with self.subTest(option=option), self.assertRaises(SystemExit):
+                self.parser.parse_args(["--model", "dummy", option, *values])
 
     def test_context_parallel_handler_initializes_cp_strategy(self):
         server_args = self._new_cp_args(
@@ -1116,97 +1119,6 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
-
-    def test_registered_cp_legacy_args_map_to_unified_strategy(self):
-        cases = [
-            (
-                "deepseek_v3_mla_cp",
-                dict(enable_prefill_context_parallel=True),
-                "zigzag",
-                "in-seq-split",
-                False,
-                True,
-            ),
-            (
-                "qwen3_gqa_cp",
-                dict(
-                    enable_prefill_context_parallel=True,
-                    tp_size=4,
-                    attn_cp_size=2,
-                ),
-                "zigzag",
-                "in-seq-split",
-                False,
-                True,
-            ),
-            (
-                "deepseek_v32_dsa_in_seq_split",
-                dict(
-                    enable_dsa_prefill_context_parallel=True,
-                    dsa_prefill_cp_mode="in-seq-split",
-                    tp_size=8,
-                    dp_size=2,
-                    attn_cp_size=4,
-                ),
-                "zigzag",
-                "in-seq-split",
-                True,
-                False,
-            ),
-            (
-                "deepseek_v32_dsa_round_robin_split",
-                dict(
-                    enable_dsa_prefill_context_parallel=True,
-                    tp_size=8,
-                    attn_cp_size=8,
-                ),
-                "interleave",
-                "round-robin-split",
-                True,
-                False,
-            ),
-            (
-                "deepseek_v4_flash_fp4_b200_dsa_round_robin_split",
-                dict(
-                    enable_dsa_prefill_context_parallel=True,
-                    dsa_prefill_cp_mode="round-robin-split",
-                    tp_size=4,
-                    attn_cp_size=4,
-                ),
-                "interleave",
-                "round-robin-split",
-                True,
-                False,
-            ),
-        ]
-
-        for name, overrides, strategy, mode, expect_dsa, expect_generic in cases:
-            with self.subTest(name=name):
-                server_args = self._new_cp_args(**overrides)
-
-                handle_legacy_cp_arguments(server_args)
-                handle_context_parallelism(server_args)
-
-                self.assertTrue(resolution_result(server_args, "enable_prefill_cp"))
-                self.assertEqual(
-                    resolution_result(server_args, "cp_strategy"), strategy
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "dsa_prefill_cp_mode"), mode
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "prefill_cp_mode"), mode
-                )
-                self.assertEqual(
-                    resolution_result(
-                        server_args, "enable_dsa_prefill_context_parallel"
-                    ),
-                    expect_dsa,
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "enable_prefill_context_parallel"),
-                    expect_generic,
-                )
 
 
 class TestPortArgs(unittest.TestCase):
@@ -1804,7 +1716,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
     def _validate_prefill_only_args(self, **overrides):
         sa = ServerArgs(**self._base_kwargs(**overrides))
-        handle_legacy_cp_arguments(sa)
         validate_prefill_only_disable_kv_cache_args(sa)
         return sa
 
@@ -1830,7 +1741,10 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
     def test_rejects_prefill_context_parallel(self):
         with self.assertRaisesRegex(ValueError, "--enable-prefill-cp"):
-            self._validate_prefill_only_args(enable_prefill_context_parallel=True)
+            self._validate_prefill_only_args(
+                enable_prefill_cp=True,
+                cp_strategy="zigzag",
+            )
 
     def test_rejects_hisparse(self):
         with self.assertRaisesRegex(ValueError, "--enable-hisparse"):
@@ -2931,6 +2845,210 @@ class TestDcpKvEventContract(CustomTestCase):
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
+
+
+class TestTheInputIsSealedDuringResolution(CustomTestCase):
+    """The record holds what the operator asked for, and resolution does not
+    write it -- enforced, not merely observed.
+
+    The guard used to arm only once resolution had *finished*, so for the whole
+    length of the pipeline nothing stopped a resolver from assigning a field.
+    Nothing in-tree did, but a resolver that started to would overwrite the
+    input the record exists to remember, and the defect is invisible: the value
+    it wrote is indistinguishable from a value the operator typed.
+    """
+
+    def test_a_write_before_resolution_is_fine(self):
+        """Callers assemble the record however they like."""
+        server_args = ServerArgs(model_path="/tmp/x")
+        server_args.tp_size = 2
+        self.assertEqual(server_args.tp_size, 2)
+
+    def test_a_write_during_resolution_is_refused(self):
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        # The seal is what the pipeline runs under; drive it directly rather
+        # than injecting a violation into a real handler.
+        object.__setattr__(server_args, "_input_frozen", True)
+        with self.assertRaisesRegex(AttributeError, "during resolution"):
+            server_args.tp_size = 4
+        # and the message says what to do instead
+        try:
+            server_args.tp_size = 4
+        except AttributeError as caught:
+            self.assertIn("declare_resolution", str(caught))
+
+    def test_the_seal_comes_off_when_resolution_ends(self):
+        """`_resolution_finished` takes over; the two messages are different
+        because the fix is different."""
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        server_args.resolve_once()
+        self.assertFalse(getattr(server_args, "_input_frozen", False))
+        with self.assertRaisesRegex(AttributeError, "after resolution"):
+            server_args.tp_size = 4
+
+    def test_the_named_exception_lifts_it(self):
+        """`declare_direct_writes` hands the record to an out-of-tree platform
+        plugin that sets fields on it; that is the only channel."""
+        from sglang.srt.server_args import record_writable
+
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        object.__setattr__(server_args, "_input_frozen", True)
+        with record_writable(server_args):
+            server_args.tp_size = 4
+        self.assertEqual(server_args.tp_size, 4)
+        # and it goes back on afterwards
+        with self.assertRaisesRegex(AttributeError, "during resolution"):
+            server_args.tp_size = 8
+
+    def test_a_failed_resolution_does_not_leave_it_sealed(self):
+        """A record that failed resolution is still the operator's input, and
+        `resolve_once` already refuses to re-run on it. Leaving the seal armed
+        would make the failure look like a different one to anyone inspecting
+        the record afterwards."""
+        server_args = ServerArgs(
+            model_path="dummy", device="cuda", prefill_decode_interval=-5
+        )
+        with self.assertRaisesRegex(ValueError, "prefill-decode-interval"):
+            server_args.resolve_once()
+        self.assertFalse(getattr(server_args, "_input_frozen", False))
+
+
+class TestLaunchCommand(CustomTestCase):
+    """The record answers what was asked for, not only what was decided.
+
+    `resolved_dict` and `launch_command` are different questions, and neither
+    recovers the other: a field the operator never set resolves to the same
+    value as one they set to what resolution would have picked anyway.
+    """
+
+    def test_the_launcher_records_what_it_parsed(self):
+        server_args = prepare_server_args(
+            ["--model-path", "/tmp/x", "--tp-size", "2", "--log-level", "warning"]
+        )
+        self.assertEqual(
+            server_args.launch_command,
+            "--model-path /tmp/x --tp-size 2 --log-level warning",
+        )
+
+    def test_a_record_nobody_launched_has_no_command(self):
+        self.assertIsNone(ServerArgs(model_path="/tmp/x").launch_command)
+
+    def test_it_crosses_a_process_boundary(self):
+        """The scheduler and detokenizer get the record by pickle, and they
+        answer `/server_info` for their own process."""
+        server_args = prepare_server_args(["--model-path", "/tmp/x"])
+        self.assertEqual(
+            pickle.loads(pickle.dumps(server_args)).launch_command,
+            server_args.launch_command,
+        )
+
+    def test_a_copy_keeps_it(self):
+        """`replace_resolved` is how the Ray paths rewrite `dist_init_addr`;
+        the copy was launched by whatever launched its parent."""
+        server_args = prepare_server_args(["--model-path", "/tmp/x"])
+        self.assertEqual(
+            server_args.replace_resolved("test").launch_command,
+            server_args.launch_command,
+        )
+
+    def test_it_is_not_a_config_field(self):
+        """It describes how the configuration was asked for, so it is not part
+        of the configuration: no CLI flag, no namespace, not in the bags."""
+        self.assertNotIn(
+            "launch_command", {f.name for f in dataclasses.fields(ServerArgs)}
+        )
+        self.assertNotIn(
+            "launch_command", ServerArgs(model_path="/tmp/x").resolved_dict()
+        )
+
+
+class TestNoneMeansUnset(CustomTestCase):
+    """A valued field the resolution rewrites carries `None` for "not set".
+
+    `mamba_full_memory_ratio` used to default to 0.9, so a model family asking
+    "did the operator leave this alone?" had to compare against the class
+    default -- which stops being true the moment anything declares the field
+    first, and says nothing at all if the operator happens to pass 0.9. `None`
+    answers both, and the generic value lands during resolution instead.
+    """
+
+    def _resolved(self, **kwargs):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda", **kwargs)
+        server_args.resolve_once()
+        return resolution_result(server_args, "mamba_full_memory_ratio")
+
+    def _checkpoint(self) -> str:
+        directory = tempfile.mkdtemp(prefix="none_means_unset_")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        with open(os.path.join(directory, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        return directory
+
+    def test_the_record_keeps_none_and_resolution_supplies_the_value(self):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda")
+        self.assertIsNone(server_args.mamba_full_memory_ratio)
+        server_args.resolve_once()
+        # The record still carries what the operator typed; the value is the
+        # resolution's.
+        self.assertIsNone(server_args.mamba_full_memory_ratio)
+        self.assertEqual(resolution_result(server_args, "mamba_full_memory_ratio"), 0.9)
+
+    def test_an_explicit_value_is_never_overwritten(self):
+        self.assertEqual(self._resolved(mamba_full_memory_ratio=0.5), 0.5)
+
+    def test_the_swa_ratio_behaves_the_same_way(self):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda")
+        self.assertIsNone(server_args.swa_full_tokens_ratio)
+        server_args.resolve_once()
+        self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.8)
+
+        explicit = ServerArgs(
+            model_path=self._checkpoint(), device="cuda", swa_full_tokens_ratio=0.3
+        )
+        explicit.resolve_once()
+        self.assertEqual(resolution_result(explicit, "swa_full_tokens_ratio"), 0.3)
+
+    def test_the_swa_ratio_is_still_range_checked(self):
+        """The check reads the resolved value, so `None` must be gone by then."""
+        with self.assertRaisesRegex(ValueError, "swa-full-tokens-ratio"):
+            ServerArgs(
+                model_path=self._checkpoint(),
+                device="cuda",
+                swa_full_tokens_ratio=0.0,
+            ).resolve_once()
+
+    def test_a_dummy_model_still_gets_the_generic_values(self):
+        """The dummy short circuit returns long before the normal fill slot.
+
+        The families it skips are exactly the ones that would have claimed
+        these fields, so the generic values have to land on the way out --
+        otherwise every bag on this path holds None where it used to hold a
+        ratio.
+        """
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        server_args.resolve_once()
+        self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.8)
+        self.assertEqual(resolution_result(server_args, "mamba_full_memory_ratio"), 0.9)
+
+    def test_an_explicit_value_equal_to_the_generic_one_still_reads_as_set(self):
+        """The case the class-default comparison could never see."""
+        server_args = ServerArgs(
+            model_path=self._checkpoint(), device="cuda", mamba_full_memory_ratio=0.9
+        )
+        self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
 if __name__ == "__main__":

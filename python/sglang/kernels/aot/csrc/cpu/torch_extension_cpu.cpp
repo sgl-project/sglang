@@ -657,6 +657,8 @@ std::string init_cpu_threads_env(const std::string& cpu_ids);
 // quant_to_nope_fp8_rope_bf16_pack
 std::tuple<at::Tensor, at::Tensor, at::Tensor> quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16);
 
+// murmur_hash32
+at::Tensor murmur_hash32_cpu(const at::Tensor& seed, const at::Tensor& positions, const at::Tensor& col_indices);
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
@@ -1154,6 +1156,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // murmur_hash32
+  m.def("murmur_hash32_cpu(Tensor seed, Tensor positions, Tensor col_indices) -> Tensor");
+  m.impl("murmur_hash32_cpu", torch::kCPU, &murmur_hash32_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(
