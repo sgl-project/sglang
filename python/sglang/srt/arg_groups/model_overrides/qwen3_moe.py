@@ -38,7 +38,6 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             overrides["quantization"] = quant_method
             quantization = quant_method
-
         if (
             (
                 quantization in ("fp8", "modelopt_fp4", "modelopt_mixed")
