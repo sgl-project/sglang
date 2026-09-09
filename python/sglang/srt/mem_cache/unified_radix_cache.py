@@ -1668,6 +1668,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
 
+    @property
+    def storage_prefetch_is_all_or_nothing(self) -> bool:
+        """Extra component pools (SWA / Mamba) make storage prefetches
+        all-or-nothing, so KV-only hit lengths over-promise."""
+        return any(ct is not BASE_COMPONENT_TYPE for ct in self.tree_components)
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,

@@ -263,13 +263,6 @@ def build_kv_cache(
                     "window attention (SWA) models requires the unified radix "
                     "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
                 )
-            if enable_hierarchical_cache:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models currently supports only "
-                    "device-resident cache and is incompatible with "
-                    "--enable-hierarchical-cache."
-                )
             if getattr(model_config, "is_deepseek_v4_arch", False):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache does not support "
@@ -281,10 +274,14 @@ def build_kv_cache(
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
         if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
-            )
+            # As with SWA: the unified tree tracks recurrent-state checkpoints
+            # at node boundaries, which legacy caches cannot.
+            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with Mamba/SSM "
+                    "models requires the unified radix tree (set "
+                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
+                )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
