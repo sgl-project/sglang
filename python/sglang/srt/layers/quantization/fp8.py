@@ -1502,9 +1502,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             new_weights = []
             new_scales = []
             for e in range(num_experts):
-                w, s = cast_e2m1fn_to_e4m3fn(
-                    weight_param.data[e], scale_param.data[e]
-                )
+                w, s = cast_e2m1fn_to_e4m3fn(weight_param.data[e], scale_param.data[e])
                 new_weights.append(w)
                 new_scales.append(s)
             weight_param.data = torch.stack(new_weights)
@@ -1653,11 +1651,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # ROCm AITER: bypass the native FP4 early return when DSV4 dequant is
         # requested, then use the standard block-FP8 MoE path.
-        if (
-            self.is_fp4_expert
-            and self.dequant_fp4_to_fp8
-            and _use_aiter
-        ):
+        if self.is_fp4_expert and self.dequant_fp4_to_fp8 and _use_aiter:
             self._dequantize_fp4_experts(layer)
             self.weight_block_size = [128, 128]
 
