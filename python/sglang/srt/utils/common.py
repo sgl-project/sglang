@@ -266,8 +266,10 @@ def _check_cuda_device_version(
 ):
     if not is_cuda():
         return False
+    # get_device_sm() answers from NVML while torch.cuda is uninitialized, so
+    # the platform probes evaluated at import time do not create a CUDA context.
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        get_device_sm() // 10 in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
@@ -572,6 +574,19 @@ def get_dispatch_device_backend():
 
 @lru_cache(maxsize=1)
 def get_device_module():
+    # torch.get_device_module() with no argument asks torch for the current
+    # accelerator, which initializes the CUDA runtime as a side effect. Several
+    # modules call this at import time, so every sglang process used to pay a
+    # CUDA runtime init on import and became unusable as a fork() parent.
+    # Resolve the device type from the platform checks instead.
+    if is_cuda() or is_hip():
+        return torch.cuda
+    if is_npu():
+        return torch.npu
+    if is_xpu():
+        return torch.xpu
+    if is_musa():
+        return torch.musa
     return torch.get_device_module()
 
 
@@ -620,8 +635,43 @@ def get_amdgpu_memory_capacity():
         )
 
 
+def _get_device_sm_via_nvml() -> Optional[int]:
+    """Compute capability of the first visible GPU from NVML, without going
+    through torch.cuda's lazy init (which creates a context and marks the
+    process as unsafe to fork)."""
+    try:
+        import pynvml
+    except ImportError:
+        return None
+    try:
+        idx = 0
+        getter = getattr(torch.cuda, "_get_nvml_device_index", None)
+        if getter is not None:
+            try:
+                idx = getter(0)
+            except Exception:
+                idx = 0
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        finally:
+            pynvml.nvmlShutdown()
+        return major * 10 + minor
+    except Exception:
+        return None
+
+
 def get_device_sm():
     if torch.cuda.is_available() or is_musa():
+        # Evaluated at import time (e.g. by the DeepGEMM configurer). Prefer
+        # NVML while torch.cuda is uninitialized so that importing sglang does
+        # not create a CUDA context in every process (launcher, detokenizer, DP
+        # controller) and does not poison fork()-based worker startup.
+        if not is_musa() and not torch.cuda.is_initialized():
+            sm = _get_device_sm_via_nvml()
+            if sm is not None:
+                return sm
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0

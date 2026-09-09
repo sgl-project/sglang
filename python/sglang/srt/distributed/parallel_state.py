@@ -107,7 +107,11 @@ def get_torch_distributed_pg_options(group_name=None):
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.get_device_module().Stream
+    # String annotation on purpose: evaluating torch.get_device_module() here
+    # runs at import time, initializes the CUDA runtime in every process that
+    # imports sglang (launcher, detokenizer, DP controller) and makes the
+    # process unusable as a fork() parent.
+    stream: "torch.Stream"
 
 
 @dataclass
