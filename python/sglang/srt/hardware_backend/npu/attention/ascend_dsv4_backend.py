@@ -438,7 +438,12 @@ class CompressorAscendBackendMixin:
                     n_compress = bundle_loc.numel()
                     if n_compress > 0:
                         compress_out_loc[:n_compress] = bundle_loc.to(torch.int32)
-                result[f"c{ratio}_loc"] = compress_out_loc
+                # ratio 1/2 loc is derived from out_cache_loc after this
+                # function returns; skip here so the fix-up logic in
+                # _build_npu_compress_metadata is not blocked by a non-None
+                # all-zeros tensor.
+                if ratio not in (1, 2):
+                    result[f"c{ratio}_loc"] = compress_out_loc
 
             # graph: keep shape aligned with the preallocated buffer; eager: clamp >=1 so kernels see a column
             if is_graph:
@@ -1533,8 +1538,21 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
+        raw_loc = ctx.forward_batch.out_cache_loc
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (1, 2, 4, 128):
+                continue
+            if ratio in (1, 2) and raw_loc is not None and raw_loc.numel() > 0:
+                # Derive c1/c2 loc from out_cache_loc: loc = full_loc // ratio
+                # for tokens that complete a group; matches the eager path.
+                pos = ctx.forward_batch.positions.to(torch.int64)
+                completes = (pos + 1) % ratio == 0
+                loc = torch.where(
+                    completes,
+                    raw_loc.to(torch.int64) // ratio,
+                    torch.zeros_like(raw_loc, dtype=torch.int64),
+                )
+                self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
                 continue
             loc = None
             if bundle is not None:
@@ -2859,6 +2877,7 @@ class DeepseekV4AscendAttnBackend(
                 publish.append(masks)
         fm.dsv41_low_ratio_topk_pages = page_indices
         fm.dsv41_low_ratio_topk_raw = raw_indices
+        setattr(fm, f"c{ratio}_topk_indices", raw_indices)
         if publish is not None:
             fm.dsv41_candidate_masks = (
                 torch.cat(publish) if len(publish) > 1 else publish[0]
