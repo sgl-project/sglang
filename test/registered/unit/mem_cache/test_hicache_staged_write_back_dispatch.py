@@ -1350,5 +1350,61 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual(captured["host_indices"].device.type, "cpu")
 
 
+class _IndexTensorStub:
+    """Stands in for an index tensor resident on ``device_type``.
+
+    xpu tensors can't be allocated on CPU CI, and on CUDA ``is_cuda`` equals
+    ``device.type != "cpu"``, so only a fake non-CUDA device separates them.
+    """
+
+    def __init__(self, device_type: str):
+        self.device = torch.device(device_type)
+        self.is_cuda = device_type == "cuda"
+        self.recorded = []
+
+    def record_stream(self, stream):
+        self.recorded.append(stream)
+
+
+def _record_stream_transfer(host_indices, device_indices) -> L2Transfer:
+    return L2Transfer(
+        host_pool=None,
+        device_pool=None,
+        host_indices=host_indices,
+        device_indices=device_indices,
+    )
+
+
+class TestL2TransferRecordStream(CustomTestCase):
+    """Index tensors on any accelerator must be kept alive across an L2 copy."""
+
+    def test_non_cuda_accelerator_indices_are_kept_alive(self):
+        host = _IndexTensorStub("cpu")
+        device = _IndexTensorStub("xpu")
+        stream = object()
+
+        L2TransferEngine._record_stream([_record_stream_transfer(host, device)], stream)
+
+        self.assertEqual(
+            device.recorded,
+            [stream],
+            "xpu index tensor was not pinned to the transfer stream; it can be "
+            "freed and reused while the copy is in flight",
+        )
+        self.assertEqual(
+            host.recorded, [], "record_stream is meaningless for a host tensor"
+        )
+
+    def test_cuda_indices_are_kept_alive(self):
+        host = _IndexTensorStub("cpu")
+        device = _IndexTensorStub("cuda")
+        stream = object()
+
+        L2TransferEngine._record_stream([_record_stream_transfer(host, device)], stream)
+
+        self.assertEqual(device.recorded, [stream])
+        self.assertEqual(host.recorded, [])
+
+
 if __name__ == "__main__":
     unittest.main()

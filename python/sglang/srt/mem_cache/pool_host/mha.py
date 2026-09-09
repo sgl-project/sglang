@@ -33,14 +33,29 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
 )
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    require_kvcacheio_ops,
+    transfer_kv_all_layer,
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_lf_pf,
+    transfer_kv_all_layer_lf_ph,
+    transfer_kv_all_layer_mla_lf_pf,
+    transfer_kv_direct,
+    transfer_kv_per_layer,
+    transfer_kv_per_layer_direct_pf_lf,
+    transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+    transfer_kv_per_layer_pf_lf,
+    transfer_kv_per_layer_ph_lf,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
     host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
+    get_alloc_memory_func,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -53,21 +68,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer,
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
-    )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
@@ -140,6 +140,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
         pool_label: str = "kv",
     ):
+        require_kvcacheio_ops(
+            pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+        )
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
         super().__init__(
@@ -256,7 +259,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -308,6 +311,26 @@ class MHATokenToKVPoolHost(HostKVCache):
     @property
     def v_buffer(self):
         return self.kv_buffer[1]
+
+    # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+    # checked at construction; keep in step with their branches.
+    _kvcacheio_ops = {
+        "kernel": {
+            "layer_first": ("transfer_kv_per_layer", "transfer_kv_all_layer"),
+            "page_first": (
+                "transfer_kv_per_layer_pf_lf",
+                "transfer_kv_all_layer_lf_pf",
+            ),
+            "page_head": ("transfer_kv_per_layer_ph_lf", "transfer_kv_all_layer_lf_ph"),
+        },
+        "direct": {
+            "layer_first": ("transfer_kv_direct",),
+            "page_first_direct": (
+                "transfer_kv_per_layer_direct_pf_lf",
+                "transfer_kv_all_layer_direct_lf_pf",
+            ),
+        },
+    }
 
     def load_to_device_per_layer(
         self,
@@ -824,6 +847,9 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         allocator_type: str = "default",
     ):
         self._destroyed = False
+        require_kvcacheio_ops(
+            pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+        )
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -916,7 +942,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         self.k_buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -932,6 +958,26 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
 
     def get_hybrid_pool_buffer(self):
         return [self.k_buffer]
+
+    # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+    # checked at construction; keep in step with their branches.
+    # layer_first backs up one layer at a time.
+    _kvcacheio_ops = {
+        "kernel": {
+            "layer_first": ("transfer_kv_per_layer_mla",),
+            "page_first": (
+                "transfer_kv_per_layer_mla_pf_lf",
+                "transfer_kv_all_layer_mla_lf_pf",
+            ),
+        },
+        "direct": {
+            "layer_first": ("transfer_kv_direct",),
+            "page_first_direct": (
+                "transfer_kv_per_layer_direct_pf_lf",
+                "transfer_kv_all_layer_direct_lf_pf",
+            ),
+        },
+    }
 
     def load_to_device_per_layer(
         self,
@@ -1273,7 +1319,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         # shared stride is a bug. Such callers will fail loudly with
         # AttributeError rather than silently use the K stride for V copies.
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_memory_func(self.device_pool.device)
         k_buffer = alloc_func(
             k_dims,
             dtype=self.dtype,
@@ -1310,6 +1356,23 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             "interface used by HiCache L3 storage backends {hf3fs, eic, nixl}. "
             "Use a backend that does not use this interface (e.g. mooncake, simm)."
         )
+
+    # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+    # checked at construction; keep in step with their branches.
+    _kvcacheio_ops = {
+        "kernel": {
+            "page_first": (
+                "transfer_kv_per_layer_mla_pf_lf",
+                "transfer_kv_all_layer_mla_lf_pf",
+            ),
+        },
+        "direct": {
+            "page_first_direct": (
+                "transfer_kv_per_layer_direct_pf_lf",
+                "transfer_kv_all_layer_direct_lf_pf",
+            ),
+        },
+    }
 
     def load_to_device_per_layer(
         self,
