@@ -271,22 +271,30 @@ class SchedulerWeightUpdaterManager:
                 )
                 base_tensors, lora_tensors = _split_lora_named_tensors(weights)
                 if base_tensors and not self._session.sync_base:
-                    raise ValueError("base tensors arrived in a sync_base=False weight-update session")
+                    raise ValueError(
+                        "base tensors arrived in a sync_base=False weight-update session"
+                    )
                 self._stash_lora_tensors(lora_tensors)
             except Exception as e:
                 success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
             else:
                 success, message = True, "Succeeded to update parameter online."
-                for _, runner in self._select_runners(recv_req.selector) if base_tensors else []:
+                for _, runner in (
+                    self._select_runners(recv_req.selector) if base_tensors else []
+                ):
                     success, message = (
-                        runner.weight_updater.load_weights_from_distributed(base_tensors)
+                        runner.weight_updater.load_weights_from_distributed(
+                            base_tensors
+                        )
                     )
                     if not success:
                         break
             if success:
                 if base_tensors:
-                    self._session = msgspec.structs.replace(self._session, loaded_weights=True)
+                    self._session = msgspec.structs.replace(
+                        self._session, loaded_weights=True
+                    )
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
             return UpdateWeightsFromDistributedReqOutput(
@@ -320,7 +328,7 @@ class SchedulerWeightUpdaterManager:
             else:
                 base_tensors, lora_tensors = _split_lora_named_tensors(named_tensors)
                 named_tensors = base_tensors
-            self._stash_lora_tensors(lora_tensors)
+            self._stash_lora_tensors(lora_tensors, copy_tensors=True)
             success, message = True, "Success"
             if base_tensors:
                 assert self._session.sync_base, (
@@ -334,7 +342,9 @@ class SchedulerWeightUpdaterManager:
                     if not success:
                         break
                 if success:
-                    self._session = msgspec.structs.replace(self._session, loaded_weights=True)
+                    self._session = msgspec.structs.replace(
+                        self._session, loaded_weights=True
+                    )
             if success:
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
@@ -398,7 +408,9 @@ class SchedulerWeightUpdaterManager:
                 runner.weight_updater.begin_weight_update()
         self._lora_stash = {}
         self._weight_update_pending_version = None
-        self._session = _WeightUpdateSession(selector=recv_req.selector, sync_base=recv_req.sync_base)
+        self._session = _WeightUpdateSession(
+            selector=recv_req.selector, sync_base=recv_req.sync_base
+        )
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
@@ -411,10 +423,16 @@ class SchedulerWeightUpdaterManager:
             )
         if self._session.sync_base:
             for _, runner in self._select_runners(self._session.selector):
-                runner.weight_updater.end_weight_update(run_post_load=not self._session.loaded_weights)
-        success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
+                runner.weight_updater.end_weight_update(
+                    run_post_load=not self._session.loaded_weights
+                )
+        if recv_req.abort:
+            self._lora_stash = {}
+            success, message = True, "Aborted: streamed adapters discarded"
+        else:
+            success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
         self._session = None
-        if success:
+        if success and not recv_req.abort:
             self.record_weight_version_after_update(self._weight_update_pending_version)
         self._weight_update_pending_version = None
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -425,7 +443,8 @@ class SchedulerWeightUpdaterManager:
         is a new adapter identity and may stream a different tensor set."""
         self._lora_applied_names.pop(lora_name, None)
 
-    def _stash_lora_tensors(self, lora_tensors) -> None:
+    def _stash_lora_tensors(self, lora_tensors, *, copy_tensors: bool = False) -> None:
+        copied_devices = set()
         for prefixed_name, tensor in lora_tensors:
             lora_name, hf_key = prefixed_name.split(":", 1)
             if isinstance(tensor, LocalSerializedTensor):
@@ -433,7 +452,14 @@ class SchedulerWeightUpdaterManager:
             assert isinstance(tensor, torch.Tensor), (
                 f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
             )
+            if copy_tensors:
+                # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
+                tensor = tensor.clone()
+                if tensor.is_cuda:
+                    copied_devices.add(tensor.device)
             self._lora_stash.setdefault(lora_name, {})[hf_key] = tensor
+        for device in copied_devices:
+            torch.cuda.current_stream(device).synchronize()
 
     def _apply_lora_stash(
         self, expected_checksums: Optional[Dict[str, Dict[str, str]]]
