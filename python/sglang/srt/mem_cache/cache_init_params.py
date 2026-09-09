@@ -42,6 +42,7 @@ class CacheInitParams:
         default_factory=KvEventLoraNames
     )
     enable_session_radix_cache: bool = False
+    allow_subagent_keepalive: bool = False
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
