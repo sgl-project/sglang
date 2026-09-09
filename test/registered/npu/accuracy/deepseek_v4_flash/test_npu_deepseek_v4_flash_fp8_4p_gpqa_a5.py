@@ -31,7 +31,7 @@ DEEPSEEK_V4_FLASH_FP8_4P_ENVS = {
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "16",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
-    "DEEPEP_HYBRID_DEPLOYMENT": "1",
+    # "DEEPEP_HYBRID_DEPLOYMENT": "1",
     # dsv4
     "IS_DEEPSEEK_V4": "1",
     "USE_FUSED_HC_PRE_ASCENDC": "1",
@@ -126,8 +126,7 @@ class TestNPUDeepSeekV4FlashFP84PGPQA(TestNpuAccuracyTestCaseBase):
     model = DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_FP8_4P_ENVS
-    # TODO: Fill in the exact accuracy threshold after baseline testing
-    accuracy = 0.80
+    accuracy = 0.874
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_FP8_4P_GENERATION_CONFIG_MAX
