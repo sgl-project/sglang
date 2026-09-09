@@ -16,6 +16,8 @@ _TRITON_KERNELS = [
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),
     ("multi_layer_eagle", "rotate_input_ids"),
+    ("ngram_embedding_triton", "update_token_table"),
+    ("ngram_embedding_triton", "compute_n_gram_ids"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
     ("spec_tree", "verify_tree_greedy_kernel_triton"),
     ("topk1", "draft_topk1_postprocess"),
