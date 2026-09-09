@@ -3,11 +3,15 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -188,7 +192,12 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
     def test_sufficient_capacity_preserves_all_prefixes(self):
         allocator, cache = self.build_cache()
-        evict_from_tree_cache(cache, 3)
+        with patch.object(
+            allocator,
+            "prepare_token_allocation",
+            side_effect=AssertionError("unexpected recovery"),
+        ):
+            evict_from_tree_cache(cache, 3)
         self.assertEqual(cache.full_evictable_size(), 96)
         self.assertIsNotNone(allocator.alloc(3))
 
@@ -225,6 +234,26 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertFalse(
             allocator.check_decode_capacity(num_tokens=2, tree_cache=cache)
         )
+
+    def test_locked_cache_cannot_satisfy_joint_shortfall(self):
+        allocator, cache = self.build_cache()
+        node_ids = [
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", [i * 1000])))
+            ).last_device_node
+            for i in range(96)
+        ]
+        locks = [(node_id, cache.inc_lock_ref(node_id)) for node_id in node_ids]
+        try:
+            self.assertEqual(cache.full_evictable_size(), 0)
+            evict_from_tree_cache(cache, 4)
+            self.assertFalse(allocator.token_allocation_ready(4))
+            self.assertEqual(allocator.available_size(), 3)
+            self.assertFalse(allocator.verify_byte_accounting())
+        finally:
+            for node_id, lock in locks:
+                cache.dec_lock_ref(node_id, lock.to_dec_params())
+        self.assertEqual(cache.full_evictable_size(), 96)
 
     def test_explicit_eviction_keeps_count_semantics(self):
         allocator, cache = self.build_cache()
