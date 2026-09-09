@@ -432,13 +432,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
-            if is_npu_arch35():
-                architectures = (
-                    getattr(kvc.model_config.hf_config, "architectures", ()) or ()
-                )
-                # Match the compact-layout rollout in the NPU pool factory.
-                if not architectures or architectures[0] != "GlmMoeDsaForCausalLM":
-                    allocate_all_layers = True
+            if not is_npu_arch35():
+                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
