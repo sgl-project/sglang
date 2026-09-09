@@ -1218,6 +1218,8 @@ class EmbeddingReqInput:
             if self.sampling_params is None:
                 self.sampling_params = {}
             self.sampling_params["max_new_tokens"] = 0
+            if self.embed_overrides is not None:
+                self.embed_overrides = self.embed_overrides[0]
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
