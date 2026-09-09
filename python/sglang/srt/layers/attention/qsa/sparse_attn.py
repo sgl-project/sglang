@@ -243,6 +243,13 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[:, None],
             other=0.0,
         )
+        # The chunk-prefill K/V tensors are gathered from the KV pool and can
+        # therefore carry the FP8 storage dtype, which Triton's dot rejects
+        # (`Unsupported rhs dtype fp8e4nv`). Convert to Q's dtype; the QSA
+        # backend writes the pool without per-tensor k/v scales, so this is a
+        # plain cast (no-op for BF16 pools).
+        keys = keys.to(q_values.dtype)
+        values = values.to(q_values.dtype)
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         alpha = tl.math.exp2(max_value - next_max)
