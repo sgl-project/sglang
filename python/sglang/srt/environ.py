@@ -1213,6 +1213,7 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+
     # ===================================================================
     # Deterministic inference and all-reduce
     # ===================================================================
