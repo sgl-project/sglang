@@ -454,7 +454,7 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} --random-range-ratio 1.0 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --flush-cache`,
+  --warmup-requests 64 --flush-cache`,
     // num_prompts = 5 × concurrency (measured floor 16).
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
   },
@@ -1013,8 +1013,7 @@ export const config = {
     {
       match: { hw: "b300", pdMode: "unified", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       // No --enable-symm-mem: it makes the fused all-reduce auto-probe skip.
       flags: [
@@ -1031,8 +1030,7 @@ export const config = {
     {
       match: { hw: "b300", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1185,7 +1183,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--host {{HOST_IP}}",
@@ -1212,7 +1210,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--host {{HOST_IP}}",
@@ -1961,7 +1959,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--disaggregation-mode decode",
@@ -1989,7 +1987,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--disaggregation-mode decode",
@@ -2381,7 +2379,7 @@ export const config = {
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.78",
         "--chunked-prefill-size 16384",
-        "--cuda-graph-bs 2 4 8 16",
+        "--cuda-graph-bs-decode 2 4 8 16",
         "--max-running-requests 64",
         "--max-mamba-cache-size 64",
         "--moe-a2a-backend deepep",

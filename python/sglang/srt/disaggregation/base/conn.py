@@ -18,6 +18,9 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    # DSA kpool-compress tail: one per-request ring row. The indices encode
+    # only the live subrange of that row for the current open pool.
+    DSA_TAIL = "dsa_tail"
     MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
@@ -71,6 +74,8 @@ class KVArgs:
     page_size: int
     # for system dp
     system_dp_rank: int
+    # Local Rust /route registry port; None on scheduler ranks without a listener.
+    rust_http_port: Optional[int]
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
@@ -87,7 +92,9 @@ class KVArgs:
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
-    total_kv_layers: int
+    hidden_kv_layers: int
+    # Only used of npu, for decode total kv layers
+    draft_kv_layers: int
     num_draft_entries: int = 0
 
 

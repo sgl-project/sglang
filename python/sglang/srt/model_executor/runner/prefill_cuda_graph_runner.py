@@ -58,13 +58,16 @@ from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
 from sglang.srt.layers.cp.bcg import (
-    enable_cp_v2_bcg_capture as should_enable_cp_v2_bcg_capture,
+    enable_cp_bcg_capture as should_enable_cp_bcg_capture,
 )
 from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import (
+    is_cp_active,
+    is_mla_cp_enabled,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -72,7 +75,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -124,6 +126,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_memory,
     get_parallel,
     get_schedule,
@@ -361,8 +364,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
-        # storage; same physical tensors, stable data_ptr for capture vs
-        # replay. Replaces populate_from_forward_batch on capture/replay paths.
+        # storage; same physical tensors, stable data_ptr for capture vs replay.
         self.buffer_registry: CudaGraphBufferRegistry = build_prefill_registry(
             device=self.device,
             max_bs=self.max_bs,
@@ -379,9 +381,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or self.prefill_backend_name == Backend.FULL
             ),
             require_gathered_buffer=require_gathered_buffer(),
-            enable_prefill_cp=(
-                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
-            ),
+            enable_prefill_cp=(is_dsa_enable_prefill_cp() or is_mla_cp_enabled()),
+            attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             source=self.buffers,
         )
 
@@ -413,7 +414,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._is_full_backend = False
         # Same ordering requirement: capture_prepare reads this.
         self._capture_lora = False
-        self.enable_cp_v2_bcg_capture = False
+        self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
@@ -511,10 +512,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 }
 
         server_args = model_runner.server_args
-        self.enable_cp_v2_bcg_capture = isinstance(
+        self.enable_cp_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_v2_bcg_capture(server_args)
-        if self.enable_cp_v2_bcg_capture:
+        ) and should_enable_cp_bcg_capture(server_args)
+        if self.enable_cp_bcg_capture:
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
@@ -580,7 +581,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
 
     def _is_mamba_track_enabled(self) -> bool:
-        return self.model_runner.server_args.enable_mamba_extra_buffer() and (
+        return get_exec().mamba.enable_mamba_extra_buffer and (
             not get_memory().disable_radix_cache
         )
 
@@ -646,10 +647,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         buf = self.buffer_registry.get_slot("num_token_non_padded").buffer
         buf.fill_(num_tokens)
-        if require_gathered_buffer():
+        # Localize the count when this bucket is attn-TP sharded (SP on).
+        if self.model_runner.attn_tp_sequence_sharded(num_tokens):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buf,
                 num_tokens_per_dp=num_tokens,
+                sharded=True,
             )
             buf.copy_(local)
         return buf
@@ -842,9 +845,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
-        # MegaMoE is exempt (prefill_graph_tolerates_sum_len): its idle ranks
-        # still execute MegaMoE with 0 tokens, so per-rank SUM_LEN buckets stay
-        # collective-safe and need no eager fallback.
+        # MegaMoE graphs without a captured DP gather tolerate per-rank buckets
+        # and an eager idle rank; graphs with one fall through to the check.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
@@ -852,13 +854,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         return len(global_num_tokens) > 1 and any(
             int(num_tokens) == 0 for num_tokens in global_num_tokens
-        )
-
-    @staticmethod
-    def _has_prefix_hit(forward_batch: ForwardBatch) -> bool:
-        prefix_lens = forward_batch.extend_prefix_lens_cpu
-        return prefix_lens is not None and any(
-            int(length) > 0 for length in prefix_lens
         )
 
     @staticmethod
@@ -896,32 +891,39 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         prefix_chunk_len = max(requested_capacity // capture_req_slots, 1)
         return prefix_chunk_len, prefix_chunk_len * capture_req_slots
 
-    def _select_prefix_capture_chunks(
-        self, prefix_lens: Sequence[int]
-    ) -> Optional[int]:
-        """Smallest captured variant covering the batch's max prefix, or None."""
-        max_prefix_len = max(int(length) for length in prefix_lens)
+    def _select_prefix_capture_chunks(self, max_prefix_len: int) -> Optional[int]:
+        """Smallest captured variant covering max_prefix_len, or None."""
         real_n = _ceil_div(max_prefix_len, self._prefix_chunk_len)
         return next((n for n in self._prefix_capture_variants if n >= real_n), None)
 
     def _has_uncapturable_chunked_prefix(
         self, prefix_lens: Sequence[int] | None
     ) -> bool:
+        if not self._capture_chunked_prefix or prefix_lens is None:
+            return False
+        max_prefix_len = max(prefix_lens, default=0)
         return (
-            self._capture_chunked_prefix
-            and prefix_lens is not None
-            and any(int(length) > 0 for length in prefix_lens)
-            and self._select_prefix_capture_chunks(prefix_lens) is None
+            max_prefix_len > 0
+            and self._select_prefix_capture_chunks(max_prefix_len) is None
         )
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
-        if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
-            captured_n = self._select_prefix_capture_chunks(
-                forward_batch.extend_prefix_lens_cpu
+        if self._capture_chunked_prefix:
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            local_max_prefix_len = (
+                max(prefix_lens, default=0) if prefix_lens is not None else 0
             )
-            assert captured_n is not None, "prefix batch has no captured FullCG variant"
-            variant = _chunked_prefix_variant(captured_n)
+            max_prefix_len = max(
+                local_max_prefix_len,
+                forward_batch.dp_prefill_cuda_graph_max_prefix_len,
+            )
+            if max_prefix_len > 0:
+                captured_n = self._select_prefix_capture_chunks(max_prefix_len)
+                assert captured_n is not None, (
+                    "prefix batch has no captured FullCG variant"
+                )
+                variant = _chunked_prefix_variant(captured_n)
         return ShapeKey(size=num_tokens, variant_label=variant)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
@@ -1065,14 +1067,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         attn_backend = self.model_runner.attn_backend
-        if not self.use_captured_attn_metadata:
-            attn_backend.init_forward_metadata(forward_batch)
-            return
-        metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
-            forward_batch
-        )
-        assert self.attn_metadata_buffers is not None
-        self.attn_metadata_buffers[num_tokens] = metadata
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
+            if not self.use_captured_attn_metadata:
+                attn_backend.init_forward_metadata(forward_batch)
+                return
+            metadata = (
+                attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                    forward_batch
+                )
+            )
+            assert self.attn_metadata_buffers is not None
+            self.attn_metadata_buffers[num_tokens] = metadata
 
     def _prepare_forward_metadata_for_replay(
         self,
@@ -1225,7 +1230,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             return False
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
@@ -1390,7 +1395,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Ported from main #27468.
                 capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=self._capture_num_token_non_padded(num_tokens),
-                num_token_non_padded_cpu=num_tokens,
+                global_num_token_non_padded_cpu=num_tokens,
+                attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
+                    num_tokens
+                ),
                 global_forward_mode=ForwardMode.EXTEND,
                 # All-None ids are safe: kernels no-op at rank 0 and replay
                 # refreshes the static batch info with live values.
@@ -1404,13 +1412,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            with graph_capture(
-                stream=get_or_create_global_graph_capture_stream()
-            ) as graph_capture_context:
-                self.stream = graph_capture_context.stream
-                with self.backend.capture_session(self.stream):
-                    self._capture_one_stream()
+        dp_flags = get_flags().dp
+        dp_flags.capturing_prefill_graph = True
+        try:
+            with freeze_gc(get_exec().graph.enable_cudagraph_gc):
+                with graph_capture(
+                    stream=get_or_create_global_graph_capture_stream()
+                ) as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with self.backend.capture_session(self.stream):
+                        self._capture_one_stream()
+        finally:
+            dp_flags.capturing_prefill_graph = False
+        if dp_flags.prefill_graph_has_dp_gather:
+            logger.info(
+                "Prefill CUDA graph captured a DP gather/scatter; "
+                "DP ranks will replay a shared MAX_LEN bucket."
+            )
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1444,7 +1462,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        if self.enable_cp_v2_bcg_capture:
+        if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
                 self,
@@ -1522,7 +1540,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
@@ -1660,7 +1678,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=padded_spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
-            num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
+            global_num_token_non_padded_cpu=forward_batch.global_num_token_non_padded_cpu,
+            attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
+                static_num_tokens
+            ),
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
@@ -1733,7 +1754,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         metadata_forward_batch = forward_batch
-        if self.enable_cp_v2_bcg_capture:
+        if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
                 self,
@@ -1785,10 +1806,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         original_layer_forward = self.layer_model.forward
         self.layer_model.forward = replay_layer_forward
-        # For Full, run the eager tail against the raw user-facing batch so it
-        # uses real request metadata instead of padded slots. BCG has no
-        # request-slot padding, so static_forward_batch is already the serving batch.
-        tail_batch = forward_batch if full_path else static_forward_batch
+        if full_path:
+            # Run the eager tail against the raw user-facing batch so it uses
+            # real request metadata instead of padded slots. Its SP verdict came
+            # from the unpadded count, though, while the captured body froze one
+            # at the padded bucket count; the two can differ, so carry the body's
+            # on a private view rather than mutating the caller's batch.
+            tail_batch = copy.copy(forward_batch)
+            tail_batch.attn_tp_sequence_sharded = (
+                static_forward_batch.attn_tp_sequence_sharded
+            )
+        else:
+            # BCG has no request-slot padding, so static_forward_batch is
+            # already the serving batch and already holds the body's verdict.
+            tail_batch = static_forward_batch
         if not full_path:
             # MTP consumes the target model's live multimodal embeddings in its
             # eager wrapper before the captured transformer body is replayed.
@@ -1891,7 +1922,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner, forward_batch, self.device_module
             )
 
-            if self.enable_cp_v2_bcg_capture:
+            if self.enable_cp_bcg_capture:
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,

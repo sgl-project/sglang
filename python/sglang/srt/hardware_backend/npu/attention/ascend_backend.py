@@ -19,6 +19,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    get_sparsity_driven_kv_offload_sparse_context_len,
+    is_sparsity_driven_kv_offload_enabled,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -341,6 +345,29 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
+        self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
+            model_config=model_runner.model_config,
+            use_mla_backend=model_runner.use_mla_backend,
+        )
+        self.sparse_kv_manager = None
+        if self.enable_sparsity_driven_kv_offload:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+                SparseKVCacheManager,
+                register_sparse_kv_manager,
+            )
+
+            self.sparse_kv_manager = SparseKVCacheManager(
+                model_runner.req_to_token_pool,
+                model_runner.token_to_kv_pool_allocator,
+                sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
+                    model_config=model_runner.model_config
+                ),
+            )
+            register_sparse_kv_manager(self.sparse_kv_manager)
+            logger.info(
+                "Sparsity-driven KV offload is enabled with manager %s.",
+                self.sparse_kv_manager,
+            )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
@@ -635,6 +662,14 @@ class AscendAttnBackend(AttentionBackend):
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
+        if self.enable_sparsity_driven_kv_offload:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
+                register_npu_host_callback_stream,
+            )
+
+            register_npu_host_callback_stream(
+                torch.npu.current_stream(self.device), self.device
+            )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
@@ -1198,6 +1233,23 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope=k_rope,
             )
         if topk_indices is not None:
+            if self.enable_sparsity_driven_kv_offload:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+                    forward_sparsity_driven_kv_offload,
+                )
+
+                return forward_sparsity_driven_kv_offload(
+                    self,
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope,
+                    k_rope,
+                    topk_indices,
+                )
             return self.forward_sparse(
                 q,
                 k,
@@ -1274,9 +1326,12 @@ class AscendAttnBackend(AttentionBackend):
                 if self.use_fia:
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
-                        if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                        if (
+                            num_token_padding
+                            > forward_batch.global_num_token_non_padded_cpu
+                        ):
                             q, k, v = [
-                                data[: forward_batch.num_token_non_padded_cpu]
+                                data[: forward_batch.global_num_token_non_padded_cpu]
                                 for data in [q, k, v]
                             ]
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -1318,7 +1373,10 @@ class AscendAttnBackend(AttentionBackend):
                         attn_out = attn_out.view(
                             -1, layer.tp_q_head_num * layer.v_head_dim
                         )
-                        if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                        if (
+                            num_token_padding
+                            != forward_batch.global_num_token_non_padded_cpu
+                        ):
                             attn_out = torch.cat(
                                 [
                                     attn_out,
@@ -1411,9 +1469,12 @@ class AscendAttnBackend(AttentionBackend):
                     """FIA supports multi-bs in the current version of CANN"""
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     num_token_padding = q.shape[0]
-                    if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    if (
+                        num_token_padding
+                        > forward_batch.global_num_token_non_padded_cpu
+                    ):
                         q, k, v = [
-                            data[: forward_batch.num_token_non_padded_cpu]
+                            data[: forward_batch.global_num_token_non_padded_cpu]
                             for data in [q, k, v]
                         ]
                     attn_output, _ = torch_npu.npu_fused_infer_attention_score(
@@ -1439,7 +1500,10 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
 
-                    if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                    if (
+                        num_token_padding
+                        != forward_batch.global_num_token_non_padded_cpu
+                    ):
                         attn_output = torch.cat(
                             [
                                 attn_output,
@@ -1699,7 +1763,8 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 num_token_padding = q.shape[0]
                 q, k, v = [
-                    data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+                    data[: forward_batch.global_num_token_non_padded_cpu]
+                    for data in [q, k, v]
                 ]
                 q_nope, q_rope = q.split(
                     [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1789,7 +1854,7 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output.reshape(
                     [-1, layer.tp_q_head_num, layer.v_head_dim]
                 )
-                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                if num_token_padding != forward_batch.global_num_token_non_padded_cpu:
                     attn_output = torch.cat(
                         [
                             attn_output,
@@ -1862,7 +1927,8 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 num_token_padding = q.shape[0]
                 q, k, v = [
-                    data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+                    data[: forward_batch.global_num_token_non_padded_cpu]
+                    for data in [q, k, v]
                 ]
 
                 q_nope, q_rope = q.split(
@@ -1891,7 +1957,7 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output.reshape(
                     -1, layer.tp_q_head_num, layer.v_head_dim
                 )
-                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                if num_token_padding != forward_batch.global_num_token_non_padded_cpu:
                     attn_output = torch.cat(
                         [
                             attn_output,
@@ -2011,7 +2077,7 @@ class AscendAttnBackend(AttentionBackend):
 
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
-                query = query[: forward_batch.num_token_non_padded_cpu]
+                query = query[: forward_batch.global_num_token_non_padded_cpu]
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
@@ -2097,14 +2163,15 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
-                and forward_batch.num_token_non_padded_cpu is not None
-                and forward_batch.num_token_non_padded_cpu != num_token_padding
+                and forward_batch.global_num_token_non_padded_cpu is not None
+                and forward_batch.global_num_token_non_padded_cpu != num_token_padding
             ):
                 attn_output = torch.cat(
                     [
                         attn_output,
                         attn_output.new_zeros(
-                            num_token_padding - forward_batch.num_token_non_padded_cpu,
+                            num_token_padding
+                            - forward_batch.global_num_token_non_padded_cpu,
                             *attn_output.shape[1:],
                         ),
                     ],
@@ -2132,8 +2199,8 @@ class AscendAttnBackend(AttentionBackend):
             q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
             if not self.graph_mode:
                 num_token_padding = q.shape[0]
-                q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
-                q_rope = q_rope[: forward_batch.num_token_non_padded_cpu]
+                q_nope = q_nope[: forward_batch.global_num_token_non_padded_cpu]
+                q_rope = q_rope[: forward_batch.global_num_token_non_padded_cpu]
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
@@ -2235,7 +2302,7 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
-                and forward_batch.num_token_non_padded_cpu != num_token_padding
+                and forward_batch.global_num_token_non_padded_cpu != num_token_padding
             ):
                 attn_output = torch.cat(
                     [
@@ -2536,6 +2603,23 @@ class AscendAttnBackend(AttentionBackend):
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:
+            if self.enable_sparsity_driven_kv_offload:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+                    forward_sparsity_driven_kv_offload,
+                )
+
+                return forward_sparsity_driven_kv_offload(
+                    self,
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope,
+                    k_rope,
+                    topk_indices,
+                )
             return self.forward_sparse(
                 q,
                 k,

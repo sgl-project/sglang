@@ -342,12 +342,11 @@ class DSAMockModelRunner(ModelRunner):
             dllm_algorithm_config=None,
             dp_size=1,
             dsa_decode_backend=dsa_decode_backend,
-            dsa_prefill_cp_mode="round-robin-split",
             dsa_prefill_backend=dsa_prefill_backend,
             device=device,
             enable_deterministic_inference=False,
             enable_dp_attention=False,
-            enable_dsa_prefill_context_parallel=False,
+            enable_prefill_cp=False,
             enable_mis=False,
             is_embedding=False,
             kv_cache_dtype="auto",
@@ -1629,7 +1628,7 @@ def run_dsa_forward(
     input_hidden = inputs["input_hidden"]
     # `input_hidden` may have trailing padding for split-op static-token
     # contracts; project only the live token rows for QKV. The kernel
-    # respects `num_token_non_padded_cpu` via the metadata.
+    # respects `global_num_token_non_padded_cpu` via the metadata.
     live_input_hidden = input_hidden[: case.num_input_tokens]
     input_parts = _split_by_lens(live_input_hidden, case.input_lens)
     kv_hidden = torch.cat(
@@ -1668,7 +1667,7 @@ def expected_dsa_output_from_inputs(
 def dsa_attention_layers(fixture: DSAAttentionFixture) -> list:
     """Return the RadixAttention layers the backend forwards through. The
     split-op runner uses this to install per-layer
-    `num_token_non_padded_cpu` metadata before forward."""
+    `global_num_token_non_padded_cpu` metadata before forward."""
     return [fixture.actual_module.attn]
 
 
