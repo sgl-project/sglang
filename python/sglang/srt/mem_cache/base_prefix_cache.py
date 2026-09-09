@@ -428,14 +428,23 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+    def evict_for_alloc(
+        self,
+        params: EvictParams,
+        *,
+        allocation_ready: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
         """Evict cache entries to cover allocator shortfalls.
 
         The default implementation preserves the component-count semantics of
         :meth:`evict`. Multi-component caches backed by shared memory can
         override this entry point to stop once collateral frees make the
-        requested allocation feasible.
+        requested allocation feasible. ``allocation_ready`` is an optional
+        allocator-owned check of the complete request; shared caches also use it
+        to continue past component-count quotas.
         """
+        if allocation_ready is not None and allocation_ready():
+            return EvictResult()
         return self.evict(params)
 
     @abstractmethod

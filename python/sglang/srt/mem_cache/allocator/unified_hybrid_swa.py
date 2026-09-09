@@ -23,7 +23,10 @@ import torch
 from torch.profiler import record_function
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.base import MambaFullCacheDonor
+from sglang.srt.mem_cache.allocator.base import (
+    MambaFullCacheDonor,
+    TokenAllocationRecovery,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedAllocator,
@@ -217,6 +220,37 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         K_total = K1 + K2 + K3
         K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
         return K_total * self.page_size
+
+    def token_allocation_recovery(self) -> TokenAllocationRecovery:
+        return self
+
+    def token_allocation_ready(self, num_tokens: int) -> bool:
+        return (
+            self.full_available_size() >= num_tokens
+            and self.swa_available_size() >= num_tokens
+            and self.available_size() >= num_tokens
+        )
+
+    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.token_allocation_ready(num_tokens)
+
+    def prepare_token_allocation(self, num_tokens: int) -> bool:
+        _flush_deferred_free_group(
+            self,
+            (self.free_group, self.free_page_reps_group, self.full_free_group),
+        )
+        if self.token_allocation_ready(num_tokens):
+            return True
+        # Preserve per-component recovery before moving the shared layout.
+        if (
+            self.full_available_size() < num_tokens
+            or self.swa_available_size() < num_tokens
+        ):
+            return False
+        return _relieve_for_alloc(self, num_tokens) and self.token_allocation_ready(
+            num_tokens
+        )
 
     # Slot-conservation views for the leak invariant only; the byte-coordinated
     # value would flag spurious leaks. `allocated_count()` is in TOKENS.
@@ -907,20 +941,6 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         # `out_cache_loc`, so its in-flight write-set is None.
         super().set_inflight_forward(forward_done, out_cache_loc_virtual)
         self.mamba_allocator.set_inflight_forward(forward_done, None)
-
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
-        """Joint-aware eviction: one tri-lifetime node frees bytes on several sides
-        at once, so re-check the JOINT gate instead of the per-side shortfall."""
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
-
-        # Arbitrary retry bound; a round that frees nothing ends the loop anyway.
-        for _ in range(4):
-            before = self.available_size()
-            if before >= num_tokens:
-                return
-            evict_from_tree_cache(tree_cache, num_tokens)
-            if self.available_size() <= before:
-                return  # no progress
 
     def verify_byte_accounting(self) -> List[str]:
         return (
