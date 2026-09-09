@@ -12,8 +12,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -84,22 +82,15 @@ def _kv_event_from_tagged(event: tuple):
     """Build the Python KV cache event for one of the binding's tagged tuples."""
     tag = event[0]
     if tag == "block_stored":
-        event_args = dict(
+        return BlockStored(
             block_hashes=event[1],
             parent_block_hash=event[2],
             token_ids=event[3],
             block_size=event[4],
             lora_id=None,
             medium=StorageMedium(event[5]),
-        )
-        if event[6] is None and event[7] is None:
-            return BlockStored(**event_args)
-        return BlockStoredWithMetadata(
-            **event_args,
-            metadata=BlockStoredMetadata(
-                cache_salt=event[6],
-                session_id=event[7],
-            ),
+            cache_salt=event[6],
+            session_id=event[7],
         )
     if tag == "block_removed":
         return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))

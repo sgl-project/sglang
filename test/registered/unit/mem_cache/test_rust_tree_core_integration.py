@@ -20,8 +20,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.environ import envs
@@ -944,14 +942,14 @@ def test_salted_events_match_python_hash_and_metadata_contract():
         for value in mem_cache.get_hash_str(array("q", [1, 2, 7, 8]), seed, 2)
     ]
     assert core.take_events() == [
-        BlockStoredWithMetadata(
+        BlockStored(
             block_hashes=hashes,
             parent_block_hash=None,
             token_ids=[1, 2, 7, 8],
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
-            metadata=BlockStoredMetadata(cache_salt="tenant-a"),
+            cache_salt="tenant-a",
         )
     ]
 
@@ -985,14 +983,14 @@ def test_salted_eagle_events_match_the_bigram_hash_contract():
         for value in mem_cache.get_hash_str(raw_tokens, seed, 2, is_bigram=True)
     ]
     assert core.take_events() == [
-        BlockStoredWithMetadata(
+        BlockStored(
             block_hashes=hashes,
             parent_block_hash=None,
             token_ids=[(1, 2), (2, 3), (3, 4), (4, 5)],
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
-            metadata=BlockStoredMetadata(cache_salt="tenant-a"),
+            cache_salt="tenant-a",
         )
     ]
 

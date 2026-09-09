@@ -12,9 +12,9 @@ import unittest
 import msgspec
 
 from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     KVEventBatch,
     StorageMedium,
     ZmqEventPublisher,
@@ -186,61 +186,67 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
 
 
 class TestBlockStoredWireFormat(CustomTestCase):
-    def _event(self, metadata=None):
-        event_type = BlockStored if metadata is None else BlockStoredWithMetadata
-        kwargs = dict(
+    def _event(self, **extra):
+        return BlockStored(
             block_hashes=[123],
             parent_block_hash=None,
             token_ids=[1, 2],
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
+            **extra,
         )
-        if metadata is not None:
-            kwargs["metadata"] = metadata
-        return event_type(**kwargs)
 
-    def test_unsalted_event_keeps_legacy_array_shape(self):
+    def test_event_is_a_tagged_map(self):
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(self._event()))
-        self.assertEqual(len(decoded), 7)
-
-    def test_salted_event_appends_typed_metadata(self):
-        event = self._event(BlockStoredMetadata(cache_salt="tenant-a"))
-        encoded = msgspec.msgpack.encode(event)
-        decoded = msgspec.msgpack.decode(encoded)
-        round_tripped = msgspec.msgpack.decode(encoded, type=BlockStoredWithMetadata)
-        self.assertEqual(len(decoded), 8)
-        self.assertEqual(decoded[7], {"cache_salt": "tenant-a"})
-        self.assertEqual(round_tripped.metadata.cache_salt, "tenant-a")
-
-    def test_session_event_appends_typed_metadata(self):
-        event = self._event(BlockStoredMetadata(session_id="session-a"))
-        encoded = msgspec.msgpack.encode(event)
-        decoded = msgspec.msgpack.decode(encoded)
-        round_tripped = msgspec.msgpack.decode(encoded, type=BlockStoredWithMetadata)
-        self.assertEqual(len(decoded), 8)
-        self.assertEqual(decoded[7], {"session_id": "session-a"})
-        self.assertEqual(round_tripped.metadata.session_id, "session-a")
-
-    def test_salt_and_session_share_metadata_extension(self):
-        event = self._event(
-            BlockStoredMetadata(cache_salt="tenant-a", session_id="session-a")
-        )
-        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertIsInstance(decoded, dict)
+        self.assertEqual(decoded["type"], "BlockStored")
         self.assertEqual(
-            decoded[7],
-            {"cache_salt": "tenant-a", "session_id": "session-a"},
+            set(decoded),
+            {
+                "type",
+                "block_hashes",
+                "parent_block_hash",
+                "token_ids",
+                "block_size",
+                "lora_id",
+                "medium",
+            },
         )
 
-    def test_salted_event_remains_compatible_with_typed_batch_consumers(self):
+    def test_salt_and_session_are_named_fields(self):
+        event = self._event(cache_salt="tenant-a", session_id="session-a")
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertEqual(decoded["cache_salt"], "tenant-a")
+        self.assertEqual(decoded["session_id"], "session-a")
+
+    def test_one_decoder_reads_a_mixed_batch(self):
         batch = KVEventBatch(
             ts=1.0,
-            events=[self._event(BlockStoredMetadata(cache_salt="tenant-a"))],
+            events=[
+                self._event(),
+                self._event(cache_salt="tenant-a"),
+                self._event(session_id="session-a"),
+                BlockRemoved(block_hashes=[123], medium=StorageMedium.GPU),
+                AllBlocksCleared(),
+            ],
         )
         round_tripped = msgspec.msgpack.decode(
             msgspec.msgpack.encode(batch), type=KVEventBatch
         )
-        self.assertEqual(round_tripped.events[0].block_hashes, [123])
+        stored = round_tripped.events[:3]
+        self.assertEqual([e.cache_salt for e in stored], [None, "tenant-a", None])
+        self.assertEqual([e.session_id for e in stored], [None, None, "session-a"])
+        self.assertIsInstance(round_tripped.events[3], BlockRemoved)
+        self.assertIsInstance(round_tripped.events[4], AllBlocksCleared)
+
+    def test_batch_stays_a_positional_array_of_maps(self):
+        batch = KVEventBatch(ts=1.0, events=[self._event()], attn_dp_rank=0)
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(batch))
+        self.assertEqual(decoded[0], 1.0)
+        self.assertEqual(decoded[2], 0)
+        self.assertIsInstance(decoded[1][0], dict)
+        self.assertEqual(len(decoded), 3)
 
 
 if __name__ == "__main__":

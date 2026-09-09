@@ -241,11 +241,20 @@ class EventBatch(
 
 class KVCacheEvent(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
-    """Base class for all KV cache-related events"""
+    """Base class for all KV cache-related events.
+
+    Events are tagged msgpack maps: ``type`` carries the class name and every
+    other key is a field name. Optional fields left at ``None`` are omitted, so
+    adding an optional field never changes the shape an older consumer sees.
+    This is the same encoding vLLM uses for its ``KVCacheEvent``, so a consumer
+    such as Dynamo decodes both engines with one code path.
+
+    ``EventBatch`` stays a positional array ``[ts, events, attn_dp_rank]``.
+    """
 
 
 class StorageMedium(str, enum.Enum):
@@ -255,13 +264,6 @@ class StorageMedium(str, enum.Enum):
     CPU = "CPU_PINNED"  # L2: host pinned memory
     DISK = "DISK"  # L3: SSD / NVMe
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
-
-
-class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
-    """Typed request metadata attached to a stored KV block."""
-
-    cache_salt: Optional[str] = None
-    session_id: Optional[str] = None
 
 
 class OffloadedState(msgspec.Struct):
@@ -280,16 +282,13 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
-
-
-class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
-    """BlockStored wire extension used only when typed metadata is present.
-
-    A separate struct keeps unsalted events at their legacy array length; an
-    optional field on BlockStored would still serialize a trailing null.
-    """
-
-    metadata: BlockStoredMetadata
+    # Salt of the request that stored these blocks. Block hashes are already
+    # namespaced by it; consumers index the emitted hashes rather than
+    # recompute them.
+    cache_salt: Optional[str] = None
+    # Session that triggered this store. Attribution only: the blocks may be
+    # shared with other sessions, and the hash does not depend on it.
+    session_id: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
@@ -302,10 +301,6 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
-    # BlockStoredWithMetadata deliberately stays out of this tagged union.
-    # Existing typed consumers decode its shared "BlockStored" tag as the base
-    # type and ignore the trailing metadata; adding both types would give
-    # msgspec duplicate tags and make the union invalid.
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 

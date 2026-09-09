@@ -591,7 +591,92 @@ fn decode_event_batch_impl(
 }
 
 fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeError> {
-    let event = expect_array(event, "KV event")?;
+    match event {
+        // Current publishers: `KVCacheEvent` without `array_like` is a tagged map.
+        Value::Map(entries) => decode_event_map(entries, actions),
+        // Older publishers: tagged positional array.
+        Value::Array(fields) => decode_event_array(fields, actions),
+        _ => Err(BridgeError::Decode(
+            "KV event must be a map or an array".to_string(),
+        )),
+    }
+}
+
+fn map_field<'a>(entries: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
+    entries
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(name))
+        .map(|(_, value)| value)
+}
+
+fn required_map_field<'a>(
+    entries: &'a [(Value, Value)],
+    name: &str,
+) -> Result<&'a Value, BridgeError> {
+    map_field(entries, name)
+        .ok_or_else(|| BridgeError::Decode(format!("KV event is missing `{name}`")))
+}
+
+/// Decodes one tagged-map event: `{"type": ..., "<field>": ...}`. Optional
+/// fields may be absent (msgspec omits `None` defaults) or present as nil.
+/// Keys the indexer does not use (`token_ids`, `lora_id`, `cache_salt`,
+/// `session_id`) are ignored.
+fn decode_event_map(
+    entries: &[(Value, Value)],
+    actions: &mut EventActions,
+) -> Result<(), BridgeError> {
+    let event_type = expect_str(required_map_field(entries, "type")?, "KV event type")?;
+    let medium = |field: &str| -> Result<Option<&str>, BridgeError> {
+        match map_field(entries, "medium") {
+            Some(value) => expect_optional_str(value, field),
+            None => Ok(None),
+        }
+    };
+
+    match event_type {
+        "BlockStored" => {
+            let tier = medium_to_tier(medium("BlockStored.medium")?)?;
+            let mask = match map_field(entries, "component_types") {
+                Some(value) => decode_component_mask(value)?,
+                None => None,
+            };
+            let block_size = match mask {
+                Some(_) => Some(decode_block_size(required_map_field(
+                    entries,
+                    "block_size",
+                )?)?),
+                None => None,
+            };
+            let parent_block_hash = match map_field(entries, "parent_block_hash") {
+                Some(value) => decode_optional_hash(value, "BlockStored.parent_block_hash")?,
+                None => None,
+            };
+            actions.report(
+                tier,
+                parent_block_hash,
+                decode_hashes(required_map_field(entries, "block_hashes")?)?,
+                mask,
+                block_size,
+            );
+        }
+        "BlockRemoved" => {
+            let tier = medium_to_tier(medium("BlockRemoved.medium")?)?;
+            actions.revoke(
+                tier,
+                decode_hashes(required_map_field(entries, "block_hashes")?)?,
+            );
+        }
+        "AllBlocksCleared" => {
+            actions.clear_all();
+        }
+        other => {
+            debug!(event_type = other, "ignoring unsupported SGLang KV event");
+        }
+    }
+    Ok(())
+}
+
+fn decode_event_array(event: &[Value], actions: &mut EventActions) -> Result<(), BridgeError> {
     let event_type = expect_str(
         event
             .first()
@@ -944,6 +1029,124 @@ mod tests {
 
     fn cleared() -> Value {
         Value::Array(vec![Value::String("AllBlocksCleared".into())])
+    }
+
+    // --- tagged-map event shape (current publishers) ---
+
+    fn map_event(entries: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (Value::String(key.into()), value))
+                .collect(),
+        )
+    }
+
+    fn stored_map(
+        hashes: &[i64],
+        parent: Option<i64>,
+        medium: &str,
+        extra: Vec<(&str, Value)>,
+    ) -> Value {
+        let mut entries = vec![
+            ("type", Value::String("BlockStored".into())),
+            ("block_hashes", ints(hashes)),
+            ("parent_block_hash", parent.map_or(Value::Nil, Value::from)),
+            ("token_ids", ints(&[1])),
+            ("block_size", Value::from(1_i64)),
+            ("lora_id", Value::Nil),
+            ("medium", Value::String(medium.into())),
+        ];
+        entries.extend(extra);
+        map_event(entries)
+    }
+
+    fn removed_map(hashes: &[i64], medium: &str) -> Value {
+        map_event(vec![
+            ("type", Value::String("BlockRemoved".into())),
+            ("block_hashes", ints(hashes)),
+            ("medium", Value::String(medium.into())),
+        ])
+    }
+
+    fn cleared_map() -> Value {
+        map_event(vec![("type", Value::String("AllBlocksCleared".into()))])
+    }
+
+    #[test]
+    fn map_events_decode_like_array_events() {
+        assert_eq!(
+            actions_of(vec![
+                stored_map(&[1, 2], None, "GPU", vec![]),
+                removed_map(&[3], "DISK"),
+                cleared_map(),
+            ]),
+            vec![
+                rep(hbm(), &["1", "2"]),
+                rev(ssd(), &["3"]),
+                Action::ClearAll
+            ]
+        );
+    }
+
+    #[test]
+    fn map_event_keeps_parent_and_ignores_attribution_keys() {
+        assert_eq!(
+            actions_of(vec![stored_map(
+                &[2, 3],
+                Some(1),
+                "GPU",
+                vec![
+                    ("cache_salt", Value::String("tenant-a".into())),
+                    ("session_id", Value::String("session-a".into())),
+                ],
+            )]),
+            vec![rep_with_parent(hbm(), Some(1), &["2", "3"])]
+        );
+    }
+
+    #[test]
+    fn component_aware_map_event_carries_mask_and_block_size() {
+        let event = map_event(vec![
+            ("type", Value::String("BlockStored".into())),
+            ("block_hashes", ints(&[1])),
+            ("parent_block_hash", Value::Nil),
+            ("token_ids", ints(&[1])),
+            ("block_size", Value::from(64_i64)),
+            ("lora_id", Value::Nil),
+            ("medium", Value::String("GPU".into())),
+            ("component_types", strv(&["full", "swa"])),
+        ]);
+        assert_eq!(
+            actions_of(vec![event]),
+            vec![Action::Report {
+                tier: hbm(),
+                parent_block_hash: None,
+                hashes: vec![1],
+                masks: vec![Some(
+                    crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
+                )],
+                block_sizes: vec![Some(64)],
+            }]
+        );
+    }
+
+    #[test]
+    fn undecodable_map_events_are_skipped_and_siblings_survive() {
+        assert_eq!(
+            actions_of(vec![
+                // no `type`
+                map_event(vec![("block_hashes", ints(&[1]))]),
+                stored_map(&[1], None, "GPU", vec![]),
+                // no `medium`
+                map_event(vec![
+                    ("type", Value::String("BlockStored".into())),
+                    ("block_hashes", ints(&[9])),
+                ]),
+                removed_map(&[5], "GPU"),
+            ]),
+            vec![rep(hbm(), &["1"]), rev(hbm(), &["5"])]
+        );
     }
 
     /// Wrap events in a 3-element batch [ts, events, attn_dp_rank].

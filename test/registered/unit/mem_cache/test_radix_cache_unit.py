@@ -34,8 +34,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -67,22 +65,15 @@ class TestKVCacheEventQueue(unittest.TestCase):
         cache_salt: str | None = None,
         session_id: str | None = None,
     ) -> BlockStored:
-        event_args = dict(
+        return BlockStored(
             block_hashes=[block_hash],
             parent_block_hash=parent_block_hash,
             token_ids=[block_hash, block_hash + 1][:block_size],
             block_size=block_size,
             lora_id=lora_id,
             medium=medium,
-        )
-        if cache_salt is None and session_id is None:
-            return BlockStored(**event_args)
-        return BlockStoredWithMetadata(
-            **event_args,
-            metadata=BlockStoredMetadata(
-                cache_salt=cache_salt,
-                session_id=session_id,
-            ),
+            cache_salt=cache_salt,
+            session_id=session_id,
         )
 
     def test_enqueue_coalesces_compatible_stores(self):
@@ -743,7 +734,7 @@ class TestRadixCache(unittest.TestCase):
         removed = [event for event in events if isinstance(event, BlockRemoved)]
 
         self.assertEqual(len(stored), 1)
-        self.assertEqual(stored[0].metadata.cache_salt, "tenant-a")
+        self.assertEqual(stored[0].cache_salt, "tenant-a")
         self.assertEqual(stored[0].parent_block_hash, None)
         self.assertEqual(len(stored[0].block_hashes), 2)
         self.assertEqual(removed[0].block_hashes, stored[0].block_hashes)

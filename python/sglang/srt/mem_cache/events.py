@@ -24,8 +24,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.mem_cache.utils import (
@@ -63,19 +61,12 @@ class KVCacheEventRecorder:
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
-                tail_metadata = (
-                    tail.metadata if isinstance(tail, BlockStoredWithMetadata) else None
-                )
-                event_metadata = (
-                    event.metadata
-                    if isinstance(event, BlockStoredWithMetadata)
-                    else None
-                )
                 if (
                     tail.medium == event.medium
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
-                    and tail_metadata == event_metadata
+                    and tail.cache_salt == event.cache_salt
+                    and tail.session_id == event.session_id
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
@@ -142,25 +133,18 @@ class KVCacheEventRecorder:
 
             block_hash = hash_str_to_int64(event_hash_values[page_index])
 
-            event_args = {
-                "block_hashes": [block_hash],
-                "parent_block_hash": parent_block_hash,
-                "token_ids": page_tokens,
-                "block_size": len(page_tokens),
-                "lora_id": None,
-                "medium": medium,
-            }
-            if node.key.cache_salt is None and session_id is None:
-                event = BlockStored(**event_args)
-            else:
-                event = BlockStoredWithMetadata(
-                    **event_args,
-                    metadata=BlockStoredMetadata(
-                        cache_salt=node.key.cache_salt,
-                        session_id=session_id,
-                    ),
+            self.enqueue(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                    medium=medium,
+                    cache_salt=node.key.cache_salt,
+                    session_id=session_id,
                 )
-            self.enqueue(event)
+            )
 
             parent_block_hash = block_hash
             page_index += 1
