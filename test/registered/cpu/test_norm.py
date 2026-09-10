@@ -574,19 +574,22 @@ class TestFusedQKNorm:
             ref_q[pos_idx] = apply_rope(ref_q[pos_idx : pos_idx + 1], pos).reshape(-1)
             ref_k[pos_idx] = apply_rope(ref_k[pos_idx : pos_idx + 1], pos).reshape(-1)
 
+        half = head_dim // 2
+        freqs = base ** (-2.0 * torch.arange(half, dtype=torch.float32) / head_dim)
+        theta = position_ids.to(torch.float32)[:, None] * freqs[None, :]
+        cos_sin_cache = torch.cat([torch.cos(theta), torch.sin(theta)], dim=-1).to(
+            dtype
+        )
+
         torch.ops.sgl_kernel.fused_qk_norm_rope_cpu(
             q,
             k,
             q_weight,
             k_weight,
             eps,
-            base,
             is_neox,
             position_ids,
-            1.0,
-            0.0,
-            0.0,
-            1.0,
+            cos_sin_cache,
             head_dim,
         )
 
