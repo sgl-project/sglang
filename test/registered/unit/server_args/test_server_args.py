@@ -2984,6 +2984,41 @@ class TestDcpCommBackendDefault(CustomTestCase):
         parallel_hook.handle_dcp_validation(args)
         self.assertEqual(resolving_view(args).dcp_comm_backend, "ag_rs")
 
+    @override_platform(is_npu=True)
+    def test_the_env_escape_hatch_holds_ag_rs_on_npu(self):
+        """ag_rs is kept as a correctness reference for localizing merge bugs,
+        and it has to be reachable at the moment one appears.
+
+        The flag alone cannot express it: 'ag_rs' is the field's own default, so
+        the pipeline cannot distinguish an explicit --dcp-comm-backend ag_rs
+        from an unset one and the NPU pass promotes both. The first time the
+        reference was actually wanted -- splitting a capture-only DCP defect
+        between the merge collective and everything else -- it turned out to be
+        unreachable, which is what this env var and this test exist to prevent
+        recurring.
+        """
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DCP_KEEP_AG_RS.override(True):
+            args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=4)
+            parallel_hook.handle_dcp_validation(args)
+            self.assertEqual(resolving_view(args).dcp_comm_backend, "ag_rs")
+
+    @override_platform(is_npu=True)
+    def test_the_escape_hatch_does_not_force_ag_rs_onto_an_a2a_request(self):
+        """It suppresses a promotion; it does not select a backend. Someone who
+        asked for a2a keeps a2a with the variable set."""
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DCP_KEEP_AG_RS.override(True):
+            args = ServerArgs(
+                model_path="dummy", tp_size=4, dcp_size=4, dcp_comm_backend="a2a"
+            )
+            parallel_hook.handle_dcp_validation(args)
+            self.assertEqual(resolving_view(args).dcp_comm_backend, "a2a")
+
 
 if __name__ == "__main__":
     unittest.main()
