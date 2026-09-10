@@ -1,0 +1,51 @@
+name: AMD obsolete HF cache cleanup
+
+# One-shot job for the draft PR that drops Qwen3-235B Instruct-2507 and
+# DeepSeek-V3.1 from the shared AMD HuggingFace cache. Does not go through
+# pr-gate (drafts are blocked there). After merge this stays dispatch-only
+# unless the script or this workflow is touched.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "scripts/ci/amd/cleanup_obsolete_hf_checkpoints.sh"
+      - ".github/workflows/amd-obsolete-hf-cache-cleanup.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amd-obsolete-hf-cache-cleanup-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cleanup:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-mi300-1gpu-sglang
+            name: mi30x
+          - runner: linux-mi35x-gpu-1
+            name: mi35x
+    name: cleanup-obsolete-hf-cache (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Remove obsolete HF checkpoints
+        env:
+          REQUIRE_HF_CACHE: "1"
+        run: |
+          bash scripts/ci/amd/cleanup_obsolete_hf_checkpoints.sh
+          if [[ -f github_summary.md ]]; then
+            cat github_summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
