@@ -67,11 +67,10 @@ register_amd_ci(
     nightly=True,
 )
 
-# Local MXFP4 checkpoint on the MI35x runners, same default as
-# test/registered/amd/accuracy/mi35x/test_qwen35_mxfp4_eval_mi35x.py.
-MODEL_PATH = os.environ.get(
-    "QWEN35_MXFP4_MODEL_PATH", "/data/amd/Qwen3.5-397B-A17B-MXFP4"
-)
+# The published MXFP4 checkpoint, resolved through the runners' shared HF cache.
+# test_qwen35_mxfp4_eval_mi35x.py points at a /data copy of the same weights,
+# but that path is a dev-host mount and is not visible inside the CI container.
+MODEL_PATH = os.environ.get("QWEN35_MXFP4_MODEL_PATH", "amd/Qwen3.5-397B-A17B-MXFP4")
 
 TP_SIZE = int(os.environ.get("AGENTIC_TP", "8"))
 EP_SIZE = int(os.environ.get("AGENTIC_EP_SIZE", str(TP_SIZE)))
@@ -112,11 +111,12 @@ COMMON_ENV = {
 
 
 def _trace_cache_dir() -> str:
-    """Prefer the runners' shared /data mount so the corpus is converted once."""
-    shared = "/data/agentic-traces"
-    parent = os.path.dirname(shared)
-    if os.path.isdir(parent) and os.access(parent, os.W_OK):
-        return shared
+    """Prefer /sgl-data, the runners' persistent mount, so this converts once."""
+    override = os.environ.get("AGENTIC_TRACE_CACHE_DIR")
+    if override:
+        return override
+    if os.path.isdir("/sgl-data") and os.access("/sgl-data", os.W_OK):
+        return "/sgl-data/agentic-traces"
     return os.path.join(tempfile.gettempdir(), "sglang-agentic-traces")
 
 
@@ -347,9 +347,7 @@ class TestQwen35Mxfp4AgenticMtpMI35x(CustomTestCase):
         # regression guard -- this config only completes if MTP, the HiCache CPU
         # tier and the aiter MXFP4 path all survive a long-context agentic
         # workload. A turn that errored out never reaches the metrics.
-        self.assertGreater(
-            result.get("completed", 0), 0, "No agentic turns completed"
-        )
+        self.assertGreater(result.get("completed", 0), 0, "No agentic turns completed")
         self.assertGreater(
             result.get("output_throughput", 0), 0, "No output tokens generated"
         )
