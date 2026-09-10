@@ -46,9 +46,11 @@ def test_strided_gather_zero_fills_tail(dtype):
         n = min(int(seq_lens[b]), topk)
         indices[b, :n] = torch.arange(n, device=device, dtype=torch.int32)
     cu_strided = torch.arange(batch + 1, device=device, dtype=torch.int32) * stride
+    # the scratch is always in the compute dtype (bf16); an FP8 pool is dequantized on the way in
+    k_scale, v_scale = (1.0, 1.0) if dtype == torch.bfloat16 else (0.5, 2.0)
     packed_k = torch.full(
         (batch * stride, heads, dim), float("nan"), device=device, dtype=torch.bfloat16
-    ).to(dtype)
+    )
     packed_v = packed_k.clone()
 
     qwen_sparse_kv_extraction_compact_triton(
@@ -64,6 +66,8 @@ def test_strided_gather_zero_fills_tail(dtype):
         batch,
         topk,
         zero_fill_cols=stride,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
     pk, pv = (
         packed_k.float().view(batch, stride, heads, dim),
@@ -73,8 +77,12 @@ def test_strided_gather_zero_fills_tail(dtype):
     for b in range(batch):
         n = min(int(seq_lens[b]), topk)
         slots = req_to_token[b, :n].long()
-        torch.testing.assert_close(pk[b, :n], k_pool[slots].float())
-        torch.testing.assert_close(pv[b, :n], v_pool[slots].float())
+        torch.testing.assert_close(
+            pk[b, :n], (k_pool[slots].float() * k_scale).to(torch.bfloat16).float()
+        )
+        torch.testing.assert_close(
+            pv[b, :n], (v_pool[slots].float() * v_scale).to(torch.bfloat16).float()
+        )
         assert (pk[b, n:] == 0).all() and (pv[b, n:] == 0).all()
 
 
