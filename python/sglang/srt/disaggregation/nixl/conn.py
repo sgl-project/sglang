@@ -962,6 +962,43 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         peer_info.kv_xfer_segments = prepared_segments
 
+    def _pp_layer_offset_dst_indices(
+        self, *, peer_info: KVArgsRegisterInfo, n_src: int, n_dst: int
+    ) -> Optional[List[int]]:
+        # Index view of _mla_kv_entry_span_with_pp: the prepped path pre-registers
+        # descriptor lists, so it needs entry indices where the non-prepped path takes
+        # sliced pointers. None keeps the caller on its layer-id pairing.
+        if self.pp_size <= 1 or n_src == n_dst:
+            return None
+        if self.kv_args.kv_layer_ids or peer_info.dst_kv_layer_ids:
+            return None
+        # Only a plain MLA pool is one region per layer: MHA registers a K block then a
+        # V block, the hybrid pool is dense over full-attention layers, and compressed
+        # MLA groups regions by compression bucket.
+        if not self.is_mla_backend or self.is_hybrid_mla_backend:
+            return None
+        if self.kv_args.mla_compression_ratios:
+            return None
+
+        start, end = self._mla_kv_entry_span_with_pp(n_src)
+        # Bootstrap admits a peer running our pp or 1, so a peer that does not cover the
+        # span is a matched-pp stage above 0, whose entries start at its own index 0.
+        if end > n_dst:
+            return None
+
+        indices = list(range(start, end))
+        src_item_lens = list(self.kv_args.kv_item_lens)
+        dst_item_lens = [peer_info.dst_kv_item_lens[j] for j in indices]
+        if src_item_lens != dst_item_lens:
+            # Disagreeing cell sizes mean the peers did not build the same KV geometry;
+            # writing anyway would silently corrupt the peer's pool.
+            raise RuntimeError(
+                "PP-heterogeneous MLA transfer: decode KV cell geometry differs from "
+                f"prefill over layers [{start}, {end}): prefill item_lens="
+                f"{src_item_lens}, decode item_lens={dst_item_lens}"
+            )
+        return indices
+
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
@@ -1045,14 +1082,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 else self._num_slots_src
             )
 
-            pairs = build_transfer_entry_pairs(
-                self.kv_args.kv_layer_ids,
-                peer_info.dst_kv_layer_ids,
-                n_src,
-                n_dst,
-                allow_positional_fallback=self.pp_size == 1,
+            dst_indices = self._pp_layer_offset_dst_indices(
+                peer_info=peer_info, n_src=n_src, n_dst=n_dst
             )
-            dst_indices = [j for _, j in pairs]
+            if dst_indices is None:
+                pairs = build_transfer_entry_pairs(
+                    self.kv_args.kv_layer_ids,
+                    peer_info.dst_kv_layer_ids,
+                    n_src,
+                    n_dst,
+                    allow_positional_fallback=self.pp_size == 1,
+                )
+                dst_indices = [j for _, j in pairs]
             dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
             dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_kv_data_lens = [

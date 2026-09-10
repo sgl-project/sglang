@@ -986,11 +986,17 @@ class CommonKVManager(BaseKVManager):
             )
 
         # Regular MLA PP slicing
-        start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
         # Decode pp size should be equal to prefill pp size or 1
+        start_layer, end_layer = self._mla_kv_entry_span_with_pp(len(src_kv_ptrs))
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
+
+    def _mla_kv_entry_span_with_pp(self, n_src: int) -> Tuple[int, int]:
+        # A plain MLA pool registers one region per layer ascending, addressed as
+        # layer_id - start_layer, so this stage occupies [start, start + n_src) of a
+        # peer that registered the whole model. Pointer view: get_mla_kv_ptrs_with_pp.
+        start_layer = self.kv_args.prefill_start_layer
+        return start_layer, start_layer + n_src
 
     def _mla_slice_ptrs_for_pp(
         self,
