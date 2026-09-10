@@ -17,6 +17,134 @@ _FLASHINFER_TIE_BREAK_VALUES = {
 }
 
 
+_TRITON_GATHER = None
+
+
+def _get_triton_gather():
+    """Fuse clamp + gather + mask into one kernel (5 launches otherwise)."""
+    global _TRITON_GATHER
+    if _TRITON_GATHER is None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _k(
+            idx_ptr, tab_ptr, out_ptr, width, tab_s0, K: tl.constexpr, BLK: tl.constexpr
+        ):
+            row = tl.program_id(0)
+            off = tl.program_id(1) * BLK + tl.arange(0, BLK)
+            m = off < K
+            i = tl.load(idx_ptr + row * K + off, mask=m, other=-1)
+            valid = i >= 0
+            j = tl.minimum(tl.maximum(i, 0), width - 1)
+            v = tl.load(
+                tab_ptr + row.to(tl.int64) * tab_s0 + j.to(tl.int64),
+                mask=m & valid,
+                other=0,
+            )
+            tl.store(out_ptr + row * K + off, tl.where(valid, v, -1), mask=m)
+
+        def run(idx, tab, width, out):
+            # width bounds the index; tab.stride(0) addresses the row. They are
+            # equal only when tab is contiguous, which is not guaranteed here.
+            BLK = 256
+            _k[(idx.shape[0], triton.cdiv(idx.shape[1], BLK))](
+                idx, tab, out, width, tab.stride(0), K=idx.shape[1], BLK=BLK
+            )
+            return out
+
+        _TRITON_GATHER = run
+    return _TRITON_GATHER
+
+
+_AITER_TOPK_CACHE: Optional[bool] = None
+
+
+def _aiter_topk_available() -> bool:
+    global _AITER_TOPK_CACHE
+    if _AITER_TOPK_CACHE is None:
+        try:
+            from sglang.srt.utils import is_hip
+
+            if not is_hip():
+                _AITER_TOPK_CACHE = False
+            else:
+                import aiter  # noqa: F401
+
+                # Probe the exact entry used; importing anything else from
+                # aiter.ops.topk would raise the required aiter version.
+                _AITER_TOPK_CACHE = hasattr(aiter, "top_k_per_row_decode")
+        except Exception:
+            _AITER_TOPK_CACHE = False
+    return _AITER_TOPK_CACHE
+
+
+def _aiter_paged_topk_transform(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    page_table_1: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor],
+    attn_metadata,
+) -> Optional[torch.Tensor]:
+    """ROCm: route DSA paged top-k through aiter's one-block kernel.
+
+    sgl_kernel's topk_transform_decode_kernel launches one workgroup per query
+    row (topk.hip: `grid = dim3{B}`), so at decode it runs 8-16 workgroups on a
+    256-CU part. aiter's one-block kernel does the same work with a wider radix
+    (11-12 bits vs 8, so 3 passes instead of 4); measured 3.3-3.9x faster on
+    MI355X at the shapes this path sees.
+
+    Returns None (falling back to sgl_kernel) for any shape not covered.
+    """
+    if not _aiter_topk_available():
+        return None
+    if logits.dtype != torch.float32:
+        return None
+    # One page-table row per logits row; ragged rows are not covered.
+    if page_table_1.shape[0] != logits.shape[0] or row_starts is not None:
+        return None
+
+    seq_lens = getattr(attn_metadata, "cache_seqlens_int32", None)
+    extend = getattr(attn_metadata, "dsa_extend_seq_lens_list", None)
+    if seq_lens is None or seq_lens.numel() == 0 or not extend:
+        return None
+    num_rows = logits.shape[0]
+    batch = seq_lens.shape[0]
+    if batch == 0:
+        return None
+    # Same derivation the indexer uses (dsa/dsa_indexer.py): sum, not len --
+    # the two metadata builders disagree on the layout ([1]*bs*n under capture,
+    # [n]*bs eager) but agree on the sum. num_rows == batch * next_n then
+    # rejects the ragged expansions this mapping does not cover.
+    next_n = sum(extend) // batch
+    if next_n < 1 or num_rows != batch * next_n or lengths.shape[0] != num_rows:
+        return None
+
+    width = page_table_1.shape[1]
+    if width <= 0:
+        return None
+
+    import aiter
+
+    # Bound selection by the page-table width; the gather has no other limit.
+    eff_seq_lens = torch.clamp(seq_lens.to(torch.int32), max=width)
+
+    indices = torch.empty((num_rows, topk), dtype=torch.int32, device=logits.device)
+    aiter.top_k_per_row_decode(
+        logits,
+        next_n,
+        eff_seq_lens,
+        indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        topk,
+    )
+    out = torch.empty_like(indices)
+    return _get_triton_gather()(indices, page_table_1, width, out)
+
+
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
     PAGED = auto()
@@ -165,6 +293,11 @@ class DSATopKBackend(Enum):
                     if batch_idx_list is not None
                     else attn_metadata.page_table_1
                 )
+                _aiter_out = _aiter_paged_topk_transform(
+                    logits, lengths, page_table_size_1, topk, row_starts, attn_metadata
+                )
+                if _aiter_out is not None:
+                    return _aiter_out
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
