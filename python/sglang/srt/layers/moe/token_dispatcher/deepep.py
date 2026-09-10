@@ -502,9 +502,6 @@ class _DeepEPDispatcherImplBase:
                 supports_mx = self.dispatch_mode == DeepEPMode.NORMAL
             elif deep_use_mode == "alltoall":
                 supports_mx = False
-            elif deep_use_mode == "allgather":
-                # Normal uses the library's global switch; LL uses default LL.
-                return
             else:
                 supports_mx = False
             if not supports_mx:
@@ -624,10 +621,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # `handle` as a member variable works.
 
         extra_kwargs = {}
-        if (
-            _is_npu
-            and os.environ.get("DEEP_USE_MODE", "default").lower() != "allgather"
-        ):
+        if _is_npu:
             # Normal dispatch uses separate MX flags; use_fp8 requests
             # per-token FP8 rather than E8M0 block-scaled MXFP8.
             if self.deepep_output_dtype == DispatcherOutputDtype.MXFP8:
