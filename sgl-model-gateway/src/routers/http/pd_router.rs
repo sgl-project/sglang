@@ -523,8 +523,8 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        load_guards: [WorkerLoadGuard; 2],
     ) -> Response {
         let status = res.status();
 
@@ -567,8 +567,8 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
                 decode,
+                load_guards,
             )
         } else {
             // Handle non-streaming error response
@@ -652,12 +652,13 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Count both selected workers before dispatch so load-aware policies can
+        // observe concurrent streaming requests. Streaming responses transfer
+        // these guards to the response body below.
+        let load_guards = [
+            WorkerLoadGuard::new(prefill.clone(), headers),
+            WorkerLoadGuard::new(decode.clone(), headers),
+        ];
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -817,7 +818,7 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode, load_guards)
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
@@ -868,8 +869,8 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
+                        load_guards,
                     )
                 } else {
                     // Non-streaming response
@@ -1108,8 +1109,8 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        load_guards: [WorkerLoadGuard; 2],
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1198,11 +1199,6 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
-
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
@@ -1210,7 +1206,7 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, guards)
+        AttachedBody::wrap_response(response, load_guards)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1715,8 +1711,86 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use axum::{extract::State, routing::post, Router};
+    use tokio::{
+        net::TcpListener,
+        sync::Notify,
+        task::JoinHandle,
+        time::{timeout, Duration},
+    };
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+
+    #[derive(Clone)]
+    struct DelayedResponseState {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        status: StatusCode,
+        content_type: &'static str,
+        body: &'static str,
+    }
+
+    struct DelayedTestServer {
+        base_url: String,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for DelayedTestServer {
+        fn drop(&mut self) {
+            self.release.notify_one();
+            self.task.abort();
+        }
+    }
+
+    async fn delayed_response(State(state): State<DelayedResponseState>) -> Response {
+        state.started.notify_one();
+        state.release.notified().await;
+
+        let mut response = Response::new(Body::from(state.body));
+        *response.status_mut() = state.status;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static(state.content_type));
+        response
+    }
+
+    async fn spawn_delayed_test_server(
+        status: StatusCode,
+        content_type: &'static str,
+        body: &'static str,
+    ) -> DelayedTestServer {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("read test server address");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let state = DelayedResponseState {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            status,
+            content_type,
+            body,
+        };
+        let app = Router::new()
+            .route("/v1/completions", post(delayed_response))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server failed");
+        });
+
+        DelayedTestServer {
+            base_url: format!("http://{address}"),
+            started,
+            release,
+            task,
+        }
+    }
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1958,68 +2032,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_streaming_load_tracking() {
-        use futures_util::StreamExt;
-        use tokio::time::{sleep, Duration};
-
-        let router = create_test_pd_router();
-
-        let prefill_worker = create_test_worker(
-            "http://prefill".to_string(),
+    async fn test_streaming_load_is_visible_before_upstream_response() {
+        let prefill_server =
+            spawn_delayed_test_server(StatusCode::OK, "application/json", "{}").await;
+        let decode_server =
+            spawn_delayed_test_server(StatusCode::OK, "text/event-stream", "data: [DONE]\n\n")
+                .await;
+        let router = Arc::new(create_test_pd_router());
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            prefill_server.base_url.clone(),
             WorkerType::Prefill {
                 bootstrap_port: None,
             },
             true,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            decode_server.base_url.clone(),
+            WorkerType::Decode,
+            true,
+        ));
 
-        router.worker_registry.register(Arc::from(prefill_worker));
-        router.worker_registry.register(Arc::from(decode_worker));
+        let dispatch_router = Arc::clone(&router);
+        let dispatch_prefill = Arc::clone(&prefill);
+        let dispatch_decode = Arc::clone(&decode);
+        let dispatch_task = tokio::spawn(async move {
+            dispatch_router
+                .execute_dual_dispatch_internal(
+                    None,
+                    json!({
+                        "model": "test-model",
+                        "prompt": "shared prefix",
+                        "max_tokens": 1,
+                        "stream": true,
+                    }),
+                    PDRequestContext {
+                        route: "/v1/completions",
+                        batch_size: None,
+                        is_stream: true,
+                        return_logprob: false,
+                        request_text: None,
+                        model_id: None,
+                        headers: None,
+                    },
+                    dispatch_prefill,
+                    dispatch_decode,
+                    Instant::now(),
+                )
+                .await
+        });
 
-        let prefill_workers = router.worker_registry.get_prefill_workers();
-        let decode_workers = router.worker_registry.get_decode_workers();
-
-        let prefill_ref = prefill_workers[0].clone();
-        let decode_ref = decode_workers[0].clone();
-
-        assert_eq!(prefill_ref.load(), 0);
-        assert_eq!(decode_ref.load(), 0);
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
-
-        {
-            let response = router.create_streaming_response(
-                stream.map(Ok),
-                StatusCode::OK,
-                None,
-                false,
-                None,
-                prefill_ref.clone(),
-                decode_ref.clone(),
+        timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                prefill_server.started.notified(),
+                decode_server.started.notified()
             );
+        })
+        .await
+        .expect("upstream requests did not arrive");
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
-            assert_eq!(decode_ref.load(), 1);
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 1);
 
-            tx.send(bytes::Bytes::from("test data")).unwrap();
+        prefill_server.release.notify_one();
+        decode_server.release.notify_one();
+        let response = timeout(Duration::from_secs(5), dispatch_task)
+            .await
+            .expect("PD dispatch timed out")
+            .expect("PD dispatch task panicked");
 
-            sleep(Duration::from_millis(10)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 1);
 
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
-            assert_eq!(decode_ref.load(), 1);
-
-            drop(tx);
-
-            // Response (and its body with guards) dropped here
-            drop(response);
-        }
-
-        // Guards dropped when response dropped
-        assert_eq!(prefill_ref.load(), 0);
-        assert_eq!(decode_ref.load(), 0);
+        drop(response);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
     }
 }
