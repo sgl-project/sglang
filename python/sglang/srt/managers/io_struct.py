@@ -79,6 +79,10 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of parallel samples (``n``) accepted per request. See
+# GenerateReqInput._handle_parallel_sampling for why this bound exists.
+MAX_PARALLEL_SAMPLE_NUM = 1024
+
 
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for single-request IPC payloads."""
@@ -501,6 +505,26 @@ class GenerateReqInput:
                     )
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
+
+        # Bound the per-request fan-out. Without a cap, a single tiny request
+        # with a huge ``n`` materializes one per-sample sub-object plus one
+        # request state (ReqState / asyncio.Event) per rid in the tokenizer
+        # manager, letting one HTTP request stall the event loop for minutes
+        # and exhaust host memory (DoS). 1024 parallel samples far exceeds any
+        # legitimate serving configuration; requests above it are rejected
+        # before any expansion happens.
+        if not isinstance(self.parallel_sample_num, int) or isinstance(
+            self.parallel_sample_num, bool
+        ):
+            raise ValueError(
+                "n (parallel sample num) must be an integer, got "
+                f"{self.parallel_sample_num!r}."
+            )
+        if not 1 <= self.parallel_sample_num <= MAX_PARALLEL_SAMPLE_NUM:
+            raise ValueError(
+                f"n (parallel sample num) must be in [1, {MAX_PARALLEL_SAMPLE_NUM}], "
+                f"got {self.parallel_sample_num}."
+            )
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
