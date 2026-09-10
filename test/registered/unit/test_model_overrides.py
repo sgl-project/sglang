@@ -36,6 +36,7 @@ from sglang.srt.runtime_context import (
     override_platform,
     reset_context,
 )
+from sglang.srt.server_args import _declared_default
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -1613,14 +1614,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
             _deepseek_v4_overrides,
         )
-        from sglang.srt.server_args import ServerArgs
 
         hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
 
         def _args(**kw):
             defaults = dict(
                 device="cuda",
-                swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
+                swa_full_tokens_ratio=_declared_default("swa_full_tokens_ratio"),
                 moe_a2a_backend="none",
                 moe_runner_backend="auto",
                 _model_config=SimpleNamespace(is_fp4_experts=True, nvfp4_moe_meta=None),
