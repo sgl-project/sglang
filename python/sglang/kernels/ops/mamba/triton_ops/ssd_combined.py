@@ -25,6 +25,33 @@ def is_int_pow_2(n):
     return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0
 
 
+def _track_states_at(
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    states,
+    cu_seqlens,
+    initial_states,
+    track_seq_idx,
+    track_end_locs,
+):
+    starts = cu_seqlens[track_seq_idx]
+    ends = track_end_locs.to(device=starts.device, dtype=starts.dtype)
+    bounds = torch.stack([starts, ends], dim=1).flatten().contiguous()
+    if initial_states is not None:
+        initial_states = initial_states[track_seq_idx].repeat_interleave(2, dim=0)[:-1]
+    return chunk_state_varlen(
+        B.squeeze(0),
+        x.squeeze(0),
+        dt.squeeze(0),
+        dA_cumsum.squeeze(0),
+        bounds,
+        states.squeeze(0),
+        initial_states=initial_states,
+    )[::2].unsqueeze(0)
+
+
 def _mamba_chunk_scan_combined_fwd(
     x,
     dt,
@@ -44,6 +71,8 @@ def _mamba_chunk_scan_combined_fwd(
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
     out=None,
+    track_seq_idx=None,
+    track_end_locs=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     batch, seqlen, nheads, headdim = x.shape
@@ -175,7 +204,24 @@ def _mamba_chunk_scan_combined_fwd(
             states.squeeze(0),
             initial_states=initial_states,
         )
-        return out_x, dt, dA_cumsum, states, final_states, varlen_states
+        track_states = None
+        if (
+            track_seq_idx is not None
+            and track_end_locs is not None
+            and track_end_locs.numel() > 0
+        ):
+            track_states = _track_states_at(
+                B,
+                x,
+                dt,
+                dA_cumsum,
+                states,
+                cu_seqlens,
+                initial_states,
+                track_seq_idx,
+                track_end_locs,
+            )
+        return out_x, dt, dA_cumsum, states, final_states, varlen_states, track_states
 
 
 def mamba_chunk_scan_combined(
@@ -200,6 +246,9 @@ def mamba_chunk_scan_combined(
     return_varlen_states=False,
     return_intermediate_states=False,
     state_dtype=None,
+    return_track_states=False,
+    track_seq_idx=None,
+    track_end_locs=None,
 ):
     """
     Argument:
@@ -246,8 +295,17 @@ def mamba_chunk_scan_combined(
             dt_limit=dt_limit,
             out=out,
             state_dtype=state_dtype,
+            track_seq_idx=track_seq_idx,
+            track_end_locs=track_end_locs,
         )
     )
+    if return_track_states:
+        assert return_varlen_states, (
+            "return_track_states requires return_varlen_states (cu_seqlens mode)"
+        )
+        # `states` rides along: a tracked position on the grid is read from it
+        # directly, which stays bit-exact against a recompute-free run.
+        return states, rest[0], rest[1]
     if return_intermediate_states:
         if return_varlen_states:
             varlen_states = rest[0]
