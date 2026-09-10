@@ -47,8 +47,8 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_dsv4_eagle_verify_cuda_graph_case,
 )
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -444,8 +444,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
                     envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(False),
                     mock.patch(
-                        "sglang.srt.layers.attention.deepseek_v4_backend._is_sm120",
-                        False,
+                        "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                        return_value=SimpleNamespace(is_sm120=False),
                     ),
                 ):
                     backend.prepare_prefill_shared_read_snapshot(
@@ -490,7 +490,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
             envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
             mock.patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm120", False
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                return_value=SimpleNamespace(is_sm120=False),
             ),
             self.assertRaisesRegex(RuntimeError, "snapshot failed"),
         ):
@@ -602,6 +603,34 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 replay_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
+
+    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        schedule = SimpleNamespace(
+            max_prefill_tokens=16384,
+            chunked_prefill_size=4096,
+            max_running_requests=256,
+        )
+        spec = SimpleNamespace(
+            speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
+        )
+        model_runner = SimpleNamespace()
+        with (
+            mock.patch.object(trtllm, "get_schedule", return_value=schedule),
+            mock.patch.object(trtllm, "get_spec", return_value=spec),
+            mock.patch.object(trtllm, "max_prefill_buffer_tokens", return_value=4096),
+        ):
+            # Prefill chunk / max_prefill_tokens dominates.
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 16384)
+            # Decode rows = requests x draft tokens dominate.
+            schedule.max_running_requests = 8192
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
+
+        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
+            trtllm._check_trtllm_query_rows(64)
+            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
+                trtllm._check_trtllm_query_rows(65)
 
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (

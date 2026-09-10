@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 def _quant(name: str):
@@ -158,6 +158,55 @@ class TestDeepseekV2Gate(_FusionGateCase):
             get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
         )
         self.assertIsNone(self._reason(DeepseekV2ForCausalLM, self._config(), matched))
+
+    def test_hopper_modelopt_fp4_marlin_disables_fusion_by_default(self):
+        import sglang.srt.models.deepseek_v2 as deepseek_v2
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(
+                deepseek_v2, "is_sm90_supported", return_value=True
+            ),
+            unittest.mock.patch.object(
+                deepseek_v2,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
+        ):
+            self.assertIn(
+                "fusion off by default",
+                self._reason(
+                    DeepseekV2ForCausalLM,
+                    self._config(),
+                    _quant("modelopt_fp4"),
+                ),
+            )
+
+    def test_hopper_modelopt_fp4_marlin_can_still_be_forced(self):
+        import sglang.srt.models.deepseek_v2 as deepseek_v2
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        with (
+            unittest.mock.patch.object(
+                deepseek_v2, "is_sm90_supported", return_value=True
+            ),
+            unittest.mock.patch.object(
+                deepseek_v2,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
+        ):
+            self.assertIsNone(
+                self._reason(
+                    DeepseekV2ForCausalLM,
+                    self._config(),
+                    _quant("modelopt_fp4"),
+                )
+            )
 
 
 class TestGlmMoeLiteGate(_FusionGateCase):
@@ -332,18 +381,9 @@ class TestBailingMoeV3Gate(_FusionGateCase):
             vocab_size=32000,
             hidden_size=4096,
         )
-        parallel = SimpleNamespace(
-            tp_size=1,
-            moe_ep_size=1,
-            config=SimpleNamespace(enable_dp_lm_head=False),
-        )
+        self._seed(enable_dp_lm_head=False)
         with (
-            unittest.mock.patch.object(
-                bailing_moe_nextn, "get_parallel", return_value=parallel
-            ),
-            unittest.mock.patch.object(
-                bailing_moe_v3, "get_parallel", return_value=parallel
-            ),
+            get_parallel().override(tp_size=1, moe_ep_size=1),
             unittest.mock.patch.object(
                 bailing_moe_v3,
                 "is_shared_experts_fusion_disabled",
