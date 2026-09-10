@@ -377,6 +377,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> None:
         parallel = get_parallel()
         pages_per_block = get_num_page_per_block_flashmla(self.page_size)
+        # None on a static pool, whose collapsed page is already physical.
+        v2p = self.kv_index_translator.full_v2p_table
         create_mla_kv_page_table_for_dcp[
             (
                 block_kv_indices.shape[0],
@@ -389,12 +391,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             req_pool_indices,
             local_seq_lens,
             block_kv_indices,
+            v2p,
             self.req_to_token.stride(0),
             block_kv_indices.stride(0),
+            self.kv_index_translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
             PAGES_PER_BLOCK=pages_per_block,
+            HAS_V2P=v2p is not None,
         )
 
     def _create_block_kv_indices(
@@ -761,21 +766,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if self.kv_index_translator.is_translating and (
             forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         ):
-            out_cache_loc = forward_batch.out_cache_loc
-            n = out_cache_loc.shape[0]
-            dst = self.cuda_graph_out_cache_loc_kernel[:n]
-            dst.copy_(out_cache_loc)
-            # Replay-prep receives the RAW (unpadded) out_cache_loc
-            # (build_replay_fb_view), but the captured write kernel consumes the
-            # full captured tier of this buffer. Zero the tail so pad rows write
-            # to the sink (row 0) instead of stale kernel-facing locs left by
-            # earlier larger replays — a stale tail scatters pad-row garbage into
-            # live KV pages. Mirrors the runner's PaddingPolicy.ZERO on its own
-            # out_cache_loc slot.
-            self.cuda_graph_out_cache_loc_kernel[n:].zero_()
-            self._decode_kernel_loc = dst
+            # The captured kernel consumes the whole buffer, so the tail a
+            # shorter replay leaves must go to slot 0 rather than live pages.
+            self._decode_kernel_loc = self.kv_index_translator.fill_capture_write_loc(
+                out=self.cuda_graph_out_cache_loc_kernel,
+                forward_batch=forward_batch,
+                width=self.cuda_graph_out_cache_loc_kernel.numel(),
+            )
         else:
             self._decode_kernel_loc = None
+
+    def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """The loc an unfused KV scatter must write at: the capture-stable
+        buffer under a captured unified-pool decode, since the translate
+        rebinds `out_cache_loc` to a fresh tensor the graph never recorded;
+        the batch's own loc everywhere else.
+        """
+        if self._decode_kernel_loc is not None:
+            return self._decode_kernel_loc
+        return forward_batch.out_cache_loc
 
     def _resolve_fused_write_loc(
         self, forward_batch: ForwardBatch
@@ -1198,6 +1207,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             return None
         parallel = get_parallel()
+        # `loc` is WIDENED: the kernel resolves the owner rule itself, and that
+        # is also its only skip. A DCP-resolved loc never reaches here -- see
+        # the `_fused_set_kv_concat_q_fp8` gate.
+        assert not (parallel.dcp_enabled and self.kv_index_translator.is_translating), (
+            "fused fp8 KV write reached with a DCP-resolved loc"
+        )
         return set_mla_kv_concat_q_fp8(
             kv_buffer=kv_2d,
             loc=loc,
@@ -1205,8 +1220,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             cache_k_rope=k_rope_2d,
             q_nope=q_nope,
             q_rope=q_rope_3d,
-            # DCP cyclic KV sharding: virtual loc -> owner mask + loc//world
-            # (identity when attn_dcp_size == 1).
             dcp_world_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
         )
