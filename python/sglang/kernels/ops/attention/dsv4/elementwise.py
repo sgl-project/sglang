@@ -1,6 +1,8 @@
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.jit.utils import (
     cache_once,
@@ -158,6 +160,118 @@ def fused_q_norm_rope(
         module.forward(q_input, q_output, freqs_real, positions, eps)
 
 
+@triton.jit
+def _hadamard_stage_128(x, GROUPS: tl.constexpr, STRIDE: tl.constexpr):
+    pairs = tl.permute(tl.reshape(x, (GROUPS, 2, STRIDE)), (0, 2, 1))
+    left, right = tl.split(pairs)
+    joined = tl.join(left + right, left - right)
+    return tl.reshape(tl.permute(joined, (0, 2, 1)), (128,))
+
+
+@triton.jit
+def _fused_q_indexer_rope_hadamard_quant_triton_kernel(
+    q_ptr,
+    weight_ptr,
+    freqs_ptr,
+    positions_ptr,
+    q_fp8_ptr,
+    weights_out_ptr,
+    num_heads: tl.constexpr,
+    weight_scale,
+    fp8_max,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    token = row // num_heads
+    offsets = tl.arange(0, HEAD_DIM)
+    q = tl.load(q_ptr + row * HEAD_DIM + offsets).to(tl.float32)
+
+    rope_offset = offsets - (HEAD_DIM - ROPE_DIM)
+    pair = rope_offset // 2
+    safe_pair = tl.maximum(pair, 0)
+    pair_base = HEAD_DIM - ROPE_DIM + safe_pair * 2
+    q_real = tl.load(q_ptr + row * HEAD_DIM + pair_base).to(tl.float32)
+    q_imag = tl.load(q_ptr + row * HEAD_DIM + pair_base + 1).to(tl.float32)
+    position = tl.load(positions_ptr + token)
+    freq_base = (position * (ROPE_DIM // 2) + safe_pair) * 2
+    freq_real = tl.load(freqs_ptr + freq_base).to(tl.float32)
+    freq_imag = tl.load(freqs_ptr + freq_base + 1).to(tl.float32)
+    rotated = tl.where(
+        rope_offset % 2 == 0,
+        q_real * freq_real - q_imag * freq_imag,
+        q_real * freq_imag + q_imag * freq_real,
+    )
+    q = tl.where(offsets >= HEAD_DIM - ROPE_DIM, rotated, q)
+
+    q = q.to(q_ptr.dtype.element_ty).to(tl.float32)
+
+    q = _hadamard_stage_128(q, GROUPS=64, STRIDE=1)
+    q = _hadamard_stage_128(q, GROUPS=32, STRIDE=2)
+    q = _hadamard_stage_128(q, GROUPS=16, STRIDE=4)
+    q = _hadamard_stage_128(q, GROUPS=8, STRIDE=8)
+    q = _hadamard_stage_128(q, GROUPS=4, STRIDE=16)
+    q = _hadamard_stage_128(q, GROUPS=2, STRIDE=32)
+    q = _hadamard_stage_128(q, GROUPS=1, STRIDE=64)
+    q *= 0.08838834764831845
+
+    abs_q = tl.abs(q)
+    q_scale = tl.maximum(tl.max(abs_q, axis=0), 1.0e-4) / fp8_max
+    q_quant = tl.clamp(q / q_scale, -fp8_max, fp8_max)
+    tl.store(q_fp8_ptr + row * HEAD_DIM + offsets, q_quant)
+
+    weight = tl.load(weight_ptr + row).to(tl.float32)
+    tl.store(weights_out_ptr + row, weight * weight_scale * q_scale)
+
+
+def _fused_q_indexer_rope_hadamard_quant_triton(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if q_input.shape[-1] != 128:
+        raise ValueError(
+            f"DSV4 indexer head dimension must be 128, got {q_input.shape[-1]}"
+        )
+    if freqs_cis.shape[-1] != 32:
+        raise ValueError(
+            "DSV4 indexer expects 64 rotary dimensions "
+            f"(32 complex frequencies), got {2 * freqs_cis.shape[-1]}"
+        )
+
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+
+    q_input = q_input.contiguous()
+    weight = weight.contiguous()
+    freqs_real = torch.view_as_real(freqs_cis).contiguous()
+    positions = positions.contiguous()
+    fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    q_fp8 = torch.empty_like(q_input, dtype=fp8_dtype)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+
+    rows = q_input.numel() // q_input.shape[-1]
+    _fused_q_indexer_rope_hadamard_quant_triton_kernel[(rows,)](
+        q_input,
+        weight,
+        freqs_real,
+        positions,
+        q_fp8,
+        weights_out,
+        num_heads=q_input.shape[-2],
+        weight_scale=float(weight_scale),
+        fp8_max=float(fp8_max),
+        HEAD_DIM=128,
+        ROPE_DIM=64,
+        num_warps=4,
+    )
+    return q_fp8, weights_out
+
+
 def fused_q_indexer_rope_hadamard_quant(
     q_input: torch.Tensor,
     weight: torch.Tensor,
@@ -165,13 +279,31 @@ def fused_q_indexer_rope_hadamard_quant(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    rocm_op = (
+        getattr(
+            torch.ops.sgl_kernel,
+            "dsv4_fused_q_indexer_rope_hadamard_quant",
+            None,
+        )
+        if _is_hip
+        else None
+    )
+    if _is_hip and rocm_op is None:
+        return _fused_q_indexer_rope_hadamard_quant_triton(
+            q_input,
+            weight,
+            weight_scale,
+            freqs_cis,
+            positions,
+        )
+
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
     if _is_hip:
-        torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
+        rocm_op(
             q_input,
             q_fp8,
             weight,
