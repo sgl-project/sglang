@@ -27,11 +27,18 @@ def _prune_configs(configs, named_args, **kwargs):
 # The best (BLOCK_N, num_warps, num_stages) is shape- and arch-sensitive, so
 # autotune over a grid keyed on the attention shape. Benchmarked once per key
 # (a one-time stall on the first prefill of each new shape), then cached.
+#
+# On ROCm (gfx950) with Triton 3.7.0, the (BLOCK_N=128, num_warps=1,
+# num_stages=2) config compiles to a kernel that produces NaN/inf on this
+# sparse-MLA path (verified on 4x MI355X with GLM-5.2-MXFP4); exclude it there
+# so autotune can never pick the broken kernel.
+_is_hip = torch.version.hip is not None
 _AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=ns)
     for bn in (32, 64, 128)
     for w in (1, 2, 4)
     for ns in (1, 2)
+    if not (_is_hip and bn == 128 and w == 1 and ns == 2)
 ]
 
 
