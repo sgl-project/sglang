@@ -253,6 +253,7 @@ class Fp8Config(QuantizationConfig):
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
         self.dequant_fp4_to_fp8 = False
+        self.is_dsv4_fp4_experts = False
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -401,7 +402,14 @@ class Fp8Config(QuantizationConfig):
                 )
                 return fp8_method
 
-            if self.is_fp4_experts and is_npu_arch35():
+            if (
+                self.is_fp4_experts
+                and is_npu_arch35()
+                # NPUW4A4Fp4MoEMethod is DSV4-specific (deepep dispatch,
+                # swiglu_limit); other FP4-expert checkpoints fall through
+                # to Fp8MoEMethod.
+                and self.is_dsv4_fp4_experts
+            ):
                 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
                     NPUW4A4Fp4MoEMethod,
                 )
@@ -497,6 +505,19 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            if (
+                _is_npu
+                and is_npu_arch35()
+                and self.quant_config.scale_fmt != "ue8m0"
+            ):
+                # The A5 backend expects the ue8m0 weight layout installed by
+                # the arch35 load path; keep plain block-FP8 checkpoints on
+                # the generic triton backend.
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    triton_w8a8_block_fp8_linear,
+                )
+
+                self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -700,7 +721,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
-        elif _is_npu and is_npu_arch35():
+        elif _is_npu and is_npu_arch35() and self.quant_config.scale_fmt == "ue8m0":
             from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
                 process_npu_arch35_mxfp8_linear_weights,
             )
