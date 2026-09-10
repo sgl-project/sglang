@@ -50,7 +50,6 @@ class RMSNorm(nn.Module):
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)
-            and x.numel() <= 64 * x.shape[-1]
             and x.is_contiguous()
             and self.weight.is_contiguous()
         ):

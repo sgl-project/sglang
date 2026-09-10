@@ -96,6 +96,7 @@ def _router_triton_kernel(
     num_token_non_padded_ptr,
     out_weights_ptr,  # [M, K] fp32
     out_indices_ptr,  # [M, K] int32
+    out_packed_ptr,  # [M, K] int32, (id << 16) | bf16 bits of weight (HAS_PACKED)
     M,
     routed_scaling_factor,
     moe_softcapping,
@@ -117,6 +118,7 @@ def _router_triton_kernel(
     HAS_TOKEN_BIAS: tl.constexpr,
     BIAS_ALT_TOKEN_ID: tl.constexpr,
     HAS_PADDING: tl.constexpr,
+    HAS_PACKED: tl.constexpr,
     RENORMALIZE_EPSILON: tl.constexpr,
     USE_PDL: tl.constexpr,
     stride_bias,
@@ -128,6 +130,8 @@ def _router_triton_kernel(
     stride_wk,
     stride_im,
     stride_ik,
+    stride_pm,
+    stride_pk,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -291,6 +295,17 @@ def _router_triton_kernel(
     store_mask = mask_m[:, None] & mask_k_total[None, :]
     tl.store(out_w_ptr, selected_vals, mask=store_mask)
     tl.store(out_i_ptr, selected_idx, mask=store_mask)
+    if HAS_PACKED:
+        # FlashInfer routed-MoE packed entry, the exact expression of
+        # _pack_topk_ids_triton_kernel applied in-register to the values stored
+        # above (same fp32 -> bf16 rounding, same -1 sentinel on padded rows),
+        # so it is bitwise identical to the separate pack launch it replaces.
+        w_bits = selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
+        packed = (selected_idx << 16) | (w_bits & 0xFFFF)
+        out_p_ptr = (
+            out_packed_ptr + offs_m[:, None] * stride_pm + offs_k[None, :] * stride_pk
+        )
+        tl.store(out_p_ptr, packed, mask=store_mask)
 
 
 @debug_kernel_api
@@ -312,6 +327,7 @@ def moe_fused_gate(
     bias_alt_token_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     renormalize_epsilon: float = 0.0,
+    packed_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -323,6 +339,10 @@ def moe_fused_gate(
     Rows with ``input_ids == bias_alt_token_id`` use ``bias_alt`` instead of ``bias``.
     Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
+    ``packed_out`` ([M, topk] int32, optional) additionally receives the FlashInfer
+    routed-MoE form ``(id << 16) | bf16_bits(weight)`` of the returned pair, computed
+    in-register (bitwise the separate ``PackTopkIds`` kernel; the radix fast path is
+    skipped when it is requested).
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert scoring_func_int is not None, (
@@ -356,6 +376,11 @@ def moe_fused_gate(
         assert bias_alt is not None and bias_alt_token_id is not None
         assert bias is not None and bias_alt.shape == bias.shape
         assert input_ids.shape == (scores.size(0),)
+    if packed_out is not None:
+        assert packed_out.dtype == torch.int32, "packed_out must be int32"
+        assert packed_out.shape == (scores.size(0), topk), (
+            "packed_out must be [M, topk]"
+        )
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
@@ -374,6 +399,7 @@ def moe_fused_gate(
         and input_ids is None
         and num_token_non_padded is None
         and renormalize_epsilon == 0.0
+        and packed_out is None
         and bias.stride(0) == 1
     ):
         radix_args = (
@@ -423,6 +449,7 @@ def moe_fused_gate(
         num_token_non_padded,
         weights,
         indices,
+        packed_out if packed_out is not None else indices,
         M,
         float(routed_scaling_factor),
         float(moe_softcapping),
@@ -444,6 +471,7 @@ def moe_fused_gate(
         HAS_TOKEN_BIAS=input_ids is not None,
         BIAS_ALT_TOKEN_ID=bias_alt_token_id,
         HAS_PADDING=num_token_non_padded is not None,
+        HAS_PACKED=packed_out is not None,
         RENORMALIZE_EPSILON=renormalize_epsilon,
         USE_PDL=use_pdl,
         stride_bias=bias.stride(0) if bias is not None else 0,
@@ -455,6 +483,8 @@ def moe_fused_gate(
         stride_wk=weights.stride(1),
         stride_im=indices.stride(0),
         stride_ik=indices.stride(1),
+        stride_pm=packed_out.stride(0) if packed_out is not None else 0,
+        stride_pk=packed_out.stride(1) if packed_out is not None else 0,
         num_warps=num_warps,
         **extra,
     )

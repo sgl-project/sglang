@@ -942,11 +942,12 @@ def _sparse_head_overlap_disable(view: Any) -> dict:
 
 # Architectures with explicit FlashInfer AllReduce Fusion support. Keep in
 # sync with the model-side fusion implementations.
+# V4 uses the custom push plane for its small decode all-reduces and fused
+# MoE finalize. Its mHC post-split does not use the FlashInfer norm epilogue.
 _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
-        "DeepseekV4ForCausalLM",
         "GptOssForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",

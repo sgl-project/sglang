@@ -76,6 +76,11 @@ def flashinfer_trtllm_deferred_finalize_context(
         _deferred_finalize_enabled.reset(token)
 
 
+def is_deferred_finalize_enabled() -> bool:
+    """Whether the caller asked for the ``do_finalize=False`` output ABI."""
+    return _deferred_finalize_enabled.get()
+
+
 def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: torch.Tensor,
