@@ -14,6 +14,8 @@
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
 import math
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -22,11 +24,13 @@ from torch import nn
 
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.lookahead import get_forecast_state
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -99,6 +103,7 @@ class MiniCPMAttention(nn.Module):
         attn_use_rope: bool = True,
         use_output_gate: bool = False,
         attention_bias: bool = False,
+        sparda_enabled: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -127,6 +132,7 @@ class MiniCPMAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.attn_use_rope = attn_use_rope
         self.use_output_gate = use_output_gate
+        self.sparda_enabled = sparda_enabled
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -137,6 +143,19 @@ class MiniCPMAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        if self.sparda_enabled:
+            # Phase one keeps Forecast weights replicated.  This preserves the
+            # GQA mapping when num_kv_heads < TP size; the projection is small
+            # compared with the backbone and avoids changing QKV sharding.
+            self.q_future_proj = ReplicatedLinear(
+                hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=False,
+                params_dtype=torch.get_default_dtype(),
+                prefix=add_prefix("q_future_proj", prefix),
+            )
+        else:
+            self.q_future_proj = None
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -172,6 +191,41 @@ class MiniCPMAttention(nn.Module):
                 prefix=add_prefix("o_gate", prefix),
             )
 
+    def _project_forecast(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if self.q_future_proj is None:
+            return None
+
+        forecast, _ = self.q_future_proj(hidden_states)
+
+        # SparDA's indexer query is in the same positional space as the KV
+        # cache.  The official MiniCPM implementation applies RoPE to
+        # q_future independently of the regular grouped-query projections.
+        if self.attn_use_rope:
+            orig_dtype = forecast.dtype
+            forecast_fp32 = forecast.float()
+            forecast, _ = self.rotary_emb(
+                positions,
+                forecast_fp32,
+                forecast_fp32.clone(),
+            )
+            forecast = forecast.to(orig_dtype)
+
+        forecast = forecast.view(-1, self.total_num_kv_heads, self.head_dim)
+
+        # Match QKVParallelLinear's GQA partitioning.  When there are fewer KV
+        # heads than TP ranks, each rank owns a replica of one logical head.
+        tp_size = self.qkv_proj.tp_size
+        tp_rank = self.qkv_proj.tp_rank
+        if self.total_num_kv_heads >= tp_size:
+            start = tp_rank * self.num_kv_heads
+        else:
+            start = tp_rank // self.qkv_proj.num_kv_head_replicas
+        return forecast[:, start : start + self.num_kv_heads, :].contiguous()
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -187,7 +241,30 @@ class MiniCPMAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
             q, k = q.to(orig_dtype), k.to(orig_dtype)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        forecast_state = None
+        forecast_for_attention = None
+        next_forecast = None
+        if self.sparda_enabled:
+            forecast_state = get_forecast_state(forward_batch)
+            forecast_for_attention = forecast_state.for_layer(self.attn.layer_id)
+            next_forecast = self._project_forecast(positions, hidden_states)
+
+        if forecast_for_attention is None:
+            # Preserve the existing backend path for the first layer (and for
+            # all requests when SparDA is disabled).  The extra kwarg would
+            # otherwise force the tc-piecewise path through the eager adapter.
+            attn_output = self.attn(q, k, v, forward_batch)
+        else:
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                forecast_query=forecast_for_attention,
+            )
+
+        if forecast_state is not None:
+            forecast_state.publish(self.attn.layer_id, next_forecast)
 
         if self.use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)
@@ -392,6 +469,7 @@ class MiniCPMDecoderLayer(nn.Module):
                 attn_use_rope=attn_use_rope,
                 use_output_gate=attn_use_output_gate,
                 attention_bias=attention_bias,
+                sparda_enabled=getattr(config, "sparda_enabled", False),
                 prefix=add_prefix("self_attn", prefix),
             )
         elif self.mixer_type == "lightning-attn":
@@ -495,6 +573,9 @@ class MiniCPMModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        if getattr(self.config, "sparda_enabled", False):
+            get_forecast_state(forward_batch).reset()
+
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
         else:
@@ -538,6 +619,7 @@ class MiniCPMSALAForCausalLM(nn.Module):
             )
 
         self.scale_width = self.config.hidden_size / self.config.dim_model_base
+        self._sparda_indexer_loaded = False
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -620,6 +702,89 @@ class MiniCPMSALAForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        self._load_sparda_indexer_weights()
+
+    def _load_sparda_indexer_weights(self) -> None:
+        """Load Forecast projections from the standalone SparDA checkpoint."""
+        if not getattr(self.config, "sparda_enabled", False):
+            return
+        if self._sparda_indexer_loaded:
+            return
+
+        indexer_path = getattr(self.config, "sparda_indexer_path", None)
+        if not indexer_path:
+            raise ValueError(
+                "SparDA is enabled but config.sparda_indexer_path is missing."
+            )
+        path = Path(indexer_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"SparDA indexer checkpoint does not exist: {path}")
+
+        checkpoint = torch.load(path, map_location="cpu")
+        if not isinstance(checkpoint, Mapping):
+            raise ValueError(
+                f"SparDA indexer checkpoint must contain a state dict, got "
+                f"{type(checkpoint).__name__}."
+            )
+        state_dict = checkpoint
+        for key in ("state_dict", "model_state_dict", "model"):
+            nested = checkpoint.get(key)
+            if isinstance(nested, Mapping):
+                state_dict = nested
+                break
+
+        params = {
+            name: param
+            for name, param in self.named_parameters()
+            if name.endswith("q_future_proj.weight")
+        }
+        if not params:
+            raise RuntimeError(
+                "SparDA is enabled but the MiniCPM model has no q_future_proj "
+                "parameters."
+            )
+
+        normalized_state = {}
+        for name, value in state_dict.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            normalized_state[name.removeprefix("module.")] = value
+
+        missing = []
+        for name, param in params.items():
+            candidates = (
+                name,
+                name.removeprefix("model."),
+                f"model.{name}",
+            )
+            loaded_weight = next(
+                (
+                    normalized_state[candidate]
+                    for candidate in candidates
+                    if candidate in normalized_state
+                ),
+                None,
+            )
+            if loaded_weight is None:
+                missing.append(name)
+                continue
+            if tuple(param.shape) != tuple(loaded_weight.shape):
+                raise ValueError(
+                    f"SparDA indexer shape mismatch for {name}: model expects "
+                    f"{tuple(param.shape)}, checkpoint provides "
+                    f"{tuple(loaded_weight.shape)}."
+                )
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+
+        if missing:
+            raise ValueError(
+                "SparDA indexer checkpoint is missing Forecast weights: "
+                + ", ".join(missing[:4])
+                + (" ..." if len(missing) > 4 else "")
+            )
+        self._sparda_indexer_loaded = True
 
 
 class MiniCPMForCausalLM(MiniCPMSALAForCausalLM):

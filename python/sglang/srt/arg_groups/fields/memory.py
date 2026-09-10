@@ -210,6 +210,18 @@ class Memory(msgspec.Struct):
     ] = None
 
     # -------------------------------------------------------------------------
+    # Lookahead sparse attention
+    # -------------------------------------------------------------------------
+    enable_sparda: A[
+        bool,
+        "Enable SparDA-style cross-layer Forecast sparse selection.",
+    ] = False
+    sparda_indexer_path: A[
+        Optional[str],
+        "Path to the external SparDA Forecast/indexer checkpoint.",
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
