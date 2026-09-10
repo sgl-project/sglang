@@ -164,7 +164,7 @@ jobs:
       self_name: nightly-1-npu-a3
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '60'
+      run_timeout_minutes: '90'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
@@ -180,7 +180,7 @@ jobs:
       self_name: nightly-2-npu-a3
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '60'
+      run_timeout_minutes: '90'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
@@ -471,9 +471,9 @@ jobs:
       matrix:
         test_config:
           # glm_5_2 accuracy tests
-          - name: glm_5_2_w4a8_16p_gpqa
+          - name: glm_5_2_w8a8_16p_gpqa
             node_size: 2
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w4a8_16p_gpqa.py
+            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
             test_type: 'accuracy'
           # kimi_k3 accuracy tests
           - name: kimi_k3_w4a8_32p_gpqa

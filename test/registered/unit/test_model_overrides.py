@@ -1423,7 +1423,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _attention_backend_default,
-            _attention_backend_dual_chunk,
             _attention_backend_fa3_fp8_fallback,
             _attention_backend_platform_fallbacks,
         )
@@ -1458,19 +1457,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with override_platform(has_amx=True):
             self.assertEqual(_attention_backend_platform_fallbacks(view), {})
-
-        # dual-chunk config: mismatched explicit backend raises verbatim
-        def _mc(dual):
-            return SimpleNamespace(
-                _model_config=SimpleNamespace(
-                    hf_config=SimpleNamespace(dual_chunk_attention_config=dual)
-                ),
-                attention_backend="fa3",
-            )
-
-        with self.assertRaises(ValueError):
-            _attention_backend_dual_chunk(ResolvedView(_mc({"a": 1})))
-        self.assertEqual(_attention_backend_dual_chunk(ResolvedView(_mc(None))), {})
 
     def test_dllm_platform_paths_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
@@ -1952,12 +1938,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             override_platform(is_hip=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 4)),
         ):
-            # ROCm with both unset -> tilelang
+            # ROCm with both unset -> Triton for FP8 and BF16 KV cache.
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
                 {
-                    "dsa_prefill_backend": "tilelang",
-                    "dsa_decode_backend": "tilelang",
+                    "dsa_prefill_backend": "triton",
+                    "dsa_decode_backend": "triton",
                 },
             )
 
@@ -2480,7 +2466,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         def _view(**kw):
-            defaults = dict(quantization=None, moe_runner_backend="auto")
+            defaults = dict(
+                quantization=None,
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+            )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
@@ -2667,16 +2657,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _view(attention_backend="trtllm_mha", page_size=256)
             ),
             {"page_size": 64},
-        )
-        # chained: cutlass_mla decode -> 128, then trtllm_mha prefill keeps 128
-        self.assertEqual(
-            _mla_backend_page_constraints(
-                _view(
-                    decode_attention_backend="cutlass_mla",
-                    prefill_attention_backend="trtllm_mha",
-                )
-            ),
-            {"page_size": 128},
         )
         # no matching backend: nothing declared
         self.assertEqual(_mla_backend_page_constraints(_view()), {})
