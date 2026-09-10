@@ -574,7 +574,6 @@ class KimiK3MoE(nn.Module):
         self._shared_experts_attn_tp_comm = (
             get_parallel().enable_shared_experts_attn_tp
             and self._ep_a2a
-            and self._dp_attention
             and get_parallel().attn_tp_size > 1
         )
         shared_experts_tp_kwargs = {}
