@@ -88,16 +88,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
-    @property
-    def current_full_capacity(self) -> int:
-        """Capacity represented by full_available_size plus live allocations."""
-        return self.size_full
-
-    @property
-    def current_swa_capacity(self) -> int:
-        """SWA counterpart of current_full_capacity for hybrid allocators."""
-        return self.size_swa
-
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
         """Return the shared-pool donor capability, if this allocator has one."""
         return None

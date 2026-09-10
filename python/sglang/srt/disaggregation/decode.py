@@ -536,6 +536,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 EvictParams(swa_num_tokens=required - available)
             )
             available = allocator.swa_available_size()
+
         if available < required:
             return (
                 f"SWA eviction insufficient: needed={required}, "
