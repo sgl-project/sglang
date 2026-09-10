@@ -7,6 +7,7 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 
 
@@ -60,6 +61,23 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def _compute_yarn_cache_extension(
+    cache: torch.Tensor,
+    inv_freq: torch.Tensor,
+    mscale: float,
+    needed_max_pos: int,
+) -> torch.Tensor:
+    """Continue a YaRN cache with its original frequencies and amplitude."""
+    align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+    new_len = ((needed_max_pos + align) // align) * align
+    inv_freq = inv_freq.to(cache.device)
+    positions = torch.arange(
+        cache.shape[0], new_len, dtype=inv_freq.dtype, device=cache.device
+    )
+    freqs = torch.einsum("i,j->ij", positions, inv_freq)
+    return torch.cat((freqs.cos() * mscale, freqs.sin() * mscale), dim=-1)
 
 
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
@@ -133,6 +151,21 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             + inv_freq_extrapolation * inv_freq_mask
         )
         return inv_freq
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        if needed_max_pos < self.cos_sin_cache.shape[0]:
+            return
+        # YaRN takes a scaling factor, whereas the base extension passes theta.
+        # Keep max_position_embeddings unchanged: it defines the correction ramp.
+        rows = _compute_yarn_cache_extension(
+            self.cos_sin_cache,
+            self._compute_inv_freq(self.scaling_factor),
+            self.mscale,
+            needed_max_pos,
+        )
+        self.cos_sin_cache = torch.cat(
+            (self.cos_sin_cache, rows.to(self.cos_sin_cache.dtype)), dim=0
+        )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
