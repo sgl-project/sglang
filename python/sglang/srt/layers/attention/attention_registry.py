@@ -143,6 +143,15 @@ def create_dsa_backend(runner):
     return DeepseekSparseAttnBackend(runner)
 
 
+@register_attention_backend("qsa")
+def create_qsa_backend(runner):
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+
+    return QwenSparseAttnBackend(runner)
+
+
 @register_attention_backend("nsa")
 def _create_nsa_compat(runner):
     warnings.warn(
@@ -172,12 +181,15 @@ def create_dsv4_backend(runner):
         )
         return DeepseekV4HipRadixBackend(runner)
     else:
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            create_deepseek_v4_attn_backend,
         )
 
-        logger.info("Using DeepseekV4AttnBackend for dsv4 attention backend (CUDA).")
-        return DeepseekV4AttnBackend(runner)
+        backend = create_deepseek_v4_attn_backend(runner)
+        logger.info(
+            f"Using {type(backend).__name__} for dsv4 attention backend (CUDA)."
+        )
+        return backend
 
 
 @register_attention_backend("triton")
@@ -454,6 +466,15 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 )
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+            if is_qwen_qsa(runner.model_config.hf_config):
+                from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+                    QwenSparseAttnBackend,
+                )
+
+                logger.info("Using QSA for sparse full-attention layers.")
+                full_attn_backend = QwenSparseAttnBackend(runner)
         elif mamba2_config(runner.model_config) is not None:
             from sglang.srt.configs.lfm2 import Lfm2Config
             from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
