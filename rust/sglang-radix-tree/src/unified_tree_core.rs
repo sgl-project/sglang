@@ -2251,7 +2251,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         "true" | "1" | "yes" | "y"
                     )
                 });
-            if self.is_write_back && !(skip_host_duplicate_reclaim && component_type == FULL) {
+            if self.is_write_back && !skip_host_duplicate_reclaim {
                 component.reclaim_coexisting_host_values(
                     self,
                     num_tokens,
