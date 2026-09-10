@@ -13,10 +13,9 @@ from sglang.srt.layers.attention.linear.kernels.gdn_cudnn import CudnnGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import LINEAR_ATTN_KERNEL_BACKEND_CHOICES, ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
@@ -229,11 +228,11 @@ class TestCudnnGDNKernel(CustomTestCase):
                 triton_states[cache_indices],
             ),
         ):
-            torch.testing.assert_close(
-                actual,
-                expected,
-                atol=tol,
-                msg=f"cuDNN/default GDN {name} error must be < {tol}",
+            error = (actual.float() - expected.float()).abs()
+            self.assertTrue(
+                torch.all(error < tol).item(),
+                f"cuDNN/default GDN {name} element-wise error must be < {tol}; "
+                f"max error: {error.max().item()}",
             )
 
         untouched_slots = torch.tensor([0, 2], device=device)
