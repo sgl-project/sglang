@@ -248,6 +248,8 @@ class TestDsv4DeepEPMxfp8DispatcherConfig(unittest.TestCase):
 
 
 class _LowLatencyBuffer:
+    """The MXFP8-era Buffer: bool flags, no quant_mode."""
+
     def __init__(self):
         self.kwargs = None
 
@@ -259,14 +261,22 @@ class _LowLatencyBuffer:
         num_experts,
         *,
         use_fp8,
-        quant_mode=_NOT_PASSED,
+        use_ue8m0=_NOT_PASSED,
+        use_mxfp8=_NOT_PASSED,
         **kwargs,
     ):
-        self.kwargs = {"use_fp8": use_fp8, "quant_mode": quant_mode, **kwargs}
+        self.kwargs = {
+            "use_fp8": use_fp8,
+            "use_ue8m0": use_ue8m0,
+            "use_mxfp8": use_mxfp8,
+            **kwargs,
+        }
         return torch.empty(0), torch.empty(0), object(), object(), object()
 
 
-class _LegacyLowLatencyBuffer:
+class _PreMxfp8LowLatencyBuffer:
+    """A runtime predating every MXFP8 selection API."""
+
     def low_latency_dispatch(
         self,
         hidden_states,
@@ -295,7 +305,7 @@ class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
         dispatcher._get_buffer = lambda: buffer
         return dispatcher
 
-    def test_mxfp8_passes_the_kernel_quant_mode(self):
+    def test_mxfp8_requests_mxfp8_through_the_flag_pair(self):
         buffer = _LowLatencyBuffer()
         dispatcher = self._dispatcher("mx_fp8_e4m3", buffer)
 
@@ -309,25 +319,11 @@ class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
                 torch.ones(1, 1),
             )
 
-        self.assertEqual(buffer.kwargs["quant_mode"], "mx_fp8_e4m3")
-
-    def test_mxfp8_ops_strategy_uses_legacy_mxfp8_flags(self):
-        buffer = _LowLatencyBuffer()
-        dispatcher = self._dispatcher("mx_fp8_e4m3", buffer)
-
-        with (
-            patch.dict(os.environ, {"DEEP_USE_MODE": "ops"}, clear=True),
-            patch.object(deepep, "_deepep_precompile_tp_barrier"),
-        ):
-            dispatcher._dispatch_core(
-                torch.zeros(1, 64),
-                torch.zeros(1, 1, dtype=torch.int64),
-                torch.ones(1, 1),
-            )
-
         self.assertTrue(buffer.kwargs["use_fp8"])
         self.assertTrue(buffer.kwargs["use_ue8m0"])
-        self.assertEqual(buffer.kwargs["quant_mode"], "mx_fp8_e4m3")
+        # Buffer.low_latency_dispatch no longer accepts quant_mode; passing it
+        # is a TypeError against the runtime.
+        self.assertNotIn("quant_mode", buffer.kwargs)
 
     def test_mxfp8_rejects_an_unsupported_low_latency_strategy(self):
         dispatcher = self._dispatcher("mx_fp8_e4m3", _LowLatencyBuffer())
@@ -366,7 +362,7 @@ class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
 
         self.assertEqual(signature.call_count, 1)
 
-    def test_bf16_does_not_pass_a_quant_mode(self):
+    def test_bf16_passes_no_quantization_flags(self):
         buffer = _LowLatencyBuffer()
         dispatcher = self._dispatcher(None, buffer)
 
@@ -377,12 +373,13 @@ class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
                 torch.ones(1, 1),
             )
 
-        self.assertIs(buffer.kwargs["quant_mode"], _NOT_PASSED)
+        self.assertFalse(buffer.kwargs["use_fp8"])
+        self.assertIs(buffer.kwargs["use_ue8m0"], _NOT_PASSED)
 
-    def test_mxfp8_rejects_legacy_runtime_without_quant_mode(self):
-        dispatcher = self._dispatcher("mx_fp8_e4m3", _LegacyLowLatencyBuffer())
+    def test_mxfp8_rejects_legacy_runtime_without_mxfp8_support(self):
+        dispatcher = self._dispatcher("mx_fp8_e4m3", _PreMxfp8LowLatencyBuffer())
 
-        with self.assertRaisesRegex(RuntimeError, "quant_mode"):
+        with self.assertRaisesRegex(RuntimeError, "use_mxfp8"):
             dispatcher._dispatch_core(
                 torch.zeros(1, 64),
                 torch.zeros(1, 1, dtype=torch.int64),

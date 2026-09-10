@@ -789,49 +789,24 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         buffer = self._get_buffer()
-        if (
-            self.low_latency_quant_mode is not None
-            and not self._low_latency_quant_mode_runtime_checked
-        ):
-            try:
-                dispatch_signature = inspect.signature(buffer.low_latency_dispatch)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    "A5 MXFP8 DeepEP dispatch requires a recent "
-                    "sgl-kernel-npu/DeepEP runtime exposing "
-                    "low_latency_dispatch(..., quant_mode=...)."
-                ) from exc
-            if "quant_mode" not in dispatch_signature.parameters:
-                raise RuntimeError(
-                    "A5 MXFP8 DeepEP dispatch requires a recent "
-                    "sgl-kernel-npu/DeepEP runtime exposing "
-                    "low_latency_dispatch(..., quant_mode=...)."
-                )
-            self._low_latency_quant_mode_runtime_checked = True
+        self._check_low_latency_quant_runtime(buffer)
 
         use_fp8 = self.use_fp8
         low_latency_quant_kwargs = {}
         if self.low_latency_quant_mode is not None:
             deep_use_mode = os.environ.get("DEEP_USE_MODE", "default")
-            if deep_use_mode == "default":
-                low_latency_quant_kwargs = {
-                    "quant_mode": self.low_latency_quant_mode,
-                }
-            elif deep_use_mode == "ops":
-                # The ops strategy ignores quant_mode and uses the legacy
-                # flags. Pass both forms so the request is explicit and the
-                # strategy still produces E4M3 + E8M0 MXFP8 tensors.
-                use_fp8 = True
-                low_latency_quant_kwargs = {
-                    "quant_mode": self.low_latency_quant_mode,
-                    "use_ue8m0": True,
-                }
-            else:
+            if deep_use_mode == "alltoall":
                 raise RuntimeError(
-                    "A5 MXFP8 DeepEP dispatch supports only "
-                    "DEEP_USE_MODE=default or DEEP_USE_MODE=ops; got "
-                    f"{deep_use_mode!r}."
+                    "A5 MXFP8 DeepEP dispatch has no MXFP8 quantization under "
+                    "DEEP_USE_MODE=alltoall; that strategy returns per-token "
+                    "FP8 scales the MXFP8 expert GEMM cannot read."
                 )
+            # MXFP8 travels as the flag pair. Buffer.low_latency_dispatch
+            # dropped its quant_mode argument, and use_fp8 + use_ue8m0 is the
+            # documented MXFP8 alias both the default and the ops strategy
+            # resolve to E4M3 data + E8M0 block scales on A5.
+            use_fp8 = True
+            low_latency_quant_kwargs = {"use_ue8m0": True}
         _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
@@ -858,6 +833,26 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
+
+    def _check_low_latency_quant_runtime(self, buffer) -> None:
+        if (
+            self.low_latency_quant_mode is None
+            or self._low_latency_quant_mode_runtime_checked
+        ):
+            return
+        try:
+            parameters = inspect.signature(buffer.low_latency_dispatch).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        # Accept both MXFP8-era generations: the current bool flags, and the
+        # quant_mode= argument that sat between them.
+        if "use_mxfp8" not in parameters and "quant_mode" not in parameters:
+            raise RuntimeError(
+                "A5 MXFP8 DeepEP dispatch requires an sgl-kernel-npu/DeepEP "
+                "runtime exposing low_latency_dispatch(..., use_mxfp8=...) or "
+                "its quant_mode= predecessor."
+            )
+        self._low_latency_quant_mode_runtime_checked = True
 
     def combine_a(
         self,
