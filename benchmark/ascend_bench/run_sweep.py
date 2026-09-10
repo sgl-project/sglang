@@ -35,6 +35,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--filter", help="glob pattern on cell_id to run a subset")
     parser.add_argument(
+        "--run-id",
+        default=None,
+        help="resume an interrupted run: pass the run_id printed by the "
+        "original invocation to reuse its directory and skip finished cells",
+    )
+    parser.add_argument(
         "--retry-failed",
         action="store_true",
         help="re-run cells whose last status was failed_*",
@@ -71,10 +77,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
-    run_id = f"{cfg.name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    run_id = args.run_id or f"{cfg.name}-{time.strftime('%Y%m%d-%H%M%S')}"
     run_dir = Path(args.workdir) / run_id
+    resumed = (run_dir / "manifest.jsonl").exists()
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"run_id: {run_id}  workdir: {run_dir}")
+    print(f"run_id: {run_id}  workdir: {run_dir}" + ("  (resume)" if resumed else ""))
 
     probe = None if args.skip_hbm_gate else hbm_used_mb
     runner = Runner(cfg, run_dir, hbm_probe=probe, log=print)

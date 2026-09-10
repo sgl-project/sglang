@@ -39,7 +39,9 @@ python benchmark/ascend_bench/run_sweep.py \
 # inspect what would run without launching anything
 python benchmark/ascend_bench/run_sweep.py --config <cfg> --dry-run
 
-# resume an interrupted run: re-run the same command; finished cells skip
+# resume an interrupted run: pass the printed run_id again
+python benchmark/ascend_bench/run_sweep.py --config <cfg> --run-id <run_id> \
+    --workdir /mnt/ascend_bench_runs
 
 # compare two runs (regression check)
 python benchmark/ascend_bench/compare.py RUN_A RUN_B \
