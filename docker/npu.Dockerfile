@@ -55,6 +55,7 @@ RUN apt-get update -y && apt upgrade -y && apt-get install -y \
     clang \
     locales \
     ccache \
+    ffmpeg \
     openssl \
     libssl-dev \
     pkg-config \
@@ -70,14 +71,6 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-
-### Install MemFabric
-RUN ${PIP_INSTALL} memfabric-hybrid==1.0.8
-
-### Install zbal
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      ${PIP_INSTALL} memfabric-zbal==1.1.1; \
-    fi
 
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
@@ -98,6 +91,18 @@ RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG /sgl-wo
     cd /sgl-workspace/sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && \
     ${PIP_INSTALL} -v -e .[all_npu]
 
+RUN mkdir cann-custom-ops && \
+    cd cann-custom-ops && \
+    wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/custom-ops-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
+    wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/ops-transformer-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
+    unzip custom-ops-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
+    unzip ops-transformer-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
+    chmod +x *.run && \
+    ./CANN-custom_ops-none-linux.$(arch).run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
+    ./cann-ops-transformer-custom_linux-$(arch).run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
+    ${PIP_INSTALL} custom_ops-1.0-cp311-cp311-linux_$(arch).whl && \
+    cd .. && rm -rf cann-custom-ops
+
 # Install Deep-ep
 # pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
 RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
@@ -105,7 +110,7 @@ RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
     && cd sgl-kernel-npu \
     && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
     && unzip sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
-    && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl \
+    && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl attentions*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
 

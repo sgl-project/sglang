@@ -4,6 +4,7 @@
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
+from sglang.srt.runtime_context import get_parallel
 
 
 class KimiLinearConfig(PretrainedConfig):
@@ -42,6 +43,7 @@ class KimiLinearConfig(PretrainedConfig):
         use_grouped_topk: bool = True,
         num_expert_group: int = 1,
         topk_group: int = 1,
+        topk_method: str = "noaux_tc",
         q_lora_rank: int | None = None,
         kv_lora_rank: int | None = None,
         qk_nope_head_dim: int | None = None,
@@ -50,6 +52,13 @@ class KimiLinearConfig(PretrainedConfig):
         mla_use_nope: bool | None = False,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
+        attn_res_block_size: int | None = None,
+        routed_expert_hidden_size: int | None = None,
+        latent_moe_use_norm: bool = False,
+        activation_situ_beta: float | None = None,
+        activation_situ_linear_beta: float | None = None,
+        mla_use_output_gate: bool = False,
+        max_position_embeddings: int = 4096,
         **kwargs,
     ):
         self.model_type = model_type
@@ -82,6 +91,7 @@ class KimiLinearConfig(PretrainedConfig):
         self.mla_use_nope = mla_use_nope
         # moe config
         self.n_routed_experts = self.num_experts = num_experts
+        self.topk_method = topk_method
         self.num_experts_per_token = num_experts_per_token
         self.moe_renormalize = moe_renormalize
         self.num_shared_experts = num_shared_experts
@@ -95,6 +105,14 @@ class KimiLinearConfig(PretrainedConfig):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.num_nextn_predict_layers = num_nextn_predict_layers
+
+        self.attn_res_block_size = attn_res_block_size
+        self.routed_expert_hidden_size = routed_expert_hidden_size
+        self.latent_moe_use_norm = latent_moe_use_norm
+        self.activation_situ_beta = activation_situ_beta
+        self.activation_situ_linear_beta = activation_situ_linear_beta
+        self.mla_use_output_gate = mla_use_output_gate
+        self.max_position_embeddings = max_position_embeddings
 
         if linear_attn_config is not None:
             assert linear_attn_config["kda_layers"] is not None
@@ -151,10 +169,9 @@ class KimiLinearConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

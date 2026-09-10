@@ -58,6 +58,7 @@ class SparseConfig:
     top_k: int = 2048
     device_buffer_size: int = 4096
     host_to_device_ratio: int = 2
+    swap_in_block_size: int = 960
     algorithm: Optional[str] = None
     backend: Optional[str] = None
     page_size: Optional[int] = None
@@ -141,18 +142,18 @@ class SparseCoordinator:
 
         Registers the request in the state tracker to enable sparse attention processing.
         """
-        if req.req_pool_idx is not None:
-            self.states.register(req.req_pool_idx, len(req.origin_input_ids))
+        if req.kv.holds_kv:
+            self.states.register(req.kv.req_pool_idx, len(req.origin_input_ids))
 
     def on_request_end(self, req: "Req") -> None:
         """
         Handle request end event. Called when a request is completed or aborted.
         Cleans up request-specific state and releases resources.
         """
-        if req.req_pool_idx is None:
+        if not req.kv.holds_kv:
             return
 
-        self.states.clear(req.req_pool_idx)
+        self.states.clear(req.kv.req_pool_idx)
 
         # TODO: Implement request end handling
         # - Release host indices if any were allocated for offloading

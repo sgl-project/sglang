@@ -59,7 +59,7 @@ if _is_cpu and _is_cpu_amx_available:
     import sgl_kernel  # noqa: F401
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
         fused_moe_npu as fused_moe,
     )
 else:
@@ -67,7 +67,6 @@ else:
 
 
 class DeepseekMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -95,8 +94,7 @@ class DeepseekMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -108,7 +106,6 @@ class DeepseekMLP(nn.Module):
 
 
 class DeepseekMoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -228,7 +225,6 @@ class DeepseekMoE(nn.Module):
 
 
 class DeepseekAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -314,7 +310,6 @@ class DeepseekAttention(nn.Module):
 
 
 class DeepseekDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -386,7 +381,6 @@ class DeepseekDecoderLayer(nn.Module):
 
 
 class DeepseekModel(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -440,7 +434,6 @@ class DeepseekModel(nn.Module):
 
 
 class DeepseekForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

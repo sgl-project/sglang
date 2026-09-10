@@ -21,7 +21,9 @@ class LoadFormat(str, enum.Enum):
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"
+    PRESHARDED = "presharded"
     GGUF = "gguf"
+    EXPERT_PACK = "expert_pack"
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
@@ -34,6 +36,7 @@ class LoadFormat(str, enum.Enum):
     FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
     RUNAI_STREAMER = "runai_streamer"
+    IPC_CACHE = "ipc_cache"
 
 
 @dataclass
@@ -91,6 +94,11 @@ class LoadConfig:
     # ModelOpt configuration object
     modelopt_config: Optional[ModelOptConfig] = None
 
+    # Inc-related loading options
+    inc_save_path: Optional[str] = None
+    inc_tuning_iters: Optional[int] = 0
+    inc_disable_opt_rtn: Optional[bool] = None
+
     # QuantizedRL-specific options (for FlashRL-style quantization)
     rl_quant_profile: Optional[str] = (
         None  # Path to rollout quantization profile (e.g., /root/profile.7b.pt)
@@ -98,6 +106,11 @@ class LoadConfig:
 
     # For multi-layer MTP
     draft_model_idx: Optional[int] = None
+
+    # Weight cache daemon options
+    weight_cache_mode: str = "off"  # "off", "daemon", "client"
+    weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
+    fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

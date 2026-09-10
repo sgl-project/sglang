@@ -47,7 +47,7 @@ gptq_shuffle = _unsupported_kernel
 try:
     from sgl_kernel import gptq_gemm, gptq_shuffle
 
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 except Exception:
     pass
 
@@ -160,7 +160,6 @@ class GPTQMarlinLinearKernel:
             layer: torch.nn.Module, name: Optional[str], fn: Callable
         ) -> None:
             if name is not None and getattr(layer, name, None) is not None:
-
                 old_param = getattr(layer, name)
                 new_param = fn(old_param)
                 # replace the parameter with torch.nn.Parameter for TorchDynamo

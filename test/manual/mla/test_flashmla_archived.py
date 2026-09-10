@@ -35,7 +35,7 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "2",
                     "--attention-backend",
                     "flashmla",

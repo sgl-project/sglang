@@ -416,6 +416,10 @@ def is_meaningful_python_scope(name: str) -> bool:
         return True
     if normalized.startswith("vllm/"):
         return True
+    if normalized.startswith("python/tokenspeed/") or normalized.startswith(
+        "tokenspeed/"
+    ):
+        return True
     if normalized.startswith("tensorrt_llm/"):
         return True
     if normalized.startswith("sgl_kernel/"):
@@ -697,6 +701,8 @@ def choose_best_scope(scope_chain: Sequence[str]) -> Optional[str]:
             score += 48.0
         elif scope.startswith("vllm/"):
             score += 46.0
+        elif scope.startswith("python/tokenspeed/") or scope.startswith("tokenspeed/"):
+            score += 45.0
         elif scope.startswith("tensorrt_llm/"):
             score += 44.0
         elif scope.startswith("sgl_kernel/"):
@@ -744,6 +750,10 @@ def source_scope_priority(scope: Optional[str]) -> int:
         return 290 - penalty
     if normalized.startswith("vllm/"):
         return 285 - penalty
+    if normalized.startswith("python/tokenspeed/") or normalized.startswith(
+        "tokenspeed/"
+    ):
+        return 283 - penalty
     if normalized.startswith("tensorrt_llm/"):
         return 280 - penalty
     if normalized.startswith("sgl_kernel/"):

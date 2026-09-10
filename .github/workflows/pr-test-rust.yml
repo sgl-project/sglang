@@ -64,7 +64,6 @@ jobs:
           shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: true
 
       - name: Build python binding
         run: |
@@ -154,7 +153,6 @@ jobs:
           shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: true
 
       - name: Run lint
         run: |

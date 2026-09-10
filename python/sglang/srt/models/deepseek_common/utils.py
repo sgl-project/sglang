@@ -17,10 +17,10 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -47,9 +48,13 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
+# gfx1250 reuses the gfx95 (CDNA4) code paths for MXFP4 q/k-norm kernels, but its
+# aiter rope kernels (ck_tile) do not build, so it runs sglang's native rope which
+# lacks the separate cos_cache/sin_cache buffers the gfx95 fused-rope decode path
+# expects. This flag lets gfx1250 carve out of that fused-rope path.
+_is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
-
 
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
@@ -59,6 +64,7 @@ NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
+    "fa4",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "flashinfer",
@@ -69,6 +75,23 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
     "intel_xpu",
 ]
+
+
+def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
+    """Return True if proj uses block-scale fp8 quantization.
+
+    Per-channel fp8 has weight_scale shape [N, 1] (one scale per output row).
+    Block-scale fp8 has weight_scale shape [N, K/block_size] (multiple columns).
+    The fused gfx95 kernels (fused_rms_fp8_group_quant, fused_flatten_fp8_group_quant)
+    are only compatible with block-scale layouts — per-channel layers must fall
+    through to the plain bf16 path instead.
+    """
+    if not hasattr(proj, "weight") or proj.weight.dtype != torch.float8_e4m3fn:
+        return False
+    weight_scale = getattr(proj, "weight_scale", None)
+    if weight_scale is None or weight_scale.dim() != 2:
+        return False
+    return weight_scale.shape[-1] > 1
 
 
 def awq_dequantize_func():
@@ -84,15 +107,15 @@ def awq_dequantize_func():
 
         return awq_dequantize
     elif _is_hip:
-        from sglang.kernel_api_logging import debug_kernel_api
-        from sglang.srt.layers.quantization.awq.awq_triton import (
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_npu:
-        from sglang.kernel_api_logging import debug_kernel_api
-        from sglang.srt.layers.quantization.awq.awq_triton import (
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_decomposition as awq_dequantize,
         )
 
@@ -112,6 +135,38 @@ def enable_nextn_moe_bf16_cast_to_fp8(
     )
 
 
+def is_wint4afp8_or_wint4a16_config(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    if quant_config is None:
+        return False
+    if quant_config.get_name() == "w4afp8":
+        return True
+
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    if not isinstance(quant_config, CompressedTensorsConfig):
+        return False
+    linear_scheme = quant_config.target_scheme_map.get("Linear", {})
+    weight_quant = linear_scheme.get("weights")
+    input_quant = linear_scheme.get("input_activations")
+    return quant_config._is_wint4afp8(
+        weight_quant, input_quant
+    ) or quant_config._is_wint4abf16(weight_quant, input_quant)
+
+
+def quant_blocks_shared_experts_fusion(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether the quantization keeps shared experts at a higher precision than
+    the routed experts, which would require shared expert fusion to be disabled.
+    """
+    can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+    return can_fuse_fn is not None and not can_fuse_fn()
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
@@ -125,3 +180,20 @@ def _get_llama_4_scaling(
         1 + torch.floor(positions / original_max_position_embeddings)
     )
     return scaling[..., None, None]
+
+
+def tiny_router_gemm_max_tokens(
+    *, num_experts: int, hidden_size: int, weight_dtype: torch.dtype
+) -> int:
+    """Rows up to which the tiny GEMM beats cuBLAS for the router, -1 when the
+    shape or the device rules it out. Doubles as the kernel's compile-time
+    max_m, so keep it as tight as the measurements allow.
+    """
+    if not _is_cuda or _device_sm < 90 or weight_dtype != torch.bfloat16:
+        return -1
+
+    from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm
+
+    if not can_use_tiny_gemm(num_experts, hidden_size, max_m=16):
+        return -1
+    return 16

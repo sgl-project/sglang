@@ -3,15 +3,10 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_transformer_blocks
 
 
 @dataclass
 class SanaWMRefinerArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [is_blocks_or_transformer_blocks]
-    )
-
     # Core dims
     in_channels: int = 128
     out_channels: int = 128

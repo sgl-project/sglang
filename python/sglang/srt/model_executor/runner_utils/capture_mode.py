@@ -24,6 +24,12 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.runtime_context import get_flags
+from sglang.srt.utils import is_gfx1250_supported
+
 # Detect whether the current forward pass is in capture mode.
 is_capture_mode = False
 
@@ -31,9 +37,16 @@ is_capture_mode = False
 # None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
 _capture_lora_variant: Optional[str] = None
 
+# When capturing dual DSA decode graphs (dense/sparse), tracks which variant is
+# being captured. Read by the DSA indexer's capture-time skip-logits branch to
+# force k-only ("dense") vs full indexer ("sparse").
+# None = not dual-capturing; the indexer then bakes in the full-indexer path,
+# which is correct for any kv_len.
+_capture_dsa_variant: Optional[str] = None
+
 
 def get_is_capture_mode() -> bool:
-    return is_capture_mode
+    return is_capture_mode or is_in_breakable_cuda_graph()
 
 
 def compile_in_capture_mode(func):
@@ -44,7 +57,7 @@ def compile_in_capture_mode(func):
     torch.compile during cuda-graph capture without paying the
     compilation cost in the eager forward path.
     """
-    if is_capture_mode:
+    if is_capture_mode and not is_gfx1250_supported():
         return torch.compile(func)
     return func
 
@@ -59,11 +72,26 @@ def _set_capture_lora_variant(variant: Optional[str]) -> None:
     _capture_lora_variant = variant
 
 
+def get_capture_dsa_variant() -> Optional[str]:
+    """Return the DSA decode variant being captured ("dense"/"sparse"), or None
+    when dual-variant capture is not active."""
+    return _capture_dsa_variant
+
+
+def _set_capture_dsa_variant(variant: Optional[str]) -> None:
+    global _capture_dsa_variant
+    _capture_dsa_variant = variant
+
+
 @contextmanager
 def model_capture_mode():
     global is_capture_mode
+
+    # Disable dispose_tensor() during capture: freeing mid-capture records data_ptr()==0 into the graph.
     is_capture_mode = True
+    get_flags().capture.disable_dispose_tensor = True
     try:
         yield
     finally:
         is_capture_mode = False
+        get_flags().capture.disable_dispose_tensor = False

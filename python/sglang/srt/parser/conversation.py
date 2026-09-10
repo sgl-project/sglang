@@ -35,7 +35,12 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import ImageData, VideoData, read_system_prompt_from_file
+from sglang.srt.utils import (
+    GLM_MEDIA_CONFIG_KEYS,
+    ImageData,
+    VideoData,
+    read_system_prompt_from_file,
+)
 
 
 class SeparatorStyle(IntEnum):
@@ -67,6 +72,7 @@ class SeparatorStyle(IntEnum):
     GEMMA3 = auto()
     MPT = auto()
     PADDLE_OCR = auto()
+    UNLIMITED_OCR = auto()
 
 
 @dataclasses.dataclass
@@ -357,8 +363,6 @@ class Conversation:
             ret = system_prompt + self.sep
             for role, message in self.messages:
                 if message:
-                    if type(message) is tuple:
-                        message, _, _ = message
                     ret += role + message + self.sep
                 else:
                     ret += role
@@ -397,6 +401,18 @@ class Conversation:
                         ret += message + self.sep
                 else:
                     ret += role + ": "  # must be end with a space
+            return ret
+        elif self.sep_style == SeparatorStyle.UNLIMITED_OCR:
+            seps = [self.sep, self.sep2]
+            if system_prompt == "" or system_prompt is None:
+                ret = ""
+            else:
+                ret = system_prompt + seps[0]
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + message + seps[i % 2]
+                else:
+                    ret += role
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -495,9 +511,9 @@ matching_function_registry: List[Callable] = []
 def register_conv_template(template: Conversation, override: bool = False):
     """Register a new conversation template."""
     if not override:
-        assert (
-            template.name not in chat_templates
-        ), f"{template.name} has been registered."
+        assert template.name not in chat_templates, (
+            f"{template.name} has been registered."
+        )
 
     chat_templates[template.name] = template
 
@@ -643,7 +659,7 @@ def generate_chat_conv(
                         conv.modalities.append(content.modalities)
                 image_token = (
                     conv.image_token + "\n"
-                    if conv.name not in ("qwen2-vl", "moss-vl")
+                    if conv.name not in ("qwen2-vl", "moss-vl", "unlimited-ocr")
                     else conv.image_token
                 )
                 add_token_as_needed: bool = (
@@ -656,7 +672,7 @@ def generate_chat_conv(
                 video_token = conv.video_token
                 for content in message.content:
                     if content.type == "text":
-                        if num_image_url > 16:
+                        if num_image_url > 16 and conv.name not in ("unlimited-ocr",):
                             real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
@@ -670,7 +686,16 @@ def generate_chat_conv(
                         )
                     elif content.type == "video_url":
                         real_content += video_token
-                        conv.append_video(content.video_url.url)
+                        preprocess_kwargs = {
+                            key: value
+                            for key in GLM_MEDIA_CONFIG_KEYS
+                            if (value := getattr(content.video_url, key, None))
+                            is not None
+                        }
+                        conv.append_video(
+                            content.video_url.url,
+                            preprocess_kwargs=preprocess_kwargs or None,
+                        )
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
@@ -889,6 +914,22 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="unlimited-ocr",
+        system_template="{system_message}",
+        system_message="",
+        roles=("", ""),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.UNLIMITED_OCR,
+        sep="",
+        sep2="",
+        image_token="<image>",
+        image_token_at_prefix=True,
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="paddle-ocr",
         system_message="",
         system_template="<|begin_of_sentence|>{system_message}",
@@ -1076,6 +1117,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "minicpmo": "minicpmo",
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
+    "unlimited-ocr": "unlimited-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
@@ -1180,6 +1222,17 @@ def match_deepseek_ocr(model_path: str):
         return "deepseek-ocr"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_unlimited_ocr(model_path: str):
+    """Match unlimited-ocr model by path or model type."""
+    if "unlimited" in model_path.lower():
+        return "unlimited-ocr"
+    model_type = get_model_type(model_path)
+    if model_type == "unlimited-ocr":
+        return "unlimited-ocr"
+    return None
 
 
 @register_conv_template_matching_function

@@ -8,7 +8,7 @@ and contains one ``CustomTestCase`` subclass per recipe
 Each subclass launches the server with the cookbook's exact flags and
 runs two sgl-eval evaluations (https://github.com/sgl-project/sgl-eval):
 - ``test_smoke_gsm8k`` — short, cheap GSM8K pass to verify the server
-  can produce coherent math answers at all (smoke gate).
+  can produce coherent math answers at all (sanity gate).
 - ``test_aime25`` — full AIME25 accuracy run (heavy; 16 repeats default).
 
 Cookbook reference:
@@ -19,7 +19,7 @@ These are MANUAL tests (not CI). ``sgl-eval`` must be on PATH.
 Per-variant defaults (set on the Flash/Pro intermediate base classes):
     Flash recipes -> AIME25 score threshold 0.93
     Pro   recipes -> AIME25 score threshold 0.95
-GSM8K smoke threshold (0.93) is shared across Flash and Pro.
+GSM8K sanity threshold (0.93) is shared across Flash and Pro.
 
 AIME25 knobs (env vars):
     DSV4_AIME25_NUM_REPEATS       (default 16    -> --n-repeats)
@@ -30,7 +30,7 @@ AIME25 knobs (env vars):
     DSV4_AIME25_SCORE_METRIC      (default "score"; sgl-eval JSON key under "aggregate")
     DSV4_AIME25_SCORE_THRESHOLD   (default 0; >0 overrides per-variant default)
 
-GSM8K smoke knobs (env vars):
+GSM8K sanity knobs (env vars):
     DSV4_GSM8K_NUM_EXAMPLES       (default 50    -> --num-examples)
     DSV4_GSM8K_N_REPEATS          (default 1     -> --n-repeats)
     DSV4_GSM8K_TEMPERATURE        (default 0.6   -> --temperature)

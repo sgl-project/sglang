@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -19,11 +20,26 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import resize
-from sglang.multimodal_gen.utils import calculate_dimensions
+from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+    PromptToSampleBatchExpander,
+)
+from sglang.multimodal_gen.runtime.utils.vision import resize
+
+
+def _calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height, None
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -180,6 +196,24 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             None,
         ]
     )
+
+    def expand_conditioning_to_sample_batch(self, batch):
+        expander = PromptToSampleBatchExpander.from_batch(batch)
+        if expander is None:
+            return batch
+
+        for field_name in (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "prompt_attention_mask",
+            "negative_attention_mask",
+            "prompt_embeds_mask",
+            "negative_prompt_embeds_mask",
+            "prompt_seq_lens",
+            "negative_prompt_seq_lens",
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         tok_kwargs.setdefault("truncation", True)
@@ -472,7 +506,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         height = batch.height
         width = batch.width
         image_size = batch.original_condition_image_size
-        edit_width, edit_height, _ = calculate_dimensions(
+        edit_width, edit_height, _ = _calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
         )
         vae_scale_factor = self.get_vae_scale_factor()
@@ -575,7 +609,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         )
 
     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             1024 * 1024, width / height
         )
         return calculated_width, calculated_height
@@ -602,7 +636,7 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         condition_image_sizes = []
         for img in image:
             image_width, image_height = img.size
-            edit_width, edit_height, _ = calculate_dimensions(
+            edit_width, edit_height, _ = _calculate_dimensions(
                 VAE_IMAGE_SIZE, image_width / image_height
             )
             condition_image_sizes.append((edit_width, edit_height))
@@ -650,13 +684,13 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         return new_images
 
     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             CONDITION_IMAGE_SIZE, width / height
         )
         return calculated_width, calculated_height
 
     def calculate_vae_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             VAE_IMAGE_SIZE, width / height
         )
         return calculated_width, calculated_height
@@ -731,6 +765,14 @@ class QwenImageEditPlus_2511_PipelineConfig(QwenImageEditPlusPipelineConfig):
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640
     vae_precision: str = "bf16"
+    # promoting the auxiliary components regresses first-request latency
+    supports_auto_residency: bool = False
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("text_encoder", "vae"),
+        )
 
     def postprocess_cfg_noise(
         self,
@@ -783,22 +825,31 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         return cond_kwargs
 
     def _unpad_and_unpack_latents(self, latents, batch):
-        vae_scale_factor = self.get_vae_scale_factor()
         channels = self.dit_config.arch_config.in_channels
         batch_size = latents.shape[0]
-        layers = batch.num_frames
 
-        height = 2 * (int(batch.height) // (vae_scale_factor * 2))
-        width = 2 * (int(batch.width) // (vae_scale_factor * 2))
+        img_shapes = batch.img_shapes
+        generated_shapes = img_shapes[0][:-1] if img_shapes and img_shapes[0] else []
+        if not generated_shapes:
+            raise ValueError("Qwen-Image-Layered requires generated latent shapes.")
+        if len({tuple(shape) for shape in generated_shapes}) != 1:
+            raise ValueError(
+                "Qwen-Image-Layered generated latent shapes must match, got "
+                f"{generated_shapes}."
+            )
+        layers = len(generated_shapes)
+        _, latent_height, latent_width = generated_shapes[0]
+        height = 2 * int(latent_height)
+        width = 2 * int(latent_width)
 
         latents = maybe_unpad_latents(latents, batch)
         latents = latents.view(
-            batch_size, layers + 1, height // 2, width // 2, channels // 4, 2, 2
+            batch_size, layers, height // 2, width // 2, channels // 4, 2, 2
         )
         latents = latents.permute(0, 1, 4, 2, 5, 3, 6)
 
         latents = latents.reshape(
-            batch_size, layers + 1, channels // (2 * 2), height, width
+            batch_size, layers, channels // (2 * 2), height, width
         )
         latents = latents.permute(0, 2, 1, 3, 4)  # (b, c, f, h, w)
         return latents, batch_size, channels, height, width

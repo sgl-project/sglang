@@ -34,10 +34,13 @@ from .common import (
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
+    gguf_sidecar_dir,
     resolve_runai_obj_uri,
 )
+from .gguf_native import build_gguf_tokenizer, has_native_gguf_support
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
+    is_bare_tekken_checkpoint,
     patch_mistral_common_tokenizer,
     retry_without_mistral_common_kwargs,
 )
@@ -129,6 +132,15 @@ class TokenizerWarningsFilter(logging.Filter):
         return "Calling super().encode with" not in record.getMessage()
 
 
+_tokenizer_warnings_filter = TokenizerWarningsFilter()
+
+
+def _install_tokenizer_warnings_filter(tokenizer):
+    logging.getLogger(tokenizer.__class__.__module__).addFilter(
+        _tokenizer_warnings_filter
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers for get_tokenizer
 # ---------------------------------------------------------------------------
@@ -143,7 +155,8 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
 
     if check_gguf_file(tokenizer_name):
         _ensure_gguf_version()
-        kwargs["gguf_file"] = tokenizer_name
+        if gguf_sidecar_dir(tokenizer_name, "tokenizer_config.json") is None:
+            kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
@@ -164,9 +177,6 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, *args, **common_kwargs
-        )
-        logging.getLogger(tokenizer.__class__.__module__).addFilter(
-            TokenizerWarningsFilter()
         )
         return tokenizer
     except TypeError as e:
@@ -415,6 +425,7 @@ def _fix_special_tokens_pattern(tokenizer):
 
 def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     """Apply all post-load patches and return the final tokenizer."""
+    _install_tokenizer_warnings_filter(tokenizer)
     _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 
@@ -486,6 +497,17 @@ def get_tokenizer(
         if "use_fast" not in kwargs:
             kwargs["use_fast"] = True
 
+    if (
+        check_gguf_file(tokenizer_name)
+        and gguf_sidecar_dir(tokenizer_name, "tokenizer_config.json") is None
+        and has_native_gguf_support(tokenizer_name)
+    ):
+        _ensure_gguf_version()
+        tokenizer = build_gguf_tokenizer(tokenizer_name)
+        _fix_special_tokens_pattern(tokenizer)
+        attach_additional_stop_token_ids(tokenizer)
+        return patch_tokenizer(tokenizer)
+
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
     common_kwargs = dict(
@@ -496,20 +518,37 @@ def get_tokenizer(
     )
 
     try:
-        tokenizer = _auto_tokenizer_from_pretrained(
-            tokenizer_name, *args, **common_kwargs
-        )
+        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
+            from transformers.tokenization_mistral_common import (
+                MistralCommonTokenizer,
+            )
 
-        # With fastokens, the patched TokenizersBackend.from_pretrained already
-        # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
-        # the declared class (e.g. Qwen2Tokenizer) would discard that work.
-        if (
-            type(tokenizer).__name__ == _TOKENIZERS_BACKEND
-            and tokenizer_backend != "fastokens"
-        ):
-            tokenizer = _resolve_tokenizers_backend(
+            logger.info(
+                "Detected bare-tekken checkpoint %s (tekken.json, no "
+                "tokenizer.json); loading via mistral-common MistralCommonTokenizer, "
+                "ignoring tokenizer_backend=%r.",
+                tokenizer_name,
+                tokenizer_backend,
+            )
+
+            tokenizer = MistralCommonTokenizer.from_pretrained(
+                tokenizer_name, revision=tokenizer_revision
+            )
+        else:
+            tokenizer = _auto_tokenizer_from_pretrained(
                 tokenizer_name, *args, **common_kwargs
             )
+
+            # With fastokens, the patched TokenizersBackend.from_pretrained already
+            # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
+            # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+            if (
+                type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+                and tokenizer_backend != "fastokens"
+            ):
+                tokenizer = _resolve_tokenizers_backend(
+                    tokenizer_name, *args, **common_kwargs
+                )
 
         return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
     except Exception as e:

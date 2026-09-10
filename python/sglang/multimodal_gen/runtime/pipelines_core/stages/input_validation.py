@@ -5,6 +5,8 @@
 Input validation stage for diffusion pipelines.
 """
 
+from typing import Iterator
+
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
@@ -13,7 +15,9 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -23,7 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import best_output_size
+from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
 
 logger = init_logger(__name__)
 
@@ -32,6 +36,31 @@ V = StageValidators
 
 
 # TODO: since this might change sampling params after logging, should be do this beforehand?
+
+
+def _best_output_size(w, h, dw, dh, expected_area):
+    # float output size
+    ratio = w / h
+    ow = (expected_area * ratio) ** 0.5
+    oh = expected_area / ow
+
+    # process width first
+    ow1 = int(ow // dw * dw)
+    oh1 = int(expected_area / ow1 // dh * dh)
+    assert ow1 % dw == 0 and oh1 % dh == 0 and ow1 * oh1 <= expected_area
+    ratio1 = ow1 / oh1
+
+    # process height first
+    oh2 = int(oh // dh * dh)
+    ow2 = int(expected_area / oh2 // dw * dw)
+    assert oh2 % dh == 0 and ow2 % dw == 0 and ow2 * oh2 <= expected_area
+    ratio2 = ow2 / oh2
+
+    # compare ratios
+    if max(ratio / ratio1, ratio1 / ratio) < max(ratio / ratio2, ratio2 / ratio):
+        return ow1, oh1
+    else:
+        return ow2, oh2
 
 
 class InputValidationStage(PipelineStage):
@@ -47,6 +76,24 @@ class InputValidationStage(PipelineStage):
     def __init__(self, vae_image_processor=None):
         super().__init__()
         self.vae_image_processor = vae_image_processor
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+            return iter((batch,))
+
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        if num_outputs == 1:
+            return iter((batch,))
+
+        return iter(
+            expand_request_outputs(
+                batch,
+                reuse_parent_trace_ctx=True,
+                preserve_parent_metrics=True,
+            )
+        )
 
     @staticmethod
     def _calculate_dimensions_from_area(
@@ -201,7 +248,7 @@ class InputValidationStage(PipelineStage):
             )
             dh, dw = patch_size[1] * vae_stride, patch_size[2] * vae_stride
             max_area = 704 * 1280
-            ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+            ow, oh = _best_output_size(iw, ih, dw, dh, max_area)
 
             scale = max(ow / iw, oh / ih)
             img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
@@ -359,7 +406,9 @@ class InputValidationStage(PipelineStage):
             neg_prompt_state = (
                 "not set"
                 if batch.negative_prompt is None
-                else "empty" if batch.negative_prompt == "" else "set"
+                else "empty"
+                if batch.negative_prompt == ""
+                else "set"
             )
             raise ValueError(
                 f"Server was launched with --enable-cfg-parallel but this "
@@ -446,8 +495,10 @@ class InputValidationStage(PipelineStage):
             result.add_check(
                 "prompt_or_embeds",
                 None,
-                lambda _: V.string_or_list_strings(batch.prompt)
-                or V.list_not_empty(batch.prompt_embeds),
+                lambda _: (
+                    V.string_or_list_strings(batch.prompt)
+                    or V.list_not_empty(batch.prompt_embeds)
+                ),
             )
 
         if server_args.pipeline_config.task_type != ModelTaskType.I2M:

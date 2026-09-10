@@ -76,18 +76,16 @@ def run_combined_tests(
     # Set up performance parameters
     if run_perf:
         perf = performance_params
-        profile_dir = perf.profile_dir or (
-            "performance_profiles_vlms"
-            if is_vlm
-            else "performance_profiles_text_models"
+        result_dir = perf.result_dir or (
+            "performance_results_vlms" if is_vlm else "performance_results_text_models"
         )
 
         perf_runner = NightlyBenchmarkRunner(
-            profile_dir=profile_dir,
+            result_dir=result_dir,
             test_name=test_name,
             base_url=base_url,
         )
-        perf_runner.setup_profile_directory()
+        perf_runner.setup_result_directory()
     else:
         perf_runner = None
 
