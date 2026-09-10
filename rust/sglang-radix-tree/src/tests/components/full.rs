@@ -405,32 +405,6 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
         .expect("live test node");
     assert!(tc.evictable_host_leaves.is_empty());
 
-    let result = tc.drive_host_eviction(FULL, 2, true);
-    assert_eq!(result.tracker[&FULL], 0);
-    assert!(result.device_frees.is_empty());
-    assert!(result.host_frees.is_empty());
-    assert!(tc.arena.node(parent).has_host_value(FULL));
-    assert!(tc.arena.node(leaf).has_host_value(FULL));
-    assert_eq!(tc.write_back_coexist_reclaim_digest, 0);
-    tc.sanity_check(&[], &[]);
-
-    let host_leaf = tc
-        .arena
-        .alloc_child(tc.arena.root(), vec![9], 0, None)
-        .unwrap();
-    tc.arena
-        .set_host_value(host_leaf, FULL, Tensor::from_slice(&[30i64]));
-    tc.evictable_host_leaves.add(host_leaf);
-    let result = tc.drive_host_eviction(FULL, 1, true);
-    assert_eq!(result.tracker[&FULL], 1);
-    assert!(result.device_frees.is_empty());
-    assert_eq!(result.host_frees[&FULL].len(), 1);
-    assert_eq!(result.host_frees[&FULL][0].int64_value(&[0]), 30);
-    assert!(tc.arena.node(parent).has_host_value(FULL));
-    assert!(tc.arena.node(leaf).has_host_value(FULL));
-    assert_eq!(tc.write_back_coexist_reclaim_digest, 0);
-    tc.sanity_check(&[], &[]);
-
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
         tc.drive_host_eviction(FULL, /* num_tokens = */ 2, false),

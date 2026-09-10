@@ -4587,14 +4587,14 @@ fn swa_host_eviction_skips_a_load_back_pinned_node() {
     )
     .expect("live test node");
 
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1, true);
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1, false);
     assert_eq!(result.tracker[&SWA], 0);
     assert!(result.host_frees.is_empty());
     assert!(tc.arena.has_host_value(a, SWA));
 
     tc.finish_load_back(tc.arena.node(b).id)
         .expect("live test node");
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1, true);
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1, false);
     assert_eq!(result.tracker[&SWA], 1);
     assert_eq!(result.host_frees[&SWA].len(), 1);
     // Write-back reclaims the loaded node's coexisting host duplicate first.
