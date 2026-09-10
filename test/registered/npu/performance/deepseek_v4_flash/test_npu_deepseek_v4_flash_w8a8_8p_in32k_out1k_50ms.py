@@ -12,6 +12,7 @@ register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
 register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3-cann910", nightly=True)
 
 # Environment variables for DSV4-Flash single-node PD-mix deployment.
+# Kept identical to the GPQA accuracy test (test_npu_deepseek_v4_flash_w8a8_8p_gpqa.py).
 DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -20,16 +21,6 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "USE_NPU_MOE_GATING_TOP_K": "1",
-    "SGLANG_NPU_USE_MULTI_STREAM": "1",
-    # deepep
-    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "DEEPEP_HCCL_BUFFSIZE": "2048",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "35",
-    "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    # war barrier
-    "SGLANG_ENABLE_WAR_BARRIER": "1",
-    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -44,9 +35,21 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    # DSPARK
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    # deepep
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "60",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
+    # war barrier
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
 }
 
 # Server launch arguments for DSV4-Flash W8A8 single-node 8p PD-mix.
+# Kept identical to the GPQA accuracy test (test_npu_deepseek_v4_flash_w8a8_8p_gpqa.py).
 DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--page-size",
     128,
@@ -55,20 +58,20 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--trust-remote-code",
     "--device",
     "npu",
-    "--prefill-max-requests",
-    32,
-    "--max-prefill-tokens",
-    80000,
     "--attention-backend",
     "dsv4",
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.68,
+    0.62,
+    "--prefill-max-requests",
+    32,
+    "--max-prefill-tokens",
+    131072,
     "--chunked-prefill-size",
     131072,
     "--max-running-requests",
-    64,
+    96,
     "--dp-size",
     16,
     "--enable-dp-attention",
@@ -81,24 +84,25 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+    "--speculative-dspark-block-size",
+    5,
     "--skip-server-warmup",
     "--cuda-graph-bs-decode",
     1,
     2,
     4,
-    8,
-    # MTP (EAGLE) configuration.
-    "--speculative-algorithm",
-    "EAGLE",
-    "--speculative-num-steps",
-    2,
-    "--speculative-eagle-topk",
-    1,
-    "--speculative-num-draft-tokens",
-    3,
-    "--ep-size",
-    16,
-    "--disable-radix-cache",
+    5,
+    6,
 ]
 
 
