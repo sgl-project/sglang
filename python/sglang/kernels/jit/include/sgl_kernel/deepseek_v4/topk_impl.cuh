@@ -171,7 +171,7 @@ struct alignas(8) TieValue {
   float value;
   uint32_t idx;
   inline static constexpr TieValue invalid() {
-    return TieValue{-std::numeric_limits<float>::infinity(), 0xFFFFFFFFu};
+    return TieValue{-FLT_MAX, 0xFFFFFFFFu};
   }
 };
 
@@ -194,8 +194,7 @@ struct TopKProblem {
   uint32_t topk;
   uint32_t seq_len;
   uint32_t page_bits;
-  int32_t bias = 0;          // needed by ragged mode
-  uint32_t input_start = 0;  // exclude the aligned prefix in ragged mode
+  int32_t bias = 0;  // needed by ragged mode
 
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
@@ -542,11 +541,10 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL, bool kHasInputStart = false>
+  template <bool kUsePDL>
   SGL_DEVICE static void forward(const TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
-    const uint32_t input_start = kHasInputStart ? problem.input_start : 0;
 
     {
       Smem::kHistVec hist_vec;
@@ -583,21 +581,17 @@ struct TopKRegister : TopKRadixBase<12> {
       const auto vi = tx + kBlockSize * i;
       if (vi >= num_full) break;
 #pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j) {
-        if constexpr (kHasInputStart) {
-          if (vi * kVecSize + j < input_start) continue;
-        }
+      for (uint32_t j = 0; j < kVecSize; ++j)
         atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
-      }
     }
     if (tx >= kBlockSize - tail) {
       const uint32_t idx = tail_start + tx - (kBlockSize - tail);
-      if (idx >= input_start) atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(problem.in[idx])], 1);
+      atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(problem.in[idx])], 1);
     }
     __syncthreads();
 
     // Phase 2: Find the threshold bin
-    find_threshold(problem.topk, problem.seq_len - input_start, smem);
+    find_threshold(problem.topk, problem.seq_len, smem);
 
     // Phase 3: collect by two fp32 boundaries (raw indices; transform applied later)
     const auto topk = problem.topk;
@@ -605,9 +599,6 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
     const auto v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
     const auto collect = [&](float val, uint32_t idx) {
-      if constexpr (kHasInputStart) {
-        if (idx < input_start) return;
-      }
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]]
@@ -650,11 +641,10 @@ struct TopKStreaming : TopKRegister<2> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL, bool kHasInputStart = false>
+  template <bool kUsePDL>
   SGL_DEVICE static void forward(const TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
-    const uint32_t input_start = kHasInputStart ? problem.input_start : 0;
 
     {
       Smem::kHistVec hist_vec;
@@ -669,17 +659,14 @@ struct TopKStreaming : TopKRegister<2> {
     PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-      if constexpr (kHasInputStart) {
-        if (idx < input_start) return;
-      }
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
       const auto bin = extract_coarse_bin<kHistBits>(val);
       atomicAdd(&smem->histogram[bin], 1);
     });
     __syncthreads();
 
     // Phase 2: Find the threshold bin
-    find_threshold(problem.topk, problem.seq_len - input_start, smem);
+    find_threshold(problem.topk, problem.seq_len, smem);
 
     // Phase 3: Collect candidates and sort. Classify by two fp32 boundaries derived
     // from the threshold bin instead of recomputing the fp16 bin per element: an
@@ -691,9 +678,6 @@ struct TopKStreaming : TopKRegister<2> {
     const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
     const auto topk = problem.topk;
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-      if constexpr (kHasInputStart) {
-        if (idx < input_start) return;
-      }
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]] {

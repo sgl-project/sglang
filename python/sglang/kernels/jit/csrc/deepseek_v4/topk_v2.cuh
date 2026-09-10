@@ -190,9 +190,20 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
  * the cluster path (which exists to split ONE row across blocks) is never worth
  * it here.
  *
- * Round the input down for aligned vector loads, then exclude the preceding
- * columns from both histogram and candidate collection. A score sentinel cannot
- * mask them: valid scores may also be negative infinity.
+ * The window start is an arbitrary token offset, so the 16-byte vectorized load
+ * needs the row pointer rounded down to a 4-float boundary. The <= 3 elements
+ * that pulls in are columns of a preceding request -- real finite scores that
+ * would otherwise win the selection -- so they are masked in place first. That
+ * write races with nothing and needs no barrier of its own:
+ *   - one block owns the row, and a column of row `b` is read by no other row;
+ *   - the score buffer is dead once the top-k has run;
+ *   - every forward() below opens with its smem init and a `__syncthreads()`
+ *     before it reads any score. That barrier both publishes the mask to
+ *     whichever thread loads the head vector and keeps the compiler from
+ *     hoisting those loads above the store -- store and loads reach the same row
+ *     through two `__restrict__` pointers, which otherwise licenses exactly that
+ *     reordering.
+ * It must however land after the PDL wait, or the indexer overwrites it.
  */
 template <bool kPDL>
 TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams params) {
@@ -216,6 +227,15 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
 
   const auto rem = row_start % kVecSize;
   const auto score = params.scores + bx * params.score_stride;
+  if (rem != 0) {
+    // The mask has to land after the indexer has retired
+    // Otherwise it may be accidentally overwritten by DG upstream
+    device::PDLWaitPrimary<kPDL>();
+    static_assert(kVecSize <= kBlockSize, "not enough threads ");
+    if (const auto tx = threadIdx.x; tx < rem) {
+      score[row_start - rem + tx] = -std::numeric_limits<float>::max();
+    }
+  }
 
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
@@ -225,15 +245,14 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
       .seq_len = seq_len + rem,
       .page_bits = 1,  // unused
       .bias = offset - static_cast<int32_t>(rem),
-      .input_start = rem,
   };
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
   if (problem.seq_len <= Register2::kMaxSeqLen) {
-    Register2::forward<kPDL, true>(problem, &smem);
+    Register2::forward<kPDL>(problem, &smem);
   } else if (problem.seq_len <= Register4::kMaxSeqLen) {
-    Register4::forward<kPDL, true>(problem, &smem);
+    Register4::forward<kPDL>(problem, &smem);
   } else {
-    Streaming::forward<kPDL, true>(problem, &smem);
+    Streaming::forward<kPDL>(problem, &smem);
   }
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
@@ -595,6 +614,11 @@ struct TopKKernel {
   /**
    * \brief Ragged (prefill) variant of `transform`: per-row window, additive
    * output transform, no page table and no plan.
+   *
+   * `scores` is written in place: the <= 3 columns the 16-byte-aligned read base
+   * pulls in ahead of each row's window are masked out (see
+   * `topk_ragged_kernel`). They are invalid for that row, and the buffer has no
+   * consumer after this call.
    *
    * `row_starts` absent means every window starts at column 0, which is the
    * single-request case; `out_offsets` is added to every selected position and
