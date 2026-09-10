@@ -1162,3 +1162,101 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("num_steps", [0, 1, 4])
+@pytest.mark.parametrize("cfg_scale", [1.0, 4.0])
+def test_sensenova_t2i_reuses_request_noise_embedding(
+    monkeypatch, enabled, num_steps, cfg_scale
+):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_fm_modules import (
+        TimestepEmbedder,
+    )
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        NEOChatModel,
+    )
+
+    # Exercise the real generation loop and embedders without a checkpoint.
+    forward_globals = NEOChatModel.t2i_generate.__wrapped__.__globals__
+    monkeypatch.setitem(forward_globals, "prepare_flash_kv_cache", lambda *a, **k: None)
+    monkeypatch.setitem(forward_globals, "clear_flash_kv_cache", lambda *a: None)
+    timestep_embedder = TimestepEmbedder(3).eval()
+    noise_embedder = TimestepEmbedder(3).eval()
+    calls = []
+    predictions = []
+
+    def record_noise(module, args, output):
+        calls.append(args[0].clone())
+
+    hook = noise_embedder.register_forward_hook(record_noise)
+
+    def predict(image_embeds, *args, **kwargs):
+        predictions.append(image_embeds.clone())
+        return image_embeds
+
+    model = SimpleNamespace(
+        concat_time_token_num=0,
+        downsample_ratio=1,
+        patch_size=1,
+        config=SimpleNamespace(),
+        noise_scale=0.5,
+        noise_scale_mode="constant",
+        noise_scale_max_value=2.0,
+        add_noise_scale_embedding=enabled,
+        fm_modules={
+            "timestep_embedder": timestep_embedder,
+            "noise_scale_embedder": noise_embedder,
+        },
+        _notify_layer_offload_phase=lambda phase: None,
+        _build_t2i_query=lambda *a, **k: "query",
+        _build_t2i_text_inputs=lambda *a: (
+            torch.zeros(1, 1, dtype=torch.long),
+            torch.zeros(3, 1, dtype=torch.long),
+            None,
+        ),
+        _build_t2i_image_indexes=lambda h, w, *a, **k: torch.zeros(3, h * w),
+        _t2i_prefix_forward=lambda *a: (SimpleNamespace(layers=[]), torch.zeros(1)),
+        patchify=lambda x, *a, **k: x.flatten(2).transpose(1, 2).contiguous(),
+        extract_feature=lambda x, **k: torch.zeros_like(x),
+        _t2i_predict_v=predict,
+        unpatchify=lambda z, patch, h, w: z.transpose(1, 2).reshape(-1, 3, h, w),
+    )
+    try:
+        # Change both shape and noise scale to detect stale cross-request reuse.
+        for width, scale in [(2, 0.5), (3, 1.0)]:
+            model.noise_scale = scale
+            calls.clear()
+            predictions.clear()
+            output = NEOChatModel.t2i_generate(
+                model,
+                None,
+                "prompt",
+                image_size=(width, 2),
+                num_steps=num_steps,
+                cfg_scale=cfg_scale,
+                enable_timestep_shift=False,
+                batch_size=2,
+            )
+            assert output.shape == (2, 3, 2, width)
+            assert len(calls) == int(enabled and num_steps > 0)
+            branches = 2 if cfg_scale > 1 else 1
+            assert len(predictions) == num_steps * branches
+            # Compare each step with the original per-step computation.
+            with torch.no_grad():
+                for step, t in enumerate(torch.linspace(0, 1, num_steps + 1)[:-1]):
+                    expanded = t.expand(2 * 2 * width)
+                    expected = timestep_embedder(expanded).view(2, 2 * width, 3)
+                    if enabled:
+                        expected += noise_embedder(
+                            torch.full_like(expanded, scale / 2.0)
+                        ).view(2, 2 * width, 3)
+                    for branch in range(branches):
+                        torch.testing.assert_close(
+                            predictions[step * branches + branch],
+                            expected,
+                            rtol=0,
+                            atol=0,
+                        )
+    finally:
+        hook.remove()
