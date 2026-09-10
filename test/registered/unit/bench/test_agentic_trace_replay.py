@@ -7,8 +7,11 @@ recorded number of reply tokens, so the two are tested together.
 """
 
 import asyncio
+import contextlib
 import json
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -41,7 +44,7 @@ from sglang.test.agentic_trace_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=16, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _build_tokenizer() -> PreTrainedTokenizerFast:
@@ -282,38 +285,74 @@ class TestRecordStreaming(CustomTestCase):
         self.assertIn("cc-traces-weka", weka_trace_url())
 
 
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 class _ChatHandler(BaseHTTPRequestHandler):
-    """Minimal OpenAI chat endpoint that records what it was asked for."""
+    """Minimal OpenAI chat endpoint that records what it was asked for.
+
+    Replies with as many tokens as the request asked for, so a caller can check
+    both the requested decode length and how history accumulates.
+    """
 
     request_bodies: list = []
+
+    def _respond(self, payload: dict):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
+        # /v1/models is bench_serving's readiness probe; /server_info is where
+        # it reads the speculative accept length from.
+        self._respond({"data": [{"id": "dummy-model"}], "internal_states": [{}]})
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length)) if length else {}
-        self.request_bodies.append(body)
+        if "chat/completions" not in self.path:  # /flush_cache and friends
+            self._respond({})
+            return
 
-        reply = " ".join(["tok"] * body.get("max_completion_tokens", 1))
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(
-            json.dumps(
-                {
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": reply},
-                            "finish_reason": "length",
-                        }
-                    ],
-                    "usage": {"completion_tokens": len(reply.split())},
-                }
-            ).encode()
+        self.request_bodies.append(body)
+        reply = " ".join(["w1"] * body.get("max_completion_tokens", 1))
+        self._respond(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"completion_tokens": len(reply.split())},
+            }
         )
-        self.wfile.flush()
 
     def log_message(self, fmt, *args):
         return
+
+
+@contextlib.contextmanager
+def _mock_chat_server():
+    class Handler(_ChatHandler):
+        request_bodies = []
+
+    server = HTTPServer(("127.0.0.1", _free_port()), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", Handler.request_bodies
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 class TestMultiTurnDecodeLengths(CustomTestCase):
@@ -332,17 +371,7 @@ class TestMultiTurnDecodeLengths(CustomTestCase):
         )
 
     def _replay(self, prompt, output_len, output_lens):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-
-        class Handler(_ChatHandler):
-            request_bodies = []
-
-        server = HTTPServer(("127.0.0.1", port), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
+        with _mock_chat_server() as (base_url, request_bodies):
             wrapped = wrap_multi_turn_request_func(
                 async_request_openai_chat_completions, backend="sglang-oai-chat"
             )
@@ -350,7 +379,7 @@ class TestMultiTurnDecodeLengths(CustomTestCase):
                 wrapped(
                     RequestFuncInput(
                         prompt=prompt,
-                        api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
+                        api_url=f"{base_url}/v1/chat/completions",
                         prompt_len=1,
                         output_len=output_len,
                         output_lens=output_lens,
@@ -361,10 +390,7 @@ class TestMultiTurnDecodeLengths(CustomTestCase):
                     )
                 )
             )
-            return outputs, Handler.request_bodies
-        finally:
-            server.shutdown()
-            server.server_close()
+            return outputs, list(request_bodies)
 
     def test_each_round_requests_its_recorded_length(self):
         prompt = [
@@ -397,6 +423,83 @@ class TestMultiTurnDecodeLengths(CustomTestCase):
         _, bodies = self._replay(prompt, output_len=7, output_lens=[3])
 
         self.assertEqual([b["max_completion_tokens"] for b in bodies], [3, 7])
+
+
+class TestBenchServingAgenticCli(CustomTestCase):
+    """The converted trace must survive the command the AMD nightly runs.
+
+    Everything between the CLI and the request payload -- dataset loading,
+    multi-turn detection, the per-round output length hand-off -- only exists
+    as a chain, and the GPU test that depends on it cannot run without an
+    MI35x node.
+    """
+
+    def test_cli_replays_the_converted_trace_round_by_round(self):
+        tokenizer = _build_tokenizer()
+        records = [
+            _weka_record("aaa", [(64, 10), (256, 30)]),
+            _weka_record("bbb", [(128, 20), (640, 50)]),
+        ]
+        document, stats = build_agentic_trace(records, tokenizer)
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            _mock_chat_server() as (
+                base_url,
+                request_bodies,
+            ),
+        ):
+            tmp = Path(tmpdir)
+            tokenizer.save_pretrained(tmp / "tokenizer")
+            with open(tmp / "trace.json", "w", encoding="utf-8") as f:
+                json.dump(document, f)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sglang.bench_serving",
+                    "--backend",
+                    "sglang-oai-chat",
+                    "--base-url",
+                    base_url,
+                    "--model",
+                    str(tmp / "tokenizer"),
+                    "--tokenizer",
+                    str(tmp / "tokenizer"),
+                    "--dataset-name",
+                    "agentic-trace",
+                    "--dataset-path",
+                    str(tmp / "trace.json"),
+                    "--num-prompts",
+                    "2",
+                    "--max-concurrency",
+                    "1",
+                    "--warmup-requests",
+                    "0",
+                    "--disable-tqdm",
+                    "--output-file",
+                    str(tmp / "result.jsonl"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            self.assertEqual(
+                completed.returncode, 0, completed.stderr or completed.stdout
+            )
+            with open(tmp / "result.jsonl", encoding="utf-8") as f:
+                result = json.loads(f.readlines()[-1])
+            bodies = list(request_bodies)
+
+        self.assertEqual(result["completed"], stats.num_turns)
+        # Recorded reply lengths reach the wire, per round, in trace order.
+        self.assertEqual(
+            sorted(b["max_completion_tokens"] for b in bodies), [10, 20, 30, 50]
+        )
+        self.assertEqual(result["total_output_tokens"], stats.total_output_tokens)
+        # Round two of each conversation carries round one plus its reply.
+        self.assertEqual(sorted(len(b["messages"]) for b in bodies), [1, 1, 3, 3])
 
 
 if __name__ == "__main__":
