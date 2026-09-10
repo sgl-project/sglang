@@ -6,6 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+)
+
 
 @triton.jit
 def _ltx2_ada_values9_kernel(
@@ -141,14 +145,17 @@ def ltx2_ada_values9(
 ) -> tuple[torch.Tensor, ...]:
     if timestep.ndim != 3:
         raise ValueError("timestep must have shape [B, S, 9 * D]")
-    if not timestep.is_cuda or timestep.dtype != torch.bfloat16:
+    if (
+        not current_platform.tensor_on_device(timestep)
+        or timestep.dtype != torch.bfloat16
+    ):
         raise ValueError("timestep must be a CUDA bfloat16 tensor")
     if not timestep.is_contiguous():
         raise ValueError("timestep must be contiguous")
     if scale_shift_table.ndim != 2 or scale_shift_table.shape[0] != 9:
         raise ValueError("scale_shift_table must have shape [9, D]")
     if (
-        not scale_shift_table.is_cuda
+        not current_platform.tensor_on_device(scale_shift_table)
         or scale_shift_table.dtype not in (torch.bfloat16, torch.float32)
         or scale_shift_table.stride(-1) != 1
     ):
