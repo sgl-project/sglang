@@ -194,6 +194,7 @@ def _run_flashinfer_cutlass(
     runner_config: MoeRunnerConfig,
     output: Optional[torch.Tensor] = None,
     enable_alltoall: bool = False,
+    swizzled_input_sf: bool = True,
 ) -> torch.Tensor:
     flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
@@ -240,6 +241,7 @@ def _run_flashinfer_cutlass(
         fc2_expert_weights=w2_weight,
         output_dtype=output_dtype,
         input_sf=x_sf,
+        swizzled_input_sf=swizzled_input_sf,
         quant_scales=quant_scales,
         ep_size=quant_info.moe_ep_size,
         ep_rank=quant_info.moe_ep_rank,
@@ -281,13 +283,22 @@ def fused_experts_none_to_flashinfer_cutlass(
 
 @register_fused_func("flashinfer", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    # Prefill/mixed extend uses all-gather and the Standard combine path.
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return fused_experts_none_to_flashinfer_cutlass(
+            dispatch_output=dispatch_output,
+            quant_info=quant_info,
+            runner_config=runner_config,
+        )
 
     assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
@@ -296,12 +307,34 @@ def fused_experts_flashinfer_to_flashinfer_cutlass(
         "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
     )
 
+    swizzled_input_sf = True
+    x_sf = dispatch_output.hidden_states_scale
+    if quant_info.quant_type == "fp4" and x_sf is not None:
+        x = dispatch_output.hidden_states
+        hidden_size = quant_info.w2_weight.shape[1]
+        assert x.shape[1] * 2 == hidden_size, (
+            "FlashInfer A2A NVFP4 packed input must match the expert hidden size."
+        )
+        assert x_sf.shape == (x.shape[0], hidden_size // 16) and x_sf.is_contiguous(), (
+            "FlashInfer A2A NVFP4 scales must be contiguous linear [M, H / 16]."
+        )
+        # FlashInfer 0.6.18 expand reads linear scales with round_up(H, 64) / 16
+        # row stride. Preserve the old conversion for unaligned hidden sizes.
+        swizzled_input_sf = hidden_size % 64 != 0
+        if swizzled_input_sf:
+            from flashinfer import nvfp4_block_scale_interleave
+
+            dispatch_output = dispatch_output._replace(
+                hidden_states_scale=nvfp4_block_scale_interleave(x_sf)
+            )
+
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
         quant_info=quant_info,
         runner_config=runner_config,
         output=dispatch_output.moe_output,
         enable_alltoall=True,
+        swizzled_input_sf=swizzled_input_sf,
     )
     return FlashinferCombineInput(hidden_states=output)
 
