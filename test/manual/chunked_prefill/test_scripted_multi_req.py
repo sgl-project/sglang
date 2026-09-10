@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -15,14 +16,19 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 
 def _drain_flush_then_assert_no_kv_leak(t: ScriptedContext, baseline: dict):
-    for _ in range(5):
+    for _ in range(DEFAULT_MAX_STEPS):
+        if t.is_fully_idle:
+            break
         yield
+    assert t.is_fully_idle, "requests did not drain"
+    assert all(ref == 0 for ref in t.get_all_node_lock_refs().values())
     t.flush_cache()
     yield
     final = t.engine_stats()
-    assert final["kv_pool_free"] >= baseline["kv_pool_free"], (
-        f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
-    )
+    for resource in ("kv_pool_free", "req_pool_free"):
+        assert final[resource] == baseline[resource], (
+            f"{resource} changed: {baseline[resource]} -> {final[resource]}"
+        )
 
 
 class TestMultiReqBasic(ScriptedTestCase):
@@ -181,11 +187,37 @@ class TestMultiReqBasic(ScriptedTestCase):
     @staticmethod
     def _script_rid_reuse_after_finish(t: ScriptedContext):
         baseline = t.engine_stats()
-        r1 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-rid")
+        r1 = yield from t.start_req_with_retry(
+            prompt_len=16,
+            max_new_tokens=2,
+            rid="reuse-rid",
+            prompt_token=210,
+            ignore_eos=True,
+        )
+        yield from run_until(r1, lambda h: h.req is not None)
+        old_req = r1.req
         yield from run_until_finished(r1)
-        r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-rid")
+        old_chunks = r1.chunks_done
+        r2 = yield from t.start_req_with_retry(
+            prompt_len=16,
+            max_new_tokens=4,
+            rid="reuse-rid",
+            prompt_token=211,
+            ignore_eos=True,
+        )
+        assert r1.finished and not r2.finished
+        assert r2.chunks_done == 0
+        yield from run_until(r2, lambda h: h.req is not None)
+        new_req = r2.req
+        assert new_req is not old_req
         yield from run_until_finished(r2)
-        assert r1.finished and r2.finished
+        assert r1.req is None or r1.req is old_req
+        assert r1.finished
+        assert r1.chunks_done == old_chunks and r2.chunks_done == 0
+        assert isinstance(old_req.finished_reason, FINISH_LENGTH)
+        assert isinstance(new_req.finished_reason, FINISH_LENGTH)
+        assert len(old_req.output_ids) == 2
+        assert len(new_req.output_ids) == 4
         yield from _drain_flush_then_assert_no_kv_leak(t, baseline)
 
     def test_submit_pause_n_resubmit_same_rid(self):
@@ -194,14 +226,38 @@ class TestMultiReqBasic(ScriptedTestCase):
     @staticmethod
     def _script_submit_pause_n_resubmit_same_rid(t: ScriptedContext):
         baseline = t.engine_stats()
-        r1 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-200")
+        r1 = yield from t.start_req_with_retry(
+            prompt_len=16,
+            max_new_tokens=2,
+            rid="reuse-200",
+            prompt_token=220,
+            ignore_eos=True,
+        )
+        yield from run_until(r1, lambda h: h.req is not None)
+        old_req = r1.req
         yield from run_until_finished(r1)
         for _ in range(200):
             assert (1 if t.scheduler.chunked_req is not None else 0) == 0
             yield
-        r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-200")
+        r2 = yield from t.start_req_with_retry(
+            prompt_len=16,
+            max_new_tokens=4,
+            rid="reuse-200",
+            prompt_token=221,
+            ignore_eos=True,
+        )
+        assert r1.finished and not r2.finished
+        assert r2.chunks_done == 0
+        yield from run_until(r2, lambda h: h.req is not None)
+        new_req = r2.req
+        assert new_req is not old_req
         yield from run_until_finished(r2)
-        assert r2.finished
+        assert r1.req is None or r1.req is old_req
+        assert r1.finished
+        assert isinstance(old_req.finished_reason, FINISH_LENGTH)
+        assert isinstance(new_req.finished_reason, FINISH_LENGTH)
+        assert len(old_req.output_ids) == 2
+        assert len(new_req.output_ids) == 4
         yield from _drain_flush_then_assert_no_kv_leak(t, baseline)
 
     def test_submit_during_decode_of_other(self):

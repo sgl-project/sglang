@@ -4,10 +4,11 @@ import logging
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from concurrent.futures import wait
 from pathlib import Path
 from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
+import msgspec
 import zmq
 
 from sglang.srt.arg_groups.overrides import resolving_view
@@ -31,6 +32,7 @@ from sglang.test.scripted_runtime.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
@@ -44,13 +46,14 @@ RESET_DRAIN_MAX_STEPS: int = 200
 WARMUP_DRIVE_TIMEOUT_S: float = 120.0
 
 
-@dataclass(frozen=True, slots=True)
-class ScriptedBatchRecord:
+class ScriptedBatchRecord(msgspec.Struct, frozen=True):
     forward_iter: int
     mode: Optional[str]
     rids: Tuple[str, ...]
     extend_rids: Tuple[str, ...]
     chunked_rid: Optional[str]
+    reqs: Tuple[Req, ...]
+    chunked_req: Optional[Req]
 
 
 def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
@@ -112,6 +115,15 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
             f"within {RESET_DRAIN_MAX_STEPS} steps"
         )
 
+    futures = tuple(epoch.post_future for epoch in ctx._request_epochs.values())
+    for _ in range(RESET_DRAIN_MAX_STEPS):
+        if all(future.done() for future in futures):
+            break
+        yield
+        wait(futures, timeout=0.005)
+    if not all(future.done() for future in futures):
+        raise RuntimeError("scripted_runtime reset: HTTP responses did not finish")
+
     ctx.flush_cache()
     yield
 
@@ -163,7 +175,7 @@ class ScriptedSchedulerHook:
                         fn = resolve_fn(fn_path)
                         ctx = self._context
                         yield from _reset_engine_state(ctx)
-                        self._batch_log.clear()
+                        ctx._reset_request_tracking()
                         sub_gen = fn(ctx, *args)
                         try:
                             yield from sub_gen
@@ -201,6 +213,8 @@ class ScriptedSchedulerHook:
                     else ()
                 ),
                 chunked_rid=chunked.rid if chunked is not None else None,
+                reqs=tuple(batch.reqs),
+                chunked_req=chunked,
             )
         )
 
