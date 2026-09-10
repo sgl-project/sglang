@@ -947,6 +947,8 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        self.resolve_prefill_drain_releases()
+
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -1067,7 +1069,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        self.release_prefill_kv_after_drain(req)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1075,6 +1077,41 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
+
+    def release_prefill_kv_after_drain(
+        self: Scheduler, req: Req, is_insert: bool = True
+    ) -> bool:
+        """Release a retired request's KV, or hold it while its sender still has
+        a chunk inside the transfer engine (deferred KV release only).
+
+        A terminal poll or abort() does not stop a chunk the transfer worker has
+        already dequeued; freeing the source pages now would let that chunk read
+        pages reused by another request. The hold is per rank and outside
+        `disagg_prefill_inflight_queue`, whose length must stay identical across
+        TP ranks for the poll all-reduce. Returns True if released now."""
+        sender = req.disagg_kv_sender
+        kv_mgr = getattr(sender, "kv_mgr", None)
+        if (
+            kv_mgr is not None
+            and kv_mgr.enable_deferred_decode_kv_release
+            and kv_mgr.has_outstanding_chunks(sender.bootstrap_room)
+        ):
+            self.disagg_prefill_drain_releases.append((req, is_insert))
+            return False
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        return True
+
+    def resolve_prefill_drain_releases(self: Scheduler) -> None:
+        if not self.disagg_prefill_drain_releases:
+            return
+        still_held = []
+        for req, is_insert in self.disagg_prefill_drain_releases:
+            sender = req.disagg_kv_sender
+            if sender.kv_mgr.has_outstanding_chunks(sender.bootstrap_room):
+                still_held.append((req, is_insert))
+            elif req.kv.holds_kv or req.kv.holds_mamba:
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        self.disagg_prefill_drain_releases = still_held
 
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.
@@ -1111,7 +1148,7 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.release_prefill_kv_after_drain(req, is_insert=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:

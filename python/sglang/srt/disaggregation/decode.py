@@ -2354,12 +2354,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
-                    and decode_req.kv_receiver.abort_notified
+                    and decode_req.kv_receiver.ensure_abort_notified()
                 ):
-                    # Decode-initiated abort: a prefill write may still target
-                    # these pages, so hold them until the drain ack or timeout.
-                    # (A prefill-initiated failure has already stopped writing ->
-                    # immediate release below.)
+                    # Whatever the cause, a prefill write may still target these
+                    # pages: a failure raised by one sender is MIN-reduced onto
+                    # every decode rank while the other prefill ranks are still
+                    # writing, and with several senders per rank the others keep
+                    # writing too. Tell every prefill rank to stop (no-op if the
+                    # decode already did) and hold the pages until each acks its
+                    # drain, or the timeout fires. Ranks with nothing outstanding
+                    # ack immediately. Without bootstrap infos no prefill was
+                    # ever told where these pages are, so release right away.
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)

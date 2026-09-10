@@ -241,9 +241,11 @@ class CommonKVManager(BaseKVManager):
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
-            # Deferred KV release: aborted room -> (decode_ip, decode_port);
-            # ack held until the transfer drains.
-            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
+            # Deferred KV release: aborted room -> {(decode_ip, decode_port)};
+            # acks held until the transfer drains. A set because several decode
+            # ranks send ABORT for one room when the sender fans out (MLA with
+            # prefill TP < decode TP), and each of them must be acked.
+            self._deferred_ack_targets: Dict[int, Set[Tuple[str, int]]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -429,14 +431,21 @@ class CommonKVManager(BaseKVManager):
         except Exception as e:
             logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
 
+    def has_outstanding_chunks(self, room: int) -> bool:
+        """True while the transfer worker holds a dequeued or in-flight chunk for
+        this room. Backends without chunk accounting never report outstanding."""
+        outstanding = getattr(self, "_staging_outstanding", None)
+        return outstanding is not None and outstanding.get(room, 0) > 0
+
     def _maybe_ack_drained_abort(self, room: int) -> None:
-        """Send the deferred ack once an aborted room's chunks have drained
-        (outstanding == 0). pop() makes it fire at most once."""
-        if self._staging_outstanding.get(room, 0) > 0:
+        """Send the deferred acks once an aborted room's chunks have drained
+        (outstanding == 0). pop() makes it fire at most once per target set."""
+        if self.has_outstanding_chunks(room):
             return
-        target = self._deferred_ack_targets.pop(room, None)
-        if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
+        targets = self._deferred_ack_targets.pop(room, None)
+        if targets:
+            for decode_ip, decode_port in targets:
+                self._send_abort_ack(decode_ip, decode_port, room)
 
     def register_deferred_ack_target(
         self, room: int, decode_ip: str, decode_port: int
@@ -444,7 +453,25 @@ class CommonKVManager(BaseKVManager):
         """Hold this room's ack until its transfer drains. Callers must mark the
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
-        self._deferred_ack_targets[room] = (decode_ip, decode_port)
+        self._deferred_ack_targets.setdefault(room, set()).add((decode_ip, decode_port))
+
+    def handle_deferred_abort_ack(
+        self, room: int, decode_ip: str, decode_port: int
+    ) -> None:
+        """Ack a decode-side ABORT for `room`, or hold the ack while a chunk is
+        still outstanding. Callers must mark the room Failed FIRST.
+
+        The decision is based only on outstanding chunks, not on whether the
+        room is still tracked: the scheduler can clear() a room whose chunk is
+        still inside the transfer engine, and acking then would let the decode
+        free pages that are still being written."""
+        if self.has_outstanding_chunks(room):
+            self.register_deferred_ack_target(room, decode_ip, decode_port)
+            # The worker may have drained between the check and the register
+            # and would never revisit this room; try once here.
+            self._maybe_ack_drained_abort(room)
+        else:
+            self._send_abort_ack(decode_ip, decode_port, room)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1334,9 +1361,14 @@ class CommonKVSender(BaseKVSender):
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
-            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+            # The scheduler polls Failed and clears the room while the worker
+            # may still be inside the transfer engine for it. Keep the held ack
+            # targets in that case: the worker acks (and pops them) on drain. If
+            # nothing is outstanding, ack now so a target registered for a room
+            # that concluded without any chunk (or whose chunk was skipped) does
+            # not leak and the decode does not wait for its timeout.
+            if not self.kv_mgr.has_outstanding_chunks(self.bootstrap_room):
+                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1600,13 +1632,7 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos()
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
+        self.ensure_abort_notified()
         return KVPoll.Failed
 
     def clear(self) -> None:
@@ -1621,13 +1647,23 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
+        self.ensure_abort_notified()
+
+    def ensure_abort_notified(self) -> bool:
+        """Send ABORT to every prefill rank of this room once, and arm the
+        deferred drain-ack accounting at the same time so no ABORT path can
+        forget it (acks for an unarmed room are dropped by note_abort_ack).
+        Returns whether the prefill has been notified."""
+        if self.abort_notified:
+            return True
+        if getattr(self, "bootstrap_infos", None) is None:
+            return False
+        if self.kv_mgr.enable_deferred_decode_kv_release:
+            # Arm before sending so an ack that races back is not dropped.
+            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
+        self._send_abort_notification()
+        self.abort_notified = True
+        return True
 
     def _send_abort_notification(self):
         for bootstrap_info in self.bootstrap_infos:
