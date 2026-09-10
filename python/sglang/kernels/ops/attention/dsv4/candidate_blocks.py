@@ -4,40 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def _maximum_with_nan(a, b):
-    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
-
-
-@triton.jit
-def _candidate_scores_kernel(
-    X,
-    LENS,
-    OUT,
-    SCORES,
-    WIDTH: tl.constexpr,
-    STRIDE: tl.constexpr,
-    BLOCKS: tl.constexpr,
-    GROUP: tl.constexpr,
-    GROUP_PAD: tl.constexpr,
-    TILE: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
-    offsets = tl.arange(0, GROUP_PAD)
-    cols = blocks[:, None] * GROUP + offsets[None, :]
-    length = tl.load(LENS + row)
-    in_bounds = (cols < WIDTH) & (offsets[None, :] < GROUP)
-    values = tl.load(
-        X + row * STRIDE + cols, in_bounds & (cols < length), other=-float("inf")
-    ).to(tl.float32)
-    tl.store(OUT + row * WIDTH + cols, values, in_bounds)
-    scores = tl.reduce(values, axis=1, combine_fn=_maximum_with_nan)
-    scores = tl.where(
-        (length > 0) & (blocks == (length - 1) // GROUP), float("inf"), scores
-    )
-    tl.store(SCORES + row * BLOCKS + blocks, scores, blocks < BLOCKS)
+from sglang.kernels.ops.attention.dsv4.candidate_fp4_indexer import (
+    _candidate_scores_kernel,
+)
 
 
 @triton.jit
@@ -103,6 +72,7 @@ def candidate_block_logits(
         scores,
         width,
         logits.stride(0),
+        width,
         blocks,
         block_size,
         group_pad,

@@ -22,6 +22,7 @@ from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _is_xpu = is_xpu()
 if _is_xpu:
@@ -235,6 +236,216 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     torch.testing.assert_close(q_fp4.view(torch.uint8), ref_fp4)
     torch.testing.assert_close(q_sf, ref_sf)
     torch.testing.assert_close(weights_out.squeeze(-1), weight.float() * weight_scale)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="DeepGEMM MXFP4 requires Blackwell",
+)
+@pytest.mark.parametrize("width", [17, 65539, 1048579])
+def test_candidate_fp4_indexer(width):
+    from deep_gemm import fp8_fp4_mqa_logits
+
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+        candidate_block_logits,
+    )
+    from sglang.kernels.ops.attention.dsv4.candidate_fp4_indexer import (
+        candidate_fp4_mqa_logits,
+        select_candidate_block_indices,
+    )
+    from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+
+    torch.manual_seed(910)
+    rows, heads, group, budget = 9, 32, 8, 2048
+    q = quantize_fp4_indexer_tensor(
+        torch.randn(rows * heads, 128, device="cuda", dtype=torch.bfloat16), rne=True
+    )
+    q = (q[0].view(rows, heads, 64), q[1].view(rows, heads))
+    # Independent per-32 scales and negative head weights exercise the FP32
+    # reduction, rather than only checking selected positions on positive scores.
+    keys = torch.randn(width, 4, 32, device="cuda", dtype=torch.bfloat16)
+    keys *= torch.tensor([0.25, 0.5, 2, 4], device="cuda")[None, :, None]
+    k = quantize_fp4_indexer_tensor(keys.flatten(1), rne=True)
+    weights = torch.randn(rows, heads, device="cuda")
+    lens = torch.tensor(
+        [0, 1, 7, 8, 9, 16, width - 1, width, width], device="cuda", dtype=torch.int32
+    )
+    width_aligned = (width + 3) // 4 * 4
+    baseline = fp8_fp4_mqa_logits(
+        q, k, weights, torch.zeros_like(lens), lens, False, width_aligned
+    )
+    visible = torch.arange(width, device="cuda")[None, :] < lens[:, None]
+    reference = baseline[:, :width].masked_fill(~visible, -torch.inf)
+    # Keep the baseline block-selection tie behavior, including all-masked rows.
+    reference[1:6] = reference[1:6].masked_fill(visible[1:6], 0)
+    block_ids = select_candidate_block_indices(reference.clone(), lens, budget, group)
+    reference_mask = select_candidate_blocks(reference, lens[:, None], budget, group)
+    # The shared block reducer must retain the paged decode helper's behavior.
+    masked, published = candidate_block_logits(
+        reference, lens, topk_blocks=budget, block_size=group, published=None
+    )
+    torch.testing.assert_close(masked, reference)
+    torch.testing.assert_close(published, reference_mask)
+    positions = (
+        (block_ids[:, :, None] * group + torch.arange(group, device="cuda"))
+        .flatten(1)
+        .long()
+    )
+    actual_mask = torch.zeros(
+        (rows, ((width + group - 1) // group + 1) * group),
+        device="cuda",
+        dtype=torch.bool,
+    )
+    actual_mask.scatter_(1, positions, True)
+    torch.testing.assert_close(actual_mask[:, :width], reference_mask)
+
+    actual = candidate_fp4_mqa_logits(q, k, weights, block_ids, lens, group)
+    expected = baseline.gather(1, positions.clamp_max(width_aligned - 1))
+    expected.masked_fill_(positions >= lens[:, None], -torch.inf)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Replaying with changed causal lengths must not reuse scores or read padding.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = candidate_fp4_mqa_logits(q, k, weights, block_ids, lens, group)
+    lens.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isneginf(replayed).all()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="DeepGEMM MXFP4 requires Blackwell",
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_candidate_prefill_mapping(ratio):
+    from types import SimpleNamespace as NS
+    from unittest import mock
+
+    from sglang.srt.layers.attention import deepseek_v4_backend as backend_module
+    from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+
+    torch.manual_seed(910)
+    lengths, q_lengths = [262147 * ratio, 0, 1, 8197 * ratio], [33, 0, 1, 17]
+    tokens, topk = sum(q_lengths), 512
+    compressed = [length // ratio for length in lengths]
+    positions = torch.cat(
+        [torch.arange(s - t, s, device="cuda") for s, t in zip(lengths, q_lengths)]
+    )
+    lens = ((positions + 1) // ratio).int()
+    slots = sum(compressed)
+    keys = quantize_fp4_indexer_tensor(
+        torch.randn(slots, 128, device="cuda", dtype=torch.bfloat16), rne=True
+    )
+    request_map = torch.zeros(
+        len(lengths), max(lengths), device="cuda", dtype=torch.int64
+    )
+    physical = torch.randperm(slots, device="cuda")
+    starts, offset = [], 0
+    for b, count in enumerate(compressed):
+        starts.append(offset)
+        request_map[b, torch.arange(count, device="cuda") * ratio] = (
+            physical[offset : offset + count] * ratio
+        )
+        offset += count
+    q_lens = torch.tensor(q_lengths, device="cuda")
+    offsets = torch.repeat_interleave(
+        torch.tensor(starts, device="cuda", dtype=torch.int32), q_lens
+    )
+    batch = NS(
+        seq_lens_cpu=lengths, req_pool_indices=torch.arange(len(lengths), device="cuda")
+    )
+    indexer = NS(
+        queries=lambda q, freqs: q,
+        head_weights=lambda x: x,
+        index_topk=topk,
+        candidate_topk_blocks=2048,
+        candidate_block_size=8,
+    )
+    layer = NS(
+        compress_ratio=ratio,
+        indexer=indexer,
+        layer_id=0,
+        freqs_cis=torch.zeros(max(lengths), 1, device="cuda"),
+    )
+    backend = backend_module.DeepseekV4AttnBackend.__new__(
+        backend_module.DeepseekV4AttnBackend
+    )
+    pages = torch.empty(tokens, topk, device="cuda", dtype=torch.int32)
+    raw = torch.empty_like(pages)
+    backend.req_to_token = request_map
+    backend.token_to_kv_pool = NS(
+        get_low_ratio_index_k_fp4=lambda _, loc: (keys[0][loc], keys[1][loc])
+    )
+    backend.forward_metadata = NS(
+        core_metadata=NS(
+            sparse_page_indices=lambda r: pages, sparse_raw_indices=lambda r: raw
+        )
+    )
+    backend.candidate_masks = None
+    published = []
+    for source in [True, False, False]:
+        query = torch.randn(tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
+        weights = torch.randn(tokens, 32, device="cuda")
+        indexer.is_candidate_source, indexer.uses_candidates = source, not source
+        packed_q = quantize_fp4_indexer_tensor(query.flatten(0, 1), rne=True)
+        scores = backend_module._dense_fp4_mqa_logits(
+            (packed_q[0].view(tokens, 32, 64), packed_q[1].view(tokens, 32)),
+            (keys[0][physical], keys[1][physical]),
+            weights,
+            offsets,
+            offsets + lens,
+            (max(compressed) + 3) // 4 * 4,
+        )
+        start = 0
+        for b, (count, q_len) in enumerate(zip(compressed, q_lengths)):
+            rows = slice(start, start + q_len)
+            local = scores[rows, :count]
+            local.masked_fill_(
+                torch.arange(count, device="cuda")[None, :] >= lens[rows, None],
+                -torch.inf,
+            )
+            if source:
+                published.append(
+                    select_candidate_blocks(local, lens[rows, None], 2048, 8)
+                    if count
+                    else None
+                )
+            elif count:
+                local.masked_fill_(~published[b], -torch.inf)
+            start += q_len
+        selected = torch.empty_like(raw)
+        backend_module.topk_transform_ragged_v2(
+            scores, lens, out_offsets=offsets, out_indices=selected
+        )
+        if not source:
+            selected = backend_module._mask_topk_scores(scores, selected, offsets)
+        sentinel = torch.iinfo(torch.int32).max
+        selected = selected.masked_fill(selected < 0, sentinel).sort(-1).values
+        chosen = selected != sentinel
+        expected_pages = torch.where(
+            chosen, physical[selected.clamp_max(slots - 1)], -1
+        ).int()
+        expected_raw = torch.where(chosen, selected - offsets[:, None], -1)
+        budget = ((max(compressed) + 3) // 4 * 4) * 4 * 7
+        dense_logits = backend_module._dense_fp4_mqa_logits
+
+        def bounded_logits(*args):
+            result = dense_logits(*args)
+            assert result.numel() * result.element_size() <= budget
+            return result
+
+        with (
+            mock.patch.object(
+                backend_module, "_DENSE_INDEXER_SCORE_BUDGET_BYTES", budget
+            ),
+            mock.patch.object(backend_module, "_dense_fp4_mqa_logits", bounded_logits),
+        ):
+            backend._low_ratio_index_topk_dense(
+                layer, weights, query, positions, batch, q_lens, q_lengths
+            )
+        torch.testing.assert_close(pages, expected_pages, rtol=0, atol=0)
+        torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

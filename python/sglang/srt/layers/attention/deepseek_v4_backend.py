@@ -329,6 +329,7 @@ def two_level_decode_logits(
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
 _TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
+_DENSE_INDEXER_SCORE_BUDGET_BYTES = 16 << 30
 
 
 def _mask_topk_scores(
@@ -3167,37 +3168,188 @@ class DeepseekV4AttnBackend(
             q_lens.to(torch.int64),
             output_size=num_tokens,
         )
-        logits = _dense_fp4_mqa_logits(
-            (q_fp4, q_sf),
-            (k_fp4, k_sf),
-            weights,
-            ks,
-            ks + compress_lens,
-            # the fused top-k reads score rows through 16-byte vectors
-            ceil_align(max(lc_per_req), 4),
-        )
-        if indexer.is_candidate_source or indexer.uses_candidates:
-            self._publish_or_consume_candidates(
-                indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
+        width = ceil_align(max(lc_per_req), 4)
+        compact_candidates = (
+            indexer.is_candidate_source or indexer.uses_candidates
+        ) and max(
+            lc_per_req
+        ) >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
+        # Keep the batched dense path when neither workspace bounds nor candidate
+        # scoring saves work; per-request launches penalize short prefills.
+        if (
+            not compact_candidates
+            and num_tokens * width * 4 <= _DENSE_INDEXER_SCORE_BUDGET_BYTES
+        ):
+            logits = _dense_fp4_mqa_logits(
+                (q_fp4, q_sf),
+                (k_fp4, k_sf),
+                weights,
+                ks,
+                ks + compress_lens,
+                # the fused top-k reads score rows through 16-byte vectors
+                ceil_align(max(lc_per_req), 4),
             )
+            if indexer.is_candidate_source or indexer.uses_candidates:
+                self._publish_or_consume_candidates(
+                    indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
+                )
+            topk = indexer.index_topk
+            selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+            topk_transform_ragged_v2(
+                logits, compress_lens, out_offsets=ks, out_indices=selected
+            )
+            if indexer.uses_candidates and not indexer.is_candidate_source:
+                selected = _mask_topk_scores(logits, selected, ks)
+            # ascending positions, padding last: the layout the consumers expect
+            unselected = torch.iinfo(torch.int32).max
+            selected = (
+                selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
+            )
+            chosen = selected != unselected
+            page_indices[:num_tokens, :topk] = torch.where(
+                chosen, k_slots[selected.clamp_max(k_slots.shape[0] - 1)], -1
+            ).to(torch.int32)
+            if raw_indices is not None:
+                raw_indices[:num_tokens, :topk] = torch.where(
+                    chosen, selected - ks[:, None], -1
+                )
+            return
+
+        from sglang.kernels.ops.attention.dsv4.candidate_fp4_indexer import (
+            candidate_fp4_mqa_logits,
+            select_candidate_block_indices,
+        )
+
+        publish = [] if indexer.is_candidate_source else None
+        consume = indexer.uses_candidates and not indexer.is_candidate_source
         topk = indexer.index_topk
-        selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
-        topk_transform_ragged_v2(
-            logits, compress_lens, out_offsets=ks, out_indices=selected
-        )
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            selected = _mask_topk_scores(logits, selected, ks)
-        # ascending positions, padding last: the layout the consumers expect
-        unselected = torch.iinfo(torch.int32).max
-        selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
-        chosen = selected != unselected
-        page_indices[:num_tokens, :topk] = torch.where(
-            chosen, k_slots[selected.clamp_max(k_slots.shape[0] - 1)], -1
-        ).to(torch.int32)
-        if raw_indices is not None:
-            raw_indices[:num_tokens, :topk] = torch.where(
-                chosen, selected - ks[:, None], -1
+        token_start = 0
+        for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
+            # Candidate gathers pay off once the full scan is much wider than
+            # the candidate pool. Short requests keep dense scoring and masks.
+            compact = (
+                (consume or publish is not None)
+                and lc
+                >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
             )
+            if publish is not None:
+                publish.append(
+                    torch.empty(
+                        (
+                            t_len,
+                            min(
+                                indexer.candidate_topk_blocks,
+                                ceil_align(lc, indexer.candidate_block_size)
+                                // indexer.candidate_block_size,
+                            )
+                            if compact
+                            else lc,
+                        ),
+                        device=device,
+                        dtype=torch.int32 if compact else torch.bool,
+                    )
+                )
+            if lc == 0 or t_len == 0:
+                token_start += t_len
+                continue
+            width = ceil_align(lc, 4)
+            # Bound the dense FP32 score allocation to 16 GiB, without shrinking
+            # the token batch used by projections and MoE.
+            score_width = (
+                indexer.candidate_topk_blocks * indexer.candidate_block_size
+                if consume and compact
+                else width
+            )
+            step = max(1, _DENSE_INDEXER_SCORE_BUDGET_BYTES // (score_width * 4))
+            for start in range(0, t_len, step):
+                stop = min(start + step, t_len)
+                rows = slice(token_start + start, token_start + stop)
+                lens = compress_lens[rows]
+                if consume and compact:
+                    blocks = self.candidate_masks[b][start:stop]
+                    logits = candidate_fp4_mqa_logits(
+                        (q_fp4[rows], q_sf[rows]),
+                        (
+                            k_fp4[starts[b] : starts[b] + lc],
+                            k_sf[starts[b] : starts[b] + lc],
+                        ),
+                        weights[rows],
+                        blocks,
+                        lens,
+                        indexer.candidate_block_size,
+                    )
+                    lengths = torch.full_like(lens, logits.shape[1])
+                    offsets = torch.zeros_like(lens)
+                else:
+                    logits = _dense_fp4_mqa_logits(
+                        (q_fp4[rows], q_sf[rows]),
+                        (k_fp4, k_sf),
+                        weights[rows],
+                        ks[rows],
+                        ks[rows] + lens,
+                        width,
+                    )
+                    lengths, offsets = lens, ks[rows]
+                if publish is not None:
+                    if compact:
+                        publish[b][start:stop] = select_candidate_block_indices(
+                            logits[:, :lc],
+                            lens,
+                            indexer.candidate_topk_blocks,
+                            indexer.candidate_block_size,
+                        )
+                    else:
+                        scores = logits[:, :lc]
+                        scores.masked_fill_(
+                            torch.arange(lc, device=device)[None, :] >= lens[:, None],
+                            -torch.inf,
+                        )
+                        publish[b][start:stop] = select_candidate_blocks(
+                            scores,
+                            lens[:, None],
+                            indexer.candidate_topk_blocks,
+                            indexer.candidate_block_size,
+                        )
+                        del scores
+                elif consume and not compact:
+                    logits[:, :lc].masked_fill_(
+                        ~self.candidate_masks[b][start:stop], -torch.inf
+                    )
+                selected = torch.empty(
+                    (stop - start, topk), dtype=torch.int32, device=device
+                )
+                topk_transform_ragged_v2(
+                    logits, lengths, out_offsets=offsets, out_indices=selected
+                )
+                if consume:
+                    selected = _mask_topk_scores(logits, selected, offsets)
+                if consume and compact:
+                    columns = selected.clamp_min(0).to(torch.int64)
+                    logical = blocks.gather(1, columns // indexer.candidate_block_size)
+                    logical = (
+                        logical * indexer.candidate_block_size
+                        + columns % indexer.candidate_block_size
+                    )
+                    selected = torch.where(selected >= 0, logical + starts[b], -1).to(
+                        torch.int32
+                    )
+                unselected = torch.iinfo(torch.int32).max
+                selected = (
+                    selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
+                )
+                chosen = selected != unselected
+                page_indices[rows, :topk] = torch.where(
+                    chosen, k_slots[selected.clamp_max(k_slots.shape[0] - 1)], -1
+                ).to(torch.int32)
+                if raw_indices is not None:
+                    raw_indices[rows, :topk] = torch.where(
+                        chosen, selected - ks[rows, None], -1
+                    )
+                # Release each slice before allocating its successor.
+                del logits
+            token_start += t_len
+        if publish is not None:
+            self.candidate_masks = publish
 
     def _publish_or_consume_candidates(
         self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
