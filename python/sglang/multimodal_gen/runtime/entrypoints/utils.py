@@ -40,6 +40,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (  # noqa: F401
+    _normalize_output_seeds as normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs as expand_request_outputs,
 )
