@@ -69,7 +69,12 @@ class _FakeSenseNovaModel:
         )
 
 
-def _install_sensenova_cache_dit_stub(monkeypatch):
+def _install_sensenova_cache_dit_stub(
+    monkeypatch,
+    *,
+    enable_error: Exception | None = None,
+    disable_error: Exception | None = None,
+):
     calls = {"enable": [], "disable": [], "refresh": []}
     module = types.ModuleType(
         "sglang.multimodal_gen.runtime.cache.cache_dit_integration"
@@ -82,17 +87,96 @@ def _install_sensenova_cache_dit_stub(monkeypatch):
     module.CacheDitConfig = CacheDitConfig
     module.cache_dit_overrides_key = lambda overrides: tuple(sorted(overrides.items()))
     module.resolve_cache_dit_request_overrides = lambda raw: dict(raw or {})
-    module.enable_cache_on_transformer = lambda transformer, config, **kwargs: (
-        calls["enable"].append((transformer, config, kwargs)) or transformer
-    )
-    module.disable_cache_on_transformer = lambda transformer: (
-        calls["disable"].append(transformer) or transformer
-    )
+
+    def enable_cache_on_transformer(transformer, config, **kwargs):
+        calls["enable"].append((transformer, config, kwargs))
+        if enable_error is not None:
+            # Model the important part of a real mid-mount failure: the
+            # transformer has already been mutated before enable raises.
+            transformer._partial_cache_dit_hook = True
+            raise enable_error
+        return transformer
+
+    def disable_cache_on_transformer(transformer):
+        calls["disable"].append(transformer)
+        if disable_error is not None:
+            raise disable_error
+        if hasattr(transformer, "_partial_cache_dit_hook"):
+            del transformer._partial_cache_dit_hook
+        return transformer
+
+    module.enable_cache_on_transformer = enable_cache_on_transformer
+    module.disable_cache_on_transformer = disable_cache_on_transformer
     module.refresh_context_on_transformer = lambda transformer, steps: calls[
         "refresh"
     ].append((transformer, steps))
     monkeypatch.setitem(sys.modules, module.__name__, module)
     return calls
+
+
+class _CacheDitRecordingBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, hidden_states, *, sensenova_marker=None, **kwargs):
+        self.calls.append((sensenova_marker, kwargs))
+        return hidden_states + 1
+
+
+class _CacheDitSenseNovaTransformer(torch.nn.Module):
+    """Small SenseNova-shaped transformer for the real cache-dit wrapper test."""
+
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [_CacheDitRecordingBlock(), _CacheDitRecordingBlock()]
+        )
+        self.used_native_layers = []
+
+    def forward(
+        self,
+        hidden_states,
+        *,
+        image_gen_indicators=None,
+        update_cache=True,
+        sensenova_marker=None,
+    ):
+        exist_non_image_gen_tokens = image_gen_indicators is None or bool(
+            (~image_gen_indicators).any().item()
+        )
+        exist_image_gen_tokens = image_gen_indicators is not None and bool(
+            image_gen_indicators.any().item()
+        )
+        layers = self.layers
+        native_layers = getattr(self, "_sensenova_cache_dit_native_layers", None)
+        if native_layers is not None and (
+            update_cache or exist_non_image_gen_tokens or not exist_image_gen_tokens
+        ):
+            layers = native_layers
+        self.used_native_layers.append(layers is native_layers)
+
+        for layer in layers:
+            hidden_states = layer(
+                hidden_states,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                update_cache=update_cache,
+                sensenova_marker=sensenova_marker,
+            )
+        return hidden_states
+
+
+_CacheDitQwen3Model = type(
+    "Qwen3Model",
+    (_CacheDitSenseNovaTransformer,),
+    {
+        "__module__": (
+            "sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3"
+        )
+    },
+)
 
 
 class _RecordingTraceContext:
@@ -690,6 +774,69 @@ def test_sensenova_u1_cache_dit_mounts_refreshes_and_unmounts(monkeypatch):
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
 
 
+def test_sensenova_u1_cache_dit_rolls_back_partial_mount(monkeypatch):
+    mount_error = RuntimeError("cache-dit mount failed")
+    calls = _install_sensenova_cache_dit_stub(monkeypatch, enable_error=mount_error)
+    transformer = SimpleNamespace(layers=object())
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = SimpleNamespace(
+        num_inference_steps=8,
+        guidance_scale=1.0,
+        sampling_params=SimpleNamespace(
+            enable_cache_dit=True,
+            cache_dit_params=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="cache-dit mount failed"):
+        stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+
+    assert calls["disable"] == [transformer]
+    assert not hasattr(transformer, "_partial_cache_dit_hook")
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert stage._cache_dit_enabled is False
+    assert stage._cache_dit_active_key is None
+    assert stage._cache_dit_cleanup_required is False
+
+
+def test_sensenova_u1_cache_dit_failed_rollback_blocks_later_requests(monkeypatch):
+    calls = _install_sensenova_cache_dit_stub(
+        monkeypatch,
+        enable_error=RuntimeError("cache-dit mount failed"),
+        disable_error=RuntimeError("cache-dit cleanup failed"),
+    )
+    transformer = SimpleNamespace(layers=object())
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = SimpleNamespace(
+        num_inference_steps=8,
+        guidance_scale=1.0,
+        sampling_params=SimpleNamespace(
+            enable_cache_dit=True,
+            cache_dit_params=None,
+        ),
+    )
+
+    # Preserve the original mount error even when its rollback also fails.
+    with pytest.raises(RuntimeError, match="cache-dit mount failed"):
+        stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+
+    assert stage._cache_dit_enabled is False
+    assert stage._cache_dit_active_key is None
+    assert stage._cache_dit_cleanup_required is True
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+
+    # A later ordinary request must retry cleanup and fail closed instead of
+    # reaching the early return while the transformer may still be wrapped.
+    batch.sampling_params.enable_cache_dit = False
+    with pytest.raises(RuntimeError, match="cache-dit cleanup failed"):
+        stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+
+    assert calls["disable"] == [transformer, transformer]
+    assert stage._cache_dit_cleanup_required is True
+
+
 @pytest.mark.parametrize(
     ("first_guidance_scale", "second_guidance_scale"),
     [(4.0, 1.0), (1.0, 4.0)],
@@ -721,6 +868,75 @@ def test_sensenova_u1_cache_dit_remounts_when_cfg_mode_changes(
         first_guidance_scale > 1.0,
         second_guidance_scale > 1.0,
     ]
+
+
+def test_sensenova_u1_real_cache_dit_wrapper_routes_only_denoising():
+    pytest.importorskip("cache_dit")
+
+    transformer = _CacheDitQwen3Model()
+    native_layers = transformer.layers
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = SimpleNamespace(
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        sampling_params=SimpleNamespace(
+            enable_cache_dit=True,
+            cache_dit_params={
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 2,
+                "residual_diff_threshold": 0.1,
+            },
+        ),
+    )
+
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    try:
+        inputs = torch.zeros(1, 2, 4)
+        transformer(
+            inputs,
+            image_gen_indicators=torch.zeros(1, 2, dtype=torch.bool),
+            update_cache=True,
+            sensenova_marker="prefix",
+        )
+        transformer(
+            inputs,
+            image_gen_indicators=torch.ones(1, 2, dtype=torch.bool),
+            update_cache=False,
+            sensenova_marker="denoise",
+        )
+
+        # cache-dit patches ``layers`` only inside its forward wrapper.
+        # Prefix/text selects the preserved ModuleList, while pure denoising
+        # selects the real UnifiedBlocks wrapper. Both native blocks must still
+        # receive SenseNova's model-specific kwargs through that wrapper.
+        assert transformer.used_native_layers == [True, False]
+        assert transformer.layers is native_layers
+        assert hasattr(transformer, "_original_forward")
+        for layer in native_layers:
+            assert [call[0] for call in layer.calls] == ["prefix", "denoise"]
+            denoise_kwargs = layer.calls[1][1]
+            assert denoise_kwargs["exist_non_image_gen_tokens"] is False
+            assert denoise_kwargs["exist_image_gen_tokens"] is True
+            assert denoise_kwargs["update_cache"] is False
+    finally:
+        stage._unmount_cache_dit()
+
+    assert transformer.layers is native_layers
+    assert not hasattr(transformer, "_original_forward")
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+
+
+def test_sensenova_u1_invalid_output_count_does_not_mount_cache_dit(monkeypatch):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
+    batch = SimpleNamespace(num_outputs_per_prompt=2)
+
+    with pytest.raises(ValueError, match="expects output expansion"):
+        stage.forward(batch, server_args=SimpleNamespace())
+
+    assert calls == {"enable": [], "disable": [], "refresh": []}
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():

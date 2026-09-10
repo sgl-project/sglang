@@ -74,6 +74,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
         self.tokenizer = tokenizer
         self._cache_dit_enabled = False
         self._cache_dit_active_key: tuple | None = None
+        self._cache_dit_cleanup_required = False
 
     def _cache_dit_requested(self, batch: Req) -> bool:
         sampling_params = getattr(batch, "sampling_params", None)
@@ -84,8 +85,10 @@ class SenseNovaU1GenerationStage(PipelineStage):
     def _cache_dit_transformer(self) -> torch.nn.Module:
         return self.model.language_model.model
 
-    def _unmount_cache_dit(self) -> None:
-        if not self._cache_dit_enabled:
+    def _unmount_cache_dit(self, *, force: bool = False) -> None:
+        if not force and not (
+            self._cache_dit_enabled or self._cache_dit_cleanup_required
+        ):
             return
         # Import lazily: SenseNova remains usable without the optional
         # cache-dit dependency when no request enables it.
@@ -94,14 +97,29 @@ class SenseNovaU1GenerationStage(PipelineStage):
         )
 
         transformer = self._cache_dit_transformer
-        disable_cache_on_transformer(transformer)
-        if hasattr(transformer, "_sensenova_cache_dit_native_layers"):
-            del transformer._sensenova_cache_dit_native_layers
-        self._cache_dit_enabled = False
-        self._cache_dit_active_key = None
+        cleanup_succeeded = False
+        try:
+            # A failed enable_cache() may already have installed the forward
+            # wrapper or cache context without letting the stage mark itself
+            # enabled.  ``force`` therefore deliberately calls disable even
+            # when _cache_dit_enabled is still False.
+            disable_cache_on_transformer(transformer)
+            cleanup_succeeded = True
+        finally:
+            if hasattr(transformer, "_sensenova_cache_dit_native_layers"):
+                del transformer._sensenova_cache_dit_native_layers
+            self._cache_dit_enabled = False
+            self._cache_dit_active_key = None
+            # If rollback itself failed, do not let a later ordinary request
+            # take the early-return path and execute a potentially wrapped
+            # transformer without its native-layers escape hatch.
+            self._cache_dit_cleanup_required = not cleanup_succeeded
 
     def _maybe_enable_cache_dit(self, batch: Req, server_args: ServerArgs) -> None:
         """Mount or refresh the pure-image Cache-DiT path for one request."""
+        if self._cache_dit_cleanup_required:
+            self._unmount_cache_dit(force=True)
+
         requested = self._cache_dit_requested(batch)
         if getattr(server_args, "enable_breakable_cuda_graph", False):
             if requested:
@@ -205,23 +223,33 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 has_separate_cfg=has_separate_cfg,
             )
         except Exception:
-            del transformer._sensenova_cache_dit_native_layers
+            # cache_dit.enable_cache() is multi-stage and may have already
+            # installed contexts or a forward wrapper before raising.  Roll
+            # back unconditionally; preserve the original mount exception if
+            # cleanup also fails.
+            try:
+                self._unmount_cache_dit(force=True)
+            except Exception:
+                logger.exception(
+                    "Failed to roll back a partial SenseNova-U1 Cache-DiT mount"
+                )
             raise
         self._cache_dit_enabled = True
         self._cache_dit_active_key = desired_key
+        self._cache_dit_cleanup_required = False
 
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        self._maybe_enable_cache_dit(batch, server_args)
-        options = SenseNovaU1GenerationOptions.from_batch(batch)
         if int(batch.num_outputs_per_prompt) != 1:
             raise ValueError(
                 "SenseNova-U1 expects output expansion before generation; "
                 f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
             )
+        self._maybe_enable_cache_dit(batch, server_args)
+        options = SenseNovaU1GenerationOptions.from_batch(batch)
         seed = batch.seed[0] if isinstance(batch.seed, list) else int(batch.seed)
 
         out = self.model.t2i_generate(
