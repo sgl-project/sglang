@@ -792,7 +792,16 @@ struct TopKCluster : TopKRadixBase<10> {
       smem->count_gt = 0;
     }
     __syncthreads();
-    barrier_cluster_arrive_relaxed();  // bar-0 arrive
+    // Rank 0's shared memory is read by its peers: the zeroed histogram they fold
+    // into after bar-0, v_hi / v_lo after bar-2. Those arrives release so the
+    // peers' acquire wait orders the reads after the writes at cluster scope;
+    // __syncthreads() alone is CTA-scoped. The peers publish nothing at these two
+    // barriers and keep the cheaper relaxed arrive.
+    if (this_rank == 0) {
+      barrier_cluster_arrive_release();  // bar-0 arrive
+    } else {
+      barrier_cluster_arrive_relaxed();  // bar-0 arrive
+    }
     PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram over this rank's contiguous chunk.
@@ -875,8 +884,7 @@ struct TopKCluster : TopKRadixBase<10> {
         smem->v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
       });
 
-      // NOTE: zero write to DSMEM, so relaxed is strong enough here
-      barrier_cluster_arrive_relaxed();  // bar-2 arrive
+      barrier_cluster_arrive_release();  // bar-2 arrive: publishes v_hi / v_lo
       barrier_cluster_wait();            // bar-2 wait
 
       // Phase 4. rank-0 directly write to output
