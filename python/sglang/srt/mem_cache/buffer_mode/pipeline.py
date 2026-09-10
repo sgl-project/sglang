@@ -355,20 +355,7 @@ class BufferModePipeline:
         """Host usage expressed in anchor-token units for scheduler accounting."""
         if host_indices is None:
             return 0
-        cc = self._cache.cache_controller
-        anchor = cc.mem_pool_host.anchor_entry.host_pool
-        if self._shared_host_domain() is None:
-            return len(host_indices)
-        num_bytes = len(host_indices) * anchor.size_per_token
-        for transfer in aux_xfers or ():
-            if transfer.indices_from_pool is not None:
-                continue
-            entry = cc.mem_pool_host.entry_map.get(transfer.name)
-            if entry is not None:
-                num_bytes += (
-                    self._transfer_tokens(transfer) * entry.host_pool.size_per_token
-                )
-        return (num_bytes + anchor.size_per_token - 1) // anchor.size_per_token
+        return self._host_request_units(len(host_indices), aux_xfers)
 
     def _shared_host_requests(
         self, kv_tokens: int, aux_xfers: Optional[list[PoolTransfer]]
@@ -388,10 +375,10 @@ class BufferModePipeline:
                 )
         return requests
 
-    def _write_request_units(
+    def _host_request_units(
         self, kv_tokens: int, aux_xfers: Optional[list[PoolTransfer]]
     ) -> int:
-        """Prospective write staging in anchor-token accounting units."""
+        """Host staging in anchor-token accounting units."""
         cc = self._cache.cache_controller
         anchor = cc.mem_pool_host.anchor_entry.host_pool
         if self._shared_host_domain() is None:
@@ -577,7 +564,7 @@ class BufferModePipeline:
                 int(HICACHE_WRITE_STAGING_POOL_FRACTION * pool_tokens),
                 pool_tokens - pool_tokens // 10,
             )
-            if self._write_request_units(intent_tokens, aux_xfers) > max_write_units:
+            if self._host_request_units(intent_tokens, aux_xfers) > max_write_units:
                 return True
             return not self._shared_host_domain().can_fit_many_then(
                 shared_requests,
@@ -690,7 +677,7 @@ class BufferModePipeline:
             shared_domain = self._shared_host_domain()
             staging_at_limit = (
                 self.write_staged_tokens_
-                + self._write_request_units(intent_tokens, sizing_xfers)
+                + self._host_request_units(intent_tokens, sizing_xfers)
                 > live_cap
                 if shared_domain is not None
                 else self.write_staged_tokens_ >= live_cap
@@ -725,8 +712,10 @@ class BufferModePipeline:
         cc = cache.cache_controller
         snapshot = intent.snapshot
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        # Sidecars reuse their source pool's transient indices and therefore
-        # must join the same D2H operation as the primary/component transfers.
+        # Sidecars reuse the source pool's transient host/device indices.  This
+        # includes both KV-derived pools and SWA-derived DSV4 state pools.  They
+        # allocate no additional staging, but must ride the same D2H operation
+        # so their bytes are present when the storage write starts.
         aux_xfers.extend(cache._build_backup_sidecar(device_value, comp_xfers))
         device_value = (
             cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(

@@ -548,16 +548,6 @@ class _SharedPageEnvelopeHostBacking:
                 self.sides[name].free_logical_extents = extents
             return results
 
-    def can_fit_many(self, requests: Sequence[tuple[str, int]]) -> bool:
-        """Whether requests fit an otherwise empty shared arena."""
-        with self.lock:
-            _, page_counts = self._request_page_counts(requests)
-            return self._can_fit_state(
-                {name: 0 for name in self.sides},
-                {name: side.page_num for name, side in self.sides.items()},
-                page_counts,
-            )
-
     def can_fit_many_then(
         self,
         requests: Sequence[tuple[str, int]],

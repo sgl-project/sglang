@@ -317,27 +317,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.page_size = page_size * dcp_size
         self.num_pages = max_slots // self.pool_page_size
         # `min_page_index` = ceil(min_slot_index / pool_page_size), keeping the
-        # reserved-sink invariant (min_page_index * entry_bytes_per_page >= entry_max).
-        assert virtual_num_pages is None or not is_id_owner, (
-            "only a non-owner allocator may use another pool's virtual-id space"
-        )
-        # An ID owner has one virtual page per physical page. A non-owner may
-        # deliberately have a different physical capacity while indexing the
-        # owner's virtual page space (the unified SWA allocator does this).
-        self.num_virtual_ids = (
-            virtual_num_pages if virtual_num_pages is not None else self.num_pages
-        )
-        if is_id_owner:
-            assert self.num_virtual_ids == self.num_pages
-        assert self.num_virtual_ids > 0, "virtual page count must be positive"
+        # reserved sink floor covered (see `_reserved_floor_bytes`).
         self.min_page_index = (
             self.min_slot_index + self.pool_page_size - 1
         ) // self.pool_page_size
         self.entry_bytes_per_page = self.entry_bytes * self.pool_page_size
 
-        # v2p is indexed by VIRTUAL page id, p2v by PHYSICAL page id. A
-        # non-owner consumes the owner's ids, so its v2p spans the owner's
-        # count; the two are unrelated and either can be the larger.
+        # v2p is indexed by VIRTUAL page id, p2v by PHYSICAL page id. A non-owner
+        # consumes the owner's ids, so the two counts are unrelated.
+        assert virtual_num_pages is None or not is_id_owner, (
+            "only a non-owner allocator may use another pool's virtual-id space"
+        )
+        self.num_virtual_ids = (
+            self.num_pages if virtual_num_pages is None else virtual_num_pages
+        )
+        assert self.num_virtual_ids > 0, "virtual page count must be positive"
         # Page 0 is the padding anchor; the trailing row is the -1 sentinel.
         self.virtual_to_physical = torch.full(
             (self.num_virtual_ids + 1,),
@@ -1279,8 +1273,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
             bs = len(prefix_lens)
-            # Snapshot the virtual pages the kernel will consume, to bind them to
-            # physical pages afterward (else v2p stays -1 → CUDA OOB).
+            # Snapshot the virtual pages the kernel will consume, to bind them
+            # to physical pages afterward.
             if num_new_pages > 0:
                 new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
             else:
@@ -1341,7 +1335,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if need_tokens > self.available_size():
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
-            # Most decode steps reuse the prefix's tail page → num_new_pages == 0.
+            # Most decode steps reuse the prefix's tail page -> num_new_pages == 0.
             if num_new_pages > 0:
                 new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
             else:

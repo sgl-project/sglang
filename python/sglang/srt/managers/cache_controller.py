@@ -323,7 +323,10 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # Buffer mode: wired by the tree cache after attach; the load rate
+        # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
+
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
@@ -1183,7 +1186,11 @@ class HiCacheController:
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
         if self.host_memory_mode == "buffer_only":
-            # Gate on actual load staging, excluding the independent write budget.
+            # Gate on real pool usage: buffer mode allocates hit-sized, so
+            # prefetch_tokens_occupied's requested spans overstate it. Pool
+            # state mutates only at scheduler-thread lockstep points, so this
+            # stays TP-deterministic. Write staging is the write budget's
+            # usage; charging it here would park hits behind its storage drain.
             used = self.mem_pool_host.size - self.mem_pool_host.available_size()
             if self.host_write_staged_tokens_fn is not None:
                 used -= self.host_write_staged_tokens_fn()

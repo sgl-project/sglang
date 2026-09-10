@@ -211,10 +211,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     if not cfg.enable_unified_memory:
         return
     if cfg.disaggregation_mode != "null":
-        assert cfg.pp_size == 1, (
-            "--enable-unified-memory with PD disaggregation does not support "
-            "pipeline parallelism (--pp-size > 1)."
-        )
         # Constraints of the whole-envelope transfer; see the unified MHA and
         # MLA pool get_contiguous_buf_infos implementations.
         supported_backends = server_args._unified_memory_pd_transfer_backends()
@@ -222,6 +218,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory with PD disaggregation supports only these "
             f"transfer backends: {', '.join(sorted(supported_backends))}; got "
             f"{cfg.disaggregation_transfer_backend!r}."
+        )
+        assert cfg.pp_size == 1, (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "pipeline parallelism (whole-envelope transfer has no per-layer "
+            "entries to subset)."
         )
         assert not (
             cfg.disaggregation_transfer_backend == "mooncake"
