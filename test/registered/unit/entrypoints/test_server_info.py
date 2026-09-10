@@ -479,6 +479,27 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         self.assertIn("internal_states", info)
         self.assertIn("version", info)
 
+    def test_effective_max_running_requests_is_exposed_at_top_level(self):
+        args = ServerArgs(model_path="dummy", max_running_requests=32, dp_size=2)
+
+        info = _call_server_info_with(
+            args,
+            internal_states=[
+                {"effective_max_running_requests_per_dp": 9},
+                {"effective_max_running_requests_per_dp": 11},
+            ],
+        )
+
+        self.assertEqual(info["max_running_requests"], 32)
+        self.assertEqual(info["effective_max_running_requests"], 9)
+
+    def test_effective_max_running_requests_is_omitted_when_unavailable(self):
+        args = ServerArgs(model_path="dummy", max_running_requests=32)
+
+        info = _call_server_info_with(args, internal_states=[{}])
+
+        self.assertNotIn("effective_max_running_requests", info)
+
     def test_kv_events_config_raw_field_still_surfaced(self):
         # The new structured `kv_events` block sits alongside the
         # pre-existing flat `kv_events_config` field (the raw CLI string
