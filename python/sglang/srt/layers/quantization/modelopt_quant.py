@@ -2251,6 +2251,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
+        self.use_marlin_fallback = use_marlin_fallback
         if not get_platform().is_blackwell and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
@@ -2382,8 +2383,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        # swizzle+allocate here to avoid GPU memory fragmentation.
+        # The Marlin fallback path also never reads blockscale_swizzled
+        # (the kernel consumes only the marlin-processed w13_weight_scale)
+        # and process_weights_after_loading returns early before the
+        # re-swizzle, so the copy allocated here would pin uninitialized
+        # garbage for the server's lifetime (~3.5 GiB/rank on a 48-layer
+        # 512-expert NVFP4 model at TP2).
+        if self.enable_flashinfer_trtllm_moe or self.use_marlin_fallback:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2403,7 +2410,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or self.use_marlin_fallback:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
