@@ -291,8 +291,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             "_input_scale",
         )
 
-        # fused experts: experts.w13_weight / experts.w2_weight
-        is_fused_expert = False
+        # Fused checkpoint tensors: experts.gate_up_proj / experts.down_proj.
+        # The checkpoint interleaves these with separate shared-expert tensors,
+        # so picking one mapping must not affect the next weight.
         fused_expert_params_mapping = [
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
@@ -368,13 +369,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     f"mlp.experts.{num_experts}.",
                 )
 
+            is_fused_expert = (
+                "experts.gate_up_proj" in name or "experts.down_proj" in name
+            )
+            current_expert_params_mapping = (
+                fused_expert_params_mapping
+                if is_fused_expert
+                else expert_params_mapping
+            )
+
             # 1) Process stacked parameters (q_proj/k_proj/v_proj & gate_proj/up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Check if this is a fused expert weight
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
-                    is_fused_expert = True
-                    expert_params_mapping = fused_expert_params_mapping
-
                 # Skip non-matching weights
                 if weight_name not in name:
                     continue
@@ -404,7 +409,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 # 2) Process MoE expert weights (including fused experts)
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
