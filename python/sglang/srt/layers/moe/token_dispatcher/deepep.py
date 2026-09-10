@@ -486,30 +486,29 @@ class _DeepEPDispatcherImplBase:
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
-        if self.deepep_output_dtype in (
-            DispatcherOutputDtype.MXFP8,
-            DispatcherOutputDtype.MXFP4,
-        ):
-            if not _is_npu or not is_npu_arch35():
-                raise RuntimeError(
-                    "MXFP8/MXFP4 DeepEP dispatch is supported only on arch35 NPU."
-                )
-
-            deep_use_mode = os.environ.get("DEEP_USE_MODE", "default").lower()
-            if deep_use_mode == "default":
-                supports_mx = True
-            elif deep_use_mode == "ops":
-                supports_mx = self.dispatch_mode == DeepEPMode.NORMAL
-            elif deep_use_mode == "alltoall":
-                supports_mx = False
-            else:
-                supports_mx = False
-            if not supports_mx:
-                self.deepep_output_dtype = DispatcherOutputDtype.BF16
-            return
-
         if _is_npu:
-            if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
+            if self.deepep_output_dtype in (
+                DispatcherOutputDtype.MXFP8,
+                DispatcherOutputDtype.MXFP4,
+            ):
+                if not is_npu_arch35():
+                    raise RuntimeError(
+                        "MXFP8/MXFP4 DeepEP dispatch is supported only on arch35 NPU."
+                    )
+
+                deep_use_mode = os.environ.get("DEEP_USE_MODE", "default").lower()
+                if deep_use_mode == "default":
+                    supports_mx = True
+                elif deep_use_mode == "ops":
+                    supports_mx = self.dispatch_mode == DeepEPMode.NORMAL
+                elif deep_use_mode == "alltoall":
+                    supports_mx = False
+                else:
+                    supports_mx = False
+                if not supports_mx:
+                    self.deepep_output_dtype = DispatcherOutputDtype.BF16
+                return
+            elif self.deepep_output_dtype == DispatcherOutputDtype.FP8:
                 logger.warning_once(
                     "Ascend A2/A3 NPU does not support fp8 "
                     "deepep_dispatcher_output_dtype, switching to int8..."
@@ -526,6 +525,13 @@ class _DeepEPDispatcherImplBase:
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
+            elif self.deepep_output_dtype in (
+                DispatcherOutputDtype.MXFP8,
+                DispatcherOutputDtype.MXFP4,
+            ):
+                raise RuntimeError(
+                    "MXFP8/MXFP4 DeepEP dispatch is supported only on arch35 NPU."
+                )
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
