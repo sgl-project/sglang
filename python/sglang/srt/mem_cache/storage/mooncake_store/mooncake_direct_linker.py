@@ -211,7 +211,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
-        result = self.storage.batch_exists_v2(page_keys, expanded)
+        # PP0 queries every PP shard; the wrapper's existing TP/CP reduction
+        # then selects a boundary that all ranks can restore.
+        result = self.storage.batch_exists_v2(page_keys, expanded, query_all_pp=True)
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
         if restorable:

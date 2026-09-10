@@ -1121,6 +1121,8 @@ class Req(ReqDllmMixin):
         self.host_loaded_length = 0
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
+        # Absolute external-cache hit boundary shared by PP0; None outside PP.
+        self.external_cache_hit_length: Optional[int] = None
         # Storage prefetch retry state while queued
         # (see Scheduler._retry_missed_storage_prefetches).
         self.storage_prefetch_retry_pending = False
