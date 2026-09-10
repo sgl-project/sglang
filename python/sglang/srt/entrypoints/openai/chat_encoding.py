@@ -113,7 +113,8 @@ def resolve_chat_encoding_spec(
 ) -> Optional[str]:
     """Return the chat encoding spec for a model.
 
-    None means the default path (HF chat template).
+    None means the default path (HF chat template); any non-None spec also owns
+    reasoning-history rendering (:func:`spec_owns_reasoning_history`).
     """
     if tool_call_parser == "deepseekv4":
         return "dsv4"
@@ -140,6 +141,20 @@ def resolve_chat_encoding_spec(
     if "DeepseekV3" in arch and not has_chat_template:
         return "dsv32"
     return None
+
+
+def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
+    """Whether the encoder for ``spec`` renders assistant reasoning history itself.
+
+    Custom encoders frame the reasoning and content channels, so history must be
+    passed as assistant ``reasoning_content``. Splicing a detector's markers into
+    content instead nests a reasoning block inside the content channel and leaves
+    the real one empty, teaching the model to emit raw markers as visible text.
+
+    Answered for the whole family rather than a list of specs, so a new spec gets
+    the safe default: worst case is dropped history, not a leak.
+    """
+    return spec is not None
 
 
 def encode_simple_chat(

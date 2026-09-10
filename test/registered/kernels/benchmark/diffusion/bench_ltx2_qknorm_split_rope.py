@@ -4,9 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.kernels.ops.diffusion.ltx2_qknorm_split_rope import (
-    ltx2_qknorm_split_rope_cuda,
-)
+from sglang.kernels.ops.diffusion import ltx2_qknorm_split_rope_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 

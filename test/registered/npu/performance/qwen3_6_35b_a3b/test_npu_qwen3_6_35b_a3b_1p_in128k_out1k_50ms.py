@@ -10,9 +10,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
-    suite="",
+    suite="nightly-perf-2-npu-a3",
     nightly=True,
-    disabled="performance testcase",
 )
 
 QWEN3_6_35B_A3B_128K_1K_ENVS = {
@@ -52,7 +51,7 @@ QWEN3_6_35B_A3B_128K_1K_OTHER_ARGS = [
     3,
     "--mem-fraction-static",
     0.9,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     3,

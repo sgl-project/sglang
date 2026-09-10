@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
@@ -8,7 +9,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.models.dits.sana_video import (
+    GLUMBTempConv,
+    SanaVideoModulatedNorm,
     SanaVideoRotaryPosEmbed,
+    apply_interleaved_rotary_emb,
+    apply_interleaved_rotary_emb_pair,
 )
 from sglang.multimodal_gen.runtime.pipelines.sana_video import (
     select_sana_video_prompt_window,
@@ -85,3 +90,59 @@ def test_sana_video_rotary_embeddings_follow_video_token_order():
     assert sin.shape == (1, 12, 1, 12)
     assert torch.isfinite(cos).all()
     assert torch.isfinite(sin).all()
+
+
+def test_sana_video_paired_rope_falls_back_to_eager_on_cpu():
+    query = torch.randn(2, 7, 3, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 7, 1, 12, dtype=torch.float64)
+    sin = torch.randn_like(cos)
+
+    query_out, key_out = apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+
+    assert torch.equal(query_out, apply_interleaved_rotary_emb(query, cos, sin))
+    assert torch.equal(key_out, apply_interleaved_rotary_emb(key, cos, sin))
+
+
+def test_sana_video_glumb_shared_fast_path_preserves_reference():
+    torch.manual_seed(0)
+    module = GLUMBTempConv(channels=4, expand_ratio=2.0).eval()
+    hidden_states = torch.randn(1, 2, 3, 5, 4)
+
+    with torch.no_grad():
+        actual = module(hidden_states)
+
+        batch_size, num_frames, height, width, channels = hidden_states.shape
+        expected = hidden_states.reshape(
+            batch_size * num_frames, height, width, channels
+        ).permute(0, 3, 1, 2)
+        expected = F.silu(module.conv_inverted(expected))
+        expected = module.conv_depth(expected)
+        expected, gate = expected.chunk(2, dim=1)
+        expected = expected * F.silu(gate)
+        expected = module.conv_point(expected)
+        temporal = expected.reshape(
+            batch_size, num_frames, channels, height * width
+        ).permute(0, 2, 1, 3)
+        expected = temporal + module.conv_temp(temporal)
+        expected = expected.permute(0, 2, 3, 1).reshape(
+            batch_size, num_frames, height, width, channels
+        )
+
+    assert torch.equal(actual, expected)
+
+
+def test_sana_video_modulated_norm_shared_fast_path_preserves_reference():
+    torch.manual_seed(1)
+    module = SanaVideoModulatedNorm(dim=8, eps=1e-6).eval()
+    hidden_states = torch.randn(2, 5, 8)
+    embedded_timestep = torch.randn(2, 1, 8)
+    scale_shift_table = torch.randn(2, 8)
+
+    actual = module(hidden_states, embedded_timestep, scale_shift_table)
+    shift, scale = (
+        scale_shift_table[None, None] + embedded_timestep[:, :, None]
+    ).unbind(dim=2)
+    expected = module.norm(hidden_states) * (1 + scale) + shift
+
+    assert torch.equal(actual, expected)

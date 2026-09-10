@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Literal
 
 import torch
@@ -12,8 +13,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.auto import CONFIG_MAPPING
-from transformers.models.gemma.modeling_gemma import GemmaConfig
-from transformers.models.paligemma.modeling_paligemma import PaliGemmaModel
+from transformers.models.gemma.configuration_gemma import GemmaConfig
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -22,20 +22,26 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
+    MergedReplicatedLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.vla.prefix_cache import VLADensePrefixCache
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.rotary_embedding import (
     apply_rotary_pos_emb as native_apply_rotary_pos_emb,
 )
+from sglang.srt.models.siglip import SiglipVisionModel
 
 
 def config_compute_dtype(config: GemmaConfig) -> torch.dtype | None:
@@ -106,73 +112,6 @@ def _use_ulysses_action_attention(num_heads: int) -> bool:
     )
 
 
-class Pi05SiglipAttention(nn.Module):
-    def __init__(self, attention: nn.Module):
-        super().__init__()
-        self.embed_dim = attention.embed_dim
-        self.num_heads = attention.num_heads
-        self.head_dim = attention.head_dim
-        self.scale = getattr(attention, "scale", self.head_dim**-0.5)
-        self.dropout = getattr(attention, "dropout", 0.0)
-        self.q_proj = attention.q_proj
-        self.k_proj = attention.k_proj
-        self.v_proj = attention.v_proj
-        self.out_proj = attention.out_proj
-        self.attn = LocalAttention(
-            num_heads=self.num_heads,
-            head_size=self.head_dim,
-            num_kv_heads=self.num_heads,
-            softmax_scale=self.scale,
-            causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.FA2,
-                AttentionBackendEnum.TORCH_SDPA,
-            },
-            compute_dtype=self.q_proj.weight.dtype,
-            allow_cudnn_sdp=True,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        output_attentions: bool = False,
-        **kwargs,
-    ) -> tuple[torch.Tensor, None]:
-        input_shape = hidden_states.shape[:-1]
-        query_states = self.q_proj(hidden_states).view(
-            *input_shape,
-            self.num_heads,
-            self.head_dim,
-        )
-        key_states = self.k_proj(hidden_states).view(
-            *input_shape,
-            self.num_heads,
-            self.head_dim,
-        )
-        value_states = self.v_proj(hidden_states).view(
-            *input_shape,
-            self.num_heads,
-            self.head_dim,
-        )
-        attn_output = self.attn(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask,
-        )
-        attn_output = attn_output.reshape(*input_shape, self.embed_dim).contiguous()
-        return self.out_proj(attn_output), None
-
-
-def patch_siglip_vision_attention_to_native(vision_model: nn.Module) -> None:
-    for layer in vision_model.encoder.layers:
-        if isinstance(layer.self_attn, Pi05SiglipAttention):
-            continue
-        layer.self_attn = Pi05SiglipAttention(layer.self_attn)
-
-
 class PiGemmaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6, cond_dim: int | None = None):
         super().__init__()
@@ -231,31 +170,26 @@ class PiGemmaMLP(nn.Module):
             self.gate_proj = None
             self.up_proj = None
         else:
-            self.gate_proj = nn.Linear(
-                self.hidden_size, self.intermediate_size, bias=False
-            )
-            self.up_proj = nn.Linear(
-                self.hidden_size, self.intermediate_size, bias=False
+            self.gate_up_proj = MergedReplicatedLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.intermediate_size] * 2,
+                bias=False,
             )
             self.down_proj = nn.Linear(
                 self.intermediate_size, self.hidden_size, bias=False
             )
-            self.gate_up_proj = None
+            self.gate_proj = None
+            self.up_proj = None
         if config.hidden_act != "gelu_pytorch_tanh":
             raise ValueError(f"Unsupported PiGemma activation: {config.hidden_act}")
         self.act_fn = GeluAndMul(approximate="tanh")
 
     @property
     def projection_dtype(self) -> torch.dtype:
-        if self.tensor_parallel:
-            return self.gate_up_proj.weight.dtype
-        return self.up_proj.weight.dtype
+        return self.gate_up_proj.weight.dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.tensor_parallel:
-            gate_up = linear_forward(self.gate_up_proj, x)
-        else:
-            gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+        gate_up = linear_forward(self.gate_up_proj, x)
         return linear_forward(self.down_proj, self.act_fn(gate_up))
 
 
@@ -353,19 +287,11 @@ class PiGemmaAttention(nn.Module):
         else:
             self.num_heads = config.num_attention_heads
             self.num_key_value_heads = config.num_key_value_heads
-            self.q_proj = nn.Linear(
-                config.hidden_size,
-                self.num_heads * self.head_dim,
-                bias=config.attention_bias,
-            )
-            self.k_proj = nn.Linear(
-                config.hidden_size,
-                self.num_key_value_heads * self.head_dim,
-                bias=config.attention_bias,
-            )
-            self.v_proj = nn.Linear(
-                config.hidden_size,
-                self.num_key_value_heads * self.head_dim,
+            self.q_size = self.num_heads * self.head_dim
+            self.kv_size = self.num_key_value_heads * self.head_dim
+            self.qkv_proj = MergedReplicatedLinear(
+                input_size=config.hidden_size,
+                output_sizes=[self.q_size, self.kv_size, self.kv_size],
                 bias=config.attention_bias,
             )
             self.o_proj = nn.Linear(
@@ -373,9 +299,9 @@ class PiGemmaAttention(nn.Module):
                 config.hidden_size,
                 bias=config.attention_bias,
             )
-            self.qkv_proj = None
-            self.q_size = self.num_heads * self.head_dim
-            self.kv_size = self.num_key_value_heads * self.head_dim
+            self.q_proj = None
+            self.k_proj = None
+            self.v_proj = None
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.attn = LocalAttention(
             num_heads=self.num_heads,
@@ -412,9 +338,7 @@ class PiGemmaAttention(nn.Module):
 
     @property
     def projection_dtype(self) -> torch.dtype:
-        if self.tensor_parallel:
-            return self.qkv_proj.weight.dtype
-        return self.q_proj.weight.dtype
+        return self.qkv_proj.weight.dtype
 
     def project_qkv(
         self,
@@ -424,16 +348,11 @@ class PiGemmaAttention(nn.Module):
         query_shape = (*input_shape, self.num_heads, self.head_dim)
         kv_shape = (*input_shape, self.num_key_value_heads, self.head_dim)
 
-        if self.tensor_parallel:
-            qkv = linear_forward(self.qkv_proj, hidden_states)
-            query_states, key_states, value_states = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size],
-                dim=-1,
-            )
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        qkv = linear_forward(self.qkv_proj, hidden_states)
+        query_states, key_states, value_states = qkv.split(
+            [self.q_size, self.kv_size, self.kv_size],
+            dim=-1,
+        )
         return (
             query_states.view(query_shape).transpose(1, 2),
             key_states.view(kv_shape).transpose(1, 2),
@@ -788,13 +707,49 @@ class PiGemmaForCausalLM(nn.Module):
         self.lm_head = None
 
 
-class PaliGemmaModelWithPiGemma(PaliGemmaModel):
+class PaliGemmaMultiModalProjector(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.linear = nn.Linear(
+            config.vision_config.hidden_size,
+            config.vision_config.projection_dim,
+            bias=True,
+        )
+
+    def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+        return self.linear(image_features)
+
+
+class Pi05SiglipVisionModel(SiglipVisionModel, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["vision_model.encoder.layers"]
+
+
+class PaliGemmaModelWithPiGemma(nn.Module):
     def __init__(self, config, *, tensor_parallel: bool = False):
-        super().__init__(config)
-        del self.language_model
+        super().__init__()
+        self.config = config
+        self.vision_tower = Pi05SiglipVisionModel(
+            config.vision_config,
+            act_layer=partial(get_act_fn, config.vision_config.hidden_act),
+            qkv_backend="sdpa",
+            flatten_batch=False,
+            use_data_parallel=True,
+        )
+        self.multi_modal_projector = PaliGemmaMultiModalProjector(config)
         self.language_model = PiGemmaModel(
             config.text_config,
             tensor_parallel=tensor_parallel,
+        )
+
+    def get_image_features(
+        self, pixel_values: torch.Tensor
+    ) -> BaseModelOutputWithPooling:
+        vision_features = self.vision_tower(pixel_values)
+        image_features = self.multi_modal_projector(vision_features)
+        return BaseModelOutputWithPooling(
+            last_hidden_state=vision_features,
+            pooler_output=image_features,
         )
 
 
@@ -854,20 +809,22 @@ def create_sinusoidal_pos_embedding(
     dimension: int,
     min_period: float,
     max_period: float,
+    scaling: torch.Tensor | None = None,
 ) -> Tensor:
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
     if time.ndim != 1:
         raise ValueError("time must have shape [batch]")
-    fraction = torch.linspace(
-        0.0,
-        1.0,
-        dimension // 2,
-        dtype=torch.float64,
-        device=time.device,
-    )
-    period = min_period * (max_period / min_period) ** fraction
-    scaling = 1.0 / period * 2 * math.pi
+    if scaling is None:
+        fraction = torch.linspace(
+            0.0,
+            1.0,
+            dimension // 2,
+            dtype=torch.float64,
+            device=time.device,
+        )
+        period = min_period * (max_period / min_period) ** fraction
+        scaling = 1.0 / period * 2 * math.pi
     sin_input = scaling[None, :] * time[:, None].to(torch.float64)
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
@@ -905,34 +862,6 @@ def prepare_optional_full_attention_mask(
         return None
     masks_4d = att_2d_masks[:, None, :, :]
     return torch.where(masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
-
-
-def siglip_vision_forward_with_openpi_dtype(
-    self,
-    pixel_values,
-    interpolate_pos_encoding: bool | None = False,
-    **kwargs,
-) -> BaseModelOutputWithPooling:
-    hidden_states = self.embeddings(
-        pixel_values,
-        interpolate_pos_encoding=interpolate_pos_encoding,
-    )
-    if (
-        len(self.encoder.layers) > 0
-        and self.encoder.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
-    ):
-        hidden_states = hidden_states.to(torch.bfloat16)
-
-    encoder_outputs = self.encoder(inputs_embeds=hidden_states, **kwargs)
-    last_hidden_state = encoder_outputs.last_hidden_state
-    last_hidden_state = self.post_layernorm(last_hidden_state)
-    pooler_output = self.head(last_hidden_state) if self.use_head else None
-    return BaseModelOutputWithPooling(
-        last_hidden_state=last_hidden_state,
-        pooler_output=pooler_output,
-        hidden_states=encoder_outputs.hidden_states,
-        attentions=encoder_outputs.attentions,
-    )
 
 
 def compute_layer_complete(
@@ -1059,12 +988,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                 config=vlm_config_hf,
                 tensor_parallel=prefix_tensor_parallel,
             )
-            vision_tower = self.paligemma.model.vision_tower
-            vision_model = getattr(vision_tower, "vision_model", vision_tower)
-            vision_model.forward = siglip_vision_forward_with_openpi_dtype.__get__(
-                vision_model,
-                type(vision_model),
-            )
             self.paligemma.lm_head = None
 
         if runtime_role in ("all", "action"):
@@ -1090,14 +1013,6 @@ class PaliGemmaWithExpertModel(nn.Module):
             self.gemma_expert.lm_head = None
             self.gemma_expert.model.embed_tokens = None
         self.to_selected_dtype(precision)
-        self.patch_native_attention_after_dtype_finalize()
-
-    def patch_native_attention_after_dtype_finalize(self) -> None:
-        if self.paligemma is None:
-            return
-        vision_tower = self.paligemma.model.vision_tower
-        vision_model = getattr(vision_tower, "vision_model", vision_tower)
-        patch_siglip_vision_attention_to_native(vision_model)
 
     def to_selected_dtype(
         self, precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -1291,6 +1206,11 @@ class Pi05CoreModel(nn.Module):
             self.action_out_proj = None
             self.time_mlp_in = None
             self.time_mlp_out = None
+        self.register_buffer(
+            "_time_embedding_scaling",
+            torch.empty(0, dtype=torch.float64),
+            persistent=False,
+        )
 
     def retain_runtime_components(
         self,
@@ -1348,12 +1268,34 @@ class Pi05CoreModel(nn.Module):
         self,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._time_embedding_scaling.numel()
+            != self.action_in_proj.out_features // 2
+            or self._time_embedding_scaling.device != timestep.device
+        ):
+            fraction = torch.linspace(
+                0.0,
+                1.0,
+                self.action_in_proj.out_features // 2,
+                dtype=torch.float64,
+                device=timestep.device,
+            )
+            period = (
+                self.config.time_embedding_min_period
+                * (
+                    self.config.time_embedding_max_period
+                    / self.config.time_embedding_min_period
+                )
+                ** fraction
+            )
+            self._time_embedding_scaling = 1.0 / period * 2 * math.pi
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.action_in_proj.out_features,
             min_period=self.config.time_embedding_min_period,
             max_period=self.config.time_embedding_max_period,
+            scaling=self._time_embedding_scaling,
         )
         action_emb = self.action_in_proj(
             noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
@@ -1364,21 +1306,54 @@ class Pi05CoreModel(nn.Module):
         time_emb = self.time_mlp_out(time_emb)
         adarms_cond = F.silu(time_emb)
 
-        batch_size, action_len = action_emb.shape[:2]
+        return action_emb, adarms_cond
+
+    def prepare_denoise_layout(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        x_t: torch.Tensor,
+        prefix_full_attention: bool = False,
+        *,
+        action_position_offset: int = 0,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        batch_size, action_len = x_t.shape[:2]
         pad_masks = torch.ones(
             batch_size,
             action_len,
             dtype=torch.bool,
-            device=noisy_actions.device,
+            device=x_t.device,
         )
         att_masks_t = torch.zeros(
             batch_size,
             action_len,
-            dtype=action_emb.dtype,
-            device=noisy_actions.device,
+            dtype=x_t.dtype,
+            device=x_t.device,
         )
         att_masks_t[:, 0] = 1
-        return action_emb, pad_masks, att_masks_t, adarms_cond
+        if prefix_full_attention:
+            attention_mask = None
+        else:
+            prefix_len = prefix_pad_masks.shape[1]
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size, action_len, prefix_len
+            )
+            suffix_att_2d_masks = make_att_2d_masks(pad_masks, att_masks_t)
+            full_att_2d_masks = torch.cat(
+                [prefix_pad_2d_masks, suffix_att_2d_masks],
+                dim=2,
+            )
+            # A masked prefix guarantees that the concatenated layout is not
+            # full attention. Avoid a device-to-host ``.item()`` here so this
+            # path remains CUDA-graph capturable.
+            attention_mask = self.prepare_attention_masks_4d(
+                full_att_2d_masks,
+                full_attention=False,
+            )
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = (
+            prefix_offsets + action_position_offset + torch.cumsum(pad_masks, dim=1) - 1
+        )
+        return attention_mask, position_ids
 
     def _move_prefix_image_encoder_to_device(self, device: torch.device) -> None:
         paligemma = self.paligemma_with_expert.paligemma
@@ -1452,12 +1427,16 @@ class Pi05CoreModel(nn.Module):
         )
         self._offload_prefix_image_encoder_after_embed()
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_full_attention = bool(prefix_full_attention_hint)
-        if prefix_full_attention:
+        if prefix_full_attention_hint is True:
+            prefix_full_attention = True
             attention_mask = None
         else:
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-            prefix_full_attention = bool(prefix_att_2d_masks.all().item())
+            prefix_full_attention = (
+                bool(prefix_att_2d_masks.all().item())
+                if prefix_full_attention_hint is None
+                else False
+            )
             attention_mask = self.prepare_attention_masks_4d(
                 prefix_att_2d_masks,
                 full_attention=prefix_full_attention,
@@ -1488,32 +1467,17 @@ class Pi05CoreModel(nn.Module):
         prefix_full_attention: bool = False,
         *,
         action_position_offset: int = 0,
+        denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
-            self.embed_suffix(x_t, timestep)
-        )
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-        if prefix_full_attention:
-            attention_mask = None
-        else:
-            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
-                batch_size, suffix_len, prefix_len
+        suffix_embs, adarms_cond = self.embed_suffix(x_t, timestep)
+        if denoise_layout is None:
+            denoise_layout = self.prepare_denoise_layout(
+                prefix_pad_masks,
+                x_t,
+                prefix_full_attention,
+                action_position_offset=action_position_offset,
             )
-            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-            full_att_2d_masks = torch.cat(
-                [prefix_pad_2d_masks, suffix_att_2d_masks],
-                dim=2,
-            )
-            attention_mask = self.prepare_attention_masks_4d(full_att_2d_masks)
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = (
-            prefix_offsets
-            + action_position_offset
-            + torch.cumsum(suffix_pad_masks, dim=1)
-            - 1
-        )
+        attention_mask, position_ids = denoise_layout
         with set_forward_context(current_timestep=0, attn_metadata=None):
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=attention_mask,

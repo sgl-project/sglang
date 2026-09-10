@@ -41,7 +41,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang
 uv venv
 source .venv/bin/activate
-uv pip install -e "python[all]" --index-url=https://pypi.org/simple
+uv pip install --prerelease=allow -e "python[all]" --index-url=https://pypi.org/simple
 pip install nvidia-cudnn-cu12==9.16.0.29
 # Install ffmpeg to support video input
 sudo apt update

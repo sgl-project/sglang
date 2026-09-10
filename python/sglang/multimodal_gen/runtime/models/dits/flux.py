@@ -28,25 +28,21 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
-from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_layernorm_modulate,
+    can_use_linear_gelu,
+    can_use_ln_modulate,
     fused_gelu_active,
+    fused_layernorm_modulate,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.fused_ln_modulate import (
-    can_fuse_ln_modulate,
     fused_ln_modulate,
     fused_ln_modulate_active,
-    mark_fused_ln_modulate_site,
-)
-from sglang.kernels.ops.diffusion.modulate_scale_shift import modulate_scale_shift
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
-    can_use_fused_layernorm_modulate,
-    fused_layernorm_modulate,
     is_plain_layer_norm,
+    mark_fused_gelu_site,
+    mark_fused_ln_modulate_site,
+    modulate_scale_shift,
+    residual_gate_add,
 )
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -173,16 +169,17 @@ def _flux_norm_modulate(
     """``norm(x) * (1 + scale) + shift`` for the FLUX adaLN sites.
 
     Priority: (1) the bit-exact single-kernel LN+modulate -- lossless, so it
-    needs no quality gate and also supersedes the ``quality="high"`` affine
+    needs no quality gate and also supersedes the request-gated affine
     fold wherever it verifies; (2) when the site is mounted
-    (``quality="high"``) and the bit-exact kernel is unavailable, the
-    modulate folded into the LN affine (one aten kernel; not bit-exact);
+    (``quality="extra-high"`` or ``"high"``) and the bit-exact kernel is
+    unavailable, the modulate folded into the LN affine (one aten kernel; not
+    bit-exact);
     (3) affine-free LayerNorm + the bit-exact fused modulate.
     """
     out = _flux_fused_ln_modulate(norm, x, scale, shift)
     if out is not None:
         return out
-    if fused_ln_modulate_active(site) and can_fuse_ln_modulate(x, scale, shift):
+    if fused_ln_modulate_active(site) and can_use_ln_modulate(x, scale, shift):
         return fused_ln_modulate(x, scale, shift, norm.eps)
     return modulate_scale_shift(norm(x), scale, shift)
 
@@ -391,12 +388,12 @@ class FluxGELU(nn.Module):
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.gelu = nn.GELU(approximate="tanh")
-        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # extra-high/high fusion site: up-proj GEMM + tanh-GELU in the cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -411,7 +408,7 @@ class FluxFusedGELUProj(nn.Module):
     ``approximate="tanh"`` that keeps the ``net.0.proj`` parameter path. The
     default path is the bit-exact reference (plain Linear + tanh-GELU); the
     cublasLt GELU epilogue is mounted per batch by the denoising stage for
-    quality="high" requests only.
+    requests with ``quality="extra-high"`` or ``quality="high"`` only.
     """
 
     def __init__(self, proj: nn.Linear):
@@ -420,7 +417,7 @@ class FluxFusedGELUProj(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -794,7 +791,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
-            # quality="high" fusion site: proj_mlp GEMM + tanh-GELU in the
+            # extra-high/high fusion site: proj_mlp GEMM + tanh-GELU in the
             # cublasLt epilogue (mounted per batch by the denoising stage).
             mark_fused_gelu_site(self, "proj_mlp")
             proj_out_cls = (
@@ -896,7 +893,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            if fused_gelu_active(self) and can_fuse_linear_gelu(
+            if fused_gelu_active(self) and can_use_linear_gelu(
                 self.proj_mlp, norm_hidden_states
             ):
                 mlp_hidden_states = fused_linear_gelu_tanh(
@@ -958,7 +955,7 @@ class FluxTransformerBlock(nn.Module):
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        # quality="high" site: the norm2/norm2_context modulate folds into the
+        # extra-high/high site: norm2/norm2_context modulate folds into the
         # LN affine when mounted.
         mark_fused_ln_modulate_site(self)
 
@@ -1013,7 +1010,7 @@ class FluxTransformerBlock(nn.Module):
                 activation_fn="gelu-approximate",
             )
             # Re-home each FF's tanh-GELU up-projection onto a marked
-            # quality="high" fusion site (bit-exact reference by default).
+            # extra-high/high fusion site (bit-exact reference by default).
             self.ff.net[0] = FluxFusedGELUProj(self.ff.net[0].proj)
             self.ff_context.net[0] = FluxFusedGELUProj(self.ff_context.net[0].proj)
 

@@ -7,7 +7,7 @@ license.workspace = true
 
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module.
 [package.metadata.sglang]
-python-module = "sglang.srt.server._core"
+python-module = "sglang.srt.rust_extensions._server"
 # Always build optimized, even for an editable install.
 debug = false
 
@@ -50,7 +50,7 @@ hf-hub = { version = "0.4", default-features = false }
 itertools = "0.14"
 # POSIX shm for the MM feature fan-out (`mm::ShmSegment`).
 libc = "0.2"
-# Same major as the workspace pyo3: the zero-copy MM drain (`take_mm`) moves
+# Same major as the workspace pyo3: the zero-copy MM drain (`take_mm_result`) moves
 # Rust vectors into numpy arrays.
 numpy = "0.29.0"
 # Pinned EXACTLY: this crate's accepted grammar defines the
