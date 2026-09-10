@@ -23,11 +23,7 @@ else:
         _preload_cuda_library()
 
     from sgl_kernel.allreduce import *
-    from sgl_kernel.attention import (
-        cutlass_mla_decode,
-        cutlass_mla_get_workspace_size,
-        merge_state_v2,
-    )
+    from sgl_kernel.attention import merge_state_v2
     from sgl_kernel.cutlass_moe import (
         cutlass_w4a8_moe_mm,
         get_cutlass_w4a8_moe_mm_data,
@@ -54,7 +50,6 @@ else:
         es_sm100_mxfp8_blockscaled_grouped_quant,
     )
     from sgl_kernel.gemm import (
-        awq_dequantize,
         convrot_int8_fused_linear,
         convrot_int8_fused_linear_gelu_input,
         convrot_int8_fused_linear_out,
@@ -63,8 +58,6 @@ else:
         convrot_int8_supported_sm_versions,
         convrot_rotate_quantize_activation,
         fp8_scaled_mm,
-        gptq_gemm,
-        gptq_shuffle,
         int8_scaled_mm,
         sgl_per_token_group_quant_8bit,
         sgl_per_token_group_quant_fp8,
@@ -157,7 +150,6 @@ else:
     _DEBUG_EXPORT_NAMES = [
         "apply_shuffle_mul_sum",
         "apply_token_bitmask_inplace_cuda",
-        "awq_dequantize",
         "build_tree_kernel_efficient",
         "causal_conv1d_fwd",
         "causal_conv1d_update",
@@ -171,8 +163,6 @@ else:
         "convrot_int8_supported_sm_versions",
         "convrot_rotate_quantize_activation",
         "copy_to_gpu_no_ce",
-        "cutlass_mla_decode",
-        "cutlass_mla_get_workspace_size",
         "dsv4_fused_k_norm_rope_flashmla",
         "dsv4_fused_q_indexer_rope_hadamard_quant",
         "dsv4_fused_q_norm_rope",
@@ -191,8 +181,6 @@ else:
         "gelu_tanh_and_mul",
         "gemma_fused_add_rmsnorm",
         "gemma_rmsnorm",
-        "gptq_gemm",
-        "gptq_shuffle",
         "int8_scaled_mm",
         "merge_state_v2",
         "moe_align_block_size",

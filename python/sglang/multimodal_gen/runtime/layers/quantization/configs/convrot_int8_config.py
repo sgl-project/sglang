@@ -25,9 +25,16 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
+    ComfyInt8EmbeddingMethod,
+    is_comfy_int8_embedding,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -109,6 +116,8 @@ class ConvRotInt8Config(QuantizationConfig):
         self._serialized_group_sizes: dict[str, int] = {}
         if layer_markers is not None:
             for prefix, marker in layer_markers.items():
+                if is_comfy_int8_embedding(marker):
+                    continue
                 if marker.get("format") != "int8_tensorwise":
                     raise ValueError(
                         f"Unsupported Comfy INT8 format for {prefix!r}: "
@@ -137,6 +146,9 @@ class ConvRotInt8Config(QuantizationConfig):
         # Logged per backend at the end of loading: a silent fallback to BF16
         # or to the slower backend looks exactly like a slow kernel.
         self.selected: list[str] = []
+        # Embeddings count as selected for the loader's marker check but never
+        # report back through note_quantized / note_loaded.
+        self.selected_embeddings: list[str] = []
         self.selected_by_backend: dict[str, list[str]] = {
             COMFY_KITCHEN: [],
             SGL_KERNEL: [],
@@ -256,6 +268,14 @@ class ConvRotInt8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
+        if isinstance(layer, VocabParallelEmbedding) and self.quantizes_embedding(
+            prefix
+        ):
+            self.selected.append(prefix)
+            self.selected_embeddings.append(prefix)
+            return ComfyInt8EmbeddingMethod(
+                tensorwise=bool(self.layer_markers[prefix].get("_is_tensorwise_scalar"))
+            )
         if not isinstance(layer, LinearBase):
             return None
         # A column-parallel layer shards its output; every rank sees the same
@@ -312,7 +332,7 @@ class ConvRotInt8Config(QuantizationConfig):
     def note_quantized(self, saved_bytes: int) -> None:
         self._processed += 1
         self._quantized_bytes += saved_bytes
-        if self._processed == len(self.selected):
+        if self._processed == len(self.selected) - len(self.selected_embeddings):
             logger.info(
                 "convrot_int8: quantized %d linear layers (%.2f GiB of BF16 weights "
                 "-> %.2f GiB INT8; sgl_kernel %d, comfy_kitchen %d), left %d in BF16",
@@ -328,7 +348,7 @@ class ConvRotInt8Config(QuantizationConfig):
     def note_loaded(self) -> None:
         """A serialized layer's INT8 weights are in place; logs the backend split once."""
         self._processed += 1
-        if self._processed == len(self.selected):
+        if self._processed == len(self.selected) - len(self.selected_embeddings):
             logger.info(
                 "convrot_int8: loaded %d serialized INT8 linear layers "
                 "(sgl_kernel %d, comfy_kitchen %d)",
@@ -339,6 +359,11 @@ class ConvRotInt8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> list[str]:
         return []
+
+    def quantizes_embedding(self, prefix: str) -> bool:
+        return self.layer_markers is not None and is_comfy_int8_embedding(
+            self.layer_markers.get(prefix)
+        )
 
     def supports_input_partition(
         self, prefix: str, input_size_per_partition: int

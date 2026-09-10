@@ -210,12 +210,12 @@ backend.
       <td>Auto-detected; omit <code>--quantization</code>. Each layer dispatches to its serialized W4A4 or INT8 ConvRot kernel. CUDA requires SM75+; TP must preserve each format's quantization and ConvRot group boundaries. Offload is supported and FSDP is not.</td>
     </tr>
     <tr>
-      <td><code>comfy-nvfp4-full-precision</code></td>
-      <td>Safetensors with serialized <code>nvfp4</code> and optional row-wise <code>int8_tensorwise</code> layer metadata</td>
+      <td><code>comfy-nvfp4</code></td>
+      <td>Safetensors with serialized <code>nvfp4</code> and optional scalar/row-wise <code>int8_tensorwise</code> layer metadata</td>
       <td><code>--component-weights-paths.text_encoder</code></td>
       <td>MiniMax-H3 native Qwen3-VL encoder</td>
-      <td>None</td>
-      <td>Auto-detected; omit explicit quantization. Preserves packed storage, high-nibble-first weights, swizzled block scales, and AWQ input pre-scales. Each active NVFP4 matrix is dequantized for BF16/FP16 compute, so this is a memory path rather than a native FP4 speed path.</td>
+      <td><code>comfy-kitchen</code> for NVFP4 matmul</td>
+      <td>Auto-detected; omit explicit quantization. Preserves high-nibble-first weights, swizzled block scales, and optional AWQ input pre-scales. Layers declaring <code>full_precision_matrix_mult</code> use BF16/FP16 compute with packed storage. Other NVFP4 layers use dynamic activation quantization and NVFP4 matmul on NVIDIA SM100+. Companion INT8 embeddings support scalar or per-row scales without expanding the full table.</td>
     </tr>
     <tr>
       <td><code>quanto-int8</code></td>
