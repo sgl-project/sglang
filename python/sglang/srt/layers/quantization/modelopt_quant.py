@@ -354,6 +354,15 @@ class ModelOptQuantConfig(QuantizationConfig):
                 expanded.append(name)
                 if name.startswith("language_model."):
                     expanded.append(name.removeprefix("language_model."))
+                # ModelOpt writes some vision-language checkpoints with the decoder
+                # nested under "model.language_model.*" while sglang builds it as
+                # "model.*". The segment is interior, so the prefix strip above never
+                # fires for it. Ref: hf_quant_config.json for
+                # https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4
+                if name.startswith("model.language_model."):
+                    expanded.append(
+                        "model." + name.removeprefix("model.language_model.")
+                    )
             # Preserve order, drop duplicates.
             self.exclude_modules = list(dict.fromkeys(expanded))
 

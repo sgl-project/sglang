@@ -17,6 +17,52 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TestModelOptExcludeModuleMapping(CustomTestCase):
+    """apply_weight_name_mapper expands exclusion patterns to the names sglang builds."""
+
+    class _IdentityMapper:
+        def apply_list(self, names):
+            return list(names)
+
+    def _mapped(self, exclude_modules):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo=None,
+            group_size=16,
+            exclude_modules=list(exclude_modules),
+        )
+        config.apply_weight_name_mapper(self._IdentityMapper())
+        return config
+
+    def test_interior_language_model_segment_is_expanded(self):
+        """nvidia/GLM-5.3-Flash-NVFP4 nests the decoder under model.language_model.*
+        while sglang builds it as model.*, leaving every excluded attention, gate and
+        shared-expert layer quantized and crashing the load on a shape mismatch."""
+        config = self._mapped(["model.language_model.layers.0.self_attn*"])
+        self.assertTrue(config.is_layer_excluded("model.layers.0.self_attn.kv_b_proj"))
+        self.assertTrue(config.is_layer_excluded("model.layers.0.self_attn.q_b_proj"))
+        # the checkpoint's own spelling keeps matching
+        self.assertTrue(
+            config.is_layer_excluded(
+                "model.language_model.layers.0.self_attn.kv_b_proj"
+            )
+        )
+
+    def test_interior_expansion_does_not_widen_the_match(self):
+        config = self._mapped(["model.language_model.layers.10.mlp.gate"])
+        self.assertTrue(config.is_layer_excluded("model.layers.10.mlp.gate"))
+        self.assertFalse(config.is_layer_excluded("model.layers.11.mlp.gate"))
+        self.assertFalse(config.is_layer_excluded("model.layers.10.mlp.experts"))
+
+    def test_leading_language_model_strip_is_unchanged(self):
+        config = self._mapped(["language_model.model.layers.0.self_attn.q_proj"])
+        self.assertTrue(config.is_layer_excluded("model.layers.0.self_attn.q_proj"))
+
+    def test_names_without_the_segment_are_untouched(self):
+        config = self._mapped(["lm_head", "model.visual*"])
+        self.assertEqual(config.exclude_modules, ["lm_head", "model.visual*"])
+
+
 class TestModelOptNvfp4(CustomTestCase):
     def _make_layer(self):
         return MergedColumnParallelLinear(
