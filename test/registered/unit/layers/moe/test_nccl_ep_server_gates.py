@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -12,11 +13,26 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from nccl_ep_test.followup_server import command, prerequisite
+from nccl_ep_test.followup_server import check_port_available, command, prerequisite
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+def test_serving_probe_accepts_time_wait_but_rejects_live_listener():
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.listen()
+        with pytest.raises(OSError):
+            check_port_available(port)
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            connection, _ = listener.accept()
+            connection.close()  # Active close leaves the server port in TIME_WAIT.
+            assert client.recv(1) == b""
+    check_port_available(port)
 
 
 @pytest.mark.parametrize("passed,head", [(False, "current"), (True, "old")])

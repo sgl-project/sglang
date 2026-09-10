@@ -175,12 +175,19 @@ def server_args(port, *, graph=True):
     return args
 
 
+def check_port_available(port):
+    # Avoid accidentally directing tests at an unrelated existing server.
+    with socket.socket() as probe:
+        # The preceding serving phase can leave connections in TIME_WAIT.
+        # SO_REUSEADDR permits those, but still rejects a live TCP listener.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("127.0.0.1", port))
+
+
 def serving_smoke(reports, port, *, graph):
     label = "graph" if graph else "eager"
     base = f"http://127.0.0.1:{port}"
-    # Avoid accidentally directing tests at an unrelated existing server.
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", port))
+    check_port_available(port)
 
     def request(path, body=None, timeout=120):
         data = json.dumps(body).encode() if body is not None else None
@@ -360,10 +367,10 @@ def main():
 
             result["bindings"] = binding_check()
             result["jit"] = prepare_jit()  # Export paths to the server subprocesses.
-            result["serving"] = [
-                serving_smoke(reports, args.port, graph=graph)
-                for graph in (False, True)
-            ]
+            result["serving"] = []
+            for graph in (False, True):
+                result["serving"].append(serving_smoke(reports, args.port, graph=graph))
+                save(target, result)  # Preserve eager evidence if Graph later fails.
             result["model_revision"] = REVISION
             result["full_model_accuracy_benchmark"] = False
         result["passed"] = True
