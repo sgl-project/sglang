@@ -28,11 +28,12 @@ pub enum OneOrMany<T: OneOrManyItem> {
 /// a batch silently arrives as a single request. Those types need a
 /// `deserialize_any` dispatch instead (see [`SamplingParamsInput`]).
 ///
-/// [`TokenIds`] is the one member that does accept a sequence, and that ambiguity
-/// is the intended semantics: flat `[1,2]` is one prompt's ids (or a broadcast),
-/// `[[1],[2]]` is per-prompt — the shapes Python's `_normalize_batch`
-/// distinguishes. `String` / `bool` / `i64` never match a list, so both forms
-/// round-trip.
+/// [`TokenIds`] and `Vec<String>` are the members that do accept a sequence, and
+/// that ambiguity is the intended semantics: flat `[1,2]` is one prompt's ids
+/// (or a broadcast), `[[1],[2]]` is per-prompt — the shapes Python's
+/// `_normalize_batch` distinguishes, and `mm_hashes`'s
+/// `Union[List[str], List[List[str]]]` reads the same way. `String` / `bool` /
+/// `i64` never match a list, so both forms round-trip.
 pub trait OneOrManyItem: sealed::SealedItem {}
 
 impl<T: sealed::SealedItem> OneOrManyItem for T {}
@@ -45,6 +46,8 @@ mod sealed {
     impl SealedItem for i64 {}
     impl SealedItem for String {}
     impl SealedItem for super::TokenIds {}
+    /// `mm_hashes`: a flat list is one request's hashes, nested is per-request.
+    impl SealedItem for Vec<String> {}
     // Nullable elements for the PD bootstrap fields (`List[Optional[...]]` in
     // Python — the PD router sends `bootstrap_port: [null, …]` when deferring to
     // the scheduler's default port). A bare `null` never reaches `One(None)`: the
