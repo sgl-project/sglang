@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 
 if TYPE_CHECKING:
@@ -459,8 +460,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 backend_params.setdefault("thread_count", str(num_threads))
             elif backend == "UCCL":
                 backend_params.setdefault("num_cpus", str(num_threads))
+
+        def create_backend():
+            torch.get_device_module(server_args.device).set_device(self.kv_args.gpu_id)
+            return self.agent.create_backend(backend, backend_params)
+
         run_with_deadline(
-            lambda: self.agent.create_backend(backend, backend_params),
+            create_backend,
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"NIXL create_backend({backend!r}, {backend_params})",
         )
