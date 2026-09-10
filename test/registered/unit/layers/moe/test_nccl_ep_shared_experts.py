@@ -32,6 +32,17 @@ def compute_context(monkeypatch):
         yield
 
 
+def test_shared_fixture_does_not_require_global_tp_initialization(monkeypatch):
+    monkeypatch.setattr(parallel_state, "_TP", None)
+    monkeypatch.setattr(
+        "sglang.srt.layers.linear.get_tp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    mlp = make_shared_mlp()
+    x = torch.zeros(1, 2048, dtype=torch.bfloat16, device="cuda")
+    torch.testing.assert_close(mlp(x), x, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("count", [1, 2])
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("hidden,intermediate", [(256, 128), (2048, 1408)])

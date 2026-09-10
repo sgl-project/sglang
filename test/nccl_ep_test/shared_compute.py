@@ -9,6 +9,7 @@ from .triton_compute import _gemm_cpu
 def make_shared_mlp(*, shared_experts=2, hidden=2048, intermediate=128, fp8=True):
     from sglang.srt.layers.quantization.fp8 import Fp8Config
     from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
+    from sglang.srt.runtime_context import get_parallel
 
     quant = (
         Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
@@ -16,7 +17,9 @@ def make_shared_mlp(*, shared_experts=2, hidden=2048, intermediate=128, fp8=True
         else None
     )
     width = shared_experts * intermediate
-    with torch.device("cuda"):
+    # The synthetic pair owns its EP communicator, not SGLang's global TP
+    # group. Match the FP8 shape validator to this explicitly unsharded MLP.
+    with torch.device("cuda"), get_parallel().override(tp_size=1, tp_rank=0):
         mlp = DeepseekV2MLP(
             hidden,
             width,
