@@ -3,26 +3,35 @@
 
 from __future__ import annotations
 
-import os
-from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import torch
-from torch.utils.cpp_extension import load
 
-from sglang.kernels.jit.utils import KERNEL_PATH
+from sglang.kernels.jit.utils import cache_once, load_jit
 
-_EXTENSION_NAME = "sglang_expert_pack_mxfp4"
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
+_CUDA_FILE = "moe/expert_pack_mxfp4.cuh"
 
 
-@lru_cache(maxsize=1)
-def _extension():
-    source = KERNEL_PATH / "csrc" / "moe" / "expert_pack_mxfp4.cu"
-    return load(
-        name=_EXTENSION_NAME,
-        sources=[str(source)],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
-        verbose=os.getenv("SGLANG_EXPERT_PACK_BUILD_VERBOSE", "0") == "1",
+@cache_once
+def _extension() -> Module:
+    """Compile and cache the expert-pack MXFP4 module.
+
+    Both element types are instantiated in one module: a decode step calls the
+    matvec kernels for whichever dtype the model runs in, and splitting the
+    build per dtype would only trade one compile for two.
+    """
+    return load_jit(
+        "expert_pack_mxfp4",
+        cuda_files=[_CUDA_FILE],
+        cuda_wrappers=[
+            ("mxfp4_matvec", "mxfp4_matvec"),
+            ("mxfp4_matvec_dual", "mxfp4_matvec_dual"),
+            ("mxfp4_marlin_repack", "mxfp4_marlin_repack"),
+        ],
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 
@@ -39,7 +48,9 @@ def mxfp4_matvec(
 ) -> torch.Tensor:
     """Multiply selected raw GGUF MXFP4 matrices by BF16/FP16 rows."""
 
-    return _extension().mxfp4_matvec(
+    out = x.new_empty((slot_ids.numel(), output_size))
+    _extension().mxfp4_matvec(
+        out,
         x,
         cache,
         slot_ids,
@@ -49,6 +60,7 @@ def mxfp4_matvec(
         output_size,
         records_per_input,
     )
+    return out
 
 
 def mxfp4_matvec_dual(
@@ -65,7 +77,12 @@ def mxfp4_matvec_dual(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute gate and up projections while loading each input row once."""
 
-    return _extension().mxfp4_matvec_dual(
+    shape = (slot_ids.numel(), output_size)
+    out_gate = x.new_empty(shape)
+    out_up = x.new_empty(shape)
+    _extension().mxfp4_matvec_dual(
+        out_gate,
+        out_up,
         x,
         cache,
         slot_ids,
@@ -76,6 +93,7 @@ def mxfp4_matvec_dual(
         output_size,
         records_per_input,
     )
+    return out_gate, out_up
 
 
 def prewarm_mxfp4_extension() -> None:
