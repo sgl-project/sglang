@@ -101,6 +101,17 @@ if TYPE_CHECKING:
             """
             return self.tree.writing_through(key, indices)
 
+        def writing_through_and_match_prefix(
+            self, key: List[int], indices: torch.Tensor
+        ) -> Tuple[
+            List[Tuple[IOHandle, torch.Tensor, torch.Tensor]],
+            int,
+            List[torch.Tensor],
+            TreeNodeCpp,
+        ]:
+            """Insert a key and return its complete device match in one tree walk."""
+            return self.tree.writing_through_and_match_prefix(key, indices)
+
         def loading_onboard(
             self,
             host_node: TreeNodeCpp,

@@ -12,6 +12,10 @@
 
 namespace radix_tree_v2 {
 
+struct TreeNode;
+
+using WriteThroughActions = std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>;
+
 struct RadixTree {
  public:
   RadixTree(bool disabled, std::optional<std::size_t> host_size, std::size_t page_size, std::size_t threshold);
@@ -30,8 +34,11 @@ struct RadixTree {
   /// @brief (Un-)Lock a node.
   void lock_ref(NodeHandle node_id, bool increment /* increment or decrement */);
   /// @brief Update new key-value pair and try to perform write-through.
-  std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, std::size_t>
-  writing_through(const token_vec_t& key, at::Tensor value);
+  std::tuple<WriteThroughActions, std::size_t> writing_through(const token_vec_t& key, at::Tensor value);
+  /// @brief Insert a key-value pair and return its complete device match without a second tree walk.
+  /// @return (pending writes, pre-existing prefix length, device indices, final device node).
+  std::tuple<WriteThroughActions, std::size_t, std::vector<at::Tensor>, NodeHandle>
+  writing_through_and_match_prefix(const token_vec_t& key, at::Tensor value);
   /// @brief Load to device from host within a range of nodes.
   std::tuple<IOTicket, std::vector<at::Tensor>> loading_onboard(NodeHandle host_id, at::Tensor indices);
   /// @brief Commit a transaction of write-through.
@@ -53,6 +60,13 @@ struct RadixTree {
 
  private:
   struct Impl;
+  struct WriteThroughState {
+    WriteThroughActions actions;
+    std::size_t matched_length;
+    TreeNode* last_node;
+  };
+
+  WriteThroughState writing_through_impl(const token_vec_t& key, at::Tensor value);
   std::unique_ptr<Impl> m_impl;
 };
 

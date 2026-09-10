@@ -75,9 +75,7 @@ std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
   return evicted_values;
 }
 
-std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, std::size_t>
-RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
-  if (m_impl->disabled) return {};
+RadixTree::WriteThroughState RadixTree::writing_through_impl(const token_vec_t& _key, at::Tensor value) {
   _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
 
   // just align the key to the page size, clip the unaligned tail
@@ -87,8 +85,9 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
 
   // insert and create a new node if the remaining part of the key is not empty
+  auto last_node = host_node;
   if (host_prefix_length != key.size()) {
-    m_impl->create_device_node(
+    last_node = m_impl->create_device_node(
         host_node,
         {key.begin() + host_prefix_length, key.end()},
         value.slice(/*dim=*/0, host_prefix_length, key.size()));
@@ -97,11 +96,29 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   // add the hit count for the device node
   walk_to_root(host_node, [&](TreeNode* n) { n->hit_count++; });
 
-  std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>> result;
+  WriteThroughActions actions;
 
   // don't write through if hicache is disabled (no host memory), fast path
-  if (!m_impl->use_hicache) return {std::move(result), host_prefix_length};
+  if (!m_impl->use_hicache) return {std::move(actions), host_prefix_length, last_node};
   throw std::runtime_error("Not implemented yet");
+}
+
+std::tuple<WriteThroughActions, std::size_t> RadixTree::writing_through(const token_vec_t& key, at::Tensor value) {
+  if (m_impl->disabled) return {};
+  auto result = writing_through_impl(key, std::move(value));
+  return {std::move(result.actions), result.matched_length};
+}
+
+std::tuple<WriteThroughActions, std::size_t, std::vector<at::Tensor>, NodeHandle>
+RadixTree::writing_through_and_match_prefix(const token_vec_t& key, at::Tensor value) {
+  if (m_impl->disabled) return {};
+
+  auto result = writing_through_impl(key, std::move(value));
+  std::vector<at::Tensor> indices;
+  walk_to_root(result.last_node, [&](TreeNode* node) { indices.push_back(node->device_indices()); });
+  std::reverse(indices.begin(), indices.end());
+
+  return {std::move(result.actions), result.matched_length, std::move(indices), node2id(result.last_node)};
 }
 
 std::tuple<IOTicket, std::vector<at::Tensor>> RadixTree::loading_onboard(NodeHandle, at::Tensor) {
