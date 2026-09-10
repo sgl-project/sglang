@@ -572,7 +572,7 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BLO
       ldc,                                                                            \
       block_size_K);
 
-#define LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(MB_SIZE, NB_SIZE)                \
+#define LAUNCH_TINYGEMM_KERNEL_NN2(MB_SIZE, NB_SIZE)                \
   tinygemm_kernel_nn2<scalar_t, packed_t, has_bias, MB_SIZE, NB_SIZE>::apply( \
       A + mb_start * lda,                                                     \
       B + nb_start * 2,                                                       \
@@ -842,18 +842,18 @@ void tinygemm_kernel_per_tensor(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch (nb_size) {
-        case 32:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(1, 32);
+      switch (nb_size >> 4) {
+        case 2:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 32);
           break;
-        case 64:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(1, 64);
+        case 4:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 64);
           break;
-        case 96:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(1, 96);
+        case 6:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 96);
           break;
-        case 128:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(1, 128);
+        case 8:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 128);
           break;
         default:
           TORCH_CHECK(false, "Unexpected block size, 1x", nb_size);
@@ -874,34 +874,34 @@ void tinygemm_kernel_per_tensor(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch (mb_size << 8 | nb_size) {
+      switch (mb_size << 4 | nb_size >> 4) {
         // mb_size = 1
-        case 0x120:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(1, 32);
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 32);
           break;
-        case 0x140:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(1, 64);
+        case 0x14:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 64);
           break;
         // mb_size = 2
-        case 0x220:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(2, 32);
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_NN2(2, 32);
           break;
-        case 0x240:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(2, 64);
+        case 0x24:
+          LAUNCH_TINYGEMM_KERNEL_NN2(2, 64);
           break;
         // mb_size = 3
-        case 0x320:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(3, 32);
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_NN2(3, 32);
           break;
-        case 0x340:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(3, 64);
+        case 0x34:
+          LAUNCH_TINYGEMM_KERNEL_NN2(3, 64);
           break;
         // mb_size = 4
-        case 0x420:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(4, 32);
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_NN2(4, 32);
           break;
-        case 0x440:
-          LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(4, 64);
+        case 0x44:
+          LAUNCH_TINYGEMM_KERNEL_NN2(4, 64);
           break;
         default:
           TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", nb_size);
