@@ -44,8 +44,8 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
-      use_run_selected_tests:
-        description: 'If true, delegate test execution to scripts/run_selected_tests.sh instead of running via run_suite.py directly'
+      use_coverage_runner:
+        description: 'If true, delegate test execution to scripts/run_tests_with_coverage.sh instead of running via run_suite.py directly'
         type: boolean
         default: false
       github-token:
@@ -271,10 +271,10 @@ jobs:
             NIGHTLY_FLAG="--nightly --continue-on-error"
           fi
 
-          # Optional: delegate execution to scripts/run_selected_tests.sh when the
-          # caller sets use_run_selected_tests=true. The original run_suite.py
+          # Optional: delegate execution to scripts/run_tests_with_coverage.sh when the
+          # caller sets use_coverage_runner=true. The original run_suite.py
           # execution below is preserved unchanged for the default (false) path.
-          if [[ "${{ inputs.use_run_selected_tests }}" == "true" ]]; then
+          if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
             pip install coverage==7.8.*
             python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
               --auto-partition-id ${{ matrix.partition }} \
@@ -284,7 +284,7 @@ jobs:
             echo "Selected test files:"
             cat /tmp/selected_tests.txt
             if [ -s /tmp/selected_tests.txt ]; then
-              bash ../scripts/run_selected_tests.sh $(cat /tmp/selected_tests.txt)
+              bash ../scripts/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
             fi
             exit 0
           fi

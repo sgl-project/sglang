@@ -23,20 +23,6 @@ COV_ROOT="${CACHE_ROOT}/${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
 
 mkdir -p "${COV_ROOT}"
 
-# --- Subprocess coverage wiring -------------------------------------------
-# Tests launch sglang servers via subprocess.Popen; the parent's tracer cannot
-# see them. Two things make Popen'd processes (and their mp children) measured:
-#   1. COVERAGE_PROCESS_START: read by the .pth hook below in every child
-#      python process to auto-start coverage. No-op in processes where the
-#      variable is absent, so the hook is safe to leave installed.
-#   2. The .pth hook in site-packages: coverage.process_startup().
-# popen_launch_server merges os.environ into the child env, so both the
-# variable and COVERAGE_FILE propagate to the server.
-export COVERAGE_PROCESS_START="${SCRIPT_DIR}/coveragerc"
-site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')"
-echo 'import coverage; coverage.process_startup()' \
-  > "${site_packages}/sglang_coverage_startup.pth"
-
 targets=("$@")
 if [ "${#targets[@]}" -eq 0 ]; then
   echo "Usage: $0 <test> [test ...]"
@@ -48,19 +34,14 @@ overall_status=0
 results=()
 
 # Derive a filesystem-safe directory name from a test target:
-#   1. strip the CI workspace prefix (/__w/sglang/sglang)
-#   2. strip the trailing ".py"
-#   3. flatten path separators:  /  ->  __
-#   4. flatten pytest separators: ::  ->  --
-#   5. replace any remaining unsafe character with "_"
-# Example:
-#   /__w/sglang/sglang/test/registered/npu/basic_function/HiCache/test_npu_hicache_mha.py
-#     -> __test__registered__npu__basic_function__HiCache__test_npu_hicache_mha
+#   1. strip the trailing ".py"
+#   2. flatten path separators:  /  ->  __
+#   3. flatten pytest separators: ::  ->  --
+#   4. replace any remaining unsafe character with "_"
 # Each test gets its own COVERAGE_FILE so results never collide.
 setup_coverage() {
   local target="$1"
-  local name="${target#/__w/sglang/sglang}"
-  name="${name%.py}"
+  local name="${target%.py}"
   name="${name//\//__}"
   name="${name//::/--}"
   name="${name//[^a-zA-Z0-9_.-]/_}"
@@ -89,11 +70,6 @@ run_one() {
     echo "=== PASSED: ${target} ==="
     results+=("${target}|PASSED")
   fi
-
-  # Merge parallel data files (main + server + mp children) into one.
-  set +e
-  python -m coverage combine --rcfile="${SCRIPT_DIR}/coveragerc" 2>/dev/null
-  set -e
 }
 
 for target in "${targets[@]}"; do

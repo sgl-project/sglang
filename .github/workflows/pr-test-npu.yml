@@ -100,7 +100,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
       npu_device_type: 910b
       run_timeout_minutes: '15'
-      use_run_selected_tests: true
+      use_coverage_runner: true
     secrets: inherit
 
   base-b-test-1-npu-a3:
@@ -113,7 +113,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
-      use_run_selected_tests: true
+      use_coverage_runner: true
     secrets: inherit
 
   base-b-test-2-npu-a3:
@@ -126,7 +126,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
-      use_run_selected_tests: true
+      use_coverage_runner: true
     secrets: inherit
 
   base-b-test-4-npu-a3:
@@ -140,7 +140,7 @@ jobs:
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
       partitions: '{"size":2,"arr":[0, 1]}'
-      use_run_selected_tests: true
+      use_coverage_runner: true
     secrets: inherit
 
   base-b-test-8-npu-a3:
@@ -153,7 +153,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
-      use_run_selected_tests: true
+      use_coverage_runner: true
     secrets: inherit
 
   base-b-test-16-npu-a3:
@@ -166,7 +166,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
-      use_run_selected_tests: true
+      use_coverage_runner: true
     secrets: inherit
 
 #  multimodal-gen-test-1-npu-a3:
@@ -310,7 +310,7 @@ jobs:
       install_sglang_deps: true
       device_type_for_deps: 'a3'
       partitions: '{"size":2,"arr":[0,1]}'
-      use_run_selected_tests: true
+      use_coverage_runner: true
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
@@ -324,7 +324,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      use_run_selected_tests: true
+      use_coverage_runner: true
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
@@ -338,7 +338,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      use_run_selected_tests: true
+      use_coverage_runner: true
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
@@ -353,7 +353,7 @@ jobs:
       install_sglang_deps: true
       device_type_for_deps: 'a3'
       test_timeout_minutes: '180'
-      use_run_selected_tests: true
+      use_coverage_runner: true
 
 
   setup-covstub:

@@ -4,8 +4,7 @@ relative_files = False
 data_file = /root/.cache/tests/precise-test/coverage/coverage
 parallel = True
 concurrency = thread,multiprocessing
-# Server processes are stopped with SIGTERM; write coverage data on that signal.
-sigterm = True
+sigterm = False
 disable_warnings = no-data-collected,module-not-python
 
 include =
