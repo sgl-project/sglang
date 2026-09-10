@@ -102,6 +102,10 @@ thorough workflows.
 - FP8 is not supported on Atlas 800T A2/A3; use modelslim **W8A8**
   checkpoints (auto-detected from `quant_model_description.json`) with
   `--quantization modelslim`.
+- **Offline hosts and gsm8k**: `benchmark/gsm8k/bench_sglang.py` fetches
+  the gsm8k test split from raw.githubusercontent.com when its
+  `--data-path` does not exist. On NAT-ed or offline bench hosts,
+  pre-download the file and point `run.gsm8k.data_path` at it.
 
 ## Adding a new model spec
 

@@ -47,3 +47,7 @@ run:
     num_questions: 200
     num_shots: 5
     accuracy_floor: 0.30    # below this, perf data is flagged untrustworthy
+    # bench_sglang.py downloads test.jsonl from raw.githubusercontent.com
+    # when --data-path does not exist; on offline/NAT-ed hosts pre-download
+    # it and set data_path, e.g. data_path: /mnt/data/gsm8k/test.jsonl
+    # data_path: /mnt/data/gsm8k/test.jsonl
