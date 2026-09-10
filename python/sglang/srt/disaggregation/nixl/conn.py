@@ -1502,6 +1502,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
         bypass_prepped: bool = False,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+        dst_item_lens: Optional[List[int]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1563,17 +1566,41 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         if self.is_mla_backend or force_flat:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
-            )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
+            if src_layer_ids or dst_layer_ids:
+                pairs = build_transfer_entry_pairs(
+                    src_layer_ids or [],
+                    dst_layer_ids or [],
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
                 )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+                # The source item length is used as the destination stride, so
+                # the paired entries must have identical layouts.
+                if dst_item_lens is not None:
+                    for i, j in pairs:
+                        if item_lens[i] != dst_item_lens[j]:
+                            raise RuntimeError(
+                                f"{state_type} item length mismatch for paired "
+                                f"entries src[{i}]={item_lens[i]} "
+                                f"dst[{j}]={dst_item_lens[j]}"
+                            )
+                layers_params = [
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                ]
+            else:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(
+                        src_data_ptrs, dst_data_ptrs, state_type
+                    )
+                )
+                layers_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        dst_kv_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -1594,6 +1621,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
+
+        if not layers_params:
+            return None
 
         src_addrs = []
         src_lens = []
@@ -2396,6 +2426,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
+                    if 0 in src_dims:
+                        raise RuntimeError(
+                            "Replicated Mamba PD state transfer currently requires "
+                            "matching prefill/decode attention TP sizes"
+                        )
                     h = self._send_mamba_state_slice(
                         peer_name,
                         src_indices,
@@ -2458,7 +2493,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     state_type=st,
                     force_flat=True,
                 )
-            elif st in (StateType.SWA, StateType.SWA_RING, StateType.C128_STATE):
+            elif st in (
+                StateType.SWA,
+                StateType.QSA_PENDING,
+                StateType.QSA_COMPRESSED,
+                StateType.SWA_RING,
+                StateType.C128_STATE,
+            ):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
@@ -2484,6 +2525,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
+                    force_flat=st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                    src_layer_ids=src_lids,
+                    dst_layer_ids=dst_lids,
+                    dst_item_lens=dst_lens,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer

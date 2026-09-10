@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import msgspec
 from torch import nn
 
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -158,7 +159,10 @@ def resolve_layer_indices(
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
-    if not is_npu():
+    supports_prefill_pp_mtp = (
+        spec_algorithm.is_eagle() and get_disagg().disaggregation_mode == "prefill"
+    )
+    if not is_npu() and not supports_prefill_pp_mtp:
         _assert_pp_mtp_compat(
             model_has_mtp_layers=model_has_mtp_layers,
             spec_algorithm=spec_algorithm,

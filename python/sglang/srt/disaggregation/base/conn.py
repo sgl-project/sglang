@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 class StateType(str, enum.Enum):
     MAMBA = "mamba"
+    QSA_PENDING = "qsa_pending"
+    QSA_COMPRESSED = "qsa_compressed"
     SWA = "swa"
     DSA = "dsa"
     # DSA kpool-compress tail: one per-request ring row. The indices encode
