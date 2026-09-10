@@ -615,7 +615,7 @@ class DFlashDraftModel(nn.Module):
         else:
             target_num_layers = num_layers
         target_layer_ids = draft_config.resolve_target_layer_ids(
-            target_num_layers=target_num_layers, draft_num_layers=num_layers
+            target_num_layers=target_num_layers
         )
         num_context_features = len(target_layer_ids)
 
