@@ -121,9 +121,75 @@ def _make_inputs(
     return kv_score_input_cpu, ape_cpu
 
 
+def _as_fused_projection_view(
+    kv_score_input: torch.Tensor, head_dim: int
+) -> torch.Tensor:
+    fused_width = 4 * (HEAD_DIM + 128)
+    offset = 0 if head_dim == HEAD_DIM else 4 * HEAD_DIM
+    fused = kv_score_input.new_empty((kv_score_input.shape[0], fused_width))
+    view = fused[:, offset : offset + 4 * head_dim]
+    view.copy_(kv_score_input)
+    assert not view.is_contiguous()
+    return view
+
+
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "buffer_dtype"),
+    [(512, torch.float32), (128, torch.bfloat16)],
+    ids=["main-same-dtype", "indexer-mixed-dtype"],
+)
+def test_fused_projection_strided_view_matches_contiguous(
+    head_dim: int, buffer_dtype: torch.dtype
+) -> None:
+    ctx = make_paged_context(bs=2, compress_ratio=RATIO, head_dim=head_dim)
+    seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend([(8, 8), (12, 12)])
+    kv_in_cpu, ape_cpu = _make_inputs(num_q, head_dim, seed=head_dim)
+    kv_contiguous = kv_in_cpu.to(get_device())
+    kv_strided = _as_fused_projection_view(kv_contiguous, head_dim)
+    ape = ape_cpu.to(get_device())
+
+    pool_contiguous = make_state_pool(ctx.num_pages, RATIO, head_dim).to(buffer_dtype)
+    pool_contiguous.zero_()
+    pool_strided = torch.zeros_like(pool_contiguous)
+    out_contiguous = _run_prefill(
+        ctx,
+        pool_contiguous,
+        kv_contiguous,
+        ape,
+        seq_lens_cpu,
+        extend_lens_cpu,
+    )
+    out_strided = _run_prefill(
+        ctx,
+        pool_strided,
+        kv_strided,
+        ape,
+        seq_lens_cpu,
+        extend_lens_cpu,
+    )
+
+    torch.testing.assert_close(out_strided, out_contiguous)
+    torch.testing.assert_close(pool_strided, pool_contiguous)
+
+    decode_input_cpu, _ = _make_inputs(8, head_dim, seed=head_dim + 1)
+    for step in range(RATIO):
+        decode_contiguous = decode_input_cpu[2 * step : 2 * step + 2].to(get_device())
+        decode_strided = _as_fused_projection_view(decode_contiguous, head_dim)
+        seq_lens_gpu = torch.tensor(
+            [9 + step, 13 + step], dtype=torch.int64, device=get_device()
+        )
+        out_contiguous = _run_decode(
+            ctx, pool_contiguous, decode_contiguous, ape, seq_lens_gpu
+        )
+        out_strided = _run_decode(ctx, pool_strided, decode_strided, ape, seq_lens_gpu)
+        torch.testing.assert_close(pool_strided, pool_contiguous)
+
+    torch.testing.assert_close(out_strided, out_contiguous)
 
 
 @pytest.mark.parametrize("ring_size", [8, 16])
