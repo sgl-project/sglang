@@ -56,6 +56,7 @@ class GigaChat35Detector(BaseFormatDetector):
         self.bot_token = _GCML_OPEN
         self.eot_token = _GCML_CLOSE
         self._tool_region_started: bool = False
+        self._tool_region_closed: bool = False
         self._emitted_invokes: int = 0
 
     def has_tool_call(self, text: str) -> bool:
@@ -70,7 +71,7 @@ class GigaChat35Detector(BaseFormatDetector):
             )
 
         leading, _, after_open = text.partition(self.bot_token)
-        invokes_body, _, _ = after_open.partition(self.eot_token)
+        invokes_body, _, trailing = after_open.partition(self.eot_token)
 
         actions = [
             {
@@ -86,6 +87,7 @@ class GigaChat35Detector(BaseFormatDetector):
 
         calls = self.parse_base_json(actions, tools)
         normal_text = _strip_trailing_markers(leading).rstrip("\n")
+        normal_text += _strip_trailing_markers(trailing)
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
@@ -93,6 +95,10 @@ class GigaChat35Detector(BaseFormatDetector):
     ) -> StreamingParseResult:
         self._buffer += new_text
         current_text = self._buffer
+
+        if self._tool_region_closed:
+            self._buffer = ""
+            return StreamingParseResult(normal_text=current_text)
 
         if not self._tool_region_started and self.bot_token not in current_text:
             if self._ends_with_partial_token(current_text, self.bot_token):
@@ -112,7 +118,7 @@ class GigaChat35Detector(BaseFormatDetector):
             self._tool_indices = self._get_tool_indices(tools)
 
         _, _, after_open = current_text.partition(self.bot_token)
-        invokes_body, _, _ = after_open.partition(self.eot_token)
+        invokes_body, closing_marker, trailing = after_open.partition(self.eot_token)
         matches = list(_GCML_INVOKE_RE.finditer(invokes_body))
         calls: List[ToolCallItem] = []
         for i in range(self._emitted_invokes, len(matches)):
@@ -132,7 +138,19 @@ class GigaChat35Detector(BaseFormatDetector):
             self.streamed_args_for_tool[i] = args_json
 
         self._emitted_invokes = len(matches)
+        if closing_marker:
+            self._tool_region_closed = True
+            self._buffer = ""
+            return StreamingParseResult(normal_text=trailing, calls=calls)
         return StreamingParseResult(calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush buffered state at stream end."""
+        result = self.parse_streaming_increment("", tools)
+        leftover, self._buffer = self._buffer, ""
+        if leftover and not self._tool_region_started:
+            result.normal_text += leftover
+        return result
 
     def supports_structural_tag(self) -> bool:
         """GigaChat 3.5 GCML does not use structural tags."""
