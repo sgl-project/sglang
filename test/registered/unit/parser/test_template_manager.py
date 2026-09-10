@@ -4,6 +4,8 @@ import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
+
 from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
@@ -268,6 +270,42 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         """
         _, _, parser = self._detect(template, ["<minimax:tool_call>"])
         self.assertEqual(parser, "minimax")
+
+    HYV4_TEMPLATE = (
+        "{%- set reasoning_mode_token = '<｜reasoning_mode:opensource｜>' %}\n"
+        "{%- if not reasoning_effort is defined %}\n"
+        "    {%- set reasoning_effort = 'high' %}\n"
+        "{%- elif reasoning_effort not in ['high', 'low', 'no_think'] %}\n"
+        "{%- endif %}\n"
+        "<tool_call:opensource>{{ name }}<arg_key:opensource>{{ k }}</arg_key:opensource>"
+    )
+
+    HYV4_VOCAB = [
+        "<tool_calls:opensource>",
+        "<tool_call:opensource>",
+        "<arg_key:opensource>",
+        "<arg_value:opensource>",
+    ]
+
+    def test_hyv4_effort_template_detected_with_special_case(self):
+        # Hy4 drops <tool_sep>; detection must key on the effort-mode template
+        # signature plus the suffixed arg tokens instead.
+        force, config, parser = self._detect(self.HYV4_TEMPLATE, self.HYV4_VOCAB)
+
+        self.assertEqual(config, ReasoningToggleConfig(special_case="hunyuan_effort"))
+        self.assertEqual(parser, "hunyuan")
+        self.assertEqual(
+            detect_tool_call_parser(
+                self.HYV4_TEMPLATE, _DummyTokenizer(self.HYV4_VOCAB), config, force
+            ),
+            "hunyuan",
+        )
+
+    def test_hyv4_template_without_arg_tokens_not_hunyuan(self):
+        _, config, parser = self._detect(self.HYV4_TEMPLATE, ["<tool_call:opensource>"])
+
+        self.assertEqual(config, ReasoningToggleConfig(special_case="hunyuan_effort"))
+        self.assertNotEqual(parser, "hunyuan")
 
 
 class TestTemplateDetectionRuleMatrix(unittest.TestCase):
@@ -856,7 +894,9 @@ class TestResolveAutoParsers(unittest.TestCase):
             reasoning_parser="auto",
             tool_call_parser="auto",
         )
-        object.__setattr__(args, "model_path", "nonexistent/model-does-not-exist-xyz")
+        msgspec.Struct.__setattr__(
+            args, "model_path", "nonexistent/model-does-not-exist-xyz"
+        )
         with _patch_hf_transformers_utils(
             Mock(side_effect=RuntimeError("tokenizer unavailable")),
             Mock(side_effect=RuntimeError("config unavailable")),

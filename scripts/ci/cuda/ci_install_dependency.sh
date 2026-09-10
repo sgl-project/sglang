@@ -324,20 +324,6 @@ setup_cargo_cache() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-invalidate_torch_rust_cache() {
-    if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
-        mark_step_done "${FUNCNAME[0]}"
-        return
-    fi
-
-    # uv's editable build uses a temporary torch path. Rebuild these units
-    # under the lock so Cargo does not reuse that path in a later job.
-    cargo clean --release --manifest-path "${REPO_ROOT}/rust/sglang-radix-tree/Cargo.toml" \
-        -p torch-sys -p sglang-radix-tree
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 release_cargo_cache_lock() {
     if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
         flock --unlock 9
@@ -775,6 +761,8 @@ install_extra_deps() {
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
+    $PIP_CMD install "helion==1.4.0" $PIP_INSTALL_SUFFIX
+
     NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     if [ "$NIXL_INSTALLED" = "$NIXL_VERSION" ] && [ "$NIXL_BIN_INSTALLED" = "$NIXL_VERSION" ]; then
@@ -918,7 +906,6 @@ main() {
     install_pytorch_stack
     install_cuda12_deepep_wheel
     setup_cargo_cache
-    invalidate_torch_rust_cache
     install_sglang
     release_cargo_cache_lock
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing

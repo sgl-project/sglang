@@ -38,10 +38,12 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
     get_dsv4_indexer_bytes_per_token,
+    get_swa_ring_size,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
@@ -53,10 +55,12 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 @dataclass
@@ -115,6 +119,23 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     return int(cell_size) * get_parallel().attn_dcp_size
 
 
+def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
+    """Global layer ids represented by the local DSA pool's dense layer slots."""
+    if kvc.mambaish_config and not kvc.is_draft_worker:
+        layer_ids = [
+            layer_id
+            for layer_id in kvc.mambaish_config.full_attention_layer_ids
+            if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
+        ]
+    else:
+        layer_ids = list(range(kvc.layer_info.start_layer, kvc.layer_info.end_layer))
+    # Draft pools and a few platform-specific pools may expose a synthetic layer
+    # count. They do not use indexShare, so only the length matters for sizing.
+    if len(layer_ids) != num_layers:
+        return list(range(num_layers))
+    return layer_ids
+
+
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -151,6 +172,27 @@ class MemoryPoolConfigurator:
         self, config: MemoryPoolConfig
     ) -> MemoryPoolConfig:
         return config
+
+    @staticmethod
+    def validate_swa_pool_size(
+        swa_tokens: int, sliding_window_size: Optional[int], page_size: int
+    ) -> None:
+        """Reject an SWA pool too small to ever admit a request.
+
+        Prefill charges min(extend + decode, window) + page_size of SWA headroom
+        per request, so a pool at or below that floor rejects every request no
+        matter how far it drains: the scheduler spins in the waiting queue and
+        the server hangs at warmup instead of failing here.
+        """
+        if sliding_window_size is None:
+            return
+        if sliding_window_size + page_size >= swa_tokens:
+            raise ValueError(
+                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
+                f"the prefill admission floor is sliding_window_size "
+                f"({sliding_window_size}) + page_size ({page_size}). "
+                f"Increase --swa-full-tokens-ratio or the total KV budget."
+            )
 
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
@@ -260,8 +302,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             get_glm_dsa_layer_split_effective_num_layers,
         )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            kvc, num_layers
+        effective_num_layers = (
+            num_layers
+            if kvc.server_args.enable_hisparse
+            else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -269,6 +313,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
+            if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+                # NPU sparse KV offload uses an index-only device pool.
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                    get_sparsity_driven_kv_offload_cell_size,
+                )
+
+                offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
+                    model_config=model_config,
+                    use_mla_backend=kvc.use_mla_backend,
+                    num_layers=num_layers,
+                    element_size=kv_size,
+                )
+                if offload_cell_size is not None:
+                    return offload_cell_size
+
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
             )
@@ -365,7 +424,39 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
 
+        cell_size += self._compute_qsa_cell_size(
+            hf_config=model_config.hf_config, num_layers=num_layers
+        )
         return cell_size
+
+    @staticmethod
+    def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_COMPRESSED,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
+
+        if num_layers == 0:
+            return 0
+        qsa_profile = parse_qsa_profile(hf_config)
+        if qsa_profile is None:
+            return 0
+        if qsa_profile.variant == QSA_VARIANT_COMPRESSED:
+            return QSATokenToKVPool.qsa_bytes_per_token(
+                kv_heads=qsa_profile.kv_heads,
+                head_dim=qsa_profile.head_dim,
+                compress_ratio=qsa_profile.compress_ratio,
+                num_layers=num_layers,
+            )
+        return QwenDSATokenToKVPool.qsa_bytes_per_token(
+            kv_heads=qsa_profile.kv_heads,
+            head_dim=qsa_profile.head_dim,
+            num_layers=num_layers,
+        )
 
     def _compute_dsa_indexer_cell_size(
         self,
@@ -381,6 +472,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            dtype = kvc.kv_cache_dtype
+            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
+            if dtype != torch.float8_e4m3fn:
+                indexer_size_per_token = index_head_dim
+                element_size = torch._utils._element_size(dtype)
+            if not is_npu_arch35():
+                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -392,18 +493,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             _should_elide_dsa_index_k,
         )
 
-        if allocate_all_layers or not _should_elide_dsa_index_k(
-            is_draft_worker=kvc.is_draft_worker
+        if (
+            allocate_all_layers
+            or kvc.server_args.enable_hisparse
+            or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers
         else:
-            active_indexer_layers = [
-                layer_id
-                for layer_id in range(
-                    kvc.layer_info.start_layer, kvc.layer_info.end_layer
-                )
-                if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
-            ]
             from sglang.srt.layers.cp.utils import (
                 get_glm_dsa_cp_layer_shard_info,
                 get_layer_shard_range,
@@ -411,6 +507,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
             if shard_size > 1:
+                # Preserve the existing LayerSplit sizing semantics. GLM-5.3
+                # hybrid-layer support is intentionally limited to the normal
+                # (non-LayerSplit) pool below.
+                active_indexer_layers = [
+                    layer_id
+                    for layer_id in range(
+                        kvc.layer_info.start_layer, kvc.layer_info.end_layer
+                    )
+                    if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                ]
                 active_set = set(active_indexer_layers)
                 max_owned = 0
                 for rank in range(shard_size):
@@ -424,7 +530,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                 num_indexer_layers = max_owned + 1
             else:
-                num_indexer_layers = len(active_indexer_layers)
+                num_indexer_layers = sum(
+                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
+                )
 
         return int(
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
@@ -433,6 +542,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes = max(available_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
@@ -661,16 +771,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
-        if (
-            not self._enable_unified_memory
-            and self._sliding_window_size is not None
-            and self._sliding_window_size + self._page_size >= swa_tokens
-        ):
-            raise ValueError(
-                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
-                f"the prefill admission floor is sliding_window_size "
-                f"({self._sliding_window_size}) + page_size ({self._page_size}). "
-                f"Increase --swa-full-tokens-ratio or the total KV budget."
+        if not self._enable_unified_memory:
+            self.validate_swa_pool_size(
+                swa_tokens, self._sliding_window_size, self._page_size
             )
 
         logger.info(
@@ -850,7 +953,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     Splits available memory across full / swa / c4 / c128 + c4_state / c128_state
     pools. coeff is bytes_per_full_token (inflated by (T+D)/T when speculative
-    decode reserves a draft worker, mirroring dflash's cell_size scaling); bias = 0.
+    decode reserves a draft worker, mirroring dflash's cell_size scaling). bias
+    is the request-scoped fixed pools that do not scale with full_token.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -863,7 +967,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # keeps the FP8 estimate.
         self.indexer_bytes_per_token = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim,
-            _is_hip and kvc.server_args.enable_deepseek_v4_fp4_indexer,
+            _is_hip and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
         )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
@@ -877,6 +981,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
+        self.sliding_window_size = kvc.sliding_window_size
         self.swa_ratio = get_schedule().swa_full_tokens_ratio
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
@@ -906,6 +1011,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        self._unified = is_unified_kv_triton()
+        self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # swa_page_size is the model's sliding window (cfg.window_size).
+        self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
+        self._spec_infl = 1.0
+
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
             self._assert_ring_serves_draft_tokens(
@@ -920,7 +1035,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
             draft_layers = 1
             target_layers = self.num_layers_total
-            self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
+            self._spec_infl = (target_layers + draft_layers) / target_layers
+            self.bytes_per_full_token *= self._spec_infl
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
@@ -973,7 +1089,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if self._unified:
+            # Unified_kv stores the whole latent in bf16.
+            kv_bytes = self.attn_head_dim * 2
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         c4_state_dtype_size, c128_state_dtype_size = (
@@ -997,27 +1117,52 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
+            # Ring mode: SWA is a fixed per-request pool (see _fixed_swa_bytes).
+            (
+                0.0
+                if self._unified
+                else self.swa_ratio * kv_bytes * self.num_layers_total
+            )
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
-            + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
+            # Ring mode: C4 state is per-request too (see _fixed_c4_state_bytes).
+            + (
+                0.0
+                if self._unified
+                else self.swa_ratio
+                * c4_state_ratio
+                * c4_state_bytes
+                * self.num_layers_ca4
+            )
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
-            + self.swa_ratio
-            * c4_state_ratio
-            * c4_indexer_state_bytes
-            * self.num_layers_ca4
+            + (
+                0.0
+                if self._unified
+                else self.swa_ratio
+                * c4_state_ratio
+                * c4_indexer_state_bytes
+                * self.num_layers_ca4
+            )
         )
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        if not self._unified:
+            # Ring mode: the paged SWA pool is vestigial, so its floor does not apply.
+            self.validate_swa_pool_size(swa_tokens, self.sliding_window_size, page_size)
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
+            # Unified_kv: request-scoped, finalized once concurrency is known.
+            c4_state_pool_size=(
+                0
+                if self._unified
+                else swa_tokens // self.swa_page_size * self.c4_ring_size
+            ),
             c128_state_pool_size=0,
         )
 
@@ -1048,18 +1193,48 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
         )
 
-    def _get_c128_state_fixed_bytes_for_token_capacity(
-        self, token_capacity: int
-    ) -> int:
-        if self.requested_max_running_requests_per_worker is not None:
-            return self._get_c128_state_fixed_bytes(
-                self.requested_max_running_requests_per_worker
-            )
+    def _unified_c4_state_pool_size(self, max_running_requests: int) -> int:
+        # Unified C4 state loc is req_pool_idx * c4_ring_size + pos % c4_ring_size.
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+        return num_req_slots * self.c4_ring_size
 
-        estimated = int(token_capacity / self.context_len * 512)
+    def _fixed_c4_state_bytes(self, max_running_requests: int) -> int:
+        if not self._unified or self.num_layers_ca4 == 0:
+            return 0
+
+        c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
+        # Mirror CompressStatePool.__init__: it allocates `size + ring_size + 1`
+        # rows, padded to the compress ratio.
+        state_rows = self._unified_c4_state_pool_size(max_running_requests)
+        state_rows = ceil_div(state_rows + self.c4_ring_size + 1, 4) * 4
+        # overlap c4: last_dim = 2 * (1 + overlap) * head_dim = 4 * head_dim.
+        core_bytes = 4 * self.attn_head_dim * c4_state_dtype_size
+        indexer_bytes = 4 * self.indexer_head_dim * c4_state_dtype_size
+        return state_rows * (core_bytes + indexer_bytes) * self.num_layers_ca4
+
+    def _resolve_max_running_requests_per_worker(self, available_bytes: int) -> int:
+        # Approximates ModelRunner._resolve_max_num_reqs. Over-estimating is safe:
+        # a larger fixed bias yields a smaller full_token.
+        if self.requested_max_running_requests_per_worker is not None:
+            return self.requested_max_running_requests_per_worker
+
+        full_token = int(available_bytes / self.bytes_per_full_token)
+        estimated = int(full_token / self.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
-        max_running_requests = min(estimated, token_capacity // 2)
-        return self._get_c128_state_fixed_bytes(max_running_requests)
+        return min(estimated, full_token // 2)
+
+    def _fixed_swa_bytes(self, max_running_requests: int) -> int:
+        if not self._unified:
+            return 0
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+        ring_bytes = (
+            num_req_slots
+            * self._swa_ring_size
+            * self.attn_head_dim
+            * 2  # bf16
+            * self.num_layers_total
+        )
+        return int(ring_bytes * self._spec_infl)
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
@@ -1090,6 +1265,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             config.c128_state_pool_size = num_req_slots
         else:
             config.c128_state_pool_size = num_req_slots * self.c128_ring_size
+        # Ring mode: C4 state is request-scoped, so size it from the known concurrency.
+        if self._unified and self.num_layers_ca4 > 0:
+            config.c4_state_pool_size = self._unified_c4_state_pool_size(
+                config.max_running_requests
+            )
         return config
 
     def calculate_pool_sizes(
@@ -1099,25 +1279,34 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             "page_size must be multiple of 128 for compressed attention"
         )
 
-        if self.requested_max_running_requests_per_worker is not None:
-            c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
-                self.requested_max_running_requests_per_worker
-            )
-        else:
-            full_token = int(available_bytes / self.bytes_per_full_token)
-            c128_state_fixed_bytes = (
-                self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
-            )
+        max_running_requests_per_worker = self._resolve_max_running_requests_per_worker(
+            available_bytes
+        )
+        c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
+            max_running_requests_per_worker
+        )
+        swa_ring_fixed_bytes = self._fixed_swa_bytes(max_running_requests_per_worker)
+        c4_state_fixed_bytes = self._fixed_c4_state_bytes(
+            max_running_requests_per_worker
+        )
 
-        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        available_bytes_for_tokens = max(
+            available_bytes
+            - c128_state_fixed_bytes
+            - swa_ring_fixed_bytes
+            - c4_state_fixed_bytes,
+            0,
+        )
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
-            f"DSV4 memory calculation: "
+            f"DSV4 memory calculation: unified={self._unified}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"swa_ring_fixed={swa_ring_fixed_bytes / (1 << 30):.2f} GB, "
+            f"c4_state_fixed={c4_state_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)
@@ -1125,6 +1314,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
+        # Token count, not a byte budget: the fixed pools are not re-subtracted, so
+        # the input must not exceed what calculate_pool_sizes derived for it.
         assert page_size % 128 == 0, (
             "page_size must be multiple of 128 for compressed attention"
         )
