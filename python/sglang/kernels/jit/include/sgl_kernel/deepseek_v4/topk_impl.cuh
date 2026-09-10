@@ -222,6 +222,17 @@ struct TopKConfig {
   // by downstream sparse attention.
   static constexpr uint32_t kMaxNumTie = 2048;
   static constexpr uint32_t kRadixSize = 1 << 8;
+  // Radix width of the threshold-bin refinement (refine_and_handle_tie). Wider
+  // than kRadixSize so that ceil(32 / kRefineBits) == 3 rounds cover the whole
+  // key: the histogram lives in the tie staging buffer, which is dead on that
+  // path, so the extra bins are free. kRefineBits = 12 is the widest that fits.
+  static constexpr uint32_t kRefineBits = 12;
+  static constexpr uint32_t kRefineSize = 1 << kRefineBits;
+  static constexpr uint32_t kRefineItems = kRefineSize / kBlockSize;
+  static_assert(
+      kRefineSize * sizeof(uint32_t) <= kMaxNumTie * sizeof(TieValue),
+      "the refinement histogram must fit the tie staging buffer it overlays");
+  static_assert(kRefineSize % kBlockSize == 0);
   static constexpr uint32_t kTopKItems = (kMaxTopK + kBlockSize - 1) / kBlockSize;
   // tie candidates owned per thread in the strided handle_tie loops
   static constexpr uint32_t kTieItems = kMaxNumTie / kBlockSize;
@@ -331,30 +342,39 @@ struct TopKConfig {
     }
   }
 
-  /// Threshold-byte search over the 256-bin refinement histogram in
-  /// `smem->histogram[0]`, by the same rule radix_tie_select uses. Publishes the
-  /// result in `smem->match`. Block-wide; ends with a barrier.
+  /// Threshold-digit search over the kRefineSize-bin refinement histogram in
+  /// `hist`, by the same rule radix_tie_select uses. One thread owns kRefineItems
+  /// contiguous bins. Publishes the result in `smem->match`. Block-wide; ends
+  /// with a barrier.
   SGL_DEVICE static void refine_find_threshold(  //
+      const uint32_t* hist,
       const uint32_t total_active,
       const uint32_t topk_remain,
       TieHandleSmem* smem) {
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;
-    uint32_t hist_val = 0;
-    uint32_t warp_inc = 0;
-    if (tx < kRadixSize) {
-      hist_val = smem->histogram[0][tx];
-      warp_inc = warp_inclusive_sum(lane_id, hist_val);
-      if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+
+    uint32_t counts[kRefineItems];
+    uint32_t local_sum = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kRefineItems; ++i) {
+      counts[i] = hist[tx * kRefineItems + i];
+      local_sum += counts[i];
     }
+    const auto warp_inc = warp_inclusive_sum(lane_id, local_sum);
+    if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
     __syncthreads();
-    if (tx < kRadixSize) {
-      const auto inter = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
-      const auto prefix = inter + warp_inc;      // inclusive prefix through this bin
+
+    // Inclusive prefix over all bins below this thread's first one.
+    uint32_t prefix = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
+    prefix += warp_inc - local_sum;
+#pragma unroll
+    for (uint32_t i = 0; i < kRefineItems; ++i) {
+      prefix += counts[i];
       const auto above = total_active - prefix;  // active elements in bins ABOVE this one
-      if (above < topk_remain && above + hist_val >= topk_remain) {
-        smem->match = {tx, above, hist_val};
+      if (above < topk_remain && above + counts[i] >= topk_remain) {
+        smem->match = {tx * kRefineItems + i, above, counts[i]};
       }
     }
     __syncthreads();
@@ -487,7 +507,13 @@ struct TopKRadixBase : TopKConfig {
       kHistVec hist_vecs[kBlockSize];
       struct {
         TieHandleSmem handle;
-        TieValue values[kMaxNumTie];
+        // refine_and_handle_tie re-derives the candidates rather than trusting
+        // what the collect pass staged, so the buffer is free to carry its
+        // radix histogram until the staging pass writes values back.
+        union {
+          TieValue values[kMaxNumTie];
+          uint32_t refine_hist[kRefineSize];
+        };
       } tie;
     };
   };
@@ -563,16 +589,25 @@ struct TopKRadixBase : TopKConfig {
   /// whichever kMaxNumTie arrived first. Replaces phase 4 when
   /// `equal_count > kMaxNumTie`; the fast path pays one comparison.
   ///
-  /// Up to four 8-bit radix passes over the order-preserving key from
-  /// `extract_exact_bin`. Exits once the refined set fits the buffer, or once
-  /// all 32 bits are consumed -- the key is injective on fp32 bit patterns, so
-  /// the survivors are bit-identical by then and any kMaxNumTie-subset is
-  /// correct. Both exits are exact. Each pass needs `0 < remain <= active`,
-  /// which the threshold-bin invariant gives and every pass restores.
+  /// Up to three radix rounds over the order-preserving key from
+  /// `extract_exact_bin`, kRefineBits wide (12 / 12 / 8). Exits once the refined
+  /// set fits the buffer, or once all 32 bits are consumed -- the key is
+  /// injective on fp32 bit patterns, so the survivors are bit-identical by then
+  /// and any kMaxNumTie-subset is correct. Both exits are exact. Each round
+  /// needs `0 < remain <= active`, which the threshold-bin invariant gives and
+  /// every round restores.
   ///
-  /// Scores are re-read from global rather than reused from the register path's
-  /// `local_vecs`, which would perturb the fast path's register allocation.
-  /// Shared memory is borrowed from the tie machinery: footprint is unchanged.
+  /// That costs at most four passes over the input: one to build the first
+  /// histogram, then one per round, which both emits the round's "above" set and
+  /// builds the next round's histogram -- or, on the last round, stages the
+  /// survivors for handle_tie instead of histogramming them.
+  ///
+  /// The histogram is `tie.refine_hist`, overlaying `tie.values`: what phase 3
+  /// staged there is an arrival-order subset that this path re-derives, so the
+  /// buffer is dead until the staging pass writes values back. Scores are
+  /// re-read from global rather than reused from the register path's
+  /// `local_vecs`, which would perturb the fast path's register allocation. The
+  /// block's shared-memory footprint is unchanged.
   SGL_DEVICE static void refine_and_handle_tie(  //
       const TopKProblem& problem,
       Smem* smem,
@@ -582,96 +617,93 @@ struct TopKRadixBase : TopKConfig {
     const auto tx = threadIdx.x;
     const auto topk = problem.topk;
     const auto handle = &smem->tie.handle;
+    const auto hist = smem->tie.refine_hist;
+    const auto clear_hist = [&] {
+#pragma unroll
+      for (uint32_t i = 0; i < kRefineItems; ++i)
+        hist[tx * kRefineItems + i] = 0;
+      __syncthreads();
+    };
 
-    // Early-out for a bit-identical candidate set: the radix passes cannot
-    // separate it and would only re-derive what phase 3 already staged. One
-    // distinct exact key means the candidates are interchangeable, so any
-    // kMaxNumTie-subset is correct, including the one already in tie.values.
-    // Comparing min against max of the key is exact for any value, and costs
-    // the one scan that non-degenerate overflow rows pay on top.
-    {
-      uint32_t key_min = 0xFFFFFFFFu;
-      uint32_t key_max = 0u;
-      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
-        if (val >= v_lo && val < v_hi) {
-          const auto key = extract_exact_bin(val);
-          key_min = min(key_min, key);
-          key_max = max(key_max, key);
-        }
-      });
-      // Reduce per-thread extrema: two atomics per thread, not per candidate.
-      if (tx == 0) {
-        handle->histogram[0][0] = 0xFFFFFFFFu;
-        handle->histogram[0][1] = 0u;
-      }
-      __syncthreads();
-      atomicMin(&handle->histogram[0][0], key_min);
-      atomicMax(&handle->histogram[0][1], key_max);
-      __syncthreads();
-      const bool bit_identical = handle->histogram[0][0] == handle->histogram[0][1];
-      __syncthreads();  // all threads read the scratch before the loop clears it
-      if (bit_identical) {
-        // equal_count > kMaxNumTie on entry, so phase 3 filled the whole buffer.
-        const auto above_count = smem->count_gt;
-        const auto remain_topk = above_count < topk ? topk - above_count : 0;
-        handle_tie(smem->tie.values, problem, above_count, kMaxNumTie, remain_topk, handle);
-        return;
-      }
+    if (smem->count_gt >= topk) [[unlikely]] {
+      // Off the threshold-bin invariant: the collect pass already filled every
+      // output slot, so no candidate can be selected. refine_find_threshold has
+      // no bin to publish in that state, so stop before entering it.
+      return;
     }
-
     uint32_t cand_count = equal_count;
-    uint32_t remain = smem->count_gt < topk ? topk - smem->count_gt : 0;
+    uint32_t remain = topk - smem->count_gt;
     uint32_t prefix = 0;  // refined key bits agreed on so far
     uint32_t mask = 0;    // which key bits `prefix` pins down
+    uint32_t width = kRefineBits;
+    uint32_t shift = 32 - kRefineBits;
 
-    for (uint32_t round = 0; round < 4 && cand_count > kMaxNumTie && remain > 0; ++round) {
-      const uint32_t shift = 24 - round * 8;
+    // First histogram: no preceding round to emit for, so it stands alone.
+    clear_hist();
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+      if (val >= v_lo && val < v_hi) atomicAdd(&hist[extract_exact_bin(val) >> shift], 1);
+    });
+    __syncthreads();
 
-      if (tx < kRadixSize) handle->histogram[0][tx] = 0;
-      __syncthreads();
-      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
-        if (val >= v_lo && val < v_hi) {
-          const auto key = extract_exact_bin(val);
-          if ((key & mask) == prefix) atomicAdd(&handle->histogram[0][(key >> shift) & 0xFFu], 1);
-        }
-      });
-      __syncthreads();
-
-      refine_find_threshold(cand_count, remain, handle);
+    while (true) {
+      refine_find_threshold(hist, cand_count, remain, handle);
       const auto match = handle->match;
 
+      // Candidate predicate for this round, pinned before `prefix`/`mask` move on.
+      const auto sel_prefix = prefix;
+      const auto sel_mask = mask;
+      const auto sel_shift = shift;
+      const auto sel_digit = (1u << width) - 1u;
+      prefix |= match.bin << sel_shift;
+      mask |= sel_digit << sel_shift;
+      remain -= match.above_count;
+      cand_count = match.equal_count;
+
+      // Stop once the survivors fit the staging buffer, the key is exhausted
+      // (they are bit-identical, so truncating them is exact), or the output is
+      // already full -- this round's "above" set still has to be emitted.
+      if (cand_count <= kMaxNumTie || sel_shift == 0 || remain == 0) {
+        if (tx == 0) smem->count_eq = 0;
+        __syncthreads();
+        // Overwrites the histogram, which refine_find_threshold has consumed.
+        for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+          if (val >= v_lo && val < v_hi) {
+            const auto key = extract_exact_bin(val);
+            if ((key & sel_mask) != sel_prefix) return;
+            const auto digit = (key >> sel_shift) & sel_digit;
+            if (digit > match.bin) {
+              const auto pos = atomicAdd(&smem->count_gt, 1);
+              if (pos < topk) [[likely]]
+                problem.emit(pos, idx);
+            } else if (digit == match.bin) {
+              const auto slot = atomicAdd(&smem->count_eq, 1);
+              if (slot < kMaxNumTie) smem->tie.values[slot] = {val, idx};
+            }
+          }
+        });
+        __syncthreads();
+        break;
+      }
+
+      width = min(sel_shift, kRefineBits);
+      shift = sel_shift - width;
+      clear_hist();
       for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
         if (val >= v_lo && val < v_hi) {
           const auto key = extract_exact_bin(val);
-          if ((key & mask) == prefix && ((key >> shift) & 0xFFu) > match.bin) {
+          if ((key & sel_mask) != sel_prefix) return;
+          const auto digit = (key >> sel_shift) & sel_digit;
+          if (digit > match.bin) {
             const auto pos = atomicAdd(&smem->count_gt, 1);
             if (pos < topk) [[likely]]
               problem.emit(pos, idx);
+          } else if (digit == match.bin) {
+            atomicAdd(&hist[(key >> shift) & ((1u << width) - 1u)], 1);
           }
         }
       });
-
-      prefix |= match.bin << shift;
-      mask |= 0xFFu << shift;
-      remain -= match.above_count;
-      cand_count = match.equal_count;
-      __syncthreads();  // `match` is read above and overwritten by the next pass
+      __syncthreads();
     }
-
-    // Stage the survivors for handle_tie. More than kMaxNumTie can remain, but
-    // only once all 32 bits are consumed, where they are bit-identical.
-    if (tx == 0) smem->count_eq = 0;
-    __syncthreads();
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-      if (val >= v_lo && val < v_hi) {
-        const auto key = extract_exact_bin(val);
-        if ((key & mask) == prefix) {
-          const auto slot = atomicAdd(&smem->count_eq, 1);
-          if (slot < kMaxNumTie) smem->tie.values[slot] = {val, idx};
-        }
-      }
-    });
-    __syncthreads();
 
     const auto above_count = smem->count_gt;
     const auto tie_count = min(smem->count_eq, kMaxNumTie);

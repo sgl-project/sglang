@@ -316,7 +316,7 @@ def test_topk_v2_dual_output(batch: int, seq: int) -> None:
 # coarse bins and leaves the threshold bin far below the tie-staging capacity.
 # These distributions collapse a whole row into one coarse bin instead, so the
 # threshold bin overflows the staging buffer.
-NARROW_DISTRIBUTIONS = ["narrow", "narrow_bin", "tiny", "all_equal"]
+NARROW_DISTRIBUTIONS = ["narrow", "narrow_bin", "tiny", "two_values", "all_equal"]
 
 
 def _single_bin_scores(kind, batch, width, device):
@@ -337,6 +337,15 @@ def _single_bin_scores(kind, batch, width, device):
         return (
             0.5 + torch.rand(batch, width, dtype=torch.float32, device=device)
         ) * 1e-30
+    if kind == "two_values":
+        # Two adjacent fp32 values, ~half the row each: the exact-key refinement
+        # has to consume all 32 bits before the survivors are bit-identical, and
+        # more than kMaxNumTie of them still remain at that point.
+        hi = torch.tensor(1.0, dtype=torch.float32, device=device).nextafter(
+            torch.tensor(2.0, dtype=torch.float32, device=device)
+        )
+        pick = torch.rand(batch, width, device=device) < 0.5
+        return torch.where(pick, hi, torch.ones_like(hi))
     # Control: the bin overflows too, but the candidates are bit-identical, so
     # any subset is correct and this must keep passing.
     return torch.full((batch, width), 0.5, dtype=torch.float32, device=device)
