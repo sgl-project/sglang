@@ -243,6 +243,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_pcie_ipc_workspace()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -305,6 +306,21 @@ class BaseRunner(ABC):
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
 
+    def _pre_initialize_pcie_ipc_workspace(self):
+        """Build the PCIe-IPC all-reduce workspace before graph capture.
+
+        Runs for every model, not only the ones that autotune: left to the first
+        reduction, the build lands inside another autotune context and tuning
+        declines there.
+        """
+        from sglang.srt.distributed import get_tp_group
+
+        pcie_ipc_comm = get_tp_group().pcie_ipc_comm
+        if pcie_ipc_comm is None:
+            return
+
+        pcie_ipc_comm.prepare(self.model_runner.model_config.hidden_size)
+
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
 
@@ -326,15 +342,6 @@ class BaseRunner(ABC):
                 buffers=buffers,
                 run_ctx=canary_run_ctx,
             )
-
-        # Before the context below opens: FlashInfer declines to profile a
-        # collective from inside an autotune context it did not open, and the
-        # first reduction of the dummy forward would land in exactly that.
-        from sglang.srt.distributed import get_tp_group
-
-        pcie_ipc_comm = get_tp_group().pcie_ipc_comm
-        if pcie_ipc_comm is not None:
-            pcie_ipc_comm.prepare(mr.model_config.hidden_size)
 
         run_flashinfer_autotune_forward(
             self.model_runner, forward_fn, run_lm_head=False

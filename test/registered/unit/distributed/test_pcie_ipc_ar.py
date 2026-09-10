@@ -89,6 +89,47 @@ class TestGroupEligibility(CustomTestCase):
                 with self.subTest(group=name):
                     self.assertFalse(pcie_ipc_ar.eligible_group(name, 4))
 
+    def test_symmetric_memory_wins_when_both_are_enabled(self):
+        """Two independent opt-in flags; the pre-existing one keeps the path.
+
+        Left undecided, eager execution returns through symmetric memory's NCCL
+        branch before the dispatch reaches this backend while compiled
+        execution selects IPC, so the same config behaves differently per mode.
+        """
+        with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
+            with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=True):
+                with self.assertLogs(pcie_ipc_ar.logger, level="WARNING") as logs:
+                    pcie_ipc_ar._warn_symm_mem_wins.cache_clear()
+                    self.assertFalse(pcie_ipc_ar.eligible_group("tp", 4))
+                self.assertIn("--enable-symm-mem", "\n".join(logs.output))
+            with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=False):
+                self.assertTrue(pcie_ipc_ar.eligible_group("tp", 4))
+
+    def test_symm_mem_probe_reads_the_real_flag(self):
+        """Exercise the probe itself: a patched stand-in cannot catch a rename."""
+        for flag in (True, False):
+            with self.subTest(flag=flag):
+                mod = MagicMock(is_symmetric_memory_enabled=lambda: flag)
+                with patch.dict(
+                    "sys.modules",
+                    {
+                        "sglang.srt.distributed.device_communicators."
+                        "pynccl_allocator": mod
+                    },
+                ):
+                    self.assertIs(pcie_ipc_ar._symm_mem_enabled(), flag)
+
+    def test_the_symm_mem_probe_target_still_exists(self):
+        """Pin the real symbol: the probe swallows exceptions by design.
+
+        Embedded use has no runtime context, so the probe has to tolerate a
+        failed read -- which means a renamed symbol would silently report "symm
+        mem off" and let this backend take a path it should have left alone.
+        """
+        from sglang.srt.distributed.device_communicators import pynccl_allocator
+
+        self.assertTrue(hasattr(pynccl_allocator, "is_symmetric_memory_enabled"))
+
     def test_single_rank_group_is_not_eligible(self):
         with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
             self.assertFalse(pcie_ipc_ar.eligible_group("tp", 1))
@@ -353,6 +394,42 @@ class TestTuning(CustomTestCase):
             ),
         ):
             PcieIpcCommunicator._tune(comm, HIDDEN)
+
+    def test_autotune_disabled_reads_the_real_flag(self):
+        """Exercise the helper itself, not a patched stand-in.
+
+        Patching _autotune_disabled in the tests above cannot catch a wrong or
+        renamed field inside it -- the same blind spot that let _decode_width
+        read a path that had stopped existing.
+        """
+        for flag in (True, False):
+            with self.subTest(flag=flag):
+                bag = MagicMock()
+                bag.kernel.disable_flashinfer_autotune = flag
+                with patch.dict(
+                    "sys.modules",
+                    {"sglang.srt.runtime_context": MagicMock(get_exec=lambda: bag)},
+                ):
+                    self.assertIs(pcie_ipc_ar._autotune_disabled(), flag)
+
+    def test_the_flag_still_exists_on_the_exec_bag(self):
+        from sglang.srt.arg_groups.fields.exec_ import ExecKernel
+
+        self.assertIn("disable_flashinfer_autotune", ExecKernel.__annotations__)
+
+    def test_honours_disable_flashinfer_autotune(self):
+        """--disable-flashinfer-autotune must stop this tuning path too.
+
+        The flag gates should_run_flashinfer_autotune, which gates prepare().
+        The lazy build on the first reduction is a second way in, and it used to
+        tune and write a cache while the operator had asked for neither.
+        """
+        comm = self._comm()
+        with patch.object(pcie_ipc_ar, "_autotune_disabled", return_value=True):
+            with self.assertLogs(pcie_ipc_ar.logger, level="INFO") as logs:
+                self._run_tune(comm)
+        self.assertIn("--disable-flashinfer-autotune", "\n".join(logs.output))
+        comm._workspace.tune.assert_not_called()
 
     def test_declines_inside_another_autotune_context(self):
         """FlashInfer will not profile a collective from a context it did not open."""

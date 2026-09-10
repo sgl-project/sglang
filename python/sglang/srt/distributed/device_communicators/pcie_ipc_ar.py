@@ -86,6 +86,25 @@ _FALLBACK_DECODE_WIDTH = 64
 _ELIGIBLE_GROUP_NAMES = frozenset({"tp"})
 
 
+def _symm_mem_enabled() -> bool:
+    try:
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            is_symmetric_memory_enabled,
+        )
+
+        return bool(is_symmetric_memory_enabled())
+    except Exception:
+        return False
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_symm_mem_wins() -> None:
+    logger.warning(
+        "Both --enable-symm-mem and SGLANG_ENABLE_PCIE_IPC_ALLREDUCE are set; "
+        "keeping symmetric memory and leaving PCIe-IPC off. Unset one to choose."
+    )
+
+
 def eligible_group(group_name: Optional[str], world_size: int) -> bool:
     """Whether ``GroupCoordinator`` should build this backend for a group."""
     if not (
@@ -93,6 +112,12 @@ def eligible_group(group_name: Optional[str], world_size: int) -> bool:
         and world_size > 1
         and group_name in _ELIGIBLE_GROUP_NAMES
     ):
+        return False
+    # Symmetric memory wins: it is the pre-existing feature, and its eager
+    # branch returns through NCCL before the dispatch reaches this backend, so
+    # deciding here keeps eager and compiled execution consistent.
+    if _symm_mem_enabled():
+        _warn_symm_mem_wins()
         return False
     return True
 
@@ -104,6 +129,16 @@ def _warn_untuned_dtype(dtype: torch.dtype) -> None:
         "FlashInfer PCIe-IPC all-reduce serves bf16 only; %s reductions stay on NCCL.",
         dtype,
     )
+
+
+def _autotune_disabled() -> bool:
+    """Whether the operator asked for no FlashInfer autotuning."""
+    try:
+        from sglang.srt.runtime_context import get_exec
+
+        return bool(get_exec().kernel.disable_flashinfer_autotune)
+    except Exception:
+        return False
 
 
 def _decode_width() -> Optional[int]:
@@ -299,6 +334,13 @@ class PcieIpcCommunicator:
         answers from that policy rather than from measurements on this host.
         Results persist to FlashInfer's cache, so only the first server pays.
         """
+        if _autotune_disabled():
+            logger.info(
+                "FlashInfer PCIe-IPC all-reduce: --disable-flashinfer-autotune is "
+                "set; keeping FlashInfer's seed policy."
+            )
+            return
+
         from flashinfer.autotuner import AutoTuner
 
         if AutoTuner.get().is_tuning_mode:
