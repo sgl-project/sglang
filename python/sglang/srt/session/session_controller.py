@@ -299,6 +299,7 @@ class Session:
             session=self,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
+            output_text_required=req.output_text_required,
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,

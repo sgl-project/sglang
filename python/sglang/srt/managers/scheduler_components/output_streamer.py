@@ -331,6 +331,7 @@ class _GenerationStreamAccumulator:
     decode_ids_list: list = field(default_factory=list)
     read_offsets: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
+    output_text_required: list = field(default_factory=list)
     skip_special_tokens: list = field(default_factory=list)
     spaces_between_special_tokens: list = field(default_factory=list)
     no_stop_trim: list = field(default_factory=list)
@@ -458,6 +459,7 @@ class _GenerationStreamAccumulator:
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
         self.output_ids.append(output_ids_[send_token_offset:])
+        self.output_text_required.append(req.output_text_required)
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
         # Index-aligned with the batch items so mixed batches resolve per-item
@@ -476,11 +478,18 @@ class _GenerationStreamAccumulator:
             # block. The parallel lists stay empty; the payload goes straight to
             # `push_generation`, which only indexes the fields appended above.
             self.http_worker_ipcs.append(req.http_worker_ipc)
-            self.decoded_texts.append(req.decoded_text)
-            decode_ids, read_offset = req.init_incremental_detokenize()
-            self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-            req.send_decode_id_offset = len(decode_ids)
-            self.read_offsets.append(read_offset)
+            if req.output_text_required:
+                self.decoded_texts.append(req.decoded_text)
+                decode_ids, read_offset = req.init_incremental_detokenize()
+                self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                req.send_decode_id_offset = len(decode_ids)
+                self.read_offsets.append(read_offset)
+            else:
+                # Keep the payload arrays aligned without creating scheduler
+                # or detokenizer incremental-decode state.
+                self.decoded_texts.append("")
+                self.decode_ids_list.append(req.output_ids[:0])
+                self.read_offsets.append(0)
             self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
             self.spaces_between_special_tokens.append(
                 req.sampling_params.spaces_between_special_tokens
@@ -708,6 +717,7 @@ class _GenerationStreamAccumulator:
             decode_ids=self.decode_ids_list,
             read_offsets=self.read_offsets,
             output_ids=self.output_ids,
+            output_text_required=self.output_text_required,
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             no_stop_trim=self.no_stop_trim,

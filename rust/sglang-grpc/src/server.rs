@@ -302,7 +302,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
 
         let mut receiver = self
             .bridge
-            .submit_request(&rid, "generate", req_dict)
+            .submit_request_with_output_mode(&rid, "generate", req_dict, false)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
