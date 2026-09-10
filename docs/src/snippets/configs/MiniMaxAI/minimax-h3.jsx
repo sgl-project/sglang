@@ -24,10 +24,11 @@ const CONSUMER_24G = ["rtx4090", "rtx3090"];
 // their recipes are derived from the tier logic, not verified runs.
 const WORKSTATION_48G = ["rtx6000ada"];
 const WORKSTATION_96G = ["rtxpro6000"];
-// GB10 unified memory: 128 GB shared between CPU and GPU, so the VRAM/host
-// split that shapes every tier above does not exist. The whole 108 GB
-// deployment fits, and an offloaded component's "copy to device" is an
-// in-memory copy on the coherent bus. No hard-cap anchor was measured.
+// GB10 unified memory: 128 GB shared between CPU and GPU (121.7 GB visible
+// to torch), so the VRAM/host split that shapes every tier above does not
+// exist. The 134 GiB deployment still exceeds the pool, and the loader's
+// automatic placement handles that split better than any explicit flag set:
+// verified on DGX Spark, see unified128Flags().
 const UNIFIED_128G = ["dgx-spark"];
 const CONSUMER_SINGLE = [
   ...CONSUMER_12G,
@@ -121,14 +122,12 @@ function consumerFlags(s) {
 }
 
 function unified128Flags() {
-  // Unified memory holds the whole deployment: the memory manager pins every
-  // component (the budget sees ~128 GB), and streamed copies move at memory
-  // speed on the coherent bus. video_vae=36 still buys the fast decode.
-  return [
-    "--performance-mode memory",
-    "--layerwise-offload-components dit,text_encoder,vae",
-    "--layerwise-resident-layers video_vae=36",
-  ];
+  // No flags: the deployment (134 GiB) exceeds the pool, automatic offload
+  // engages on its own and pins 42 of 50 DiT layers. Measured on DGX Spark,
+  // the explicit discrete-GPU recipe (--performance-mode memory + offload
+  // components + video_vae=36) ran the same denoise 2.1x slower (25.8 vs
+  // 12.1 s/it) -- do not carry discrete-card flags onto unified memory.
+  return [];
 }
 
 function workstation96Flags() {
@@ -165,8 +164,10 @@ function consumerHints(s) {
   }
   if (UNIFIED_128G.includes(s.hw)) {
     return [
-      "derived recipe, not yet verified: the 128 GB unified pool holds the whole 108 GB deployment, so the memory manager pins every component and offload copies run at memory speed on the coherent bus",
-      "expect step times above the discrete-GPU rows: the GB10's ~273 GB/s memory bandwidth is the denoise ceiling, not the placement",
+      "verified on DGX Spark at 480P: ~12.1 s per denoise step steady-state, ~40 s decode, ~12 min per warm request -- with no flags at all; adding the discrete-GPU offload flags measured 2.1x slower on the same box",
+      "the text encoder runs ~5.5 min per request and does not warm up: it is steady-state compute on this chip, not a stall -- budget for it",
+      "expect ~12 min of server load before the first request; the first request itself runs at full speed (no JIT tax was measured)",
+      "step times sit above the discrete-GPU rows because the GB10's ~273 GB/s memory bandwidth is the denoise ceiling, not the placement",
     ];
   }
   if (WORKSTATION_96G.includes(s.hw)) {
@@ -194,6 +195,8 @@ return {
   supportedHardware: [
     "b200",
     "b300",
+    "gb300",
+    "gb200",
     "h200",
     "h100",
     "mi300x",
@@ -475,10 +478,10 @@ return {
           id: "dp",
           label: "Data parallel",
           flags: ["--encoder-parallel dp"],
-          disabled: (s) => (s.topology_mode === "manual"
+          disabled: (s) => CONSUMER_SINGLE.includes(s.hw) || (s.topology_mode === "manual"
             ? Number(s.tp_size)
             : config.commandBuilder.resource.autoTopology(s).tp_size) > 1,
-          disableReason: "The server rejects encoder DP with TP > 1 (encoder_parallel=dp requires tp_size=1).",
+          disableReason: "Encoder DP requires TP1 and a multi-GPU DP group; TP > 1 and the single-card consumer recipes do not qualify.",
           soft: (s) => s.nodes > 1,
           softReason: "Runs across nodes, but the measured 1.9× encode speedup comes from a single-node 2× H100 run; cross-node encoder DP is unverified.",
           description: "Useful for a real request batch; it is not bitwise-identical to fold scheduling.",
@@ -534,7 +537,7 @@ return {
       title: "Quality",
       scope: "request",
       docsHref: "/docs/sglang-diffusion/cache_dit",
-      description: "Reference execution or the audited Cache-DiT acceleration preset.",
+      description: "Cumulative reference, fusion-only, or audited Cache-DiT execution.",
       quality: "Sampling policy",
       learnMore: "#choose-the-quality-level",
       default: "lossless",
@@ -544,6 +547,11 @@ return {
           label: "Lossless",
           recommended: true,
           description: "Reference-exact denoising without Cache-DiT approximation.",
+        },
+        {
+          id: "extra-high",
+          label: "Extra high",
+          description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its lossless denoise path at this tier.",
         },
         {
           id: "high",
@@ -593,6 +601,8 @@ return {
         { id: "b200-fsdp-4", hw: "b200", nodes: 1, gpus_per_node: 4, placement: "fsdp", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "b300-resident-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
         { id: "b300-fsdp-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "fsdp", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto" },
+        { id: "gb300-resident-4", hw: "gb300", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true },
+        { id: "gb200-resident-4", hw: "gb200", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true, unverified: true },
         { id: "h200-resident-4", hw: "h200", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true },
         { id: "h200-fsdp-4", hw: "h200", nodes: 1, gpus_per_node: 4, placement: "fsdp", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "h200-cross-node-16", hw: "h200", nodes: 2, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 2, encoder: "replicate" },
@@ -719,9 +729,12 @@ return {
         || (s.precision === "fp8" && ["b200", "b300"].includes(s.hw));
       const executionVerified = s.execution === "eager"
         || (s.execution === "bcg" && ["b200", "h200"].includes(s.hw) && s.weights === "ref2va");
+      const checkpointVerified = s.hw !== "gb300" || s.weights === "fl2va";
       const serveVerified = topologyVerified && encoderVerified && attentionVerified
-        && precisionVerified && executionVerified;
-      const requestVerified = topologyVerified && (s.quality === "lossless"
+        && precisionVerified && executionVerified && checkpointVerified;
+      const requestCovered = s.hw !== "gb300" || (serveVerified && s.weights === "fl2va"
+        && s.mode === "t2va" && s.quality === "lossless" && Number(s.outputs) === 1);
+      const requestVerified = topologyVerified && requestCovered && (["lossless", "extra-high"].includes(s.quality)
         || (s.quality === "high" && s.execution === "eager"
           && ["paired", "smoke"].includes(highEvidence)));
 
@@ -759,9 +772,9 @@ return {
       let automaticAttention = "FlashAttention (auto)";
       if (["mi300x", "mi355x"].includes(s.hw)) {
         automaticAttention = "AITER (auto)";
-      } else if (topology.ring_degree === 1 && ["b200", "b300"].includes(s.hw)) {
+      } else if (topology.ring_degree === 1 && ["b200", "b300", "gb200", "gb300"].includes(s.hw)) {
         automaticAttention = "Dynamic cuDNN / FA (auto)";
-      } else if (topology.ring_degree === 1 && s.hw === "rtx5090") {
+      } else if (topology.ring_degree === 1 && ["rtx5090", "rtx4090"].includes(s.hw)) {
         automaticAttention = "Torch SDPA (auto)";
       }
 
@@ -1011,9 +1024,9 @@ return {
       ? `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion_hip]" && exec sglang serve "$@"' --`
       : `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion]" && exec sglang serve "$@"' --`,
 
-  // Publish AMD Docker only after an H3-capable ROCm image has been validated.
+  // Publish Docker only after the platform's H3 image/command has been validated.
   runModes: (s) =>
-    ["mi300x", "mi355x"].includes(s.hw)
+    ["mi300x", "mi355x", "gb200", "gb300"].includes(s.hw)
       ? ["python"]
       : ["python", "docker"],
 

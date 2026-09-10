@@ -33,6 +33,7 @@ export const config = {
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
       s.hicache === "off" &&
+      s.bcg === "off" &&
       s.dcp === "off"
     );
   },
@@ -65,6 +66,20 @@ export const config = {
             "--dsa-prefill-backend tilelang",
             "--dsa-decode-backend tilelang",
           ],
+        },
+      ],
+    },
+    {
+      id: "bcg",
+      title: "Breakable Cuda Graph",
+      default: "off",
+      options: [
+        { id: "off", label: "Off" },
+        {
+          id: "on",
+          label: "On",
+          flags: ["--cuda-graph-backend-prefill breakable"],
+          hints: ["Enables breakable prefill CUDA graphs; requires a build with PR #38522."],
         },
       ],
     },
@@ -158,7 +173,7 @@ python3 -m sglang.bench_serving \\
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
@@ -331,6 +346,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
@@ -362,6 +378,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
@@ -386,15 +403,14 @@ sgl-eval run gsm8k \\
     // RadixArk NVFP4 W4A4 checkpoint (ModelOpt 0.46.0, abs-max, group size
     // 16): routed and shared experts plus the dense MLPs are FP4; attention,
     // router, MTP, embeddings, and the vision tower stay BF16. Validated on
-    // 4x GB300 on the stock image with both KV/DSA pairings: the speed rows
-    // were measured with BF16 KV + TileLang DSA, while FP8 KV + TRT-LLM DSA
-    // passed smoke, a 200-example GSM8K check, a 600-request soak, and the
-    // TB2.1 run without separate speed measurements.
+    // 4x GB300 and 4x B300 with both KV/DSA pairings; the benchmark rows
+    // carry measured speed for both pairings on the current release image.
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
@@ -418,7 +434,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -428,6 +444,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
@@ -451,8 +468,8 @@ sgl-eval run gsm8k \\
       ],
     },
     // Same NVFP4 recipe on the remaining Blackwell platforms, at each fp8
-    // cell's parallelism (gb200 TP4/EP4, b200/b300 TP8/EP8). Not measured on
-    // this hardware, so every cell here reports unverified.
+    // cell's TP size (gb200 TP4, b200/b300 TP8). Not measured on this
+    // hardware, so every cell here reports unverified.
     {
       match: { hw: "gb200", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
@@ -462,7 +479,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--ep-size 4",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
@@ -475,7 +491,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -489,7 +505,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 4",
-        "--ep-size 4",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
@@ -510,7 +525,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 8",
-        "--ep-size 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
@@ -523,7 +537,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -537,7 +551,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 8",
-        "--ep-size 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
@@ -558,7 +571,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 8",
-        "--ep-size 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
@@ -571,7 +583,7 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
+        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -585,7 +597,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--quantization modelopt_fp4",
         "--tp-size 8",
-        "--ep-size 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
@@ -602,6 +613,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         s.mmTransport === "auto" && s.hicache === "off"
           ? "verified"
           : "unverified",
@@ -631,6 +643,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
@@ -653,6 +666,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         s.mmTransport === "auto" && s.hicache === "off"
           ? "verified"
           : "unverified",
@@ -682,6 +696,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
@@ -702,7 +717,8 @@ sgl-eval run gsm8k \\
       match: { hw: "b200", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
-      verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
+      verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" : (s.hicache === "off" ? "verified" : "unverified"),
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -728,6 +744,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
@@ -748,7 +765,8 @@ sgl-eval run gsm8k \\
       match: { hw: "b300", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
-      verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
+      verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" : (s.hicache === "off" ? "verified" : "unverified"),
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -774,6 +792,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" :
         ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [

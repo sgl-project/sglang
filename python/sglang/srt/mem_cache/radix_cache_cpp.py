@@ -52,9 +52,9 @@ class RadixCacheCpp(BasePrefixCache):
         self.disable = params.disable
         self.enable_write_cancel = enable_write_cancel
 
-        assert (
-            params.enable_kv_cache_events is False
-        ), "HiRadixCache does not support kv cache events yet"
+        assert params.enable_kv_cache_events is False, (
+            "HiRadixCache does not support kv cache events yet"
+        )
 
         # record the nodes with ongoing write through
         self.ongoing_write_through: Set[IOHandle] = set()
