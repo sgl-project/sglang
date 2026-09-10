@@ -276,6 +276,7 @@ impl RequestPipeline {
             &request_for_metrics.model,
             metrics_labels::ENDPOINT_CHAT,
             bool_to_static_str(streaming),
+            headers.as_ref(),
         );
 
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
@@ -380,6 +381,7 @@ impl RequestPipeline {
             model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_GENERATE,
             bool_to_static_str(streaming),
+            headers.as_ref(),
         );
 
         let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
@@ -486,6 +488,7 @@ impl RequestPipeline {
             model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_EMBEDDINGS,
             bool_to_static_str(false),
+            headers.as_ref(),
         );
 
         let mut ctx = RequestContext::for_embedding(request, headers, model_id.clone(), components);
@@ -586,6 +589,7 @@ impl RequestPipeline {
             model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_CLASSIFY,
             bool_to_static_str(false), // Classify is never streaming
+            headers.as_ref(),
         );
 
         let mut ctx = RequestContext::for_classify(request, headers, model_id.clone(), components);

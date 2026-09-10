@@ -278,6 +278,10 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Prometheus Metrics")]
     prometheus_duration_buckets: Vec<f64>,
 
+    /// Request header recorded as a `source` label on smg_router_requests_total
+    #[arg(long, help_heading = "Prometheus Metrics")]
+    source_label_header: Option<String>,
+
     // ==================== Request Handling ====================
     /// Custom HTTP headers to check for request IDs
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
@@ -1055,6 +1059,7 @@ impl CliArgs {
             .maybe_request_id_headers(
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
+            .maybe_source_label_header(self.source_label_header.as_ref())
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())

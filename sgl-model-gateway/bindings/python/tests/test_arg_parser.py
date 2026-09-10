@@ -605,6 +605,13 @@ class TestParseRouterArgs:
             "https://example.com",
         ]
 
+    def test_parse_source_label_header_arg(self):
+        """Test parsing the source label header argument."""
+        assert parse_router_args([]).source_label_header is None
+
+        router_args = parse_router_args(["--source-label-header", "x-request-source"])
+        assert router_args.source_label_header == "x-request-source"
+
     def test_parse_tokenizer_args(self):
         """Test parsing tokenizer arguments."""
         # Note: model-path and tokenizer-path arguments are not available in current implementation
