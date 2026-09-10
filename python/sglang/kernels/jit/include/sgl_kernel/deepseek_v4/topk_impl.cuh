@@ -435,6 +435,25 @@ struct TopKConfig {
 template <uint32_t kHistBits_>
 struct TopKRadixBase : TopKConfig {
   static constexpr uint32_t kVecSize = 4;
+#ifdef USE_ROCM
+  // Vectors each thread keeps in flight across a full-length pass over the input.
+  //
+  // Both of the streaming path's passes are a dependent chain of
+  // load -> classify -> LDS atomic, and the grid is one block per row, so at
+  // decode batch sizes only a fraction of the CUs are occupied and there is no
+  // other resident work to hide the load latency behind. Holding a second
+  // vector in flight before either is consumed fills that gap; 2 measured best
+  // on gfx950 for the same loop shape in the legacy kernel, 4 and 8 spend the
+  // registers without buying more overlap.
+  //
+  // kUnroll == 1 reduces the loop below to the original single-vector pipeline
+  // element for element, which is what CUDA keeps: there the register paths
+  // already cover the seq_len range that matters, and the streaming path only
+  // runs where the occupancy is high enough to hide the latency anyway.
+  static constexpr uint32_t kUnroll = 2;
+#else
+  static constexpr uint32_t kUnroll = 1;
+#endif
   static constexpr uint32_t kHistBits = kHistBits_;
   static constexpr uint32_t kHistSize = 1 << kHistBits;
   using vec_t = AlignedVector<float, kVecSize>;
@@ -468,17 +487,39 @@ struct TopKRadixBase : TopKConfig {
     const auto tx = threadIdx.x;
     const uint32_t num_full = seq_len / kVecSize;  // fully-in-bounds vectors
 
-    vec_t next_vec;
+    // The kUnroll vectors a thread owns in one trip stay kBlockSize apart, so
+    // every load is still the same coalesced 16B access as the depth-1 version;
+    // only the issue order changes. The set of (value, index) pairs handed to
+    // `fn` is identical -- the order is not, which the callers do not depend on
+    // (they classify into LDS counters / atomically-slotted buffers).
+    constexpr uint32_t kStep = kUnroll * kBlockSize;
+    vec_t next_vec[kUnroll];
     uint32_t vi = tx;
-    if (vi < num_full) next_vec.load(in, vi);
-    while (vi < num_full) {
-      const auto cur = next_vec;
-      const auto base = vi * kVecSize;
-      vi += kBlockSize;
-      if (vi < num_full) next_vec.load(in, vi);
 #pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j) {
-        fn(cur[j], base + j);
+    for (uint32_t k = 0; k < kUnroll; ++k) {
+      if (vi + k * kBlockSize < num_full) next_vec[k].load(in, vi + k * kBlockSize);
+    }
+    while (vi < num_full) {
+      vec_t cur[kUnroll];
+#pragma unroll
+      for (uint32_t k = 0; k < kUnroll; ++k) {
+        cur[k] = next_vec[k];
+      }
+      const uint32_t cur_vi = vi;
+      vi += kStep;
+#pragma unroll
+      for (uint32_t k = 0; k < kUnroll; ++k) {
+        if (vi + k * kBlockSize < num_full) next_vec[k].load(in, vi + k * kBlockSize);
+      }
+#pragma unroll
+      for (uint32_t k = 0; k < kUnroll; ++k) {
+        const uint32_t vik = cur_vi + k * kBlockSize;
+        if (vik >= num_full) break;
+        const auto base = vik * kVecSize;
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          fn(cur[k][j], base + j);
+        }
       }
     }
 
