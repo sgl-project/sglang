@@ -232,7 +232,9 @@ pub(super) fn prepare_mcp_tools_as_functions(
         }
         if !tools_json.is_empty() {
             obj.insert("tools".to_string(), Value::Array(tools_json));
-            obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+            // Preserve an explicit choice on the initial request; default to auto.
+            obj.entry("tool_choice".to_string())
+                .or_insert_with(|| Value::String("auto".to_string()));
         }
     }
 }
@@ -288,6 +290,10 @@ pub(super) fn build_resume_payload(
             obj.insert("tools".to_string(), tools_json.clone());
         }
     }
+
+    // After a tool has run, let the model either call another tool or finish.
+    // Keeping an initial "required" choice here would force repeated calls.
+    obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
 
     // Set streaming mode based on caller's context
     obj.insert("stream".to_string(), Value::Bool(is_streaming));
