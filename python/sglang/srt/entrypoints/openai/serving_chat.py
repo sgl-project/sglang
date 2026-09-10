@@ -700,6 +700,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
         """Request effort for the V4.1 encoder; unsupported tiers warn once and fall back."""
+        # ``none`` controls thinking during request normalization, but the
+        # encoder still needs a valid effort value. This fallback is expected
+        # and should not produce an unsupported-input warning.
+        if value == "none":
+            return self._dsv41_default_reasoning_effort
         effort = chat_encoding.resolve_dsv41_reasoning_effort(value)
         if effort is not None:
             return effort
