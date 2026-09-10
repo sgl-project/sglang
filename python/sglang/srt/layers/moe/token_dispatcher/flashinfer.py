@@ -37,7 +37,6 @@ from sglang.srt.runtime_context import get_flags, get_parallel, get_schedule, ge
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 try:
-    from flashinfer import nvfp4_block_scale_interleave
     from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
     from flashinfer.comm.mapping import Mapping
     from flashinfer.comm.mnnvl import MnnvlConfig
@@ -422,10 +421,8 @@ class FlashinferDispatcher(BaseDispatcher):
         )
         if x_sf is not None:
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
+            # Keep the linear receive view; each MoE runner owns its scale layout.
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
-            # TODO: fuse interleave into cutlass moe
-            if get_moe_runner_backend().is_flashinfer_cutlass():
-                x_sf = nvfp4_block_scale_interleave(x_sf)
         else:
             x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
         x = x_recv.view(-1, x_recv.shape[-1])
