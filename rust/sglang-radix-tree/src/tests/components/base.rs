@@ -70,7 +70,7 @@ impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
         &self,
         tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
         unimplemented!()

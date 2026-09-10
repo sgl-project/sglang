@@ -132,39 +132,44 @@ class EvictResult:
 
 @dataclasses.dataclass
 class IncLockRefResult:
-    """Result of an inc_lock_ref operation."""
+    """Receipt returned by ``inc_lock_ref``.
+
+    ``node_id`` is the anchor the lock was taken on; a release replays the
+    receipt on that node only. The SWA UUID marks the segment boundary;
+    ``None`` means root. ``skipped_lock_components`` records the components
+    the acquire left untaken, so the release leaves them untouched.
+    """
 
     delta: Optional[int] = None
+    node_id: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    # Component nodes that were tombstones at acquire time. Replaying this set
-    # at release prevents a short-lived lock from consuming a later load-back or
-    # request lock after that tombstone becomes a valid device value.
-    skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
-        default_factory=dict
-    )
+    skipped_lock_components: tuple[ComponentType, ...] = ()
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
+            node_id=self.node_id,
             swa_uuid_for_lock=self.swa_uuid_for_lock,
             swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
-            skip_lock_node_ids={
-                component_type: set(node_ids)
-                for component_type, node_ids in self.skip_lock_node_ids.items()
-            },
+            skipped_lock_components=tuple(self.skipped_lock_components),
         )
 
 
 @dataclasses.dataclass
 class DecLockRefParams:
-    """Parameters for dec_lock_ref operation."""
+    """Receipt required by unified-tree ``dec_lock_ref``.
 
+    Fields default to nothing-acquired, so a lost receipt under-releases (a
+    leak the sanity checks report) instead of releasing another holder's
+    lock. ``node_id`` is ``None`` only for receipts that never came from a
+    unified-tree acquire (legacy caches, session sentinels).
+    """
+
+    node_id: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
-        default_factory=dict
-    )
+    skipped_lock_components: tuple[ComponentType, ...] = ()
 
 
 @dataclasses.dataclass

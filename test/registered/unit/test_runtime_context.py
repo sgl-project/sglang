@@ -14,6 +14,9 @@ import unittest
 import warnings
 from unittest.mock import patch
 
+import msgspec
+import msgspec.structs
+
 import sglang as _sglang
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg
@@ -438,7 +441,7 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         from sglang.srt.runtime_context import get_spec
 
         name = "_speculative_draft_quantization_explicitly_set"
-        self.assertIn(name, ServerArgs.__dataclass_fields__)
+        self.assertIn(name, ServerArgs.__struct_fields__)
 
         published = get_context().override_server_args(**{name: True}).install()
         # The record keeps the operator's input, as it does for every other
@@ -473,7 +476,6 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
             override.install()
 
 
-@dataclasses.dataclass
 class _FakeCaptureGroup(_FlagGroupBase):
     gamma: int = 0
 
@@ -1639,13 +1641,12 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
     def test_a_declared_quotient_is_not_a_record_field(self):
         """It has no operator input to preserve, and the record is what crosses
         a process boundary."""
-        import dataclasses
 
         from sglang.srt.arg_groups.arg_utils import Derived
         from sglang.srt.arg_groups.fields.parallel import Parallel
         from sglang.srt.server_args import ServerArgs
 
-        fields = {f.name for f in dataclasses.fields(ServerArgs)}
+        fields = {f.name for f in msgspec.structs.fields(ServerArgs)}
         for name, value in vars(Parallel).items():
             if isinstance(value, Derived):
                 self.assertNotIn(name, fields)
