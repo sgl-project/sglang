@@ -119,6 +119,42 @@ class TestProfileMerger(CustomTestCase):
         discovered = empty_merger._discover_trace_files()
         self.assertEqual(len(discovered), 0)
 
+    def test_merge_with_glob_characters_in_paths(self):
+        for directory, profile_id in [
+            ("trace[1]", "profile"),
+            ("traces", "profile[1]"),
+            ("trace[1]", "profile[1]"),
+        ]:
+            with self.subTest(directory=directory, profile_id=profile_id):
+                with tempfile.TemporaryDirectory(dir=self.temp_dir) as root:
+                    output_dir = os.path.join(root, directory)
+                    decoy_dir = output_dir.replace("[1]", "1")
+                    decoy_id = profile_id.replace("[1]", "1")
+                    for folder, identifier, name in [
+                        (output_dir, profile_id, "expected"),
+                        (decoy_dir, decoy_id, "decoy"),
+                    ]:
+                        os.makedirs(folder, exist_ok=True)
+                        path = os.path.join(folder, f"{identifier}-TP-0.trace.json.gz")
+                        with gzip.open(path, "wt") as f:
+                            json.dump(
+                                {"traceEvents": [{"ph": "X", "name": name, "pid": 1}]},
+                                f,
+                            )
+
+                    merger = ProfileMerger(output_dir, profile_id)
+                    expected_path = os.path.join(
+                        output_dir, f"{profile_id}-TP-0.trace.json.gz"
+                    )
+                    self.assertEqual(merger._discover_trace_files(), [expected_path])
+                    merged_path = merger.merge_chrome_traces()
+                    with gzip.open(merged_path, "rt") as f:
+                        merged = json.load(f)
+                    self.assertEqual(
+                        [event["name"] for event in merged["traceEvents"]], ["expected"]
+                    )
+                    self.assertEqual(merger.get_merge_summary()["total_files"], 1)
+
     def test_merge_chrome_traces(self):
         # Create multiple trace files in random order
         trace_files = [
