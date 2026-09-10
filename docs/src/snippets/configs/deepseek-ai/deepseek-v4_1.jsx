@@ -235,8 +235,8 @@ export const config = {
       ],
     },
 
-    // ---------- B200 / B300: verification round open. Mirrors the GB300 recipe
-    // because the kernels dispatch by architecture family. ----------
+    // ---------- B200: verification round open. Mirrors the GB300 recipe because
+    // the kernels dispatch by architecture family. ----------
     {
       match: { hw: "b200", strategy: "low-latency" },
       nnodes: 1,
@@ -271,10 +271,14 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
+
+    // ---------- B300: 4x B300, TP4 + EP4. Same recipe as GB300 — the kernels
+    // dispatch by architecture family — with one extra memory knob on
+    // Low-Latency that GB300 does not need. ----------
     {
       match: { hw: "b300", strategy: "low-latency" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -283,6 +287,9 @@ export const config = {
         "--mem-fraction-static 0.8",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
+        // GB300 does not need this, B300 does: the derived value (256) runs
+        // out of memory capturing the DSpark decode graphs at this fraction.
+        "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -292,7 +299,7 @@ export const config = {
     {
       match: { hw: "b300", strategy: "high-throughput" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
