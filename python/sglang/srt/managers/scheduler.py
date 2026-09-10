@@ -1603,6 +1603,14 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        # Depth 3: at most two copy_done records are in flight (result_queue
+        # holds the previous result plus the one just appended; the processor
+        # synchronizes before a slot comes around again). Built alongside
+        # device_module, above the MLX return below, because the non-overlap
+        # speculative path records into it on every device.
+        self._copy_done_event_ring = ReusableEventRing(
+            self.device_module.Event, depth=3
+        )
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
@@ -1648,12 +1656,6 @@ class Scheduler(
             self.forward_stream
         )
         self.copy_stream: CudaStream = self.device_module.Stream()
-        # Depth 3: at most two copy_done records are in flight (result_queue
-        # holds the previous result plus the one just appended; the processor
-        # synchronizes before a slot comes around again).
-        self._copy_done_event_ring = ReusableEventRing(
-            self.device_module.Event, depth=3
-        )
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
