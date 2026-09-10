@@ -14,7 +14,10 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
+from sglang.srt.mem_cache.common import (
+    _release_overallocated_kv_indices,
+    merge_adjacent_kv_row_ranges,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -234,6 +237,35 @@ class TestBaseFallbackFreeSegments(unittest.TestCase):
             alloc.free_segment(row[1:], start_pos=1)
         self.assertEqual(len(alloc.freed), 1)
         self.assertTrue(torch.equal(alloc.freed[0], row[0:6]))
+
+
+class TestMergeAdjacentKvRowRanges(unittest.TestCase):
+    def test_eagle_plus_one_abuts_truncation_tail(self):
+        # E6 warmup: page-aligned branch 52992, EAGLE +1, then the leftover row
+        self.assertEqual(
+            merge_adjacent_kv_row_ranges([(52992, 52993), (52993, 60000)]),
+            [(52992, 60000)],
+        )
+
+    def test_empty_dropped_and_gaps_kept(self):
+        self.assertEqual(merge_adjacent_kv_row_ranges([(8, 8), (12, 16)]), [(12, 16)])
+        self.assertEqual(
+            merge_adjacent_kv_row_ranges([(0, 4), (8, 12)]),
+            [(0, 4), (8, 12)],
+        )
+
+    def test_merged_segment_passes_page_disjoint(self):
+        row = torch.arange(16)
+        raw = [(4, 5), (5, 16)]
+        broken = _RecordingBaseAllocator()
+        with self.assertRaises(AssertionError):
+            broken.free_segments([(row[s:e], s) for s, e in raw])
+        merged = merge_adjacent_kv_row_ranges(raw)
+        self.assertEqual(merged, [(4, 16)])
+        alloc = _RecordingBaseAllocator()
+        alloc.free_segments([(row[s:e], s) for s, e in merged])
+        self.assertEqual(len(alloc.freed), 1)
+        self.assertTrue(torch.equal(alloc.freed[0], row[4:16]))
 
 
 if __name__ == "__main__":
