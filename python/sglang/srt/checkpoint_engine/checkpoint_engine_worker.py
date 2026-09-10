@@ -114,7 +114,11 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
 
     def get_model_loader(self) -> Callable:
         """Get the model weight loader function."""
-        return self.model_runner.model.load_weights
+        from sglang.srt.model_loader.loader import load_model_weights
+
+        return lambda weights: load_model_weights(
+            self.model_runner.model, weights, is_full_load=False
+        )
 
     def get_post_hook(self) -> Optional[Callable]:
         """Get the post-processing hook after weight loading."""
