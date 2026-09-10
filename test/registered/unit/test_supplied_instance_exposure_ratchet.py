@@ -43,13 +43,15 @@ process-wide at all, so neither the read nor the field is on this axis.
 """
 
 import ast
-import dataclasses
 import json
 import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+
+import msgspec
+import msgspec.structs
 
 import sglang
 from sglang.srt.server_args import ServerArgs
@@ -367,10 +369,10 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     "would drift"
                 )
             defaults = {}
-            for field in dataclasses.fields(resolved):
-                if field.default is not dataclasses.MISSING:
+            for field in msgspec.structs.fields(resolved):
+                if field.default is not msgspec.NODEFAULT:
                     defaults[field.name] = field.default
-                elif field.default_factory is not dataclasses.MISSING:
+                elif field.default_factory is not msgspec.NODEFAULT:
                     defaults[field.name] = field.default_factory()
             for field_name, default in defaults.items():
                 if field_name in _PASSED or field_name in extra:

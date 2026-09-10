@@ -1,5 +1,4 @@
 import argparse
-import dataclasses
 import json
 import os
 import pickle
@@ -9,6 +8,9 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import msgspec
+import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
@@ -267,7 +269,7 @@ class TestPrepareServerArgs(CustomTestCase):
         # And across the hop that matters: the scheduler and the draft worker
         # rebuild the record from its fields and resolve again, so the bit has
         # to survive `asdict` and come back the same the second time.
-        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
+        reconstructed = ServerArgs(**msgspec.structs.asdict(inherited))
         handle_missing_default_values(reconstructed)
 
         self.assertFalse(
@@ -1046,7 +1048,9 @@ class TestContextParallelServerArgs(CustomTestCase):
         ServerArgs.add_cli_args(self.parser)
 
     def _new_cp_args(self, **overrides):
-        server_args = object.__new__(ServerArgs)
+        # Constructed, not conjured: a Struct has no uninitialized form, and
+        # every field this case does not name wants its declared default
+        # anyway.
         defaults = dict(
             enable_prefill_cp=False,
             cp_strategy=None,
@@ -1061,9 +1065,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             enable_aiter_allreduce_fusion=False,
         )
         defaults.update(overrides)
-        for key, value in defaults.items():
-            setattr(server_args, key, value)
-        return server_args
+        return ServerArgs(**defaults)
 
     def test_canonical_prefill_cp_requires_strategy(self):
         args = self.parser.parse_args(["--model", "dummy", "--enable-prefill-cp"])
@@ -2170,7 +2172,7 @@ class TestDeepEPv2Args(CustomTestCase):
             prefill=PhaseConfig(backend=Backend.FULL, max_bs=512),
         )
         server_args._resolved_overrides = []
-        valid = {f.name for f in dataclasses.fields(ServerArgs)}
+        valid = {f.name for f in msgspec.structs.fields(ServerArgs)}
         for key, value in overrides.items():
             # Reject stale field names before setattr silently accepts them.
             assert key in valid, f"{key} is not a ServerArgs field"
@@ -2489,7 +2491,7 @@ class TestHandleCrashDumpEnv(CustomTestCase):
     )
 
     def _run_handler(self, crash_dump_folder, preset_env=None):
-        server_args = ServerArgs.__new__(ServerArgs)
+        server_args = ServerArgs(model_path="dummy")
         server_args.crash_dump_folder = crash_dump_folder
         with patch.dict(os.environ, preset_env or {}):
             for key in self._COREDUMP_ENV_KEYS:
@@ -2868,7 +2870,7 @@ class TestTheInputIsSealedDuringResolution(CustomTestCase):
         server_args = ServerArgs(model_path="dummy", device="cuda")
         # The seal is what the pipeline runs under; drive it directly rather
         # than injecting a violation into a real handler.
-        object.__setattr__(server_args, "_input_frozen", True)
+        msgspec.Struct.__setattr__(server_args, "_input_frozen", True)
         with self.assertRaisesRegex(AttributeError, "during resolution"):
             server_args.tp_size = 4
         # and the message says what to do instead
@@ -2901,7 +2903,7 @@ class TestTheInputIsSealedDuringResolution(CustomTestCase):
         )
 
         server_args = ServerArgs(model_path="dummy", device="cuda")
-        object.__setattr__(server_args, "_input_frozen", True)
+        msgspec.Struct.__setattr__(server_args, "_input_frozen", True)
 
         def foreign(config):
             # What a plugin does: read what is decided, assign a default.
@@ -2961,7 +2963,7 @@ class TestLaunchCommand(CustomTestCase):
         """It describes how the configuration was asked for, so it is not part
         of the configuration: no CLI flag, no namespace, not in the bags."""
         self.assertNotIn(
-            "launch_command", {f.name for f in dataclasses.fields(ServerArgs)}
+            "launch_command", {f.name for f in msgspec.structs.fields(ServerArgs)}
         )
         self.assertNotIn(
             "launch_command", ServerArgs(model_path="/tmp/x").resolved_dict()

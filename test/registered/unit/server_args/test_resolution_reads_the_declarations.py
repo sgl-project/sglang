@@ -22,9 +22,11 @@ the two scopes it can derive exactly.
 """
 
 import ast
-import dataclasses
 import pathlib
 import re
+
+import msgspec
+import msgspec.structs
 
 import sglang
 from sglang.srt.server_args import ServerArgs
@@ -34,7 +36,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
-_FIELDS = frozenset(field.name for field in dataclasses.fields(ServerArgs))
+_FIELDS = frozenset(field.name for field in msgspec.structs.fields(ServerArgs))
 
 # Names a config travels under. `args` is included because the platform hooks
 # use it; a false positive would be a function taking an argparse Namespace and

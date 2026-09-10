@@ -32,7 +32,6 @@ Two declaration forms, keyed on ``hf_config.architectures[0]``:
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import math
@@ -41,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from sglang.srt.arg_groups import model_override_base
 from sglang.srt.arg_groups.arg_utils import (
     field_names,
+    is_record,
     resolvable_fields,
     with_fallback,
 )
@@ -159,7 +159,7 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     again, so a declaration afterwards is a silent no-op; post-publish changes
     go to the bags through ``get_context().override(...)``.
     """
-    if dataclasses.is_dataclass(type(server_args)):
+    if is_record(server_args):
         unknown = sorted(set(fields) - field_names(type(server_args)))
         if unknown:
             raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
@@ -229,7 +229,7 @@ def record_foreign_defaults(
     A stand-in record (tests drive the hooks with a plain namespace) has no
     view to read, so the resolver runs against it directly and uncaptured.
     """
-    if not dataclasses.is_dataclass(server_args):
+    if not is_record(server_args):
         return resolve(server_args)
     recorder = _ForeignDefaults(server_args)
     result = resolve(recorder)
@@ -1726,7 +1726,7 @@ def validate_declarations(
     """
     # Non-dataclass fixtures carry no Arg metadata (mirrors the
     # resolvable_fields escape); only real ServerArgs is validated.
-    if not dataclasses.is_dataclass(type(server_args)):
+    if not is_record(server_args):
         return
     whitelist = resolvable_fields(type(server_args))
     for source, decl in declarations:

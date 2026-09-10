@@ -8,9 +8,9 @@ it.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any
 
+from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
@@ -49,7 +49,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # stash is the resolution result the projection reads.
     server_args._raw_input = {
         field.name: getattr(server_args, field.name)
-        for field in dataclasses.fields(server_args)
+        for field in record_fields(type(server_args))
     }
 
     # Preserve launcher-stage declarations made before Engine starts. They are
