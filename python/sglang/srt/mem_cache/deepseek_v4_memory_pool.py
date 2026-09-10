@@ -943,7 +943,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return data_ptrs, data_lens, item_lens
 
-    def get_c128_state_buf_infos(
+    def get_request_state_buf_infos(
         self,
     ) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
@@ -1076,7 +1076,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 )
 
     def _init_compressed_layer_mapping(self):
-        c1_cnt = c4_cnt = c128_cnt = 0
+        c0_cnt = c4_cnt = c128_cnt = 0
         total_L = len(self.compression_ratios)
         self.layer_mapping: List[Optional[DeepSeekV4LayerItem]] = [None] * total_L
 
@@ -1085,9 +1085,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio == 0:
                 self.layer_mapping[idx] = DeepSeekV4LayerItem(
                     compress_ratio=0,
-                    compress_layer_id=c1_cnt,
+                    compress_layer_id=c0_cnt,
                 )
-                c1_cnt += 1
+                c0_cnt += 1
             elif ratio == 4:
                 self.layer_mapping[idx] = DeepSeekV4LayerItem(
                     compress_ratio=4,

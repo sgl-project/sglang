@@ -1022,7 +1022,7 @@ class CommonKVManager(BaseKVManager):
           list contains entries for layers not materialized into the SWA
           pool (e.g. an MTP/nextn slot at the tail).
 
-        - C128_STATE layout, length = c128_L:
+        - DSV4_REQUEST_STATE layout, length = c128_L:
             [c128_compress_state_{0..c128_L-1}]
 
         src is already PP-filtered on the prefill side. dst is the
@@ -1045,7 +1045,7 @@ class CommonKVManager(BaseKVManager):
         c128_off_s = sum(1 for r in mla_ratios[:start_layer] if r == 128)
         c128_off_e = sum(1 for r in mla_ratios[:end_layer] if r == 128)
 
-        if state_type == StateType.C128_STATE:
+        if state_type == StateType.DSV4_REQUEST_STATE:
             return src_kv_ptrs, list(dst_kv_ptrs[c128_off_s:c128_off_e])
 
         if state_type == StateType.SWA_RING:
@@ -1054,7 +1054,8 @@ class CommonKVManager(BaseKVManager):
             return src_kv_ptrs, list(dst_kv_ptrs[swa_s:swa_e])
 
         if (
-            state_type not in (StateType.SWA, StateType.SWA_RING, StateType.C128_STATE)
+            state_type
+            not in (StateType.SWA, StateType.SWA_RING, StateType.DSV4_REQUEST_STATE)
             and len(dst_kv_ptrs) == kv_layout_len
         ):
             sliced_dst = (
@@ -1067,7 +1068,7 @@ class CommonKVManager(BaseKVManager):
         # SWA state-data layout. ``swa_L`` is derived from the actual dst
         # length so we tolerate cases where the SWA pool has fewer buffers
         # than ``len(mla_ratios)`` (e.g. nextn padding). C128 state ships as
-        # a separate StateType.C128_STATE component and must not be counted
+        # a separate StateType.DSV4_REQUEST_STATE component and must not be counted
         # here.
         swa_L = len(dst_kv_ptrs) - 2 * c4_full
         if swa_L < 0 or swa_L > len(mla_ratios):

@@ -654,7 +654,7 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.get_unified_swa_ring_buf_infos = lambda: (
         _buf_infos(12) if unified else ([], [], [])
     )
-    pool.get_c128_state_buf_infos = lambda: ([], [], [])
+    pool.get_request_state_buf_infos = lambda: ([], [], [])
     return pool
 
 
