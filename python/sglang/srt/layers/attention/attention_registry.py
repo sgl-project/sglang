@@ -476,18 +476,23 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 Lfm2VlConfig,
             )
             if isinstance(mamba2_config(runner.model_config), short_conv_cfgs):
-                if is_npu():
-                    # The model conv layers call
-                    # get_attn_backend().conv_state_metadata() unconditionally,
-                    # but the Ascend hybrid/mamba backend has no such method.
-                    # Fail here (before model execution) with a clear message
-                    # rather than an AttributeError deep in the first conv layer.
+                if _is_npu and isinstance(
+                    mamba2_config(runner.model_config), ZayaConfig
+                ):
+                    # ZAYA1's pure-torch cca_extend/cca_decode paths assume the
+                    # channel-major conv-state pool (slots, channels, window),
+                    # but the NPU MambaPool allocates window-major states
+                    # (slots, window, channels) via _init_npu_conv_state, so
+                    # CCA fails on the first conv layer. LFM2 models dispatch
+                    # to the layout-aware sgl_kernel_npu v2 conv1d wrappers and
+                    # are supported; fail here (before model execution) with a
+                    # clear message for ZAYA1.
                     raise NotImplementedError(
-                        "Short-conv hybrid models (ZAYA1 CCA, LFM2 / LFM2-MoE) "
-                        "are not yet supported on NPU: the conv-state sidecar "
-                        "(ShortConvAttnBackend.conv_state_metadata) has no Ascend "
-                        "implementation. Add an Ascend conv-state backend before "
-                        "serving these models on NPU."
+                        "ZAYA1 CCA is not yet supported on NPU: the "
+                        "cca_extend/cca_decode paths assume the channel-major "
+                        "conv-state pool, but the NPU MambaPool allocates "
+                        "window-major states. Add a layout-aware CCA path "
+                        "before serving ZAYA1 on NPU."
                     )
                 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                     ShortConvHybridAttnBackend,
