@@ -761,3 +761,104 @@ def fused_qkv_split_gdn_prefill(
         num_stages=3,
     )
     return q, k, v
+
+
+@triton.jit
+def fused_qkv_split_l2norm_gdn_prefill_kernel(
+    q,
+    k,
+    v,
+    mixed_qkv,
+    eps,
+    MIXED_QKV_STRIDE_T: tl.constexpr,
+    MIXED_QKV_STRIDE_D: tl.constexpr,
+    NUM_QK_HEADS: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    HEAD_QK: tl.constexpr,
+    HEAD_V: tl.constexpr,
+    HEAD_QK_POW2: tl.constexpr,
+    V_BLOCK: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    row = mixed_qkv + i_t * MIXED_QKV_STRIDE_T
+
+    qk_dim: tl.constexpr = NUM_QK_HEADS * HEAD_QK
+    v_dim: tl.constexpr = NUM_V_HEADS * HEAD_V
+
+    # [NUM_QK_HEADS, HEAD_QK_POW2] so the reduction runs along the head dim and
+    # every head of this token is normalized in one pass.
+    head = tl.arange(0, NUM_QK_HEADS)[:, None]
+    dim = tl.arange(0, HEAD_QK_POW2)[None, :]
+    inner = dim < HEAD_QK
+    flat = head * HEAD_QK + dim
+
+    b_q = tl.load(row + flat * MIXED_QKV_STRIDE_D, mask=inner, other=0.0).to(tl.float32)
+    # Divide by sqrt rather than multiplying by the reciprocal so the result is
+    # bit-identical to l2norm_fwd_kernel, which the unfused path runs.
+    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q, axis=1) + eps)[:, None]
+    tl.store(q + i_t * qk_dim + flat, b_q.to(q.dtype.element_ty), mask=inner)
+
+    b_k = tl.load(
+        row + (qk_dim + flat) * MIXED_QKV_STRIDE_D, mask=inner, other=0.0
+    ).to(tl.float32)
+    b_k = b_k / tl.sqrt(tl.sum(b_k * b_k, axis=1) + eps)[:, None]
+    tl.store(k + i_t * qk_dim + flat, b_k.to(k.dtype.element_ty), mask=inner)
+
+    v_off = tl.arange(0, V_BLOCK)
+    v_mask = v_off < v_dim
+    b_v = tl.load(row + (2 * qk_dim + v_off) * MIXED_QKV_STRIDE_D, mask=v_mask)
+    tl.store(v + i_t * v_dim + v_off, b_v, mask=v_mask)
+
+
+def fused_qkv_split_l2norm_gdn_prefill(
+    mixed_qkv: torch.Tensor,
+    num_qk_heads: int,
+    num_v_heads: int,
+    head_qk: int,
+    head_v: int,
+    eps: float = 1e-6,
+):
+    """Split post-conv GDN QKV and L2-normalize Q/K in a single launch.
+
+    This is the HIP counterpart of the CUDA `gdn_prefill_qkv_prepare_fwd`
+    path, which materializes Q/K/V and then runs `l2norm_fwd` twice. Folding
+    the norm into the split drops those two launches and the extra Q/K
+    round-trip through HBM, so the caller must pass
+    `use_qk_l2norm_in_kernel=False` to the chunk kernel.
+
+    `mixed_qkv` is laid out per token as `[all_q | all_k | all_v]` and may be a
+    strided `[T, qkv_dim]` view.
+    """
+    seq_len = mixed_qkv.shape[0]
+    q = torch.empty(
+        (1, seq_len, num_qk_heads, head_qk),
+        dtype=mixed_qkv.dtype,
+        device=mixed_qkv.device,
+    )
+    k = torch.empty_like(q)
+    v = torch.empty(
+        (1, seq_len, num_v_heads, head_v),
+        dtype=mixed_qkv.dtype,
+        device=mixed_qkv.device,
+    )
+    if seq_len == 0:
+        return q, k, v
+
+    fused_qkv_split_l2norm_gdn_prefill_kernel[(seq_len,)](
+        q,
+        k,
+        v,
+        mixed_qkv,
+        eps,
+        mixed_qkv.stride(0),
+        mixed_qkv.stride(1),
+        num_qk_heads,
+        num_v_heads,
+        head_qk,
+        head_v,
+        HEAD_QK_POW2=triton.next_power_of_2(head_qk),
+        V_BLOCK=triton.next_power_of_2(num_v_heads * head_v),
+        num_warps=8,
+        num_stages=3,
+    )
+    return q, k, v
