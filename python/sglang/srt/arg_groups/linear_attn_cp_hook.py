@@ -51,7 +51,7 @@ def resolve_linear_attn_cp(server_args: Any) -> None:
         "speculative-algorithm": cfg.speculative_algorithm is not None,
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
-        "enable-dp-attention": view.enable_dp_attention,
+        "attn-dp-size > 1": view.attn_dp_size > 1,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
     }
     for flag, enabled in unsupported.items():

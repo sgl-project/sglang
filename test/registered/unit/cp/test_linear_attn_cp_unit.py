@@ -1144,7 +1144,7 @@ class TestLinearAttnCPResolution(CustomTestCase):
         for overrides, message in (
             ({"cp_strategy": "interleave"}, "cp-strategy"),
             ({"enable_mixed_chunk": True}, "enable-mixed-chunk"),
-            ({"enable_dp_attention": True, "attn_dp_size": 2}, "enable-dp-attention"),
+            ({"attn_dp_size": 2}, "attn-dp-size"),
             ({"moe_dp_size": 2}, "moe-dp-size"),
             ({"dcp_size": 2}, "dcp-size"),
             ({"tp_size": 64, "attn_cp_size": 8}, "linear_num_key_heads"),
