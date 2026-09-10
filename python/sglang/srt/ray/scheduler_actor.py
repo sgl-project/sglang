@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 
 import ray
 
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 
@@ -47,8 +48,6 @@ class SchedulerActor:
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
     ):
-        import dataclasses
-
         from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
         from sglang.srt.utils.numa_utils import (
@@ -56,10 +55,13 @@ class SchedulerActor:
             numa_bind_to_node,
         )
 
-        # Override dist_init_addr if provided (for multi-node)
+        # Declared, not copied: Ray deserializes the argument per call, so this
+        # record is the actor's own and nothing else in the process holds it.
+        # The field stays the operator's input; `PortArgs.init_new` and the bags
+        # this actor publishes read the decision.
         if dist_init_addr:
-            server_args = dataclasses.replace(
-                server_args, dist_init_addr=dist_init_addr
+            declare_resolution(
+                server_args, "ray.scheduler_actor", dist_init_addr=dist_init_addr
             )
 
         # Get actual GPU IDs from Ray runtime context

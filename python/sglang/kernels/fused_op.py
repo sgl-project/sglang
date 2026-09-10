@@ -108,6 +108,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.AOT: "forward_aot",
     KernelBackend.CUTE_DSL: "forward_cute_dsl",
     KernelBackend.FLYDSL: "forward_flydsl",
+    KernelBackend.KDA: "forward_kda",
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
@@ -122,6 +123,7 @@ _METHOD_BACKEND_LABELS: Dict[str, str] = {
 # must never trigger a surprise compilation in a serving process; force it
 # explicitly when wanted. Per-op priority overrides this (see BaseFusedOp).
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
+    KernelBackend.KDA,
     KernelBackend.AOT,
     KernelBackend.JIT,
     KernelBackend.FLASHINFER,
@@ -433,6 +435,9 @@ class BaseFusedOp(nn.Module, ABC):
 
     def forward_cute_dsl(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no cute_dsl backend")
+
+    def forward_kda(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no KDA backend")
 
     def forward_flashinfer(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no flashinfer backend")

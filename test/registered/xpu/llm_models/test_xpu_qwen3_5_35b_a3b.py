@@ -23,8 +23,6 @@ class TestQwen3_5_35BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     tp_size = 4
     accuracy = 0.90
     timeout_for_server_launch = 3600
-    # SGL XPU MoE kernels gate on this env var.
-    env = {"SGLANG_USE_SGL_XPU": "1"}
     num_examples = 50
     num_threads = 4
     max_tokens = 8192
