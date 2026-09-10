@@ -934,6 +934,11 @@ class SWAComponent(TreeComponent):
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
+        # A recurrent checkpoint must stay attached to its exact token prefix.
+        # Let MambaComponent select the insertion length for hybrid caches.
+        if self.cache.is_mamba_enabled:
+            return None
+
         branching_seqlen = req.swa_branching_seqlen
         if branching_seqlen is None or branching_seqlen <= req.kv.cache_protected_len:
             return None
