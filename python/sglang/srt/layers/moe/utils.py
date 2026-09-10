@@ -165,6 +165,9 @@ class _MoeRunnerBackendPredicates:
     def is_aiter(self):
         return self.value == MoeRunnerBackend.AITER.value
 
+    def is_intel_xpu(self):
+        return self.value == MoeRunnerBackend.INTEL_XPU.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
@@ -226,9 +229,6 @@ def resolve_moe_runner_backend(
         raise ValueError(
             f"MoE runner backend {backend!r} is neither built in nor registered"
         ) from None
-
-    def is_intel_xpu(self):
-        return self == MoeRunnerBackend.INTEL_XPU
 
 
 class DeepEPv2Fp8ScaleFormat(NamedTuple):

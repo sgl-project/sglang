@@ -2551,6 +2551,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if self.block_quant
                     else layer.w2_weight_scale
                 ),
+                block_shape=(
+                    getattr(self.quant_config, "weight_block_size", None)
+                    if self.block_quant
+                    else None
+                ),
                 activation=moe_runner_config.activation,
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
