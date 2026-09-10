@@ -675,8 +675,8 @@ class UMBPStore(HiCacheStorage):
                         )
                     else:
                         meta = mem_pool_host.get_page_buffer_meta(dummy)
-                    # meta is None for a logical-anchor group (see note above);
-                    # esz is the per-page element-size list otherwise.
+                    # A hybrid logical anchor returns None here by design; leave
+                    # dram_page_size at 0 and let the per-pool v2 sizes handle it.
                     esz = meta[1] if meta else None
                     page_byte_size = int(esz[0]) if esz else 0
 

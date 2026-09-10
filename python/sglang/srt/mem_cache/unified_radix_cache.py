@@ -1286,11 +1286,12 @@ class UnifiedRadixCache(BasePrefixCache):
             assert bool((swa_indices > 0).all()), (
                 f"unmapped SWA window positions for request {req.rid}"
             )
-            swa_indices = self._pad_retraction_indices(swa_indices, self.page_size)
             component_transfers[ComponentType.SWA] = [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=swa_indices,
+                    device_indices=self._pad_retraction_indices(
+                        swa_indices, self.page_size
+                    ),
                 )
             ]
 
