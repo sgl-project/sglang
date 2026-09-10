@@ -773,6 +773,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             req_pool_indices=batch.req_pool_indices,
             out_cache_loc=locs,
             positions=positions,
+            # Both loc sources read req_to_token untranslated, so `locs` is the
+            # PRE-translate write loc the capture rail needs.
+            out_cache_loc_virtual=locs,
         )
         return True
 

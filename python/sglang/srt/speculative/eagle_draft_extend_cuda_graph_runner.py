@@ -628,6 +628,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             ),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
         )
