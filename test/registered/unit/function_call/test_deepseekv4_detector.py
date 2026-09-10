@@ -94,6 +94,71 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertEqual([c.name for c in result.calls if c.name], ["get_weather"])
 
+    def test_malformed_non_string_parameter_waits_for_closing_tag(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="create_tasks",
+                    description="Create tasks",
+                    parameters={"type": "object"},
+                ),
+            )
+        ]
+
+        for value in ("[{]", "[}"):
+            text = _wrapped(_invoke("create_tasks", _param("tasks", "false", value)))
+            expected = DeepSeekV4Detector().detect_and_parse(text, tools).calls[0]
+            for width in range(1, len(text) + 1):
+                with self.subTest(value=value, width=width):
+                    chunks = [
+                        text[index : index + width]
+                        for index in range(0, len(text), width)
+                    ]
+                    detector = DeepSeekV4Detector()
+                    normal, calls = "", []
+                    for chunk in chunks:
+                        result = detector.parse_streaming_increment(chunk, tools)
+                        normal += result.normal_text
+                        calls.extend(result.calls)
+
+                    self.assertEqual(normal, "")
+                    self.assertEqual(
+                        [call.name for call in calls if call.name], ["create_tasks"]
+                    )
+                    self.assertEqual(
+                        "".join(call.parameters for call in calls), expected.parameters
+                    )
+
+    def test_tolerated_outer_formats_keep_existing_streaming_results(self):
+        invoke_start = f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
+        invoke_end = f"</{DSML}invoke></{DSML}tool_calls>"
+        duplicate = _param("city", "true", "first")
+        duplicate_end = _param("city", "true", "second") + invoke_end
+        cases = [
+            ([invoke_start + '{"city":"SF"', invoke_end], "{}"),
+            (
+                [
+                    invoke_start + f'<{DSML}parameter name="city" string="true">SF',
+                    invoke_end,
+                ],
+                "{}",
+            ),
+            ([invoke_start + duplicate, duplicate_end], '{"city": "second"}'),
+        ]
+
+        for chunks, expected in cases:
+            with self.subTest(chunks=chunks):
+                _, calls = self._feed(chunks)
+                self.assertEqual("".join(call.parameters for call in calls), expected)
+
+    def test_partial_tag_suffix_trim_does_not_eat_value_characters(self):
+        trim = DeepSeekV4Detector()._strip_partial_tag_suffix
+        end = f"</{DSML}parameter>"
+
+        self.assertEqual(trim("read the note", end), "read the note")
+        self.assertEqual(trim(f"value</{DSML}par", end), "value")
+
     def test_non_streaming_parses_every_tool_calls_section(self):
         """A turn with two tool_calls sections must yield both calls."""
         result = DeepSeekV4Detector().detect_and_parse(
