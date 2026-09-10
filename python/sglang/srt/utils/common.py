@@ -319,6 +319,12 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
+# RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
+@lru_cache(maxsize=1)
+def is_sm120() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
+
+
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
 # _check_cuda_device_version, which only matches on the major.
 @lru_cache(maxsize=1)
