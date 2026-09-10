@@ -75,7 +75,11 @@ def topk_transform_paged(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
+def plan_topk_v2(
+    seq_lens: torch.Tensor,
+    static_threshold: int = 0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE. The device
@@ -84,12 +88,19 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
     the plan, and drives the transform kernel into an illegal memory access.
     Producers of padded rows must clamp their lengths to 0 (0 selects the
     trivial all-(-1) output path, which is safe).
+
+    Pass a preallocated ``out`` plan to refresh CUDA-graph metadata in place.
     """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
-    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
-    module.topk_plan(seq_lens, metadata, static_threshold)
-    return metadata
+    if out is None:
+        out = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    else:
+        assert out.shape == (bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+        assert out.dtype == seq_lens.dtype and out.device == seq_lens.device
+        assert out.is_contiguous()
+    module.topk_plan(seq_lens, out, static_threshold)
+    return out
 
 
 def topk_transform_ragged_v2(

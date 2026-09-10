@@ -58,6 +58,9 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_metadata_ingraph import (
+    DSAInGraphVerifyMetadataMixin,
+)
 from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
     DSAMetadataManagementMixin,
 )
@@ -297,6 +300,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
 
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
+    DSAInGraphVerifyMetadataMixin,
     DeepseekSparseAttnBackendKPoolMixin,
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     AttentionBackend,
@@ -336,6 +340,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self._init_kpool_metadata_fusion()
+        self._init_ingraph_verify_metadata()
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -814,6 +819,10 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if in_capture:
+            metadata = self.decode_cuda_graph_metadata.get(forward_batch.batch_size)
+            if metadata is not None and hasattr(metadata, "_ingraph_verify_metadata"):
+                object.__delattr__(metadata, "_ingraph_verify_metadata")
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1507,6 +1516,10 @@ class DeepseekSparseAttnBackend(
 
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
 
+        if self._replay_ingraph_verify_metadata(
+            metadata, seq_lens, req_pool_indices, forward_mode
+        ):
+            return
         self.set_dsa_prefill_impl(forward_batch=None)
 
         seq_lens = seq_lens[:bs]

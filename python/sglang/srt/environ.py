@@ -1546,6 +1546,7 @@ class Envs:
     )
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
+    SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
