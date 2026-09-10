@@ -22,6 +22,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils import is_hip
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -320,6 +321,16 @@ class QSAIndexer(MultiPlatformOp):
             group_locs = member_rows[:, None] + torch.arange(
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
+            if is_hip():
+                # The device-side write plan pads capacity with no-op entries
+                # targeting reserved compressed slot 0; real writes never target
+                # it. Clamp those padded gathers to row 0 so a short extend
+                # (one MTP token) cannot index out of bounds.
+                group_locs = torch.where(
+                    (compressed_locs != 0)[:, None],
+                    group_locs,
+                    torch.zeros_like(group_locs),
+                )
             source_keys = token_k
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
