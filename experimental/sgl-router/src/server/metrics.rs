@@ -105,7 +105,7 @@ impl RequestOutcome {
     }
 }
 
-/// Final outcome of a 2xx SSE stream, observed after headers are committed.
+/// Final outcome of a 2xx SSE stream.
 #[derive(Debug, Clone, Copy)]
 pub enum StreamOutcome {
     /// Stream ended without errors.
@@ -297,8 +297,7 @@ struct EdgeResponseKey {
     status_code: u16,
 }
 
-/// Labels for `sgl_router_stream_outcome_total`. Per-worker so a single pod
-/// stuck in an accept-then-error-event loop stands out.
+/// Labels for `sgl_router_stream_outcome_total`.
 #[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
 struct StreamOutcomeKey {
     worker_url: String,
@@ -735,7 +734,7 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // stream_outcome_total — end-of-stream truth for 2xx streaming responses
+        // Final outcomes observed after a 2xx stream's headers are committed.
         out.push_str("# HELP sgl_router_stream_outcome_total Final outcome of a 2xx stream.\n");
         out.push_str("# TYPE sgl_router_stream_outcome_total counter\n");
         let guard = self.stream_outcome_total.lock();

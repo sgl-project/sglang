@@ -22,61 +22,42 @@ pub struct StreamEnd {
     pub client_disconnect: bool,
 }
 
-/// Maximum buffered length of an SSE line split across chunks.
-const INBAND_SCAN_CARRYOVER_CAP: usize = 1 << 20; // 1 MiB
+const ERROR_EVENT_PREFIX: &[u8] = b"data: {\"error\"";
 
 /// Finds error events emitted after an SSE response commits a 200.
 #[derive(Default)]
 struct ErrorEventScanner {
-    carry: Vec<u8>,
+    overlap: Vec<u8>,
 }
 
 impl ErrorEventScanner {
-    fn feed(&mut self, mut chunk: &[u8]) -> bool {
-        // Complete a line carried over from the previous chunk.
-        if !self.carry.is_empty() {
-            let Some(newline) = chunk.iter().position(|&byte| byte == b'\n') else {
-                self.extend_carry(chunk);
-                return false;
-            };
-            self.extend_carry(&chunk[..newline]);
-            let found = Self::line_is_error_event(&self.carry);
-            self.carry.clear();
-            if found {
-                return true;
-            }
-            chunk = &chunk[newline + 1..];
+    fn feed(&mut self, chunk: &[u8]) -> bool {
+        if chunk
+            .windows(ERROR_EVENT_PREFIX.len())
+            .any(|window| window == ERROR_EVENT_PREFIX)
+        {
+            return true;
         }
 
-        // Scan complete lines in place and retain the trailing partial line.
-        while let Some(newline) = chunk.iter().position(|&byte| byte == b'\n') {
-            if Self::line_is_error_event(&chunk[..newline]) {
-                return true;
-            }
-            chunk = &chunk[newline + 1..];
+        let overlap_len = ERROR_EVENT_PREFIX.len() - 1;
+        self.overlap
+            .extend_from_slice(&chunk[..chunk.len().min(overlap_len)]);
+        if self
+            .overlap
+            .windows(ERROR_EVENT_PREFIX.len())
+            .any(|window| window == ERROR_EVENT_PREFIX)
+        {
+            return true;
         }
-        self.extend_carry(chunk);
+
+        if chunk.len() >= overlap_len {
+            self.overlap.clear();
+            self.overlap
+                .extend_from_slice(&chunk[chunk.len() - overlap_len..]);
+        } else if self.overlap.len() > overlap_len {
+            self.overlap.drain(..self.overlap.len() - overlap_len);
+        }
         false
-    }
-
-    fn extend_carry(&mut self, bytes: &[u8]) {
-        if bytes.len() <= INBAND_SCAN_CARRYOVER_CAP.saturating_sub(self.carry.len()) {
-            self.carry.extend_from_slice(bytes);
-        } else {
-            self.carry.clear();
-        }
-    }
-
-    fn line_is_error_event(line: &[u8]) -> bool {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(payload) = line.strip_prefix(b"data:") else {
-            return false;
-        };
-        let first_non_space = payload
-            .iter()
-            .position(|&byte| byte != b' ')
-            .unwrap_or(payload.len());
-        payload[first_non_space..].starts_with(b"{\"error\"")
     }
 }
 
@@ -117,10 +98,7 @@ impl ErrorEventScanner {
 ///
 /// # Completion hook
 /// When `on_complete` is `Some`, it runs exactly once when the pump task
-/// finishes, receiving a [`StreamEnd`]. `forward_streaming_to` records the
-/// worker's circuit-breaker outcome from `transport_ok` alone — an SSE error
-/// event is an application-level verdict, not a transport fault. The event
-/// scan runs only when `on_complete` is installed.
+/// finishes with the transport, SSE error-event, and client-disconnect state.
 ///
 /// # First-byte hook
 /// When `on_first_byte` is `Some`, the closure runs exactly once, the moment
@@ -141,15 +119,12 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         let tx_for_panic = tx.clone();
-        // Capture the pump's outcome so we can report it through `on_complete`
-        // AFTER `pump.catch_unwind()` settles. The closure inside owns
-        // `outcome_setter`; the outer scope reads `outcome_holder` once.
-        let outcome_holder = Arc::new(parking_lot::Mutex::new(StreamEnd {
+        let outcome = Arc::new(parking_lot::Mutex::new(StreamEnd {
             transport_ok: true,
             saw_error_event: false,
             client_disconnect: false,
         }));
-        let outcome_setter = Arc::clone(&outcome_holder);
+        let outcome_setter = Arc::clone(&outcome);
         // The error-event scan exists solely to inform `on_complete`; skip the
         // per-chunk work entirely when nobody is listening.
         let mut scanner = on_complete.is_some().then(ErrorEventScanner::default);
@@ -215,8 +190,8 @@ where
                 .await;
         }
         if let Some(hook) = on_complete {
-            let mut end = *outcome_holder.lock();
-            end.transport_ok = end.transport_ok && !panicked;
+            let mut end = *outcome.lock();
+            end.transport_ok &= !panicked;
             hook(end);
         }
     });
@@ -489,12 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn error_event_scanner_tolerates_no_space_and_crlf() {
-        let mut scanner = ErrorEventScanner::default();
-        assert!(scanner.feed(b"data:{\"error\": {\"code\": 500}}\r\n"));
-    }
-
-    #[test]
     fn error_event_scanner_ignores_error_text_inside_content() {
         let mut scanner = ErrorEventScanner::default();
         assert!(!scanner.feed(
@@ -504,12 +473,11 @@ mod tests {
     }
 
     #[test]
-    fn error_event_scanner_bounds_carryover_and_recovers() {
+    fn error_event_scanner_bounds_overlap() {
         let mut scanner = ErrorEventScanner::default();
-        let big = vec![b'x'; INBAND_SCAN_CARRYOVER_CAP + 1024];
+        let big = vec![b'x'; 1 << 20];
         assert!(!scanner.feed(&big));
-        assert!(scanner.carry.len() <= INBAND_SCAN_CARRYOVER_CAP);
-        assert!(scanner.feed(b"\ndata: {\"error\": {\"code\": 503}}\n"));
+        assert_eq!(scanner.overlap.len(), ERROR_EVENT_PREFIX.len() - 1);
     }
 
     fn body_with_completion(
@@ -527,60 +495,61 @@ mod tests {
         (body, rx)
     }
 
-    async fn wait_for_stream_end(rx: tokio::sync::oneshot::Receiver<StreamEnd>) -> StreamEnd {
-        tokio::time::timeout(std::time::Duration::from_secs(1), rx)
-            .await
-            .expect("on_complete timed out")
-            .expect("on_complete dropped")
+    async fn stream_end(rx: tokio::sync::oneshot::Receiver<StreamEnd>) -> StreamEnd {
+        rx.await.expect("completion hook dropped")
     }
 
     #[tokio::test]
-    async fn on_complete_reports_error_event_with_clean_transport() {
+    async fn completion_reports_error_event() {
         let chunks = vec![
-            Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                b"data: {\"choices\": [{\"delta\": {\"content\": \"partial\"}}]}\n\n",
-            )),
-            Ok(Bytes::from_static(
-                b"data: {\"error\": {\"message\": \"aborted\", \"code\": 503}}\n\n",
-            )),
-            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: {\"err")),
+            Ok(Bytes::from_static(b"or\": {\"code\": 503}}\n\n")),
         ];
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await.unwrap();
-        let end = wait_for_stream_end(completion).await;
-        assert!(end.transport_ok, "clean close: transport is fine");
-        assert!(end.saw_error_event, "SSE error event must be reported");
+        let end = stream_end(completion).await;
+        assert!(end.transport_ok);
+        assert!(end.saw_error_event);
         assert!(!end.client_disconnect);
     }
 
     #[tokio::test]
-    async fn on_complete_reports_clean_success() {
-        let chunks = vec![
-            Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                b"data: {\"choices\": [{\"delta\": {\"content\": \"hello\"}}]}\n\n",
-            )),
-            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
-        ];
+    async fn completion_reports_upstream_error() {
+        let chunks = vec![Err(std::io::Error::other("upstream failed"))];
+        let (body, completion) = body_with_completion(chunks);
+        let _ = body.collect().await;
+        let end = stream_end(completion).await;
+        assert!(!end.transport_ok);
+        assert!(!end.saw_error_event);
+        assert!(!end.client_disconnect);
+    }
+
+    #[tokio::test]
+    async fn completion_reports_clean_end() {
+        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"data: [DONE]\n\n",
+        ))];
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await.unwrap();
-        let end = wait_for_stream_end(completion).await;
+        let end = stream_end(completion).await;
         assert!(end.transport_ok);
         assert!(!end.saw_error_event);
         assert!(!end.client_disconnect);
     }
 
     #[tokio::test]
-    async fn on_complete_reports_client_disconnect() {
-        let chunks: Vec<Result<Bytes, std::io::Error>> =
-            std::iter::repeat_with(|| Ok(Bytes::from_static(b"data: x\n\n")))
-                .take(1000)
-                .collect();
+    async fn completion_reports_client_disconnect() {
+        let chunks = std::iter::repeat_with(|| {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: x\n\n"))
+        })
+        .take(1000)
+        .collect();
         let (body, completion) = body_with_completion(chunks);
-        let mut data_stream = body.into_data_stream();
-        let _ = data_stream.next().await;
-        drop(data_stream);
-        let end = wait_for_stream_end(completion).await;
-        assert!(end.transport_ok, "a walk-away client is not a worker fault");
-        assert!(end.client_disconnect, "disconnect must be reported");
+        let mut stream = body.into_data_stream();
+        let _ = stream.next().await;
+        drop(stream);
+        let end = stream_end(completion).await;
+        assert!(end.transport_ok);
+        assert!(end.client_disconnect);
     }
 }

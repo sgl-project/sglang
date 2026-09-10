@@ -218,20 +218,14 @@ impl Proxy {
         // is recorded as a failure. For 5xx headers we record_failure
         // up front and skip the pump hook (the body we surface is the
         // error response — its stream completing is not a worker win).
-        let caller_end_hook = if status.is_success() {
-            on_stream_end
-        } else {
-            None
-        };
+        let caller_end_hook = status.is_success().then_some(on_stream_end).flatten();
         let on_complete: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>> =
             if status.is_server_error() {
                 breaker.record_failure();
                 None
             } else {
                 let breaker_for_hook = Arc::clone(breaker);
-                Some(Box::new(move |end: sse::StreamEnd| {
-                    // Breaker judges transport only; the SSE error event
-                    // deliberately stays out of routing.
+                Some(Box::new(move |end| {
                     if end.transport_ok {
                         breaker_for_hook.record_success();
                     } else {

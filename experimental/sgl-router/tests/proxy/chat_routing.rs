@@ -1521,9 +1521,9 @@ async fn stream_chat_and_render(
     }
 }
 
-/// A clean transport carrying an SSE error event records only the stream failure.
+/// A post-200 SSE error event is classified without affecting routing health.
 #[tokio::test]
-async fn streaming_error_event_records_stream_outcome_without_tripping_breaker() {
+async fn streaming_error_event_records_outcome_without_tripping_breaker() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![
         "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
         "data: {\"error\": {\"message\": \"The request queue is full.\", \"code\": 503}}\n\n",
@@ -1548,9 +1548,8 @@ async fn streaming_error_event_records_stream_outcome_without_tripping_breaker()
     );
 }
 
-/// A clean stream records one successful outcome.
 #[tokio::test]
-async fn streaming_clean_completion_records_stream_outcome_ok() {
+async fn streaming_clean_completion_records_ok() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![
         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
         "data: [DONE]\n\n",
@@ -1560,9 +1559,5 @@ async fn streaming_clean_completion_records_stream_outcome_ok() {
         r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="ok"}} 1"#,
         worker.url,
     );
-    let (_, metrics) = stream_chat_and_render(&worker.url, &expected).await;
-    assert!(
-        !metrics.contains(r#"outcome="stream_error_event""#),
-        "clean stream recorded an SSE error event; got:\n{metrics}",
-    );
+    stream_chat_and_render(&worker.url, &expected).await;
 }

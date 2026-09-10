@@ -765,13 +765,12 @@ pub async fn chat_completions(
         start,
     };
 
-    // Builds the end-of-stream hook classifying a 2xx stream after the 200
-    // was committed. Takes the streaming worker's URL (Final D in PD mode).
+    // Classifies a 2xx stream after its headers are committed. Takes the
+    // streaming worker's URL (Final D in PD mode).
     let make_stream_end_hook = |worker_url: String| -> Box<dyn FnOnce(StreamEnd) + Send + 'static> {
         let metrics = Arc::clone(&ctx.metrics);
         let model = metrics_model.clone();
-        Box::new(move |end: StreamEnd| {
-            // Precedence: error event > transport fault > disconnect.
+        Box::new(move |end| {
             let outcome = if end.saw_error_event {
                 StreamOutcome::StreamErrorEvent
             } else if !end.transport_ok {
