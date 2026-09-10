@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import json
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -845,3 +849,54 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+def test_sensenova_u1_pipeline_import_does_not_load_models():
+    # Earlier tests import model code, so check discovery in a fresh process.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import sys
+                from sglang.multimodal_gen.runtime.pipelines import sensenova_u1
+                from sglang.multimodal_gen.runtime.models.sensenova_u1 import register
+                from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+                prefix = "sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_"
+                assert not any(name.startswith(prefix) for name in sys.modules)
+                assert "neo_chat" not in CONFIG_MAPPING
+                assert "neo_vision" not in CONFIG_MAPPING
+                """
+            ),
+        ],
+        check=True,
+        timeout=60,
+    )
+
+
+def test_sensenova_u1_load_registers_before_loading(monkeypatch):
+    from sglang.multimodal_gen.runtime.models import sensenova_u1
+    from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
+        AutoTokenizer,
+        SenseNovaU1Pipeline,
+    )
+
+    register = Mock()
+    monkeypatch.setattr(sensenova_u1, "register", register)
+
+    def stop_at_checkpoint_load(*args, **kwargs):
+        register.assert_called_once_with()
+        raise RuntimeError("checkpoint loading reached")
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", stop_at_checkpoint_load)
+    pipeline = SimpleNamespace(model_path="test-checkpoint")
+    args = SimpleNamespace(
+        num_gpus=1,
+        pipeline_config=SimpleNamespace(model_precision="bf16"),
+        trust_remote_code=False,
+        revision=None,
+    )
+    with pytest.raises(RuntimeError, match="checkpoint loading reached"):
+        SenseNovaU1Pipeline.load_modules(pipeline, args)

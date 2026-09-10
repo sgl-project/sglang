@@ -14,9 +14,6 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.models import (  # noqa: F401
-    sensenova_u1 as _sensenova_u1,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -58,6 +55,10 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
                 "SenseNovaU1Pipeline currently supports num_gpus=1. "
                 "Native tensor/pipeline parallelism is not implemented yet."
             )
+        from sglang.multimodal_gen.runtime.models.sensenova_u1 import register
+
+        register()
+
         dtype = PRECISION_TO_TYPE.get(
             server_args.pipeline_config.model_precision, torch.bfloat16
         )
