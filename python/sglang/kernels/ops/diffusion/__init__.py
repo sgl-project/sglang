@@ -399,6 +399,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Wan causal VAE main + DupUp3D(src).",
     ),
     (
+        "diffusion.nearest_upsample_nhwc",
+        KernelBackend.TRITON,
+        "layout.nearest_upsample_nhwc_triton:nearest_upsample_nhwc",
+        _CUDA,
+        "Wan-family VAE channels_last integer-factor nearest upsample.",
+    ),
+    (
         "diffusion.flux2_token_cat_nvfp4",
         KernelBackend.JIT,
         "layout.flux2_token_cat_nvfp4_jit:try_flux2_token_cat_nvfp4",
@@ -542,6 +549,8 @@ _EXPORTS: dict[str, str] = {
     "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
     "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
     "dup_up3d_add": "layout.wan_causal_cache_triton",
+    "nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
+    "can_use_nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
     "try_flux2_token_cat_nvfp4": "layout.flux2_token_cat_nvfp4_jit",
     # Fusion-site policy: quality gate, first-sight verification, mount
     "BitExactFusionGate": "sites.bitexact_gate",
@@ -587,6 +596,10 @@ _EXPORTS: dict[str, str] = {
     "mark_ltx2_rms_norm_modulate_site": "sites.ltx2_rmsnorm_modulate_site",
     "mount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
     "unmount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "ltx2_qknorm_split_rope_active": "sites.ltx2_qknorm_split_rope_site",
+    "mark_ltx2_qknorm_split_rope_site": "sites.ltx2_qknorm_split_rope_site",
+    "mount_ltx2_qknorm_split_rope": "sites.ltx2_qknorm_split_rope_site",
+    "unmount_ltx2_qknorm_split_rope": "sites.ltx2_qknorm_split_rope_site",
     "lingbot_video_rmsnorm_active": "sites.lingbot_video_rmsnorm_site",
     "mark_lingbot_video_rmsnorm_site": "sites.lingbot_video_rmsnorm_site",
     "mount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
