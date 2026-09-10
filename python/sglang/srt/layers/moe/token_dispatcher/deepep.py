@@ -499,22 +499,18 @@ class _DeepEPDispatcherImplBase:
                 )
 
             deep_use_mode = os.environ.get("DEEP_USE_MODE", "default").lower()
-            # ops uses the default normal strategy, but its LL strategy only
-            # supports MXFP8. allgather (when installed) uses default LL.
-            if self.dispatch_mode == DeepEPMode.NORMAL:
-                supports_mx = deep_use_mode in ("default", "ops")
+            if deep_use_mode == "default":
+                supports_mx = True
+            elif deep_use_mode == "ops":
+                supports_mx = self.dispatch_mode == DeepEPMode.NORMAL
+            elif deep_use_mode == "alltoall":
+                supports_mx = False
+            elif deep_use_mode == "allgather":
+                # Normal uses the library's global switch; LL uses default LL.
+                return
             else:
-                supports_mx = deep_use_mode in ("default", "allgather") or (
-                    deep_use_mode == "ops"
-                    and self.deepep_output_dtype == DispatcherOutputDtype.MXFP8
-                )
-            if _use_zbal or not supports_mx:
-                logger.warning_once(
-                    f"{self.deepep_output_dtype.value} DeepEP dispatch is not "
-                    f"supported with DEEP_USE_MODE={deep_use_mode}, "
-                    f"mode={self.dispatch_mode.value}, ZBal={_use_zbal}; "
-                    "switching to bf16."
-                )
+                supports_mx = False
+            if not supports_mx:
                 self.deepep_output_dtype = DispatcherOutputDtype.BF16
             return
 
@@ -631,7 +627,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # `handle` as a member variable works.
 
         extra_kwargs = {}
-        if _is_npu and not _use_zbal:
+        if (
+            _is_npu
+            and os.environ.get("DEEP_USE_MODE", "default").lower() != "allgather"
+        ):
             # Normal dispatch uses separate MX flags; use_fp8 requests
             # per-token FP8 rather than E8M0 block-scaled MXFP8.
             if self.deepep_output_dtype == DispatcherOutputDtype.MXFP8:
@@ -821,7 +820,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         low_latency_quant_kwargs = {}
-        if _is_npu and not _use_zbal:
+        if _is_npu:
             if self.use_ue8m0:
                 low_latency_quant_kwargs["use_ue8m0"] = True
             if self.use_mxfp4:
