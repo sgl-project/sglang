@@ -28,7 +28,7 @@ from sglang.srt.utils import FP4_KV_CACHE_DTYPES
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=1, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _skip_unless_fp4_dtype_available(test_case):
