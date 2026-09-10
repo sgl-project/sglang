@@ -29,7 +29,7 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
-from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
 
@@ -846,4 +846,4 @@ def resolve_auto_parsers(server_args) -> None:
                 detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
 
     if detected:
-        declare_late_resolution(server_args, "template-detection", **detected)
+        declare_resolution(server_args, "template-detection", **detected)
