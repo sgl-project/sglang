@@ -357,6 +357,35 @@ kimik26-fp8-mi355x-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp.yaml
 
+# DeepSeek-R1-0528 (native FP8) 2-node 1P1D with HiCache (L1 GPU radix + L2 host
+# pinned + L3 file) on the PREFILL role. This is the disaggregated counterpart of
+# the single-instance registered test
+# test/registered/amd/test_deepseek_r1_hicache_mi35x.py (#26395 / #26478); the DI
+# CI had no hierarchical-cache coverage at all before this leg. R1 is used
+# because it is the model HiCache is known-good on for MI35x.
+#
+# The recipe sets runtime.disable_radix_cache: false -- HiCache L1 *is* the radix
+# cache, and --disable-radix-cache was previously hardcoded for every role.
+#
+# The perf sweep uses --dataset-name random (no cross-request prefix sharing), so
+# this leg's throughput reflects HiCache overhead rather than benefit; the GSM8K
+# hard-gate is the signal that matters here.
+dsr1-fp8-mi355x-hicache-sglang:
+  model: deepseek-ai/DeepSeek-R1-0528
+  model-prefix: dsr1
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-R1-0528
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsr1/1k1k/1p1d-hicache.yaml
+
 # AMD 4-node disaggregation with narrow-prefill EP8 + WIDE-decode EP16 (Oren's
 # 2P1D config: two single-node prefill engines EP8 that the router fans across +
 # one decode engine EP16 spanning 2 nodes; 4 nodes total). Runs on the `mi355x`
