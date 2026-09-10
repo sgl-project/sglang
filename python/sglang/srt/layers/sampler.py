@@ -150,6 +150,15 @@ class Sampler(nn.Module):
             all_greedy=sampling_info.is_all_greedy,
         )
 
+        if logits_output.tp_sharded_greedy_token_ids is not None:
+            assert logits is None
+            assert sampling_info.is_all_greedy
+            assert not return_logprob
+            assert not any(sampling_info.return_sampling_masks or [])
+            batch_next_token_ids = logits_output.tp_sharded_greedy_token_ids
+            self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+            return batch_next_token_ids
+
         if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
 

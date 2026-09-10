@@ -180,6 +180,9 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
     next_token_logits: Optional[torch.Tensor]
+    # Greedy-only TP fast path: globally selected token ids without gathering
+    # the vocab logits. Mutually exclusive with next_token_logits.
+    tp_sharded_greedy_token_ids: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -239,6 +242,7 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
+    use_tp_sharded_greedy: bool = False
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -282,6 +286,8 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        from sglang.srt.layers.tp_sharded_greedy import can_use_tp_sharded_greedy
+
         if (
             forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob
@@ -316,6 +322,7 @@ class LogitsMetadata:
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            use_tp_sharded_greedy=can_use_tp_sharded_greedy(forward_batch),
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -497,6 +504,20 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if logits_metadata.use_tp_sharded_greedy:
+                greedy_token_ids = self._get_tp_sharded_greedy_token_ids(
+                    pruned_states, lm_head
+                )
+                if greedy_token_ids is not None:
+                    if sample_indices is not None:
+                        greedy_token_ids = greedy_token_ids[sample_indices]
+                    return LogitsProcessorOutput(
+                        next_token_logits=None,
+                        tp_sharded_greedy_token_ids=greedy_token_ids,
+                        hidden_states=hidden_states_to_store,
+                        mm_input_embeds=logits_metadata.mm_input_embeds,
+                    )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -528,6 +549,54 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def _get_tp_sharded_greedy_token_ids(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+    ) -> Optional[torch.Tensor]:
+        """Try the no-full-logits greedy path; return ``None`` to fall back."""
+
+        if (
+            not self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+            or not isinstance(lm_head, VocabParallelEmbedding)
+            or lm_head.tp_size <= 1
+            or lm_head.num_added_embeddings != 0
+            or lm_head.num_embeddings != self.vocab_size
+        ):
+            return None
+
+        logits = self._compute_lm_head(hidden_states, lm_head)
+        if logits.ndim != 2:
+            return None
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        logits = logits.float()
+        if self.final_logit_softcapping:
+            if not (_is_npu or _is_cpu):
+                fused_softcap(logits, self.final_logit_softcapping)
+            else:
+                logits = self.final_logit_softcapping * torch.tanh(
+                    logits / self.final_logit_softcapping
+                )
+
+        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.layers.tp_sharded_greedy import tp_sharded_greedy_argmax
+        from sglang.srt.utils.async_probe import sanitize_nan_logits
+
+        sanitize_nan_logits(logits, "tp-sharded greedy: local logits")
+        tp_group = (
+            get_parallel().attn_tp_group if self.use_attn_tp_group else get_tp_group()
+        )
+        shard = lm_head.shard_indices
+        return tp_sharded_greedy_argmax(
+            logits,
+            vocab_start=shard.org_vocab_start_index,
+            vocab_end=shard.org_vocab_end_index,
+            process_group=tp_group.device_group,
+            world_size=tp_group.world_size,
+        )
 
     def _get_pruned_states(
         self,
