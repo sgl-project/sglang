@@ -525,13 +525,6 @@ class _DeepEPDispatcherImplBase:
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
-            elif self.deepep_output_dtype in (
-                DispatcherOutputDtype.MXFP8,
-                DispatcherOutputDtype.MXFP4,
-            ):
-                raise RuntimeError(
-                    "MXFP8/MXFP4 DeepEP dispatch is supported only on arch35 NPU."
-                )
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
