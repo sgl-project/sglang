@@ -17,7 +17,10 @@ Server configuration is a faithful port: parallelism, aiter attention, fp8 KV,
 page size, chunked prefill and prefill caps, scheduler/stream intervals,
 tokenizer workers, reasoning and tool-call parsers, EAGLE MTP shape, and the
 HiCache CPU tier are all the recipe's values, with the derived
-``max_running_requests``/``cuda_graph_max_bs`` arithmetic carried over.
+``max_running_requests``/``cuda_graph_max_bs`` arithmetic carried over. The
+parallelism and concurrency defaults come from the recipe's search space in
+InferenceX ``configs/amd-master.yaml`` rather than from the shell script, which
+takes them as required environment variables.
 
 Two things intentionally differ from AgentX:
 
@@ -41,7 +44,7 @@ Two things intentionally differ from AgentX:
 Everything is env-overridable so the AMD CI owners can retune the workload
 without touching the recipe.
 
-Registry: nightly-perf-8-gpu-mi35x-qwen35-mxfp4-agentic-mtp suite
+Registry: nightly-perf-4-gpu-mi35x-qwen35-mxfp4-agentic-mtp suite
 """
 
 import json
@@ -63,7 +66,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=7200,
-    suite="nightly-perf-8-gpu-mi35x-qwen35-mxfp4-agentic-mtp",
+    suite="nightly-perf-4-gpu-mi35x-qwen35-mxfp4-agentic-mtp",
     nightly=True,
 )
 
@@ -72,10 +75,17 @@ register_amd_ci(
 # but that path is a dev-host mount and is not visible inside the CI container.
 MODEL_PATH = os.environ.get("QWEN35_MXFP4_MODEL_PATH", "amd/Qwen3.5-397B-A17B-MXFP4")
 
-TP_SIZE = int(os.environ.get("AGENTIC_TP", "8"))
-EP_SIZE = int(os.environ.get("AGENTIC_EP_SIZE", str(TP_SIZE)))
-CONCURRENCY = int(os.environ.get("AGENTIC_CONCURRENCY", "32"))
-NUM_CONVERSATIONS = int(os.environ.get("AGENTIC_NUM_CONVERSATIONS", "64"))
+# Parallelism and concurrency come from the recipe's own search space in
+# InferenceX configs/amd-master.yaml (qwen3.5-fp4-mi355x-sglang-agentic-mtp):
+# tp2 and tp4 at ep1, with the HiCache CPU tier only on the high-concurrency
+# rows -- tp4 runs it at concurrency 40/48/56/64. 48 is the middle of that row,
+# so one CI point exercises the offload path the rest of this config exists to
+# serve. tp4 leaves half of the 8-GPU runner idle, as the MiniMax-M3 tp4 job
+# already does; the recipe never runs this checkpoint at tp8.
+TP_SIZE = int(os.environ.get("AGENTIC_TP", "4"))
+EP_SIZE = int(os.environ.get("AGENTIC_EP_SIZE", "1"))
+CONCURRENCY = int(os.environ.get("AGENTIC_CONCURRENCY", "48"))
+NUM_CONVERSATIONS = int(os.environ.get("AGENTIC_NUM_CONVERSATIONS", "96"))
 # AgentX runs to a wall-clock duration; sglang's replay is closed-loop, so the
 # run is bounded by conversations x turns instead. 16 turns already carries each
 # trajectory past 80k tokens of context, which is where this config is aimed.
