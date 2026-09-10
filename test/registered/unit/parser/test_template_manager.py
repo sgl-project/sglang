@@ -4,6 +4,8 @@ import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
+
 from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
@@ -948,7 +950,9 @@ class TestResolveAutoParsers(unittest.TestCase):
             reasoning_parser="auto",
             tool_call_parser="auto",
         )
-        object.__setattr__(args, "model_path", "nonexistent/model-does-not-exist-xyz")
+        msgspec.Struct.__setattr__(
+            args, "model_path", "nonexistent/model-does-not-exist-xyz"
+        )
         with _patch_hf_transformers_utils(
             Mock(side_effect=RuntimeError("tokenizer unavailable")),
             Mock(side_effect=RuntimeError("config unavailable")),
