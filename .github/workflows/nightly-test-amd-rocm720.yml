@@ -1906,9 +1906,13 @@ jobs:
 
       # The replay converts the published AgentX corpus on first use and caches
       # it under the persistent /sgl-data mount alongside the weights.
+      #
+      # No continue-on-error: the perf steps that set it are the second step of
+      # an accuracy+perf job, where it keeps a throughput blip from masking the
+      # eval result. This job is only this step, so swallowing its exit code
+      # would leave check-all-jobs green no matter what the replay did.
       - name: Performance Test MI35x ROCm 7.2 (8-GPU Qwen3.5-MXFP4 agentic MTP)
         timeout-minutes: 240
-        continue-on-error: true
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
