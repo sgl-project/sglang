@@ -344,7 +344,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     );
 
@@ -465,6 +465,49 @@ pub const BASE_COMPONENT_TYPE: ComponentType = ComponentType::Full;
 
 /// Slots per tier — the arrays are sized to this, not the enabled subset.
 pub const NUM_COMPONENT_TYPES: usize = ComponentType::Mamba as usize + 1;
+
+/// A set of component types (bitmask over `ComponentType::idx`), e.g. the
+/// components an `inc_lock_ref` left untaken.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub struct ComponentSet(u8);
+
+impl ComponentSet {
+    pub const EMPTY: ComponentSet = ComponentSet(0);
+
+    /// The set holding exactly one component.
+    pub const fn of(component_type: ComponentType) -> ComponentSet {
+        ComponentSet(1 << component_type.idx())
+    }
+
+    pub fn insert(&mut self, component_type: ComponentType) {
+        self.0 |= 1 << component_type.idx();
+    }
+
+    pub const fn contains(self, component_type: ComponentType) -> bool {
+        self.0 & (1 << component_type.idx()) != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The members, in component-index order.
+    pub fn iter(self) -> impl Iterator<Item = ComponentType> {
+        (0..NUM_COMPONENT_TYPES)
+            .filter(move |idx| self.0 & (1 << idx) != 0)
+            .map(ComponentType::from_idx)
+    }
+}
+
+impl FromIterator<ComponentType> for ComponentSet {
+    fn from_iter<I: IntoIterator<Item = ComponentType>>(iter: I) -> Self {
+        let mut set = ComponentSet::EMPTY;
+        for component_type in iter {
+            set.insert(component_type);
+        }
+        set
+    }
+}
 
 impl ComponentType {
     /// Index into a per-component array.
