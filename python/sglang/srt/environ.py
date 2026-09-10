@@ -1653,6 +1653,13 @@ class Envs:
     # prefill (3.4x FLOPs, 64-row tiles), so the default admits expanded MHA up
     # to ~128K tokens at CP4/CP8 (estimate ~11.6 GB at 128K/CP4).
     SGLANG_K3_CP_MHA_MAX_WORKSPACE_MB = EnvInt(16384)
+    # Phase 1 (experimental): under K3 prefill CP with attention TP width 1
+    # (attn_cp_size == tp_size), keep the residual stream sequence-sharded in
+    # the CP rank's zigzag rows between layers. Row-wise work (norms, residual
+    # adds, attention-residual bank, MoE router / latent projections / shared
+    # experts) runs on N/cp rows; the TP-sharded experts see an all-gathered
+    # latent and reduce-scatter their partials; KDA gathers full rows.
+    SGLANG_K3_CP_SP_RESIDUAL = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
