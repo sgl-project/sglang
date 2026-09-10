@@ -45,18 +45,13 @@ class SenseNovaU1Pipeline(LoRAPipeline):
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, Any]:
         if loaded_modules is not None and {"model", "tokenizer"} <= set(loaded_modules):
-            modules = loaded_modules
+            modules = dict(loaded_modules)
         else:
-            if server_args.num_gpus != 1:
-                raise ValueError(
-                    "SenseNovaU1Pipeline currently supports num_gpus=1. "
-                    "Native tensor/pipeline parallelism is not implemented yet."
-                )
             modules = load_model_and_tokenizer(self.model_path, server_args)
             logger.info("Loaded SenseNova-U1 model from %s", self.model_path)
 
-        # LoRAPipeline looks the denoiser up as "transformer"; this pipeline loads
-        # one monolithic model, so alias it rather than load a second copy.
+        # LoRAPipeline resolves the denoiser as modules["transformer"]; this pipeline
+        # loads one monolithic model, so alias it rather than load a second copy.
         modules["transformer"] = modules["model"]
         return modules
 

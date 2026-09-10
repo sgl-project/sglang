@@ -100,6 +100,11 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
                 "SenseNovaU1Pipeline does not support torch.compile yet. "
                 "Please omit --enable-torch-compile."
             )
+        if server_args.lora_path and server_args.lora_target_modules is None:
+            # The official distilled adapter carries only the generation branch.
+            # Without a target list every nn.Linear in the monolithic model is
+            # wrapped and its base weight cloned into host memory.
+            server_args.lora_target_modules = ["_mot_gen"]
         _set_compatible_runtime_defaults(server_args)
         if _is_arg_explicitly_set(
             server_args, "component_residency"

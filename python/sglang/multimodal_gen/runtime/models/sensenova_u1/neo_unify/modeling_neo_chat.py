@@ -194,13 +194,8 @@ class NEOChatModel(PreTrainedModel):
     main_input_name = "pixel_values"
     base_model_prefix = "language_model"
     _supports_flash_attn_2 = True
-    # Read off the module registered as "transformer" by LoRAPipeline, whose arch
-    # config leaves both empty. The official distilled adapter is written with the
-    # kohya suffix names, which are not the canonical lora_A / lora_B.
-    lora_param_names_mapping: dict = {
-        r"\.lora_down$": ".lora_A",
-        r"\.lora_up$": ".lora_B",
-    }
+    # LoRAPipeline reads this off the module it resolves as "transformer", and the
+    # arch config's copy is empty, so the attribute must exist even when unused.
     param_names_mapping: dict = {}
     supports_gradient_checkpointing = True
     _no_split_modules = [
