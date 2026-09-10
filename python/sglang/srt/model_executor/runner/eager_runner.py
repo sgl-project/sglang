@@ -151,6 +151,7 @@ class EagerRunner(BaseRunner):
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
             dp_size=get_parallel().dp_size,
+            memory_pool=mr.cuda_graph_persistent_pool,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()

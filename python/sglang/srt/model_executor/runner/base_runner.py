@@ -229,7 +229,8 @@ class BaseRunner(ABC):
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.tbo_plugin = TboCudaGraphRunnerPlugin()
+        with model_runner.cuda_graph_persistent_pool_context():
+            self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
     def warmup(self) -> None:
         """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""

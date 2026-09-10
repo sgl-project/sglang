@@ -1,8 +1,9 @@
-"""CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
+"""CPU coverage for persistent Full prefill CUDA-graph state."""
 
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -139,6 +140,119 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
                 self.assertIs(runner.prepare_dummy_forward_batch(batch), batch)
                 self.assertEqual(batch.attn_tp_sequence_sharded, expected)
+
+    def test_persistent_pool_covers_prefill_graph_state(self):
+        pool = object()
+        pool_active = False
+
+        @contextmanager
+        def pool_context():
+            nonlocal pool_active
+            self.assertFalse(pool_active)
+            pool_active = True
+            try:
+                yield
+            finally:
+                pool_active = False
+
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.device = torch.device("cpu")
+        runner.max_bs = 4
+        runner.buffers = Mock()
+        runner._persistent_capture_global_num_tokens = {}
+        runner.model_runner = SimpleNamespace(
+            cuda_graph_persistent_pool=pool,
+            cuda_graph_persistent_pool_context=pool_context,
+        )
+
+        runner._share_input_buffers()
+        runner.buffers.share_buffers.assert_called_once_with(memory_pool=pool)
+
+        real_zeros = torch.zeros
+
+        def zeros_in_pool(*args, **kwargs):
+            self.assertTrue(pool_active)
+            return real_zeros(*args, **kwargs)
+
+        with patch.object(runner_module.torch, "zeros", side_effect=zeros_in_pool):
+            static_buffers = runner._create_prefill_static_buffers()
+        self.assertEqual(set(static_buffers), set(runner_module._PREFILL_STATIC_FIELDS))
+
+        real_tensor = torch.tensor
+
+        def tensor_in_pool(*args, **kwargs):
+            self.assertTrue(pool_active)
+            return real_tensor(*args, **kwargs)
+
+        with patch.object(runner_module.torch, "tensor", side_effect=tensor_in_pool):
+            global_num_tokens = runner._create_capture_global_num_tokens([8, 8, 8, 8])
+            reused_global_num_tokens = runner._create_capture_global_num_tokens(
+                [8, 8, 8, 8]
+            )
+        self.assertEqual(global_num_tokens.tolist(), [8, 8, 8, 8])
+        self.assertIs(reused_global_num_tokens, global_num_tokens)
+
+        forward_batch = object()
+        attn_backend = Mock()
+        attn_backend.init_forward_metadata_out_graph.side_effect = (
+            lambda *_args, **_kwargs: self.assertTrue(pool_active)
+        )
+        runner._init_full_cuda_graph_attention_metadata(attn_backend, forward_batch)
+        attn_backend.init_forward_metadata_out_graph.assert_called_once_with(
+            forward_batch, in_capture=True
+        )
+
+    def test_chunked_prefix_buffers_preserve_no_pool_behavior(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._capture_req_slots = 2
+        runner._prefix_chunk_len = 4
+        runner._prefix_chunk_capacity = 8
+        runner._prefix_capture_variants = (1, 2)
+        runner.device = torch.device("cpu")
+        runner._persistent_capture_global_num_tokens = {}
+        runner.model_runner = SimpleNamespace(
+            cuda_graph_persistent_pool=None,
+            cuda_graph_persistent_pool_context=nullcontext,
+        )
+
+        with patch.object(runner_module.torch.cuda, "use_mem_pool") as use_mem_pool:
+            buffers = runner._create_chunked_prefix_buffers()
+        first_counts = runner._create_capture_global_num_tokens([8, 8])
+        second_counts = runner._create_capture_global_num_tokens([8, 8])
+
+        use_mem_pool.assert_not_called()
+        self.assertEqual(buffers.starts_cpu.device.type, "cpu")
+        self.assertEqual(buffers.seq_lens_cpu.device.type, "cpu")
+        self.assertIsNot(first_counts, second_counts)
+
+    def test_chunked_prefix_cuda_buffers_use_persistent_pool(self):
+        pool = object()
+        entered = False
+
+        @contextmanager
+        def pool_context():
+            nonlocal entered
+            entered = True
+            yield
+
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._capture_req_slots = 2
+        runner._prefix_chunk_len = 4
+        runner._prefix_chunk_capacity = 8
+        runner._prefix_capture_variants = (1, 2)
+        runner.device = torch.device("cpu")
+
+        with patch.object(
+            runner_module.torch.cuda,
+            "use_mem_pool",
+            return_value=pool_context(),
+        ) as use_mem_pool:
+            buffers = runner._create_chunked_prefix_buffers(memory_pool=pool)
+
+        use_mem_pool.assert_called_once_with(pool)
+        self.assertTrue(entered)
+        self.assertEqual(buffers.starts_cpu.device.type, "cpu")
+        self.assertEqual(buffers.seq_lens_cpu.device.type, "cpu")
 
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()

@@ -315,6 +315,11 @@ class ModelRunner:
         """Whether this runner's sampling path publishes observer output."""
         return get_exec().dllm.dllm_algorithm is None and self.spec_algorithm.is_none()
 
+    def cuda_graph_persistent_pool_context(self):
+        if self.cuda_graph_persistent_pool is None:
+            return contextlib.nullcontext()
+        return torch.cuda.use_mem_pool(self.cuda_graph_persistent_pool)
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -341,6 +346,7 @@ class ModelRunner:
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
+        self.cuda_graph_persistent_pool: Optional[torch.cuda.MemPool] = None
         self.is_draft_worker = is_draft_worker
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
