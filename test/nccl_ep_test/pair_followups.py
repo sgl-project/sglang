@@ -282,7 +282,12 @@ def exercise(*, replays=1000):
                         checked += 1
             assert runner.capture_generations == 2
             assert idle_receives > 0
-        finally:
+        except BaseException:
+            # A peer may still be inside a native transaction. Let torchrun
+            # terminate the job; collective cleanup can hide the first error
+            # behind a second timeout when another rank is waiting for us.
+            raise
+        else:
             runner.backend.cleanup()
             resources = close_runtime(coordinator, audit)
     return {

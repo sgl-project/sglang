@@ -213,6 +213,14 @@ def runner_routing(batch, rank):
     values = batch.input_ids
     pattern = (2.0 ** (torch.arange(2048, device=values.device) // 128 % 4)).bfloat16()
     x = values[:, None].bfloat16() * pattern
+    if not values.numel():
+        # Real MoE layers bypass select_experts on IDLE and use an empty
+        # top-k output. The mask kernel requires a positive launch grid.
+        return (
+            x,
+            torch.empty((0, 2), dtype=torch.int32, device=values.device),
+            torch.empty((0, 2), dtype=torch.float32, device=values.device),
+        )
 
     def router(**kwargs):
         first = (values + rank) % 4

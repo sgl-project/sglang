@@ -34,6 +34,16 @@ def _runner():
     return runner
 
 
+def test_synthetic_eager_idle_routing_preserves_true_empty_input():
+    from nccl_ep_test.sglang_graph import runner_routing
+
+    batch = input_batch([])
+    batch.forward_mode = ForwardMode.IDLE
+    x, ids, weights = runner_routing(batch, 0)
+    assert x.shape == (0, 2048)
+    assert ids.shape == weights.shape == (0, 2)
+
+
 def test_true_idle_preserves_zero_valid_tokens_and_empty_result():
     runner = _runner()
     try:
