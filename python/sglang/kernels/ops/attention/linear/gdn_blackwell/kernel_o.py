@@ -415,6 +415,10 @@ class Sm100ChunkOKernel:
 
                 parity ^= 1
 
+                # Order this iteration's s_g_cu loads before the next
+                # iteration's loop-top s_g_cu stores (cross-iteration WAR).
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+
         else:
             # epilogue warps
             # for ldmatrix layout later
