@@ -29,7 +29,7 @@ export const benchmarks = [
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
     accuracy: { mmmu_pro_pct: 77.34, gsm8k_pct: 97.19 },
-    notes: "GB300 TP=1, official FP8 checkpoint. MMMU-Pro 77.34% (stop 99.77%, truncated 0.23%, error 0) measured at TP=4 --ep 4 on 4×GB300; TP=1 serving smoke also verified on one GB300; GSM8K 97.19% (stop 100%) measured with online dynamic FP8 on the same serving path. BF16 on the same box: MMMU-Pro 75.78% (TP=4), GSM8K 97.35%. Speed (LL points, online-quantized measurement, same protocol as the BF16 card): text 8192/1024 conc 1: TTFT 174.80 ms, TPOT 3.95 ms, 546 tok/s/GPU; conc 16: TTFT 981.25 ms, TPOT 7.49 ms, 4273 tok/s/GPU. Image 1024/1024 conc 1: TTFT 272.09 ms, TPOT 4.51 ms, 153 tok/s/GPU; conc 16: TTFT 1389.27 ms, TPOT 7.15 ms, 1369 tok/s/GPU. FP8 prefill (TTFT) is consistently faster than BF16 while TPOT is ~10% slower.",
+    notes: "GB300 TP=1, official FP8 checkpoint. MMMU-Pro 77.34% (stop 99.77%, truncated 0.23%, error 0) measured at TP=4 --ep 4 on 4×GB300; TP=1 serving smoke also verified on one GB300; GSM8K 97.19% (stop 100%) measured with online dynamic FP8 (--quantization fp8 on the BF16 checkpoint). BF16 on the same box: MMMU-Pro 75.78% (TP=4), GSM8K 97.35%. Speed (LL points, online-quantized measurement at TP=4, same protocol as the BF16 card): text 8192/1024 conc 1: TTFT 174.80 ms, TPOT 3.95 ms, 546 tok/s/GPU; conc 16: TTFT 981.25 ms, TPOT 7.49 ms, 4273 tok/s/GPU. Image 1024/1024 conc 1: TTFT 272.09 ms, TPOT 4.51 ms, 153 tok/s/GPU; conc 16: TTFT 1389.27 ms, TPOT 7.15 ms, 1369 tok/s/GPU. FP8 prefill (TTFT) is consistently faster than BF16 while TPOT is ~10% slower.",
   },
   { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
@@ -53,7 +53,8 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    notes: "2×H200, TP=2, E4M3 block-[128,128] kernels engaged (measured: 126.2 GB checkpoint, ~59 GB weights per GPU, healthy in 581 s including download and first-time DeepGEMM compile). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Accuracy for this checkpoint (measured at TP=4 --ep 4 on 4×GB300): MMMU-Pro 77.34%, GSM8K 97.19%.",
+    accuracy: { mmmu_pro_pct: 77.34, gsm8k_pct: 97.19 },
+    notes: "2×H200, TP=2, E4M3 block-[128,128] kernels engaged (measured: 126.2 GB checkpoint, ~59 GB weights per GPU, healthy in 581 s including download and first-time DeepGEMM compile). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Accuracy: MMMU-Pro 77.34% measured on the official FP8 checkpoint at TP=4 --ep 4 on 4×GB300; GSM8K 97.19% measured with online dynamic FP8 (--quantization fp8 on the BF16 checkpoint) on the same serving path.",
   },
   { match: { hw: "h100", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
   {
@@ -67,14 +68,15 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    notes: "1×H200 (141 GB), TP=1, auto-detected compressed-tensors int4 (W4A16 Marlin MoE; 121 GB GPU memory in use incl. KV pool). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Accuracy for this checkpoint (measured on 2×B300, TP=2): MMMU-Pro 77.51%, GSM8K 96.97%.",
+    accuracy: { mmmu_pro_pct: 77.51, gsm8k_pct: 96.97 },
+    notes: "1×H200 (141 GB), TP=1, auto-detected compressed-tensors int4 (W4A16 Marlin MoE; 121 GB GPU memory in use incl. KV pool). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Accuracy measured on 2×B300, TP=2 (sgl-eval, single-shot, thinking on): MMMU-Pro 77.51% (stop 98.96%), GSM8K 96.97% (stop 100%).",
   },
   { match: { hw: "h100", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" } },
   {
     match: { hw: "gb300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
     accuracy: { mmmu_pro_pct: 76.24, gsm8k_pct: 96.66 },
-    notes: "GB300 TP=1, flashinfer_mxfp4 MoE backend (auto-selected). Serving smoke verified at TP=1 and 4×GB300 TP=2: text and image requests complete with finish_reason=stop and reasoning split. Accuracy measured on 2×B300, TP=2, no-flag serve (sgl-eval, single-shot, thinking on): MMMU-Pro 76.24% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.66% (stop 100%).",
+    notes: "GB300 TP=1, flashinfer_mxfp4 MoE backend (auto-selected). Serving smoke verified on one GB300 at TP=1 and on 2×GB300 at TP=2: text and image requests complete with finish_reason=stop and reasoning split. Accuracy measured on 2×B300, TP=2, without an explicit --moe-runner-backend flag (sgl-eval, single-shot, thinking on): MMMU-Pro 76.24% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.66% (stop 100%).",
   },
   { match: { hw: "b300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" } },
@@ -88,7 +90,7 @@ export const benchmarks = [
         ttft_ms: 23622.31, tpot_ms: 111.61, tokens_per_sec_per_gpu: 1069.73 },
     ],
     accuracy: { mmmu_pro_pct: 76.24, gsm8k_pct: 96.66 },
-    notes: "DGX Spark GB10, TP=1, flashinfer_mxfp4 MoE backend (SM120 CUTLASS W4A8 path), auto-selected — verified with a no-flag serve on GB10. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Speed: bench_serving --flush-cache, temperature 0, TTFT/TPOT are P50; tok/s = total (input + output) token throughput on one GPU. Image workload (one 720p JPEG per request, 883 vision tokens, in/out=1024/1024): conc 1 (8 prompts): TTFT 318.70 ms, TPOT 30.70 ms, 96.26 tok/s; conc 16 (32 prompts): TTFT 9476.07 ms, TPOT 82.39 ms, 510.44 tok/s. Accuracy measured on 2×B300, TP=2 (sgl-eval, single-shot, thinking on): MMMU-Pro 76.24% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.66% (stop 100%).",
+    notes: "DGX Spark GB10, TP=1, flashinfer_mxfp4 MoE backend (SM120 CUTLASS W4A8 path), auto-selected — verified on GB10 without an explicit --moe-runner-backend flag. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Speed: bench_serving --flush-cache, temperature 0, TTFT/TPOT are P50; tok/s = total (input + output) token throughput on one GPU. Image workload (one 720p JPEG per request, 883 vision tokens, in/out=1024/1024): conc 1 (8 prompts): TTFT 318.70 ms, TPOT 30.70 ms, 96.26 tok/s; conc 16 (32 prompts): TTFT 9476.07 ms, TPOT 82.39 ms, 510.44 tok/s. Accuracy measured on 2×B300, TP=2 (sgl-eval, single-shot, thinking on): MMMU-Pro 76.24% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.66% (stop 100%).",
   },
   {
     match: { hw: "dgx-spark", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
