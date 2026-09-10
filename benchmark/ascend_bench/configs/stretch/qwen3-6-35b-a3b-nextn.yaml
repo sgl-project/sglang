@@ -1,0 +1,57 @@
+# STRETCH (not part of the must-set): speculative decoding sweep for the
+# Qwen3.6-35B-A3B MoE spec via its built-in MTP layer (NEXTN).
+# Requires on-hardware validation of the draft-path convention before use —
+# day-1 smoke should confirm whether the MTP weights resolve from the main
+# checkpoint directory or need an explicit --speculative-draft-model-path.
+# 2 speculative axis values x 1 concurrency x 1 repeat = 2 cells.
+name: qwen3-6-35b-a3b-nextn
+
+model:
+  path: /workspace/shared_assets/models/Qwen/Qwen3.6-35B-A3B
+  dtype: bfloat16
+  trust_remote_code: true
+
+server:
+  args:
+    --device: npu
+    --attention-backend: ascend
+    --tp-size: 2
+    --port: 30000
+    --mem-fraction-static: 0.82      # leave room for draft + graphs
+    --cuda-graph-bs-decode: [1, 2, 4, 8]   # <= 10 entries (Ascend guard)
+    --speculative-eagle-topk: 1
+    --speculative-num-draft-tokens: 4
+  env:
+    HCCL_BUFFSIZE: "1200"
+  axes:
+    --speculative-num-steps: [2, 3]
+
+workload:
+  dataset_name: random
+  args:
+    --random-input-len: 1024
+    --random-output-len: 1024
+    --random-range-ratio: 1.0
+  axes:
+    --max-concurrency: [32]
+  num_prompts_mult: 8
+
+sla:
+  thresholds:
+    p99_ttft_ms: 3000
+    p99_tpot_ms: 100
+  cv_max: 0.15
+
+run:
+  repeats: 1               # stretch runs are for signal, not ranking
+  seed: 42
+  warmup_requests: 8
+  health_timeout_s: 2400
+  bench_timeout_s: 3600
+  hbm_budget_mb: 500
+  hbm_timeout_s: 240
+  gsm8k:
+    num_questions: 200
+    num_shots: 5
+    accuracy_floor: 0.30
+    # data_path: /mnt/data/gsm8k/test.jsonl   # pre-downloaded on offline hosts
