@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 use itertools::izip;
 use serde::Deserialize;
+use sglang_environ::env_i64;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
@@ -14,8 +15,8 @@ use super::response::ResponseSink;
 use super::sampling::{SamplingParams, SamplingParamsInput};
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use crate::message::ids::Rid;
+use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
-use crate::utils::{environ::env_i64, error::Error};
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,

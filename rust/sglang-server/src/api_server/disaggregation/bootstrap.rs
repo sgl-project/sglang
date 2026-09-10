@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use sglang_environ::env_i64;
 
-use crate::utils::environ;
 use crate::utils::response::json_error;
 use crate::utils::serialize::{parse_int, parse_int_opt, parse_int_vec};
 
@@ -339,7 +339,7 @@ fn router(state: Arc<Registry>) -> Router {
 /// Drop room entries
 async fn cleanup_sweeper(state: Arc<Registry>) {
     let cleanup_interval = Duration::from_secs(
-        environ::env_i64(
+        env_i64(
             ENTRY_CLEANUP_INTERVAL_ENV,
             ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS as i64,
         )

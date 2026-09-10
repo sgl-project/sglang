@@ -1,0 +1,9 @@
+[package]
+name = "sglang-environ"
+description = "Shared environment variable parsing for SGLang Rust crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing = { workspace = true }

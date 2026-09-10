@@ -18,6 +18,7 @@ name = "sglang_server"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+sglang-environ = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }

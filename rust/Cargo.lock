@@ -3662,6 +3662,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-environ"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "sglang-grpc"
 version = "0.1.0"
 dependencies = [
@@ -3722,6 +3729,7 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "sglang-environ",
  "sglang-mm",
  "socket2 0.6.5",
  "thiserror",

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "sglang-environ",
     "sglang-grpc",
     "sglang-mm",
     "sglang-server"
@@ -21,6 +22,7 @@ license = "Apache-2.0"
 # Members pull these in with `dep = { workspace = true }` (plus extra features
 # where needed).
 [workspace.dependencies]
+sglang-environ = { path = "sglang-environ" }
 async-stream = "0.3"
 bytes = "1"
 futures = "0.3"
