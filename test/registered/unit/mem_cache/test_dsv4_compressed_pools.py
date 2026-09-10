@@ -8,6 +8,7 @@ import torch
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
+    _CompressedPoolConfig,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -24,9 +25,12 @@ class TestDSV4CompressedPools(CustomTestCase):
                 pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
                 pool._unified_kv = unified
                 pool.uniform_fp8 = False
-                pool.c4_size = 256
-                pool.c4_logical_size = 1024
-                pool.c128_size = 512
+                pool.compressed_pool_configs = {
+                    4: _CompressedPoolConfig(
+                        256, 64, torch.bfloat16, indexer_size=1024
+                    ),
+                    128: _CompressedPoolConfig(512, 8, torch.float32),
+                }
                 pool.indexer_head_dim = 128
                 pool.page_size = 256
                 pool.compression_ratios = [128] + stage_ratios + [4]
@@ -104,6 +108,46 @@ class TestDSV4CompressedPools(CustomTestCase):
                 expected = kv_entries(4) + indexer_entries + kv_entries(128)
                 actual = list(zip(*pool.get_contiguous_buf_infos()))
                 self.assertEqual(actual, expected)
+
+    def test_shared_state_factory_preserves_layouts(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.compressed_pool_configs = {
+            4: _CompressedPoolConfig(256, 64, torch.bfloat16, indexer_size=1024),
+            128: _CompressedPoolConfig(512, 8, torch.float32),
+        }
+        pool.compression_ratios = [0, 4, 128]
+        pool._stage_start, pool._stage_end = 0, 3
+        pool.index_pools = {4: object()}
+        pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
+        pool.indexer_head_dim = 128
+        pool.device = "cpu"
+        pool.swa_page_size = 128
+        pool.online_mtp_max_draft_tokens = 3
+        for online in (False, True):
+            with (
+                self.subTest(online=online),
+                patch(
+                    "sglang.srt.mem_cache.deepseek_v4_memory_pool.ONLINE_C128", online
+                ),
+                patch.object(
+                    pool,
+                    "get_ring_size",
+                    side_effect=lambda r: 8 if r == 4 else (1 if online else 128),
+                ),
+            ):
+                pool._init_paged_compress_states(False)
+            c4 = pool.compress_state_pools[1].kv_score_buffer.kv_score
+            indexer = pool.indexer_compress_state_pools[1].kv_score_buffer.kv_score
+            c128 = pool.compress_state_pools[2].kv_score_buffer.kv_score
+            self.assertEqual(c4.shape, (76, 2048))
+            self.assertEqual(indexer.shape, (76, 512))
+            self.assertEqual(c128.shape, (40, 1536) if online else (256, 1024))
+            self.assertEqual(c4.dtype, torch.bfloat16)
+            self.assertEqual(indexer.dtype, torch.bfloat16)
+            self.assertEqual(c128.dtype, torch.float32)
+            self.assertNotEqual(c4.data_ptr(), indexer.data_ptr())
+            self.assertIsNone(pool.compress_state_pools[0])
+            self.assertIsNone(pool.indexer_compress_state_pools[2])
 
     def test_indexer_access_uses_layer_ratio_and_waits_only_for_reads(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)

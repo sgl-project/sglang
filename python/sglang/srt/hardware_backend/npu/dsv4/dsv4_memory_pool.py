@@ -321,8 +321,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             return self.get_indexer_compress_states(layer_id)
         return self.get_attention_compress_states(layer_id)
 
-    def _make_attn_state_pool(
-        self, ratio: int, enable_memory_saver: bool
+    def _make_compress_state_pool(
+        self, ratio: int, *, head_dim: int, enable_memory_saver: bool
     ) -> NPUCompressStatePool:
         # ONLINE_C128 (CUDA-only) collapses the c128 ring to size 1; the NPU fused
         # compressor has no online mode, so assert the config mismatch early.
@@ -330,41 +330,21 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "SGLANG_OPT_USE_ONLINE_COMPRESS is incompatible with the "
             "NPU fused compressor (no online mode in the kernel)."
         )
+        config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
         # A5 cache_mode=2 addresses one ring bank per request.  The A3
         # explicit-location path can share the smaller flat pool, but the A5
         # cycle ABI needs enough physical banks for every req_pool_idx.
-        size = self._state_pool_size(ratio)
+        size = config.state_size
         if is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
             ring_size=ring_size,
             overlap=ratio == 4,
-            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-            dtype=self.state_pool_dtypes[ratio],
+            head_dim=head_dim,
+            dtype=config.state_dtype,
             device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            ratio=ratio,
-            swa_page_size=self.swa_page_size,
-        )
-
-    def _make_indexer_state_pool(
-        self, ratio: int, enable_memory_saver: bool
-    ) -> NPUCompressStatePool:
-        # c4 indexer shares the c4 state pool size budget but has its own
-        # slot_dim (indexer_head_dim vs attention head_dim).
-        ring_size = self.get_ring_size(ratio)
-        size = self._state_pool_size(ratio)
-        if is_npu_arch35():
-            size = max(size, self.num_req_slots * ring_size)
-        return NPUCompressStatePool(
-            size=size,
-            ring_size=ring_size,
-            overlap=ratio == 4,
-            head_dim=self.indexer_head_dim,
-            device=self.device,
-            dtype=self.state_pool_dtypes[ratio],
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             swa_page_size=self.swa_page_size,
