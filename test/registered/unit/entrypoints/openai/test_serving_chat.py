@@ -1360,17 +1360,13 @@ class ServingChatTestCase(unittest.TestCase):
             model="x",
             messages=[{"role": "user", "content": "Add two numbers"}],
             tools=tools,
-            tool_choice=ToolChoice(
-                function=ToolChoiceFuncName(name="calculate")
-            ),
+            tool_choice=ToolChoice(function=ToolChoiceFuncName(name="calculate")),
         )
 
         result = self.chat._process_messages(request, is_multimodal=True)
 
         call = self.tm.tokenizer.apply_chat_template.call_args
-        tool_names = [
-            tool["function"]["name"] for tool in call.kwargs["tools"]
-        ]
+        tool_names = [tool["function"]["name"] for tool in call.kwargs["tools"]]
         self.assertEqual(tool_names, ["calculate"])
         self.assertEqual(call.kwargs["tool_choice"], "required")
         self.assertEqual(result.prompt_ids, [7, 8, 9])
