@@ -88,6 +88,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
@@ -95,7 +96,6 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     process_model_weights_after_loading,
     resolve_comfy_checkpoint_quantization,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SrtFp8Config
 from sglang.srt.layers.quantization.unquant import (
