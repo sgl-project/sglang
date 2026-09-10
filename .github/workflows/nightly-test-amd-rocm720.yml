@@ -2079,6 +2079,16 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
+      # amd/GLM-5.2-MXFP4 is 408 GiB and is not used by any other suite, so it
+      # is the fleet-shared cache's worst case: a checkpoint nothing has seeded.
+      # Run 34446866991 spent five minutes downloading it before dying on
+      # ENOSPC with 853 MB free. Report the shortfall up front instead.
+      - name: Check model cache space
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            bash scripts/ci/amd/check_hf_cache_space.sh \
+            amd/GLM-5.2-MXFP4 408
+
       # Two arms (TP4/EP4 with HiCache, then TP8/EP1 GPU-resident), each
       # sweeping concurrency over a multi-turn agentic-coding replay. Both load
       # the same checkpoint, so they share one job and one MI35x slot.
