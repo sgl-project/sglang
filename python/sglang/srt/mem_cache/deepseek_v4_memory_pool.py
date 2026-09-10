@@ -690,10 +690,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_head_dim = indexer_head_dim
 
         stage_layer_num = len(stage_ratios)
-        c4_layer_num = sum(1 for r in stage_ratios if r == 4)
-        c128_layer_num = sum(1 for r in stage_ratios if r == 128)
-        c4_page_size = page_size // 4
-        c128_page_size = page_size // 128
+        kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -721,7 +718,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
-            kv_pool_cls: type = DeepSeekV4SingleKVPool
             if self.uniform_fp8:
                 assert dtype == torch.float8_e4m3fn, (
                     "--dsv4-attn-backend trtllm requires "
@@ -739,43 +735,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 cls=kv_pool_cls,
             )
 
-            c4_kv_pool_type = kv_pool_cls
-            if enable_hisparse:
-                assert not self.uniform_fp8, (
-                    "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
-                )
-                c4_kv_pool_type = HiSparseC4DevicePool
-            self.c4_kv_pool = self._make_kv_pool(
-                size=c4_size,
-                page_size=c4_page_size,
-                dtype=dtype,
-                layer_num=c4_layer_num,
-                device=device,
-                enable_memory_saver=enable_memory_saver,
-                global_page_size=page_size,
-                cls=c4_kv_pool_type,
-            )
-
-            self.c128_kv_pool = self._make_kv_pool(
-                size=c128_size,
-                page_size=c128_page_size,
-                dtype=dtype,
-                layer_num=c128_layer_num,
-                device=device,
-                enable_memory_saver=enable_memory_saver,
-                global_page_size=page_size,
-                cls=kv_pool_cls,
-            )
-
-        indexer_size = self.c4_logical_size
-        self.c4_indexer_kv_pool = self._make_indexer_pool(
-            indexer_size,
-            c4_page_size,
-            dtype,
-            indexer_head_dim,
-            c4_layer_num,
-            device,
-            enable_memory_saver,
+        self._init_compressed_pools(
+            stage_ratios=stage_ratios,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            enable_hisparse=enable_hisparse,
+            kv_pool_cls=kv_pool_cls,
         )
 
         self._init_compressed_layer_mapping()
@@ -949,6 +916,62 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(t.nbytes)
             item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
+
+    def _init_compressed_pools(
+        self,
+        *,
+        stage_ratios: Sequence[int],
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+        enable_hisparse: bool,
+        kv_pool_cls: type,
+    ) -> None:
+        c4_layer_num = sum(1 for r in stage_ratios if r == 4)
+        c128_layer_num = sum(1 for r in stage_ratios if r == 128)
+        c4_page_size = page_size // 4
+        c128_page_size = page_size // 128
+
+        if not self._unified_kv:
+            c4_kv_pool_type = kv_pool_cls
+            if enable_hisparse:
+                assert not self.uniform_fp8, (
+                    "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
+                )
+                c4_kv_pool_type = HiSparseC4DevicePool
+            self.c4_kv_pool = self._make_kv_pool(
+                size=self.c4_size,
+                page_size=c4_page_size,
+                dtype=dtype,
+                layer_num=c4_layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=page_size,
+                cls=c4_kv_pool_type,
+            )
+
+            self.c128_kv_pool = self._make_kv_pool(
+                size=self.c128_size,
+                page_size=c128_page_size,
+                dtype=dtype,
+                layer_num=c128_layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=page_size,
+                cls=kv_pool_cls,
+            )
+
+        indexer_size = self.c4_logical_size
+        self.c4_indexer_kv_pool = self._make_indexer_pool(
+            indexer_size,
+            c4_page_size,
+            dtype,
+            self.indexer_head_dim,
+            c4_layer_num,
+            device,
+            enable_memory_saver,
+        )
 
     def _make_kv_pool(
         self,
