@@ -680,6 +680,7 @@ class Envs:
     # below fires. Off by default (no behavior/perf impact when disabled).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    SGLANG_PP_EARLY_RELEASE_KV = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
