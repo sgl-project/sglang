@@ -1597,6 +1597,17 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
+        from sglang.srt.layers.dcp.sm120_dsa import uses_sm120_dsa_dcp
+
+        if uses_sm120_dsa_dcp(get_exec().kernel, get_parallel().attn_dcp_size):
+            # Latent KV is local; every rank's indexer addresses the full
+            # widened token space. Match the byte budget in pool_configurator.
+            pool_kwargs["index_buf_size"] = (
+                max_total_num_tokens * get_parallel().attn_dcp_size
+                + (get_parallel().attn_dcp_size - 1) * self.pool_page_size
+            )
+            # The allocator reserves a widened page0. IndexKeyCache adds only
+            # one physical page itself, so cover the other D-1 reserved pages.
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config

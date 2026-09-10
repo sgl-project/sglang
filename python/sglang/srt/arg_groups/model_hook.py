@@ -244,6 +244,10 @@ def handle_model_specific_adjustments(server_args: Any):
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
+                from sglang.srt.layers.dcp.sm120_dsa import validate_sm120_dsa_dcp
+
+                validate_sm120_dsa_dcp(resolving_view(server_args), hf_config, major)
+
             elif get_platform().is_xpu:
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)

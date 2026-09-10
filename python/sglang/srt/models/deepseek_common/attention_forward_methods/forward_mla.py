@@ -644,6 +644,8 @@ class DeepseekMLAForwardMixin:
                     self.kv_lora_rank,
                     k_nope,
                     k_pe,
+                    dcp_prefix_storage_tokens=forward_batch.attn_dcp_metadata.dcp_prefix_storage_tokens,
+                    dcp_total_local_prefix_tokens=forward_batch.attn_dcp_metadata.dcp_total_local_prefix_tokens,
                 )
             else:
                 logger.warning(

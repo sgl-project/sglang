@@ -353,7 +353,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                cell_size += self._compute_dsa_indexer_cell_size(
+                from sglang.srt.layers.dcp.sm120_dsa import uses_sm120_dsa_dcp
+
+                index_replication = (
+                    dcp_size if uses_sm120_dsa_dcp(get_exec().kernel, dcp_size) else 1
+                )
+                cell_size += index_replication * self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
                 )

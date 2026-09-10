@@ -87,6 +87,11 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dcp.sm120_dsa import (
+    SM120_DSA_LAYOUT,
+    localize_sparse_indices,
+    uses_sm120_dsa_dcp,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
@@ -229,6 +234,10 @@ class DSAMetadata:
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
+    # Ordinary prefill's packed temporary rows, distinct from resident Index-K
+    # virtual ids. Only attention consumes this table; the indexer never does.
+    dcp_attention_page_table_1: Optional[torch.Tensor] = None
+
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
@@ -358,6 +367,18 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self.dcp_packed_kv_layout = (
+            SM120_DSA_LAYOUT
+            if uses_sm120_dsa_dcp(get_exec().kernel, get_parallel().attn_dcp_size)
+            else None
+        )
+        if self.dcp_packed_kv_layout is not None:
+            if model_runner.is_draft_worker:
+                raise ValueError(
+                    "SM120 packed DSA DCP target-only path cannot run a draft worker"
+                )
+            if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+                raise ValueError("SM120 packed DSA DCP requires packed FP8 storage")
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -1103,6 +1124,30 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        dcp_attention_page_table_1 = None
+        if (
+            self.dcp_packed_kv_layout is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            dcp = forward_batch.attn_dcp_metadata
+            if dcp is None or dcp.dcp_prefix_storage_tokens is None:
+                raise RuntimeError("Packed DSA DCP prefill metadata was not prepared")
+            lengths = dcp.dcp_kv_indptr[1:] - dcp.dcp_kv_indptr[:-1]
+            rows = torch.repeat_interleave(
+                torch.arange(batch_size, device=device),
+                lengths.long(),
+                output_size=dcp.dcp_kv_indices.numel(),
+            )
+            columns = (
+                torch.arange(dcp.dcp_kv_indices.numel(), device=device)
+                - dcp.dcp_kv_indptr[rows]
+            )
+            table = torch.full(
+                (batch_size, max_seqlen_k), -1, dtype=torch.int32, device=device
+            )
+            table[rows, columns] = dcp.dcp_kv_indices
+            dcp_attention_page_table_1 = table
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1111,6 +1156,7 @@ class DeepseekSparseAttnBackend(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seq_lens_sum=forward_batch.seq_lens_sum,
+            dcp_attention_page_table_1=dcp_attention_page_table_1,
             page_table_1=page_table,
             page_table_1_flattened=page_table_1_flattened,
             flashmla_metadata=(
@@ -2072,7 +2118,7 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        if self._use_fused_topk_for_batch(forward_batch):
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2095,7 +2141,11 @@ class DeepseekSparseAttnBackend(
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
+                    page_table=(
+                        metadata.dcp_attention_page_table_1
+                        if metadata.dcp_attention_page_table_1 is not None
+                        else metadata.page_table_1
+                    ),
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
@@ -2222,6 +2272,12 @@ class DeepseekSparseAttnBackend(
                 attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
+            if self.dcp_packed_kv_layout is not None:
+                if not forward_batch.forward_mode.is_extend_without_speculative():
+                    raise ValueError(
+                        "SM120 packed DSA DCP speculative verify is not enabled"
+                    )
+                kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -2402,13 +2458,23 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            sparse_lengths = metadata.dsa_cache_seqlens_int32
+            if self.dcp_packed_kv_layout is not None:
+                parallel = get_parallel()
+                page_table_1, sparse_lengths = localize_sparse_indices(
+                    page_table_1,
+                    self.kv_index_translator,
+                    parallel.attn_dcp_size,
+                    parallel.attn_dcp_rank,
+                )
             return self._forward_flashinfer_sparse_mla(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
-                seq_lens=metadata.dsa_cache_seqlens_int32,
+                seq_lens=sparse_lengths,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                return_lse=self.dcp_packed_kv_layout is not None,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2924,12 +2990,20 @@ class DeepseekSparseAttnBackend(
         seq_lens: torch.Tensor,
         sm_scale: float,
         skip_softmax_threshold_scale_factor: float | None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             flashinfer_sparse_mla_forward,
         )
 
         assert self.workspace_buffer is not None
+        if self.dcp_packed_kv_layout is not None and (
+            self.token_to_kv_pool.write_loc_is_dcp_resolved
+            or self.kv_index_translator.is_translating
+        ):
+            raise ValueError(
+                "SM120 packed DSA DCP currently requires static, widened-address storage"
+            )
         return flashinfer_sparse_mla_forward(
             q=q_all,
             kv_cache=kv_cache,
@@ -2943,6 +3017,7 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            return_lse=return_lse,
         )
 
     def _forward_flashmla_kv(
@@ -3684,10 +3759,18 @@ class DeepseekSparseAttnBackend(
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
 
+    def _use_fused_topk_for_batch(self, forward_batch: ForwardBatch) -> bool:
+        # Fused top-k emits resident virtual ids. Ordinary prefill attention
+        # instead needs offsets transformed through its packed temporary table.
+        return self.use_fused_topk and not (
+            self.dcp_packed_kv_layout is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = not self.use_fused_topk or (
+        force_unfused = not self._use_fused_topk_for_batch(forward_batch) or (
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )

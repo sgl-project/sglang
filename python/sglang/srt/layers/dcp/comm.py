@@ -32,6 +32,9 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     dcp_lse_combine_triton,
     dcp_pack_a2a_send,
 )
+from sglang.kernels.ops.attention.dsa.quant_k_cache import (
+    quantize_k_cache_separate,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -278,7 +281,60 @@ def all_gather_kv_cache_for_mla_extend(
     kv_lora_rank,
     k_nope,
     k_pe,
+    *,
+    dcp_prefix_storage_tokens=None,
+    dcp_total_local_prefix_tokens=None,
 ):
+    # GLM DSA on SM120 stores each token as 656 packed bytes:
+    #   512 FP8 latent bytes + 16 scale bytes + 128 RoPE BF16 bytes.
+    # get_mla_kv_buffer() returns the logical 512 + 64 BF16 tensors and cannot
+    # be assigned to that cache.  Preserve the physical representation across
+    # DCP so FlashInfer sees the exact layout it consumes.
+    if dcp_prefix_storage_tokens is not None:
+        if dcp_total_local_prefix_tokens is None:
+            raise RuntimeError("Packed DSA DCP metadata is missing rank-major extents")
+        kv_cache = token_to_kv_pool.get_key_buffer(attn_mqa.layer_id).view(torch.uint8)
+        local_packed_prefix = kv_cache[dcp_local_prefix_kv_indices].contiguous()
+        assert local_packed_prefix.dtype == torch.uint8
+        assert local_packed_prefix.shape[-1] == 656
+        dcp_kv_buffer_bytes = dcp_kv_buffer.view(torch.uint8)
+        if local_packed_prefix.shape[0] != dcp_total_local_prefix_tokens:
+            raise RuntimeError(
+                "Packed DSA DCP local prefix size mismatch: "
+                f"actual={local_packed_prefix.shape[0]}, "
+                f"expected={dcp_total_local_prefix_tokens}"
+            )
+        if dcp_prefix_storage_tokens:
+            # Preserve NCCL's native [rank, local-row] layout in the final DCP
+            # buffer. dcp_kv_indices maps logical request order to these rows,
+            # avoiding the old full-size transpose and request-order torch.cat.
+            get_parallel().dcp_group.all_gather_into_tensor(
+                dcp_kv_buffer_bytes[:dcp_prefix_storage_tokens],
+                local_packed_prefix,
+            )
+
+        packed_nope, packed_rope = quantize_k_cache_separate(k_nope, k_pe)
+        extend_start = dcp_prefix_storage_tokens
+        extend_end = extend_start + packed_nope.shape[0]
+        destination = dcp_kv_buffer_bytes[extend_start:extend_end]
+        if destination.shape[:-1] != packed_nope.shape[:-1] or (
+            packed_nope.shape[-1] + packed_rope.shape[-1] != destination.shape[-1]
+        ):
+            destination_shape = tuple(destination.shape)
+            raise RuntimeError(
+                "DCP packed DSA extend KV shape mismatch: "
+                f"packed_nope={tuple(packed_nope.shape)}, "
+                f"packed_rope={tuple(packed_rope.shape)}, "
+                f"destination={destination_shape}"
+            )
+        nope_bytes = packed_nope.shape[-1]
+        destination[..., :nope_bytes].copy_(packed_nope)
+        destination[..., nope_bytes:].copy_(packed_rope)
+        # The packed FlashInfer adapter views storage as [-1, 64, 656].  Keep
+        # padding deterministic and unreachable from dcp_kv_indices.
+        dcp_kv_buffer_bytes[extend_end:].zero_()
+        return
+
     # On hip, skip the all-gather when there is no cached prefix to avoid crash
     if not _is_hip or dcp_extend_prefix_lens_sum > 0:
         cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(

@@ -35,3 +35,8 @@ class DecodeContextParallelMetadata:
     dcp_kv_indices: Optional[torch.Tensor] = None
     dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
     dcp_extend_prefix_lens_sum: Optional[int] = None
+    # Packed SM120 DSA keeps the all-gather output in NCCL-native rank-major
+    # order.  These fields distinguish its physical prefix extent from the
+    # logical prefix-token count above.
+    dcp_prefix_storage_tokens: Optional[int] = None
+    dcp_total_local_prefix_tokens: Optional[int] = None

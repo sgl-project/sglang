@@ -262,6 +262,29 @@ class TestDefaultConfigurator(CustomTestCase):
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=656,
+    )
+    def test_sm120_dcp_accounts_for_replicated_index_k(self, _):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        for size in (1, 2, 4, 8):
+            with self.subTest(dcp_size=size):
+                runner = _make_model_runner(self, num_layers=2, use_mla_backend=True)
+                _configure_dsa_model(runner)
+                _publish_config(
+                    self,
+                    dsa_prefill_backend="flashinfer_sparse_mla",
+                    dsa_decode_backend="flashinfer_sparse_mla",
+                )
+                with (
+                    mock_cpu_env(kv_size=1),
+                    get_parallel().override(attn_dcp_size=size),
+                ):
+                    configurator = DefaultPoolConfigurator(runner)
+                self.assertEqual(configurator._cell_size, (656 + size * 132) * 2)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         side_effect=(576, 656),
     )
     def test_dsa_mla_cell_size_uses_backend_kv_layout(
