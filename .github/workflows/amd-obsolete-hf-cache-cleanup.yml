@@ -1,17 +1,18 @@
 name: AMD obsolete HF cache cleanup
 
-# One-shot job for the draft PR that drops Qwen3-235B Instruct-2507 and
-# DeepSeek-V3.1 from the shared AMD HuggingFace cache. Does not go through
-# pr-gate (drafts are blocked there). After merge this stays dispatch-only
-# unless the script or this workflow is touched.
+# Deletes the checkpoints listed in cleanup_obsolete_hf_checkpoints.sh from the
+# shared AMD HuggingFace cache PVC, which no per-job script may do (see the
+# rationale in check_hf_cache_space.sh: evicting weights other jobs still need
+# just moves the failure). Retiring a nightly is the case where it is safe, and
+# then only for that nightly's own checkpoints.
+#
+# Dispatch-only: reclaiming space is not a per-PR activity. To reuse this, edit
+# the ALLOWED_DIRS allowlist and dispatch from the branch carrying that edit.
+#
+# The Qwen3-235B Instruct-2507 and DeepSeek-V3.1 weights this PR retires were
+# removed by run 34481735602.
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened]
-    paths:
-      - "scripts/ci/amd/cleanup_obsolete_hf_checkpoints.sh"
-      - ".github/workflows/amd-obsolete-hf-cache-cleanup.yml"
   workflow_dispatch:
 
 permissions:
@@ -22,8 +23,8 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
-  group: amd-obsolete-hf-cache-cleanup-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: amd-obsolete-hf-cache-cleanup-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   cleanup:
@@ -46,7 +47,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
