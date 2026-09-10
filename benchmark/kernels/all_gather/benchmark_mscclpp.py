@@ -40,9 +40,9 @@ def _time_eager(func, group, warmup: int = 2, repeat: int = 10) -> float:
 def _time_cuda_graph(
     func,
     group,
-    warmup: int = 2,
+    warmup: int = 100,
     graph_loop: int = 10,
-    repeat: int = 10,
+    repeat: int = 100,
 ) -> float:
     current_stream = torch.cuda.current_stream()
     capture_stream = torch.cuda.Stream()
@@ -154,12 +154,15 @@ def main() -> None:
     if not (1 << 10) <= args.min_bytes <= args.max_bytes <= (8 << 20):
         parser.error("Require 1 KiB <= min-bytes <= max-bytes <= 8 MiB")
 
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device("cuda", local_rank),
+        )
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
-    torch.cuda.set_device(local_rank)
     device = torch.cuda.current_device()
     set_mscclpp_all_reduce(True)
     init_distributed_environment(
@@ -178,7 +181,7 @@ def main() -> None:
     if args.min_bytes % world_size != 0 or args.max_bytes % world_size != 0:
         parser.error("Total message sizes must be divisible by WORLD_SIZE")
 
-    if not mscclpp_comm.allgather_best_configs:
+    if not mscclpp_comm._best_configs["allgather"]:
         raise RuntimeError("No tuned MSCCL++ AllGather configuration is available")
 
     result = []
@@ -224,12 +227,9 @@ def main() -> None:
                 stream=stream,
             )
 
-        def py_nccl_on_stream(stream):
-            pynccl_comm.cp_all_gather_into_tensor(
-                nccl_output,
-                input_tensor,
-                stream=stream,
-            )
+        def py_nccl_on_stream(_stream):
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.all_gather(nccl_output, input_tensor)
 
         torch_nccl()
         mscclpp()
