@@ -192,3 +192,15 @@ Prefill/decode disaggregation is validated token-identical against a single serv
 One deployment note: Mooncake needs the RDMA fabric visible inside the container, so launch with `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1`. Without it Mooncake selects its NVLink transport, which only serves buffers from its own allocator and fails with `Requested address ... not found`. If you hit that, force TCP with `MOONCAKE_PROTOCOL=tcp` and `MC_FORCE_TCP=1` — the Playground's Mooncake option sets both.
 
 PD and speculative decoding cannot be combined.
+
+### 3.5 HiCache (Hierarchical KV Caching)
+
+HiCache extends RadixAttention with a hierarchy of KV cache tiers, significantly expanding effective context capacity for long-context and multi-turn scenarios.
+
+To enable HiCache, open the **HiCache** card in the [Playground above](#playground) and flip **Enable**: the Playground emits `--enable-hierarchical-cache` on top of the recipe's flags, and cold KV pages spill to CPU pinned memory (L2, GPU + CPU) instead of being dropped from the GPU pool. The host pool is sized by ratio (`--hicache-ratio 2`), not by a fixed `--hicache-size`.
+
+The Write policy knob controls the GPU → CPU write and defaults to `write_through` (the upstream default): every page is mirrored to the CPU tier as it is written. `write_through_selective` backs up only hot data and `write_back` defers the copy to eviction, trading cache freshness for host-side I/O.
+
+The card is not offered on MI350X: the ROCm recipes run `--disable-radix-cache`, and the server rejects that alongside `--enable-hierarchical-cache`.
+
+Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).
