@@ -114,6 +114,19 @@ export const config = {
       },
     },
 
+    // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI350X: both
+    // ROCm cells run `--disable-radix-cache`, which the server rejects alongside
+    // `--enable-hierarchical-cache`.
+    hicache: {
+      excludesHw: ["mi350x"],
+      writePolicies: [
+        { id: "auto",                    label: "Auto" },
+        { id: "write_through",           label: "Write-through" },
+        { id: "write_back",              label: "Write-back" },
+        { id: "write_through_selective", label: "Write-through (selective)" },
+      ],
+    },
+
     flagSelects: [
       {
         id: "dsparkBlockSize",
