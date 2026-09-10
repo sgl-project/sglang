@@ -107,6 +107,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -1141,13 +1142,11 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_retry_pending = False
         self.storage_prefetch_retry_wait_polls = 0
         self.storage_prefetch_retry_attempts = 0
-        # The node to lock until for swa radix tree lock ref
-        self.swa_uuid_for_lock: Optional[int] = None
+        # Receipt of the tree lock held on last_node (anchor, SWA boundary,
+        # skipped components); every release replays it unchanged.
+        self.lock_receipt: DecLockRefParams = DecLockRefParams()
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
-        # per-component nodes this req skipped locking (e.g. mamba on the decode
-        # hold, already COW'd), so their dec releases only what it took.
-        self.skip_lock_node_ids: dict = {}
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1335,6 +1334,9 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+        # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
+        self.arrival_processed_tokens: int = 0
 
     @property
     def seqlen(self) -> int:
@@ -1836,10 +1838,9 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.kv.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
-        self.swa_uuid_for_lock = None
+        self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
         self.swa_branching_seqlen = None
-        self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -3688,14 +3689,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
-                        and req.swa_uuid_for_lock is not None
+                        and req.lock_receipt.swa_uuid_for_lock is not None
                         and req.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node,
-                            req.swa_uuid_for_lock,
-                            skip_lock_node_ids=req.skip_lock_node_ids,
+                            req.last_node, req.lock_receipt
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
