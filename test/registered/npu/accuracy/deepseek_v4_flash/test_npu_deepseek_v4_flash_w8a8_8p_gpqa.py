@@ -69,7 +69,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.65,
+    0.7,
     "--prefill-max-requests",
     32,
     "--max-prefill-tokens",
