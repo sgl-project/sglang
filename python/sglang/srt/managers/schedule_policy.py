@@ -903,8 +903,7 @@ class PrefillAdder:
             )
             if cap <= 0:
                 return 0
-            cap = cap // self.page_size * self.page_size
-            return cap
+            return cap // self.page_size * self.page_size
 
         assert max_chunk_tokens is not None
         cap = max_chunk_tokens // self.page_size * self.page_size
@@ -1481,6 +1480,7 @@ class PrefillAdder:
         # this returns 0, so the debit sites below reuse the value.
         mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
         total_tokens += mamba_gap_reserve
+
         # adjusting the input_tokens based on host_hit_length and page_size
         swa_extend_input_len = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(swa_extend_input_len)
@@ -1510,7 +1510,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # Capacity may decrease after the lock acquisition.
+            # self.rem_total_tokens may decrease after the lock acquisition
             if not self.is_unified_swa and total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
