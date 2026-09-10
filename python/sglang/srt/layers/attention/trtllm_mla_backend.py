@@ -1163,9 +1163,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         Separate from _run_decode_kernel(): that hook serves the dense
         [bs, draft_token_num] verify layout, while `query` here is the ragged
         [total_q, num_heads, head_dim_qk] layout."""
-        assert (
-            self.backend == "trtllm-gen"
-        ), "varlen absorbed MLA requires backend='trtllm-gen'"
+        assert self.backend == "trtllm-gen", (
+            "varlen absorbed MLA requires backend='trtllm-gen'"
+        )
         return self._call_trtllm_batch_decode_mla(
             query=query,
             kv_cache=kv_cache,
