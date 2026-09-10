@@ -525,8 +525,12 @@ pub(super) async fn handle_simple_streaming_passthrough(
     let status_code =
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    if !status.is_success() {
+    // 4xx = client/request error — the worker is healthy.
+    // Only trip the circuit breaker for 5xx / transport failures.
+    if !status.is_success() && !status.is_client_error() {
         worker.circuit_breaker().record_failure();
+    }
+    if !status.is_success() {
         let error_body = response
             .text()
             .await

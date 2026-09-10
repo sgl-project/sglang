@@ -600,7 +600,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     if !is_streaming {
                         // Non-streaming: record the breaker outcome inline
                         // once the body is fully read.
-                        if !status.is_success() {
+                        // 4xx = client/request error; worker is healthy.
+                        if !status.is_success() && !status.is_client_error() {
                             worker.circuit_breaker().record_failure();
                         }
                         let content_type = resp.headers().get(CONTENT_TYPE).cloned();
@@ -639,7 +640,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             Arc::clone(&worker),
                             url.clone(),
                         );
-                        if !status.is_success() {
+                        if !(status.is_success() || status.is_client_error()) {
                             tracked.mark_errored();
                         }
                         let mut response = Response::new(Body::from_stream(tracked));
