@@ -2,8 +2,8 @@
 
 The feature is off by default. Without a case that turns the flag on, CI never
 touches the Quark scheme rewrite and cannot claim the path works. These tests
-exercise that ON wiring on CPU (and AMD stage-a, same file) without loading a
-70B MXFP4 checkpoint: they check enable_glm_nextn_moe_ptpc and
+exercise that ON wiring on CPU without loading a 70B MXFP4 checkpoint: they
+check enable_glm_nextn_moe_ptpc and
 GlmMoeDsaForCausalLMNextN._resolve_nextn_quant_config.
 
 A full serve+generate job still needs the MXFP4 weights in the runner cache;
@@ -18,11 +18,10 @@ from unittest.mock import patch
 
 from sglang.srt.models.deepseek_common.utils import enable_glm_nextn_moe_ptpc
 from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
-from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-register_amd_ci(est_time=10, suite="stage-a-test-1-gpu-small-amd")
 
 LAYER = 78
 PREFIX = f"model.layers.{LAYER}"
