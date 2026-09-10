@@ -99,13 +99,7 @@ def get_dsv4_c128_state_indices(
 
 
 def get_dsv4_request_state_indices(pool, req_pool_idx: int, seq_len: int) -> np.ndarray:
-    """PD transfer indices of the request-scoped state component (C128_STATE).
-
-    The component carries the c128 ring, whose item is one c128 page (or the
-    single online row), or the ratio-2 pair ring, whose item is one request's
-    whole ring; there only an odd prefix leaves a pending half-pair that decode
-    reads, so an even prefix ships nothing.
-    """
+    """C128 pages or the single pending C2 row at the processed prefix boundary."""
     if 128 in pool.kv_pools:
         online = is_dsv4_c128_online_enabled()
         ring_size = 1 if online else pool.get_ring_size(128)
@@ -117,7 +111,9 @@ def get_dsv4_request_state_indices(pool, req_pool_idx: int, seq_len: int) -> np.
     )
     if seq_len % 2 == 0:
         return np.empty((0,), dtype=np.int32)
-    return np.array([int(req_pool_idx)], dtype=np.int32)
+    ring_size = pool.get_ring_size(2)
+    row = int(req_pool_idx) * ring_size + (seq_len - 1) % ring_size
+    return np.array([row], dtype=np.int32)
 
 
 class DisaggregationMode(Enum):

@@ -280,13 +280,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.speculative_algorithm is not None
             and str(cfg.speculative_algorithm).upper() != "DSPARK",
         ),
-        # The ratio-2 pair ring ships as one item per request and its ring size
-        # follows the speculative window, so prefill and decode layouts only
-        # agree when neither side speculates.
-        (
-            "PD disaggregation with speculative decoding",
-            cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None,
-        ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
         ("two-batch overlap", cfg.enable_two_batch_overlap),

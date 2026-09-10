@@ -21,7 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -790,6 +790,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
+        if compress_ratio == 2 and get_disagg().disaggregation_mode == "prefill":
+            # Prefill only carries one unfinished pair across chunk boundaries.
+            return get_compress_state_ring_size(2)
         spec = get_spec()
         return get_compress_state_ring_size(
             compress_ratio,
@@ -960,9 +963,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_c128_state_buf_infos(
         self,
     ) -> Tuple[List[int], List[int], List[int]]:
-        """The request-scoped state component, named after its first member: the
-        c128 raw-token ring (or its single online row) and the ratio-2
-        pending-pair ring. One item is one c128 page / one request's pair ring."""
+        """Transfer C128 pages and C2 pending rows independently of ring capacity."""
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
@@ -974,7 +975,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_ptrs.append(t.data_ptr())
             data_lens.append(t.nbytes)
             if pool.ratio == 2:
-                item_lens.append(t[0].nbytes * pool.ring_size)
+                item_lens.append(t[0].nbytes)
             else:
                 item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
