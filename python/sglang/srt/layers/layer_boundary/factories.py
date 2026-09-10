@@ -553,6 +553,10 @@ def _reject_unsupported(stage):
     cannot bind, naming the combination. The rejections that depend on the
     rows of one edge are made where that edge binds (``_bind_stage``)."""
     parallel = get_parallel()
+    if stage.row_transport is not None:
+        # Explicit transports declare and validate their own compute and
+        # return rows; restrictions on inferred MoE moves do not apply.
+        return
     if stage.replicated_cp_residual:
         if parallel.attn_dp_size != 1:
             raise NotImplementedError("a replicated CP residual with attention DP")
