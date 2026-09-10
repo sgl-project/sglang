@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
 
@@ -162,6 +162,7 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
         swa_page_size: int,
         ring_size: int,
+        use_req_ring: bool = False,
     ) -> CompressorDecodePlan:
         if _is_xpu:
             fn = plan_compress_decode
@@ -169,7 +170,7 @@ class CompressorDecodePlan(NamedTuple):
             module = _jit_compress_plan_module()
             fn = module.plan_decode
 
-        plan_d = fn(
+        args = (
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -178,6 +179,10 @@ class CompressorDecodePlan(NamedTuple):
             int(swa_page_size),
             int(ring_size),
         )
+        assert not (_is_xpu and use_req_ring), (
+            "use_req_ring is not supported by the XPU compress plan builder"
+        )
+        plan_d = fn(*args) if _is_xpu else fn(*args, bool(use_req_ring))
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
 
     @staticmethod
@@ -247,6 +252,7 @@ class CompressorPrefillPlan(NamedTuple):
         ring_size: int,
         num_q_tokens: int,
         use_cuda_graph: bool = False,
+        use_req_ring: bool = False,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
@@ -274,7 +280,7 @@ class CompressorPrefillPlan(NamedTuple):
             module = _jit_compress_plan_module()
             fn = module.plan_prefill
 
-        plan_c, plan_w = fn(
+        args = (
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -285,7 +291,14 @@ class CompressorPrefillPlan(NamedTuple):
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
-            bool(use_cuda_graph),
+        )
+        assert not (_is_xpu and use_req_ring), (
+            "use_req_ring is not supported by the XPU compress plan builder"
+        )
+        plan_c, plan_w = (
+            fn(*args, bool(use_cuda_graph))
+            if _is_xpu
+            else fn(*args, bool(use_req_ring), bool(use_cuda_graph))
         )
         return CompressorPrefillPlan(
             compress_ratio,
@@ -430,9 +443,33 @@ def compress_norm_rope_store(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    # HIP FP4 uses split scale storage and precomputed BF16 RoPE tables.
+    kvcache_scale: Optional[torch.Tensor] = None,
+    rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    fp4_k_write_metadata=None,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
+    if is_hip() and use_fp4:
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            aiter_k_indexer_fp4_cache_write,
+        )
+
+        cos, sin = cast(tuple[torch.Tensor, torch.Tensor], rope_cache)
+        aiter_k_indexer_fp4_cache_write(
+            k=kv,
+            norm_weight=norm_weight,
+            norm_epsilon=norm_eps,
+            cos=cos,
+            sin=sin,
+            plan=plan,
+            out_loc=out_loc,
+            k_payload=kvcache,
+            k_scale=cast(torch.Tensor, kvcache_scale),
+            write_metadata=fp4_k_write_metadata,
+        )
+        return
+
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
         compress_norm_rope_store_xpu(

@@ -39,6 +39,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
@@ -563,7 +566,11 @@ class LTX2DenoisingStage(DenoisingStage):
         noise = torch.randn(
             reference_tensor.shape,
             generator=generator,
-            dtype=torch.float64,
+            dtype=(
+                torch.float32
+                if not current_platform.is_float64_supported()
+                else torch.float64
+            ),
             device=reference_tensor.device,
         )
         noise = (noise - noise.mean()) / noise.std()
@@ -2719,8 +2726,8 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _get_negative_prompt_embeds_validator(self, batch: Req):
         """Allow either tensor or list negative prompt embeddings for LTX-2 CFG."""
-        return (
-            lambda x: (not batch.do_classifier_free_guidance)
+        return lambda x: (
+            (not batch.do_classifier_free_guidance)
             or V.is_tensor(x)
             or V.list_not_empty(x)
         )

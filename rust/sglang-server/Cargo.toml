@@ -50,7 +50,7 @@ hf-hub = { version = "0.4", default-features = false }
 itertools = "0.14"
 # POSIX shm for the MM feature fan-out (`mm::ShmSegment`).
 libc = "0.2"
-# Same major as the workspace pyo3: the zero-copy MM drain (`take_mm`) moves
+# Same major as the workspace pyo3: the zero-copy MM drain (`take_mm_result`) moves
 # Rust vectors into numpy arrays.
 numpy = "0.29.0"
 # Pinned EXACTLY: this crate's accepted grammar defines the

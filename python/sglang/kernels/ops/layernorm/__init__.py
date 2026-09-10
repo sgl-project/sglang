@@ -385,8 +385,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
             "(rocm-triton, sglang.kernels.jit)."
         ),
         KernelBackend.TORCH: (
-            "Gemma-style fused residual-add + RMS normalization "
-            "(pure-torch reference)."
+            "Gemma-style fused residual-add + RMS normalization (pure-torch reference)."
         ),
     }
 
@@ -515,6 +514,8 @@ _PHASE25_KERNELS = [
     ("gemma4_fused_ops", "gemma4_fused_routing", "triton"),
     ("gemma4_fused_ops", "gemma_qkv_rmsnorm", "triton"),
     ("mhc_head", "fused_hc_head", "triton"),
+    ("hy4_ihc", "fused_hy4_ihc_pre", "triton"),
+    ("hy4_ihc", "fused_hy4_ihc_post", "triton"),
 ]
 for _mod, _fn, _bk in _PHASE25_KERNELS:
     register_kernel(

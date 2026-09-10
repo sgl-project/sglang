@@ -5,7 +5,7 @@ import logging
 import os
 import socket
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import torch
@@ -68,8 +68,8 @@ def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
 class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
-    remote_instance_weight_info: Optional[Any]
-    startup_weight_load: Optional[Any] = None
+    remote_instance_weight_info: Any | None
+    startup_weight_load: Any | None = None
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
@@ -87,14 +87,16 @@ def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, tp_rank: int, load_format: Optional[str] = None
+    *, tp_rank: int, load_format: str | None = None
 ) -> None:
     """``load_format`` is this runner's effective format: a draft loading under
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
     target's format cannot answer for it."""
     if (
-        load_format or get_model().load_format
-    ) == LoadFormat.REMOTE_INSTANCE and get_model().remote_instance_weight_loader_backend == RemoteInstanceWeightLoaderBackend.NCCL:
+        (load_format or get_model().load_format) == LoadFormat.REMOTE_INSTANCE
+        and get_model().remote_instance_weight_loader_backend
+        == RemoteInstanceWeightLoaderBackend.NCCL
+    ):
         if tp_rank == 0:
             instance_ip = NetworkAddress.resolve_host(socket.gethostname())
             t = threading.Thread(
@@ -130,12 +132,11 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
         else:
             logger.warning(
                 "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0. "
-                "This may lead to less accurate results!"
+                "provided. Defaulting to scaling factors of 1.0."
             )
 
 
-def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
+def resolve_sliding_window_size(model, model_config: ModelConfig) -> int | None:
     # Parse other args
     sliding_window_size = None
     if hasattr(model, "get_attention_sliding_window_size"):
@@ -195,12 +196,12 @@ def build_load_config(
     *,
     server_args: ServerArgs,
     tp_rank: int,
-    load_format: Optional[str] = None,
+    load_format: str | None = None,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
-    draft_model_idx: Optional[int],
+    draft_model_idx: int | None,
     weight_cache_mode: str,
-    weight_cache_socket: Optional[str],
+    weight_cache_socket: str | None,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -254,7 +255,6 @@ def maybe_enable_ipc_weight_cache(
 
 def load_model_with_memory_saver(
     *,
-    server_args: ServerArgs,
     model_config: ModelConfig,
     load_config: LoadConfig,
     device: str,
@@ -264,6 +264,17 @@ def load_model_with_memory_saver(
 ) -> LoadedModel:
     # Remove monkey_patch when linear.py quant remove dependencies with vllm
     monkey_patch_vllm_parallel_state()
+
+    if not is_draft_worker:
+        architectures = model_config.hf_config.architectures or []
+        is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
+        ple_offload_embedding = get_exec().offload.ple_offload_embedding
+        if ple_offload_embedding and not is_qwen4_exp:
+            raise ValueError(
+                "--ple-offload-embedding only supports Qwen4ExpForConditionalGeneration"
+            )
+        if is_qwen4_exp:
+            model_config.hf_text_config.ple_offload_embedding = ple_offload_embedding
 
     enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
@@ -290,7 +301,7 @@ def load_model_with_memory_saver(
             model_config=model_config,
         )
         device_config = DeviceConfig(device, gpu_id)
-        if server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
                 StartupWeightLoadManager,
             )
@@ -312,6 +323,12 @@ def load_model_with_memory_saver(
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
             )
+    if (
+        not is_draft_worker
+        and get_exec().offload.ple_offload_embedding
+        and device == "cuda"
+    ):
+        current_platform.empty_cache()
     # Cache needs to be cleared after loading model weights (in the loader.load_model function).
     # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
     if _is_npu:
@@ -328,7 +345,7 @@ def load_model_with_memory_saver(
 
 def dist_barrier_after_load(
     *,
-    elastic_ep_backend: Optional[str],
+    elastic_ep_backend: str | None,
     tp_rank: int,
     is_ep_joiner: bool = False,
 ) -> None:

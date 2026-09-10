@@ -13,6 +13,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     # H3 fuses Q/K/V, so split projections are stacked for the fused LoRA layer
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            r"^model\.diffusion_model\.(.*)$": r"\1",
             r"^(.*)\.weight_scale$": r"\1.weight_scale_inv",
             r"^(.*\.lora_[AB])\.[^.]+$": r"\1",
             r"^base_model\.model\.(.*\.lora_[AB])$": r"\1",
@@ -46,6 +47,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
                 3,
             ),
             r"^transformer_blocks\.(\d+)\.attn\.to_out\.0\.(.*)$": r"blocks.\1.attn.out_proj.\2",
+            r"^transformer_blocks\.(\d+)\.attn\.to_gate_compress\.(.*)$": r"blocks.\1.attn.to_gate_compress.\2",
             r"^transformer_blocks\.(\d+)\.attn\.norm_q\.(.*)$": r"blocks.\1.attn.q_norm.\2",
             r"^transformer_blocks\.(\d+)\.attn\.norm_k\.(.*)$": r"blocks.\1.attn.k_norm.\2",
             r"^transformer_blocks\.(\d+)\.ff\.net\.0\.proj\.(.*)$": r"blocks.\1.mlp.fc1.\2",
@@ -99,6 +101,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     final_norm_eps: float = 1e-5
     checkpoint_uses_diffusers_layout: bool = False
     adaln_affine_input_dim: int | None = None
+    has_gate_compress: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()

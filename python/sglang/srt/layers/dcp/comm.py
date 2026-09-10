@@ -36,7 +36,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.utils.common import is_mnnvl_fabric_device
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
@@ -384,6 +385,17 @@ def all_gather_kv_cache_for_dcp(
 _FI_A2A_STATE: Optional[dict] = None
 
 
+def is_fi_a2a_supported(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> bool:
+    if not get_platform().is_sm100:
+        return False
+    if is_mnnvl_fabric_device():
+        return True
+    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+    return tp_size_per_node % dcp_size == 0
+
+
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
     # the stream and barriers cross-rank, neither of which is capturable.
@@ -401,7 +413,7 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
             decode_cp_a2a_init_workspace,
         )
         from flashinfer.comm.mapping import Mapping
-        from flashinfer.comm.mnnvl import MnnvlConfig, is_mnnvl_fabric_supported
+        from flashinfer.comm.mnnvl import MnnvlConfig
     except ImportError as e:
         raise ImportError(
             "--dcp-comm-backend fi_a2a requires FlashInfer with the DCP "
@@ -416,15 +428,25 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
         TorchDistributedCommBackend,
     )
 
-    if not is_mnnvl_fabric_supported(torch.cuda.current_device()):
-        raise RuntimeError(
-            "--dcp-comm-backend fi_a2a requires MNNVL fabric memory (e.g. "
-            "GB200 NVL72); is_mnnvl_fabric_supported() returned False. Use "
-            "--dcp-comm-backend a2a or ag_rs on clusters without MNNVL."
-        )
-
     cp_size = cp_group.world_size
     cp_rank = cp_group.rank_in_group
+    parallel = get_parallel()
+
+    if not is_fi_a2a_supported(
+        dcp_size=cp_size,
+        tp_size=parallel.tp_size,
+        pp_size=parallel.pp_size,
+        nnodes=parallel.nnodes,
+    ):
+        raise RuntimeError(
+            "--dcp-comm-backend fi_a2a needs a Blackwell system whose DCP group "
+            "shares one MNNVL domain: either MNNVL fabric memory (GB200/GB300) "
+            f"or a DCP group inside one node (got dcp_size={cp_size}, "
+            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
+            f"nnodes={parallel.nnodes}). Use --dcp-comm-backend a2a or ag_rs "
+            "otherwise."
+        )
+
     mapping = Mapping(
         world_size=cp_size,
         rank=cp_rank,

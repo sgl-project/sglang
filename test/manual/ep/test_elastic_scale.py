@@ -238,8 +238,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         join_end = rank_offset + join_tp
         if join_end > len(visible_devices):
             raise RuntimeError(
-                f"Scale-up requires {join_end} visible GPUs, got "
-                f"{len(visible_devices)}"
+                f"Scale-up requires {join_end} visible GPUs, got {len(visible_devices)}"
             )
         env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices[rank_offset:join_end])
         base_joining_log = os.environ.get(

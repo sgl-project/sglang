@@ -10,7 +10,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from array import array
@@ -53,7 +53,6 @@ def _recv(rid, input_ids, max_new_tokens=8):
 
 
 class TestSessionTokenShare(CustomTestCase):
-
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
 

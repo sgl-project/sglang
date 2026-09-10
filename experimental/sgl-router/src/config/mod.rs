@@ -15,6 +15,9 @@ impl Config {
         if self.model.id.is_empty() {
             return Err(anyhow!("model id must be non-empty"));
         }
+        if let Some(bucket_config) = self.model.bucket_config.as_ref() {
+            validate_bucket_config(bucket_config)?;
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
@@ -66,6 +69,133 @@ impl Config {
     }
 }
 
+fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
+    if bucket_config.buckets.is_empty() {
+        return Err(anyhow!(
+            "bucket_config.buckets must be non-empty when configured"
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut ranks = std::collections::HashSet::new();
+    let mut stage_workers = std::collections::HashSet::new();
+    let mut has_prefill_bucket = false;
+    for bucket in &bucket_config.buckets {
+        has_prefill_bucket |= bucket.stage == BucketStage::Prefill;
+        if bucket.id.is_empty() || !ids.insert(bucket.id.as_str()) {
+            return Err(anyhow!(
+                "bucket_config bucket id must be non-empty and unique: {:?}",
+                bucket.id
+            ));
+        }
+        if !ranks.insert((bucket.stage, bucket.rank)) {
+            return Err(anyhow!(
+                "bucket_config rank must be unique within each stage: {}",
+                bucket.rank
+            ));
+        }
+        if bucket.worker_ids.is_empty() {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} has no worker_ids",
+                bucket.id
+            ));
+        }
+        let mut worker_ids = std::collections::HashSet::new();
+        for worker_id in &bucket.worker_ids {
+            if worker_id.is_empty() || !worker_ids.insert(worker_id.as_str()) {
+                return Err(anyhow!(
+                    "bucket_config bucket {:?} has an empty or duplicate worker id",
+                    bucket.id
+                ));
+            }
+            if !stage_workers.insert((bucket.stage, worker_id.as_str())) {
+                return Err(anyhow!(
+                    "bucket_config worker {:?} belongs to more than one {:?} bucket",
+                    worker_id,
+                    bucket.stage
+                ));
+            }
+        }
+        validate_range(
+            bucket.min_extend_tokens,
+            bucket.max_extend_tokens,
+            &bucket.id,
+            "extend",
+        )?;
+        validate_range(
+            bucket.min_sequence_tokens,
+            bucket.max_sequence_tokens,
+            &bucket.id,
+            "sequence",
+        )?;
+        if bucket.max_context_tokens == Some(0) {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} max_context_tokens must be > 0",
+                bucket.id
+            ));
+        }
+        if bucket.ttft_p95_at_capacity_ms == Some(0) {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} TTFT p95 must be > 0",
+                bucket.id
+            ));
+        }
+        if bucket
+            .tps_p05_at_capacity
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} TPS p05 must be finite and > 0",
+                bucket.id
+            ));
+        }
+        if bucket.max_pending_prefill_tokens == Some(0) {
+            return Err(anyhow!(
+                "bucket_config bucket {:?} max_pending_prefill_tokens must be > 0",
+                bucket.id
+            ));
+        }
+        match bucket.stage {
+            BucketStage::Prefill
+                if bucket.min_sequence_tokens.is_some()
+                    || bucket.max_sequence_tokens.is_some()
+                    || bucket.tps_p05_at_capacity.is_some() =>
+            {
+                return Err(anyhow!(
+                    "bucket_config Prefill bucket {:?} contains Decode-only sequence/TPS fields",
+                    bucket.id
+                ));
+            }
+            BucketStage::Decode
+                if bucket.min_extend_tokens.is_some()
+                    || bucket.max_extend_tokens.is_some()
+                    || bucket.ttft_p95_at_capacity_ms.is_some()
+                    || bucket.max_pending_prefill_tokens.is_some() =>
+            {
+                return Err(anyhow!(
+                    "bucket_config Decode bucket {:?} contains Prefill-only extend/TTFT/pending fields",
+                    bucket.id
+                ));
+            }
+            _ => {}
+        }
+    }
+    if !has_prefill_bucket {
+        return Err(anyhow!(
+            "bucket_config must contain at least one Prefill bucket; enabling Bucket routing otherwise leaves every request without a Prefill domain"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_range(min: Option<u64>, max: Option<u64>, id: &str, name: &str) -> Result<()> {
+    if min.zip(max).is_some_and(|(min, max)| min > max) {
+        return Err(anyhow!(
+            "bucket_config bucket {id:?} has invalid {name} range: min > max"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,9 +215,14 @@ mod tests {
                 id: model_id.into(),
                 tokenizer_path: "/tmp/tok.json".into(),
                 policy: PolicyKind::RoundRobin,
+                decode_policy: DecodePolicyKind::PowerOfTwo,
+                bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                affinity: None,
+                fused: None,
+                eligibility: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
@@ -151,5 +286,197 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported scheme"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_worker_reused_by_two_buckets_of_the_same_stage() {
+        let mut config = cfg("qwen3", &["http://x:30000"]);
+        config.model.bucket_config = Some(BucketConfig {
+            buckets: vec![
+                BucketSpec {
+                    id: "p-short".into(),
+                    stage: BucketStage::Prefill,
+                    rank: 10,
+                    worker_ids: vec!["p1".into()],
+                    min_extend_tokens: None,
+                    max_extend_tokens: Some(1_024),
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: Some(100),
+                    tps_p05_at_capacity: None,
+                    max_pending_prefill_tokens: None,
+                },
+                BucketSpec {
+                    id: "p-long".into(),
+                    stage: BucketStage::Prefill,
+                    rank: 20,
+                    worker_ids: vec!["p1".into()],
+                    min_extend_tokens: Some(1_025),
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(8_192),
+                    ttft_p95_at_capacity_ms: Some(200),
+                    tps_p05_at_capacity: None,
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        });
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("more than one"), "got: {error}");
+    }
+
+    #[test]
+    fn accepts_the_same_rank_in_independent_prefill_and_decode_stages() {
+        let mut config = cfg("qwen3", &["http://x:30000"]);
+        config.model.bucket_config = Some(BucketConfig {
+            buckets: vec![
+                BucketSpec {
+                    id: "p-fast".into(),
+                    stage: BucketStage::Prefill,
+                    rank: 10,
+                    worker_ids: vec!["p1".into()],
+                    min_extend_tokens: None,
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: Some(100),
+                    tps_p05_at_capacity: None,
+                    max_pending_prefill_tokens: None,
+                },
+                BucketSpec {
+                    id: "d-fast".into(),
+                    stage: BucketStage::Decode,
+                    rank: 10,
+                    worker_ids: vec!["d1".into()],
+                    min_extend_tokens: None,
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: None,
+                    tps_p05_at_capacity: Some(20.0),
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::SloFirst,
+        });
+
+        config
+            .validate()
+            .expect("Prefill and Decode ranks only need to be unique within their stage");
+    }
+
+    #[test]
+    fn rejects_bucket_config_without_a_prefill_domain() {
+        let mut config = cfg("qwen3", &["http://x:30000"]);
+        config.model.bucket_config = Some(BucketConfig {
+            buckets: vec![BucketSpec {
+                id: "d-only".into(),
+                stage: BucketStage::Decode,
+                rank: 10,
+                worker_ids: vec!["d1".into()],
+                min_extend_tokens: None,
+                max_extend_tokens: None,
+                min_sequence_tokens: None,
+                max_sequence_tokens: None,
+                max_context_tokens: Some(4_096),
+                ttft_p95_at_capacity_ms: None,
+                tps_p05_at_capacity: Some(20.0),
+                max_pending_prefill_tokens: None,
+            }],
+            ttft_slo_policy: SloBucketPolicy::Disabled,
+            tps_slo_policy: SloBucketPolicy::SloFirst,
+        });
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("Prefill bucket"), "got: {error}");
+    }
+
+    #[test]
+    fn rejects_stage_inapplicable_bucket_fields_instead_of_ignoring_them() {
+        let mut prefill = cfg("qwen3", &["http://x:30000"]);
+        prefill.model.bucket_config = Some(BucketConfig {
+            buckets: vec![BucketSpec {
+                id: "p".into(),
+                stage: BucketStage::Prefill,
+                rank: 10,
+                worker_ids: vec!["p1".into()],
+                min_extend_tokens: None,
+                max_extend_tokens: None,
+                min_sequence_tokens: None,
+                max_sequence_tokens: Some(4_096),
+                max_context_tokens: Some(4_096),
+                ttft_p95_at_capacity_ms: Some(100),
+                tps_p05_at_capacity: None,
+                max_pending_prefill_tokens: None,
+            }],
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::Disabled,
+        });
+        let error = prefill.validate().unwrap_err().to_string();
+        assert!(error.contains("Decode-only"), "got: {error}");
+
+        let mut decode = cfg("qwen3", &["http://x:30000"]);
+        decode.model.bucket_config = Some(BucketConfig {
+            buckets: vec![
+                BucketSpec {
+                    id: "p".into(),
+                    stage: BucketStage::Prefill,
+                    rank: 10,
+                    worker_ids: vec!["p1".into()],
+                    min_extend_tokens: None,
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: None,
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: Some(100),
+                    tps_p05_at_capacity: None,
+                    max_pending_prefill_tokens: None,
+                },
+                BucketSpec {
+                    id: "d".into(),
+                    stage: BucketStage::Decode,
+                    rank: 20,
+                    worker_ids: vec!["d1".into()],
+                    min_extend_tokens: Some(1),
+                    max_extend_tokens: None,
+                    min_sequence_tokens: None,
+                    max_sequence_tokens: Some(4_096),
+                    max_context_tokens: Some(4_096),
+                    ttft_p95_at_capacity_ms: None,
+                    tps_p05_at_capacity: Some(20.0),
+                    max_pending_prefill_tokens: None,
+                },
+            ],
+            ttft_slo_policy: SloBucketPolicy::SloFirst,
+            tps_slo_policy: SloBucketPolicy::SloFirst,
+        });
+        let error = decode.validate().unwrap_err().to_string();
+        assert!(error.contains("Prefill-only"), "got: {error}");
+    }
+
+    #[test]
+    fn bucket_json_rejects_unknown_profile_fields() {
+        let raw = r#"{
+          "buckets": [{
+            "id": "p-fast",
+            "stage": "prefill",
+            "rank": 10,
+            "worker_ids": ["p1"],
+            "ttft_p95_at_capcity_ms": 100
+          }]
+        }"#;
+
+        let error = serde_json::from_str::<BucketConfig>(raw)
+            .expect_err("a misspelled capacity profile must fail startup")
+            .to_string();
+        assert!(error.contains("ttft_p95_at_capcity_ms"), "got: {error}");
     }
 }

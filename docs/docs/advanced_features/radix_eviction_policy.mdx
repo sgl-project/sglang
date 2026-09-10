@@ -1,0 +1,72 @@
+---
+title: "Radix Cache Eviction Policies"
+metatags:
+    description: "Choose how the radix cache picks which prefix KV to drop under memory pressure, and tune a policy with --radix-eviction-policy-config."
+---
+
+When the KV cache pool is full, the radix cache reclaims space by evicting cached prefixes. The eviction policy decides which prefix goes first. The default, `lru`, is the right choice for most workloads; the others trade recency for hit frequency, reuse history, or request priority.
+
+## How eviction picks a victim
+
+Eviction only ever considers **evictable leaves**: nodes whose KV is present, unlocked (no in-flight request holds them), and not shadowed by a child that still holds KV. The root is never evictable.
+
+The policy scores each candidate and the **lowest score is evicted first**. Once a leaf is evicted, its parent may become a leaf and re-enter the candidate set, so eviction walks a branch from its tip toward the root.
+
+A policy only scores. It does not decide how much to free, and it cannot pin KV in memory — a node protected by the policy is still evicted if reclaiming everything else is not enough.
+
+## Available policies
+
+Select one with `--radix-eviction-policy`. All of them fall back to least-recently-used order within a tie.
+
+| Policy | Evicts first | Use when |
+|---|---|---|
+| `lru` (default) | The prefix unused for longest. | General serving. Matches how prefix reuse decays with time. |
+| `lfu` | The prefix with the fewest cache hits, then the least recent. | A small set of prompts is reused far more than the rest, and you want those to survive bursts of one-off traffic. |
+| `slru` | Prefixes still in the probationary segment, then the least recent within a segment. | Like `lfu`, but you want a hard floor on how much a one-off prefix can displace a proven one. See [`slru` parameters](#slru-parameters). |
+| `priority` | The prefix belonging to the lowest-priority request, then the least recent. | You run [priority scheduling](/docs/advanced_features/server_arguments) and want cache retention to follow the same ranking as admission. |
+
+Notes on the scoring inputs:
+
+- **Hit count** (`lfu`, `slru`) counts how many times a node was matched by a later request. It is not incremented for chunked-prefill steps, for evicted nodes, or under write-back HiCache.
+- **Request priority** (`priority`) is the `priority` field of the request that inserted the prefix; a node reached by several requests keeps the highest priority among them. Without priority scheduling every node is priority `0` and this policy is equivalent to `lru`.
+
+`fifo`, `mru`, and `filo` also exist in the policy registry but are not offered on the command line. They are reachable only by out-of-tree code that extends the choice list, and exist for experiments rather than serving.
+
+## Tuning a policy
+
+Some policies take parameters. Pass them as a json object to `--radix-eviction-policy-config`; the keys are the policy's own, so they are only valid for the policy you selected.
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --radix-eviction-policy slru \
+  --radix-eviction-policy-config '{"protected_threshold": 4}'
+```
+
+Omit the flag to accept every default. An unrecognized key fails at startup rather than being ignored:
+
+```
+TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected_treshold'
+```
+
+<Note>
+`--radix-eviction-policy-config` is not supported by the experimental Rust tree core (`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust`), which builds its strategy from the policy name alone. Passing both fails at startup.
+</Note>
+
+### Policy parameters
+
+Only `slru` currently takes a parameter. `lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
+
+#### `slru` parameters
+
+`slru` splits the cache into a **probationary** segment and a **protected** segment. A prefix enters probationary, and is promoted to protected once it has been hit enough times. Everything probationary is evicted before anything protected.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `protected_threshold` | int | `2` | Hit count at which a prefix is promoted to the protected segment. |
+
+Raising it makes promotion harder, so the protected set stays small and closer to your genuinely hot prefixes; a prefix hit three times stays probationary at `4` but is protected at the default `2`. Lowering it to `1` promotes any prefix that is reused even once, which approaches `lru` with a one-hit grace period.
+
+## Which policy to pick
+
+Start with `lru` and change it only against a measured cache hit rate — the counters are exposed under `--enable-metrics`. `lfu` and `slru` help when your traffic has a stable hot set that a recency-only policy keeps flushing; they hurt when prefix popularity shifts over time, because a prefix that earned a high hit count keeps its advantage after it stops being useful.

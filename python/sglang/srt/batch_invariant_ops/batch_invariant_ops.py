@@ -176,9 +176,9 @@ def _matmul_persistent_triton(
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert (
-        bias is None or bias.dim() == 1
-    ), "Currently assuming bias is 1D, let Horace know if you run into this"
+    assert bias is None or bias.dim() == 1, (
+        "Currently assuming bias is 1D, let Horace know if you run into this"
+    )
     NUM_SMS = get_device_core_count()
     M, K = a.shape
     K, N = b.shape
@@ -501,9 +501,9 @@ def mean_dim(
     """
     # Validate inputs
     assert input.is_cuda or input.is_xpu, "Input must be a CUDA or XPU tensor"
-    assert (
-        -input.ndim <= dim < input.ndim
-    ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
+    assert -input.ndim <= dim < input.ndim, (
+        f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
+    )
 
     # Handle negative dim
     if dim < 0:

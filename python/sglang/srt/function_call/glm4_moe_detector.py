@@ -553,9 +553,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += json_increment
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += json_increment
+                            self.streamed_args_for_tool[self.current_tool_id] += (
+                                json_increment
+                            )
 
                     if is_tool_end == self.eot_token:
                         if self._is_first_param:
@@ -568,9 +568,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += empty_object
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += empty_object
+                            self.streamed_args_for_tool[self.current_tool_id] += (
+                                empty_object
+                            )
                         else:
                             # The streamed outer `{` is only closed here; a
                             # trailing "}" may belong to a nested object value.
@@ -583,9 +583,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += closing_brace
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += closing_brace
+                            self.streamed_args_for_tool[self.current_tool_id] += (
+                                closing_brace
+                            )
 
                         try:
                             pairs = self.func_arg_regex.findall(func_args_raw)
