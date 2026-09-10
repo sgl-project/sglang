@@ -505,11 +505,7 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
-            if (
-                _is_npu
-                and is_npu_arch35()
-                and self.quant_config.scale_fmt != "ue8m0"
-            ):
+            if _is_npu and is_npu_arch35() and self.quant_config.scale_fmt != "ue8m0":
                 # The A5 backend expects the ue8m0 weight layout installed by
                 # the arch35 load path; keep plain block-FP8 checkpoints on
                 # the generic triton backend.
