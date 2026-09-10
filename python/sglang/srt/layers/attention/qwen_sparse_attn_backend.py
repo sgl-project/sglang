@@ -65,7 +65,7 @@ def _resolve_trtllm_sparse_decode():
 
 @lru_cache(maxsize=1)
 def _resolve_flash_attn_varlen_func():
-    from sglang.srt.utils import is_sm121
+    from sglang.srt.utils import is_hip, is_sm121
 
     if is_sm121():
         from sglang.kernels.ops.attention import (
@@ -73,6 +73,22 @@ def _resolve_flash_attn_varlen_func():
         )
 
         return qwen38_qsa_sm121_varlen
+    if is_hip():
+        # ROCm ships neither flash_attn (FA2) nor flash-attn-4; aiter provides an
+        # FA2-compatible varlen kernel (CK) with the same call signature. Fall
+        # through to the flash_attn probes below if aiter is unavailable.
+        try:
+            from aiter import flash_attn_varlen_func as aiter_varlen_func
+        except ImportError:
+            aiter_varlen_func = None
+        if aiter_varlen_func is not None:
+
+            def flash_attn_varlen_func(*args, **kwargs):
+                output = aiter_varlen_func(*args, **kwargs)
+                # aiter returns a tuple when return_lse/return_attn_probs is set.
+                return output[0] if isinstance(output, tuple) else output
+
+            return flash_attn_varlen_func
     try:
         from flash_attn import flash_attn_varlen_func
 
@@ -90,8 +106,8 @@ def _resolve_flash_attn_varlen_func():
         return flash_attn_varlen_func
     except ImportError as exc:
         raise ImportError(
-            "QSA decode requires flash_attn (FA2) or flash-attn-4 "
-            "(FA4 cute) for its packed varlen fallback."
+            "QSA decode requires flash_attn (FA2), flash-attn-4 (FA4 cute), "
+            "or aiter (ROCm) for its packed varlen fallback."
         ) from exc
 
 
