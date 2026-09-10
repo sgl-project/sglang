@@ -161,12 +161,19 @@ tensor copy per residual site.
 `usp_merge_heads`, `pack_qkv_destination_major`, `fused_pack_qkv`,
 `fused_pack_segmented_qkv`, `fused_scatter_to_padded`,
 `fused_causal_conv3d_cat_pad_cuda`,
-`cat_pad_channels_last_3d`, `dup_up3d_add`, `fused_temb_table_slices`,
+`cat_pad_channels_last_3d`, `dup_up3d_add`, `nearest_upsample_nhwc`,
+`fused_temb_table_slices`,
 and `ltx2_ada_values9` are bit-exact data movement or same-order arithmetic.
 `fused_layernorm_modulate_fp8_quant_raw` folds FLUX.2 LayerNorm, adaLN
 modulation, and static FP8 quantization. `try_flux2_token_cat_fp8` and
 `try_flux2_token_cat_nvfp4` fuse branch concatenation directly into the
 quantized representation selected by the FLUX.2 checkpoint path.
+
+`nearest_upsample_nhwc` replaces `nn.Upsample(nearest / nearest-exact,
+integer factor)` on a dense channels_last input with a Triton gather: same
+values and layout as aten, but aten's own NHWC nearest kernel is several times
+slower than its NCHW sibling, which is what the Wan-family VAE decoders hit
+once they run channels_last end-to-end.
 
 `fused_temb_table_slices` is worth knowing about: the eager
 `(table + temb.float()).chunk(6, dim=2)` materializes ~8 GB of fp32 at
