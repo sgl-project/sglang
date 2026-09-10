@@ -1266,9 +1266,9 @@ def gdn_replayssm_spec_decode(
     scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
-    block_v: int | None = None,
+    block_v: int = 64,
     num_warps: int = 1,
-    num_stages: int | None = None,
+    num_stages: int = 2,
     nk: int = 2,
     bs_min: int = 4,
     block_v_flush: int = 64,
@@ -1295,24 +1295,16 @@ def gdn_replayssm_spec_decode(
         scale = checkpoint_state.shape[-1] ** -0.5
     batch_size = query_start_loc.shape[0] - 1
     # At the Qwen3.5 MTP shape, one wide V tile avoids duplicating q/k and gate
-    # work across two programs on gfx950. Keep explicit tuning authoritative.
-    use_gfx95_wide_v = (
-        block_v is None
-        and num_stages is None
-        and (
-            _IS_GFX95
-            and batch_size >= 32
-            and max_cache_len == 16
-            and max_spec_len == 4
-            and q.shape[-1] == 128
-            and v.shape[-1] == 128
-        )
-    )
-    if use_gfx95_wide_v:
+    # work across two programs on gfx950.
+    if (
+        _IS_GFX95
+        and batch_size >= 32
+        and max_cache_len == 16
+        and max_spec_len == 4
+        and q.shape[-1] == 128
+        and v.shape[-1] == 128
+    ):
         block_v, num_stages = 128, 1
-    else:
-        block_v = 64 if block_v is None else block_v
-        num_stages = 2 if num_stages is None else num_stages
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
