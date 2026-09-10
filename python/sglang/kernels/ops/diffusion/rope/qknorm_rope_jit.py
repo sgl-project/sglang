@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_CACHE_DTYPES = (*_SUPPORTED_DTYPES, torch.float32)
+_CPU_RELEASE_HEAD_DIM = 128
+_CPU_RELEASE_ROPE_DIM = 96
 
 
 @cache_once
@@ -127,6 +129,31 @@ def _can_use_fused_qknorm_rope(
 
 @torch.compiler.assume_constant_result
 @cache_once
+def can_use_fused_inplace_qknorm_rope_cpu(
+    head_dim: int,
+    rope_dim: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+    cache_dtype: torch.dtype = torch.float32,
+    round_norm_before_rope: bool = False,
+) -> bool:
+    if dtype != torch.bfloat16 or cache_dtype != torch.bfloat16:
+        return False
+    if head_dim != _CPU_RELEASE_HEAD_DIM or rope_dim != _CPU_RELEASE_ROPE_DIM:
+        return False
+    if not is_neox or not round_norm_before_rope:
+        return False
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return hasattr(torch.ops.sgl_kernel, "fused_inplace_qknorm_rope_cpu")
+    except Exception as exc:
+        logger.warning("Failed to load CPU fused QK norm + RoPE kernel: %s", exc)
+        return False
+
+
+@torch.compiler.assume_constant_result
+@cache_once
 def can_use_fused_inplace_qknorm_rope(
     head_dim: int,
     rope_dim: int,
@@ -149,8 +176,8 @@ def can_use_fused_inplace_qknorm_rope(
     )
 
 
-@register_custom_op(mutates_args=["q", "k"])
-def fused_inplace_qknorm_rope(
+@register_custom_op(op_name="fused_inplace_qknorm_rope", mutates_args=["q", "k"])
+def _fused_inplace_qknorm_rope_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -180,6 +207,41 @@ def fused_inplace_qknorm_rope(
         cache_has_full_width,
     )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)
+
+
+def fused_inplace_qknorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
+    cache_has_full_width: bool = False,
+) -> None:
+    head_dim = head_dim or q.size(-1)
+    if not rope_dim:
+        cache_width = cos_sin_cache.size(-1)
+        rope_dim = cache_width // 2 if cache_has_full_width else cache_width
+    if q.device.type == "cpu":
+        import sgl_kernel  # noqa: F401
+
+        torch.ops.sgl_kernel.fused_inplace_qknorm_rope_cpu(
+            q, k, q_weight, k_weight, cos_sin_cache, positions, eps,
+            head_dim, rope_dim, is_neox, round_norm_before_rope
+        )
+        return
+    _fused_inplace_qknorm_rope_cuda(
+        q, k, q_weight, k_weight, cos_sin_cache, positions,
+        is_neox=is_neox, eps=eps, head_dim=head_dim, rope_dim=rope_dim,
+        round_norm_before_rope=round_norm_before_rope,
+        cache_has_full_width=cache_has_full_width,
+    )
 
 
 @register_custom_op(mutates_args=["q", "packed_kv"])
