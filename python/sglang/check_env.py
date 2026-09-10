@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu, is_xpu
 
 
 def is_cuda_v2():
@@ -414,6 +414,313 @@ class NPUEnv(BaseEnv):
             return {}
 
 
+class XPUEnv(BaseEnv):
+    """Environment checker for Intel XPU (SYCL / Level Zero)"""
+
+    # CUDA-only wheels that are never installed in an XPU environment.
+    SKIP_PACKAGE_LIST = [
+        "flashinfer_python",
+        "flashinfer_cubin",
+        "flashinfer_jit_cache",
+        "triton",
+        "sglang-kernel",
+    ]
+
+    # sgl-kernel-xpu ships under the `sgl-kernel` distribution name.
+    PACKAGE_ALIASES = {"sgl-kernel-xpu": "sgl-kernel"}
+
+    EXTRA_PACKAGE_LIST = [
+        # SGLang XPU kernels / Triton
+        "sgl-kernel",
+        "sgl-kernel-xpu",
+        "triton-xpu",
+        # Torch XPU stack
+        "torchvision",
+        "torchaudio",
+        # oneAPI DPC++ / SYCL runtime
+        "intel-sycl-rt",
+        "intel-cmplr-lib-rt",
+        "intel-cmplr-lib-ur",
+        "intel-cmplr-lic-rt",
+        "intel-opencl-rt",
+        "intel-openmp",
+        "intel-pti",
+        "dpcpp-cpp-rt",
+        "umf",
+        "tcmlib",
+        # oneMKL
+        "mkl",
+        "onemkl-sycl-blas",
+        "onemkl-sycl-dft",
+        "onemkl-sycl-lapack",
+        "onemkl-sycl-rng",
+        "onemkl-sycl-sparse",
+        # Collectives / distributed
+        "oneccl",
+        "oneccl-devel",
+        "impi-rt",
+    ]
+
+    # Runtime knobs that materially change XPU behaviour; only set ones are shown.
+    ENV_VAR_LIST = [
+        "ONEAPI_ROOT",
+        "CMPLR_ROOT",
+        "ONEAPI_DEVICE_SELECTOR",
+        "SYCL_DEVICE_ALLOWLIST",
+        "SYCL_CACHE_PERSISTENT",
+        "SYCL_CACHE_DIR",
+        "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS",
+        "SYCL_PROGRAM_COMPILE_OPTIONS",
+        "UR_L0_USE_IMMEDIATE_COMMANDLISTS",
+        "UR_L0_IN_ORDER_BARRIER_BY_SIGNAL",
+        "ZE_AFFINITY_MASK",
+        "ZE_FLAT_DEVICE_HIERARCHY",
+        "ZE_ENABLE_PCI_ID_DEVICE_ORDER",
+        "ZES_ENABLE_SYSMAN",
+        "NEOReadDebugKeys",
+        "OverrideGpuAddressSpace",
+        "TORCH_LLM_ALLREDUCE",
+        "TORCH_XPU_ARCH_LIST",
+        "PYTORCH_ENABLE_XPU_FALLBACK",
+        "IPEX_XPU_ONEDNN_LAYOUT",
+        "CCL_ROOT",
+        "CCL_BACKEND",
+        "CCL_ATL_TRANSPORT",
+        "CCL_ZE_IPC_EXCHANGE",
+        "CCL_PROCESS_LAUNCHER",
+        "FI_PROVIDER",
+        "SGLANG_ATTENTION_BACKEND",
+        "SGLANG_MOE_RUNNER_BACKEND",
+    ]
+
+    # torch.xpu device property -> label, formatter
+    DEVICE_PROPERTIES = [
+        ("device_id", "Device ID", lambda v: hex(v) if isinstance(v, int) else v),
+        # Raw SYCL device-architecture enum value; the device name is the readable form.
+        ("architecture", "Architecture", lambda v: hex(v) if isinstance(v, int) else v),
+        ("vendor", "Vendor", str),
+        ("platform_name", "SYCL Platform", str),
+        ("type", "Device Type", str),
+        ("driver_version", "Compute Runtime (driver_version)", str),
+        ("version", "Backend Version", str),
+        ("uuid", "UUID", str),
+        ("total_memory", "Total Memory", lambda v: f"{v / 1024**3:.2f} GiB"),
+        ("max_compute_units", "Max Compute Units", str),
+        ("gpu_eu_count", "EU Count", str),
+        ("gpu_subslice_count", "Subslice Count (Xe cores)", str),
+        ("max_work_group_size", "Max Work Group Size", str),
+        ("max_num_sub_groups", "Max Sub Groups", str),
+        ("sub_group_sizes", "Sub Group Sizes", lambda v: ",".join(map(str, v))),
+        ("local_mem_size", "Local (SLM) Memory", lambda v: f"{v / 1024:.0f} KiB"),
+        ("memory_bus_width", "Memory Bus Width", lambda v: f"{v} bit"),
+        ("memory_clock_rate", "Memory Clock", lambda v: f"{v} MHz"),
+    ]
+
+    # Capability flags that gate which SGLang kernels can be selected.
+    DEVICE_CAPABILITIES = [
+        ("has_fp16", "fp16"),
+        ("has_fp64", "fp64"),
+        ("has_atomic64", "atomic64"),
+        ("has_bfloat16_conversions", "bf16_conversions"),
+        ("has_subgroup_matrix_multiply_accumulate", "XMX (dpas)"),
+        ("has_subgroup_matrix_multiply_accumulate_tensor_float32", "XMX tf32"),
+        ("has_subgroup_2d_block_io", "2d_block_io"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.package_list = [
+            p for p in self.package_list if p not in XPUEnv.SKIP_PACKAGE_LIST
+        ]
+        self.package_list.extend(XPUEnv.EXTRA_PACKAGE_LIST)
+
+    def get_package_versions(self):
+        versions = super().get_package_versions()
+        for name, dist in XPUEnv.PACKAGE_ALIASES.items():
+            if versions.get(name) == "Module Not Found":
+                versions[name] = versions.get(dist, "Module Not Found")
+        return versions
+
+    def get_info(self):
+        xpu_info = {"XPU available": torch.xpu.is_available()}
+
+        if xpu_info["XPU available"]:
+            xpu_info.update(self.get_device_info())
+            xpu_info.update(self._get_torch_xpu_build_info())
+            xpu_info.update(self._get_oneapi_info())
+            xpu_info.update(self._get_kmd_info())
+            xpu_info.update(self._get_sgl_kernel_info())
+            xpu_info.update(self._get_env_vars())
+
+        return xpu_info
+
+    def get_device_info(self):
+        """
+        Per-device SYCL/Level Zero properties. Devices sharing a name are
+        grouped, with the full property dump taken from the first of the group.
+        """
+        devices = defaultdict(list)
+        for k in range(torch.xpu.device_count()):
+            devices[torch.xpu.get_device_name(k)].append(k)
+
+        xpu_info = {"XPU count": torch.xpu.device_count()}
+        for name, device_ids in devices.items():
+            ids = ",".join(str(i) for i in device_ids)
+            xpu_info[f"XPU {ids}"] = name
+
+            props = torch.xpu.get_device_properties(device_ids[0])
+            for attr, label, fmt in XPUEnv.DEVICE_PROPERTIES:
+                value = getattr(props, attr, None)
+                if value is None:
+                    continue
+                try:
+                    xpu_info[f"XPU {ids} {label}"] = fmt(value)
+                except Exception:
+                    xpu_info[f"XPU {ids} {label}"] = value
+
+            supported = [
+                label
+                for attr, label in XPUEnv.DEVICE_CAPABILITIES
+                if getattr(props, attr, False)
+            ]
+            xpu_info[f"XPU {ids} Capabilities"] = ", ".join(supported) or "None"
+
+        return xpu_info
+
+    def _get_torch_xpu_build_info(self):
+        """
+        How torch itself was built for XPU: SYCL compiler version and the
+        AOT-compiled architectures (an arch mismatch means JIT or a hard failure).
+        """
+        info = {"SYCL Version (torch.version.xpu)": getattr(torch.version, "xpu", None)}
+
+        try:
+            info["Torch XPU Arch List"] = (
+                ", ".join(torch.xpu.get_arch_list()) or "JIT only"
+            )
+        except Exception:
+            info["Torch XPU Arch List"] = "Not Available"
+
+        try:
+            info["Torch XPU Gencode Flags"] = torch.xpu.get_gencode_flags() or "None"
+        except Exception:
+            pass
+
+        for label, fn in (
+            ("bf16 Supported", torch.xpu.is_bf16_supported),
+            ("tf32 Supported", torch.xpu.is_tf32_supported),
+        ):
+            try:
+                info[label] = fn()
+            except Exception:
+                info[label] = "Not Available"
+
+        return info
+
+    def _get_oneapi_info(self):
+        """
+        oneAPI toolkit location plus the DPC++ compiler and sycl-ls views,
+        which is what sgl-kernel-xpu actually builds against.
+        """
+        info = {}
+
+        oneapi_root = os.environ.get("ONEAPI_ROOT") or os.environ.get("CMPLR_ROOT")
+        info["ONEAPI_ROOT"] = oneapi_root or "Not Set"
+
+        info["DPC++ (icpx)"] = self._first_line(["icpx", "--version"])
+
+        sycl_ls = self._run(["sycl-ls"])
+        if sycl_ls:
+            info["sycl-ls"] = "\n" + sycl_ls
+
+        return info
+
+    def _get_kmd_info(self):
+        """
+        Kernel-mode driver in use (i915 vs xe) and its version. The KMD choice
+        changes Level Zero behaviour and is a common source of XPU-only bugs.
+        """
+        info = {}
+        for module in ("xe", "i915"):
+            version_file = f"/sys/module/{module}/version"
+            if not os.path.exists(f"/sys/module/{module}"):
+                continue
+            version = "loaded"
+            try:
+                with open(version_file, "r", encoding="utf-8") as f:
+                    version = f.read().strip()
+            except OSError:
+                pass
+            info["Intel KMD"] = f"{module} ({version})"
+            break
+        else:
+            info["Intel KMD"] = "Not Available"
+
+        return info
+
+    def _get_sgl_kernel_info(self):
+        """
+        Confirm the sgl-kernel XPU extension actually loads and registers ops;
+        an importable-but-opless build is the usual symptom of an arch mismatch.
+        """
+        try:
+            import sgl_kernel  # noqa: F401
+        except Exception as e:
+            return {"sgl_kernel XPU ops": f"Import failed ({type(e).__name__}: {e})"}
+
+        try:
+            ops = [
+                name for name in dir(torch.ops.sgl_kernel) if not name.startswith("_")
+            ]
+            return {"sgl_kernel XPU ops": f"{len(ops)} registered"}
+        except Exception:
+            return {"sgl_kernel XPU ops": "No ops registered"}
+
+    def _get_env_vars(self):
+        return {
+            f"env {var}": os.environ[var]
+            for var in XPUEnv.ENV_VAR_LIST
+            if os.environ.get(var)
+        }
+
+    def get_topology(self):
+        """
+        XPU topology and per-card discovery via xpu-smi (the Intel analogue of
+        nvidia-smi topo -m).
+        """
+        topology = {}
+
+        matrix = self._run(["xpu-smi", "topology", "-m"])
+        if matrix:
+            topology["XPU Topology"] = "\n" + matrix
+
+        discovery = self._run(["xpu-smi", "discovery"])
+        if discovery:
+            topology["XPU Discovery"] = "\n" + discovery
+
+        return topology
+
+    @staticmethod
+    def _run(cmd):
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            return result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    @staticmethod
+    def _first_line(cmd):
+        output = XPUEnv._run(cmd)
+        return output.splitlines()[0].strip() if output else "Not Available"
+
+
 class MUSAEnv(BaseEnv):
     """Environment checker for MThreads GPU"""
 
@@ -591,4 +898,10 @@ if __name__ == "__main__":
         env = MUSAEnv()
     elif is_mps():
         env = MPSEnv()
+    elif is_xpu():
+        env = XPUEnv()
+    else:
+        raise RuntimeError(
+            "No supported accelerator (CUDA/HIP/NPU/MUSA/MPS/XPU) detected."
+        )
     env.check_env()
