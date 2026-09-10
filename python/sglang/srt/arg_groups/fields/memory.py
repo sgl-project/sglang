@@ -213,12 +213,8 @@ class Memory(msgspec.Struct):
     # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
-    enable_lmcache: A[
-        bool, "Use the legacy LMCRadixCache integration"
-    ] = False
-    enable_unified_lmcache: A[
-        bool, "Use LMCache with LMCacheUnifiedRadixCache"
-    ] = False
+    enable_lmcache: A[bool, "Use the legacy LMCRadixCache integration"] = False
+    enable_unified_lmcache: A[bool, "Use LMCache with LMCacheUnifiedRadixCache"] = False
     lmcache_config_file: A[
         Optional[str],
         "Path to the LMCache YAML configuration file",
