@@ -128,12 +128,15 @@ def _top_p_renorm_kernel(
             values = tl.load(probs_ptr + row_start + offsets, mask=mask, other=0.0).to(
                 tl.float32
             )
-            sum_gt_pivot_low += tl.sum(tl.where(values > pivot_low, values, 0.0), axis=0)
+            sum_gt_pivot_low += tl.sum(
+                tl.where(values > pivot_low, values, 0.0), axis=0
+            )
             sum_gt_pivot_high += tl.sum(
                 tl.where(values > pivot_high, values, 0.0), axis=0
             )
             min_gt_low = tl.minimum(
-                min_gt_low, tl.min(tl.where(mask & (values > low), values, high), axis=0)
+                min_gt_low,
+                tl.min(tl.where(mask & (values > low), values, high), axis=0),
             )
             max_le_high = tl.maximum(
                 max_le_high,
