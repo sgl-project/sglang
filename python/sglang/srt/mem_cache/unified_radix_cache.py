@@ -1594,7 +1594,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # entirely empty spec (e.g. foreign-pin rejection) must never report
         # success, even at load_back_threshold <= 0.
         if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
+            mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
