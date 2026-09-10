@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use dynamo_renderer::{ChatTemplate, ContextMixins, PromptContextMixin, PromptFormatter};
+use dynamo_renderer::{
+    ChatTemplate, ContextMixins, PromptContextMixin, PromptFormatter, native_formatter_for,
+};
 use serde_json::Value;
 
 use crate::message::types::OneOrMany;
@@ -44,6 +46,7 @@ const SUPPORTED_STYLES: &[&str] = &[
 pub(super) fn load_chat_formatter(
     config_file: Option<&str>,
     model_path: Option<&str>,
+    model_type: Option<&str>,
     chat_template_arg: Option<&str>,
 ) -> Result<ChatFormatter, TemplateError> {
     // Python resolves registry names before looking at the filesystem — and
@@ -66,10 +69,21 @@ pub(super) fn load_chat_formatter(
         return Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter { spec })));
     }
 
+    // Models that ship no template (Python `resolve_chat_encoding_spec`) use
+    // Dynamo's built-in encoder for their architecture.
+    let native_formatter = || match chat_template_arg {
+        None => native_formatter_for(
+            &model_type.map(str::to_lowercase),
+            &model_path.unwrap_or_default().to_lowercase(),
+        )
+        .map(ChatFormatter::Dynamo),
+        Some(_) => None,
+    };
+
     // Every remaining source builds the HF renderer around the tokenizer
     // config (the template itself, or the argument injected into it).
     let Some(config_file) = config_file else {
-        return Err(TemplateError::MissingConfig);
+        return native_formatter().ok_or(TemplateError::MissingConfig);
     };
 
     let config_path = Path::new(config_file);
@@ -77,7 +91,10 @@ pub(super) fn load_chat_formatter(
     let mut config = parse_json(&config_text, config_path, "tokenizer config")?;
 
     let Some(argument) = chat_template_arg else {
-        return formatter_from_config(&config);
+        return match formatter_from_config(&config) {
+            Err(TemplateError::Missing) => native_formatter().ok_or(TemplateError::Missing),
+            result => result,
+        };
     };
 
     let path = Path::new(argument);
@@ -264,7 +281,7 @@ fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError>
     .map_err(|error| TemplateError::Renderer {
         message: error.to_string(),
     })?;
-    Ok(ChatFormatter::HuggingFace(formatter))
+    Ok(ChatFormatter::Dynamo(formatter))
 }
 
 /// Port of Python `_load_json_chat_template`: fields mirror `Conversation`

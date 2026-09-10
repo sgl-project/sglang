@@ -20,8 +20,8 @@ use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, ReasoningEffort, ResponseFormat, Role,
-    ServiceTier as ChatServiceTier, Stop, TopLogprobs,
+    FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
+    TopLogprobs,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -35,8 +35,8 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
+    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
@@ -56,18 +56,12 @@ struct ChatRequest {
     chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
-#[derive(Deserialize)]
-struct ChatTemplateKwargs {
-    thinking: Option<bool>,
-    reasoning_effort: Option<ReasoningEffort>,
-}
-
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
     let ChatRequest {
-        mut request,
+        request,
         chat_template_kwargs,
     } = match body {
         Ok(Json(request)) => request,
@@ -75,12 +69,6 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    let thinking = chat_template_kwargs.and_then(|kwargs| {
-        if let Some(effort) = kwargs.reasoning_effort {
-            request.reasoning_effort = Some(effort);
-        }
-        kwargs.thinking
-    });
     if request.model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -164,10 +152,11 @@ async fn chat_completions(
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) = match prepare_chat_request(&state, request, thinking).await {
-        Ok(prepared) => prepared,
-        Err(response) => return response,
-    };
+    let (request, prompt) =
+        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
 
     let sampling = match chat_sampling(
         &request,
@@ -277,7 +266,7 @@ async fn chat_completions(
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
-    thinking: Option<bool>,
+    kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
@@ -291,7 +280,7 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request, thinking).map_err(|error| {
+    let prompt = formatter.render(&request, kwargs).map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
@@ -996,15 +985,15 @@ mod tests {
         assert_eq!(req.stop, Some(Stop::TokenIdArray(vec![2, 3])));
     }
 
-    /// The HuggingFace renderer carries no template stops (Python's jinja path
+    /// The Dynamo renderer carries no template stops (Python's jinja path
     /// keeps only the request's stops), so the request is left unchanged.
     #[test]
-    fn huggingface_formatter_leaves_request_stops_alone() {
+    fn dynamo_formatter_leaves_request_stops_alone() {
         let mut req = request();
         req.stop = Some(Stop::String("x".into()));
         // A prompt formatter is not constructible here without a tokenizer; the
         // empty-legacy-spec twin proves the merge is formatter-gated, and the
-        // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
+        // `Dynamo` arm returns `None` by construction (see `stop_strs`).
         let legacy = super::super::ChatFormatter::Legacy(Box::new(
             super::super::template::LegacyFormatter {
                 spec: super::super::template::LegacySpec::default(),
