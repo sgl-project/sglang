@@ -125,8 +125,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
                 return_value=("trtllm_mla", "trtllm_mla"),
             ),
             patch(
-                "sglang.srt.arg_groups.cuda_graph_hook"
-                ".trtllm_mla_has_varlen_absorbed",
+                "sglang.srt.arg_groups.cuda_graph_hook.trtllm_mla_has_varlen_absorbed",
                 return_value=has_varlen,
             ),
         ):

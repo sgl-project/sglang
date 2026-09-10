@@ -983,9 +983,9 @@ def run_mla_fixture_eager(
     """``piecewise=True``/``breakable=True`` set the corresponding process-global
     capture-mode flag that backends branch on, without capturing a torch.compile
     or segmented graph."""
-    assert not (
-        piecewise and breakable
-    ), "a captured prefill graph is either tc_piecewise or breakable, not both"
+    assert not (piecewise and breakable), (
+        "a captured prefill graph is either tc_piecewise or breakable, not both"
+    )
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
         enable_breakable_cuda_graph,
     )
@@ -1029,9 +1029,9 @@ def run_mla_fixture_captured(
       property that actually matters here: the backend's static buffers
       (block_kv_indices/seq_lens_k tensors) are captured and replay-safe.
     """
-    assert not (
-        piecewise and breakable
-    ), "a captured prefill graph is either tc_piecewise or breakable, not both"
+    assert not (piecewise and breakable), (
+        "a captured prefill graph is either tc_piecewise or breakable, not both"
+    )
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
         enable_breakable_cuda_graph,
     )
