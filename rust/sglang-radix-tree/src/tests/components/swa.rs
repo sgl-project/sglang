@@ -3391,7 +3391,7 @@ fn host_drive_tombstones_internal_nodes_and_evicts_host_leaves() {
     tc.evictable_host_leaves.add(c);
     let (mut tr, mut df, mut hf) = host_drive_state();
     accumulate_step(
-        tc.drive_host_eviction(SWA, /* num_tokens = */ 100),
+        tc.drive_host_eviction(SWA, /* num_tokens = */ 100, false),
         &mut tr,
         &mut df,
         &mut hf,
@@ -3442,7 +3442,7 @@ fn host_drive_skips_host_locked_nodes() {
     tc.evictable_host_leaves.add(victim);
     let (mut tr, mut df, mut hf) = host_drive_state();
     accumulate_step(
-        tc.drive_host_eviction(SWA, /* num_tokens = */ 100),
+        tc.drive_host_eviction(SWA, /* num_tokens = */ 100, false),
         &mut tr,
         &mut df,
         &mut hf,
@@ -3486,7 +3486,7 @@ fn host_drive_stops_at_the_token_budget_consuming_lru_first() {
     }
     let (mut tr, mut df, mut hf) = host_drive_state();
     accumulate_step(
-        tc.drive_host_eviction(SWA, /* num_tokens = */ 1),
+        tc.drive_host_eviction(SWA, /* num_tokens = */ 1, false),
         &mut tr,
         &mut df,
         &mut hf,
@@ -3544,7 +3544,7 @@ fn host_drive_ends_when_the_next_candidate_left_the_lru() {
     tc.evictable_host_leaves.add(s);
     let (mut tr, mut df, mut hf) = host_drive_state();
     accumulate_step(
-        tc.drive_host_eviction(SWA, /* num_tokens = */ 100),
+        tc.drive_host_eviction(SWA, /* num_tokens = */ 100, false),
         &mut tr,
         &mut df,
         &mut hf,
@@ -3574,7 +3574,7 @@ fn host_drive_panics_on_an_lru_member_without_a_swa_host_value() {
         .unwrap();
     set_full_host(&mut tc, n);
     tc.host_lru_list_mut(SWA).insert_mru(n);
-    tc.drive_host_eviction(SWA, /* num_tokens = */ 100);
+    tc.drive_host_eviction(SWA, /* num_tokens = */ 100, false);
 }
 
 #[test]
@@ -4587,14 +4587,14 @@ fn swa_host_eviction_skips_a_load_back_pinned_node() {
     )
     .expect("live test node");
 
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1, true);
     assert_eq!(result.tracker[&SWA], 0);
     assert!(result.host_frees.is_empty());
     assert!(tc.arena.has_host_value(a, SWA));
 
     tc.finish_load_back(tc.arena.node(b).id)
         .expect("live test node");
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1, true);
     assert_eq!(result.tracker[&SWA], 1);
     assert_eq!(result.host_frees[&SWA].len(), 1);
     // Write-back reclaims the loaded node's coexisting host duplicate first.
@@ -4688,7 +4688,7 @@ fn host_drive_reclaims_swa_coexisting_host_values_when_the_host_lru_is_empty() {
     let mut tracker = swa_tracker();
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
     accumulate_step(
-        tc.drive_host_eviction(SWA, /* num_tokens = */ 2),
+        tc.drive_host_eviction(SWA, /* num_tokens = */ 2, false),
         &mut tracker,
         &mut df,
         &mut hf,

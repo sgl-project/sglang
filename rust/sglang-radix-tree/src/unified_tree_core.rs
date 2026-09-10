@@ -2239,12 +2239,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         component_type: ComponentType,
         num_tokens: usize,
+        skip_host_duplicate_reclaim: bool,
     ) -> EvictionStepResult {
         let mut result = EvictionStepResult::default();
         if let Some(component) = self.try_component_by_type_(component_type) {
             // The drive gates on the driven component's entry, so seed it.
             result.tracker.insert(component_type, 0);
-            if self.is_write_back {
+            if self.is_write_back && !(skip_host_duplicate_reclaim && component_type == FULL) {
                 component.reclaim_coexisting_host_values(
                     self,
                     num_tokens,

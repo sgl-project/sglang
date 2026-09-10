@@ -1693,9 +1693,13 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         component_type: u8,
         num_tokens: usize,
+        skip_host_duplicate_reclaim: bool,
     ) -> PyResult<HostEvictionResultBinding> {
         let ct = parse_component_type(component_type)?;
-        let result = py.allow_threads(move || self.core().drive_host_eviction(ct, num_tokens));
+        let result = py.allow_threads(move || {
+            self.core()
+                .drive_host_eviction(ct, num_tokens, skip_host_duplicate_reclaim)
+        });
         Ok(HostEvictionResultBinding {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -2775,8 +2779,14 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 component_type: u8,
                 num_tokens: usize,
+                skip_host_duplicate_reclaim: bool,
             ) -> PyResult<HostEvictionResultBinding> {
-                self.inner.drive_host_eviction(py, component_type, num_tokens)
+                self.inner.drive_host_eviction(
+                    py,
+                    component_type,
+                    num_tokens,
+                    skip_host_duplicate_reclaim,
+                )
             }
 
             /// Evict shallow Mamba device checkpoints beyond the per-path cap

@@ -1313,14 +1313,14 @@ fn mamba_host_eviction_skips_a_load_back_pinned_node() {
     )
     .expect("live test node");
 
-    let result = tc.drive_host_eviction(MAMBA, /* num_tokens = */ 1);
+    let result = tc.drive_host_eviction(MAMBA, /* num_tokens = */ 1, true);
     assert_eq!(result.tracker[&MAMBA], 0);
     assert!(result.host_frees.is_empty());
     assert!(tc.arena.has_host_value(a, MAMBA));
 
     tc.finish_load_back(tc.arena.node(b).id)
         .expect("live test node");
-    let result = tc.drive_host_eviction(MAMBA, /* num_tokens = */ 1);
+    let result = tc.drive_host_eviction(MAMBA, /* num_tokens = */ 1, true);
     assert_eq!(result.tracker[&MAMBA], 1);
     assert_eq!(result.host_frees[&MAMBA].len(), 1);
     assert!(!tc.arena.has_host_value(a, MAMBA));

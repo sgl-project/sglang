@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStoredWithMetadata,
     StorageMedium,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -609,7 +610,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         binding_result = self._binding.drive_host_eviction(
-            int(component_type), num_tokens
+            int(component_type),
+            num_tokens,
+            envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get(),
         )
         return _fill_evict_result(binding_result, DriveHostEvictionResult())
 

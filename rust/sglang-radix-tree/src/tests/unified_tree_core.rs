@@ -2796,7 +2796,7 @@ fn demoted_events_leaf(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
 fn host_eviction_emits_a_cpu_block_removed() {
     let mut tc = events_core(1);
     demoted_events_leaf(&mut tc);
-    tc.drive_host_eviction(FULL, 1);
+    tc.drive_host_eviction(FULL, 1, false);
     let hashes = crate::node::get_hash_str::<Vec<i64>>(&[1], None, 1);
     assert_eq!(
         tc.take_events(),
@@ -6094,7 +6094,7 @@ fn drive_host_eviction_is_a_noop_for_an_absent_component() {
     let mut tr = HashMap::from([(SWA, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
     accumulate_step(
-        tc.drive_host_eviction(SWA, /* num_tokens = */ 100),
+        tc.drive_host_eviction(SWA, /* num_tokens = */ 100, false),
         &mut tr,
         &mut df,
         &mut hf,
@@ -6107,7 +6107,7 @@ fn drive_host_eviction_is_a_noop_for_an_absent_component() {
 #[test]
 fn drive_host_eviction_keeps_zero_delta_tracker_entries() {
     let mut tc = core();
-    let result = tc.drive_host_eviction(FULL, /* num_tokens = */ 10);
+    let result = tc.drive_host_eviction(FULL, /* num_tokens = */ 10, false);
     assert_eq!(result.tracker, HashMap::from([(FULL, 0)]));
     assert!(result.device_frees.is_empty());
     assert!(result.host_frees.is_empty());
@@ -6125,7 +6125,7 @@ fn drive_host_eviction_dispatches_reclaim_only_under_write_back() {
     let recorder = Arc::new(RecordingComponentForTest::default());
     tc.register_component_(recorder.clone());
 
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 10);
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 10, false);
 
     assert_eq!(
         *recorder.host_eviction_calls.lock().unwrap(),
@@ -6135,7 +6135,7 @@ fn drive_host_eviction_dispatches_reclaim_only_under_write_back() {
 
     recorder.host_eviction_calls.lock().unwrap().clear();
     tc.is_write_back = false;
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 10);
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 10, false);
 
     assert_eq!(
         *recorder.host_eviction_calls.lock().unwrap(),
@@ -6155,7 +6155,7 @@ fn drive_host_eviction_default_reclaim_hook_is_a_noop() {
     );
     tc.register_component_(Arc::new(SwaComponentForTest));
 
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 10);
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 10, false);
 
     assert_eq!(result.tracker, HashMap::from([(SWA, 0)]));
     assert!(result.device_frees.is_empty());

@@ -907,6 +907,49 @@ def test_drive_host_eviction_frees_the_demoted_leaf():
     core.sanity_check([], [])
 
 
+@pytest.mark.parametrize("write_back", [False, True])
+def test_skip_host_duplicate_reclaim_preserves_full_copies(write_back):
+    core = _tree_core()
+    core.set_hicache_enabled()
+    core.is_write_back = write_back
+    _insert(core, [1], [10])
+    leaf = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+    core.commit_backup(leaf, torch.tensor([100], dtype=torch.int64), {})
+    core.insert_host(
+        core.root_node_handle(), _key([2]), torch.tensor([200], dtype=torch.int64), []
+    )
+
+    with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(True):
+        result = core.drive_host_eviction(ComponentType.FULL, 1)
+        assert result.tracker[ComponentType.FULL] == 1
+        assert [t.tolist() for t in result.host_frees.pop(ComponentType.FULL)] == [
+            [200]
+        ]
+        assert not result.device_frees
+        assert core.is_backuped(leaf)
+        core.sanity_check([], [])
+
+        result = core.drive_host_eviction(ComponentType.FULL, 1)
+        assert result.tracker.get(ComponentType.FULL, 0) == 0
+        assert not result.host_frees
+        assert core.is_backuped(leaf)
+
+    with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(False):
+        result = core.drive_host_eviction(ComponentType.FULL, 1)
+        if write_back:
+            assert result.tracker[ComponentType.FULL] == 1
+            assert [t.tolist() for t in result.host_frees.pop(ComponentType.FULL)] == [
+                [100]
+            ]
+            assert not core.is_backuped(leaf)
+        else:
+            assert result.tracker.get(ComponentType.FULL, 0) == 0
+            assert not result.host_frees
+            assert core.is_backuped(leaf)
+        assert not result.device_frees
+        core.sanity_check([], [])
+
+
 def test_events_disabled_take_events_is_empty():
     core = _tree_core()
     _insert(core, [1, 2], [10, 11])
