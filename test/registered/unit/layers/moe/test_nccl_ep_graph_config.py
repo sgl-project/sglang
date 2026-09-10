@@ -84,6 +84,46 @@ def server_args(model_path, **overrides):
     return ServerArgs(**options)
 
 
+@pytest.mark.parametrize(
+    "backend,symm_mem,configured,expected",
+    [
+        ("nccl_ep", False, None, "1"),
+        ("nccl_ep", False, "0", "1"),
+        ("nccl_ep", False, "1", "1"),
+        ("none", False, None, "0"),
+        ("none", False, "1", "1"),
+        ("none", True, "0", "1"),
+    ],
+)
+def test_engine_preserves_nccl_ep_device_api(
+    monkeypatch, backend, symm_mem, configured, expected
+):
+    import os
+    from unittest.mock import patch
+
+    from sglang.srt.entrypoints import engine
+
+    args = SimpleNamespace(
+        enable_symm_mem=symm_mem,
+        moe_a2a_backend=backend,
+        enable_nccl_nvls=False,
+        dcp_size=1,
+        enable_metrics=False,
+        attention_backend="triton",
+        custom_sigquit_handler=None,
+    )
+    monkeypatch.setattr(engine, "set_ulimit", lambda: None)
+    monkeypatch.setattr(engine, "assert_pkg_version", lambda *args: None)
+    monkeypatch.setattr(engine.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(engine.mp, "set_start_method", lambda *args, **kwargs: None)
+    with patch.dict(os.environ):
+        os.environ.pop("NCCL_CUMEM_ENABLE", None)
+        if configured is not None:
+            os.environ["NCCL_CUMEM_ENABLE"] = configured
+        engine._set_envs_and_config(args)
+        assert os.environ["NCCL_CUMEM_ENABLE"] == expected
+
+
 def test_nccl_ep_defaults_to_eager_without_graph_opt_in(model_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kw: (9, 0))
     args = server_args(model_path)
@@ -213,7 +253,7 @@ def test_followup_serving_recipe_resolves_per_rank_capacity(
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     config = DeepseekV2Config(
         hidden_size=2048,
-        intermediate_size=10944,
+        intermediate_size=11008,
         moe_intermediate_size=1408,
         n_routed_experts=64,
         n_shared_experts=2,
