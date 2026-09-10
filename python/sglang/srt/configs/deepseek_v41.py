@@ -80,15 +80,6 @@ class DeepseekV41TextConfig(DeepseekV41Config):
 class DeepseekV41VisionConfig(PretrainedConfig):
     model_type = "deepseek_v41_vision"
 
-    def __init__(self, **kwargs):
-        kwargs["model_type"] = "deepseek_v41_vision"
-        super().__init__(**kwargs)
-
-    def to_dict(self):
-        values = super().to_dict()
-        values["model_type"] = "deepseek_v41_vision"
-        return values
-
 
 DEEPSEEK_V41_CONFIG_CLASSES = (
     DeepseekV41Config,
