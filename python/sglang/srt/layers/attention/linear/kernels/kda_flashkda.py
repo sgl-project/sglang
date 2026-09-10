@@ -9,13 +9,10 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
 
-# FlashKDA's max sequence length, Batches whose longest sequence exceeds this
-# fall back to Triton for the whole batch. Default 2048 (the measured
-# crossover); override with SGLANG_FLASHKDA_MAX_SEQ_LEN.
-_FLASHKDA_MAX_SEQ_LEN = 2048
-
-
 def _flashkda_max_seq_len() -> int:
+    """FlashKDA's max sequence length: batches whose longest sequence exceeds
+    it fall back to Triton for the whole batch. SGLANG_FLASHKDA_MAX_SEQ_LEN,
+    default 2048 (the measured crossover on TP8 K3)."""
     from sglang.srt.environ import envs
 
     return envs.SGLANG_FLASHKDA_MAX_SEQ_LEN.get()
