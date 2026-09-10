@@ -51,6 +51,87 @@ def _make_comm(world_size=8, workspace_cls=None, cpu_group=None, tune=None):
     return comm
 
 
+class TestGroupEligibility(CustomTestCase):
+    """Which groups get this backend, which is the rule that broke other models.
+
+    ``"tp" in unique_name`` also matched attention_tp / moe_tp /
+    pdmux_prefill_tp. Those groups carry no pynccl or custom all-reduce
+    communicator, so a reduction dispatched to them hits an assertion instead
+    of falling back, and Qwen3-8B TP4/DP2 and Qwen3-30B-A3B TP4/EP2 fail to
+    start with the flag on.
+    """
+
+    def test_only_the_tensor_parallel_group_is_eligible(self):
+        with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
+            self.assertTrue(pcie_ipc_ar.eligible_group("tp", 4))
+            for name in ("attention_tp", "moe_tp", "pdmux_prefill_tp", "world", "pp"):
+                with self.subTest(group=name):
+                    self.assertFalse(pcie_ipc_ar.eligible_group(name, 4))
+
+    def test_single_rank_group_is_not_eligible(self):
+        with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
+            self.assertFalse(pcie_ipc_ar.eligible_group("tp", 1))
+
+    def test_disabled_by_default(self):
+        """The backend is opt-in; nothing attaches without the flag."""
+        self.assertFalse(pcie_ipc_ar.eligible_group("tp", 4))
+
+    def test_anonymous_group_is_not_eligible(self):
+        with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
+            self.assertFalse(pcie_ipc_ar.eligible_group(None, 4))
+            self.assertFalse(pcie_ipc_ar.eligible_group("anonymous", 4))
+
+
+class TestWorkspaceRelease(CustomTestCase):
+    """The workspace must be released before the groups it was built on.
+
+    FlashInfer collectives on that group while tearing the workspace down, so
+    ordering is the whole point: releasing afterwards is not a leak that shows
+    up in testing, it is a collective on a destroyed group.
+    """
+
+    def _coordinator(self, order):
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        coordinator = GroupCoordinator.__new__(GroupCoordinator)
+        coordinator.device_group = MagicMock(name="device_group")
+        coordinator.cpu_group = MagicMock(name="cpu_group")
+        coordinator.pynccl_comm = None
+        coordinator.pymscclpp_comm = None
+        coordinator.ca_comm = None
+        coordinator.mq_broadcaster = None
+        workspace = MagicMock()
+        workspace.destroy.side_effect = lambda: order.append("workspace")
+        coordinator.pcie_ipc_comm = workspace
+        return coordinator
+
+    def test_released_before_the_process_groups(self):
+        order = []
+        coordinator = self._coordinator(order)
+        with patch.object(
+            torch.distributed,
+            "destroy_process_group",
+            side_effect=lambda g: order.append("process_group"),
+        ):
+            coordinator.destroy()
+
+        self.assertEqual(order[0], "workspace")
+        self.assertEqual(order.count("process_group"), 2)
+        self.assertIsNone(coordinator.pcie_ipc_comm)
+
+    def test_destroy_without_the_backend_is_a_no_op(self):
+        order = []
+        coordinator = self._coordinator(order)
+        coordinator.pcie_ipc_comm = None
+        with patch.object(
+            torch.distributed,
+            "destroy_process_group",
+            side_effect=lambda g: order.append("process_group"),
+        ):
+            coordinator.destroy()
+        self.assertEqual(order, ["process_group", "process_group"])
+
+
 class TestWorldSizeGate(CustomTestCase):
     def test_unsupported_world_size_disables(self):
         """A world size the kernels have no IPC channels for must disable cleanly."""

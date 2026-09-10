@@ -79,6 +79,22 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _FALLBACK_DECODE_WIDTH = 64
 
 
+
+#: Exact names, not a substring test: attention_tp / moe_tp / pdmux_prefill_tp
+#: carry no pynccl or custom all-reduce communicator, and a reduction
+#: dispatched to them asserts rather than falling back.
+_ELIGIBLE_GROUP_NAMES = frozenset({"tp"})
+
+
+def eligible_group(group_name: Optional[str], world_size: int) -> bool:
+    """Whether ``GroupCoordinator`` should build this backend for a group."""
+    return (
+        envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.get()
+        and world_size > 1
+        and group_name in _ELIGIBLE_GROUP_NAMES
+    )
+
+
 def _decode_width() -> Optional[int]:
     """Rows in the widest decode reduction, or None when the server args are absent.
 

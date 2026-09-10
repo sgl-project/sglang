@@ -471,18 +471,13 @@ class GroupCoordinator:
         self.qr_comm: Optional[QuickAllReduce] = None
 
         self.pcie_ipc_comm: Optional[Any] = None
-        # Only the tensor-parallel group issues the per-layer reductions these
-        # kernels target; other groups would just pin IPC buffers.
-        if (
-            envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.get()
-            and self.world_size > 1
-            and "tp" in self.unique_name
-        ):
-            try:
-                from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
-                    PcieIpcCommunicator,
-                )
+        from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
+            PcieIpcCommunicator,
+            eligible_group,
+        )
 
+        if eligible_group(group_name=group_name, world_size=self.world_size):
+            try:
                 # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
                 # Autotuning is the other way round: it rendezvouses on the host.
                 self.pcie_ipc_comm = PcieIpcCommunicator(
@@ -1884,6 +1879,11 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        # Must precede destroy_process_group(): FlashInfer's workspace
+        # teardown collectives on the group it was built with.
+        if self.pcie_ipc_comm is not None:
+            self.pcie_ipc_comm.destroy()
+            self.pcie_ipc_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
