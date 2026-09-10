@@ -165,6 +165,7 @@ class Memory(msgspec.Struct):
                 "simm",
                 "mori",
                 "shm",
+                "kvcr",
             ],
         ),
     ] = None

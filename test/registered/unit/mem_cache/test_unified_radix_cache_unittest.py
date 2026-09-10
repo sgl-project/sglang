@@ -897,6 +897,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
                 new_input_tokens,
                 last_hash=None,
                 prefix_keys=None,
+                kv_hints=None,
                 extra_pools=None,
                 assume_stored=False,
             ):

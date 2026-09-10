@@ -3173,6 +3173,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    kv_hints=req.kv_hints,
                 )
 
     def _process_storage_prefetch_retries(self):
@@ -5147,10 +5148,25 @@ class Scheduler(
                 logger.info("Cache flushed successfully!")
             success = True
         else:
+            # HiCache in-flight ops also block the flush, so reporting only the
+            # request counts leaves "0 queued, 0 running, still refused".
+            hicache_pending = ""
+            if self.enable_hierarchical_cache:
+                tc = self.tree_cache
+                hicache_pending = (
+                    f", #write-through: {len(tc.ongoing_write_through)}"
+                    f", #load-back: {len(tc.ongoing_load_back)}"
+                )
+                if tc.enable_storage:
+                    hicache_pending += (
+                        f", #prefetch: {len(tc.ongoing_prefetch)}"
+                        f", #backup: {len(tc.ongoing_backup)}"
+                    )
             logging.warning(
-                f"Cache not flushed because there are pending requests. "
+                f"Cache not flushed because there is pending work. "
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {len(self.running_batch.reqs)}"
+                f"{hicache_pending}"
             )
             success = False
         return success
