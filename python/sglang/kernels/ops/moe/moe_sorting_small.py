@@ -27,6 +27,7 @@ to the original functions when the fast path does not apply:
 from __future__ import annotations
 
 import functools
+from contextvars import ContextVar
 import logging
 
 import torch
@@ -448,10 +449,12 @@ def _run_small_sort(
     return None
 
 
-# hidden_states of the in-flight aiter fused_moe call, when its dtypes make
-# the stage1 mxfp8 quant path certain (single-threaded forward; cleared in
-# the fused_moe wrapper's finally).
-_pending_quant_input: torch.Tensor | None = None
+# hidden_states of the in-flight aiter fused_moe call, when its dtypes make the
+# stage1 mxfp8 quant path certain. aiter calls _moe_sorting_impl from inside
+# fused_moe without threading the tensor through, so it travels as ambient state.
+_pending_quant_input: ContextVar[torch.Tensor | None] = ContextVar(
+    "aiter_pending_quant_input", default=None
+)
 
 _patched = False
 
@@ -483,7 +486,6 @@ def apply_aiter_small_moe_sort_patch() -> None:
     def fused_moe_wrapper(
         hidden_states, w1, w2, topk_weight, topk_ids, *args, **kwargs
     ):
-        global _pending_quant_input
         quant_type = kwargs.get("quant_type", fm.QuantType.No)
         emit = (
             quant_type == fm.QuantType.per_1x32
@@ -493,13 +495,13 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and hidden_states.shape[-1] % 2048 == 0
             and topk_ids.numel() <= 256
         )
-        _pending_quant_input = hidden_states if emit else None
+        token = _pending_quant_input.set(hidden_states if emit else None)
         try:
             return orig_fused_moe(
                 hidden_states, w1, w2, topk_weight, topk_ids, *args, **kwargs
             )
         finally:
-            _pending_quant_input = None
+            _pending_quant_input.reset(token)
 
     @functools.wraps(orig_sorting_impl)
     def sorting_impl_wrapper(
@@ -555,7 +557,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 num_valid_ids,
                 moe_buf,
                 int(block_size),
-                _pending_quant_input,
+                _pending_quant_input.get(),
                 int(num_experts),
             )
             if quant_ret is not None:
