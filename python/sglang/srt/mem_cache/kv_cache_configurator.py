@@ -131,6 +131,16 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 _is_npu = is_npu()
 
 
+def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
+    """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
+    stays a bf16 ring; MTP/EAGLE NextN follows the env."""
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_fp8,
+    )
+
+    return is_unified_kv_fp8() and not (is_draft_worker and spec_algorithm.is_dspark())
+
+
 def _should_enable_lazy_compaction() -> bool:
     """Lazy compaction default — ON unless
     `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
@@ -1348,6 +1358,11 @@ class KVCacheConfigurator:
         else:
             pool_cls = DeepSeekV4TokenToKVPool
 
+        unified_fp8 = unified_fp8_for_dsv4_pool(
+            is_draft_worker=self.is_draft_worker,
+            spec_algorithm=self.spec_algorithm,
+        )
+
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
@@ -1375,6 +1390,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            unified_fp8=unified_fp8,
         )
         if not self.is_draft_worker and token_to_kv_pool._unified_kv:
             # The draft pool has no C4 layers and shares this req pool, so only

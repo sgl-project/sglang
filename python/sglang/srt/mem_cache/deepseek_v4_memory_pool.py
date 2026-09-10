@@ -68,6 +68,19 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
     return sliding_window + spec_extra
 
 
+def resolve_unified_kv_fp8(unified_fp8: Optional[bool] = None) -> bool:
+    """Per-pool fp8 layout. None follows SGLANG_DSV4_UNIFIED_KV_FP8.
+
+    A caller may pass False so this pool keeps the bf16 ring while the env
+    stays on (target fused-Q still keys off the global switch).
+    """
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_fp8,
+    )
+
+    return is_unified_kv_fp8() if unified_fp8 is None else bool(unified_fp8)
+
+
 class DeepSeekV4SingleKVPool(KVCache):
     def __init__(
         self,
@@ -679,6 +692,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        unified_fp8: Optional[bool] = None,
     ):
         super().__init__(
             swa_size,
@@ -691,13 +705,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             end_layer,
         )
         c4_logical_size = c128_size * 32
-
-        logger.info(
-            "Initialize DeepSeekV4TokenToKVPool with "
-            f"{max_num_reqs=} {swa_size=} {c4_size=} "
-            f"{c4_logical_size=} {c128_size=} "
-            f"{c4_state_pool_size=} {c128_state_pool_size=}"
-        )
 
         self.max_num_reqs = max_num_reqs
         # PD preallocation can exceed max_num_reqs;
@@ -714,7 +721,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified_kv = is_unified_kv_triton()
-        self._unified_kv_fp8 = is_unified_kv_fp8()
+        self._unified_kv_fp8 = resolve_unified_kv_fp8(unified_fp8)
+        logger.info(
+            "Initialize DeepSeekV4TokenToKVPool with "
+            f"{max_num_reqs=} {swa_size=} {c4_size=} "
+            f"{c4_logical_size=} {c128_size=} "
+            f"{c4_state_pool_size=} {c128_state_pool_size=} "
+            f"unified={self._unified_kv} unified_fp8={self._unified_kv_fp8}"
+        )
+        if is_unified_kv_fp8() and not self._unified_kv_fp8:
+            logger.info(
+                "SGLANG_DSV4_UNIFIED_KV_FP8 is on; this pool stays bf16 "
+                "(unified_fp8=False)"
+            )
         # Uniform 512-dim e4m3 layout for the trtllm attention backend
         self.uniform_fp8 = (
             not self._unified_kv
