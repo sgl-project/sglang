@@ -2,6 +2,7 @@ import logging
 
 import torch
 
+from sglang.kernels.ops.memory.allocator import get_and_clear_swa_pages
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -462,30 +463,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         self._free_swa_pages(free_index, start_pos=start_pos)
 
-    def _free_swa_pages(self, free_index: torch.Tensor, *, start_pos: int):
+    def _free_swa_pages(self, free_index: torch.Tensor, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
-        # First token of every page the segment touches; the caller allocated
-        # each one, so a dead entry means the caller wanted free_full.
-        reps = free_index[::ps]
-        swa_tokens = self.full_to_swa_index_mapping[reps]
-        expect(_SWA_PEER_MAPPED, swa_tokens > 0, msg="caller wants free_full")
-
-        if ps == 1:
-            swa_pages = swa_tokens
-            mapping_indices = free_index
+        full_page_representatives = free_index[::ps]
+        # torch_npu's transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu.
+        if not _is_npu and free_index.is_cuda:
+            swa_pages = self._free_swa_pages_cuda(full_page_representatives)
         else:
-            swa_pages = swa_tokens // ps
-            # Both pools page in step (alloc_extend / alloc_decode drive them
-            # with one seq_lens), so a rep's peer page is the whole peer page.
-            mapping_indices = self._expand_to_full_pages(reps)
-            if self.swa_attn_allocator.debug_mode:
-                ref = self.full_to_swa_index_mapping[mapping_indices].cpu()
-                assert torch.equal(
-                    torch.sort(swa_pages.cpu())[0],
-                    torch.unique(ref[ref > 0] // ps),
-                ), "swa pages do not match the mapped pages"
-        self.clear_full_to_swa_mapping(mapping_indices)
+            swa_pages = self._free_swa_pages_none_cuda(full_page_representatives)
 
         if self._swa_req_ring:
             # Ring slots are owned by the req slot, never lent by the paged
@@ -499,6 +485,52 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.swa_attn_allocator.free_page_ids(swa_pages)
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def _free_swa_pages_none_cuda(
+        self, full_page_representatives: torch.Tensor
+    ) -> torch.Tensor:
+        ps = self.page_size
+        swa_tokens = self.full_to_swa_index_mapping[full_page_representatives]
+        expect(_SWA_PEER_MAPPED, swa_tokens > 0, msg="caller wants free_full")
+
+        if ps == 1:
+            swa_pages = swa_tokens
+            mapping_indices = full_page_representatives
+        else:
+            swa_pages = swa_tokens // ps
+            # Both pools page in step (alloc_extend / alloc_decode drive them
+            # with one seq_lens), so a rep's peer page is the whole peer page.
+            mapping_indices = self._expand_to_full_pages(full_page_representatives)
+            if self.swa_attn_allocator.debug_mode:
+                ref = self.full_to_swa_index_mapping[mapping_indices].cpu()
+                assert torch.equal(
+                    torch.sort(swa_pages.cpu())[0],
+                    torch.unique(ref[ref > 0] // ps),
+                ), "swa pages do not match the mapped pages"
+
+        self.clear_full_to_swa_mapping(mapping_indices)
+        return swa_pages
+
+    def _free_swa_pages_cuda(
+        self, full_page_representatives: torch.Tensor
+    ) -> torch.Tensor:
+        ps = self.page_size
+        check_page_mappings = ps > 1 and self.swa_attn_allocator.debug_mode
+        swa_pages, peers_mapped, page_mappings_valid = get_and_clear_swa_pages(
+            full_page_representatives,
+            self.full_to_swa_index_mapping,
+            ps,
+            check_page_mappings=check_page_mappings,
+        )
+        expect(_SWA_PEER_MAPPED, peers_mapped, msg="caller wants free_full")
+        if check_page_mappings:
+            assert page_mappings_valid is not None
+            # JIT checks within pages; sorting catches duplicate SWA pages.
+            sorted_swa_pages = torch.sort(swa_pages).values
+            assert torch.all(page_mappings_valid) & torch.all(
+                sorted_swa_pages[1:] != sorted_swa_pages[:-1]
+            ), "swa pages do not match the mapped pages"
+        return swa_pages
 
     def _release_swa(self, swa_indices: torch.Tensor):
         if self.page_size > 1:
