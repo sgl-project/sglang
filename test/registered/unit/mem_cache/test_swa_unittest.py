@@ -1369,6 +1369,79 @@ class TestSWAPageRepsFree(CustomTestCase):
     def _sizes(self, allocator):
         return allocator.full_available_size(), allocator.swa_available_size()
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a tensor with is_cuda=True")
+    def test_free_swa_segment_npu_uses_reference_path(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                _, allocator, _ = _build_swa_tree(
+                    is_eagle=False,
+                    page_size=page_size,
+                    kv_size=8 * page_size,
+                    kv_size_swa=8 * page_size,
+                )
+                available_before = allocator.swa_available_size()
+                full_indices = _swa_alloc(allocator, page_size)
+                self.assertTrue(full_indices.is_cuda)
+
+                # transfer_to_npu makes NPU tensors report is_cuda=True as well.
+                with (
+                    patch("sglang.srt.mem_cache.allocator.swa._is_npu", True),
+                    patch(
+                        "sglang.srt.mem_cache.allocator.swa.get_and_clear_swa_pages",
+                        side_effect=AssertionError("NPU free reached Triton"),
+                    ),
+                ):
+                    allocator.free_swa_segment(full_indices[:1], start_pos=0)
+
+                self.assertEqual(allocator.swa_available_size(), available_before)
+                self.assertTrue(
+                    torch.all(allocator.full_to_swa_index_mapping[full_indices] == 0)
+                )
+
+    def test_free_swa_segment_debug_rejects_invalid_page_mappings(self):
+        page_size = 4
+
+        def leading_hole(mapping, full_indices, _swa_indices):
+            mapping[full_indices[0]] = 0
+
+        def multiple_peers(mapping, full_indices, swa_indices):
+            mapping[full_indices[2:page_size]] = swa_indices[
+                page_size + 2 : 2 * page_size
+            ]
+
+        def duplicate_peer(mapping, full_indices, swa_indices):
+            mapping[full_indices[page_size : 2 * page_size]] = swa_indices[:page_size]
+
+        def duplicate_representative(_mapping, full_indices, _swa_indices):
+            full_indices[-page_size:] = full_indices[:page_size]
+
+        for name, mutate, num_tokens in (
+            ("leading_hole", leading_hole, page_size),
+            ("multiple_peers", multiple_peers, page_size),
+            ("duplicate_peer", duplicate_peer, 2 * page_size),
+            # At page size 4, representatives 0 and 64 belong to separate programs.
+            ("duplicate_representative", duplicate_representative, 65 * page_size),
+        ):
+            with self.subTest(name=name):
+                num_allocated_tokens = max(2 * page_size, num_tokens)
+                kv_size = max(8 * page_size, num_allocated_tokens)
+                _, allocator, _ = _build_swa_tree(
+                    is_eagle=False,
+                    page_size=page_size,
+                    kv_size=kv_size,
+                    kv_size_swa=kv_size,
+                )
+                full_indices = _swa_alloc(allocator, num_allocated_tokens)
+                mapping = allocator.full_to_swa_index_mapping
+                swa_indices = mapping[full_indices].clone()
+                mutate(mapping, full_indices, swa_indices)
+                allocator.swa_attn_allocator.debug_mode = True
+
+                with self.assertRaisesRegex(
+                    AssertionError, "swa pages do not match the mapped pages"
+                ):
+                    allocator.free_swa_segment(full_indices[:num_tokens], start_pos=0)
+
     def test_segment_free_releases_the_mapped_pages_for_every_tail(self):
         ps = self.PS
         for num_tokens in (1, ps, ps + 1, 3 * ps - 1, 3 * ps):
