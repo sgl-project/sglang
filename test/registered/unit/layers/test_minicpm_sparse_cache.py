@@ -16,10 +16,12 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class RecordingAllocator(BaseTokenToKVPoolAllocator):
@@ -52,6 +54,9 @@ class RecordingAllocator(BaseTokenToKVPoolAllocator):
 
     def available_size(self):
         return self.capacity - len(self.live)
+
+    def get_all_free_pages(self):
+        return self.free_pages
 
     def clear(self):
         self.next_slot = 1
@@ -86,6 +91,16 @@ def alloc_extend(pool, req_pool_idx: int, seq_len: int):
         req_pool_indices_cpu=torch.tensor([req_pool_idx], dtype=torch.int64),
         target_seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
     )
+
+
+def setup_function(_):
+    # The cache reads its parallel topology from the context.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+
+def teardown_function(_):
+    reset_context()
 
 
 def test_extend_allocates_at_sparse_boundaries():
@@ -179,6 +194,7 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_full_pool(
@@ -244,7 +260,6 @@ def test_streaming_session_release_frees_compressed_slots():
 def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
     allocator.free_pages = torch.arange(6, 70, dtype=torch.int64)
-    allocator.release_pages = torch.empty(0, dtype=torch.int64)
     pool.mamba_pool = SimpleNamespace(size=1)
     pool.mamba_allocator = SimpleNamespace(
         size=1,
@@ -270,6 +285,7 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         ),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_mamba_pool(

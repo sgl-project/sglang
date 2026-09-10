@@ -1077,9 +1077,9 @@ class TransformersBase(nn.Module):
             )
 
         if get_embedding:
-            assert (
-                self.pooler is not None
-            ), "pooling is not enabled for this model class"
+            assert self.pooler is not None, (
+                "pooling is not enabled for this model class"
+            )
             return self.pooler(hidden_states, forward_batch)
 
         assert self.logits_processor is not None and self.lm_head is not None
@@ -1100,7 +1100,6 @@ class TransformersBase(nn.Module):
 
 
 class CausalMixin:
-
     def __init__(self, *args, prefix: str = "", **kwargs):
         super().__init__(*args, prefix=prefix, **kwargs)
 
@@ -1128,7 +1127,6 @@ class CausalMixin:
 
 
 class EmbeddingMixin:
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ignore_unexpected_prefixes.append("lm_head.")
@@ -1141,7 +1139,6 @@ class EmbeddingMixin:
 
 
 class MoEMixin:
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

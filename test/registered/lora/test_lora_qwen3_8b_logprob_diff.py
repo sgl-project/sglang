@@ -37,7 +37,7 @@ from sglang.srt.lora.utils import auto_detect_lora_target_modules
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=40, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=56, stage="extra-a", runner_config="1-gpu-large")
 
 BASE_MODEL = "Qwen/Qwen3-8B"
 LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-8B"
@@ -48,6 +48,25 @@ PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "fa4"
 
 KL_THRESHOLD = 5e-3
+
+
+def attention_backend_kwargs():
+    """Engine attention-backend kwargs for the current platform.
+
+    fa4 and flashinfer are CUDA-only: fa4 dispatches into the CUTLASS CUTE DSL
+    kernel, which cannot import off CUDA. On XPU the equivalent fused path is
+    the intel_xpu backend, so select it there instead of forcing a backend the
+    device has no kernels for.
+    """
+    from sglang.srt.utils import is_xpu
+
+    if is_xpu():
+        return {"attention_backend": "intel_xpu"}
+    return {
+        "attention_backend": "flashinfer",
+        "prefill_attention_backend": PREFILL_ATTENTION_BACKEND,
+        "decode_attention_backend": DECODE_ATTENTION_BACKEND,
+    }
 
 
 def kl_v2(a, b):
@@ -103,7 +122,6 @@ def _build_qwen3_mock():
 
 
 class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
-
     def test_auto_detect_lora_target_modules(self):
         """Verify auto_detect_lora_target_modules returns the expected module
         set for a Qwen3-8B-like (dense) architecture.  Catches silent renames
@@ -138,9 +156,7 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
             max_lora_rank=MAX_LORA_RANK,
             lora_paths={"my_lora": adapter_path},
             lora_backend=LORA_BACKEND,
-            attention_backend="flashinfer",
-            prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
-            decode_attention_backend=DECODE_ATTENTION_BACKEND,
+            **attention_backend_kwargs(),
         )
 
         try:

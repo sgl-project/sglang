@@ -215,10 +215,12 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError()
 
     def get_kv_cache_quant_method(self) -> Any:
@@ -252,6 +254,9 @@ class BaseSWAKVPool(KVCache):
     """
 
     swa_kv_pool: KVCache
+    # Set when SWA KV is a per-request ring of this many tokens (addressed by
+    # req_pool_idx) rather than a paged token pool; SWA is then not budgeted per token.
+    swa_req_ring_size: Optional[int] = None
 
     @abc.abstractmethod
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:

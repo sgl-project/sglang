@@ -681,7 +681,7 @@ def hpc_ops_fp8_rope_store_kv(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     backend = get_attn_backend()
     backend._run_fp8_rope_store_kv(

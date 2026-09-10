@@ -15,7 +15,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
+from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.utils.common import is_gfx1250_supported
@@ -584,6 +584,20 @@ def mhc_pre_gemm_sqrsum_tilelang(
 
 
 @functools.cache
+def _mhc_pre_gemm_sqrsum_dispatch():
+    """SM120's TileLang pipeline cannot warp-specialize this kernel (the role
+    marker fails on tirx.Bind), so re-wrap it there with warp specialization
+    disabled. Other archs keep the original compiled form."""
+    from sglang.srt.utils import is_sm120_supported
+
+    if not is_sm120_supported():
+        return mhc_pre_gemm_sqrsum_tilelang
+    _tl = _load_tilelang()
+    cfg = {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+    return _tl.jit(pass_configs=cfg)(mhc_pre_gemm_sqrsum_tilelang.__wrapped__)
+
+
+@functools.cache
 def mhc_pre_gemm_sqrsum_splitk_kernel(
     hc_mult3: int,
     hc_hidden_size: int,
@@ -603,7 +617,18 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     ENABLE_PDL = is_arch_support_pdl()
 
-    @tilelang.jit
+    from sglang.srt.utils import is_sm120_supported
+
+    _tl = _load_tilelang()
+    # See _mhc_pre_gemm_sqrsum_dispatch: SM120 cannot compile the
+    # warp-specialized form of these kernels.
+    _cfg = (
+        {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+        if is_sm120_supported()
+        else None
+    )
+
+    @tilelang.jit(pass_configs=_cfg)
     def mhc_pre_gemm_sqrsum_splitk_stage_0(
         x: T.Tensor[(num_tokens, hc_hidden_size), T.bfloat16],
         fn: T.Tensor[(hc_mult3, hc_hidden_size), T.float32],
@@ -1078,10 +1103,10 @@ def mhc_pre(
             gemm_out_sqrsum = torch.empty(
                 n_splits, num_tokens, dtype=torch.float32, device=residual.device
             )
-            assert (
-                n_splits == 1
-            ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
-            mhc_pre_gemm_sqrsum_tilelang(
+            assert n_splits == 1, (
+                "The simple TileLang version gemm_sqrsum doesn't support split-k"
+            )
+            _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_flat.view(num_tokens, hc_mult * hidden_size),
                 fn_flat,
                 gemm_out_mul.squeeze(0),
@@ -1094,9 +1119,9 @@ def mhc_pre(
 
     if norm_weight is not None:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
-        assert norm_weight.shape == (
-            hidden_size,
-        ), f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
+        assert norm_weight.shape == (hidden_size,), (
+            f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
+        )
         norm_weight_bf = (
             norm_weight.bfloat16()
             if norm_weight.dtype != torch.bfloat16
@@ -1215,7 +1240,7 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if is_dsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_interleave():
         x = strict_contiguous(x)
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
@@ -1637,7 +1662,7 @@ def mhc_fused_post_pre(
             gemm_out_sqrsum_1d = torch.empty(
                 num_tokens, dtype=torch.float32, device=residual.device
             )
-            mhc_pre_gemm_sqrsum_tilelang(
+            _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
                 gemm_out_mul_2d,

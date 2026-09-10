@@ -589,7 +589,7 @@ export const config = {
       // RTX 5090 32GB. NVFP4 is the only checkpoint that fits (FP8 does not
       // boot — total_rest_memory negative at every mem-fraction, measured —
       // and BF16 does not fit). Published operating point is ONE request in
-      // flight; --cuda-graph-max-bs 1 also protects the token pool (default
+      // flight; --cuda-graph-max-bs-decode 1 also protects the token pool (default
       // capture set costs 39,247 -> 37,347 and K 8 -> 7). The `warn` below
       // carries the user-facing guidance for raising concurrency.
       match: { hw: "rtx5090", variant: "default", quant: "nvfp4-bf16-head", nodes: "single" },
@@ -598,7 +598,7 @@ export const config = {
       // multi-user deployment unaware.
       warn:
         "This recipe serves ONE request at a time: --max-running-requests 1 " +
-        "and --cuda-graph-max-bs 1 pin it to the validated single-stream " +
+        "and --cuda-graph-max-bs-decode 1 pin it to the validated single-stream " +
         "envelope. To handle more concurrent requests, raise both flags " +
         "together and re-derive --mamba-full-memory-ratio (and mem-fraction) " +
         "with the [Mamba ratio calculator](#mamba-ratio-calculator) — on this " +
@@ -611,7 +611,7 @@ export const config = {
         "--mem-fraction-static 0.9",
         "--attention-backend flashinfer",
         "--max-running-requests 1",
-        "--cuda-graph-max-bs 1",
+        "--cuda-graph-max-bs-decode 1",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -624,7 +624,7 @@ export const config = {
       // RTX 5090 32GB. NVFP4 is the only checkpoint that fits (FP8 does not
       // boot — total_rest_memory negative at every mem-fraction, measured —
       // and BF16 does not fit). Published operating point is ONE request in
-      // flight; --cuda-graph-max-bs 1 also protects the token pool (default
+      // flight; --cuda-graph-max-bs-decode 1 also protects the token pool (default
       // capture set costs 39,247 -> 37,347 and K 8 -> 7). The `warn` below
       // carries the user-facing guidance for raising concurrency.
       match: { hw: "rtx5090", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
@@ -633,7 +633,7 @@ export const config = {
       // multi-user deployment unaware.
       warn:
         "This recipe serves ONE request at a time: --max-running-requests 1 " +
-        "and --cuda-graph-max-bs 1 pin it to the validated single-stream " +
+        "and --cuda-graph-max-bs-decode 1 pin it to the validated single-stream " +
         "envelope. To handle more concurrent requests, raise both flags " +
         "together and re-derive --mamba-full-memory-ratio (and mem-fraction) " +
         "with the [Mamba ratio calculator](#mamba-ratio-calculator) — on this " +
@@ -646,7 +646,7 @@ export const config = {
         "--mem-fraction-static 0.9",
         "--attention-backend flashinfer",
         "--max-running-requests 1",
-        "--cuda-graph-max-bs 1",
+        "--cuda-graph-max-bs-decode 1",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",

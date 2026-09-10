@@ -10,6 +10,7 @@ import torch
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
+    _RESERVED_ALIASES,
     CustomSpecAlgo,
     ServerArgsValidator,
     WorkerFactory,
@@ -37,6 +38,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    UNO = auto()
     DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
@@ -56,6 +58,8 @@ class SpeculativeAlgorithm(Enum):
             return cls[upper]
         except KeyError:
             pass
+        if upper in _RESERVED_ALIASES:
+            return cls.EAGLE
         spec = _get_registered_spec(upper)
         if spec is not None:
             return spec
@@ -113,6 +117,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
+
+    def is_uno(self) -> bool:
+        return self == SpeculativeAlgorithm.UNO
 
     def is_dspark(self) -> bool:
         return self == SpeculativeAlgorithm.DSPARK
@@ -220,6 +227,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_uno,
         )
 
         # Validate for every algorithm at startup: the metrics paths read the
@@ -230,6 +238,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_uno():
+            _handle_uno(server_args)
         elif self.is_dspark():
             _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
@@ -293,9 +303,9 @@ class SpeculativeAlgorithm(Enum):
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
 
         cfg = resolving_view(server_args)
-        assert (
-            not self.is_none()
-        ), "Cannot create worker for NONE speculative algorithm."
+        assert not self.is_none(), (
+            "Cannot create worker for NONE speculative algorithm."
+        )
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -303,6 +313,11 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_uno():
+            from sglang.srt.speculative.uno_worker_v2 import UnoWorkerV2
+
+            return UnoWorkerV2
 
         if self.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
@@ -356,6 +371,9 @@ class SpecInputType(IntEnum):
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    UNO_STATE = auto()
+    UNO_DRAFT = auto()
+    UNO_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -393,6 +411,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
             SpecInputType.DFLASH_DRAFT,
+            SpecInputType.UNO_DRAFT,
         }
 
     def is_verify_input(self) -> bool:
@@ -401,6 +420,7 @@ class SpecInput(ABC):
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.UNO_VERIFY,
         }
 
 

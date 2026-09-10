@@ -475,7 +475,6 @@ class TargetVerifyExecutor:
 
 
 class CommitInjectCtx(msgspec.Struct):
-
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
@@ -492,7 +491,6 @@ class AcceptOuts(msgspec.Struct):
 
 
 class DsparkVerifyEpilogue:
-
     def __init__(
         self,
         *,
