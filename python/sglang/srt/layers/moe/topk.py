@@ -104,7 +104,10 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+    should_use_flashinfer_moe_fp4_allgather,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -764,6 +767,17 @@ class TopK(BaseFusedOp):
                         device=device,
                     )
                 )
+        if should_use_flashinfer_moe_fp4_allgather() and (
+            self.topk_config.output_format == TopKOutputFormat.BYPASSED
+            or (
+                self.topk_config.output_format is None
+                and get_moe_runner_backend().is_flashinfer_trtllm()
+            )
+        ):
+            # Empty DP ranks must gather the same routing fields as nonempty
+            # ranks. The standard dispatcher fills in the logits' expert width.
+            empty = torch.empty((0, 0), dtype=torch.float32, device=device)
+            return BypassedTopKOutput(empty, empty, self.topk_config)
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()

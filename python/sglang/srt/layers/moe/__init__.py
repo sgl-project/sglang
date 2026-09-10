@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_mlp_all_reduce,
     should_skip_post_experts_all_reduce,
     should_use_dp_reduce_scatterv,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_moe_fp4_allgather,
 )
 
 __all__ = [
@@ -30,7 +30,7 @@ __all__ = [
     "should_skip_mlp_all_reduce",
     "should_skip_post_experts_all_reduce",
     "should_use_dp_reduce_scatterv",
-    "should_use_flashinfer_cutlass_moe_fp4_allgather",
+    "should_use_flashinfer_moe_fp4_allgather",
     "is_moe_input_scattered_across_dp_ranks",
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",

@@ -12,7 +12,10 @@ from sglang.srt.layers.communicator import (
     apply_flashinfer_allreduce_fusion,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    should_use_flashinfer_moe_fp4_allgather,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 ATTN_LAYERS = (MAMBA, ATTENTION)
@@ -51,7 +54,9 @@ def pad_to_original_num_tokens(
 
 
 def _build_layer_scatter_modes(is_sparse: bool = False) -> LayerScatterModes:
-    scatter_mlp = is_sparse and not get_moe_a2a_backend().is_none()
+    scatter_mlp = is_sparse and (
+        not get_moe_a2a_backend().is_none() or should_use_flashinfer_moe_fp4_allgather()
+    )
     mlp_mode = ScatterMode.SCATTERED if scatter_mlp else ScatterMode.FULL
     middle_residual_mode = (
         ScatterMode.SCATTERED if scatter_mlp else ScatterMode.TP_ATTN_FULL

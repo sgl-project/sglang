@@ -21,7 +21,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     is_flashinfer_cutedsl_v1_path,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_moe_fp4_allgather,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -2628,20 +2628,43 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
-        # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
-        use_dispatch_fp4 = (
-            not self.quant_config.use_per_token_activation
-            and not use_cutedsl_w4a16
-            and (
-                MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
-            )
+        use_fp4_allgather = should_use_flashinfer_moe_fp4_allgather()
+        use_dispatch_fp4 = not use_cutedsl_w4a16 and (
+            (MOE_NVFP4_DISPATCH and not self.quant_config.use_per_token_activation)
+            or use_fp4_allgather
         )
+        dispatch_input_scale = layer.w13_input_scale_quant
+        if use_fp4_allgather and self.quant_config.use_per_token_activation:
+            if self.enable_flashinfer_cutlass_moe:
+                raise ValueError(
+                    "Per-token NVFP4 all-gather requires flashinfer_trtllm, "
+                    "flashinfer_trtllm_routed, or flashinfer_cutedsl."
+                )
+            from flashinfer.quantization.nvfp4_quantization_utils import (
+                current_nvfp4_4over6_config,
+                make_nvfp4_global_scale,
+            )
 
+            # Keep the canonical per-token quantizer scale's address stable
+            # across weight reloads, just like the static activation scales.
+            copy_or_rebind_param(
+                layer,
+                "dispatch_input_scale",
+                make_nvfp4_global_scale(
+                    layer.w13_input_scale_quant,
+                    per_token_activation=True,
+                    nvfp4_4over6_config=current_nvfp4_4over6_config(),
+                ),
+            )
+            dispatch_input_scale = layer.dispatch_input_scale
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant if use_dispatch_fp4 else None
-                )
+                    dispatch_input_scale if use_dispatch_fp4 else None
+                ),
+                "use_per_token_activation": (
+                    use_fp4_allgather and self.quant_config.use_per_token_activation
+                ),
             }
         )
         block_size = 16

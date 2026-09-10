@@ -772,7 +772,7 @@ class ExecMoe:
         "[Deprecated] Alias for --elastic-ep-join-mode recover.",
     ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
-        bool, "Disables quantize before all-gather for flashinfer cutlass moe."
+        bool, "Disables quantize before all-gather for FlashInfer NVFP4 MoE runners."
     ] = False
     disable_shared_experts_fusion: A[
         bool,
