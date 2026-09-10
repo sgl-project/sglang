@@ -648,6 +648,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             ),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             # Virtual input stays separate from the backend's physical buffer.
             mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
