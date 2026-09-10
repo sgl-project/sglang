@@ -76,7 +76,7 @@ pub(super) fn load_chat_formatter(
             &model_type.map(str::to_lowercase),
             &model_path.unwrap_or_default().to_lowercase(),
         )
-        .map(ChatFormatter::Dynamo),
+        .map(ChatFormatter::HuggingFace),
         Some(_) => None,
     };
 
@@ -281,7 +281,7 @@ fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError>
     .map_err(|error| TemplateError::Renderer {
         message: error.to_string(),
     })?;
-    Ok(ChatFormatter::Dynamo(formatter))
+    Ok(ChatFormatter::HuggingFace(formatter))
 }
 
 /// Port of Python `_load_json_chat_template`: fields mirror `Conversation`

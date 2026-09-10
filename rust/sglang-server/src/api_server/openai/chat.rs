@@ -985,15 +985,15 @@ mod tests {
         assert_eq!(req.stop, Some(Stop::TokenIdArray(vec![2, 3])));
     }
 
-    /// The Dynamo renderer carries no template stops (Python's jinja path
+    /// The HuggingFace renderer carries no template stops (Python's jinja path
     /// keeps only the request's stops), so the request is left unchanged.
     #[test]
-    fn dynamo_formatter_leaves_request_stops_alone() {
+    fn huggingface_formatter_leaves_request_stops_alone() {
         let mut req = request();
         req.stop = Some(Stop::String("x".into()));
         // A prompt formatter is not constructible here without a tokenizer; the
         // empty-legacy-spec twin proves the merge is formatter-gated, and the
-        // `Dynamo` arm returns `None` by construction (see `stop_strs`).
+        // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
         let legacy = super::super::ChatFormatter::Legacy(Box::new(
             super::super::template::LegacyFormatter {
                 spec: super::super::template::LegacySpec::default(),
