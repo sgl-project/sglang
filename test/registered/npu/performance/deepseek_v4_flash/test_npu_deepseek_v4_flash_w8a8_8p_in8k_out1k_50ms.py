@@ -26,23 +26,13 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_NPU_USE_MULTI_STREAM": "1",
-
     # deepep
-    "DEEPEP_HCCL_BUFFSIZE": "1000",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "16",
-    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
-    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
-
-    # zbal
-    "HCCL_BUFFSIZE": "8",
-    "SGLANG_ZBAL_LOCAL_MEM_SIZE": "61000",
-    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
-    "ZBAL_NPU_ALLOC_CONF": "use_vmm_for_static_memory:True",
-    "SGLANG_ZBAL_BOOTSTRAP_URL": "tcp://127.0.0.1:24669",
-    "ZBAL_ENABLE_GRAPH": "1",
-
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    # war barrier
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -57,6 +47,9 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    # DSPARK
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0", 
 }
 
 # Server launch arguments for DSV4-Flash W8A8 single-node 8p PD-mix.
@@ -95,7 +88,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--kv-cache-dtype",
     "bfloat16",
     "--skip-server-warmup",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,
