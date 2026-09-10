@@ -19,11 +19,10 @@ use axum::{
 use data_connector::{ResponseId, StoredResponse};
 use serde_json::json;
 use smg::{
+    completion::CompletionRequest,
     config::{ConfigError, HistoryBackend, OracleConfig, RouterConfig, RoutingMode},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        common::StringOrArray,
-        completion::CompletionRequest,
         generate::GenerateRequest,
         responses::{ResponseInput, ResponsesGetParams, ResponsesRequest},
     },
@@ -51,42 +50,12 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 
 /// Helper function to create a minimal completion request for testing
 fn create_minimal_completion_request() -> CompletionRequest {
-    CompletionRequest {
-        model: "gpt-3.5-turbo".to_string(),
-        prompt: StringOrArray::String("Hello".to_string()),
-        suffix: None,
-        max_tokens: Some(100),
-        temperature: None,
-        top_p: None,
-        n: None,
-        stream: false,
-        stream_options: None,
-        logprobs: None,
-        echo: false,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        best_of: None,
-        logit_bias: None,
-        user: None,
-        seed: None,
-        top_k: None,
-        min_p: None,
-        min_tokens: None,
-        repetition_penalty: None,
-        regex: None,
-        ebnf: None,
-        json_schema: None,
-        stop_token_ids: None,
-        no_stop_trim: false,
-        ignore_eos: false,
-        skip_special_tokens: true,
-        lora_path: None,
-        session_params: None,
-        return_hidden_states: false,
-        sampling_seed: None,
-        other: serde_json::Map::new(),
-    }
+    serde_json::from_value(serde_json::json!({
+        "model": "gpt-3.5-turbo",
+        "prompt": "Hello",
+        "max_tokens": 100
+    }))
+    .unwrap()
 }
 
 /// Test basic OpenAI router creation and configuration

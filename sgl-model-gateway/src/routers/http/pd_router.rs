@@ -17,6 +17,7 @@ use tracing::{debug, error, warn};
 
 use super::pd_types::api_path;
 use crate::{
+    completion::CompletionRequest,
     config::types::RetryConfig,
     core::{
         is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
@@ -31,8 +32,7 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        common::{GenerationRequest, InputIds, StringOrArray},
-        completion::CompletionRequest,
+        common::{GenerationRequest, InputIds},
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
@@ -221,12 +221,7 @@ impl PDRouter {
     }
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
-        if let StringOrArray::Array(arr) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
-        }
-        None
+        req.batch_size()
     }
 
     // Static key strings to avoid per-request allocations
@@ -1626,14 +1621,11 @@ impl RouterTrait for PDRouter {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs.is_some();
+        let is_stream = body.is_stream();
+        let return_logprob = body.logprobs().is_some();
 
         let request_text = if self.policies_need_request_text() {
-            match &body.prompt {
-                StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-            }
+            body.first_prompt_for_routing()
         } else {
             None
         };
@@ -1788,6 +1780,25 @@ mod tests {
             PDRouter::build_chat_request_text(&body).is_none(),
             "empty conversation text should produce None, not Some(\"\")"
         );
+    }
+
+    #[test]
+    fn test_completion_token_id_batch_semantics() {
+        let single: CompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3]
+        }))
+        .expect("valid single token-ID prompt");
+        let batch: CompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt": [[1, 2], [3, 4]]
+        }))
+        .expect("valid batched token-ID prompt");
+
+        assert_eq!(PDRouter::get_completion_batch_size(&single), None);
+        assert_eq!(PDRouter::get_completion_batch_size(&batch), Some(2));
+        assert_eq!(single.first_prompt_for_routing(), None);
+        assert_eq!(batch.first_prompt_for_routing(), None);
     }
 
     #[tokio::test]
