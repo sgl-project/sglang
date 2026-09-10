@@ -10,14 +10,13 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import get_device, get_device_capability, is_hip
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
-_is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
@@ -115,11 +114,6 @@ class TestFusedMOE(CustomTestCase):
         rtol, atol = self.get_tolerance(dtype)
 
         if use_fp8_w8a8:
-            # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-            capability = get_device_capability()
-            if not _is_hip and not (capability[0] >= 9 or capability == (8, 9)):
-                return
-
             a = self.create_random_gpu_tensor((m, k), dtype)
             w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype)
             w2 = self.create_random_gpu_tensor((e, k, n), dtype)

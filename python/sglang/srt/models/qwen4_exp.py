@@ -13,6 +13,10 @@ import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.quantization.fp8_utils import (
+    fp8_dtype_to_triton,
+    use_fp8_e4b15_for_e4m3fn,
+)
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -714,6 +718,8 @@ def _gather_ple_embedding_from_pinned_kernel(
     tp_vocab_start,
     tp_vocab_end,
     is_fp8: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
+    FP8_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row_id = tl.program_id(0)
@@ -723,14 +729,20 @@ def _gather_ple_embedding_from_pinned_kernel(
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     if is_fp8:
-        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(FP8_DTYPE))
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        )
+        values = values.to(tl.bfloat16) * FP8_SCALE
     else:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
-    values = tl.load(
-        weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.bfloat16)
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        )
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
         tl.where(in_range, values, 0.0),
@@ -837,6 +849,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            is_fp8 = self.weight.dtype == torch.float8_e4m3fn
+            fp8_uses_e4b15 = is_fp8 and use_fp8_e4b15_for_e4m3fn(
+                device=input_ids.device
+            )
+            fp8_dtype = (
+                fp8_dtype_to_triton(torch.float8_e4m3fn, device=input_ids.device)
+                if is_fp8
+                else tl.bfloat16
+            )
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 self.weight.data_ptr(),
                 flat_ids,
@@ -844,7 +865,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 embedding_dim=self.embedding_dim,
                 tp_vocab_start=self.shard_indices.org_vocab_start_index,
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                is_fp8=is_fp8,
+                # Triton only exposes e4b15 on SM80/86; decode checkpoint e4m3fn
+                # bytes directly there and keep the native path on newer GPUs.
+                FP8_DTYPE=fp8_dtype,
+                # e4b15's exponent bias is 15 vs. 7 for OCP e4m3fn.
+                FP8_SCALE=256.0 if fp8_uses_e4b15 else 1.0,
                 BLOCK_D=self._block_d,
             )
         return output
