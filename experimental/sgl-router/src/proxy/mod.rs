@@ -218,7 +218,11 @@ impl Proxy {
         // is recorded as a failure. For 5xx headers we record_failure
         // up front and skip the pump hook (the body we surface is the
         // error response — its stream completing is not a worker win).
-        let caller_end_hook = status.is_success().then_some(on_stream_end).flatten();
+        let caller_end_hook = if status.is_success() {
+            on_stream_end
+        } else {
+            None
+        };
         let on_complete: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>> =
             if status.is_server_error() {
                 breaker.record_failure();

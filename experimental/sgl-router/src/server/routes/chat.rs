@@ -771,10 +771,12 @@ pub async fn chat_completions(
         let metrics = Arc::clone(&ctx.metrics);
         let model = metrics_model.clone();
         Box::new(move |end| {
-            let outcome = if end.saw_error_event {
-                StreamOutcome::StreamErrorEvent
-            } else if !end.transport_ok {
+            // Transport truth first, so the label agrees with the breaker
+            // (proxy/mod.rs records failure from `transport_ok` alone).
+            let outcome = if !end.transport_ok {
                 StreamOutcome::UpstreamError
+            } else if end.saw_error_event {
+                StreamOutcome::StreamErrorEvent
             } else if end.client_disconnect {
                 StreamOutcome::ClientDisconnect
             } else {

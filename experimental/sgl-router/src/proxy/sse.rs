@@ -22,42 +22,40 @@ pub struct StreamEnd {
     pub client_disconnect: bool,
 }
 
-const ERROR_EVENT_PREFIX: &[u8] = b"data: {\"error\"";
+/// A `data:` line whose payload's first JSON key is `error` — tolerant of
+/// SSE-legal framing variants (no space after `data:`, whitespace after `{`),
+/// so the match is anchored to the spec rather than one serializer's bytes.
+fn is_error_event_line(line: &[u8]) -> bool {
+    line.strip_prefix(b"data:")
+        .map(|p| p.trim_ascii_start())
+        .and_then(|p| p.strip_prefix(b"{"))
+        .map(|p| p.trim_ascii_start())
+        .is_some_and(|p| p.starts_with(b"\"error\""))
+}
+
+/// Line-start bytes that suffice to decide `is_error_event_line`.
+const LINE_PROBE: usize = 32;
 
 /// Finds error events emitted after an SSE response commits a 200.
+/// Line-anchored, so lookalike text inside event payloads cannot match.
 #[derive(Default)]
 struct ErrorEventScanner {
-    overlap: Vec<u8>,
+    line_start: Vec<u8>,
 }
 
 impl ErrorEventScanner {
     fn feed(&mut self, chunk: &[u8]) -> bool {
-        if chunk
-            .windows(ERROR_EVENT_PREFIX.len())
-            .any(|window| window == ERROR_EVENT_PREFIX)
-        {
-            return true;
+        let mut hit = false;
+        for (i, segment) in chunk.split(|&b| b == b'\n').enumerate() {
+            if i > 0 {
+                hit |= is_error_event_line(&self.line_start);
+                self.line_start.clear();
+            }
+            let room = LINE_PROBE - self.line_start.len();
+            self.line_start
+                .extend_from_slice(&segment[..segment.len().min(room)]);
         }
-
-        let overlap_len = ERROR_EVENT_PREFIX.len() - 1;
-        self.overlap
-            .extend_from_slice(&chunk[..chunk.len().min(overlap_len)]);
-        if self
-            .overlap
-            .windows(ERROR_EVENT_PREFIX.len())
-            .any(|window| window == ERROR_EVENT_PREFIX)
-        {
-            return true;
-        }
-
-        if chunk.len() >= overlap_len {
-            self.overlap.clear();
-            self.overlap
-                .extend_from_slice(&chunk[chunk.len() - overlap_len..]);
-        } else if self.overlap.len() > overlap_len {
-            self.overlap.drain(..self.overlap.len() - overlap_len);
-        }
-        false
+        hit
     }
 }
 
@@ -125,9 +123,8 @@ where
             client_disconnect: false,
         }));
         let outcome_setter = Arc::clone(&outcome);
-        // The error-event scan exists solely to inform `on_complete`; skip the
-        // per-chunk work entirely when nobody is listening.
-        let mut scanner = on_complete.is_some().then(ErrorEventScanner::default);
+        // `None` once an error event is found — the scan is done for good.
+        let mut scanner = Some(ErrorEventScanner::default());
         let pump = AssertUnwindSafe(async move {
             // Hold the guards for the task's lifetime — dropped when this
             // block exits (stream done or client disconnect).  Leading
@@ -473,11 +470,26 @@ mod tests {
     }
 
     #[test]
-    fn error_event_scanner_bounds_overlap() {
+    fn error_event_scanner_accepts_sse_framing_variants() {
+        for event in [
+            &b"data:{\"error\": {\"code\": 503}}\n\n"[..],
+            b"data: { \"error\": {\"code\": 503}}\n\n",
+            b"data:  {\"error\": \"queue full\"}\n\n",
+        ] {
+            assert!(
+                ErrorEventScanner::default().feed(event),
+                "missed variant: {}",
+                String::from_utf8_lossy(event)
+            );
+        }
+    }
+
+    #[test]
+    fn error_event_scanner_bounds_line_buffer() {
         let mut scanner = ErrorEventScanner::default();
         let big = vec![b'x'; 1 << 20];
         assert!(!scanner.feed(&big));
-        assert_eq!(scanner.overlap.len(), ERROR_EVENT_PREFIX.len() - 1);
+        assert_eq!(scanner.line_start.len(), LINE_PROBE);
     }
 
     fn body_with_completion(
@@ -511,6 +523,21 @@ mod tests {
         assert!(end.transport_ok);
         assert!(end.saw_error_event);
         assert!(!end.client_disconnect);
+    }
+
+    #[tokio::test]
+    async fn completion_reports_error_event_then_transport_error() {
+        let chunks = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"error\": {\"code\": 503}}\n\n",
+            )),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let (body, completion) = body_with_completion(chunks);
+        let _ = body.collect().await;
+        let end = stream_end(completion).await;
+        assert!(!end.transport_ok);
+        assert!(end.saw_error_event);
     }
 
     #[tokio::test]
