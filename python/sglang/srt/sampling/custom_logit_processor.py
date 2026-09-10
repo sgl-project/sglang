@@ -51,11 +51,22 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
         custom_param_list: Optional[List[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
         disallowed_token_ids = custom_param_list[0]["token_ids"]
-        assert all(
-            disallowed_token_ids == c["token_ids"] for c in custom_param_list
-        ), f"{custom_param_list=}"
+        assert all(disallowed_token_ids == c["token_ids"] for c in custom_param_list), (
+            f"{custom_param_list=}"
+        )
         logits[..., disallowed_token_ids] = -float("inf")
         return logits
+
+
+def supports_sampling_mask(serialized_processor: str) -> bool:
+    """Hard exclusion preserves the relative logits needed for mask-based replay."""
+    try:
+        return isinstance(
+            CustomLogitProcessor.from_str(serialized_processor),
+            DisallowedTokensLogitsProcessor,
+        )
+    except Exception:
+        return False
 
 
 def _open_thinking_start(ids: list[int], start_id: int, end_id: int) -> int:

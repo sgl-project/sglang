@@ -1,3 +1,4 @@
+import gc
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -23,7 +24,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
     ComponentUse,
+    ResidencyState,
     build_component_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -468,6 +471,147 @@ def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
         "so the stepped DiT must claim the pin budget before the "
         "once-per-request encoder"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
+    transformer = _NestedDummyModel()
+    vae = torch.nn.Linear(4, 4, bias=False)
+    encoder = torch.nn.Linear(32, 32, bias=False)
+    modules = {"transformer": transformer, "vae": vae, "text_encoder": encoder}
+    pipeline = SimpleNamespace(
+        modules=modules, _stage_name_mapping={}, component_residency_strategies={}
+    )
+    args = _server_args(
+        component_residency={
+            "transformer": "layerwise-offload",
+            "vae": "snapshot-offload",
+            "text_encoder": "snapshot-offload",
+        },
+        pin_cpu_memory=True,
+    )
+    manager = ComponentResidencyManager(pipeline, args)
+    budget = manager.host_pin_budget
+    budget.available_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
+    budget.reserve_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES
+    configured = configure_layerwise_offload_modules(modules, args, pin_budget=budget)
+    assert configured == ["transformer"]
+    layerwise = transformer.layerwise_offload_managers[0]
+    assert layerwise._pin_budget is budget
+    booked = budget.committed_bytes
+    assert 0 < booked < 1024 - 64
+    for name in ("vae", "text_encoder"):
+        module = modules[name]
+        strategy = manager.strategy_for(name, module)
+        use = ComponentUse("encode", name)
+        strategy.prepare_for_use(module, use, ResidencyState())
+        strategy.finish_use(module, use, ResidencyState())
+        assert budget.committed_bytes == booked + 64
+        assert module.weight.is_pinned() == (name == "vae")
+    transformer.disable_offload()
+    layerwise.release_host_stores()
+    assert budget.committed_bytes == 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_layerwise_pin_lease_includes_alignment_and_survives_host_aliases():
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 76
+    )
+    for _ in range(2):
+        model = torch.nn.Module()
+        model.blocks = torch.nn.ModuleList([torch.nn.Linear(3, 3)])
+        manager = LayerwiseOffloadManager(
+            model=model,
+            layers_attr_str="blocks",
+            num_layers=1,
+            enabled=True,
+            pin_cpu_memory=True,
+            pin_budget=budget,
+        )
+        # 36 bytes of weights, 28 bytes of alignment, then a 12-byte bias
+        assert budget.committed_bytes == 76
+        host_alias = manager._consolidated_cpu_weights[0][torch.float32].detach()
+        manager.remove_forward_hooks()
+        manager.load_all_layers()
+        torch.cuda.synchronize()
+        manager.enabled = False
+        manager.release_host_stores()
+        assert budget.committed_bytes == 76
+        del host_alias, manager, model
+        gc.collect()
+        assert budget.committed_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("stride,allocation_bytes", [(1, 16), (3, 40)])
+def test_layerwise_budget_uses_view_allocation_not_the_backing_storage(
+    stride, allocation_bytes
+):
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    source = torch.arange(32, dtype=torch.float32)[1 : 1 + 4 * stride : stride]
+    expected = source.clone()
+    block.weight = torch.nn.Parameter(source)
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + allocation_bytes
+    )
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    assert budget.committed_bytes == allocation_bytes
+    manager.load_all_layers()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(block.weight.cpu(), expected, rtol=0, atol=0)
+    manager.remove_forward_hooks()
+    manager.enabled = False
+    manager.release_host_stores()
+    assert budget.committed_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_failed_layerwise_allocation_refunds_only_unallocated_allowance(monkeypatch):
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
+    )
+    assert budget.request(component_name="other", weight_bytes=64)
+    model = torch.nn.Module()
+    model.blocks = torch.nn.ModuleList([torch.nn.Linear(3, 3) for _ in range(2)])
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=2,
+        enabled=True,
+        initialize=False,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    empty = torch.empty
+    allocations = 0
+
+    def fail_second_pin(*args, **kwargs):
+        nonlocal allocations
+        if kwargs.get("pin_memory"):
+            allocations += 1
+            if allocations == 2:
+                raise RuntimeError("pin allocation failed")
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fail_second_pin)
+    with pytest.raises(RuntimeError, match="pin allocation failed"):
+        manager.initialize()
+    assert allocations == 2
+    gc.collect()
+    assert budget.committed_bytes == 64 + 76
+    del manager, model
+    gc.collect()
+    assert budget.committed_bytes == 64
 
 
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):
@@ -1323,14 +1467,26 @@ class _FileBackedBlock(torch.nn.Module):
         self.weight = torch.nn.Parameter(mapped.reshape(8, 8), requires_grad=False)
 
 
+class _TransposedFileBackedBlock(torch.nn.Module):
+    """A mapped weight whose layout is not contiguous, as an FP8 weight is."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        super().__init__()
+        path.write_bytes(b"\x00" * (64 * 4))
+        mapped = torch.from_file(str(path), shared=True, size=64, dtype=torch.float32)
+        self.weight = torch.nn.Parameter(mapped.reshape(8, 8).t(), requires_grad=False)
+
+
 class _FileBackedModel(torch.nn.Module):
-    def __init__(self, path: pathlib.Path, num_blocks: int = 1) -> None:
+    def __init__(
+        self,
+        path: pathlib.Path,
+        num_blocks: int = 1,
+        block_cls=_FileBackedBlock,
+    ) -> None:
         super().__init__()
         self.blocks = torch.nn.ModuleList(
-            [
-                _FileBackedBlock(path.with_name(f"{path.name}.{i}"))
-                for i in range(num_blocks)
-            ]
+            [block_cls(path.with_name(f"{path.name}.{i}")) for i in range(num_blocks)]
         )
 
 
@@ -1363,15 +1519,45 @@ def test_mapped_layers_ship_through_the_courier(tmp_path, monkeypatch):
 
     manager.prefetch_layer(0, non_blocking=True)
     assert 0 in manager._courier_inflight, "an async prefetch hands the layer over"
-    assert (
-        0 not in manager._gpu_layers
-    ), "the layer is not ready until its tensors are bound on this thread"
+    assert 0 not in manager._gpu_layers, (
+        "the layer is not ready until its tensors are bound on this thread"
+    )
 
     manager.prefetch_layer(0, non_blocking=False)
     assert 0 in manager._gpu_layers and not manager._courier_inflight
-    assert torch.equal(
-        model.blocks[0].weight.detach().cpu(), expected
-    ), "the bytes that went through the courier's slot must be the checkpoint's"
+    assert torch.equal(model.blocks[0].weight.detach().cpu(), expected), (
+        "the bytes that went through the courier's slot must be the checkpoint's"
+    )
+
+
+def test_collected_mapped_weights_record_the_compute_stream(monkeypatch):
+    """Courier tensors must stay live until their compute-stream kernels finish."""
+    compute_stream = _FakeStream()
+    recorded_streams = []
+    gpu_tensor = SimpleNamespace(
+        device=torch.device("cuda"), record_stream=recorded_streams.append
+    )
+    monkeypatch.setattr(
+        _FakeDeviceModule, "current_stream", staticmethod(lambda: compute_stream)
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+
+    manager = object.__new__(LayerwiseOffloadManager)
+    target = torch.nn.Parameter(torch.zeros(1))
+    manager._mapped_courier = SimpleNamespace(
+        collect=lambda _layer_idx: (_FakeEvent(), {"weight": gpu_tensor})
+    )
+    manager._named_parameters = {"weight": target}
+    manager._named_buffers = {}
+    manager._wrap_for_target = lambda _target, _tensor: target.data
+    manager._courier_inflight = {0}
+    manager._gpu_layers = set()
+
+    manager._collect_mapped_layer(0)
+
+    assert recorded_streams == [compute_stream]
 
 
 def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypatch):
@@ -1385,9 +1571,9 @@ def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypat
     manager.release_all()
     manager.prefetch_layer(0, non_blocking=True)
     assert not manager._courier_inflight and manager._mapped_courier is None
-    assert (
-        0 in manager._gpu_layers
-    ), "with the courier disabled the direct synchronous path serves the layer"
+    assert 0 in manager._gpu_layers, (
+        "with the courier disabled the direct synchronous path serves the layer"
+    )
 
 
 def test_release_all_drains_the_courier(tmp_path, monkeypatch):
@@ -1450,6 +1636,7 @@ def _mapped_manager(
     available_bytes=None,
     num_blocks=1,
     pin_budget_bytes=None,
+    block_cls=_FileBackedBlock,
 ):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -1460,7 +1647,9 @@ def _mapped_manager(
     monkeypatch.setattr(
         host_memory_budget, "host_memory_available_bytes", lambda: available_bytes
     )
-    model = _FileBackedModel(tmp_path / "weights.bin", num_blocks=num_blocks)
+    model = _FileBackedModel(
+        tmp_path / "weights.bin", num_blocks=num_blocks, block_cls=block_cls
+    )
     return LayerwiseOffloadManager(
         model=model,
         layers_attr_str="blocks",
@@ -1671,6 +1860,55 @@ def test_mapped_weights_are_visible_to_checksums(tmp_path, monkeypatch):
     assert "blocks.0.weight" in names
 
 
+def test_a_non_contiguous_mapped_weight_keeps_its_layout(tmp_path, monkeypatch):
+    """Staying mapped costs the layout, so a strided weight must not stay.
+
+    The reload path allocates with `torch.empty(shape)` and copies, which is
+    layout-agnostic: values survive, strides do not. ModelOpt FP8 calls its
+    transposed layout a correctness requirement, so such a weight has to take
+    the strided path even when its storage is a mapping the copies cannot
+    afford.
+    """
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_gib=0.001,
+        pin_budget_bytes=0,
+        block_cls=_TransposedFileBackedBlock,
+    )
+    name = "blocks.0.weight"
+    assert name not in manager._mapped_cpu_weights[0], (
+        "a non-contiguous weight stayed mapped, so its layout is dropped "
+        "on reload without any error"
+    )
+    stored = manager._strided_cpu_weights[0][name]
+    assert not stored.is_contiguous()
+    assert stored.stride() == (1, 8)
+    assert manager._weight_metadata[0][name]["preserve_strides"] is True
+
+
+def test_refitting_a_mapped_weight_updates_the_store(tmp_path, monkeypatch):
+    """A refit must reach a mapped weight without writing to the checkpoint."""
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    path = tmp_path / "weights.bin.0"
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_gib=0.001, pin_budget_bytes=0
+    )
+    name = "blocks.0.weight"
+    assert manager._weight_metadata[0][name]["mapped"] is True
+    on_disk_before = path.read_bytes()
+
+    new_weight = torch.full((8, 8), 3.0)
+    updated = manager.update_cpu_weights({name: new_weight})
+
+    assert updated == {name}
+    assert torch.equal(manager._mapped_cpu_weights[0][name], new_weight)
+    assert path.read_bytes() == on_disk_before, "the checkpoint was written to"
+
+
 def test_layerwise_tuning_defaults_match_the_group():
     """No per-component entry: the DiT group keeps its knobs, auxiliaries do not."""
     args = _server_args(
@@ -1808,6 +2046,36 @@ def test_host_copies_are_given_back_when_room_appears(monkeypatch):
     assert not comp._parked_non_layer_weights, "host copies should be released"
 
 
+def test_releasing_host_copies_restores_placeholders(monkeypatch):
+    """When room appears, release host copies but restore parameters from placeholders."""
+    local_device = layerwise_offload_mod.current_platform.get_local_torch_device()
+    if local_device.type == "cpu":
+        pytest.skip("parking targets device-resident parameters")
+
+    # The parking path is for the non-MPS accelerator path, so bypass the
+    # MPS-specific early return while still using the real local device.
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_mps", lambda: False)
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    assert comp.non_layer.device.type == local_device.type
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+    comp.restore_non_layer_weights()
+
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+    # Only the non-layer parameter must be restored; streamed layer weights are
+    # intentionally left as placeholders by the layerwise manager.
+    assert comp.non_layer.shape != (1,), (
+        "non_layer left as a (1,) placeholder after host copies were released"
+    )
+
+
 def test_park_placeholders_are_shared(monkeypatch):
     """One stand-in per (device, dtype), not one allocation per parked weight."""
     comp = _ParkableResidentComponent(4)
@@ -1819,3 +2087,182 @@ def test_park_placeholders_are_shared(monkeypatch):
         id(p) for n, p in comp.named_parameters() if n not in managed and p.numel() == 1
     }
     assert len(stand_ins) <= len(comp._park_placeholders)
+
+
+def _layer_weight_ok(layer: torch.nn.Module) -> bool:
+    return tuple(layer.weight.shape) != (1,)
+
+
+def test_skip_middle_layers_loads_destination_weights(monkeypatch):
+    """Cache-DiT DBCache shape: run Fn, jump to Bn, middle never forwards.
+
+    The destination layer used to see empty(1,) weights when wraparound
+    prefetch and the sequential i+1 window desynced. The jump must sync-load
+    Bn and leave the skipped gap released.
+    """
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(8)
+    manager = _resident_manager(model, num_layers=8, prefetch_size=1)
+
+    hidden = torch.ones(1, 2)
+    fn_end = 1
+    bn_start = 6
+    for layer in model.blocks[:fn_end]:
+        hidden = layer(hidden)
+    for layer in model.blocks[bn_start:]:
+        hidden = layer(hidden)
+
+    assert hidden.shape == (1, 2)
+    for idx in range(fn_end, bn_start):
+        assert idx not in manager._gpu_layers, idx
+        assert not _layer_weight_ok(model.blocks[idx]), idx
+
+
+def test_skip_only_fn_releases_speculative_prefetch_on_next_step(monkeypatch):
+    """Fn-only step (Cache-DiT hit with Bn=0) must not leak the i+1 prefetch."""
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(8)
+    manager = _resident_manager(model, num_layers=8, prefetch_size=1)
+
+    hidden = torch.ones(1, 2)
+    hidden = model.blocks[0](hidden)
+    # Layer 0's leading burst prefetches layer 1; that layer never runs.
+    assert 1 in manager._gpu_layers
+
+    # Next denoise step's prepare drops leftovers that never posted.
+    manager.prepare_for_next_req(non_blocking=False)
+    assert 1 not in manager._gpu_layers
+
+
+def test_last_layer_wraps_to_next_step_head(monkeypatch):
+    """A full-stack step may hide the next step's layer 0 behind the last layer."""
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(8)
+    manager = _resident_manager(model, num_layers=8, prefetch_size=1)
+
+    hidden = torch.ones(1, 2)
+    for layer in model.blocks:
+        hidden = layer(hidden)
+
+    assert hidden.shape == (1, 2)
+    assert 0 in manager._gpu_layers
+    assert 7 not in manager._gpu_layers
+
+
+def _dbcache_layers(num_layers: int, fn: int, bn: int) -> list[int]:
+    """Layers CachedBlocks would call for one DBCache step."""
+    fn = min(max(fn, 0), num_layers)
+    bn = min(max(bn, 0), num_layers - fn)
+    layers = list(range(fn))
+    if bn:
+        layers.extend(range(num_layers - bn, num_layers))
+    return layers
+
+
+def _run_layer_set(model, layer_indices: list[int]) -> torch.Tensor:
+    hidden = torch.ones(1, 2)
+    for idx in layer_indices:
+        hidden = model.blocks[idx](hidden)
+    return hidden
+
+
+@pytest.mark.parametrize("num_layers", [8, 12])
+@pytest.mark.parametrize(
+    "fn,bn",
+    [
+        (1, 0),  # default Cache-DiT hit
+        (1, 1),
+        (1, 2),
+        (2, 0),
+        (2, 2),
+        (4, 2),
+        (3, 5),  # Fn+Bn == 8, no gap when num_layers=8
+        (8, 0),  # full stack / miss
+    ],
+)
+@pytest.mark.parametrize("prefetch_size", [1, 2])
+@pytest.mark.parametrize(
+    "residency_policy",
+    [RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED],
+)
+def test_dbcache_layer_patterns_never_see_empty_weights(
+    monkeypatch, num_layers, fn, bn, prefetch_size, residency_policy
+):
+    """Hit / miss / hit-again under several Cache-DiT Fn/Bn and prefetch windows."""
+    if fn + bn > num_layers:
+        pytest.skip("Fn+Bn exceeds this stack")
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(num_layers)
+    manager = _resident_manager(
+        model,
+        num_layers=num_layers,
+        prefetch_size=prefetch_size,
+        residency_policy=residency_policy,
+        resident_layers=0,
+    )
+
+    hit_layers = _dbcache_layers(num_layers, fn, bn)
+    miss_layers = list(range(num_layers))
+    gap = [idx for idx in miss_layers if idx not in set(hit_layers)]
+
+    def _assert_gpu_layers_have_real_weights() -> None:
+        for idx in range(num_layers):
+            on_gpu = idx in manager._gpu_layers
+            assert _layer_weight_ok(model.blocks[idx]) is on_gpu, idx
+
+    hidden = _run_layer_set(model, hit_layers)
+    assert hidden.shape == (1, 2)
+    _assert_gpu_layers_have_real_weights()
+
+    # Speculative Mn prefetch may still sit on GPU until the next prepare.
+    manager.prepare_for_next_req(non_blocking=False)
+    keep = set(manager._head_of_stream()) | set(manager._retained_set)
+    for idx in gap:
+        if idx not in keep:
+            assert idx not in manager._gpu_layers, idx
+            assert not _layer_weight_ok(model.blocks[idx]), idx
+
+    hidden = _run_layer_set(model, miss_layers)
+    assert hidden.shape == (1, 2)
+    _assert_gpu_layers_have_real_weights()
+
+    manager.prepare_for_next_req(non_blocking=False)
+    hidden = _run_layer_set(model, hit_layers)
+    assert hidden.shape == (1, 2)
+    _assert_gpu_layers_have_real_weights()
+
+    # Two hits in a row (Bn=0 never reaches last layer; still must rematerialize 0).
+    manager.prepare_for_next_req(non_blocking=False)
+    hidden = _run_layer_set(model, hit_layers)
+    assert hidden.shape == (1, 2)
+    _assert_gpu_layers_have_real_weights()
+
+
+@pytest.mark.parametrize(
+    "step_kinds",
+    [
+        # SCM-style: forced compute (full stack) mixed with DBCache hits.
+        ("full", "hit10", "hit10", "full", "hit12", "hit10"),
+        # TaylorSeer does not change which blocks CachedBlocks calls.
+        ("full", "full", "hit20", "hit20", "hit12", "full"),
+    ],
+)
+def test_mixed_scm_and_dbcache_step_schedule(monkeypatch, step_kinds):
+    """A request is a sequence of full-stack and skip-compute steps."""
+    _patch_fake_device(monkeypatch)
+    num_layers = 8
+    model = _RunnableBlockModel(num_layers)
+    manager = _resident_manager(model, num_layers=num_layers, prefetch_size=2)
+    kind_to_layers = {
+        "full": list(range(num_layers)),
+        "hit10": _dbcache_layers(num_layers, 1, 0),
+        "hit12": _dbcache_layers(num_layers, 1, 2),
+        "hit20": _dbcache_layers(num_layers, 2, 0),
+    }
+    for kind in step_kinds:
+        hidden = _run_layer_set(model, kind_to_layers[kind])
+        assert hidden.shape == (1, 2)
+        for idx in range(num_layers):
+            on_gpu = idx in manager._gpu_layers
+            assert _layer_weight_ok(model.blocks[idx]) is on_gpu, (kind, idx)
+        manager.prepare_for_next_req(non_blocking=False)
