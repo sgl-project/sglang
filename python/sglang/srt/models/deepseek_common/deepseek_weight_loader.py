@@ -59,9 +59,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
-    enable_glm_nextn_moe_ptpc,
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
+    should_apply_glm_nextn_moe_ptpc,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
@@ -893,7 +893,7 @@ class DeepseekV2WeightLoaderMixin:
 
         The GLM-5.2 MXFP4 checkpoint ships the draft layer's routed and shared
         experts in bf16. This pairs with the QuarkW8A8FP8MoE scheme that
-        GlmMoeDsaForCausalLMNextN injects for that module.
+        GlmMoeDsaForCausalLMNextN injects, using the same apply gate.
 
         Args:
             weights: Iterable of (weight_name, weight_tensor) pairs
@@ -905,11 +905,11 @@ class DeepseekV2WeightLoaderMixin:
         """
         if not isinstance(nextn_conf, NextNEnabledConfig):
             return weights
-        if not enable_glm_nextn_moe_ptpc(self.quant_config):
-            return weights
-        # DeepSeek shares this mixin but gets no matching scheme, so the cast
-        # weights would have nowhere to load.
-        if "glm" not in self.config.model_type.lower():
+        if not should_apply_glm_nextn_moe_ptpc(
+            self.quant_config,
+            nextn_conf.nextn_layer_id,
+            model_type=getattr(self.config, "model_type", "") or "",
+        ):
             return weights
 
         layer_prefix = nextn_conf.nextn_layer_prefix

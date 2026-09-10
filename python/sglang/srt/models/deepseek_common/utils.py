@@ -138,12 +138,45 @@ def enable_nextn_moe_bf16_cast_to_fp8(
 def enable_glm_nextn_moe_ptpc(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Per-channel FP8, unlike ``enable_nextn_moe_bf16_cast_to_fp8``'s block FP8."""
+    """Per-channel FP8, unlike ``enable_nextn_moe_bf16_cast_to_fp8``'s block FP8.
+
+    Env + quark only. Use ``should_apply_glm_nextn_moe_ptpc`` to apply.
+    """
     return (
         envs.SGLANG_GLM_NEXTN_MOE_PTPC.get()
         and quant_config is not None
         and quant_config.get_name() == "quark"
     )
+
+
+def glm_nextn_mtp_fused_experts_excluded(
+    quant_config: Optional[QuantizationConfig],
+    num_hidden_layers: int,
+) -> bool:
+    """True if Quark excluded MTP fused experts (bf16 in the checkpoint)."""
+    exclude_layers = getattr(quant_config, "exclude_layers", None) or []
+    layer_prefix = f"model.layers.{num_hidden_layers}."
+    return any(
+        name.startswith(layer_prefix) and ".mlp.experts." in name
+        for name in exclude_layers
+    )
+
+
+def should_apply_glm_nextn_moe_ptpc(
+    quant_config: Optional[QuantizationConfig],
+    num_hidden_layers: int,
+    model_type: Optional[str] = None,
+) -> bool:
+    """Apply PTPC-FP8 only when MTP fused experts are Quark-excluded.
+
+    ``model_type`` is required on the DeepSeek-shared loader mixin; the GLM
+    NextN class may omit it.
+    """
+    if not enable_glm_nextn_moe_ptpc(quant_config):
+        return False
+    if model_type is not None and "glm" not in model_type.lower():
+        return False
+    return glm_nextn_mtp_fused_experts_excluded(quant_config, num_hidden_layers)
 
 
 def is_wint4afp8_or_wint4a16_config(
