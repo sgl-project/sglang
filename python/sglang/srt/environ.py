@@ -1531,6 +1531,11 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # ROCm only: split the prefill indexer's logits + top-k across attn-TP
+    # ranks in interleaved row stripes and AllReduce(MAX) the -1-filled
+    # result. Port of vllm-moreh ops/indexer_m_split.py.
+    SGLANG_DSA_INDEXER_M_SPLIT = EnvBool(False)
+    SGLANG_DSA_INDEXER_M_SPLIT_STRIPE = EnvInt(512)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written

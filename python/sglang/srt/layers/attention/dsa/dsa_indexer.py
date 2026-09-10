@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from einops import rearrange
 
 from sglang.kernels.fused_op import BaseFusedOp
@@ -255,6 +256,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_size = None
+        # ROCm-only: split the prefill indexer's logits + top-k across attn-TP
+        # ranks (port of vllm-moreh indexer_m_split). See _get_topk_ragged_m_split.
+        self.dsa_indexer_m_split = _is_hip and envs.SGLANG_DSA_INDEXER_M_SPLIT.get()
+        self.dsa_indexer_m_split_stripe = max(
+            1, envs.SGLANG_DSA_INDEXER_M_SPLIT_STRIPE.get()
+        )
+        if self.dsa_indexer_m_split and layer_id == 0:
+            logger.info(
+                "DSA indexer M-split enabled: prefill indexer rows are striped "
+                "across attn-TP ranks (stripe=%d).",
+                self.dsa_indexer_m_split_stripe,
+            )
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
@@ -1176,6 +1189,27 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_offset, k_offset, device_index
         )
 
+        if self.dsa_indexer_m_split:
+            m_split_result = self._get_topk_ragged_m_split(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=kv_fp8,
+                ks=ks,
+                ke=ke,
+                seq_lens_expanded=seq_lens_expanded,
+                token_to_batch_idx=token_to_batch_idx,
+                metadata=metadata,
+                topk_result=topk_result,
+                q_offset=q_offset,
+                k_offset=k_offset,
+                need_chunk=need_chunk,
+                logits_budget_bytes=logits_budget_bytes,
+            )
+            # None: nothing to split (single rank / too few rows), use the
+            # replicated paths below.
+            if m_split_result is not None:
+                return m_split_result
+
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
@@ -1311,6 +1345,132 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             start = end
 
         return topk_result
+
+    def _get_topk_ragged_m_split(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_fp8: Tuple[torch.Tensor, torch.Tensor],
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        seq_lens_expanded: torch.Tensor,
+        token_to_batch_idx: Optional[torch.Tensor],
+        metadata: BaseIndexerMetadata,
+        topk_result: torch.Tensor,
+        q_offset: int,
+        k_offset: int,
+        need_chunk: bool,
+        logits_budget_bytes: int,
+    ) -> Optional[torch.Tensor]:
+        """M-split prefill indexer (ROCm): each attn-TP rank scores an interleaved
+        stripe subset of the query rows, writes its top-k into a -1-filled
+        buffer, and AllReduce(MAX) recovers the full result on every rank.
+
+        The Indexer weights are replicated, so without this every rank redoes
+        the full [M x K] logits + top-k. Interleaved stripes keep the causal
+        workload balanced (~M^2/2/tp per rank).
+
+        Returns None when there is nothing to split so the caller falls back
+        to the replicated path.
+        """
+        assert _is_hip, "DSA indexer M-split is ROCm-only"
+        tp_group = get_attn_tp_group()
+        tp_size = tp_group.world_size
+        tp_rank = tp_group.rank_in_group
+        if tp_size <= 1 or q_offset < tp_size:
+            return None
+
+        from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+        assert seq_lens_expanded.shape[0] == q_offset, (
+            f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        )
+        kv, scale = kv_fp8
+        device = q_fp8.device
+
+        stripe = max(1, min(self.dsa_indexer_m_split_stripe, q_offset // tp_size))
+        if need_chunk:
+            # Every stripe must stay under the logits budget (aiter's 2 GiB
+            # buffer_store limit on ROCm), same bound as the chunked path.
+            bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+            max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+            stripe = min(stripe, max_rows)
+        block = tp_size * stripe
+
+        # Same per-row-range top-k contract as the chunked path: RAGGED uses the
+        # global offset slice, PAGED treats each token as a length-1 sequence.
+        global_topk_offset = metadata.attn_metadata.topk_indices_offset
+        cu_seqlens_q_full = None
+        if global_topk_offset is None:
+            cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
+        else:
+            assert global_topk_offset.shape[0] >= q_offset, (
+                f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            )
+
+        # Rows owned by other ranks must be -1 so that MAX recovers them.
+        topk_result[:q_offset].fill_(-1)
+
+        for block_start in range(0, q_offset, block):
+            start = block_start + tp_rank * stripe
+            if start >= q_offset:
+                break
+            end = min(start + stripe, q_offset)
+
+            with self._with_real_sm_count():
+                # clean_logits=False: topk transform handles masking via ks/ke.
+                logits_chunk = fp8_mqa_logits(
+                    q_fp8[start:end],
+                    kv,
+                    scale,
+                    weights[start:end],
+                    ks[start:end],
+                    ke[start:end],
+                    clean_logits=False,
+                )
+
+            lengths_chunk = seq_lens_expanded[start:end]
+            self._mask_init_and_local_tokens(logits_chunk, lengths_chunk, ks[start:end])
+
+            if global_topk_offset is not None:
+                topk_offset_chunk = global_topk_offset[start:end]
+                cu_seqlens_q_chunk = None
+                batch_idx_chunk = None
+            else:
+                topk_offset_chunk = None
+                cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
+                batch_idx_chunk = token_to_batch_idx[start:end]
+
+            topk_result[start:end] = metadata.topk_transform(
+                logits_chunk,
+                self.index_topk,
+                ks=ks[start:end],
+                cu_seqlens_q=cu_seqlens_q_chunk,
+                ke_offset=lengths_chunk,
+                batch_idx_list=batch_idx_chunk,
+                topk_indices_offset_override=topk_offset_chunk,
+            )
+
+        self._m_split_all_reduce_max(tp_group, topk_result[:q_offset])
+        return topk_result
+
+    @staticmethod
+    def _m_split_all_reduce_max(tp_group, buf: torch.Tensor) -> None:
+        # GroupCoordinator.all_reduce is SUM-only, so MAX goes straight to the
+        # communicator. Mirrors _broadcast_indexer_topk_from_rank0_impl: PyNCCL
+        # under capture when available, process group otherwise.
+        tmp = buf if buf.is_contiguous() else buf.contiguous()
+        if (
+            tmp.device.type == "cuda"
+            and torch.cuda.is_current_stream_capturing()
+            and tp_group.pynccl_comm is not None
+        ):
+            with tp_group.pynccl_comm.change_state(enable=True):
+                tp_group.pynccl_comm.all_reduce(tmp, op=dist.ReduceOp.MAX)
+        else:
+            dist.all_reduce(tmp, op=dist.ReduceOp.MAX, group=tp_group.device_group)
+        if tmp is not buf:
+            buf.copy_(tmp)
 
     def _forward_cuda_k_only(
         self,
