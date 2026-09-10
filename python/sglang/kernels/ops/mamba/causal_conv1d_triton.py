@@ -10,7 +10,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.spec import KernelBackend
 
 PAD_SLOT_ID = -1
 
@@ -390,7 +392,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
-def causal_conv1d_fn(
+def _causal_conv1d_fn_triton(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Union[torch.Tensor, None],
@@ -565,6 +567,81 @@ def causal_conv1d_fn(
         num_stages=2,
     )
     return out
+
+
+class CausalConv1dOp(BaseFusedOp):
+    op = "mamba.causal_conv1d_fn"
+    priority = (KernelBackend.TRITON,)
+    capabilities = {KernelBackend.TRITON: frozenset()}
+
+    def _torch_compile_forward(self, num_tokens: int) -> None:
+        return None
+
+    def forward_native(self, *args, **kwargs):
+        raise NotImplementedError("causal_conv1d_fn has no native implementation")
+
+    def forward_triton(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Union[torch.Tensor, None],
+        conv_states: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens_cpu: List[int],
+        cache_indices: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        activation: Optional[str] = "silu",
+        pad_slot_id: int = PAD_SLOT_ID,
+        validate_data=False,
+        **kwargs,
+    ) -> torch.Tensor:
+        return _causal_conv1d_fn_triton(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            seq_lens_cpu,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            validate_data=validate_data,
+            **kwargs,
+        )
+
+
+_CAUSAL_CONV1D_OP = CausalConv1dOp()
+
+
+def causal_conv1d_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Union[torch.Tensor, None],
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    activation: Optional[str] = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    **kwargs,
+) -> torch.Tensor:
+    return _CAUSAL_CONV1D_OP(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        seq_lens_cpu,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
+        validate_data=validate_data,
+        **kwargs,
+    )
 
 
 # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask
