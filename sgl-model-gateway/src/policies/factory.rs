@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    LMetricConfig, LMetricPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -34,6 +34,16 @@ impl PolicyFactory {
                     max_tree_size: *max_tree_size,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
+            }
+            PolicyConfig::LMetric {
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                let config = LMetricConfig {
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                };
+                Arc::new(LMetricPolicy::with_config(config))
             }
             PolicyConfig::Bucket {
                 balance_abs_threshold,
@@ -80,6 +90,7 @@ impl PolicyFactory {
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+            "lmetric" | "l_metric" => Some(Arc::new(LMetricPolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
             "consistent_hashing" | "consistenthashing" => {
@@ -117,6 +128,12 @@ mod tests {
         });
         assert_eq!(policy.name(), "cache_aware");
 
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::LMetric {
+            eviction_interval_secs: 30,
+            max_tree_size: 1000,
+        });
+        assert_eq!(policy.name(), "lmetric");
+
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
@@ -145,6 +162,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
+        assert!(PolicyFactory::create_by_name("lmetric").is_some());
+        assert!(PolicyFactory::create_by_name("LMetric").is_some());
         assert!(PolicyFactory::create_by_name("bucket").is_some());
         assert!(PolicyFactory::create_by_name("Bucket").is_some());
         assert!(PolicyFactory::create_by_name("manual").is_some());

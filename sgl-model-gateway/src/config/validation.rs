@@ -190,6 +190,26 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::LMetric {
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                if *eviction_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "eviction_interval_secs".to_string(),
+                        value: eviction_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *max_tree_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "max_tree_size".to_string(),
+                        value: max_tree_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
             } => {
@@ -752,6 +772,31 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_lmetric_tree_parameters() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::LMetric {
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::LMetric {
+                eviction_interval_secs: 0,
+                max_tree_size: 1000,
+            },
+        );
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     #[test]

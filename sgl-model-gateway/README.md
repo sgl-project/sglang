@@ -27,7 +27,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Advanced load balancing with cache-aware request reuse, load-aware (power-of-two) selection, and per-model policy overrides.
 
 ## Feature Highlights
-- Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `power_of_two`, `bucket`) with DP-aware scheduling.
+- Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `lmetric`, `power_of_two`, `bucket`) with DP-aware scheduling.
 - Multi-model HTTP serving and inference gateway routing with model-specific policies.
 - Prefill/decode disaggregation, including bootstrap port handling and cache-aware merging.
 - gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, GLM4.7 and other reasoning-capable models.
@@ -737,6 +737,7 @@ Router flags map to these values:
 - `random`: uniform random worker selection.
 - `round_robin`: sequential rotation with atomic counters.
 - `cache_aware`: maintains a prefix tree of prompts to route repeat traffic and evens load with configurable thresholds (`--cache-threshold`, `--balance-abs-threshold`, `--balance-rel-threshold`, `--eviction-interval`, `--max-tree-size`).
+- `lmetric`: multiplies estimated new prefill work by active worker load, using the prefix tree to preserve cache locality while avoiding overloaded workers (`--eviction-interval`, `--max-tree-size`).
 - `power_of_two`: chooses the lighter worker among two random candidates; integrates with `LoadMonitor`.
   Per-model overrides are available in PD mode (`--prefill-policy`, `--decode-policy`) and IGW mode via the worker registry.
 
