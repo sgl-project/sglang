@@ -93,6 +93,8 @@ on:
           - nightly-8-gpu-glm51-rocm720
           # 8-GPU GLM-5.2-FP8 (MI35x accuracy + performance)
           - nightly-8-gpu-mi35x-glm52-fp8-rocm720
+          # 8-GPU GLM-5.2-MXFP4 agentic-coding + MTP (MI35x only)
+          - nightly-8-gpu-mi35x-glm52-fp4-agentic-mtp-rocm720
           # 8-GPU GLM-5-MXFP4 (MI35x only)
           - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
           # 4-GPU MiniMax-M2.5 (MI35x)
@@ -2044,6 +2046,56 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
+  # 8-GPU GLM-5.2-MXFP4 agentic-coding + MTP (MI35x only)
+  # ==============================================================================
+
+  nightly-8-gpu-mi35x-glm52-fp4-agentic-mtp-rocm720:
+    name: ${{ format('nightly-8-gpu-mi35x-glm52-fp4-agentic-mtp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm52-fp4-agentic-mtp-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      # Two arms (TP4/EP4 with HiCache, then TP8/EP1 GPU-resident), each
+      # sweeping concurrency over a multi-turn agentic-coding replay. Both load
+      # the same checkpoint, so they share one job and one MI35x slot.
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU GLM-5.2-MXFP4 agentic MTP)
+        timeout-minutes: 300
+        continue-on-error: true
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-glm52-fp4-agentic-mtp --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
   # 8-GPU GLM-5-MXFP4 (MI35x only)
   # ==============================================================================
 
@@ -2367,6 +2419,8 @@ jobs:
       - nightly-8-gpu-glm51-rocm720
       # 8-GPU GLM-5.2-FP8 (MI35x accuracy + performance)
       - nightly-8-gpu-mi35x-glm52-fp8-rocm720
+      # 8-GPU GLM-5.2-MXFP4 agentic-coding + MTP (MI35x only)
+      - nightly-8-gpu-mi35x-glm52-fp4-agentic-mtp-rocm720
       # 8-GPU GLM-5-MXFP4 (MI35x only)
       - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
       # 4-GPU MiniMax-M2.5 (MI35x)
