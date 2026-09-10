@@ -192,6 +192,7 @@ class ExecKernel(msgspec.Struct):
                 "flashmla_kv",
                 "flashmla_auto",
                 "flashinfer_sparse_mla",
+                "triton_sparse_mla",
                 "fa3",
                 "tilelang",
                 "aiter",
@@ -211,6 +212,16 @@ class ExecKernel(msgspec.Struct):
             choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
         ),
     ] = "auto"
+    dsa_triton_union: A[
+        int,
+        Arg(
+            help="Union group size for --dsa-prefill-backend triton_sparse_mla: "
+            "0 disables, 2 or 4 make G adjacent query tokens share one gathered "
+            "index set (mathematically exact; an ownership mask restores each "
+            "token's own softmax support).",
+            choices=[0, 2, 4],
+        ),
+    ] = 0
     dsa_decode_backend: A[
         Optional[str],
         Arg(
