@@ -2162,6 +2162,8 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     # Qwen4-Exp is intentionally absent: QSA builds host-side sparse metadata
     # per forward and cannot serve the breakable prefill capture.
     "MuseGlimmerForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
