@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
+    IncLockRefResult,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
@@ -9690,6 +9691,84 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         for n in post_segment:
             self.assertEqual(self._swa_ref(cache, n), 0)
         cache.sanity_check()
+
+    def test_host_boundary_survives_repeated_splits(self):
+        if _selected_tree_core_test_backend() != "python":
+            self.skipTest("drives Python component objects directly")
+        for host_only in (False, True):
+            with self.subTest(host_only=host_only):
+                cache, allocator, req_pool = self._build_hicache_fixture()
+                seq = self._make_seq(1, 2 * self.cfg.sliding_window_size)
+                self._insert(cache, allocator, req_pool, seq)
+                leaf_id = self._match_leaf(cache, seq)
+                path = []
+                node_id = leaf_id
+                while not cache.tree_core.is_root(node_id):
+                    path.append(node_id)
+                    node_id = _node_parent(cache, node_id)
+                for node_id in reversed(path):
+                    self.assertGreater(_write_backup(cache, node_id, True), 0)
+                    cache.writing_check(write_back=True)
+                if host_only:
+                    cache.evict(EvictParams(num_tokens=len(seq)))
+
+                core = cache.tree_core
+                leaf = core.node_by_id(leaf_id)
+                ct = ComponentType.SWA
+                component = next(c for c in core.components if c.component_type == ct)
+                older = leaf.parent
+                self.assertIsNot(older, core.root_node)
+                self.assertEqual(len(leaf.key), self.cfg.sliding_window_size)
+                self.assertEqual(leaf.component_data[ct].value is None, host_only)
+                original_host = leaf.component_data[ct].host_value.clone()
+                receipts = [
+                    component.acquire_component_lock(
+                        leaf, IncLockRefResult(), lock_host=True
+                    ).to_dec_params()
+                    for _ in range(2)
+                ]
+                boundary_uuid = receipts[0].swa_uuid_for_host_lock
+                self.assertIsNotNone(boundary_uuid)
+                boundary = leaf
+                for split_len in (4, 2):
+                    boundary, action = core._split_node(
+                        boundary.key, boundary, split_len
+                    )
+                    self.assertIsNone(action)
+                    self.assertEqual(
+                        boundary.component_data[ct].metadata.get("host_uuid"),
+                        boundary_uuid,
+                    )
+                fragments = []
+                cur = leaf
+                while cur is not older:
+                    fragments.append(cur)
+                    self.assertEqual(cur.component_data[ct].host_lock_ref, 2)
+                    self.assertFalse(core.host_lru_lists[ct].in_list(cur))
+                    cur = cur.parent
+                self.assertTrue(
+                    torch.equal(
+                        torch.cat(
+                            [
+                                n.component_data[ct].host_value
+                                for n in reversed(fragments)
+                            ]
+                        ),
+                        original_host,
+                    )
+                )
+                for remaining, receipt in zip((1, 0), receipts):
+                    component.release_component_lock(leaf, receipt, lock_host=True)
+                    for node in fragments:
+                        self.assertEqual(
+                            node.component_data[ct].host_lock_ref, remaining
+                        )
+                        self.assertEqual(
+                            core.host_lru_lists[ct].in_list(node),
+                            host_only and remaining == 0,
+                        )
+                    self.assertEqual(older.component_data[ct].host_lock_ref, 0)
+                cache.sanity_check()
 
     def test_aux_release_readmits_the_leaf_whatever_the_release_order(self):
         """Each component's release refreshes the leaf sets of the nodes it

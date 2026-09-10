@@ -608,9 +608,6 @@ class SWAComponent(TreeComponent):
             parent_swa_data = new_parent.component_data[self.component_type]
             child_swa_data = child.component_data[self.component_type]
             parent_swa_data.host_lock_ref = child_swa_data.host_lock_ref
-            host_uuid = child_swa_data.metadata.pop("host_uuid", None)
-            if host_uuid is not None:
-                parent_swa_data.metadata["host_uuid"] = host_uuid
 
             host_lru = self.tree_core.host_lru_lists[self.component_type]
             # Host-locked halves stay out of the host LRU: in-flight IO
