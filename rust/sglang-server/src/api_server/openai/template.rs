@@ -27,12 +27,12 @@ pub(super) use super::template_loader::load_chat_formatter;
 /// Extra variables for the chat template (`chat_template_kwargs`).
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
-/// A chat prompt formatter: a Dynamo renderer (the model's Jinja template or a
-/// built-in encoder for models that ship none) or a legacy SGLang conversation
-/// template.
+/// A chat prompt formatter: either the model's HuggingFace Jinja template (or
+/// Dynamo's built-in encoder for models that ship none) or a legacy SGLang
+/// conversation template.
 #[derive(Clone)]
 pub enum ChatFormatter {
-    Dynamo(PromptFormatter),
+    HuggingFace(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -44,7 +44,7 @@ impl ChatFormatter {
         kwargs: Option<&ChatTemplateKwargs>,
     ) -> Result<String, TemplateError> {
         match self {
-            ChatFormatter::Dynamo(PromptFormatter::OAI(formatter)) => formatter
+            ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter)) => formatter
                 .render(&TemplateRequest { request, kwargs })
                 .map_err(|error| TemplateError::Renderer {
                     message: error.to_string(),
@@ -55,11 +55,11 @@ impl ChatFormatter {
 
     /// The template's stop strings — Python `Conversation.stop_str`
     /// (`str | list[str] | None`). Legacy/builtin templates define them (e.g.
-    /// chatml's `<|im_end|>`); the Dynamo renderer carries none, matching
+    /// chatml's `<|im_end|>`); the HuggingFace renderer carries none, matching
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::Dynamo(_) => None,
+            ChatFormatter::HuggingFace(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -740,7 +740,7 @@ mod tests {
         };
 
         let formatter = load(Some(config), Some("deepseek_v4"), None).unwrap();
-        assert!(matches!(formatter, ChatFormatter::Dynamo(_)));
+        assert!(matches!(formatter, ChatFormatter::HuggingFace(_)));
         let kwargs = HashMap::from([("thinking".into(), serde_json::json!(false))]);
         assert_eq!(
             formatter.render(&request(), Some(&kwargs)).unwrap(),
@@ -748,7 +748,7 @@ mod tests {
         );
         assert!(matches!(
             load(None, Some("deepseek_v4"), None),
-            Ok(ChatFormatter::Dynamo(_))
+            Ok(ChatFormatter::HuggingFace(_))
         ));
 
         // A template, `--chat-template`, or an unknown architecture wins.
