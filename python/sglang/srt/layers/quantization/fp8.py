@@ -864,9 +864,35 @@ class Fp8LinearMethod(LinearMethodBase):
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
+    def _process_cpu_per_tensor_weights(self, layer: Module) -> None:
+        if not _is_cpu_amx_available:
+            raise ValueError("CPU per-tensor FP8 linear requires AMX support.")
+        if layer.orig_dtype != torch.bfloat16:
+            raise ValueError("CPU per-tensor FP8 linear requires bfloat16 activations.")
+        output_size, input_size = layer.weight.shape
+        if output_size % 32 != 0 or input_size % 32 != 0:
+            raise ValueError(
+                "CPU per-tensor FP8 linear requires N and K to be multiples of 32, "
+                f"got N={output_size}, K={input_size}."
+            )
+        if self.is_checkpoint_fp8_serialized:
+            weight_scale, weight = requantize_with_max_scale(
+                weight=layer.weight.data,
+                weight_scale=layer.weight_scale.data,
+                logical_widths=layer.logical_widths,
+            )
+        else:
+            weight, weight_scale = input_to_float8(layer.weight.data)
+        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
+        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+        layer.input_scale = None
+        _amx_process_weight_after_loading(layer, ["weight"])
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
+        elif _is_cpu:
+            self._process_cpu_per_tensor_weights(layer)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -980,16 +1006,6 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
-            if _is_cpu:
-                assert (
-                    _is_cpu_amx_available
-                ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
-                # The AMX kernel consumes (N, K) weights; undo the (K, N) transpose.
-                layer.weight = Parameter(
-                    layer.weight.data.t().contiguous(), requires_grad=False
-                )
-                _amx_process_weight_after_loading(layer, ["weight"])
-
         if self.use_marlin:
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
@@ -1075,15 +1091,21 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if use_intel_amx_backend(layer) and not isinstance(x, tuple):
-            return torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
-                x,
+        if use_intel_amx_backend(layer):
+            if isinstance(x, tuple) or x.dtype != torch.bfloat16:
+                raise ValueError(
+                    "CPU per-tensor FP8 linear requires bfloat16 activations, "
+                    "not pre-quantized FP8 or float16 inputs."
+                )
+            output = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+                x.reshape(-1, x.shape[-1]),
                 layer.weight,
                 layer.weight_scale,
                 bias,
                 x.dtype,
                 True,  # is_vnni
             )
+            return output.view(*x.shape[:-1], layer.weight.shape[0])
 
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:

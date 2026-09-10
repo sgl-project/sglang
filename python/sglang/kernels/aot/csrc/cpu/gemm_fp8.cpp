@@ -65,15 +65,14 @@ inline void copy_add_stub(
     out[d] = static_cast<scalar_t>(input[d] + bias[d]);
   }
 }
-
 template <typename scalar_t>
-inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size, float scale) {
+inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int size, float scale) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec vscale = fVec(scale);
 
-  int64_t d;
+  int d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     auto [data0, data1] = load_float_vec2(input + d);
@@ -408,9 +407,7 @@ struct tinygemm_kernel_nn2<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, B
     Unroll<ROWS * COLS>{}(loadc);
 
     const int64_t K2 = K >> 1;
-    const int64_t lda2 = lda >> 1;
     const int64_t ldb2 = ldb;  // ldb * 2 >> 1;
-    const float* a_ptr = reinterpret_cast<const float*>(A);
     const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(B);
 
     auto compute = [&](auto i, int64_t k) {
@@ -418,7 +415,9 @@ struct tinygemm_kernel_nn2<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, B
       constexpr int col = i % COLS;
 
       if constexpr (col == 0) {
-        va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+        int32_t packed_a;
+        std::memcpy(&packed_a, A + row * lda + k * 2, sizeof(packed_a));
+        va = (__m512bh)(_mm512_set1_epi32(packed_a));
       }
       if constexpr (row == 0) {
         if constexpr (col % 2 == 0) {
@@ -1335,17 +1334,17 @@ at::Tensor fp8_per_tensor_scaled_mm_cpu(
     bool is_vnni) {
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
+  CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales2);
-  CHECK_DIM(2, mat1);
-  CHECK_DIM(2, mat2);
 
   const int64_t M = mat1.size(0);
   const int64_t N = mat2.size(0);
   const int64_t K = mat2.size(1);
 
   CHECK_EQ(mat1.size(1), K);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
 
   constexpr int64_t BLOCK_N = block_size_n();
   TORCH_CHECK(
@@ -1354,7 +1353,7 @@ at::Tensor fp8_per_tensor_scaled_mm_cpu(
 
   const auto st = mat1.scalar_type();
   // only the bf16 micro-kernels are implemented
-  TORCH_CHECK(st == at::kBFloat16, "fp8_per_tensor_scaled_mm_cpu: expect A to be bfloat16, got ", st, ".");
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "fp8_per_tensor_scaled_mm_cpu: expect A to be bfloat16 or half.");
   TORCH_CHECK(st == out_dtype, "fp8_per_tensor_scaled_mm_cpu: expect A has same dtype with out_dtype.");
   TORCH_CHECK(mat2.scalar_type() == at::kFloat8_e4m3fn, "fp8_per_tensor_scaled_mm_cpu: expect mat2 to be fp8_e4m3.");
   TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_per_tensor_scaled_mm_cpu: expect scales2 to be float32.");
