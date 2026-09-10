@@ -56,6 +56,30 @@ The CLI defaults to sampling parameters from the model's generation config.
 `--help` for template, parser, and limit options. A custom Cargo target directory
 or compilation target changes the executable path shown above.
 
+## Docker image
+
+Build the CPU-only renderer image from the repository root (`linux/amd64` or
+`linux/arm64`).
+
+```sh
+docker buildx build --load -f docker/renderer.Dockerfile \
+  -t local/sglang-renderer:dev .
+```
+
+Run preprocessing without an engine.
+
+```sh
+docker run --rm -p 30000:30000 \
+  -v renderer-cache:/home/sglang/.cache/huggingface \
+  -e HF_TOKEN \
+  local/sglang-renderer:dev meta-llama/Llama-3.1-8B-Instruct \
+  --host 0.0.0.0 --sampling-defaults openai
+```
+
+For inference, add `--engine-url` with a URL reachable from the container.
+The image runs as UID/GID `65532:65532`; bind-mounted caches must be writable by
+that user. `HF_TOKEN` is passed from the host for gated models.
+
 ## Current scope
 
 OpenAI serving supports text chat and completions. Multimodal OpenAI inputs,
