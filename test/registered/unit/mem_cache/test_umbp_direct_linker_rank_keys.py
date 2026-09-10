@@ -50,40 +50,42 @@ class TestStorageSuffix(CustomTestCase):
         )
 
 
-class TestOffloadOwnership(CustomTestCase):
-    @staticmethod
-    def _linker(*, offload_owner: bool, transfers=("transfer",)) -> UMBPDirectLinker:
+class TestEveryRankWrites(CustomTestCase):
+    """Collapsing the key must not also elide the write on non-zero ranks.
+
+    A Local-mode UMBP tier is in-process and private to its rank, and a
+    standalone server is per node, so a page written only by rank 0 is not
+    reachable from the other ranks' stores. They then miss on a key nobody
+    wrote for them, and the attention group's MIN over the restorable mask
+    drives the hit to zero.
+    """
+
+    def test_offload_queues_the_write_on_every_rank(self):
         linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
-        linker.offload_owner = offload_owner
         linker._offload_results = Queue()
         linker._offload_queue = Queue()
         linker._gc_frozen = True  # short-circuits _freeze_gc_once
         linker.pool_group = SimpleNamespace(
-            resolve_transfers=lambda _transfers, allow_partial: list(transfers)
+            resolve_transfers=lambda _transfers, allow_partial: ["transfer"]
         )
-        return linker
-
-    def test_non_owner_reports_completion_without_queueing_io(self):
-        linker = self._linker(offload_owner=False)
-        self.assertTrue(linker.offload(["t"]))
-        # The tree pairs one result per submitted offload, so a rank that skips
-        # the write still has to produce one or the group's MIN never advances.
-        self.assertEqual(linker._offload_results.qsize(), 1)
-        self.assertTrue(linker._offload_results.get_nowait())
-        self.assertEqual(linker._offload_queue.qsize(), 0)
-
-    def test_owner_queues_the_write(self):
-        linker = self._linker(offload_owner=True)
         fake_device = SimpleNamespace(
             Event=lambda: SimpleNamespace(record=lambda: None)
         )
         with mock.patch.object(umbp_direct_linker, "device_module", fake_device):
             self.assertTrue(linker.offload(["t"]))
         self.assertEqual(linker._offload_queue.qsize(), 1)
+        # The result comes from the offload thread once the write lands, so
+        # nothing may pre-post one here.
         self.assertEqual(linker._offload_results.qsize(), 0)
 
     def test_empty_transfer_set_produces_no_result(self):
-        linker = self._linker(offload_owner=False, transfers=())
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker._offload_results = Queue()
+        linker._offload_queue = Queue()
+        linker._gc_frozen = True
+        linker.pool_group = SimpleNamespace(
+            resolve_transfers=lambda _transfers, allow_partial: []
+        )
         self.assertFalse(linker.offload([]))
         self.assertEqual(linker._offload_results.qsize(), 0)
         self.assertEqual(linker._offload_queue.qsize(), 0)
