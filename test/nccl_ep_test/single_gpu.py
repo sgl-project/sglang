@@ -53,6 +53,14 @@ def run(*, experts=4, capacity=8, replays=1000, require_sm=None):
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
         enable_timing=True
     )
+    eager_steps = min(replays, 100)
+    start.record()
+    for step in range(eager_steps):
+        dispatched.masked_m.copy_(patterns[step % len(patterns)])
+        run_nccl_ep_triton(dispatched, quant, config)
+    end.record()
+    end.synchronize()
+    eager_ms = start.elapsed_time(end) / eager_steps
     start.record()
     for step in range(replays):
         dispatched.masked_m.copy_(patterns[step % len(patterns)])
@@ -70,6 +78,7 @@ def run(*, experts=4, capacity=8, replays=1000, require_sm=None):
         "experts": experts,
         "capacity": capacity,
         "replays": replays,
+        "eager_with_count_copy_ms": eager_ms,
         "replay_with_count_copy_ms": start.elapsed_time(end) / replays,
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
         "native_ep_tested": False,

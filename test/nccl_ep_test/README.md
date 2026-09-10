@@ -1,6 +1,9 @@
 # NCCL EP low-latency CUDA Graph tests
 
 Shared fixtures for the registered unit tests and the two-GPU manual harness.
+The Triton compute, zero-token rank and independent shared-expert follow-ups
+have a separate [validation guide](followup_validation.md) and cost-ordered
+server gate. The synthetic expert harness described below remains available.
 The harness exercises the real dispatcher, FP8 conversion, full Graph backend
 and runner input buffers with synthetic experts `f_e(x) = (e + 1) * x`. It does
 not load model weights or run an expert GEMM. The CPU oracle checks receive-row

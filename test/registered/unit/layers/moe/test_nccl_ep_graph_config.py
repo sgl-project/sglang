@@ -194,5 +194,58 @@ def test_nccl_ep_gate_prefers_the_binding_library_version(model_path, monkeypatc
     assert args.moe_a2a_backend == "nccl_ep"
 
 
+@pytest.mark.parametrize("graph", [False, True])
+def test_followup_serving_recipe_resolves_per_rank_capacity(
+    tmp_path, monkeypatch, graph
+):
+    import argparse
+
+    from nccl_ep_test.followup_server import server_args as serving_command
+    from transformers import DeepseekV2Config, GenerationConfig
+
+    from sglang.srt.server_args import ServerArgs
+
+    torch.cuda.init()
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda *args, **kw: (12, 0)
+    )
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    config = DeepseekV2Config(
+        hidden_size=2048,
+        intermediate_size=10944,
+        moe_intermediate_size=1408,
+        n_routed_experts=64,
+        n_shared_experts=2,
+        num_experts_per_tok=6,
+        num_hidden_layers=27,
+        num_attention_heads=16,
+        kv_lora_rank=512,
+        q_lora_rank=None,
+    )
+    config.architectures = ["DeepseekV2ForCausalLM"]
+    config.quantization_config = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    config.save_pretrained(tmp_path)
+    GenerationConfig().save_pretrained(tmp_path)
+    argv = serving_command(30000, graph=graph)[3:]
+    argv[argv.index("--model-path") + 1] = str(tmp_path)
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    resolved = ServerArgs.from_cli_args(parser.parse_args(argv))
+    assert resolved.tp_size == resolved.dp_size == resolved.ep_size == 2
+    assert resolved.moe_dense_tp_size == 1 and resolved.enable_dp_lm_head
+    assert resolved.disable_shared_experts_fusion
+    assert resolved.chunked_prefill_size == 64
+    assert resolved.nccl_ep_num_max_dispatch_tokens_per_rank == 64
+    assert resolved.cuda_graph_config.decode.backend == (
+        "full" if graph else "disabled"
+    )
+    assert resolved.cuda_graph_config.prefill.backend == "disabled"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
