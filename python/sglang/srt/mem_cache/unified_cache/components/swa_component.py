@@ -323,8 +323,18 @@ def _restore_state_ride_per_layer(
         window = flat.view(dev.dtype).reshape(ratio, -1).to(device=dev.device)
         dev[state_locs] = window
         if _SWA_DBG_CHECKSUM:
+            # clone on this stream; a later read races the compressor
             _dbg_verify_state_restore(
-                node, host_value_attr, hp, li, page_row, off0, flat, dev, state_locs
+                node,
+                host_value_attr,
+                hp,
+                li,
+                page_row,
+                off0,
+                flat,
+                dev,
+                state_locs,
+                dev[state_locs].clone(),
             )
 
 
@@ -381,15 +391,15 @@ def _restore_state_windows(component, node, r: int) -> None:
 
 
 def _dbg_verify_state_restore(
-    node, host_value_attr, hp, li_local, page_row, off0, flat, dev, state_locs
+    node, host_value_attr, hp, li_local, page_row, off0, flat, dev, state_locs, landed
 ):
     """Gated (SGLANG_SWA_DBG_CHECKSUM) double-ended check for one c4 state ride layer.
     (a) host round-trip: the bound tile bytes still match the position-weighted CRC
     taken at capture, proving capture/bind/promote/restore kept the exact tile at
-    the exact page_row/off0. (b) device landing: the rows just written match the
-    host window, proving the write hit the intended state ring rows (catches
-    state_locs collisions / out-of-range). Immune to model non-determinism;
-    localizes any mismatch to layer/page_row/off0/state_locs.
+    the exact page_row/off0. (b) device landing: ``landed`` (same-stream clone
+    after scatter) matches the host window, proving the write hit the intended
+    state ring rows (catches state_locs collisions / out-of-range). Immune to
+    model non-determinism; localizes any mismatch to layer/page_row/off0/state_locs.
     """
     idx = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64) + 1
     got_host = int((flat.to(torch.int64) * idx).sum().item())
@@ -401,14 +411,17 @@ def _dbg_verify_state_restore(
             f"li_local={li_local} page_row={page_row} off0={off0} "
             f"expected={exp} got={got_host}"
         )
-    back = dev[state_locs].contiguous().view(torch.uint8).reshape(-1)
+    back = landed.contiguous().view(torch.uint8).reshape(-1)
     bidx = torch.arange(back.numel(), device=back.device, dtype=torch.int64) + 1
     got_dev = int((back.to(torch.int64) * bidx).sum().item())
     if got_dev != got_host:
+        now = dev[state_locs].contiguous().view(torch.uint8).reshape(-1)
+        got_now = int((now.to(torch.int64) * bidx).sum().item())
         raise AssertionError(
             f"[C4-STATE-DBG] device landing mismatch attr={host_value_attr} "
             f"li_local={li_local} page_row={page_row} off0={off0} "
-            f"state_locs={state_locs.tolist()} host={got_host} dev={got_dev}"
+            f"state_locs={state_locs.tolist()} host={got_host} landed={got_dev} "
+            f"now={got_now}"
         )
     _n = getattr(hp, "_dbg_state_verified", 0) + 1
     hp._dbg_state_verified = _n
