@@ -14,7 +14,7 @@ on:
         description: 'ROCm image version ("all" runs rocm10, rocm724, and rocm720)'
         required: false
         type: choice
-        default: 'all'
+        default: rocm10
         options:
           - 'all'
           - rocm10
@@ -114,8 +114,8 @@ on:
         description: 'ROCm image version ("all" runs rocm10, rocm724, and rocm720)'
         required: false
         type: string
-        # A single flavor, unlike the schedule and the dispatch form: a caller
-        # that says nothing should not silently get multi-version GPU cost.
+        # A caller that says nothing gets the same single-flavor default as a
+        # manual dispatch; pass "all" explicitly for multi-version GPU coverage.
         default: rocm10
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
