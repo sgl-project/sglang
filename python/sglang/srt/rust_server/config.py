@@ -33,30 +33,12 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
     keyword (see ``rust/sglang-server/src/message/config.rs``), so a
     missing, extra or mistyped field fails here at boot rather than
     running on a silently-defaulted knob."""
-    from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4
     from sglang.srt.rust_extensions import load_rust_extension
 
     ext = load_rust_extension("sglang.srt.rust_extensions._server")
 
     sa = resolving_view(scheduler.server_args)
     mc = scheduler.model_config
-    dsv4_effort_prompts = None
-    if (
-        chat_encoding.resolve_chat_encoding_spec(
-            hf_config=mc.hf_config,
-            tokenizer=None,
-            tool_call_parser=get_serving().tool_call_parser,
-        )
-        == "dsv4"
-    ):
-        profile = chat_encoding.resolve_dsv4_reasoning_effort_profile(
-            model_path=get_model().model_path,
-            revision=get_model().revision,
-            override=mc.hf_config.to_dict().get(
-                chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
-            ),
-        )
-        dsv4_effort_prompts = encoding_dsv4.REASONING_EFFORT_PROFILES[profile]
     disaggregation_mode = {
         "null": ext.DisaggregationMode.Null,
         "prefill": ext.DisaggregationMode.Prefill,
@@ -87,7 +69,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
             context_len=mc.context_len,
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
-            dsv4_effort_prompts=dsv4_effort_prompts,
+            model_type=getattr(mc.hf_config, "model_type", None),
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
