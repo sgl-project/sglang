@@ -972,6 +972,12 @@ class MQALayer(MqaAttentionBase):
                     fp4_sin=(self.sin_cache[:, 0, 0, :] if _is_hip else None),
                 )
 
+        self._fused_compressor_weight: Optional[torch.Tensor] = None
+        self._fused_compressor_split_sizes: Optional[Tuple[int, int]] = None
+        self.register_load_state_dict_post_hook(
+            MQALayer._rebuild_compressor_gemm_fusion_after_state_load
+        )
+
         self.attn_mqa = RadixAttention(
             self.n_local_heads,
             self.head_dim,
@@ -990,11 +996,83 @@ class MQALayer(MqaAttentionBase):
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
 
+    def prepare_compressor_gemm_fusion(self) -> bool:
+        if self._fused_compressor_weight is not None:
+            return False
+
+        from sglang.srt.utils.offloader import NoopOffloader, get_offloader
+
+        if self.compress_ratio != 4:
+            return False
+        if not isinstance(get_offloader(), NoopOffloader):
+            return False
+        if self.compressor is None or self.indexer is None:
+            return False
+
+        main_weight = getattr(self.compressor.wkv_gate, "weight", None)
+        indexer_weight = getattr(self.indexer.compressor.wkv_gate, "weight", None)
+        if not (
+            isinstance(main_weight, nn.Parameter)
+            and isinstance(indexer_weight, nn.Parameter)
+            and main_weight.layout == torch.strided
+            and indexer_weight.layout == torch.strided
+            and main_weight.ndim == 2
+            and indexer_weight.ndim == 2
+            and main_weight.shape[1] == indexer_weight.shape[1]
+            and main_weight.dtype == indexer_weight.dtype
+            and main_weight.device == indexer_weight.device
+        ):
+            return False
+
+        main_size = main_weight.shape[0]
+        indexer_size = indexer_weight.shape[0]
+        fused_weight = torch.cat((main_weight, indexer_weight), dim=0)
+        with torch.no_grad():
+            main_weight.set_(fused_weight[:main_size])
+            indexer_weight.set_(fused_weight[main_size:])
+
+        self._fused_compressor_weight = fused_weight
+        self._fused_compressor_split_sizes = (main_size, indexer_size)
+        return True
+
+    @staticmethod
+    def _rebuild_compressor_gemm_fusion_after_state_load(
+        module: MQALayer, _incompatible_keys
+    ) -> None:
+        if module._fused_compressor_weight is None:
+            return
+        module._fused_compressor_weight = None
+        module._fused_compressor_split_sizes = None
+        module.prepare_compressor_gemm_fusion()
+
+    def _compute_fused_compressor_kv_scores(
+        self, x: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if dsa_use_prefill_cp(forward_batch):
+            return None, None
+
+        fused_weight = self._fused_compressor_weight
+        split_sizes = self._fused_compressor_split_sizes
+        if fused_weight is None or split_sizes is None:
+            return None, None
+        if self.compressor is None or self.indexer is None:
+            raise RuntimeError("Fused compressor weight requires a C4 indexer")
+
+        fused_scores = self.compressor._compute_wkv_gate(x, weight=fused_weight)
+        main_score, indexer_score = fused_scores.split(split_sizes, dim=-1)
+        return main_score, indexer_score
+
     def _apply(self, fn, recurse=True):
+        rebuild_compressor_fusion = self._fused_compressor_weight is not None
+        if rebuild_compressor_fusion:
+            self._fused_compressor_weight = None
+            self._fused_compressor_split_sizes = None
         result = super()._apply(fn, recurse=recurse)
         if self.indexer is not None and hasattr(self.indexer.compressor, "fp4_cos"):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
+        if rebuild_compressor_fusion:
+            self.prepare_compressor_gemm_fusion()
         return result
 
     def _get_npu_rope_position_cache(
@@ -1571,19 +1649,34 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
+        main_kv_score = None
+        indexer_kv_score = None
+        if not forward_batch.forward_mode.is_idle():
+            main_kv_score, indexer_kv_score = self._compute_fused_compressor_kv_scores(
+                x, forward_batch
+            )
+
         if self.indexer is not None:
+            indexer_kwargs = {}
+            if indexer_kv_score is not None:
+                indexer_kwargs["kv_score_input"] = indexer_kv_score
             self.indexer(
                 x=x,
                 q_lora=q_lora,
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
+                **indexer_kwargs,
             )
         if self.compressor is not None:
+            compressor_kwargs = {}
+            if main_kv_score is not None:
+                compressor_kwargs["kv_score_input"] = main_kv_score
             attn_backend.forward_core_compressor(
                 x,
                 forward_batch,
                 self.layer_id,
                 self.compressor,
+                **compressor_kwargs,
             )
 
         return q, kv
@@ -3369,6 +3462,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+        enable_compressor_gemm_fusion = (
+            _is_hip and envs.SGLANG_OPT_DSV4_C4_COMPRESSOR_GEMM_FUSION.get()
+        )
+        fused_compressor_layers = 0
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
@@ -3382,7 +3479,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and not self_attn.indexer.compressor.ape_converted
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
+            if enable_compressor_gemm_fusion:
+                fused_compressor_layers += self_attn.prepare_compressor_gemm_fusion()
             layer.refresh_mhc_norm_weight_cache()
+        if fused_compressor_layers:
+            logger.info(
+                "Prepared fused C4 compressor GEMM weights for %d layers",
+                fused_compressor_layers,
+            )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
