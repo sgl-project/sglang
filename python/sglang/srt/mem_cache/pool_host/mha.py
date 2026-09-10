@@ -362,9 +362,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                     transfer_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
-                        device_k=device_pool.k_buffer,
+                        device_k=getattr(device_pool, "k_buffer_5d", device_pool.k_buffer),
                         host_k=self.k_buffer,
-                        device_v=device_pool.v_buffer,
+                        device_v=getattr(device_pool, "v_buffer_5d", device_pool.v_buffer),
                         host_v=self.v_buffer,
                         page_size=self.page_size,
                         direction=TransferDirection.H2D,
@@ -494,9 +494,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
+                    device_k=getattr(device_pool, "k_buffer_5d", device_pool.k_buffer),
                     host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
+                    device_v=getattr(device_pool, "v_buffer_5d", device_pool.v_buffer),
                     host_v=self.v_buffer,
                     page_size=self.page_size,
                     direction=TransferDirection.D2H,

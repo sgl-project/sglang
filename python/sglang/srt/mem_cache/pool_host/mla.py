@@ -116,9 +116,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
-        if self.layout == "page_first":
+        if self.layout in ("page_first", "page_first_kv_split"):
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
-            # This swaps strides without copying data
+            # This swaps strides without copying data.  For page_first_kv_split,
+            # kv_buffer is the k_buffer with the same page-major dims.
             transposed = self.kv_buffer.transpose(0, 1)
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
         else:
@@ -206,19 +207,50 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self._is_dummy:
             return [], [], []
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
-        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        if self.layout == "page_first_kv_split":
+            # data_refs are per-layer views of the k_buffer (page-major), so
+            # take the per-layer slab size instead of kv_buffer[i] (a page slab).
+            data_lens = [x.nbytes for x in self.data_refs]
+        else:
+            data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.token_stride_size * self.page_size] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
+        # FP8 DSA packs K/V into the single device k_buffer (device v_buffer is
+        # empty and never transferred). Exposed for the L3 store to skip the
+        # dead v component when generating per-page keys/pointers.
+        self.dsa_kv_cache_store_fp8 = getattr(
+            self.device_pool, "dsa_kv_cache_store_fp8", False
+        )
         self.target_layer_num = self._effective_host_layer_num()
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
         )
-        return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        size_per_token = self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        if (
+            self.layout == "page_first_kv_split"
+            and self.device_pool.index_head_dim is not None
+        ):
+            # Indexer buffers only exist for physical Indexer layers, which can
+            # be a subset of all layers (e.g. GLM 5.2: 21 of 78).  Mirror the
+            # layer count used by init_kv_buffer so host capacity sizing stays
+            # consistent with the actually-allocated buffers.
+            num_indexer_layers = getattr(self.device_pool, "num_indexer_layers", None)
+            if num_indexer_layers is None:
+                num_indexer_layers = self.layer_num
+            size_per_token += (
+                self.device_pool.index_head_dim
+                * self.dtype.itemsize
+                * num_indexer_layers
+            )
+            if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
+                # FP32 quantization scale per token per indexer layer.
+                size_per_token += 4 * num_indexer_layers
+        return size_per_token
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -249,15 +281,25 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
         elif self.layout == "page_first_kv_split":
-            base_dims = (
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                1,
-            )
+            base_dims = (self.page_num, self.layer_num, self.page_size, 1)
+            # Indexer buffers only exist for physical Indexer layers, which can
+            # be a subset of all layers (e.g. GLM 5.2: 21 of 78).  The device
+            # pool packs them as (num_indexer_layers, page, ...); mirror that
+            # layer count here so transfer_kv_dim_exchange's layer check
+            # (device dim0 == host dim1) holds.
+            num_indexer_layers = getattr(self.device_pool, "num_indexer_layers", None)
+            if num_indexer_layers is None:
+                num_indexer_layers = self.layer_num
+            indexer_dims = (self.page_num, num_indexer_layers, self.page_size, 1)
             alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+            if getattr(self.device_pool, "dsa_kv_cache_store_fp8", False):
+                # FP8 DSA packs latent+RoPE+scale into the device k_buffer;
+                # mirror the packed width so the 2D memcpy row width matches.
+                k_width = self.device_pool.kv_cache_dim
+            else:
+                k_width = self.kv_lora_rank
             self.k_buffer = alloc_func(
-                (*base_dims, self.kv_lora_rank),
+                (*base_dims, k_width),
                 dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
@@ -273,8 +315,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
                 self.index_k_buffer = alloc_func(
-                    (*base_dims, self.device_pool.index_head_dim),
+                    (*indexer_dims, self.device_pool.index_head_dim),
                     dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+            # Host-side mirror of the NPU quantized-Indexer FP32 scale cache
+            # (see NPUMLATokenToKVPool.index_k_scale_buffer). Only present when
+            # the device pool carries one (FP8 DSA + npu_quant_lightning_indexer).
+            self.index_k_scale_buffer = None
+            if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
+                self.index_k_scale_buffer = alloc_func(
+                    (*indexer_dims, 1),
+                    dtype=torch.float32,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
@@ -416,19 +470,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
-                if device_layer_id == 0:
-                    transfer_kv_dim_exchange(
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        device_k=device_pool.k_buffer,
-                        host_k=self.k_buffer,
-                        device_v=device_pool.v_buffer,
-                        host_v=self.v_buffer,
-                        device_index_k=device_pool.index_k_buffer,
-                        host_index_k=self.index_k_buffer,
-                        page_size=self.page_size,
-                        direction=TransferDirection.H2D,
-                    )
+                if device_layer_id != 0:
+                    return
+                transfer_kv_dim_exchange(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    device_k=getattr(device_pool, "k_buffer_5d", device_pool.k_buffer),
+                    host_k=self.k_buffer,
+                    device_v=getattr(device_pool, "v_buffer_5d", device_pool.v_buffer),
+                    host_v=self.v_buffer,
+                    device_index_k=device_pool.index_k_buffer,
+                    host_index_k=self.index_k_buffer,
+                    page_size=self.page_size,
+                    direction=TransferDirection.H2D,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
@@ -614,9 +669,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
+                    device_k=getattr(device_pool, "k_buffer_5d", device_pool.k_buffer),
                     host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
+                    device_v=getattr(device_pool, "v_buffer_5d", device_pool.v_buffer),
                     host_v=self.v_buffer,
                     device_index_k=device_pool.index_k_buffer,
                     host_index_k=self.index_k_buffer,
@@ -695,6 +750,88 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
+        if self.layout == "page_first_kv_split":
+            k_buffer_data_ptr = self.k_buffer.data_ptr()
+            v_buffer_data_ptr = self.v_buffer.data_ptr()
+            index_k_buffer = getattr(self, "index_k_buffer", None)
+            index_k_buffer_data_ptr = (
+                index_k_buffer.data_ptr() if index_k_buffer is not None else None
+            )
+            scale_buffer = getattr(self, "index_k_scale_buffer", None)
+            scale_buffer_data_ptr = (
+                scale_buffer.data_ptr() if scale_buffer is not None else None
+            )
+            # k row width mirrors the device pool (packed dim for FP8 DSA).
+            k_width = self.k_buffer.shape[-1]
+            k_item_size = self.k_buffer.element_size()
+            # Indexer buffers cover only physical Indexer layers, which can be
+            # a subset of all layers (e.g. GLM 5.2: 21 of 78).
+            num_indexer_layers = (
+                index_k_buffer.shape[1] if index_k_buffer is not None else 0
+            )
+            index_k_width = (
+                index_k_buffer.shape[-1] if index_k_buffer is not None else 0
+            )
+            index_k_item_size = (
+                index_k_buffer.element_size() if index_k_buffer is not None else 0
+            )
+            # FP8 DSA packs V into k_buffer; the device v_buffer is empty and
+            # never transferred, so the host v mirror holds no valid data and
+            # must not be persisted to storage.
+            skip_v = getattr(self, "dsa_kv_cache_store_fp8", False)
+            for index in range(0, len(indices), self.page_size):
+                k_ptr = (
+                    k_buffer_data_ptr
+                    + indices[index] * self.layer_num * k_width * k_item_size
+                )
+                ptr_list.append(k_ptr)
+                if not skip_v:
+                    v_ptr = (
+                        v_buffer_data_ptr
+                        + indices[index]
+                        * self.layer_num
+                        * self.qk_rope_head_dim
+                        * self.dtype.itemsize
+                    )
+                    ptr_list.append(v_ptr)
+                if index_k_buffer_data_ptr is not None:
+                    # Host index_k layout is (page_num, num_indexer_layers,
+                    # page_size, 1, index_head_dim).
+                    ptr_list.append(
+                        index_k_buffer_data_ptr
+                        + indices[index]
+                        * num_indexer_layers
+                        * index_k_width
+                        * index_k_item_size
+                    )
+                if scale_buffer_data_ptr is not None:
+                    # Host scale layout is (page_num, num_indexer_layers,
+                    # page_size, 1, 1) FP32: one scale value per token per
+                    # indexer layer.
+                    ptr_list.append(
+                        scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
+                    )
+            k_element_size = self.layer_num * k_item_size * self.page_size * k_width
+            v_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.qk_rope_head_dim
+            )
+            index_k_element_size = (
+                num_indexer_layers * index_k_item_size * self.page_size * index_k_width
+            )
+            scale_element_size = num_indexer_layers * 4 * self.page_size
+            element_size_list = []
+            for _ in range(0, len(indices), self.page_size):
+                element_size_list.append(k_element_size)
+                if not skip_v:
+                    element_size_list.append(v_element_size)
+                if index_k_buffer_data_ptr is not None:
+                    element_size_list.append(index_k_element_size)
+                if scale_buffer_data_ptr is not None:
+                    element_size_list.append(scale_element_size)
+            return ptr_list, element_size_list
         if self.layout == "layer_first":
             for index in range(0, len(indices), self.page_size):
                 for layer_id in range(self.layer_num):

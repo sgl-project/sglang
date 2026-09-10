@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -166,6 +166,31 @@ class HostPoolGroup:
                 continue
             released += self.free(transfer.host_indices, pool=transfer.name)
         return released
+
+    @property
+    def kv_buffer(self):
+        return self.anchor_entry.host_pool.kv_buffer
+
+    @property
+    def v_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "v_buffer", None)
+
+    @property
+    def index_k_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "index_k_buffer", None)
+
+    @property
+    def index_k_scale_buffer(self):
+        # Delegate to the anchor pool so NpuMemcacheStore sees the same
+        # buffer set as get_page_buffer_meta (which also delegates), keeping
+        # the per-page component-key count consistent (k, v, index_k, scale).
+        return getattr(self.anchor_entry.host_pool, "index_k_scale_buffer", None)
+
+    @property
+    def dsa_kv_cache_store_fp8(self):
+        # Delegate so the L3 store skips the dead v component exactly when
+        # get_page_buffer_meta (which also delegates) skips it.
+        return getattr(self.anchor_entry.host_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
     def size_per_token(self):

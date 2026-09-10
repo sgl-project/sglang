@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to SGLang project
 
 import importlib
@@ -165,6 +165,9 @@ class StorageBackendFactory:
         elif backend_name == "mooncake":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
+        elif backend_name == "npu_memcache":
+            backend = backend_class(storage_config, mem_pool_host)
+            return backend
         elif backend_name == "aibrix":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
@@ -212,6 +215,12 @@ StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
+)
+
+StorageBackendFactory.register_backend(
+    "npu_memcache",
+    "sglang.srt.mem_cache.storage.npu_memcache.npu_memcache_store",
+    "NpuMemcacheStore",
 )
 
 StorageBackendFactory.register_backend(

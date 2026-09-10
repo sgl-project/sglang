@@ -127,6 +127,11 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
+            # Keep a reference to the 5-D contiguous tensor for HiCache
+            # D2H/H2D transfers (transfer_kv_dim_exchange expects a 5-D
+            # tensor, not the per-layer list used in FIA mode below).
+            self.k_buffer_5d = self.k_buffer
+            self.v_buffer_5d = self.v_buffer
 
             if self.use_fia:
                 # Use per-layer Python lists to avoid torch.compile capturing
@@ -436,6 +441,10 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
+            # Keep a reference to the 5-D contiguous tensor for HiCache
+            # D2H/H2D transfers (transfer_kv_dim_exchange expects a 5-D
+            # tensor, not the per-layer list used in FIA mode below).
+            self.k_buffer_5d = self.k_buffer
             if self.use_fia:
                 self.k_buffer = [
                     self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
@@ -755,15 +764,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_contiguous_buf_infos(self):
         self._raise_if_native_kv_cache_disabled()
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
-            self.v_buffer[i].data_ptr() for i in range(self.layer_num)
-        ]
-        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
+        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        # When DSA KV cache is packed into the FP8 k_buffer, the v_buffer is
+        # intentionally empty (kr_cache_dim == 0). Its data_ptr() is null
+        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+            kv_data_ptrs += [self.v_buffer[i].data_ptr() for i in range(self.layer_num)]
+            kv_data_lens += [self.v_buffer[i].nbytes for i in range(self.layer_num)]
+            kv_item_lens += [self.v_buffer[i][0].nbytes for i in range(self.layer_num)]
         if self.index_head_dim is not None:
             ptrs, lens, item_lens = self.get_state_buf_infos()
             kv_data_ptrs += ptrs

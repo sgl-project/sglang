@@ -1,4 +1,4 @@
-"""Config fields of the ``memory`` namespace.
+﻿"""Config fields of the ``memory`` namespace.
 
 One class per namespace. The class *is* the namespace: a field declared here
 lands in the ``memory`` bag, which is what ``get_memory()`` returns, so a reader
@@ -139,11 +139,12 @@ class Memory(msgspec.Struct):
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
                 "mooncake",
+                "npu_memcache",
                 "hf3fs",
                 "nixl",
                 "aibrix",
