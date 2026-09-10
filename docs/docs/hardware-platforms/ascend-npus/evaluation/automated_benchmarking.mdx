@@ -1,0 +1,118 @@
+---
+title: Automated Benchmarking
+---
+
+# Automated benchmarking with ascend_bench
+
+This page describes the methodology behind
+[`benchmark/ascend_bench`](https://github.com/sgl-project/sglang/tree/main/benchmark/ascend_bench),
+a configuration-driven sweep tool for benchmarking SGLang on Ascend NPU:
+multi-parameter search, SLA threshold filtering, ranked reports, and
+regression diffs. Use it to establish performance baselines and verify
+that configuration or version changes do not regress them.
+
+## Why automated sweeps
+
+Manual benchmarking on NPU hosts fails in predictable ways:
+
+- A server killed at the end of a manual run leaves **orphaned engine
+  workers holding tens of GB of HBM**; the next "failed" run is actually a
+  phantom OOM. ascend_bench treats HBM reclamation as a hard gate: after
+  every cell it kills the server process group (SIGTERM → SIGKILL), polls
+  `npu-smi info` until per-device usage is back within a budget of the
+  pre-run baseline, and marks the cell `failed_hbm` instead of letting a
+  dirty node silently poison the rest of the sweep.
+- Manual sweeps are not repeatable. Every cell here records its full
+  provenance: sglang / torch_npu / CANN / driver versions, git sha, NPU
+  topology, environment variables, and the exact server argv.
+- Long sweeps get interrupted. Every cell transition is appended to an
+  append-only `manifest.jsonl`; re-running the same command skips
+  completed cells.
+
+## Metrics and percentile choices
+
+| Metric | Meaning |
+| --- | --- |
+| TTFT | time to first token, per request |
+| TPOT | time per output token, per request (excluding the first token) |
+| ITL | inter-token latency, per token gap |
+| E2E latency | full request latency |
+| Output throughput | aggregate output tokens/second across the run |
+
+SLA thresholds are expressed as **upper bounds on percentiles** (e.g.
+`p99_ttft_ms: 2000`). Tail percentiles (p99) are the default gate because
+SLA violations in serving are tail events; a mean can hide one stalled
+stream in a hundred. Cells violating any threshold are eliminated before
+ranking.
+
+## Warmup, repeats, and the variance gate
+
+- Each cell issues `warmup_requests` before measurement so one-off costs
+  (graph capture, allocator growth, cache population) do not land in the
+  measured window.
+- Each cell is repeated (`run.repeats`, 3 recommended) with distinct
+  seeds; metrics are aggregated as **mean ± std**.
+- If `std/mean` of a ranking-relevant metric exceeds `sla.cv_max`
+  (default 0.15), the cell is marked **unrankable** and shown separately.
+  A noisy cell must not decide a ranking.
+
+## Dataset selection
+
+- `random` — synthetic fixed input/output lengths. No download needed on
+  the bench host, fully controlled ISL/OSL; the default for cookbook
+  sweeps.
+- `generated-shared-prefix` — grouped prompts sharing prefixes, for
+  systems where radix/prefix caching matters.
+- `sharegpt` — real conversation lengths; pre-download the dataset and
+  point `--dataset-path` at it on offline hosts.
+
+`num_prompts` defaults to `num_prompts_mult × max-concurrency` so every
+concurrency level issues enough requests to reach steady state
+(k = 8 is a reasonable default).
+
+## Ranking and cross-config comparison
+
+Surviving cells are ranked by **output token throughput** (descending)
+with **TPOT p99 as tiebreak**, so a throughput win achieved by unacceptable
+per-token latency does not rank first. Reports also include
+**throughput per card** (`output_throughput / tp-size`) so configurations
+with different parallel widths remain comparable. On A3 nodes remember
+`--tp-size` counts dies: it is 2× the number of cards.
+
+## Accuracy smoke gate
+
+Performance numbers from a mis-adapted model are worthless. With
+`run.gsm8k` enabled, each cell runs a small gsm8k evaluation (reusing
+`benchmark/gsm8k/bench_sglang.py`, 200 questions, 5-shot) and records the
+accuracy next to the perf metrics; accuracy below `accuracy_floor`
+excludes the cell from ranking. This is a smoke gate, not a full
+evaluation — see [Accuracy Evaluation](./accuracy_evaluation.mdx) for
+thorough workflows.
+
+## Ascend NPU pitfalls encoded in the tool
+
+- **NPU graph capture is limited**: keep `--cuda-graph-bs` to ≤ 10 batch
+  sizes or capture fails with stream-conflict error 507000. The config
+  loader rejects larger lists up front.
+- **`--mem-fraction-static`**: start conservative (0.80–0.85) and
+  increase; cookbook sweeps search the grid.
+- Ascend-documented environment knobs (`HCCL_BUFFSIZE`,
+  `TASK_QUEUE_ENABLE`, `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`,
+  ...) belong in `server.env` so they are captured in provenance.
+- FP8 is not supported on Atlas 800T A2/A3; use modelslim **W8A8**
+  checkpoints (auto-detected from `quant_model_description.json`) with
+  `--quantization modelslim`.
+
+## Adding a new model spec
+
+1. Copy `benchmark/ascend_bench/configs/cookbook/qwen3-8b-bf16.yaml`.
+2. Set `model.path` (local weights or a hub id) and adjust
+   `--tp-size` for the model's memory footprint.
+3. Pick the workload grid (input/output lengths, concurrency) and SLA
+   thresholds appropriate for the deployment target.
+4. `--dry-run` to inspect the expanded cell list, then run.
+
+## Baselines
+
+Cookbook baselines on Atlas 800I A3 (2 × 64 GB, single node, PD
+co-located) will be published here as runs complete.
