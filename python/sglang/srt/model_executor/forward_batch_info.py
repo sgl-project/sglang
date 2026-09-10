@@ -863,6 +863,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+        pin_memory = is_pin_memory_available(device)
 
         model_runner.kv_index_translator.rebind_write_loc(ret)
 
@@ -895,7 +896,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_token_non_padded = torch.tensor(
                 num_tokens,
                 dtype=torch.int32,
-                pin_memory=is_pin_memory_available(device),
+                pin_memory=pin_memory,
             ).to(device, non_blocking=True)
         ret.global_num_token_non_padded_cpu = num_tokens
 
@@ -934,7 +935,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
-                pin_memory = is_pin_memory_available(device)
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
                 ).to(device, non_blocking=True)
@@ -1546,12 +1546,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
-        self.use_pin_memory = not _is_cpu
+        pin_memory = is_pin_memory_available(device=self.global_num_tokens_gpu.device)
         global_num_tokens_pinned = torch.tensor(
-            global_num_tokens, pin_memory=self.use_pin_memory
+            global_num_tokens, pin_memory=pin_memory
         )
         self.global_num_tokens_gpu.copy_(
-            global_num_tokens_pinned, non_blocking=self.use_pin_memory
+            global_num_tokens_pinned, non_blocking=pin_memory
         )
 
         TboForwardBatchPreparer.prepare(
