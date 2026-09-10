@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
+    dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
@@ -626,6 +627,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if is_retracted and dsv41_dspark_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
+            if req.output_ids:
+                req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+            req.pd_rebootstrap_in_progress = True
+            req.time_stats.set_retract_time()
+            is_retracted = False
+            is_rebootstrap = True
+
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
