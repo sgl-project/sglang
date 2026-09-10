@@ -575,8 +575,13 @@ The accuracy benchmark results below are shared with GLM-5.1, as GLM-5.1 was not
 
 - Benchmark Command
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --port 30000
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 127.0.0.1 --port 30000 \
+  --num-examples 200 --num-threads 64
 ```
+
+Historical results below use the removed harness and are not measurements of the Chat API command above.
 
 - Test Result
 ```text Output
@@ -663,8 +668,13 @@ Average accuracy: 0.877
 - MI325/MI35x Test (GLM-5 BF16, `tp=8`, TileLang DSA backends)
 
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 200
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 127.0.0.1 --port 30000 \
+  --num-examples 200 --num-threads 64
 ```
+
+Historical results below use the removed harness and are not measurements of the Chat API command above.
 
 ```text Output
 Accuracy: 0.970

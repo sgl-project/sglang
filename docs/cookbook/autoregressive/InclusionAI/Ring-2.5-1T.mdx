@@ -250,8 +250,17 @@ sglang serve \
 
 - Benchmark Command
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --temperature 1.2 --top-p 0.8 --max-new-tokens 32768 --num-questions 200 --tokenizer-path inclusionAI/Ring-2.5-1T --enable-thinking
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 127.0.0.1 --port 30000 \
+  --num-examples 200 --num-threads 64 \
+  --temperature 1.2 \
+  --top-p 0.8 \
+  --max-tokens 32768 \
+  --chat-template-kwargs '{"enable_thinking": true}'
 ```
+
+Historical results below use the removed harness and are not measurements of the Chat API command above.
 
 - Test Result
 ```text Output

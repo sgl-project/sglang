@@ -721,11 +721,17 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
     Output throughput: 965.919 token/s
     ```
 
-- **Full GSM8K (1319 questions)** — for a stricter accuracy check, run the full set 8-shot:
+- **Full held-out GSM8K (1311 questions)** — use eight examples as the few-shot prefix and evaluate the remaining questions via the Chat API:
 
 ```shell Command
-python3 benchmark/gsm8k/bench_sglang.py --num-shots 8 --num-questions 1319 --parallel 1319
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 127.0.0.1 --port 30000 \
+  --num-examples 1311 --num-threads 1319 \
+  --num-shots 8
 ```
+
+Historical results below use the removed harness and are not measurements of the Chat API command above.
 
   - 8-shot:
     ```

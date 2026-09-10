@@ -597,14 +597,16 @@ The following results are from the official Kimi-K2.7-Code model card. They were
 
 #### 5.2.1 Accuracy Benchmark
 
-GSM8K accuracy of the MXFP4 checkpoint, measured on the deployed server across several client parallelism levels (2,000 questions each):
+Evaluate GSM8K on the deployed MXFP4 checkpoint across client parallelism levels (1314 held-out questions after the five-shot prefix):
 
 ```shell Command
-python3 benchmark/gsm8k/bench_sglang.py \
-  --num-questions 2000 \
-  --parallel <PARALLEL> \
-  --port 30000
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 127.0.0.1 --port 30000 \
+  --num-examples 1314 --num-threads <PARALLEL>
 ```
+
+Historical results below use the removed harness and are not measurements of the Chat API command above.
 
 <table>
   <thead>

@@ -213,8 +213,13 @@ For more API examples, see the [SGLang Basic Usage Guide](../../../docs/basic_us
 Reference run on a single GB300 node with `--tp 4`:
 
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 127.0.0.1 --port 30000 \
+  --num-examples 200 --num-threads 64
 ```
+
+Historical results below use the removed harness and are not measurements of the Chat API command above.
 
 ```text Output
 Accuracy: 0.9621 (1269 / 1319)

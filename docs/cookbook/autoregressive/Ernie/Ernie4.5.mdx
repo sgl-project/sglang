@@ -680,11 +680,14 @@ Document model accuracy on standard benchmarks:
 - Benchmark Command:
 
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py \
-  --num-shots 8 \
-  --num-questions 1316 \
-  --parallel 1316
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 127.0.0.1 --port 30000 \
+  --num-examples 1311 --num-threads 1316 \
+  --num-shots 8
 ```
+
+Historical results below use the removed harness and are not measurements of the Chat API command above.
 
 - Test Results:
   - ERNIE-4.5-21B-A3B-PT

@@ -271,7 +271,10 @@ Then we can benchmark the accuracy and latency by accessing the first node's exp
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host 10.0.0.1 --port 30000
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 10.0.0.1 --port 30000 \
+  --num-examples 1314 --num-threads 64
 
 # bench latency
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
@@ -322,13 +325,16 @@ Then on the **master node**, supposing the ShareGPT data is located at `/path/to
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k --api chat \
+  --host 127.0.0.1 --port 30000 \
+  --num-examples 1314 --num-threads 64
 
 # bench serving
 python3 -m sglang.bench_serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
 ```
 
-> **Note: using `--parallel 200` can accelerate accuracy benchmarking**.
+> **Note: using `--num-threads 200` can accelerate accuracy benchmarking**.
 
 ### Example: Serving with 32 L40S with int8 Quantization
 
