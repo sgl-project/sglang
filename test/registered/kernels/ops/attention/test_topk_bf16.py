@@ -84,9 +84,7 @@ def _check(scores, lens, table, page_size, out):
 @pytest.mark.parametrize("ties", [False, True])
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize("batch,seq", CONFIGS)
-def test_topk_bf16(
-    batch: int, seq: int, k: int, ties: bool, page_mode: str
-) -> None:
+def test_topk_bf16(batch: int, seq: int, k: int, ties: bool, page_mode: str) -> None:
     page_size = 8
     scores, lens = _rows(batch, seq, k, ties, ragged=False)
     nblocks = MAX_SEQ // page_size

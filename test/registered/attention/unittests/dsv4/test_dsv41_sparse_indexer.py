@@ -198,7 +198,9 @@ class TestSparseIndexer(CustomTestCase):
         # scores are compared as a multiset. Slots invert through the page table.
         page_indices = torch.empty(bs, TOPK, dtype=torch.int32, device="cuda")
         impl.select_decode(table, inputs, page_indices)
-        slot_to_pos = torch.empty(bs, num_pages * PAGE, dtype=torch.int64, device="cuda")
+        slot_to_pos = torch.empty(
+            bs, num_pages * PAGE, dtype=torch.int64, device="cuda"
+        )
         for b in range(bs):
             n_valid = min(TOPK, int(row_valid[b]))
             chosen = page_indices[b] >= 0
@@ -207,7 +209,9 @@ class TestSparseIndexer(CustomTestCase):
             pages_b = page_table[b].long()
             slot_to_pos[b].fill_(-1)
             slot_to_pos[b][
-                (pages_b[:, None] * PAGE + torch.arange(PAGE, device="cuda")[None, :]).flatten()
+                (
+                    pages_b[:, None] * PAGE + torch.arange(PAGE, device="cuda")[None, :]
+                ).flatten()
             ] = torch.arange(pages_b.numel() * PAGE, device="cuda")
             p = slot_to_pos[b][slots]
             self.assertTrue(bool((p >= 0).all()) and bool((p < lens[b]).all()))

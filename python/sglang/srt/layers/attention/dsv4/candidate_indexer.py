@@ -41,16 +41,14 @@ class CandidateIndexer(Protocol, Generic[T]):
         inputs: IndexerInputs,
         page_indices: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
-    ) -> T:
-        ...
+    ) -> T: ...
     def select_decode(
         self,
         candidate_metadata: T,
         inputs: IndexerInputs,
         page_indices: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 def make_candidate_indexer(topk_blocks: int, block_size: int) -> CandidateIndexer:

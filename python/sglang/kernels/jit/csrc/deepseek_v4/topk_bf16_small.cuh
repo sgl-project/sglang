@@ -169,7 +169,8 @@ TOPK_BF16_KERNEL void topk_bf16_approx_kernel(const __grid_constant__ TopKBF16Pa
     auto* __restrict__ out = params.page_indices + bx * params.page_indices_stride;
     const auto page_mask = (1u << params.page_bits) - 1;
     for (uint32_t t = tx; t < params.topk; t += C::kBlockSize) {
-      out[t] = t < seq_len ? (table[t >> params.page_bits] << params.page_bits) | static_cast<int32_t>(t & page_mask) : -1;
+      out[t] =
+          t < seq_len ? (table[t >> params.page_bits] << params.page_bits) | static_cast<int32_t>(t & page_mask) : -1;
     }
     return PDLTriggerSecondary<kUsePDL>();
   }
