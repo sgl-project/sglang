@@ -1111,7 +1111,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
-        is_stats_logging_rank = ps.attn_tp_rank == 0
+        # Under attention CP every CP rank runs a scheduler over the same global
+        # requests. Gate on the CP rank as well, otherwise every CP rank exports
+        # the same request gauges and Prometheus sums inflate by attn_cp_size
+        # (issue #31896), matching the kv-cache event gate below.
+        is_stats_logging_rank = ps.attn_tp_rank == 0 and ps.attn_cp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
