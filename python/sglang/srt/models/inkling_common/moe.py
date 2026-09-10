@@ -364,6 +364,9 @@ class InklingGate(nn.Module):
             and x.dtype == torch.bfloat16
             and x.is_contiguous()
             and x.shape[-1] == _INKLING_GATE_GEMV_HIDDEN
+            # Both GEMV branches below are nvcc JIT kernels. ROCm reports `.is_cuda`
+            # too, so match the hip exclusion `__init__` uses for their scratch.
+            and x.is_cuda
             and torch.version.hip is None
         ):
             if gemv_mode >= GateGemvMode.FUSED:
