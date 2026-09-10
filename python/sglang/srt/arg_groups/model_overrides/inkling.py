@@ -17,6 +17,23 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def resolve_inkling_attention_backend(server_args: Any) -> str:
+    """The attention backend Inkling will actually run on.
+
+    Shared with apply_inkling_prefill_cuda_graph_default, which runs before
+    declarative overrides are materialized and so cannot read the resolved
+    value off server_args.
+    """
+    cfg = resolving_view(server_args)
+    if not is_attention_backend_not_set(cfg):
+        return (
+            cfg.attention_backend
+            or cfg.prefill_attention_backend
+            or cfg.decode_attention_backend
+        )
+    return "fa4" if get_platform().is_sm100 else "triton"
+
+
 @_register_for(
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationMTP",
@@ -66,7 +83,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
     if is_attention_backend_not_set(cfg):
-        inkling_attn_backend = "fa4" if get_platform().is_sm100 else "triton"
+        inkling_attn_backend = resolve_inkling_attention_backend(server_args)
         overrides["attention_backend"] = inkling_attn_backend
         logger.info(
             f"Use {inkling_attn_backend} as the attention backend for Inkling "
