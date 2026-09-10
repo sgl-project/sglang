@@ -84,6 +84,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
@@ -112,6 +113,12 @@ if _is_gfx95_supported:
     )
 else:
     router_gemv = router_gemv_supported = None
+
+# Import-time CUDA kernels would block processor imports on CPU CI.
+if _is_cuda:
+    from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+else:
+    tiny_gemm_bf16 = None
 
 _FP8_KV_DTYPES = (
     torch.float8_e4m3fn,
@@ -414,6 +421,11 @@ class MiniMaxM3MoE(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+        self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
+            num_experts=config.num_local_experts,
+            hidden_size=config.hidden_size,
+            weight_dtype=self.gate.weight.dtype,
+        )
 
         self.layer_id = layer_id
 
@@ -529,6 +541,20 @@ class MiniMaxM3MoE(nn.Module):
             if _is_npu:
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
+            if (
+                not get_exec().deterministic.enable_deterministic_inference
+                and hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens
+            ):
+                # N is num_local_experts, so cuBLAS gets too few output tiles to fill
+                # the device and splits K, running the projection as an nvjet split-K
+                # plus a splitKreduce. The tiny GEMM does it in one launch. It takes w
+                # as [n, k] and computes x @ w.T, so no transpose here.
+                return tiny_gemm_bf16(
+                    hidden_states,
+                    self.gate.weight,
+                    out_dtype=torch.float32,
+                    max_m=self.tiny_router_gemm_max_tokens,
+                )
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )
