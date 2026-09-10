@@ -33,7 +33,7 @@ from sglang.srt.load_reporter.snapshot_validation import (
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=75, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 pytest_plugins = ("pytest_asyncio",)
 
@@ -878,9 +878,9 @@ class TestFireLoop:
 
             await asyncio.wait_for(source.started.wait(), timeout=1.0)
             elapsed = time.monotonic() - reporter_started_at
-            assert (
-                0.42 <= elapsed < 0.62
-            ), f"fire 2 started {elapsed:.3f}s after reporter epoch"
+            assert 0.42 <= elapsed < 0.62, (
+                f"fire 2 started {elapsed:.3f}s after reporter epoch"
+            )
         finally:
             source.release.set()
             await rt.close()

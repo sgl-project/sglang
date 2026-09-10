@@ -159,7 +159,7 @@ class DFlashDraftInputV2(SpecInput):
         nxt_kv_lens_sum = 0
         committed_seq_lens_sum = 0
         for i, (req, cur, nxt) in enumerate(zip(batch.reqs, cur_kv_lens, nxt_kv_lens)):
-            committed_len = int(req.kv_committed_len)
+            committed_len = int(req.kv.kv_committed_len)
             committed_seq_lens_sum += committed_len
             top_k = int(req.sampling_params.top_k)
 

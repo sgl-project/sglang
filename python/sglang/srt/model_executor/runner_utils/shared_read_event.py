@@ -1,4 +1,4 @@
-"""Shared-read-done event utilities for CUDA graph runners."""
+"""Shared-read-done event utilities for graph and eager runners."""
 
 import logging
 from typing import Optional
@@ -31,9 +31,13 @@ def maybe_publish_prefill_shared_read_done(
         return
     if forward_batch.forward_mode != ForwardMode.EXTEND:
         return
-    # TODO(Jialin): Relax this gate for speculative decoding after its prefill
-    # WAR boundaries are validated.
-    if not model_runner.spec_algorithm.is_none():
+    # TODO(Jialin): Relax for EAGLE/MTP after validating the later
+    # draft-extend reader's WAR boundary.
+    if (
+        not model_runner.spec_algorithm.is_none()
+        and not model_runner.spec_algorithm.is_dflash_family()
+    ):
+        # Other speculative algorithms may have a later draft-extend reader.
         return
     # The record lands right after replay prep, so PRE_REPLAY only.
     declared = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)

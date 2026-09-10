@@ -59,9 +59,9 @@ class LlamaForClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
+        assert get_embedding, (
+            "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return score_and_pool(

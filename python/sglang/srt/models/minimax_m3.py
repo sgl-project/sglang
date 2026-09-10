@@ -91,6 +91,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -101,7 +102,16 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_gfx95_supported = _is_hip and is_gfx95_supported()
 _device_sm = get_device_sm()
+
+if _is_gfx95_supported:
+    from sglang.kernels.ops.gemm.router_gemv import (
+        router_gemv,
+        router_gemv_supported,
+    )
+else:
+    router_gemv = router_gemv_supported = None
 
 _FP8_KV_DTYPES = (
     torch.float8_e4m3fn,
@@ -512,6 +522,10 @@ class MiniMaxM3MoE(nn.Module):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
+            if router_gemv is not None and router_gemv_supported(
+                hidden_states, self.gate.weight
+            ):
+                return router_gemv(hidden_states, self.gate.weight)
             if _is_npu:
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
@@ -1071,9 +1085,9 @@ class MiniMaxM3Attention(nn.Module):
     ):
         """NPU qkv projection + fused norm/RoPE/split; returns (None, fb, inner_state)."""
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, forward_batch, None
 
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1574,7 +1588,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
 
             self.logits_processor = LogitsProcessor(config)
@@ -1612,9 +1626,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         if is_shared_experts_fusion_disabled():
             return
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for MiniMax-M3"
+        assert self.num_fused_shared_experts == 1, (
+            "Only 1 fused shared expert is supported for MiniMax-M3"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
