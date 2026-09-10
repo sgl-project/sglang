@@ -211,19 +211,17 @@ def http_client(monkeypatch, tmp_path, request):
     async def upload(paths):
         return [None] * len(paths)
 
-    async def dispatch(job_id, req, **kwargs):
+    async def complete_dispatch():
+        pass
+
+    def dispatch(job_id, req, **kwargs):
+        # capture admission before the background coroutine can race the response
         admitted.append(req)
-
-    # Run queued dispatch immediately so the tests can inspect admitted requests.
-    def start(job_id, coroutine):
-        import asyncio
-
-        return asyncio.create_task(coroutine)
+        return complete_dispatch()
 
     monkeypatch.setattr(image_api, "process_generation_batch", generate)
     monkeypatch.setattr(image_api, "_upload_and_cleanup_images", upload)
     monkeypatch.setattr(video_api, "_dispatch_job_async", dispatch)
-    monkeypatch.setattr(video_api, "_start_video_job", start)
     app = FastAPI()
     app.include_router(image_api.router)
     app.include_router(video_api.router)
