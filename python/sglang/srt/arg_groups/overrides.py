@@ -614,6 +614,35 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+def _check_dsa_backend_constraints(
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    hip: bool,
+) -> None:
+    """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    chosen = {prefill_backend, decode_backend}
+
+    rocm_only = {"triton"} & chosen
+    if not hip and rocm_only:
+        raise ValueError(
+            f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
+            "ROCm/HIP. Pick an alternative DSA backend for CUDA "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+    cuda_fp8_unsupported = {"tilelang"} & chosen
+    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+        raise ValueError(
+            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
+            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
+            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
+            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],
@@ -621,20 +650,10 @@ def _check_tilelang_dsa_fp8_kv(
     *,
     hip: bool,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
-    if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
-    ):
-        raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
-            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
-        )
+    """Backward-compatible entry point for the TileLang DSA validation."""
+    _check_dsa_backend_constraints(
+        kv_cache_dtype, prefill_backend, decode_backend, hip=hip
+    )
 
 
 @register_post_process
@@ -728,15 +747,23 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = backend
         prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
         decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        # The hisparse allow-list in hisparse_hook is platform- but not
+        # dtype-aware, so an explicitly requested backend still has to clear the
+        # shared backend/kv-cache-dtype rules before this arm returns early.
+        _check_dsa_backend_constraints(
+            kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
             f"prefill={prefill}, decode={decode}."
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and get_platform().is_hip:
-        declared["dsa_prefill_backend"] = "tilelang"
-        declared["dsa_decode_backend"] = "tilelang"
+    if get_platform().is_hip:
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "triton"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "triton"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
@@ -753,7 +780,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-    _check_tilelang_dsa_fp8_kv(
+    _check_dsa_backend_constraints(
         kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
     )
     logger.warning(
@@ -1483,7 +1510,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
             allowed.append("triton")
-        mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+
+        if view.moe_a2a_backend == "flashinfer_megamoe":
+            mxfp8_default = "flashinfer_megamoe"
+        else:
+            mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
         elif moe_runner_backend not in allowed:
@@ -1537,7 +1569,8 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
     legacy write slots in _handle_a2a_moe: Waterfill requires the
-    fusion enabled; FlashInfer and DeepEP v2 A2A require it disabled."""
+    fusion enabled; FlashInfer, FlashInfer MegaMOE, and DeepEP v2 A2A require it disabled.
+    """
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
@@ -1545,7 +1578,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             )
             return {"disable_shared_experts_fusion": False}
         return {}
-    if view.moe_a2a_backend == "flashinfer":
+    if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
         logger.warning(
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
@@ -1566,6 +1599,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "nixl",
         "ascend_fuseep",
         "flashinfer",
+        "flashinfer_megamoe",
         "mori",
         "pplx",
         "deepep_v2",
