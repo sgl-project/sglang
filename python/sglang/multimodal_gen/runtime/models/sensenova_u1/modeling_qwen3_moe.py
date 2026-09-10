@@ -18,7 +18,10 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
-from .configuration_neo_chat import NEOMoELLMConfig
+from sglang.multimodal_gen.configs.transformers.configuration_neo_chat import (
+    NEOMoELLMConfig,
+)
+
 from .modeling_qwen3 import (
     Qwen3Attention,
     Qwen3RMSNorm,

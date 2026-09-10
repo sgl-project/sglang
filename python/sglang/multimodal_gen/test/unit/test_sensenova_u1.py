@@ -11,10 +11,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SENSENOVA_U1_REQUEST_EXTRA_KEY,
     SenseNovaU1SamplingParams,
 )
-from sglang.multimodal_gen.configs.sensenova_u1 import (
-    SENSENOVA_U1_REQUEST_EXTRA_KEY,
+from sglang.multimodal_gen.configs.transformers.configuration_neo_vit import (
+    NEOVisionConfig,
 )
 from sglang.multimodal_gen.registry import (
     _get_config_info,
@@ -26,15 +27,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
-    NEOVisionConfig,
-)
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation import (
-    get_conv_template,
-)
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+from sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_neo_chat import (
     _randn_with_seed,
 )
+from sglang.multimodal_gen.runtime.parser.conversation import get_conv_template
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )

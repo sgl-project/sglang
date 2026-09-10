@@ -9,6 +9,7 @@ information based on model paths or other identifiers.
 
 import dataclasses
 import importlib
+import json
 import os
 import pkgutil
 from functools import lru_cache
@@ -206,11 +207,6 @@ from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
     ZImageTurboSamplingParams,
 )
-from sglang.multimodal_gen.configs.sensenova_u1 import (
-    SENSENOVA_U1_MODEL_IDS,
-    is_sensenova_u1_adapter_only_model,
-    is_sensenova_u1_model,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -223,6 +219,40 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+SENSENOVA_U1_MODEL_IDS = {
+    "sensenova/sensenova-u1.5-8b-mot",
+}
+SENSENOVA_U1_ADAPTER_ONLY_MODEL_IDS = {
+    "sensenova/sensenova-u1.5-8b-mot-loras",
+}
+
+
+def is_sensenova_u1_model(model_path: str) -> bool:
+    """Identify SenseNova-U1 Hub IDs and local base checkpoints."""
+    if os.path.isdir(model_path):
+        config_path = os.path.join(model_path, "config.json")
+        try:
+            with open(config_path) as config_file:
+                config = json.load(config_file)
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures", [])
+        return (
+            config.get("model_type") == "neo_chat"
+            and isinstance(architectures, list)
+            and "NEOChatModel" in architectures
+        )
+
+    return model_path.rstrip("/").lower() in SENSENOVA_U1_MODEL_IDS
+
+
+def is_sensenova_u1_adapter_only_model(model_path: str) -> bool:
+    return model_path.rstrip("/").lower() in SENSENOVA_U1_ADAPTER_ONLY_MODEL_IDS
+
 
 # --- Part 1: Pipeline Discovery ---
 

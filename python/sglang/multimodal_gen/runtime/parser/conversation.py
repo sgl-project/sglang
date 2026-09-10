@@ -7,7 +7,7 @@ If you have changes in mind, please contribute back so the community can benefit
 Modified from https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 """
 
-# Modified for SGLang; see this directory's README.md for upstream source.
+# Modified for SGLang; see the SenseNova-U1 vendored model README.md for upstream source.
 
 import dataclasses
 from enum import IntEnum, auto
