@@ -12,6 +12,7 @@ in a functional manner, reducing the need for explicit parameter passing.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import pprint
 from collections import Counter
@@ -38,12 +39,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-from sglang.multimodal_gen.utils import align_to
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
+
+
+def _align_to(value: int, alignment: int) -> int:
+    return int(math.ceil(value / alignment) * alignment)
 
 
 @dataclass
@@ -426,11 +430,11 @@ class Req:
 
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
-            target_height = align_to(self.height, 16)
+            target_height = _align_to(self.height, 16)
         else:
             target_height = -1
         if self.width:
-            target_width = align_to(self.width, 16)
+            target_width = _align_to(self.width, 16)
         else:
             target_width = -1
 
