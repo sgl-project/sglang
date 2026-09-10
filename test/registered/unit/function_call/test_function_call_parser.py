@@ -1207,6 +1207,33 @@ class TestBaseFormatDetector(unittest.TestCase):
             params["city"], "杭州", "Should correctly parse Chinese city name"
         )
 
+    def test_partial_token_match_prefers_the_longest_suffix(self):
+        """A marker whose prefix repeats inside itself is held back whole.
+
+        `<|action_start|> <|plugin|>` starts over with `<|` in the middle, so a
+        shortest-first match holds back only those two characters and streams the
+        rest of the marker to the client as content.
+        """
+        marker = "<|action_start|> <|plugin|>"
+        partial = "<|action_start|> <|"
+
+        self.assertEqual(
+            self.detector._ends_with_partial_token(f"Sure. {partial}", marker),
+            len(partial),
+        )
+
+    def test_partial_token_match_requires_a_strict_prefix(self):
+        """A completed marker is not a partial one, so it is not held back."""
+        marker = "<tool_call>"
+
+        self.assertEqual(self.detector._ends_with_partial_token(marker, marker), 0)
+
+    def test_partial_token_match_returns_zero_without_a_shared_boundary(self):
+        """Text that cannot grow into the marker streams out instead of buffering."""
+        self.assertEqual(
+            self.detector._ends_with_partial_token("all done>", "<tool_call>"), 0
+        )
+
 
 class TestLlama32Detector(unittest.TestCase):
     def setUp(self):
