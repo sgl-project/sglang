@@ -185,7 +185,7 @@ class ExecKernel(msgspec.Struct):
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. 'triton' is a gfx950 fused per-query sparse-MLA prefill kernel (fp8 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -195,6 +195,7 @@ class ExecKernel(msgspec.Struct):
                 "fa3",
                 "tilelang",
                 "aiter",
+                "triton",
                 "trtllm",
             ],
             resolvable=True,
@@ -214,7 +215,7 @@ class ExecKernel(msgspec.Struct):
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. 'triton' is a gfx950 split-K sparse-MLA decode kernel (fp8 KV); auto-tiles from token and head count.",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -224,6 +225,7 @@ class ExecKernel(msgspec.Struct):
                 "fa3",
                 "tilelang",
                 "aiter",
+                "triton",
                 "trtllm",
             ],
             resolvable=True,

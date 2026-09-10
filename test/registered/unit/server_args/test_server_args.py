@@ -946,6 +946,32 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
 
     @override_platform(is_hip=True)
+    def test_hisparse_accepts_triton_prefill_on_rocm(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="triton",
+            dsa_decode_backend="tilelang",
+        )
+
+        validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
+        validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=True)
+    def test_hisparse_accepts_triton_decode_on_rocm(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="triton",
+            dsa_decode_backend="triton",
+        )
+
+        validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
+        validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=True)
     def test_hisparse_rejects_cuda_backend_on_rocm(self):
         server_args = ServerArgs(
             model_path="dummy",

@@ -100,12 +100,73 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
-# Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
-# per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
-# TP4: 16 heads, d_v=512, tail=64). Reads q_nope/q_rope directly (skips the
-# concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
-_DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+
+# gfx950 fused per-query sparse-MLA prefill (`--dsa-prefill-backend triton`).
+# Per-request shape gates stay in forward and fall back to TileLang; gfx950 +
+# fp8 are checked at construction.
+_TRITON_PREFILL_FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+# The Triton path is gated on seq length, so a short warmup would otherwise
+# always log tilelang and hide the production chunk. Bucket by magnitude.
+_dsa_prefill_logged = set()
+_dsa_decode_logged = False
+
+
+def _log_prefill_kernel_once(name: str, tokens: int = 0, **fields) -> None:
+    """Report the chosen kernel once per (kernel, token magnitude)."""
+    key = (name, tokens.bit_length())
+    if key in _dsa_prefill_logged:
+        return
+    _dsa_prefill_logged.add(key)
+    detail = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("DSA sparse-MLA prefill using %s (tokens=%d %s)", name, tokens, detail)
+
+
+def _log_decode_kernel_once(name: str, **fields) -> None:
+    """Report the chosen decode kernel once. Decode is not seq-gated."""
+    global _dsa_decode_logged
+    if _dsa_decode_logged:
+        return
+    _dsa_decode_logged = True
+    detail = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("DSA sparse-MLA decode using %s (%s)", name, detail)
+
+
+def _triton_sparse_mla_prefill_ok(
+    kv_cache: torch.Tensor,
+    n_heads: int,
+    v_head_dim: int,
+    head_dim: int,
+    topk: int,
+    n_tokens: int,
+) -> bool:
+    return (
+        kv_cache.dtype in _TRITON_PREFILL_FP8
+        and n_heads in (8, 16)
+        and v_head_dim == 512
+        and (head_dim - v_head_dim) == 64
+        and topk == 2048
+        and 512 <= n_tokens <= 32768
+    )
+
+
+def _triton_sparse_mla_decode_ok(
+    kv_cache: torch.Tensor,
+    n_heads: int,
+    v_head_dim: int,
+    head_dim: int,
+    topk: int,
+    n_tokens: int,
+) -> bool:
+    return (
+        kv_cache.dtype in _TRITON_PREFILL_FP8
+        and n_heads in (8, 16)
+        and v_head_dim == 512
+        and (head_dim - v_head_dim) == 64
+        and topk == 2048
+        and 1 <= n_tokens <= 84
+    )
 
 if is_cuda():
     import deep_gemm
@@ -302,6 +363,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "triton",
     "trtllm",
     "intel_xpu",
 ]
@@ -478,6 +540,23 @@ class DeepseekSparseAttnBackend(
                 "--dsa-prefill-backend flashmla_sparse_q8 together with "
                 "--dsa-decode-backend flashmla_kv."
             )
+
+        if self.dsa_prefill_impl == "triton":
+            if not _is_hip or not _IS_GFX95:
+                raise ValueError("--dsa-prefill-backend triton is gfx950-only.")
+            if self.kv_cache_dtype not in _TRITON_PREFILL_FP8:
+                raise ValueError(
+                    "--dsa-prefill-backend triton requires --kv-cache-dtype fp8_e4m3 "
+                    f"(got kv_cache_dtype={self.kv_cache_dtype})."
+                )
+        if self.dsa_decode_impl == "triton":
+            if not _is_hip or not _IS_GFX95:
+                raise ValueError("--dsa-decode-backend triton is gfx950-only.")
+            if self.kv_cache_dtype not in _TRITON_PREFILL_FP8:
+                raise ValueError(
+                    "--dsa-decode-backend triton requires --kv-cache-dtype fp8_e4m3 "
+                    f"(got kv_cache_dtype={self.kv_cache_dtype})."
+                )
 
         # Q8KV8 per-call device-tensor caches, populated lazily on the first
         # Q8KV8 dispatch (no-ops for other backends).
@@ -2121,39 +2200,52 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
-        if dsa_impl == "tilelang":
-            if q_rope is not None:
-                # Triton prefill kernel reads q_nope/q_rope directly, skipping
-                # the concat (it splits q into main/tail internally anyway).
-                # Gated to gfx950 + the validated shape (16 heads, d_v=512,
-                # tail=64, topk=2048); everything else uses TileLang.
-                if (
-                    _DSA_TRITON_PREFILL
-                    and _IS_GFX95
-                    and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-                    and layer.tp_q_head_num == 16
-                    and layer.v_head_dim == 512
-                    and (layer.head_dim - layer.v_head_dim) == 64
-                    and page_table_1.shape[-1] == 2048
-                    and q_nope.shape[0] >= 512
-                ):
-                    from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
-                        triton_sparse_mla_fwd,
-                    )
+        if dsa_impl == "triton":
+            if q_rope is not None and _triton_sparse_mla_prefill_ok(
+                kv_cache,
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                layer.head_dim,
+                page_table_1.shape[-1],
+                q_nope.shape[0],
+            ):
+                from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+                    triton_sparse_mla_prefill_fwd,
+                )
 
-                    return triton_sparse_mla_fwd(
-                        q_nope=q_nope,
-                        q_rope=q_rope,
-                        kv=kv_cache,
-                        indices=page_table_1.unsqueeze(1),
-                        sm_scale=layer.scaling,
-                        d_v=layer.v_head_dim,
-                    )
-                # Cat-skip, as in forward_decode: q_rope=None means the caller
-                # already handed us the concatenated form and q_all is a
-                # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
-                if q_all is None or not _is_hip:
-                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                _log_prefill_kernel_once(
+                    "triton",
+                    tokens=q_nope.shape[0],
+                    heads=layer.tp_q_head_num,
+                )
+                return triton_sparse_mla_prefill_fwd(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv=kv_cache,
+                    indices=page_table_1.unsqueeze(1),
+                    sm_scale=layer.scaling,
+                    d_v=layer.v_head_dim,
+                )
+            _log_prefill_kernel_once(
+                "tilelang",
+                tokens=q_nope.shape[0],
+                reason="triton_shape_gate",
+                heads=layer.tp_q_head_num,
+                kv_dtype=kv_cache.dtype,
+                topk=page_table_1.shape[-1],
+            )
+            if q_all is None or not _is_hip:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_tilelang(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        if dsa_impl == "tilelang":
+            if q_all is None or not _is_hip:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2450,6 +2542,45 @@ class DeepseekSparseAttnBackend(
             # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_tilelang(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "triton":
+            if q_rope is None:
+                if q_all is None:
+                    q_all = q_nope
+                q_nope, q_rope = (
+                    q_all[..., : layer.v_head_dim],
+                    q_all[..., layer.v_head_dim :],
+                )
+            if _triton_sparse_mla_decode_ok(
+                kv_cache,
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                layer.head_dim,
+                page_table_1.shape[-1],
+                q_nope.shape[0],
+            ):
+                return self._forward_triton_decode(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )
+            if q_all is None or not _is_hip:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            _log_decode_kernel_once(
+                "tilelang",
+                reason="triton_shape_gate",
+                seq=q_nope.shape[0],
+                heads=layer.tp_q_head_num,
+            )
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -3113,6 +3244,32 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+        )
+
+    def _forward_triton_decode(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """gfx950 Triton sparse-MLA decode. Same [1, seq, H, d_v] as tilelang."""
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk_fwd,
+        )
+
+        _log_decode_kernel_once(
+            "triton", seq=q_nope.shape[0], heads=q_nope.shape[1]
+        )
+        return triton_sparse_mla_decode_splitk_fwd(
+            q_nope,
+            q_rope,
+            kv_cache,
+            page_table_1.unsqueeze(1),
+            sm_scale,
+            v_head_dim,
         )
 
     def _forward_intel_xpu_sparse_decode(
