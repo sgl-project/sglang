@@ -46,6 +46,9 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
+        SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
+            get=lambda: 0
+        ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
             get=lambda: "bf16"
         ),
@@ -90,6 +93,47 @@ def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     runtime_context = sys.modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 0
     assert module._resolve_max_tokens_per_rank() == 1024
+
+
+def test_decode_capacity_is_opt_in(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    assert module._resolve_decode_max_tokens_per_rank() == 0
+    envs = sys.modules["sglang.srt.environ"].envs
+    envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get = lambda: 256
+    assert module._resolve_decode_max_tokens_per_rank() == 256
+
+
+def test_selects_decode_profile_for_small_rank_invariant_batch(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    default_forward = object()
+    decode_forward = object()
+    default_mega = types.SimpleNamespace(
+        _fleet_params=types.SimpleNamespace(max_tokens_per_rank=4096)
+    )
+    decode_mega = types.SimpleNamespace(
+        _fleet_params=types.SimpleNamespace(max_tokens_per_rank=256)
+    )
+    quant_info = module.FlashInferMegaMoeQuantInfo(
+        mega=default_mega,
+        mega_forward=default_forward,
+        decode_mega=decode_mega,
+        decode_mega_forward=decode_forward,
+    )
+    x = torch.empty((32, 8))
+
+    monkeypatch.setattr(module, "_runtime_max_tokens_per_rank", lambda _x: 128)
+    assert module._select_megamoe_profile(quant_info, x) == (
+        decode_mega,
+        decode_forward,
+    )
+
+    monkeypatch.setattr(module, "_runtime_max_tokens_per_rank", lambda _x: 512)
+    assert module._select_megamoe_profile(quant_info, x) == (
+        default_mega,
+        default_forward,
+    )
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):

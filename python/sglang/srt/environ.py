@@ -1021,6 +1021,13 @@ class Envs:
     # per-rank symmetric workspace; must be >= the largest padded per-rank batch
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
+    # Optional small-batch runtime profile for FlashInfer MegaMOE. When set,
+    # batches at or below this per-rank token count use a second MegaMOE layer
+    # that shares transformed weights with the default layer and owns a smaller
+    # workspace. The workspace is still pooled across all model layers. This is
+    # primarily intended for decode/CUDA-graph batches while prefill retains the
+    # capacity selected by SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK.
+    SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
     # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
     # region and can win at large batch, but makes the output accumulation order
