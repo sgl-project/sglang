@@ -942,12 +942,11 @@ def _sparse_head_overlap_disable(view: Any) -> dict:
 
 # Architectures with explicit FlashInfer AllReduce Fusion support. Keep in
 # sync with the model-side fusion implementations.
-# V4 uses the custom push plane for its small decode all-reduces and fused
-# MoE finalize. Its mHC post-split does not use the FlashInfer norm epilogue.
 _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
         "GptOssForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",
@@ -974,7 +973,18 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     single-node systems. Reads the mid-resolution enable_dp_attention /
     moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
     like the legacy tail block."""
-    model_arch = model_config_of(view).hf_config.architectures[0]
+    hf_config = model_config_of(view).hf_config
+    model_arch = hf_config.architectures[0]
+    # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
+    # Keep the existing default for other models and parallel configurations.
+    prefer_custom_dsv41 = (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and getattr(hf_config, "hidden_size", None) == 5120
+        and get_platform().is_blackwell
+        and view.tp_size == 4
+        and view.nnodes == 1
+        and not view.disable_custom_all_reduce
+    )
     if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -992,6 +1002,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
         and not view.enable_dp_attention
