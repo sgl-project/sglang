@@ -3056,6 +3056,7 @@ class Scheduler(
             self.tree_cache.cache_controller, "pp_prefetch_command_group", None
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
+            self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:

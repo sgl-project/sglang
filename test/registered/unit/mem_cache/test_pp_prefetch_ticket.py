@@ -96,6 +96,11 @@ class TestPPPrefetchTicket(unittest.TestCase):
 
     def test_miss_and_subpage_hit_do_not_broadcast(self):
         c = self.controller
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True)
+        cache.cache_controller = c
+        cache.ongoing_prefetch = {}
+        cache._all_reduce = Mock()
         for hit in (0, 3):
             with self.subTest(hit=hit):
                 c._storage_hit_query.return_value = ([], hit)
@@ -107,8 +112,78 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 c.pp_prefetch_command_queue.join.assert_not_called()
                 self.assertFalse(c.get_prefetch_submission("hit").decision)
                 self.assertFalse(c.get_prefetch_submission("hit").decision)
+                query_count = c._storage_hit_query.call_count
+                # Even if L3 becomes available, requeue/retry must reuse the miss.
+                c._storage_hit_query.return_value = (["h0", "h1"], 8)
+                for _ in range(2):
+                    self.assertTrue(cache.check_prefetch_progress("hit"))
+                    self.assertFalse(
+                        cache.prefetch_from_storage("hit", 0, list(range(8)))
+                    )
+                self.assertEqual(c._storage_hit_query.call_count, query_count)
+                cache._all_reduce.assert_not_called()
+                c.pp_prefetch_command_queue.put.assert_not_called()
                 self.assertFalse(c.release_pp_prefetch("hit"))
                 self.assertIsNone(c.get_prefetch_submission("hit"))
+
+    def test_pre_relay_records_skipped_prefetch_before_normal_enqueue(self):
+        from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+        maybe_stub_sgl_kernel()
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.managers.scheduler import Scheduler
+
+        c = self.controller
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True)
+        cache.cache_controller = c
+        scheduler = Mock(tree_cache=cache, disaggregation_mode=DisaggregationMode.NULL)
+        scheduler.ps.pp_rank = 0
+        scheduler.metrics_reporter.enable_metrics = False
+        scheduler.spec_algorithm.is_dflash_family.return_value = False
+        scheduler.spec_algorithm.is_uno.return_value = False
+        scheduler._prefetch_kvcache.return_value = (
+            None  # E.g. short suffix/alloc failure.
+        )
+        scheduler.grammar_manager.process_req_with_grammar.return_value = False
+        scheduler._add_request_to_queue.side_effect = lambda req: (
+            cache.prefetch_from_storage(req.rid, 0, list(range(8)))
+        )
+        recv_req = Mock(
+            session_params=None,
+            session_id=None,
+            input_embeds=None,
+            bootstrap_port=1,
+            pp_prefetch_ticketed=False,
+            mm_inputs=None,
+            return_logprob=False,
+            logprob_start_len=-1,
+            return_routed_experts=False,
+        )
+        req = Mock(rid="skip", return_sampling_mask=False, is_prefill_only=False)
+        req.origin_input_ids = list(range(8))
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                return_value=1,
+            ),
+            patch("sglang.srt.managers.scheduler.Req", return_value=req),
+            patch(
+                "sglang.srt.managers.scheduler.validate_input_length", return_value=None
+            ),
+            patch("sglang.srt.managers.scheduler.get_serving"),
+            patch(
+                "sglang.srt.managers.scheduler.get_device",
+                return_value=Mock(mlx_enable_sampling=False),
+            ),
+        ):
+            Scheduler.handle_generate_request(scheduler, recv_req)
+        scheduler._prefetch_kvcache.assert_called_once_with(req)
+        scheduler._add_request_to_queue.assert_called_once_with(req)
+        self.assertFalse(c.pp_prefetch_decisions["skip"])
+        self.assertFalse(recv_req.pp_prefetch_ticketed)
+        c._storage_hit_query.assert_not_called()
+        c.pp_prefetch_command_queue.put.assert_not_called()
 
     def test_query_failure_falls_back_to_miss(self):
         c = self.controller
@@ -513,13 +588,18 @@ class TestPPPrefetchTicket(unittest.TestCase):
         cache.cache_controller = c
         cache.session = Mock()
         cache.session.try_cache_finished_req.return_value = True
-        req = Mock(rid="hit")
-        req.finished.return_value = False
-        cache.cache_finished_req(req, kv_len_to_handle=0)
-        self.assertIs(c.pp_prefetch_states["hit"], state)
-        req.finished.return_value = True
-        cache.cache_finished_req(req, kv_len_to_handle=0)
-        self.assertNotIn("hit", c.pp_prefetch_states)
+        cache.bind_prefetch_ticket("miss", False)
+        for rid in ("hit", "miss"):
+            with self.subTest(rid=rid):
+                req = Mock(rid=rid)
+                req.finished.return_value = False
+                cache.cache_finished_req(req, kv_len_to_handle=0)
+                self.assertFalse(c.get_prefetch_submission(rid).decision)
+                req.finished.return_value = True
+                cache.cache_finished_req(req, kv_len_to_handle=0)
+                self.assertIsNone(c.get_prefetch_submission(rid))
+        self.assertEqual(c.pp_prefetch_states, {})
+        self.assertEqual(c.pp_prefetch_decisions, {})
         c.mem_pool_host.free.assert_not_called()
 
     def test_take_zero_completion_releases_buffers(self):
@@ -615,11 +695,11 @@ class TestPPTicketAdmission(unittest.TestCase):
         self.assertEqual(tail.tolist(), [4, 5, 6, 7])
         cache._handle_prefetch_result.assert_called_once_with(operation)
 
-    def test_miss_admission_clears_decision_without_collective(self):
+    def test_miss_admission_keeps_decision_without_collective(self):
         cache = self.cache
         cache.cache_controller.pp_prefetch_decisions["miss"] = False
         self.assertTrue(cache.check_prefetch_progress("miss"))
-        self.assertNotIn("miss", cache.cache_controller.pp_prefetch_decisions)
+        self.assertIs(cache.cache_controller.pp_prefetch_decisions["miss"], False)
         cache._all_reduce.assert_not_called()
         cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
 

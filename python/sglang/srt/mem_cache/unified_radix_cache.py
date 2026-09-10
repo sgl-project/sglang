@@ -1914,10 +1914,10 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             return True
 
-    def bind_prefetch_ticket(self, req_id: str) -> None:
-        # Use PP0's request handoff, not the asynchronous local ticket arrival.
+    def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
+        # PP0 also records misses/skips; only hits travel with the request relay.
         with self.cache_controller.pp_prefetch_state_lock:
-            self.cache_controller.pp_prefetch_decisions[req_id] = True
+            self.cache_controller.pp_prefetch_decisions[req_id] = decision
 
     def _check_pp_prefetch_progress(self, req_id: str) -> bool:
         ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(req_id)
@@ -1980,8 +1980,6 @@ class UnifiedRadixCache(BasePrefixCache):
             return self._check_pp_prefetch_progress(req_id)
 
         if req_id not in self.ongoing_prefetch:
-            if self.cache_controller is not None:
-                self.cache_controller.pp_prefetch_decisions.pop(req_id, None)
             return True
 
         _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
