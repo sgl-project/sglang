@@ -239,8 +239,9 @@ class TestCacheDitRefreshContext(unittest.TestCase):
         )
 
 
-def _make_transformer(class_name, layers=None):
-    transformer = type(class_name, (), {})()
+def _make_transformer(class_name, layers=None, module_name=None):
+    namespace = {"__module__": module_name} if module_name is not None else {}
+    transformer = type(class_name, (), namespace)()
     if layers is not None:
         transformer.layers = layers
     return transformer
@@ -256,6 +257,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
 
         self.assertIsNotNone(adapter)
         self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.blocks_name, "layers")
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertTrue(adapter.has_separate_cfg)
 
@@ -284,6 +286,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             transformer_raw, has_separate_cfg=True
         )
         self.assertEqual(adapter_raw.blocks, blocks)
+        self.assertEqual(adapter_raw.blocks_name, "transformer_blocks")
         self.assertEqual(adapter_raw.forward_pattern, "Pattern_3")
         self.assertTrue(adapter_raw.has_separate_cfg)
 
@@ -303,8 +306,39 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         adapter = module._build_custom_block_adapter(transformer)
 
         self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.blocks_name, "blocks")
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertFalse(adapter.has_separate_cfg)
+
+    def test_sensenova_dense_and_moe_adapters_pin_the_layers_attribute(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0"]
+
+        for class_name in ("Qwen3Model", "Qwen3MoeModel"):
+            transformer = _make_transformer(
+                class_name,
+                blocks,
+                module_name=(
+                    "sglang.multimodal_gen.runtime.models.sensenova_u1."
+                    "neo_unify.modeling_qwen3"
+                ),
+            )
+            transformer._sensenova_cache_dit_native_layers = blocks
+
+            adapter = module._build_custom_block_adapter(transformer)
+
+            self.assertEqual(adapter.blocks_name, "layers")
+            self.assertIs(adapter.blocks, transformer.layers)
+
+    def test_rejects_same_named_qwen_outside_sensenova(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer(
+            "Qwen3Model",
+            ["block_0"],
+            module_name="transformers.models.qwen3.modeling_qwen3",
+        )
+
+        self.assertIsNone(module._build_custom_block_adapter(transformer))
 
     def test_custom_adapter_is_retained_until_disable(self):
         module = _import_module_with_stub()

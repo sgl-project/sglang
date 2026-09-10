@@ -507,14 +507,43 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        # Match the dense Qwen3 path: Cache-DiT is valid only for pure image
+        # denoising forwards.  Prefix, Think, and text-cache updates must keep
+        # using the native decoder layers.
+        layers = self.layers
+        native_layers = getattr(self, "_sensenova_cache_dit_native_layers", None)
+        if native_layers is not None and (
+            kwargs.get("update_cache", True)
+            or exist_non_image_gen_tokens
+            or not exist_image_gen_tokens
+        ):
+            layers = native_layers
+
+        for decoder_layer in layers[: self.config.num_hidden_layers]:
+            attention_type = getattr(decoder_layer, "attention_type", None)
+            if attention_type is None:
+                if native_layers is None:
+                    raise AttributeError(
+                        "Decoder layer does not expose an attention_type."
+                    )
+                attention_types = {
+                    layer.attention_type
+                    for layer in native_layers[: self.config.num_hidden_layers]
+                }
+                if len(attention_types) != 1:
+                    raise ValueError(
+                        "SenseNova-U1 Cache-DiT requires all decoder layers to "
+                        "use the same attention type."
+                    )
+                attention_type = next(iter(attention_types))
+
             hidden_states = decoder_layer(
                 hidden_states,
                 image_gen_indicators=image_gen_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask_mapping[attention_type],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,

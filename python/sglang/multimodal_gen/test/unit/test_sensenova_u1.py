@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import json
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -65,6 +67,32 @@ class _FakeSenseNovaModel:
                 ]
             ]
         )
+
+
+def _install_sensenova_cache_dit_stub(monkeypatch):
+    calls = {"enable": [], "disable": [], "refresh": []}
+    module = types.ModuleType(
+        "sglang.multimodal_gen.runtime.cache.cache_dit_integration"
+    )
+
+    class CacheDitConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    module.CacheDitConfig = CacheDitConfig
+    module.cache_dit_overrides_key = lambda overrides: tuple(sorted(overrides.items()))
+    module.resolve_cache_dit_request_overrides = lambda raw: dict(raw or {})
+    module.enable_cache_on_transformer = lambda transformer, config, **kwargs: (
+        calls["enable"].append((transformer, config, kwargs)) or transformer
+    )
+    module.disable_cache_on_transformer = lambda transformer: (
+        calls["disable"].append(transformer) or transformer
+    )
+    module.refresh_context_on_transformer = lambda transformer, steps: calls[
+        "refresh"
+    ].append((transformer, steps))
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return calls
 
 
 class _RecordingTraceContext:
@@ -566,6 +594,8 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
         cfg_norm="global",
         timestep_shift=9.0,
         think_mode=True,
+        enable_cache_dit=True,
+        cache_dit_params={"residual_diff_threshold": 0.1},
     )
 
     cli_args = SenseNovaU1SamplingParams.get_cli_args(args)
@@ -576,6 +606,8 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert cli_args["guidance_scale"] == 4.5
     assert cli_args["num_inference_steps"] == 30
     assert cli_args["num_outputs_per_prompt"] == 2
+    assert cli_args["enable_cache_dit"] is True
+    assert cli_args["cache_dit_params"] == {"residual_diff_threshold": 0.1}
     assert "cfg_norm" not in cli_args
     assert "timestep_shift" not in cli_args
     assert "think_mode" not in cli_args
@@ -624,6 +656,71 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+
+
+def test_sensenova_u1_cache_dit_mounts_refreshes_and_unmounts(monkeypatch):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(layers=object())
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = SimpleNamespace(
+        num_inference_steps=8,
+        guidance_scale=4.0,
+        sampling_params=SimpleNamespace(
+            enable_cache_dit=True,
+            cache_dit_params={"residual_diff_threshold": 0.1},
+        ),
+    )
+
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+
+    assert len(calls["enable"]) == 1
+    assert transformer._sensenova_cache_dit_native_layers is transformer.layers
+    config = calls["enable"][0][1]
+    assert config.kwargs["num_inference_steps"] == 8
+    assert config.kwargs["residual_diff_threshold"] == 0.1
+    assert calls["enable"][0][2]["has_separate_cfg"] is True
+
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    assert calls["refresh"] == [(transformer, 8)]
+
+    batch.sampling_params.enable_cache_dit = False
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    assert calls["disable"] == [transformer]
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+
+
+@pytest.mark.parametrize(
+    ("first_guidance_scale", "second_guidance_scale"),
+    [(4.0, 1.0), (1.0, 4.0)],
+)
+def test_sensenova_u1_cache_dit_remounts_when_cfg_mode_changes(
+    monkeypatch, first_guidance_scale, second_guidance_scale
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(layers=object())
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = SimpleNamespace(
+        num_inference_steps=8,
+        guidance_scale=first_guidance_scale,
+        sampling_params=SimpleNamespace(
+            enable_cache_dit=True,
+            cache_dit_params={"residual_diff_threshold": 0.1},
+        ),
+    )
+
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    batch.guidance_scale = second_guidance_scale
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+
+    assert len(calls["enable"]) == 2
+    assert calls["disable"] == [transformer]
+    assert calls["refresh"] == []
+    assert [call[2]["has_separate_cfg"] for call in calls["enable"]] == [
+        first_guidance_scale > 1.0,
+        second_guidance_scale > 1.0,
+    ]
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():

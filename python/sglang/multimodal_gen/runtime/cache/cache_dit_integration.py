@@ -348,6 +348,7 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 class CustomBlockAdapterSpec:
     blocks_attr: str
     forward_pattern: ForwardPattern
+    module_prefix: str | None = None
 
 
 # Custom BlockAdapter metadata for models absent from cache-dit's registry.
@@ -364,6 +365,20 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    # SenseNova's Qwen3 backbones have Pattern_3 block loops, but their decoder
+    # blocks also receive model-specific keyword arguments.  The model keeps
+    # those arguments in its original forward and selects cached blocks only
+    # for pure image-generation calls (see modeling_qwen3.py).
+    "Qwen3Model": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+        module_prefix=("sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."),
+    ),
+    "Qwen3MoeModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+        module_prefix=("sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."),
+    ),
 }
 
 
@@ -376,6 +391,11 @@ def _build_custom_block_adapter(
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
+    if (
+        spec.module_prefix is not None
+        and not transformer.__class__.__module__.startswith(spec.module_prefix)
+    ):
+        return None
     blocks = getattr(transformer, spec.blocks_attr, None)
     if blocks is None:
         raise ValueError(
@@ -385,6 +405,11 @@ def _build_custom_block_adapter(
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
+        # Always identify the attribute explicitly.  Some integrations keep an
+        # unregistered alias to the native ModuleList; cache-dit's automatic
+        # identity scan could otherwise select that alias and patch the wrong
+        # attribute during forward.
+        blocks_name=spec.blocks_attr,
         forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
     )

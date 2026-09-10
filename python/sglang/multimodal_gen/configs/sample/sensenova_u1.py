@@ -33,6 +33,8 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "output_quality",
     "output_compression",
     "quality",
+    "enable_cache_dit",
+    "cache_dit_params",
 }
 
 
