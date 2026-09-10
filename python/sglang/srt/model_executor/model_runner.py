@@ -33,7 +33,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
-from sglang.srt.distributed import bootstrap
+from sglang.srt.distributed import bootstrap, get_world_rank
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
@@ -590,7 +590,7 @@ class ModelRunner:
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             get_model=lambda: self.model,
-            tp_rank=self.ps.tp_rank,
+            rank=get_world_rank(),
             gpu_id=self.gpu_id,
         )
 
