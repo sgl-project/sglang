@@ -1019,7 +1019,15 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
-        if self.chat_encoding_spec == "dsv4":
+        # Only requests that actually reach the dsv4 encoder can be mis-rendered:
+        # client-supplied input_ids skip tokenization, and a named conversation
+        # template is rendered by its own code, which is allowed to handle inline
+        # system messages.
+        if (
+            self.chat_encoding_spec == "dsv4"
+            and request.input_ids is None
+            and self.template_manager.chat_template_name is None
+        ):
             # The dsv4 encoder renders a `system` turn as plain content, so a
             # non-leading system message can produce a malformed prompt without
             # an assistant generation boundary

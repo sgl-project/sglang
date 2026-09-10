@@ -2699,6 +2699,46 @@ class ServingChatTestCase(unittest.TestCase):
         )
         tm.generate_request.assert_called_once()
 
+    def test_dsv4_bypass_input_ids_skips_guard(self):
+        """Pre-computed input_ids skip tokenization, so the guard must not fire."""
+        chat, tm = self._serving_chat_for_spec("dsv4", "DeepseekV4ForCausalLM")
+        request = ChatCompletionRequest(
+            model="x",
+            messages=self._dsv4_trailing_system_messages(),
+            input_ids=[11, 12, 13],
+        )
+        self.assertIsNone(chat._validate_request(request))
+        response = get_or_create_event_loop().run_until_complete(
+            chat.handle_request(request, self.fastapi_request)
+        )
+        self.assertIsInstance(response, ChatCompletionResponse)
+        tm.generate_request.assert_called_once()
+        # The client's ids reach generation verbatim; the encoder never ran.
+        self.assertEqual(
+            list(tm.generate_request.call_args.args[0].input_ids), [11, 12, 13]
+        )
+
+    def test_dsv4_bypass_named_conversation_template_skips_guard(self):
+        """A named template renders its own messages and may allow inline system."""
+        chat, tm = self._serving_chat_for_spec("dsv4", "DeepseekV4ForCausalLM")
+        # Route the request through the legacy conversation-template path.
+        chat.template_manager.chat_template_name = "llama-2"
+        tm.chat_template_name = "llama-2"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Hi?"},
+                {"role": "system", "content": "<reminder>brief</reminder>"},
+            ],
+        )
+        self.assertIsNone(chat._validate_request(request))
+        response = get_or_create_event_loop().run_until_complete(
+            chat.handle_request(request, self.fastapi_request)
+        )
+        self.assertIsInstance(response, ChatCompletionResponse)
+        tm.generate_request.assert_called_once()
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
