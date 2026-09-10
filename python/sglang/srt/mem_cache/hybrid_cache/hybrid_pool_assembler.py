@@ -918,7 +918,7 @@ def build_hybrid_mamba_swa_stack(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
-        allocator_type=get_memory().hicache_storage_backend,
+        allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
     )
     entries = [
@@ -1900,7 +1900,7 @@ def build_minimax_sparse_hicache_stack(
             index_k_pool,
             kv_host_pool,
             get_memory().hicache_mem_layout,
-            allocator_type=get_memory().hicache_storage_backend,
+            allocator_type=_get_allocator_type(),
         )
         entries.append(
             build_pool_entry(
