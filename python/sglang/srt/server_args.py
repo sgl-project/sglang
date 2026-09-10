@@ -355,7 +355,7 @@ class ServerArgs:
             "--sampling-backend",
             type=str,
             choices=sampling_backend_choices,
-            default=ServerArgs.sampling_backend,
+            default=_declared_default("sampling_backend"),
             help="Choose the kernels for sampling layers.",
         )
 
@@ -364,7 +364,7 @@ class ServerArgs:
             "--reasoning-parser",
             type=str,
             choices=["auto"] + reasoning_parser_choices,
-            default=ServerArgs.reasoning_parser,
+            default=_declared_default("reasoning_parser"),
             help=f"Specify the parser for reasoning models. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
@@ -374,7 +374,7 @@ class ServerArgs:
             "--tool-call-parser",
             type=str,
             choices=["auto"] + tool_call_parser_choices,
-            default=ServerArgs.tool_call_parser,
+            default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {tool_call_parser_choices}.",
@@ -382,7 +382,7 @@ class ServerArgs:
         parser.add_argument(
             "--kv-canary-real-data",
             type=str,
-            default=ServerArgs.kv_canary_real_data,
+            default=_declared_default("kv_canary_real_data"),
             choices=[m.name.lower() for m in RealKvHashMode],
             help=(
                 "Check the real KV-cache in the canary. "
@@ -670,6 +670,21 @@ def _rebuild_server_args(cls, fields, bookkeeping):
     record = cls(**fields)
     record.__dict__.update(bookkeeping)
     return record
+
+
+def _declared_default(name: str):
+    """The declared default of a field, for a manual `add_argument`.
+
+    `ServerArgs.<field>` used to answer with it. The record is a Struct now, so
+    that expression returns the slot descriptor instead -- which argparse
+    happily stores as the default, and the first reader gets a
+    `member_descriptor` where it expected a string.
+    """
+    return next(
+        field.default
+        for field in msgspec.structs.fields(ServerArgs)
+        if field.name == name
+    )
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
