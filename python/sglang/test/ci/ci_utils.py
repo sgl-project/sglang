@@ -1,14 +1,18 @@
+import glob
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
 
 from sglang.srt.debug_utils import cuda_coredump
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
 
@@ -209,6 +213,52 @@ DERIVED_TIMEOUT_FACTOR = 1.5
 def derive_timeout_per_file(est_time: float) -> float:
     est = float(est_time)
     return max(est * DERIVED_TIMEOUT_FACTOR, est + DERIVED_TIMEOUT_SLACK)
+
+
+HICACHE_SCRATCH_PREFIX = "sglang_ci_hicache_"
+# A run killed by a job timeout or a cancelled workflow never reaches the
+# cleanup, so its scratch dir is orphaned. Nothing this old can belong to a live
+# job (CI caps a suite far below it), which keeps the sweep safe on a runner
+# hosting several agents at once.
+HICACHE_SCRATCH_STALE_SECONDS = 6 * 3600
+
+
+def _sweep_stale_hicache_scratch_dirs() -> None:
+    cutoff = time.time() - HICACHE_SCRATCH_STALE_SECONDS
+    pattern = os.path.join(tempfile.gettempdir(), f"{HICACHE_SCRATCH_PREFIX}*")
+    for path in glob.glob(pattern):
+        try:
+            stale = os.path.getmtime(path) < cutoff
+        except OSError:
+            continue
+        if stale:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def setup_hicache_scratch_dir() -> Optional[str]:
+    """Redirect the HiCache file backend to a per-run scratch dir.
+
+    The backend defaults to a persistent /tmp/hicache and only evicts once a cap
+    is configured, so a test that leaves the default on strands its 8 MiB pages
+    on the runner. Returns the dir to hand to cleanup_hicache_scratch_dir, or
+    None when the caller already pinned one. A test keeps its own dir either by
+    passing env= to popen_launch_server, which layers over os.environ, or by
+    overriding the var in-process.
+    """
+    _sweep_stale_hicache_scratch_dirs()
+    if envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.is_set():
+        return None
+    scratch_dir = tempfile.mkdtemp(prefix=HICACHE_SCRATCH_PREFIX)
+    envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.set(scratch_dir)
+    return scratch_dir
+
+
+def cleanup_hicache_scratch_dir(scratch_dir: Optional[str]) -> None:
+    """Remove a scratch dir returned by setup_hicache_scratch_dir."""
+    if scratch_dir is None:
+        return
+    envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.clear()
+    shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 def run_unittest_files(
