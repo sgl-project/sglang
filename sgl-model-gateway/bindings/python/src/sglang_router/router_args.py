@@ -912,8 +912,13 @@ class RouterArgs:
             f"--{prefix}control-plane-api-keys",
             type=str,
             nargs="*",
-            default=[],
+            default=(
+                [os.environ["CONTROL_PLANE_API_KEYS"]]
+                if os.environ.get("CONTROL_PLANE_API_KEYS")
+                else []
+            ),
             help="API keys for control plane authentication. Format: 'id:name:role:key' where role is 'admin' or 'user'. "
+            "The CONTROL_PLANE_API_KEYS environment variable supplies one key when the flag is absent. "
             "Example: --control-plane-api-keys 'key1:Service Account:admin:secret123' 'key2:Read Only:user:secret456'",
         )
         auth_group.add_argument(
