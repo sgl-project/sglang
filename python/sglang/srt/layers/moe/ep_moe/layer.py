@@ -95,6 +95,14 @@ class DeepEPMoE(FusedMoE):
             self.deprecate_flag = True
         elif _is_npu:
             self.deprecate_flag = True
+        elif (
+            get_moe_a2a_backend().is_nccl_ep()
+            and get_moe_runner_backend().is_triton()
+            and isinstance(quant_config, Fp8Config)
+        ):
+            # The explicit LL Triton adapter consumes the dispatch output via
+            # Fp8MoEMethod; it does not require DeepGEMM on SM120.
+            self.deprecate_flag = True
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
             quant_config, Fp8Config
         ):

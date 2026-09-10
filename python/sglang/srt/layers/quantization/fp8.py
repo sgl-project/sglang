@@ -1054,6 +1054,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        if get_moe_a2a_backend().is_nccl_ep() and get_moe_runner_backend().is_triton():
+            if (
+                self.use_mxfp8
+                or self.is_fp4_expert
+                or self.weight_block_size != [128, 128]
+            ):
+                raise ValueError(
+                    "NCCL EP Triton requires ordinary block-128 FP8 weights"
+                )
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
