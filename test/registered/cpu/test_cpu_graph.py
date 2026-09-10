@@ -19,11 +19,13 @@ from sglang.test.test_utils import (
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
+    requires_intel_amx,
 )
 
 register_cpu_ci(est_time=315, suite="stage-a-tp-test-cpu-intel")
 
 
+@requires_intel_amx()
 class TestCPUGraph(CustomTestCase):
     @intel_amx_benchmark(
         extra_args=[

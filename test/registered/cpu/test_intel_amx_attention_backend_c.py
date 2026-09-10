@@ -12,11 +12,13 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
     CustomTestCase,
     intel_amx_benchmark,
+    requires_intel_amx,
 )
 
 register_cpu_ci(est_time=477, suite="stage-a-tp-test-cpu-intel")
 
 
+@requires_intel_amx()
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
     @intel_amx_benchmark(
         extra_args=[
