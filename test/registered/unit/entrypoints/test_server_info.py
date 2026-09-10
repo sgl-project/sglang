@@ -21,10 +21,12 @@ Current coverage:
 """
 
 import asyncio
-import dataclasses
 import json
 import unittest
 from types import SimpleNamespace
+
+import msgspec
+import msgspec.structs
 
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
@@ -457,7 +459,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
 
         info = _call_server_info_with(args)
 
-        for field in dataclasses.fields(ServerArgs):
+        for field in msgspec.structs.fields(ServerArgs):
             self.assertIn(
                 field.name,
                 info,
