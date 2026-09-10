@@ -94,6 +94,12 @@ class Observability(msgspec.Struct):
         int,
         "Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
     ] = 15
+    load_reporter_port: A[
+        Optional[int],
+        "Port on which this worker listens for load reporter gRPC connections. "
+        "None (default) disables load reporting with zero socket, task, or "
+        "optional-dependency overhead.",
+    ] = None
     tokenizer_metrics_custom_labels_header: A[
         str, "Specify the HTTP header for passing custom labels for tokenizer metrics."
     ] = "x-custom-labels"

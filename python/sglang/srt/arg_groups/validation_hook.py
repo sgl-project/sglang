@@ -438,6 +438,18 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_load_reporter_port(server_args: Any):
+    """Validate the optional reporter listener without importing its dependencies."""
+    cfg = resolving_view(server_args)
+    if cfg.load_reporter_port is not None and not (
+        1 <= cfg.load_reporter_port <= 65535
+    ):
+        raise ValueError(
+            f"--load-reporter-port must be between 1 and 65535 "
+            f"(got {cfg.load_reporter_port})."
+        )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with

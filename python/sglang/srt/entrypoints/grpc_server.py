@@ -19,6 +19,7 @@ from aiohttp import web
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,7 @@ async def serve_grpc(server_args, model_info=None):
 
     sidecar_app = web.Application()
     sidecar_runner = None
+    reporter_handle = None
     sidecar_port = (
         cfg.smg_http_sidecar_port
         if cfg.smg_http_sidecar_port is not None
@@ -200,7 +202,7 @@ async def serve_grpc(server_args, model_info=None):
             )
 
     async def _on_request_manager_ready(request_manager, srv_args, sched_info):
-        nonlocal sidecar_runner
+        nonlocal sidecar_runner, reporter_handle
         try:
             _add_admin_routes(sidecar_app, request_manager)
         except Exception as e:
@@ -229,6 +231,19 @@ async def serve_grpc(server_args, model_info=None):
                 exc_info=True,
             )
 
+        if cfg.load_reporter_port is not None:
+            from sglang.srt.load_reporter import start_load_reporter
+            from sglang.srt.load_reporter.snapshot_source import (
+                ManagerLoadSnapshotSource,
+            )
+
+            reporter_handle = await start_load_reporter(
+                srv_args,
+                ManagerLoadSnapshotSource(
+                    request_manager, range(get_parallel().dp_size)
+                ),
+            )
+
     # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,
     # model_info) and reject the on_request_manager_ready hook. The hook is
     # what calls _start_sidecar_server, so dropping the kwarg disables the
@@ -240,6 +255,14 @@ async def serve_grpc(server_args, model_info=None):
     )
     if sidecar_supported:
         serve_kwargs["on_request_manager_ready"] = _on_request_manager_ready
+    elif cfg.load_reporter_port is not None:
+        # The reporter attaches its source and lifecycle hook at readiness.
+        raise RuntimeError(
+            "--load-reporter-port requires smg-grpc-servicer ≥ 0.5.3 (the "
+            "version that accepts 'on_request_manager_ready'); installed "
+            "version lacks the hook so the load reporter could never start. "
+            "Upgrade smg-grpc-servicer or unset --load-reporter-port."
+        )
     elif cfg.enable_metrics:
         # User explicitly asked for metrics but the installed servicer can't
         # start the sidecar that serves them — fail loud rather than silently
@@ -261,6 +284,11 @@ async def serve_grpc(server_args, model_info=None):
     try:
         await _serve_grpc(server_args, model_info, **serve_kwargs)
     finally:
+        if reporter_handle is not None:
+            try:
+                await reporter_handle.close()
+            except Exception:
+                logger.exception("Load reporter shutdown failed")
         if sidecar_runner is not None:
             try:
                 await sidecar_runner.cleanup()

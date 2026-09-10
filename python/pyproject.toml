@@ -158,6 +158,11 @@ fastokens = [
   "fastokens>=0.1.1,<0.2.0",
 ]
 
+load-reporter = [
+  "grpcio>=1.78.0",
+  "protobuf>=6.31.1,<7",
+]
+
 test = [
   "accelerate",
   "addict",
@@ -181,12 +186,14 @@ test = [
   "polars",
   "pytest",
   "pytest-cov",
+  "pytest-asyncio",
   "sentence_transformers",
   # Pinned: a bump moves scoring for every eval test at once, so re-baseline
   # MODEL_SCORE_THRESHOLDS in test/registered/eval/test_text_models_gsm8k_eval.py
   # and the mmlu thresholds of run_eval's other callers before changing it.
   "sgl-eval==0.1.0",
   "sglang[fastokens]",
+  "sglang[load-reporter]",
   "tabulate",
 ]
 

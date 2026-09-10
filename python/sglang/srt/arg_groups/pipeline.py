@@ -94,10 +94,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_offload_compatibility(server_args)
     from sglang.srt.arg_groups.validation_hook import (
         validate_experimental_sgl_marlin,
+        validate_load_reporter_port,
         validate_prefill_decode_interval,
     )
 
     validate_prefill_decode_interval(server_args)
+    # Listener ports must be valid before model loading or the dummy-model return.
+    validate_load_reporter_port(server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
