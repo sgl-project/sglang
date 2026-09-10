@@ -80,7 +80,10 @@ class TestGptOssRunaiOwnership(CustomTestCase):
 
         held = kept["model.embed_tokens.weight"]
         self.assertIsNot(held, streamed)
-        self.assertFalse(held.data_ptr() == streamed.data_ptr())
+        self.assertNotEqual(held.data_ptr(), streamed.data_ptr())
+        # Held until the stream ends, so it belongs on the host rather than
+        # in device memory the streamer's limit does not account for.
+        self.assertEqual(held.device.type, "cpu")
         torch.testing.assert_close(held, streamed)
 
         # Anything not streamed is left alone rather than copied for nothing.

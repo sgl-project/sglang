@@ -972,9 +972,7 @@ class GptOssForCausalLM(nn.Module):
                 ):
                     yield name, weight
                 else:
-                    normal_weights.append(
-                        (name, _clone_if_runai_streamed_tensor(weight))
-                    )
+                    normal_weights.append((name, _own_if_runai_streamed(weight)))
 
         mxfp4_loaded_params = self._load_mxfp4_experts_weights(experts(weights))
         self._load_normal_weights(
@@ -1389,9 +1387,15 @@ class GptOssForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
 
-def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+def _own_if_runai_streamed(tensor: torch.Tensor) -> torch.Tensor:
+    """Take a copy the streamer cannot overwrite.
+
+    The copy lands on the host: distributed streaming yields device tensors,
+    and these are held until the whole checkpoint has streamed, so cloning
+    them in place would add their own GiB to peak GPU usage.
+    """
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
-        return tensor.clone().detach()
+        return tensor.detach().to("cpu", copy=True)
     return tensor
 
 
