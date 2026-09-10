@@ -261,7 +261,7 @@ def test_cosmos3_image_endpoint_selects_image_task(http_client, task):
     "conditioning,task",
     [
         ({}, Task.TI2V),
-        ({"image_path": "/tmp/image.png"}, Task.TI2V),
+        ({"input_reference": "/tmp/image.png"}, Task.TI2V),
         ({"video_path": "/tmp/clip.mp4"}, Task.V2V),
     ],
 )
@@ -273,6 +273,8 @@ def test_cosmos3_video_endpoint_preserves_conditioning(http_client, conditioning
     assert response.status_code == 200, response.text
     assert admitted[-1].task_type == task
     assert admitted[-1].data_type == DataType.VIDEO
+    assert admitted[-1].image_path == conditioning.get("input_reference")
+    assert admitted[-1].video_path == conditioning.get("video_path")
     assert config.task_type == Task.TI2V
 
 
