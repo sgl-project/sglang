@@ -1086,7 +1086,7 @@ class GemmaRMSNorm(BaseFusedOp):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
-        torch.add(param.data, 1.0, out=self.gemma_weight)
+        torch.add(param.data.to(self.gemma_weight.device, non_blocking=True), 1.0, out=self.gemma_weight)
 
     def _forward_impl(
         self,
