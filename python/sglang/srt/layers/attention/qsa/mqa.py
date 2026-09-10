@@ -349,10 +349,15 @@ def tilelang_qsa_mqa_decode(
     )
     if not q.shape[0] or not max_model_len:
         return logits
-    # The validated MMA layout requires N (the Q-head dimension) to be a
-    # multiple of eight. Zero-padding preserves the weight-free head sum.
+    # The MMA layout requires N (the Q-head dimension) to be aligned.
+    # ROCm MFMA needs a multiple of 16; CUDA accepts 8.
+    # Zero-padding preserves the weight-free head sum.
     query_heads, head_dim = q.shape[1:]
-    kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
+    head_multiple = 16 if torch.version.hip else 8
+    kernel_heads = max(
+        head_multiple,
+        ((query_heads + head_multiple - 1) // head_multiple) * head_multiple,
+    )
     q_kernel = q.to(torch.bfloat16)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(
