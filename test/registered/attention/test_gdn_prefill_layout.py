@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
@@ -9,11 +10,13 @@ from sglang.kernels.ops.attention.fla.l2norm import (
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
+    fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -139,6 +142,73 @@ class TestGdnPrefillLayout(unittest.TestCase):
                         is_rms_norm=True,
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_strided_gating_matches_contiguous(self):
+        _, (_, _, b, a) = self._projection_views(torch.bfloat16)
+        a_log = torch.randn(self.NUM_V_HEADS, dtype=torch.float32, device="cuda")
+        dt_bias = torch.randn(self.NUM_V_HEADS, dtype=torch.float32, device="cuda")
+        g_view, beta_view = fused_gdn_gating(a_log, a, b, dt_bias)
+        g_ref, beta_ref = fused_gdn_gating(
+            a_log, a.contiguous(), b.contiguous(), dt_bias
+        )
+        torch.testing.assert_close(g_view, g_ref, rtol=0, atol=0)
+        torch.testing.assert_close(beta_view, beta_ref, rtol=0, atol=0)
+
+    def test_fused_split_from_strided_mixed_qkv_matches_unpack(self):
+        (qkvz, ba), (mixed_qkv, _, _, _) = self._projection_views(torch.bfloat16)
+        q_view, k_view, v_view = fused_qkv_split_gdn_prefill(
+            mixed_qkv,
+            self.NUM_QK_HEADS,
+            self.NUM_QK_HEADS,
+            self.NUM_V_HEADS,
+            self.HEAD_DIM,
+            self.HEAD_DIM,
+            self.HEAD_DIM,
+        )
+        mixed_ref, _, _, _ = fused_qkvzba_split_reshape_cat_contiguous(
+            qkvz,
+            ba,
+            self.NUM_QK_HEADS,
+            self.NUM_V_HEADS,
+            self.HEAD_DIM,
+            self.HEAD_DIM,
+        )
+        q_ref, k_ref, v_ref = fused_qkv_split_gdn_prefill(
+            mixed_ref,
+            self.NUM_QK_HEADS,
+            self.NUM_QK_HEADS,
+            self.NUM_V_HEADS,
+            self.HEAD_DIM,
+            self.HEAD_DIM,
+            self.HEAD_DIM,
+        )
+        torch.testing.assert_close(q_view, q_ref, rtol=0, atol=0)
+        torch.testing.assert_close(k_view, k_ref, rtol=0, atol=0)
+        torch.testing.assert_close(v_view, v_ref, rtol=0, atol=0)
+
+    def test_qwen35_tp2_ratio4_views_and_empty_batch(self):
+        num_qk, num_v, head = 8, 32, 128
+        qkv_dim = 2 * num_qk * head + num_v * head
+        for tokens in (0, 17):
+            with self.subTest(tokens=tokens):
+                qkvz = torch.randn(
+                    tokens,
+                    qkv_dim + num_v * head,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                ba = torch.randn(tokens, 2 * num_v, dtype=torch.bfloat16, device="cuda")
+                mixed_qkv, z, b, a = qwen3_5_gdn_prefill_projection_views(
+                    qkvz, ba, num_qk, num_v, head, head
+                )
+                self.assertEqual(mixed_qkv.shape, (tokens, qkv_dim))
+                self.assertEqual(z.shape, (tokens, num_v, head))
+                self.assertEqual(b.shape, (tokens, num_v))
+                self.assertEqual(a.shape, (tokens, num_v))
+                if tokens == 0:
+                    continue
+                self.assertFalse(mixed_qkv.is_contiguous())
+                torch.testing.assert_close(mixed_qkv, qkvz[:, :qkv_dim], rtol=0, atol=0)
 
 
 if __name__ == "__main__":
