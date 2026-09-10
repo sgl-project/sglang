@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -31,12 +32,25 @@ class _StubProcessor(BaseMultimodalProcessor):
 
 
 def _make(**fields):
+    """Both surfaces, because the device decision reads both.
+
+    `base_gpu_id` is the instance's own -- two engines in one process keep
+    different ones, which `test_publishing_another_config_does_not_move_the_device`
+    pins -- so it stays on the record the processor holds. `rl_on_policy_target`
+    is the process's, so it is published.
+    """
+    server_args = ServerArgs(model_path="dummy", **fields)
+    publish(server_args, role="tokenizer")
     processor = _StubProcessor.__new__(_StubProcessor)
-    processor.server_args = ServerArgs(model_path="dummy", **fields)
+    processor.server_args = server_args
     return processor
 
 
 class TestFastImageProcessorDevice(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
     def _device(self, processor, **platform):
         flags = {"_is_cpu": False, "_is_xpu": False, "_is_npu": False}
         flags.update(platform)
@@ -80,6 +94,10 @@ class TestFastImageProcessorDevice(CustomTestCase):
 
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
     def _processor(self, *, transport="cpu", precompute_hash=False):
         processor = _make(base_gpu_id=0)
         processor.mm_feature_transport = transport
