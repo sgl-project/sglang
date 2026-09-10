@@ -120,7 +120,7 @@ struct AllReduceNormTrait {
 // routing rows and the kTopK gathers are fetched; the routed combine is then
 // accumulated in ascending k from zero, rounded to bf16, and the shared vector
 // is added with one more bf16 rounding (see the header: the unfused path's
-// numerics, reproduced so the fusion does not move the greedy output).
+// numerics, preserving the rank-local rounding points).
 // Threads of the same token read the same kTopK indices / weights (a broadcast
 // load per warp). All arithmetic is on bf16 pairs: one cast converts two
 // elements.
@@ -179,8 +179,7 @@ SGL_DEVICE StageVec finalize_vec(const FinalizeAllReduceParams<kWorldSize>& para
   // Same rounding as the unfused path: TRT-LLM's finalize returns the routed
   // combine rounded to bf16, and `shared.add_(routed)` then rounds the bf16 +
   // bf16 sum once more (torch adds in fp32). Reproducing both roundings keeps
-  // the staged vector bit-identical to what `dev` all-reduces, so the greedy
-  // output does not move with the fusion.
+  // the staged vector bit-identical to the unfused rank-local result.
   StageVec out;
 #pragma unroll
   for (uint32_t j = 0; j < 4; ++j) {

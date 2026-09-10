@@ -389,7 +389,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             _get_packed_topk_ids_for_flashinfer_routed,
-            trtllm_moe_enable_pdl,
         )
 
         # The sqrtsoftplus router emits the packed ids in its own launch

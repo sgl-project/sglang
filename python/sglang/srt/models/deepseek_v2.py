@@ -575,7 +575,7 @@ class MoEGate(nn.Module):
 
 # Fused finalize + shared add + TP all-reduce:
 # batch cap for routing onto the fused kernel. It stages the whole [T, hidden]
-# row view through one CustomAllReduceV2 push slot; 96 rows of 5120 bf16 fill
+# row view through one CustomAllReduceV2 push slot; 96 rows of 5120 bf16 fit
 # the 1 MiB slot the plane allocates, and larger batches keep the unfused
 # finalize + all-reduce chain (the slot fit itself is re-checked in the gate).
 _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 96
