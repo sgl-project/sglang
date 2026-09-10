@@ -38,7 +38,11 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.page_interleave import (
@@ -604,9 +608,8 @@ class _GraftReq:
         self.last_node = None
         self.priority = 0
         self.kv_rotation_base = None
-        self.swa_uuid_for_lock = None
+        self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
-        self.skip_lock_node_ids = {}
         self.finished_reason = None
         self.session = None
 
