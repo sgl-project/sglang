@@ -70,23 +70,27 @@ def _should_record_expert_distribution() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _aiter_supports_mxfp8_dispatch() -> bool:
-    """Whether this aiter can consume fp8 activations with group-32 e8m0 scales.
+    """Can this aiter both emit and consume mxfp8 activations?
 
-    Probed rather than assumed, because the failure is silent in the worst way:
-    an older per_1x32 quant still returns fp8, but with continuous fp32 scales,
-    which the MoE then reads as e8m0 bytes and produces garbage rather than an
-    exception. Checking the signature keeps this a startup-time fallback instead
-    of a runtime corruption.
+    The halves ship in different commits (ROCm/aiter#4954 is the receive side),
+    and on a build with only the first the activations reach a bf16-only
+    quantizer and abort. No capability flag exists, hence the probes.
     """
     try:
         import inspect
 
+        import aiter.fused_moe as aiter_fused_moe
         from aiter import get_hip_quant
 
-        return "scale_type" in inspect.signature(get_hip_quant).parameters or any(
+        can_emit = "scale_type" in inspect.signature(get_hip_quant).parameters or any(
             "scale_type" in inspect.signature(f).parameters
             for f in (get_hip_quant(QuantType.per_1x32),)
         )
+        can_consume = (
+            "hidden_states.dtype == dtypes.fp8 and a1_scale is not None"
+            in inspect.getsource(aiter_fused_moe)
+        )
+        return can_emit and can_consume
     except Exception:
         return False
 
@@ -485,13 +489,10 @@ class _MoriEPDispatcherImplBase:
                         self.dispatch_dtype = DispatchDtype.mxfp8
                     else:
                         logger.warning_once(
-                            "SGLANG_MORI_DISPATCH_DTYPE=mxfp8 requires an aiter "
-                            "build whose per_1x32 quant accepts scale_type "
-                            "(for the group-32 e8m0 byte layout the MoE kernels "
-                            "consume). This aiter does not, so the send-side "
-                            "quant would emit continuous fp32 scales and the "
-                            "MoE would read them as e8m0 bytes. Falling back to "
-                            "bf16 dispatch."
+                            "SGLANG_MORI_DISPATCH_DTYPE=mxfp8 needs an aiter that "
+                            "can emit group-32 e8m0 scales and consume them without "
+                            "re-deriving (ROCm/aiter#4954); this build cannot. "
+                            "Falling back to bf16 dispatch."
                         )
         elif (
             "SGLANG_MORI_FP8_DISP" in os.environ or "SGLANG_MORI_FP4_DISP" in os.environ
@@ -551,19 +552,52 @@ class _MoriEPDispatcherImplBase:
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
-        # Auto-detect dispatch quantization from weight dtype
         weight_dtype = quant_config.get("weight_dtype", None)
-        if weight_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            self.dispatch_dtype = DispatchDtype.fp8
-            self.combine_dtype = CombineDtype.bf16
-        elif weight_dtype == torch.float4_e2m1fn_x2:
-            self.dispatch_dtype = DispatchDtype.fp4
+
+        self.dispatch_dtype = self._resolve_dispatch_dtype(quant_config)
+
+        # Combine has no receiver format to match (bf16 in, bf16 out), so it
+        # stays keyed off the weight dtype. Values unchanged.
+        if weight_dtype == torch.float4_e2m1fn_x2:
             self.combine_dtype = CombineDtype.fp8
         else:
-            self.dispatch_dtype = DispatchDtype.bf16
             self.combine_dtype = CombineDtype.bf16
+
         # Apply env var override immediately so dispatch_a sees correct flags
         self._apply_dispatch_dtype_override()
+
+    def _resolve_dispatch_dtype(self, quant_config: dict) -> DispatchDtype:
+        """Pick the wire format from the activation dtype the MoE consumes."""
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            AiterDispatchFormat,
+            resolve_aiter_dispatch_format,
+        )
+
+        choice = resolve_aiter_dispatch_format(
+            quant_config.get("quant_type"),
+            quant_config.get("weight_dtype"),
+            activation=quant_config.get("activation", "silu"),
+            swiglu_limit=quant_config.get("swiglu_limit"),
+        )
+        chosen = {
+            AiterDispatchFormat.FP8: DispatchDtype.fp8,
+            AiterDispatchFormat.MXFP8: DispatchDtype.mxfp8,
+            AiterDispatchFormat.MXFP4: DispatchDtype.fp4,
+            AiterDispatchFormat.BF16: DispatchDtype.bf16,
+        }[choice.format]
+        why, actionable = choice.reason, choice.actionable
+
+        if chosen is DispatchDtype.mxfp8 and not _aiter_supports_mxfp8_dispatch():
+            chosen, why, actionable = (
+                DispatchDtype.bf16,
+                "MoE consumes mxfp8 (a8w4) but this aiter cannot emit or consume "
+                "it (needs ROCm/aiter#4954)",
+                True,
+            )
+
+        log = logger.warning_once if actionable else logger.info_once
+        log(f"[MORI] auto dispatch_dtype={chosen.name}: {why}")
+        return chosen
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict

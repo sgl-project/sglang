@@ -5,7 +5,7 @@ import inspect
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
 
 import torch
 
@@ -354,6 +354,109 @@ def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
     # MoriEP{Normal,LL}DispatchOutput carry the post-mori-permute origin_topk_*
     # tensors that the standard DeepEP outputs lack.
     return hasattr(dispatch_output, "origin_topk_ids")
+
+
+class AiterDispatchFormat(str, Enum):
+    """What the dispatcher should send, i.e. what AITER's MoE will consume.
+    BF16 doubles as "unknown": the receive path always accepts it."""
+
+    FP8 = "fp8"  # fp8 + fp32 scale per 128
+    MXFP8 = "mxfp8"  # fp8 + e8m0 scale per 32
+    MXFP4 = "mxfp4"  # fp4x2 + e8m0 scale per 32
+    BF16 = "bf16"
+
+
+class AiterDispatchChoice(NamedTuple):
+    format: AiterDispatchFormat
+    reason: str
+    # Worth a warning: config can lift it. The rest follow from hardware or model.
+    actionable: bool = False
+
+
+@functools.cache
+def _aiter_dispatch_dtype_api():
+    """AITER's `resolve_activation_dtype`, on builds that expose it."""
+    try:
+        from aiter import dtypes
+        from aiter.fused_moe import resolve_activation_dtype
+        from aiter.ops.flydsl.moe_common import GateMode
+    except ImportError:
+        return None
+
+    # (quant type, dtype AITER resolves to) -> wire format. Both fp8 rows carry
+    # the same payload and differ only in scale layout, which is why the quant
+    # type has to be part of the key. Both fp8 variants appear because AITER
+    # returns the weight dtype itself for per_1x128. Anything absent -- per_Token
+    # fp8 above all -- has no MoRI format.
+    fp8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    wire_format = {
+        **{(AiterQuantType.PER_128X128, d): AiterDispatchFormat.FP8 for d in fp8},
+        **{(AiterQuantType.PER_1X32, d): AiterDispatchFormat.MXFP8 for d in fp8},
+        (AiterQuantType.PER_1X32, dtypes.fp4x2): AiterDispatchFormat.MXFP4,
+    }
+    return resolve_activation_dtype, GateMode, dtypes.bf16, wire_format
+
+
+def resolve_aiter_dispatch_format(
+    quant_type: Optional[AiterQuantType],
+    weight_dtype: Optional[torch.dtype],
+    activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
+) -> AiterDispatchChoice:
+    """Which activation format AITER's fused_moe will consume for this layer.
+
+    AITER's answer can depend on the token count M, but a dispatch format is
+    fixed when the all-to-all buffers are sized, so M is not passed and AITER
+    returns None wherever it would have mattered. Anything not committed to a
+    format answers BF16, which the receive path always accepts.
+    """
+    if quant_type is None or weight_dtype is None:
+        return AiterDispatchChoice(
+            AiterDispatchFormat.BF16, "quant method did not report the MoE numerics"
+        )
+
+    api = _aiter_dispatch_dtype_api()
+    if api is None:
+        return AiterDispatchChoice(
+            AiterDispatchFormat.BF16,
+            "AITER does not expose resolve_activation_dtype; upgrade it to let "
+            "the dispatch format follow what the MoE consumes",
+            actionable=True,
+        )
+    resolve_activation_dtype, GateMode, aiter_bf16, wire_format = api
+
+    # Mirrors AiterRunnerCore.run: only a clamped-SwiGLU layer sets gate_mode.
+    interleave = bool(swiglu_limit and swiglu_limit > 0) and get_bool_env_var(
+        "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
+    )
+
+    q_dtype_a = resolve_activation_dtype(
+        _aiter_quant_type(quant_type),
+        weight_dtype,
+        activation=_aiter_activation(activation),
+        gate_mode=GateMode.INTERLEAVE if interleave else GateMode.SEPARATED,
+    )
+    if q_dtype_a is None:
+        # bf16 where fp8 was wanted costs a quantize on the receive side; fp8
+        # where bf16 was wanted raises, or returns garbage at small M.
+        bound = get_int_env_var("AITER_BF16_FP8_MOE_BOUND", 256)
+        return AiterDispatchChoice(
+            AiterDispatchFormat.BF16,
+            "MoE activation dtype varies with batch size and a dispatch format "
+            f"cannot (AITER_BF16_FP8_MOE_BOUND={bound}); set it to 0 to pin fp8 "
+            "and allow mxfp8 dispatch",
+            actionable=True,
+        )
+    if q_dtype_a == aiter_bf16:
+        return AiterDispatchChoice(AiterDispatchFormat.BF16, "MoE consumes bf16")
+
+    fmt = wire_format.get((quant_type, q_dtype_a))
+    if fmt is None:
+        return AiterDispatchChoice(
+            AiterDispatchFormat.BF16,
+            f"no MoRI wire format carries {q_dtype_a} for {quant_type.value}",
+        )
+    return AiterDispatchChoice(fmt, f"MoE consumes {q_dtype_a} ({quant_type.value})")
 
 
 def _resolve_mori_quant_type(
