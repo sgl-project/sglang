@@ -81,6 +81,11 @@ class BaseFormatDetector(ABC):
 
         results = []
         for act in action:
+            if not isinstance(act, dict):
+                # Without this, act.get() raises AttributeError and the whole
+                # batch is lost, valid calls included; /parse_function_call 500s.
+                logger.warning(f"Skipping non-object tool call entry: {act!r}")
+                continue
             name = act.get("name")
             if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
