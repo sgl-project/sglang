@@ -849,3 +849,200 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+# ===== Shared RoPE tables =====
+
+_HIDDEN_DIM, _HEADS, _KV_HEADS, _HEAD_DIM, _LAYERS, _INTER = 8, 2, 1, 8, 2, 16
+
+
+def _tiny_dense_config():
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+        NEOLLMConfig,
+    )
+
+    config = NEOLLMConfig(
+        hidden_size=_HIDDEN_DIM,
+        intermediate_size=_INTER,
+        num_attention_heads=_HEADS,
+        num_key_value_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        num_hidden_layers=_LAYERS,
+        rms_norm_eps=1e-6,
+        attention_dropout=0.0,
+        attention_bias=False,
+        vocab_size=32,
+    )
+    config.layer_types = ["full_attention"] * _LAYERS
+    # forward_und asserts eager; the understanding path is unreachable otherwise.
+    config._attn_implementation = "eager"
+    return config
+
+
+def _tiny_dense_attention(layer_idx=0):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Attention,
+    )
+
+    return Qwen3Attention(_tiny_dense_config(), layer_idx)
+
+
+def test_sensenova_u1_shared_rope_tables_match_per_layer_computation():
+    """Qwen3Model builds RoPE once per forward and shares it across layers.
+
+    Guards the assumption that makes it valid: two identically configured layers
+    derive identical tables from the same `indexes`. If the tables ever become
+    layer-dependent, sharing them would silently change every attention output.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        _build_neo_unify_rope_tables,
+    )
+
+    torch.manual_seed(0)
+    first, other = _tiny_dense_attention(0), _tiny_dense_attention(1)
+    x = torch.randn(1, 5, _HIDDEN_DIM)
+    indexes = torch.arange(3 * 5).reshape(3, 5) % 3
+
+    shared = _build_neo_unify_rope_tables(
+        first.rotary_emb, first.rotary_emb_hw, indexes, x
+    )
+    reference_modules = (
+        other.rotary_emb,
+        other.rotary_emb_hw,
+        other.rotary_emb_hw,
+    )
+    for (cos_shared, sin_shared), module, axis in zip(
+        shared, reference_modules, (0, 1, 2)
+    ):
+        cos_ref, sin_ref = module(x, indexes[axis].unsqueeze(0))
+        assert torch.equal(cos_shared, cos_ref), f"cos differs on axis {axis}"
+        assert torch.equal(sin_shared, sin_ref), f"sin differs on axis {axis}"
+
+
+class _RopeRebuildDetector(torch.nn.Module):
+    """An nn.Module so it can take over a registered submodule slot."""
+
+    def forward(self, *args, **kwargs):
+        pytest.fail("rope tables rebuilt")
+
+
+def test_sensenova_u1_attention_reuses_passed_rope_tables(monkeypatch):
+    """Passing tables down must skip the per-layer rebuild.
+
+    The failure mode is silent: reintroducing the rebuild keeps every output
+    correct, so only this case notices that the sharing stopped happening.
+    """
+    attn = _tiny_dense_attention()
+    shared = ("t", "h", "w")
+    detector = _RopeRebuildDetector()
+    monkeypatch.setattr(attn, "rotary_emb", detector)
+    monkeypatch.setattr(attn, "rotary_emb_hw", detector)
+
+    x = torch.randn(1, 5, _HIDDEN_DIM)
+    indexes = torch.zeros(3, 5, dtype=torch.long)
+
+    assert attn._resolve_rope_tables(x, indexes, shared) is shared
+
+
+def test_sensenova_u1_model_shares_rope_tables_with_every_layer(monkeypatch):
+    """Guards the wiring from the model loop down to attention.
+
+    A dropped kwarg anywhere in that chain leaves every output correct, so
+    without this case the sharing could stop happening unnoticed.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Attention,
+        Qwen3Model,
+    )
+
+    model = Qwen3Model(_tiny_dense_config()).eval()
+    seen = []
+    original = Qwen3Attention._resolve_rope_tables
+
+    def spy(self, hidden_states, indexes, rope_tables):
+        seen.append(rope_tables is not None)
+        return original(self, hidden_states, indexes, rope_tables)
+
+    monkeypatch.setattr(Qwen3Attention, "_resolve_rope_tables", spy)
+    with torch.no_grad():
+        model(
+            inputs_embeds=torch.randn(1, 5, _HIDDEN_DIM),
+            image_gen_indicators=torch.ones(1, 5, dtype=torch.bool),
+            indexes=torch.zeros(3, 5, dtype=torch.long),
+            attention_mask={"full_attention": None},
+        )
+
+    assert len(seen) == _LAYERS, f"attention ran {len(seen)} times, want {_LAYERS}"
+    assert all(seen), f"layers that had to rebuild their own tables: {seen}"
+
+
+def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
+    """The end-to-end claim: sharing must not move the output by one bit.
+
+    Ran with sharing and with sharing bypassed (each layer rebuilding its own
+    tables, as before the change) on identical inputs.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Attention,
+        Qwen3Model,
+    )
+
+    torch.manual_seed(0)
+    model = Qwen3Model(_tiny_dense_config()).eval()
+    embeds = torch.randn(1, 5, _HIDDEN_DIM)
+    indicators = torch.ones(1, 5, dtype=torch.bool)
+    indexes = torch.zeros(3, 5, dtype=torch.long)
+
+    def run():
+        with torch.no_grad():
+            return model(
+                inputs_embeds=embeds,
+                image_gen_indicators=indicators,
+                indexes=indexes,
+                attention_mask={"full_attention": None},
+            ).last_hidden_state
+
+    shared = run()
+
+    original = Qwen3Attention._resolve_rope_tables
+    monkeypatch.setattr(
+        Qwen3Attention,
+        "_resolve_rope_tables",
+        lambda self, hidden_states, idx, tables: original(
+            self, hidden_states, idx, None
+        ),
+    )
+    per_layer = run()
+
+    assert torch.equal(shared, per_layer)
+
+
+def test_sensenova_u1_rope_tables_reach_the_understanding_path(monkeypatch):
+    """`forward_und` has its own pop site, so the gen-path cases do not cover it.
+
+    All-zeros indicators select the understanding path used by the text prefix.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Attention,
+        Qwen3Model,
+    )
+
+    model = Qwen3Model(_tiny_dense_config()).eval()
+    seen = []
+    original = Qwen3Attention._resolve_rope_tables
+
+    def spy(self, hidden_states, indexes, rope_tables):
+        seen.append(rope_tables is not None)
+        return original(self, hidden_states, indexes, rope_tables)
+
+    monkeypatch.setattr(Qwen3Attention, "_resolve_rope_tables", spy)
+    with torch.no_grad():
+        model(
+            inputs_embeds=torch.randn(1, 5, _HIDDEN_DIM),
+            image_gen_indicators=torch.zeros(1, 5, dtype=torch.bool),
+            indexes=torch.zeros(3, 5, dtype=torch.long),
+            attention_mask={"full_attention": None},
+        )
+
+    assert len(seen) == _LAYERS, f"attention ran {len(seen)} times, want {_LAYERS}"
+    assert all(seen), f"layers that had to rebuild their own tables: {seen}"

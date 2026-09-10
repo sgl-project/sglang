@@ -402,6 +402,15 @@ class Qwen3RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+def _build_neo_unify_rope_tables(rotary_emb, rotary_emb_hw, indexes, x):
+    """Temporal positions use ``rotary_emb``; height and width use ``rotary_emb_hw``."""
+    return (
+        rotary_emb(x, indexes[0].unsqueeze(0)),
+        rotary_emb_hw(x, indexes[1].unsqueeze(0)),
+        rotary_emb_hw(x, indexes[2].unsqueeze(0)),
+    )
+
+
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -503,6 +512,13 @@ class Qwen3Attention(nn.Module):
         hw_config.max_position_embeddings = config.max_position_embeddings_hw
         self.rotary_emb_hw = Qwen3RotaryEmbedding(config=hw_config)
 
+    def _resolve_rope_tables(self, hidden_states, indexes, rope_tables):
+        if rope_tables is not None:
+            return rope_tables
+        return _build_neo_unify_rope_tables(
+            self.rotary_emb, self.rotary_emb_hw, indexes, hidden_states
+        )
+
     def forward_und(
         self,
         hidden_states: torch.Tensor,
@@ -530,17 +546,15 @@ class Qwen3Attention(nn.Module):
 
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
+            hidden_states, indexes, kwargs.pop("rope_tables", None)
+        )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
-
-        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
         )
-
-        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
         )
@@ -705,17 +719,15 @@ class Qwen3Attention(nn.Module):
         )  # [B,H,S,D]
 
         # RoPE
-        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
+            hidden_states, indexes, kwargs.pop("rope_tables", None)
+        )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
-
-        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
         )
-
-        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
         )
@@ -982,17 +994,15 @@ class Qwen3Attention(nn.Module):
             )
         value_states = value_states.view(hidden_shape).transpose(1, 2)
 
-        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
+            hidden_states, indexes, kwargs.pop("rope_tables", None)
+        )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
-
-        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
         )
-
-        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
         )
@@ -1388,7 +1398,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        # RoPE depends only on `indexes`, which is fixed for every layer of this
+        # forward, so build the tables once instead of once per layer.
+        layers = self.layers[: self.config.num_hidden_layers]
+        first_attn = layers[0].self_attn
+        rope_tables = _build_neo_unify_rope_tables(
+            first_attn.rotary_emb,
+            first_attn.rotary_emb_hw,
+            indexes,
+            hidden_states,
+        )
+
+        for decoder_layer in layers:
             hidden_states = decoder_layer(
                 hidden_states,
                 image_gen_indicators=image_gen_indicators,
@@ -1400,6 +1421,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                rope_tables=rope_tables,
                 **kwargs,
             )
         if not exist_image_gen_tokens:
