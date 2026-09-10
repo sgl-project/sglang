@@ -650,22 +650,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     uses_own_vocab_modules = _is_npu
 
     @classmethod
-    def shared_experts_fusion_disable_reason(
-        cls,
-        hf_config,
-        quant_config,
-    ):
-        if _is_npu:
-            return (
-                "NPU DSpark ModelSlim weight loading does not support mapping "
-                "shared experts into fused expert slots."
-            )
-
-        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-            hf_config, quant_config
-        )
-
-    @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
             hf_config, quant_config
