@@ -2286,6 +2286,20 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
+    if _is_hip and _use_aiter:
+        from sglang.srt.layers.moe.aiter_topk import try_select_experts
+
+        output = try_select_experts(
+            hidden_states,
+            router_logits,
+            topk_config,
+            layer_id=layer_id,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+        if output is not None:
+            return output
+
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
