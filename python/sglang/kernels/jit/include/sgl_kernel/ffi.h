@@ -103,6 +103,23 @@ inline Tensor from_blob_like(
   return from_blob(data, t.shape(), t.dtype(), t.device(), std::forward<Fn>(deleter), stride, byte_offset);
 }
 
+inline Tensor alloc_workspace_tensor(size_t required_bytes, DLDevice device) {
+  if (required_bytes == 0) return {};
+  DLDataType u8 = {kDLUInt, 8, 1};
+  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
+  return ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
+}
+
 }  // namespace host::ffi
+
+// Declare `REF`, the not-nullable ObjectRef handle for `OBJ`.
+//
+// Whether `ref->` hands out a mutable pointer is decided by
+// `OBJ::_type_mutable` (see TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE),
+// so it belongs on the object, not here.
+#define SGLANG_REGISTER_FFI_REFERENCE_CLASS(REF, OBJ)                             \
+  struct REF : public tvm::ffi::ObjectRef {                                       \
+    TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(REF, tvm::ffi::ObjectRef, OBJ); \
+  }
 
 }  // namespace sglang

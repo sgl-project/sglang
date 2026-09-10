@@ -13,7 +13,7 @@ register_npu_ci(
     est_time=4800,
     suite="",
     nightly=True,
-    disabled="accuracy testcase",
+    disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
 )
 
 GLM_5_1_PD_SEP_PREFILL_ENVS = {
@@ -127,7 +127,7 @@ GLM_5_1_PD_SEP_DECODE_ARGS = [
     "deepep",
     "--deepep-mode",
     "low_latency",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     3,
@@ -139,7 +139,6 @@ GLM_5_1_PD_SEP_DECODE_ARGS = [
     180000,
     "--tokenizer-worker-num",
     16,
-    "--prefill-round-robin-balance",
     "--disable-shared-experts-fusion",
     "--dtype",
     "bfloat16",
@@ -159,11 +158,14 @@ GLM_5_1_PD_SEP_MODEL_CONFIG = {
     "decode_args": GLM_5_1_PD_SEP_DECODE_ARGS,
     "prefill_envs": GLM_5_1_PD_SEP_PREFILL_ENVS,
     "decode_envs": GLM_5_1_PD_SEP_DECODE_ENVS,
-    "router_args": ["--policy", "round_robin"],
+    "router_args": ["--policy", "round_robin", "--request-timeout-secs", 7200],
     "router_envs": {},
 }
 
 
+@unittest.skip(
+    "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+)
 class TestNPUGLM5_1_W4A8_PD_SEP_AIME2026(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     """Test NPU accuracy for GLM-5.1-w4a8 PD separation on AIME2026"""
 

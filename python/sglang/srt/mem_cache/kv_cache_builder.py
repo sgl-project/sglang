@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.runtime_context import get_exec
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -23,7 +25,9 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -47,9 +51,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
-
     from torch.distributed import ProcessGroup
 
     from sglang.srt.configs.model_config import ModelConfig
@@ -61,11 +65,33 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def get_draft_kv_pool(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+):
+    """Return the draft token-to-KV pool for the current draft worker,
+    or None when no draft KV pool is available."""
+    if draft_worker is None or spec_algorithm.is_ngram():
+        return None
+
+    # V2 draft workers exist only on their hosting PP stage; other ranks own no
+    # nested draft worker or draft KV pool.
+    if draft_worker.draft_worker is None:
+        return None
+
+    if resolving_view(server_args).enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
-    server_args: ServerArgs,
 ) -> None:
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
@@ -84,7 +110,6 @@ def maybe_register_hicache_draft(
     specs, entries = build_hicache_draft_sidecars(
         draft_device_pools=draft_plan.device_pools,
         tree_cache=tree_cache,
-        server_args=server_args,
     )
     for spec, entry in zip(specs, entries, strict=True):
         tree_cache.register_sidecar_pool(spec, entry)
@@ -104,6 +129,7 @@ def uses_ssm_state(model_config) -> bool:
         or mamba2_config(model_config) is not None
         or (spec.uses_mamba_radix_cache if spec is not None else False)
         or kimi_linear_config(model_config) is not None
+        or glm5_next_config(model_config) is not None
         or hybrid_lightning_config(model_config) is not None
     )
 
@@ -143,6 +169,9 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         backend = (
             "host_pool"
             if disagg.disaggregation_mode == "decode"
+            # Large ROCm retraction restores can fault the GPU process. Keep
+            # host_pool opt-in on HIP until the retraction path is safe at scale.
+            and not is_hip()
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
@@ -281,13 +310,16 @@ def build_kv_cache(
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
+        eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
-        enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
+        attn_cp_rank=ps.attn_cp_rank,
+        attn_cp_size=ps.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -318,7 +350,6 @@ def build_kv_cache(
         maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
-            server_args=server_args,
         )
 
     if retraction_backup == "host_pool":
