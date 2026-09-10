@@ -32,6 +32,114 @@
 
 namespace cutlass::gemm::collective {
 
+namespace detail {
+
+// CUTLASS 4.5 swapped the trailing template parameters of the stage-count helpers from
+// <..., carveout_bytes, alignment> to <..., alignment, carveout_bytes>, where the carveout now
+// deduces from the argument instead of being spelled out. The AOT build compiles against 4.2 and
+// the JIT build against flashinfer's 4.5, so both orders must stay reachable from one source. The
+// probe is the 4.2 order: under 4.5 its explicit carveout contradicts the deduced one, so the call
+// is a deduction failure rather than a silently mis-bound alignment. `cutlass/version.h` is not an
+// option here -- it pulls in the CMake-generated version_extended.h that neither build produces.
+template <
+    int CapacityBytes,
+    class ElementA,
+    class ElementB,
+    class ElementScale,
+    class ElementZero,
+    class TileShapeMNK,
+    int Alignment,
+    class StageCountType>
+constexpr auto mixed_input_stage_count_impl(StageCountType stage_count, int)
+    -> decltype(compute_stage_count_or_override_single_affine_transformed_input<
+                CapacityBytes,
+                ElementA,
+                ElementB,
+                ElementScale,
+                ElementZero,
+                TileShapeMNK,
+                StageCountType::bytes,
+                Alignment>(stage_count)) {
+  return compute_stage_count_or_override_single_affine_transformed_input<
+      CapacityBytes,
+      ElementA,
+      ElementB,
+      ElementScale,
+      ElementZero,
+      TileShapeMNK,
+      StageCountType::bytes,
+      Alignment>(stage_count);
+}
+
+template <
+    int CapacityBytes,
+    class ElementA,
+    class ElementB,
+    class ElementScale,
+    class ElementZero,
+    class TileShapeMNK,
+    int Alignment,
+    class StageCountType>
+constexpr int mixed_input_stage_count_impl(StageCountType stage_count, long) {
+  return compute_stage_count_or_override_single_affine_transformed_input<
+      CapacityBytes,
+      ElementA,
+      ElementB,
+      ElementScale,
+      ElementZero,
+      TileShapeMNK,
+      Alignment>(stage_count);
+}
+
+template <
+    int CapacityBytes,
+    class ElementA,
+    class ElementB,
+    class ElementScale,
+    class ElementZero,
+    class TileShapeMNK,
+    int Alignment,
+    class StageCountType>
+constexpr int mixed_input_stage_count(StageCountType stage_count) {
+  return mixed_input_stage_count_impl<
+      CapacityBytes,
+      ElementA,
+      ElementB,
+      ElementScale,
+      ElementZero,
+      TileShapeMNK,
+      Alignment>(stage_count, 0);
+}
+
+template <int CapacityBytes, class ElementA, class ElementB, class TileShapeMNK, int Alignment, class StageCountType>
+constexpr auto plain_stage_count_impl(StageCountType stage_count, int) -> decltype(compute_stage_count_or_override<
+                                                                                  CapacityBytes,
+                                                                                  ElementA,
+                                                                                  ElementB,
+                                                                                  TileShapeMNK,
+                                                                                  StageCountType::bytes,
+                                                                                  Alignment>(stage_count)) {
+  return compute_stage_count_or_override<
+      CapacityBytes,
+      ElementA,
+      ElementB,
+      TileShapeMNK,
+      StageCountType::bytes,
+      Alignment>(stage_count);
+}
+
+template <int CapacityBytes, class ElementA, class ElementB, class TileShapeMNK, int Alignment, class StageCountType>
+constexpr int plain_stage_count_impl(StageCountType stage_count, long) {
+  return compute_stage_count_or_override<CapacityBytes, ElementA, ElementB, TileShapeMNK, Alignment>(stage_count);
+}
+
+template <int CapacityBytes, class ElementA, class ElementB, class TileShapeMNK, int Alignment, class StageCountType>
+constexpr int plain_stage_count(StageCountType stage_count) {
+  return plain_stage_count_impl<CapacityBytes, ElementA, ElementB, TileShapeMNK, Alignment>(stage_count, 0);
+}
+
+}  // namespace detail
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // GMMA_TMA_WS_RS
@@ -203,30 +311,27 @@ struct CollectiveBuilderMixedInput<
   static constexpr int Sm90ReducedSmemCapacityBytes = detail::sm90_smem_capacity_bytes - KernelSmemCarveout;
 
   static constexpr int PipelineStages =
-      IsMixedInput ? (IsArrayOfPointersGemm ? detail::compute_stage_count_or_override_single_affine_transformed_input<
+      IsMixedInput ? (IsArrayOfPointersGemm ? detail::mixed_input_stage_count<
                                                   Sm90ReducedSmemCapacityBytes,
                                                   RealElementA,
                                                   RealElementB,
                                                   ElementScale,
                                                   ElementZero,
                                                   TileShape_MNK,
-                                                  StageCountType::bytes,
                                                   SmemAlignment>(StageCountType{})
-                                            : detail::compute_stage_count_or_override_single_affine_transformed_input<
+                                            : detail::mixed_input_stage_count<
                                                   detail::sm90_smem_capacity_bytes,
                                                   RealElementA,
                                                   RealElementB,
                                                   ElementScale,
                                                   ElementZero,
                                                   TileShape_MNK,
-                                                  StageCountType::bytes,
                                                   SmemAlignment>(StageCountType{}))
-                   : detail::compute_stage_count_or_override<
+                   : detail::plain_stage_count<
                          detail::sm90_smem_capacity_bytes,
                          ElementAMma,
                          ElementBMma,
                          TileShape_MNK,
-                         StageCountType::bytes,
                          SmemAlignment>(StageCountType{});
 
   using DispatchPolicy = cute::conditional_t<

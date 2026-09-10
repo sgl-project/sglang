@@ -93,6 +93,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_offload_compatibility(server_args)
     from sglang.srt.arg_groups.validation_hook import (
+        validate_cutlass_mxfp4,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
     )
@@ -305,6 +306,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_expert_distribution_metrics(server_args)
     handle_elastic_ep(server_args)
     validate_experimental_sgl_marlin(server_args)
+    validate_cutlass_mxfp4(server_args)
 
     # Handle pipeline parallelism.
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)

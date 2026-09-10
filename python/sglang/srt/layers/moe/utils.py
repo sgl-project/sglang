@@ -147,6 +147,9 @@ class _MoeRunnerBackendPredicates:
     def is_cutlass(self):
         return self.value == MoeRunnerBackend.CUTLASS.value
 
+    def is_cutlass_mxfp4(self):
+        return self.value == MoeRunnerBackend.CUTLASS_MXFP4.value
+
     def is_marlin(self):
         # experimental_sgl_marlin shares the marlin weight repack, quant-method
         # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
@@ -179,6 +182,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
+    CUTLASS_MXFP4 = "cutlass_mxfp4"
     MARLIN = "marlin"
     HUMMING = "humming"
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"

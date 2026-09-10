@@ -432,6 +432,40 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+def validate_cutlass_mxfp4(server_args: Any):
+    view = resolved_view(server_args)
+    selected = [
+        flag
+        for flag, backend in (
+            ("--moe-runner-backend", view.moe_runner_backend),
+            ("--speculative-moe-runner-backend", view.speculative_moe_runner_backend),
+        )
+        if backend == "cutlass_mxfp4"
+    ]
+    if not selected:
+        return
+
+    flags = " / ".join(selected)
+    # Only the SM90 mixed-input collective is instantiated (verified on H100 80GB);
+    # without this the run would die at weight load, after minutes of loading.
+    if not get_platform().is_sm90:
+        raise ValueError(
+            f"{flags} cutlass_mxfp4 is an SM90 (Hopper, H100/H800) kernel and no other "
+            f"architecture is built; this GPU reports sm{get_platform().device_sm}. Use "
+            "marlin instead."
+        )
+    if view.ep_size != 1:
+        raise ValueError(
+            f"{flags} cutlass_mxfp4 serves the standard (non-EP) MoE dispatch only, "
+            f"got ep_size={view.ep_size}."
+        )
+    if view.moe_a2a_backend != "none":
+        raise ValueError(
+            f"{flags} cutlass_mxfp4 has no all-to-all dispatch path, got "
+            f"--moe-a2a-backend {view.moe_a2a_backend}."
+        )
+
+
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval < 0:
