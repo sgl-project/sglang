@@ -1115,7 +1115,13 @@ class Scheduler(
                 self.draft_worker.prewarm_sampling()
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
-            model_runner.post_capture_resize_kv_pool()
+            model_runner.post_capture_resize_kv_pool(
+                draft_runners=(
+                    self.draft_worker._draft_model_runners()
+                    if self.draft_worker is not None
+                    else ()
+                )
+            )
             self.kv_cache_allocation_time += time.perf_counter() - tic
 
         if get_model().is_startup_weight_load_overlap:
