@@ -262,7 +262,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                 FakeCudaPlatform,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.layers.attention.selector.resolve_obj_by_qualname",
+                "sglang.multimodal_gen.runtime.layers.attention.selector.resolve_name",
                 return_value=FakeAITERBackend,
             ),
         ):
