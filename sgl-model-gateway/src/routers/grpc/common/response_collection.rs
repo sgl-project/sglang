@@ -28,6 +28,13 @@ pub(crate) async fn collect_responses(
     let all_responses = match execution_result {
         ExecutionResult::Single { mut stream } => {
             let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
+            if responses.is_empty() {
+                stream.reject_completed_body();
+                return Err(error::internal_error(
+                    "no_responses_from_server",
+                    "No responses from server",
+                ));
+            }
             stream.mark_completed();
             responses
         }
