@@ -407,6 +407,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     scheduler.scheduler_stage_metrics = None
     scheduler.metrics_reporter = Mock()
     scheduler.forward_ct = 0
+    scheduler.processed_tokens_counter = 0
     scheduler._sched_idled = False
     scheduler.scripted_scheduler_hook = None
     scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
@@ -431,6 +432,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
         reqs=[],
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
+        extend_num_tokens=1,
         return_logprob=False,
         return_hidden_states=False,
     )
