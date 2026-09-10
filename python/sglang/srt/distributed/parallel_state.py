@@ -1036,9 +1036,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -1178,9 +1178,9 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for reduce_scatterv"
+            assert pynccl_comm is not None and not pynccl_comm.disabled, (
+                "pynccl is required for reduce_scatterv"
+            )
 
             if sizes is not None:
                 assert len(sizes) == world_size
@@ -1303,9 +1303,9 @@ class GroupCoordinator:
                 output_tensor_list, input_, group=self.device_group
             )
 
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
 
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
@@ -1369,9 +1369,9 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for all_gatherv"
+            assert pynccl_comm is not None and not pynccl_comm.disabled, (
+                "pynccl is required for all_gatherv"
+            )
 
             def _all_gather_allocate_output(
                 input_: torch.Tensor,
@@ -1435,9 +1435,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -1467,10 +1467,16 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        # Broadcast.
-        torch.distributed.broadcast(
-            input_, src=self.ranks[src], group=self.device_group
-        )
+
+        # Always use pynccl to avoid capturing hip graph failure on torch
+        # version smaller than or equal to 2.11
+        if is_hip() and self.pynccl_comm is not None and not self.pynccl_comm.disabled:
+            self.pynccl_comm.broadcast(input_, src=src)
+        else:
+            # Broadcast.
+            torch.distributed.broadcast(
+                input_, src=self.ranks[src], group=self.device_group
+            )
         return input_
 
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
@@ -1580,9 +1586,9 @@ class GroupCoordinator:
         """NOTE: `src` is the local rank of the source rank."""
 
         assert src < self.world_size, f"Invalid src rank ({src})"
-        assert (
-            src != self.rank_in_group
-        ), "Invalid source rank. Source rank is the same as the current rank."
+        assert src != self.rank_in_group, (
+            "Invalid source rank. Source rank is the same as the current rank."
+        )
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
@@ -1629,9 +1635,9 @@ class GroupCoordinator:
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
             metadata_list: List[Tuple[Any, Any]] = []
-            assert isinstance(
-                tensor_dict, dict
-            ), f"Expecting a dictionary, got {type(tensor_dict)}"
+            assert isinstance(tensor_dict, dict), (
+                f"Expecting a dictionary, got {type(tensor_dict)}"
+            )
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
@@ -1716,9 +1722,9 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        assert isinstance(
-            tensor_dict, dict
-        ), f"Expecting a dictionary, got {type(tensor_dict)}"
+        assert isinstance(tensor_dict, dict), (
+            f"Expecting a dictionary, got {type(tensor_dict)}"
+        )
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
@@ -1804,6 +1810,161 @@ class GroupCoordinator:
             else:
                 tensor_dict[key] = value
         return tensor_dict
+
+    def send_recv_tensor_dict(
+        self,
+        send_tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+        send_dst: Optional[int] = None,
+        recv_src: Optional[int] = None,
+        send_all_gather_group: Optional["GroupCoordinator"] = None,
+        recv_all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        """Send tensor dict to *send_dst* and simultaneously recv from *recv_src*.
+
+        Uses ``batch_isend_irecv`` to submit all send/recv operations
+        atomically, avoiding deadlock on backends (e.g. NPU/HCCL) where
+        ``isend`` may block until a matching ``recv`` is posted.
+
+        NOTE: ``send_dst`` / ``recv_src`` are local ranks within this group.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+
+        if send_dst is None:
+            send_dst = (self.rank_in_group + 1) % self.world_size
+        if recv_src is None:
+            recv_src = (self.rank_in_group - 1) % self.world_size
+
+        assert send_dst < self.world_size, f"Invalid send_dst rank ({send_dst})"
+        assert recv_src < self.world_size, f"Invalid recv_src rank ({recv_src})"
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        # ---- 1. Exchange metadata via batch_isend_irecv on CPU group ----
+        send_metadata_list, send_tensor_list = _split_tensor_dict(send_tensor_dict)
+
+        send_meta_bytes = pickle.dumps(send_metadata_list)
+        send_meta_size = torch.tensor([len(send_meta_bytes)], dtype=torch.long)
+        send_meta_data = torch.frombuffer(send_meta_bytes, dtype=torch.uint8)
+
+        recv_meta_size = torch.empty(1, dtype=torch.long)
+
+        meta_ops = [
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_meta_size,
+                self.ranks[send_dst],
+                group=metadata_group,
+            ),
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_meta_size,
+                self.ranks[recv_src],
+                group=metadata_group,
+            ),
+        ]
+        reqs = torch.distributed.batch_isend_irecv(meta_ops)
+        for req in reqs:
+            req.wait()
+
+        recv_meta_len = recv_meta_size.item()
+        recv_meta_data = torch.empty(recv_meta_len, dtype=torch.uint8)
+
+        meta_ops = [
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_meta_data,
+                self.ranks[send_dst],
+                group=metadata_group,
+            ),
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_meta_data,
+                self.ranks[recv_src],
+                group=metadata_group,
+            ),
+        ]
+        reqs = torch.distributed.batch_isend_irecv(meta_ops)
+        for req in reqs:
+            req.wait()
+
+        recv_metadata_list = pickle.loads(recv_meta_data.numpy())
+
+        # ---- 2. Prepare recv buffers and collect all tensor ops ----
+        recv_tensor_dict: Dict[str, Any] = {}
+        tensor_ops: List[torch.distributed.P2POp] = []
+        recv_tensor_info: List[
+            Tuple[str, torch.Tensor, bool, Optional[torch.Size]]
+        ] = []
+
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                if tensor.numel() == 0:
+                    recv_tensor_dict[key] = tensor
+                    continue
+
+                use_all_gather = (
+                    recv_all_gather_group is not None
+                    and tensor.numel() % recv_all_gather_group.world_size == 0
+                )
+                orig_shape = None
+                if use_all_gather:
+                    orig_shape = tensor.shape
+                    tensor = tensor.reshape(recv_all_gather_group.world_size, -1)[
+                        recv_all_gather_group.rank_in_group
+                    ]
+
+                comm_group = metadata_group if tensor.is_cpu else group
+                tensor_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        tensor,
+                        self.ranks[recv_src],
+                        group=comm_group,
+                    )
+                )
+                recv_tensor_info.append((key, tensor, use_all_gather, orig_shape))
+            else:
+                recv_tensor_dict[key] = value
+
+        # Add send ops
+        for tensor in send_tensor_list:
+            if tensor.numel() == 0:
+                continue
+            send_t = tensor
+            if (
+                send_all_gather_group is not None
+                and send_t.numel() % send_all_gather_group.world_size == 0
+            ):
+                send_t = send_t.reshape(send_all_gather_group.world_size, -1)[
+                    send_all_gather_group.rank_in_group
+                ]
+            comm_group = metadata_group if send_t.is_cpu else group
+            tensor_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    send_t,
+                    self.ranks[send_dst],
+                    group=comm_group,
+                )
+            )
+
+        # ---- 3. Batch exchange all tensors ----
+        if tensor_ops:
+            reqs = torch.distributed.batch_isend_irecv(tensor_ops)
+            for req in reqs:
+                req.wait()
+
+        # ---- 4. Post-process received tensors (all_gather if needed) ----
+        for key, tensor, use_all_gather, orig_shape in recv_tensor_info:
+            if use_all_gather:
+                tensor = recv_all_gather_group.all_gather(tensor, dim=0)
+                tensor = tensor.reshape(orig_shape)
+            recv_tensor_dict[key] = tensor
+
+        return recv_tensor_dict
 
     def barrier(self):
         """Barrier synchronization among the group.
@@ -1932,7 +2093,6 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
-_ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -1948,75 +2108,26 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
 
 def get_tp_group() -> GroupCoordinator:
     if _ENABLE_PDMUX_P_TP:
-        assert (
-            _PDMUX_PREFILL_TP_GROUP is not None
-        ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        assert _PDMUX_PREFILL_TP_GROUP is not None, (
+            "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        )
         return _PDMUX_PREFILL_TP_GROUP
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
 
 def get_attn_tp_group() -> GroupCoordinator:
-    assert (
-        _ATTN_TP is not None
-    ), "attention tensor model parallel group is not initialized"
+    assert _ATTN_TP is not None, (
+        "attention tensor model parallel group is not initialized"
+    )
     return _ATTN_TP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
-    assert (
-        _ATTN_CP is not None
-    ), "attention context model parallel group is not initialized"
+    assert _ATTN_CP is not None, (
+        "attention context model parallel group is not initialized"
+    )
     return _ATTN_CP
-
-
-def get_attn_cp_overlap_group() -> GroupCoordinator:
-    return _ATTN_CP_OVERLAP if _ATTN_CP_OVERLAP is not None else get_attn_cp_group()
-
-
-def _init_attn_cp_overlap_group(
-    *,
-    world_size: int,
-    attn_cp_size: int,
-    attn_tp_size: int,
-    backend: Optional[str],
-    recovered_rank: bool,
-    rank_offset: int,
-    max_world_size: Optional[int],
-) -> None:
-    """Second communicator over the attention CP ranks; RCCL deadlocks when one
-    communicator is driven from two streams at once."""
-    global _ATTN_CP_OVERLAP
-    assert (
-        _ATTN_CP_OVERLAP is None
-    ), "attention context parallel overlap group is already initialized"
-    if attn_cp_size <= 1:
-        return
-
-    span = attn_tp_size * attn_cp_size
-    group_ranks = [
-        list(range(base + i, base + i + span, attn_tp_size))
-        for base in range(0, world_size, span)
-        for i in range(attn_tp_size)
-    ]
-    rank = torch.distributed.get_rank()
-    mine = next(ranks for ranks in group_ranks if rank in ranks)
-    assert mine == get_attn_cp_group().ranks, (
-        f"attn_cp_overlap partition {mine} does not match attn_cp "
-        f"{get_attn_cp_group().ranks}; the two communicators must span the "
-        "same ranks or the overlapped collectives will not pair up"
-    )
-
-    _ATTN_CP_OVERLAP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=False,
-        group_name="attn_cp_overlap",
-        recovered_rank=recovered_rank,
-        rank_offset=rank_offset,
-        max_world_size=max_world_size,
-    )
 
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -2259,7 +2370,7 @@ def init_distributed_environment(
     max_world_size: Optional[int] = None,
 ):
     logger.debug(
-        "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
+        "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
         rank,
         local_rank,
@@ -2334,9 +2445,9 @@ def init_distributed_environment(
             ranks, local_rank, backend, recovered_rank=recovered_rank
         )
     else:
-        assert (
-            _WORLD.world_size == torch.distributed.get_world_size()
-        ), "world group already initialized with a different world size"
+        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+            "world group already initialized with a different world size"
+        )
 
 
 def initialize_model_parallel(
@@ -2349,7 +2460,6 @@ def initialize_model_parallel(
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
-    duplicate_attn_cp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2470,9 +2580,9 @@ def initialize_model_parallel(
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
-        assert (
-            _PDMUX_PREFILL_TP_GROUP is None
-        ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        assert _PDMUX_PREFILL_TP_GROUP is None, (
+            "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        )
         _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2526,9 +2636,9 @@ def initialize_model_parallel(
     attn_tp_size = derived_widths["attn_tp_size"]
 
     global _ATTN_CP
-    assert (
-        _ATTN_CP is None
-    ), "attention context model parallel group is already initialized"
+    assert _ATTN_CP is None, (
+        "attention context model parallel group is already initialized"
+    )
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
     else:
@@ -2559,23 +2669,12 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    if duplicate_attn_cp_group and is_hip():
-        _init_attn_cp_overlap_group(
-            world_size=world_size,
-            attn_cp_size=attn_cp_size,
-            attn_tp_size=attn_tp_size,
-            backend=backend,
-            recovered_rank=recovered_rank,
-            rank_offset=rank_offset,
-            max_world_size=max_world_size,
-        )
-
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
     global _ATTN_TP
-    assert (
-        _ATTN_TP is None
-    ), "attention tensor model parallel group is already initialized"
+    assert _ATTN_TP is None, (
+        "attention tensor model parallel group is already initialized"
+    )
     if attn_tp_size == tensor_model_parallel_size:
         _ATTN_TP = _TP
     else:
@@ -2821,9 +2920,9 @@ def ensure_model_parallel_initialized(
     )
     if decode_context_parallel_size > 1:
         dcp_world_size = get_dcp_group().world_size
-        assert (
-            dcp_world_size == decode_context_parallel_size
-        ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
+        assert dcp_world_size == decode_context_parallel_size, (
+            f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
+        )
 
 
 def model_parallel_is_initialized():
@@ -3016,16 +3115,12 @@ def destroy_model_parallel():
     _MOE_TP = None
 
     global _ATTN_CP
-    global _ATTN_CP_OVERLAP
     global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
         _MOE_DP.destroy()
     _MOE_DP = None
-    if _ATTN_CP_OVERLAP:
-        _ATTN_CP_OVERLAP.destroy()
-    _ATTN_CP_OVERLAP = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
@@ -3084,9 +3179,9 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     as the source rank. It tests if processes are attached to the same
     memory system (shared access to shared memory).
     """
-    assert (
-        torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
-    ), "in_the_same_node_as should be tested with a non-NCCL group."
+    assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
+        "in_the_same_node_as should be tested with a non-NCCL group."
+    )
     # local rank inside the group
     rank = torch.distributed.get_rank(group=pg)
     world_size = torch.distributed.get_world_size(group=pg)
