@@ -32,7 +32,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import (
+    LoRABatchInfo,
+    generate_sequence_lengths,
+    get_batch_token_counts,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 GATHERED = 16  # forced gathered length (> any local num_tokens used below)
@@ -41,13 +46,8 @@ RANKS = [0, 8, 8, 0]
 
 
 def _forward_batch(num_tokens: int):
-    mode = SimpleNamespace(
-        is_extend=lambda: False,
-        is_idle=lambda: num_tokens == 0,
-        is_cuda_graph=lambda: False,
-    )
     return SimpleNamespace(
-        forward_mode=mode,
+        forward_mode=ForwardMode.IDLE if num_tokens == 0 else ForwardMode.DECODE,
         batch_size=num_tokens,  # decode: 1 token per seq
         extend_seq_lens_cpu=None,
         global_dp_buffer_len=GATHERED,
@@ -86,6 +86,13 @@ def _run(weight_indices, num_tokens, idle_bid=None, single_bid=None):
 
 
 class TestMoELoRATailStamp(unittest.TestCase):
+    def test_idle_batch_has_no_local_segments(self):
+        batch = _forward_batch(0)
+        self.assertEqual(get_batch_token_counts(batch), (0, 0))
+        lengths = generate_sequence_lengths(batch, device=torch.device(DEVICE))
+        self.assertEqual(lengths.numel(), 0)
+        self.assertEqual(lengths.dtype, torch.int32)
+
     def test_base_only_local_batch_keeps_disabled_tail(self):
         # All local tokens on the base (None-uid) slot, nothing armed: the
         # gathered tail must stay -1 and no adapter may be enabled.

@@ -384,7 +384,7 @@ class LoRAMemoryPool:
         the LoRA buffer matches the actual shard regardless of which TP group
         owns it — covers DP-attention (``o_proj`` uses ``attn_tp_size``) and
         shared-expert dense-vs-MoE per-layer-TP differences. Falls back to
-        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+        the module's attention/global TP size. Cached per ``(module_name, layer_idx)``.
 
         MoE-internal names go through ``self.moe_tp_size`` upstream.
         """
@@ -420,7 +420,7 @@ class LoRAMemoryPool:
                 found = r
                 break
 
-        out = found if found is not None else self.tp_size
+        out = found if found is not None else self._effective_tp_size(module_name)
         cache[key] = out
         return out
 
@@ -542,7 +542,11 @@ class LoRAMemoryPool:
         # down_proj match attn_tp under DP-attention and the shared-experts
         # dense-vs-MoE per-layer-TP differences.
         row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
-        if row_tp > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+        if (
+            row_tp > 1
+            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+        ):
             input_dim = divide(input_dim, row_tp)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
@@ -560,6 +564,11 @@ class LoRAMemoryPool:
             - Standard: [num_loras, rank, hidden_dim]
             - MoE: [num_loras, num_experts, rank, hidden_dim]
         """
+        if not self.is_moe_module(module_name):
+            return self._get_standard_shape(
+                module_name, base_model, max_lora_dim, layer_idx
+            )
+
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )

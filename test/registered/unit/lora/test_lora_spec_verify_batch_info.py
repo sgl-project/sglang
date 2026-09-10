@@ -34,6 +34,7 @@ def _verify_batch(bs: int, draft_token_num: int) -> SimpleNamespace:
         spec_info=SimpleNamespace(draft_token_num=draft_token_num),
         extend_seq_lens=None,
         extend_seq_lens_cpu=None,
+        global_dp_buffer_len=None,
     )
 
 
@@ -103,6 +104,43 @@ class TestLoRASpecVerifyBatchInfo(CustomTestCase):
             )
         self.assertEqual(captured["num_tokens"], 8)
         self.assertEqual(captured["max_len"], 4)
+
+    def test_idle_dp_rank_prepares_eager_and_graph_moe_metadata(self):
+        for use_cuda_graph in (False, True):
+            with self.subTest(use_cuda_graph=use_cuda_graph):
+                backend = self._backend()
+                if use_cuda_graph:
+                    backend.init_cuda_graph_batch_info(
+                        max_bs_in_cuda_graph=4, num_tokens_per_req=1
+                    )
+                    backend.moe_cg_buffers = {
+                        "adapter_enabled": torch.zeros(
+                            2, dtype=torch.int32, device="cuda"
+                        ),
+                        "token_lora_mapping": torch.empty(
+                            16, dtype=torch.int32, device="cuda"
+                        ),
+                    }
+                backend.is_moe_lora = True
+                backend._idle_rank_active_buffer_id = 1
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.IDLE,
+                    batch_size=0,
+                    global_dp_buffer_len=16,
+                )
+                backend.prepare_lora_batch(
+                    batch,
+                    weight_indices=[],
+                    lora_ranks=[0, 8],
+                    scalings=[1.0, 1.0],
+                    use_cuda_graph=use_cuda_graph,
+                )
+                info = backend.batch_info
+                self.assertEqual(info.bs, 0)
+                self.assertEqual(
+                    info.moe_lora_info.token_lora_mapping.tolist(), [1] * 16
+                )
+                self.assertEqual(info.moe_lora_info.adapter_enabled.tolist(), [0, 1])
 
 
 if __name__ == "__main__":
