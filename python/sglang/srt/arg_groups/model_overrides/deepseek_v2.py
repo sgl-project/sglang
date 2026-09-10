@@ -92,19 +92,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 logger.warning(
                     "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                 )
-                overrides["enable_dp_attention"] = True
-                overrides["moe_dense_tp_size"] = 1
-                if cfg.cp_strategy == "zigzag":
-                    overrides["moe_a2a_backend"] = "deepep"
-                    overrides["ep_size"] = cfg.tp_size
-                    logger.warning(
-                        "zigzag DSA CP requires moe_dense_tp_size=1, "
-                        "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
-                    )
-                else:
-                    assert cfg.dp_size == 1, (
-                        "interleave DSA CP does not support DP attention."
-                    )
+                assert cfg.dp_size == 1, (
+                    "interleave DSA CP does not support DP attention."
+                )
                 assert cfg.tp_size <= 8, (
                     "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                 )
@@ -116,11 +106,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 logger.warning(
                     "Enabled DSA context parallel: "
                     f"strategy={cfg.cp_strategy}, dp_size={cfg.dp_size}, "
-                    f"moe_dense_tp_size={overrides['moe_dense_tp_size']}, "
-                    f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
+                    f"moe_dense_tp_size={cfg.moe_dense_tp_size}, "
+                    f"ep_size={cfg.ep_size}, tp_size={cfg.tp_size}, "
                     f"attn_cp_size={attn_cp_size}, "
                     f"kv_cache_dtype={cfg.kv_cache_dtype}, "
-                    f"moe_a2a_backend={overrides.get('moe_a2a_backend', cfg.moe_a2a_backend)}, "
+                    f"moe_a2a_backend={cfg.moe_a2a_backend}, "
                     f"cuda_graph_config[prefill].backend=disabled"
                 )
 
