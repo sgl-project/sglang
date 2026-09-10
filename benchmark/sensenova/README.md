@@ -1,8 +1,8 @@
 # NEO-Unify GPU attention
 
-The model entry point currently serves T2I; the attention adapter also covers
-the model's reference-image prefill helper. This does not add an image-editing
-serving endpoint.
+The model entry point serves T2I through `/v1/images/generations` and I2I
+through `/v1/images/edits`. Reference images use the model's image-aware
+prefill path.
 
 ## Backends and semantics
 
@@ -113,3 +113,11 @@ implementations. Reuse
 `bench_serving` for end-to-end measurements. Record checkpoint/revisions,
 software versions, prefill time, denoising time, latency and peak memory.
 No end-to-end speedup or image-quality claim is made without those runs.
+
+For an I2I serving run using the VBench reference images:
+
+```bash
+python -m sglang.multimodal_gen.benchmarks.bench_serving \
+  --dataset vbench --task image-to-image --num-prompts 20 \
+  --max-concurrency 1 --port 30000
+```

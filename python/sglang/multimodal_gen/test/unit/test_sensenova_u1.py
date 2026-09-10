@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
@@ -53,9 +54,25 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
 class _FakeSenseNovaModel:
     def __init__(self):
         self.call_kwargs = None
+        self.call_method = None
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
+        self.call_method = "t2i_generate"
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
+        return self._output()
+
+    def it2i_generate(self, tokenizer, prompt, images, **kwargs):
+        self.call_method = "it2i_generate"
+        self.call_kwargs = {
+            "tokenizer": tokenizer,
+            "prompt": prompt,
+            "images": images,
+            **kwargs,
+        }
+        return self._output()
+
+    @staticmethod
+    def _output():
         return torch.tensor(
             [
                 [
@@ -341,8 +358,20 @@ def test_sensenova_u1_accepts_openai_image_api_num_frames():
 def test_sensenova_u1_scheduler_capabilities():
     config = SenseNovaU1PipelineConfig()
 
+    assert config.task_type == ModelTaskType.TI2I
+    assert config.skip_input_image_preprocess
     assert not config.supports_dynamic_batching()
     assert config.supports_sequential_multi_output_inference()
+
+
+def test_sensenova_u1_skips_generic_reference_image_preprocessing():
+    condition_image = object()
+    batch = SimpleNamespace(condition_image=condition_image)
+    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+
+    InputValidationStage().preprocess_condition_image(batch, server_args, 1, 1)
+
+    assert batch.condition_image is condition_image
 
 
 def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
@@ -635,6 +664,43 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+    assert model.call_method == "t2i_generate"
+
+
+def test_sensenova_u1_generation_stage_dispatches_image_inputs_to_it2i():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="turn the reference into a watercolor",
+        image_path=["reference.png"],
+        width=1024,
+        height=1024,
+        num_inference_steps=20,
+        guidance_scale=4.0,
+        seed=7,
+    )
+    batch = Req(
+        request_id="req-i2i",
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        sampling_params=sampling,
+        extra=sampling.build_request_extra(),
+        output_file_name="sample.png",
+    )
+    model = _FakeSenseNovaModel()
+
+    output = SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    assert len(output.output) == 1
+    assert model.call_method == "it2i_generate"
+    assert model.call_kwargs["images"] == ["reference.png"]
+    assert model.call_kwargs["image_size"] == (1024, 1024)
+    assert model.call_kwargs["num_steps"] == 20
+    assert model.call_kwargs["seed"] == 7
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():

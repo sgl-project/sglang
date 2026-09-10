@@ -74,9 +74,10 @@ def _set_compatible_runtime_defaults(server_args) -> None:
 
 @dataclass
 class SenseNovaU1PipelineConfig(PipelineConfig):
-    """Native SenseNova-U1 text-to-image pipeline configuration."""
+    """Native SenseNova-U1 text/image-to-image pipeline configuration."""
 
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
+    skip_input_image_preprocess: bool = True
     model_precision: str = "bf16"
     should_use_guidance: bool = True
     supports_cfg_parallel: bool = False
