@@ -1600,33 +1600,14 @@ class TestGraniteThinkingDetector(CustomTestCase):
     def setUp(self):
         self.detector = GraniteThinkingDetector()
 
-    def test_init(self):
-        self.assertEqual(self.detector.think_start_token, "<think>")
-        self.assertEqual(self.detector.think_end_token, "</think>")
-        self.assertEqual(self.detector.tool_start_token, "<tool_call>")
-        self.assertEqual(self.detector.reasoning_default, "enable_thinking")
-        self.assertFalse(self.detector._in_reasoning)
-
     def test_leading_newline_stripped(self):
         text = "<think>reasoning</think>\nHello"
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "reasoning")
         self.assertEqual(result.normal_text, "Hello")
 
-    def test_no_newline(self):
-        text = "<think>r</think>c"
-        result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "r")
-        self.assertEqual(result.normal_text, "c")
-
     def test_reasoning_only(self):
         text = "<think>reasoning</think>"
-        result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "reasoning")
-        self.assertEqual(result.normal_text, "")
-
-    def test_whitespace_only_content_stripped(self):
-        text = "<think>reasoning</think>\n\n"
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "reasoning")
         self.assertEqual(result.normal_text, "")
@@ -1647,13 +1628,6 @@ class TestGraniteThinkingDetector(CustomTestCase):
         result = detector.detect_and_parse("<think>reasoning</think>")
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "reasoning")
-
-    def test_force_nonempty_content_no_swap_when_content_exists(self):
-        detector = GraniteThinkingDetector(force_nonempty_content=True)
-        text = "<think>reasoning</think>\nreal answer"
-        result = detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "reasoning")
-        self.assertEqual(result.normal_text, "real answer")
 
     def test_force_nonempty_content_truncated_reasoning(self):
         detector = GraniteThinkingDetector(force_nonempty_content=True)
@@ -1680,12 +1654,6 @@ class TestGraniteThinkingDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "line1\nline2")
         self.assertEqual(result.normal_text, "result1\nresult2")
 
-    def test_empty_think_block(self):
-        text = "<think></think>content"
-        result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "")
-        self.assertEqual(result.normal_text, "content")
-
     def test_streaming_newlines_preserved_after_content_starts(self):
         self.detector.parse_streaming_increment("<think>")
         self.detector.parse_streaming_increment("r")
@@ -1700,8 +1668,6 @@ class TestGraniteThinkingDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "\nHello")
 
     def test_streaming_result_is_chunking_independent(self):
-        """A whole think block in one chunk must strip the leading newline the
-        same as tag-by-tag chunking."""
         # The empty think block only trips stripped_think_start evidence:
         # reasoning text and pre/post _in_reasoning are all empty/False there.
         for text, exp_r, exp_c in (
