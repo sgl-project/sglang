@@ -17,7 +17,8 @@ def concat_and_cast_mha_k_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
 ):
-    pid_loc = tl.program_id(0)
+    # int64: pid_loc * k_stride0 exceeds int32 past ~116K tokens with 96 heads.
+    pid_loc = tl.program_id(0).to(tl.int64)
     head_range = tl.arange(0, head_cnt)
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
@@ -62,7 +63,8 @@ def concat_and_cast_mha_k_pad_kernel(
     tl.arange needs a power-of-two extent, so walk HEAD_BLOCK == next_power_of_2(head_cnt)
     lanes and mask the tail.
     """
-    pid_loc = tl.program_id(0)
+    # int64: pid_loc * k_stride0 exceeds int32 past ~116K tokens with 96 heads.
+    pid_loc = tl.program_id(0).to(tl.int64)
     head_range = tl.arange(0, HEAD_BLOCK)
     head_mask = head_range < head_cnt
 

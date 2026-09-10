@@ -1321,6 +1321,11 @@ class Envs:
     # ===================================================================
     # Mamba state and cache
     # ===================================================================
+    # FlashKDA (--linear-attn-prefill-backend flashkda) hands batches whose
+    # longest request exceeds this many tokens to the Triton chunk_kda kernel
+    # (the branch-measured crossover). Raise it to keep long prefills on the
+    # fused CUTLASS kernel.
+    SGLANG_FLASHKDA_MAX_SEQ_LEN = EnvInt(2048)
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
@@ -1607,6 +1612,15 @@ class Envs:
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
+    # Context parallel (zigzag prefill)
+    # ===================================================================
+    # Run the two zigzag query blocks (prev/next) of a CP rank as ONE
+    # flash-attention varlen launch (2 sequences per request sharing the same
+    # K/V rows through per-sequence base offsets + seqused_k) instead of two
+    # launches. Expanded-MHA (contiguous K/V) path only.
+    SGLANG_CP_ZIGZAG_SINGLE_LAUNCH = EnvBool(False)
+
+    # ===================================================================
     # Kimi K3
     # ===================================================================
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
@@ -1633,9 +1647,12 @@ class Envs:
     SGLANG_K3_GEMM_AR = EnvBool(False)
     # Overlap K3 zigzag prefill's latent KV gather/cache write with query preparation.
     SGLANG_K3_CP_KV_OVERLAP = EnvBool(False)
-    # Opt in to expanded MHA for K3 CP prefill when its estimated temporary
-    # workspace fits this MiB budget. Zero keeps the absorbed MLA path.
-    SGLANG_K3_CP_MHA_MAX_WORKSPACE_MB = EnvInt(0)
+    # Use expanded MHA for K3 CP prefill when its estimated temporary workspace
+    # fits this MiB budget; zero forces the absorbed MLA path. Absorbed FA4
+    # attention is ~11x slower per MLA layer than expanded MHA at 32K-64K
+    # prefill (3.4x FLOPs, 64-row tiles), so the default admits expanded MHA up
+    # to ~128K tokens at CP4/CP8 (estimate ~11.6 GB at 128K/CP4).
+    SGLANG_K3_CP_MHA_MAX_WORKSPACE_MB = EnvInt(16384)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.

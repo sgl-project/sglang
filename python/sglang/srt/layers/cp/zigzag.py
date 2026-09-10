@@ -373,6 +373,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         device: Any,
         attn_fn,
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
+        single_launch: bool = False,
     ) -> Any:
         assert (
             attention_backend in self.get_supported_attention_backend()
@@ -385,7 +386,22 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         prev_kwargs = {}
         next_kwargs = {}
-        if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+        if (
+            single_launch
+            and attention_backend == CPAttentionBackendKind.FLASH_ATTENTION
+        ):
+            # One varlen launch over [q_prev | q_next]: the combined metadata
+            # lists every request's prev block first, then every next block,
+            # each with its own kv length; the closure maps `combined=True`
+            # to per-sequence K base offsets (request-major, repeated).
+            result = attn_fn(
+                q[:logical_tokens],
+                meta.cu_seqlens_q_combined_tensor,
+                meta.kv_len_combined_tensor,
+                meta.max_seqlen_q_combined,
+                combined=True,
+            )
+        elif attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
             result = attn_fn(
                 q[:logical_tokens],
                 meta.cu_seqlens_q_combined_tensor,

@@ -756,7 +756,9 @@ class DeepseekMHAForwardMixin:
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
         elif (
             _is_cuda
-            and next_power_of_2(self.num_local_heads) == self.num_local_heads
+            # The Triton wrapper pads a non-power-of-two head count itself
+            # (Kimi-K3 has 96 heads: 12/24/48/96 per rank at TP8/CP2/4/8), so
+            # only the head dims need to be powers of two here.
             and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
             and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
         ):

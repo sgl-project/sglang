@@ -10,8 +10,15 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 _FLASHKDA_CHUNK_SIZE = 64
 
 # FlashKDA's max sequence length, Batches whose longest sequence exceeds this
-# fall back to Triton for the whole batch.
+# fall back to Triton for the whole batch. Default 2048 (the measured
+# crossover); override with SGLANG_FLASHKDA_MAX_SEQ_LEN.
 _FLASHKDA_MAX_SEQ_LEN = 2048
+
+
+def _flashkda_max_seq_len() -> int:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_FLASHKDA_MAX_SEQ_LEN.get()
 
 
 def _load_flash_kda():
@@ -153,22 +160,23 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                beta_is_raw=beta_is_raw,
-            ),
-            None,
+        # KDAAttnBackend.forward_extend expects a bare output tensor unless it
+        # asked for intermediate states (return_intermediate_states=True), and
+        # that case is routed to the Triton fallback above -- so match
+        # chunk_kda's contract and return the tensor, not an (out, None) tuple.
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
         )
 
     @staticmethod
@@ -205,7 +213,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
             seq_lens = query_start_loc[1:] - query_start_loc[:-1]
             lo_t, hi_t = torch.aminmax(seq_lens)
             lo, hi = int(lo_t), int(hi_t)
-        return lo < _FLASHKDA_CHUNK_SIZE or hi > _FLASHKDA_MAX_SEQ_LEN
+        return lo < _FLASHKDA_CHUNK_SIZE or hi > _flashkda_max_seq_len()
 
     def _flashkda_extend(
         self,

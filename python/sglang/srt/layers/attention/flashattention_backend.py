@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.kernels.ops.attention.metadata import (
     draft_extend_set_metadata,
     normal_decode_set_metadata,
@@ -1242,17 +1244,27 @@ class FlashAttentionBackend(AttentionBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype)
 
-        def attend(q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp):
+        def attend(
+            q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp, combined=False
+        ):
             # cu_seqlens_k gives the full request-major storage offsets;
             # seqused_k truncates each request to this query block's end.
             # The bottom-right causal mask then gives each query its exact
             # global position, including any previously cached prefix.
+            k_offsets = cu_seqlens_k
+            if combined:
+                # Single launch over [all prev blocks | all next blocks]: both
+                # blocks of a request read the same K/V rows, so repeat the
+                # request base offsets (FA4 uses cu_seqlens_k[i] purely as the
+                # K base offset of sequence i when seqused_k is given).
+                base = cu_seqlens_k[:-1]
+                k_offsets = torch.cat([base, base, cu_seqlens_k[-1:]]).contiguous()
             return flash_attn_varlen_func(
                 q=q_chunk,
                 k=k,
                 v=v,
                 cu_seqlens_q=cu_seqlens_q_cp,
-                cu_seqlens_k=cu_seqlens_k,
+                cu_seqlens_k=k_offsets,
                 seqused_k=cache_seqlens_cp,
                 max_seqlen_q=max_seqlen_q_cp,
                 max_seqlen_k=max_seqlen_k,
@@ -1271,6 +1283,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.device,
             attend,
             attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+            single_launch=envs.SGLANG_CP_ZIGZAG_SINGLE_LAUNCH.get(),
         )
 
     def forward_extend(
