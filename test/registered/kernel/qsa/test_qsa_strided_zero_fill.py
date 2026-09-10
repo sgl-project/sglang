@@ -7,6 +7,8 @@ multiply masked probabilities into stale NaN/Inf bytes. Also checks the compact
 (FA2 fallback) layout is unchanged. Intended for test/registered/kernel/qsa/.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -184,3 +186,7 @@ def test_strided_gather_addresses_pool_beyond_int32_elements():
     torch.testing.assert_close(packed_k[:300], k_pool[hi].to(torch.bfloat16))
     torch.testing.assert_close(packed_v[:300], v_pool[hi].to(torch.bfloat16))
     assert (packed_k[300:] == 0).all() and (packed_v[300:] == 0).all()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
