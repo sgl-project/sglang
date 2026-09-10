@@ -96,6 +96,9 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.mm_preprocessing_metrics import (
+    observe_mm_media_download,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -1522,9 +1525,13 @@ def load_audio(
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        download_start = time.perf_counter()
         with get_mm_http_session().get(audio_file, timeout=timeout) as response:
             response.raise_for_status()
             source = response.content
+        observe_mm_media_download(
+            "audio", time.perf_counter() - download_start, len(source)
+        )
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
     elif isinstance(audio_file, str):
@@ -1683,12 +1690,16 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         return image_file
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        download_start = time.perf_counter()
         response = get_mm_http_session().get(image_file, timeout=timeout)
         try:
             response.raise_for_status()
             result = response.content
         finally:
             response.close()
+        observe_mm_media_download(
+            "image", time.perf_counter() - download_start, len(result)
+        )
         return result
     if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
@@ -1715,11 +1726,16 @@ def _normalize_video_input(
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            download_start = time.perf_counter()
             with get_mm_http_session().get(
                 video_file, stream=True, timeout=timeout
             ) as response:
                 response.raise_for_status()
-                return response.content
+                content = response.content
+            observe_mm_media_download(
+                "video", time.perf_counter() - download_start, len(content)
+            )
+            return content
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)

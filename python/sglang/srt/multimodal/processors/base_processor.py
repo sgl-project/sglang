@@ -5,6 +5,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -18,6 +19,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
     MultimodalProcessorOutput,
+)
+from sglang.srt.observability.mm_preprocessing_metrics import (
+    observe_mm_load_data,
+    observe_mm_media_load,
+    observe_mm_processor,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
@@ -491,12 +497,16 @@ class BaseMultimodalProcessor(ABC):
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
-        )
+        processor_start = time.perf_counter()
+        try:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+        finally:
+            observe_mm_processor(time.perf_counter() - processor_start)
         if not self.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
@@ -561,6 +571,7 @@ class BaseMultimodalProcessor(ABC):
         """
         if cls._is_preprocessed_input(data):
             return data
+        load_start = time.perf_counter()
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
@@ -588,6 +599,10 @@ class BaseMultimodalProcessor(ABC):
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
             raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+        finally:
+            observe_mm_media_load(
+                modality.name.lower(), time.perf_counter() - load_start
+            )
 
     @staticmethod
     def _get_preprocessed_input_format(data):
@@ -810,6 +825,35 @@ class BaseMultimodalProcessor(ABC):
         return is_precomputed, images, videos, audios
 
     async def load_mm_data(
+        self,
+        prompt: str,
+        multimodal_tokens: MultimodalSpecialTokens,
+        image_data: Optional[list] = None,
+        video_data: Optional[list] = None,
+        audio_data: Optional[list] = None,
+        return_text: Optional[bool] = True,
+        discard_alpha_channel: bool = True,
+        audio_sample_rate: Optional[int] = None,
+    ) -> BaseMultiModalProcessorOutput:
+        # Timed wrapper around _load_mm_data_impl. Requests whose mm inputs
+        # are all precomputed embeddings / processor outputs take a
+        # near-instant fast path and are still observed (lowest bucket).
+        load_start = time.perf_counter()
+        try:
+            return await self._load_mm_data_impl(
+                prompt=prompt,
+                multimodal_tokens=multimodal_tokens,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                return_text=return_text,
+                discard_alpha_channel=discard_alpha_channel,
+                audio_sample_rate=audio_sample_rate,
+            )
+        finally:
+            observe_mm_load_data(time.perf_counter() - load_start)
+
+    async def _load_mm_data_impl(
         self,
         prompt: str,
         multimodal_tokens: MultimodalSpecialTokens,
