@@ -994,7 +994,8 @@ class Gemma4TextModel(PreTrainedModel):
 
         for layer_idx in range(self.start_layer, self.end_layer):
             if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states)
+                # The next layer's fused norm updates its input residual in place.
+                aux_hidden_states.append(hidden_states.clone())
 
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, layer_idx, :]
