@@ -1477,6 +1477,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            zero_fill_cols=stride,
         )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]

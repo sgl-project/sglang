@@ -381,8 +381,10 @@ def _compact_kv(
     dim: tl.constexpr,
     req_stride: tl.constexpr,
     idx_stride: tl.constexpr,
+    pad_cols,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ZERO_FILL: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -400,9 +402,17 @@ def _compact_kv(
     )
     src = slots[:, None] * heads * dim + head * dim + dims[None, :]
     dst = (pack_start + cols)[:, None] * heads * dim + head * dim + dims[None, :]
-    mask = valid[:, None] & (dims[None, :] < dim)
-    tl.store(out_k + dst, tl.load(k + src, mask=mask, other=0.0), mask=mask)
-    tl.store(out_v + dst, tl.load(v + src, mask=mask, other=0.0), mask=mask)
+    load_mask = valid[:, None] & (dims[None, :] < dim)
+    if ZERO_FILL:
+        # Strided (page-aligned) packing: the paged decode kernel reads whole pages,
+        # so every slot in [valid_count, pad_cols) must hold zeros, never stale bytes.
+        # `valid_count` here is the row's page-aligned stride, not its valid count, so
+        # the store covers the full region while the load stays limited to valid rows.
+        store_mask = (cols < pad_cols)[:, None] & (dims[None, :] < dim)
+    else:
+        store_mask = load_mask
+    tl.store(out_k + dst, tl.load(k + src, mask=load_mask, other=0.0), mask=store_mask)
+    tl.store(out_v + dst, tl.load(v + src, mask=load_mask, other=0.0), mask=store_mask)
 
 
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
@@ -419,11 +429,33 @@ def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
 
 
 def qwen_sparse_kv_extraction_compact_triton(
-    k, v, req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v, batch, topk
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    batch,
+    topk,
+    zero_fill_cols: int = 0,
 ):
+    """Gather the selected K/V rows into ``out_k``/``out_v``.
+
+    ``zero_fill_cols`` > 0 selects the strided (page-aligned) layout used by the paged
+    decode kernel: row ``b`` owns ``[cu_k[b], cu_k[b] + zero_fill_cols)`` and every slot
+    past its valid rows is zero-filled. Paged kernels read whole pages and multiply the
+    masked probabilities into V, so stale or uninitialized bytes there (NaN/Inf bit
+    patterns) would otherwise leak into the output. ``0`` keeps the compact layout for
+    the varlen fallback, whose rows are packed back-to-back.
+    """
     _, heads, dim = k.shape
     block_topk = 16
-    _compact_kv[(batch, heads, triton.cdiv(topk, block_topk))](
+    zero_fill = zero_fill_cols > 0
+    num_cols = zero_fill_cols if zero_fill else topk
+    _compact_kv[(batch, heads, triton.cdiv(num_cols, block_topk))](
         k,
         v,
         req_to_token,
@@ -438,8 +470,10 @@ def qwen_sparse_kv_extraction_compact_triton(
         dim,
         req_to_token.stride(0),
         indices.stride(0),
+        num_cols,
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
+        ZERO_FILL=zero_fill,
         num_warps=8,
     )
 
