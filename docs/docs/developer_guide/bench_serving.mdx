@@ -130,9 +130,11 @@ Image dataset flags (for `image`):
 Agentic trace flags (for `agentic-trace`):
 
 - `--dataset-path`: path to the pre-built trace JSON
-- `--sharegpt-output-len`: per-turn output length (default: 220)
+- `--sharegpt-output-len`: force a uniform per-turn output length. When omitted, each turn generates the `output_tokens` its trace entry records, falling back to 220 for traces that do not record one
 - `--dataset-offset`: rotate the conversation list by this many entries before sampling, so successive sweep steps start on fresh conversations
 - `--agentic-max-turns`: cap each conversation to at most this many turns (useful for small, fast profiling runs)
+
+To replay the [SemiAnalysis Claude Code corpus](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k) that InferenceX's AgentX benchmark uses, convert it into this format with `sglang.test.agentic_trace_utils`. Those traces record token counts and KV block ids rather than text, so the converter synthesises prompts that reproduce the recorded prompt growth and decode lengths; see the module docstring for what the conversion does and does not preserve.
 
 SPEED-Bench flags (for `speed-bench`):
 
