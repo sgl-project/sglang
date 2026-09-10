@@ -20,6 +20,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
+# Backend-specific: the llama3 and pythonic parsers run on real decoded text,
+# so ROCm decode divergence surfaces as tool calls that no longer parse.
 register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
 # Backend-specific: Ascend uses a local model mirror and its native
 # attention backend, while sharing the protocol assertions below.
