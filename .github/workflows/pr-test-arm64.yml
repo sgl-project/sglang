@@ -76,9 +76,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Build container
+        env:
+          # github.head_ref is the PR author's branch name; a ${{ }} expression is
+          # substituted into the run: script as TEXT before bash parses it, so a
+          # branch named x$(cmd)x would run cmd on this (self-hosted) runner. In
+          # env: the value is placed in the process environment as data, not code.
+          PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF_NAME: ${{ github.head_ref }}
         run: |
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
+          PR_REPO="$PR_REPO_URL"
+          PR_HEAD_REF="$PR_HEAD_REF_NAME"
 
           docker build \
             ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
