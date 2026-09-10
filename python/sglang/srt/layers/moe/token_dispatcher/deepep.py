@@ -804,7 +804,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
-            if self.use_fp8 and not _is_npu
+            if self.use_fp8
             else dict()
         )
 
@@ -813,6 +813,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if not self.use_mxfp4:
             low_latency_quant_kwargs["use_fp8"] = self.use_fp8
         if _is_npu:
+            fp8_deepgemm_scale_opts = {}
             if self.use_ue8m0:
                 low_latency_quant_kwargs["use_ue8m0"] = True
             if self.use_mxfp4:
