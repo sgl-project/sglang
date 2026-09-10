@@ -33,9 +33,8 @@ PYTHONPATH=python:test python -m nccl_ep_test.single_gpu --report /tmp/nccl-ep-c
 
 Before two-GPU integration, run the same gate on one PRO 6000, adding
 `--require-sm 120 --experts 32 --capacity 128`. This records actual peak memory
-and replay time. SM120, real EP and model serving remain pending until their
-respective hardware gates pass. The former server's Torch 2.11 environment
-and the local Torch 2.13 environment are separate validation records.
+and replay time. The completed SM120 and native validation record is below.
+Server Torch 2.11 and local Torch 2.13 are separate validation records.
 
 ## Zero-token rank integration
 
@@ -52,8 +51,8 @@ replays its old generation. This control overhead must be measured on the pair.
 
 Local tests cover real Gloo agreement with two CPU processes, production
 ModelRunner branch ordering, actual zero-length IDLE runner inputs, scheduler
-idle creation and coordinated recapture. They do not establish that independent
-buckets interoperate on native EP; that remains a two-GPU acceptance gate.
+idle creation and coordinated recapture. Native independent-bucket interoperability is established separately by the
+two-GPU acceptance gate recorded below.
 
 ## Serial independent shared experts
 
@@ -138,8 +137,8 @@ nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --sample=none \
 
 Keep profiling disabled when comparing latency. Full-model quality benchmarks,
 throughput optimization, fused shared experts, EPLB, SBO/TBO and deterministic
-fallback are outside this follow-up's validation scope. Native SM120, pair,
-model serving and Nsight results must remain pending until actually executed.
+fallback are outside this follow-up's validation scope. Record the exact tested
+commit for each hardware result; never reuse a preceding gate from another SHA.
 
 In the local combined structured-input case, receive quantization matched the
 CPU wire reference exactly. One routed expert differed from CPU by up to
@@ -157,3 +156,54 @@ and replay time 1.174 ms, both including count-buffer updates. Peak PyTorch
 allocation was 388,546,048 bytes (370.5 MiB). These measurements use default
 Triton tuning and exclude native EP, model attention, full model memory and
 cross-rank control synchronization; they do not establish an LL speedup.
+
+
+## Native validation (two SM120 GPUs)
+
+On 2026-09-10, all four driver phases passed on
+`6afcf2b64e580420df72553107cf2a0ea9c97259`. Hardware: two RTX PRO 6000
+Blackwell Server Edition GPUs, NODE topology, bidirectional P2P read/write and
+Torch peer access. Ubuntu 22.04.5; driver 595.71.05 (advertised CUDA compatibility
+13.2), Toolkit 13.0.88, official Torch 2.11.0+cu130, NCCL runtime 2.30.7,
+nccl4py 0.4.1 and nccl-extensions 0.1.0. No Torch source build was used.
+
+| Gate | Observed result |
+| --- | --- |
+| Single SM120 | 24 Triton/shared-MLP tests passed; E32/C128/H2048/I1408, 1000 replays |
+| Compute-only time | Eager 0.268 ms; replay 0.196 ms, including count copies; peak allocation 370.5 MiB |
+| Native pair | All seven routing/bucket cases, recovery, two layers and two generations passed; 1000 changing replays per generation |
+| Empty ranks | Each rank checked eight snapshots containing remote expert work while locally idle |
+| Arithmetic | Independent device oracle passed; CPU composed diagnostic max absolute error 0.0 on both ranks for this fixture |
+| Resource lifetime | Per rank: one eager group plus two Graph generations, one persistent handle per generation; all explicitly closed |
+| Host admission | Mean 0.283 / 0.279 ms on ranks 0 / 1, including peer wait |
+| Host forward submission | Mean 0.541 / 0.502 ms on ranks 0 / 1, including peer wait |
+| Eager serving | Eight requests passed; 76 actual `decode_none` passes |
+| Graph serving | Eight requests passed; 72 actual `decode_cuda_graph` passes |
+
+Serving used the pinned model and exact recipe above. All requests returned
+positive completion lengths and finite logprobs. The median request wall times
+were 1.581 s eager and 0.316 s Graph. These are eight-request smoke measurements,
+with mixed serial/concurrent requests and cache effects, not a controlled
+throughput or speedup benchmark. Raw completions include byte-level marker text;
+seven of eight eager/Graph completions matched, and one concurrent completion
+differed. Readable generation quality and deterministic equivalence were not
+acceptance criteria and are not certified by this smoke.
+
+A separate Nsight Systems 2025.3.1 trace on `bc95943f16a5f4aa6528ec8781f1348d499819dc`
+ran the pair harness with 50 replays per generation. It recorded 224 Graph
+launches, 16 instantiations/destructions, 1040 native dispatch kernels, 1040
+native combine kernels and 1248 Triton `fused_moe_kernel` invocations across
+both ranks. Each of those three kernel families had 896 invocations identified
+as CUDA Graph nodes. All captured kernels ran on one stream per GPU. The trace
+includes warmup, capture, oracle gaps and peer waits; it is execution evidence,
+not isolated LL latency. It predates the engine cuMem and serving-port fixes;
+the native compute/Graph implementation is identical to the final tested SHA.
+
+The server run exposed and fixed four integration/fixture issues: standalone
+shared-MLP construction incorrectly queried uninitialized global TP state;
+the synthetic eager IDLE router launched a zero-grid TopK mask kernel; engine
+startup disabled cuMem needed by the NCCL Device API; and the serving driver
+mistook TCP TIME_WAIT for a live listener. Regression tests cover each issue.
+Native group creation fails with cuMem=0 and succeeds with cuMem=1; engine
+startup now ensures cuMem is enabled for NCCL EP. The complete local suite at
+the tested SHA passed 135 tests on SM89.
