@@ -662,7 +662,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             }
         }
-        with override_platform(is_sm100=True):
+        with override_platform(is_cuda=True, is_sm100=True):
             from_config_json = self._construct(*qwen4, config_extra=mixed_ckpt)
             explicit_fp4 = self._construct(
                 *qwen4, config_extra=mixed_ckpt, quantization="modelopt_fp4"
