@@ -5,7 +5,6 @@ production path: RealProcs popen/kill, health polling, manifest, report.
 """
 
 import json
-import sys
 from pathlib import Path
 
 import run_sweep
