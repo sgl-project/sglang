@@ -582,6 +582,135 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         self.assertIn("complex_tool", tool_names)
         self.assertIn("another_simple_tool", tool_names)
 
+    def test_specific_tool_choice_with_defs(self):
+        """Specific tool choice must hoist the tool's $defs so its $ref resolves.
+
+        A named tool whose parameters use "#/$defs/..." references produced a
+        schema with a dangling $ref because $defs were only kept nested under
+        items/properties/parameters instead of at the schema root (the
+        "required" branch already hoists them). check_schema does not resolve
+        internal refs, so this only shows up when validating an instance.
+        """
+        tools_with_defs = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {"$ref": "#/$defs/Location"},
+                        },
+                        "required": ["location"],
+                        "$defs": {
+                            "Location": {
+                                "type": "object",
+                                "properties": {
+                                    "lat": {"type": "number"},
+                                    "lon": {"type": "number"},
+                                },
+                                "required": ["lat", "lon"],
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        schema = get_json_schema_constraint(tools_with_defs, tool_choice)
+
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
+        # $defs must be hoisted to the root so the ref inside parameters resolves.
+        self.assertIn("$defs", schema)
+        self.assertIn("Location", schema["$defs"])
+
+        # A valid instance must validate without a RefResolutionError.
+        validator = jsonschema.Draft202012Validator(schema)
+        validator.validate(
+            [
+                {
+                    "name": "get_weather",
+                    "parameters": {"location": {"lat": 1.0, "lon": 2.0}},
+                }
+            ]
+        )
+        # The referenced definition still constrains the instance.
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate(
+                [{"name": "get_weather", "parameters": {"location": {"lat": 1.0}}}]
+            )
+
+    def test_specific_tool_choice_nested_defs(self):
+        """Nested $defs must resolve for a specific tool choice as well."""
+        tools_with_nested_defs = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="complex_tool",
+                    description="Tool with nested $defs",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "user": {"$ref": "#/$defs/User"},
+                        },
+                        "required": ["user"],
+                        "$defs": {
+                            "User": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "profile": {"$ref": "#/$defs/Profile"},
+                                },
+                                "required": ["id"],
+                            },
+                            "Profile": {
+                                "type": "object",
+                                "properties": {"name": {"type": "string"}},
+                                "required": ["name"],
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="complex_tool")
+        )
+        schema = get_json_schema_constraint(tools_with_nested_defs, tool_choice)
+
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+        self.assertIn("$defs", schema)
+        self.assertIn("User", schema["$defs"])
+        self.assertIn("Profile", schema["$defs"])
+
+        validator = jsonschema.Draft202012Validator(schema)
+        validator.validate(
+            [
+                {
+                    "name": "complex_tool",
+                    "parameters": {"user": {"id": "u1", "profile": {"name": "Ada"}}},
+                }
+            ]
+        )
+
+    def test_specific_tool_choice_no_defs_omits_defs_key(self):
+        """A specific tool without $defs should not gain an empty $defs key."""
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        schema = get_json_schema_constraint(self.tools, tool_choice)
+
+        self.assertIsNotNone(schema)
+        self.assertNotIn("$defs", schema)
+
     def test_tools_with_defs_but_no_refs(self):
         """Test tools with $defs but no $ref usage"""
         tools_with_unused_defs = [
