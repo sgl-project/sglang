@@ -123,18 +123,10 @@ def cached_tokens_details_from_dict(
     details: Dict[str, Any],
 ) -> CachedTokensDetails:
     """Convert a raw cached_tokens_details dict to a CachedTokensDetails object."""
-    if "storage" in details:
-        return CachedTokensDetails(
-            device=details.get("device", 0),
-            host=details.get("host", 0),
-            storage=details.get("storage", 0),
-            storage_backend=details.get("storage_backend"),
-        )
-    else:
-        return CachedTokensDetails(
-            device=details.get("device", 0),
-            host=details.get("host", 0),
-        )
+    fields = CachedTokensDetails.model_fields
+    return CachedTokensDetails(
+        **{key: value for key, value in details.items() if key in fields}
+    )
 
 
 def process_cached_tokens_details_from_ret(

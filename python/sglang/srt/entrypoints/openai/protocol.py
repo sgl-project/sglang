@@ -170,15 +170,23 @@ class CachedTokensDetails(BaseModel):
     # L3 storage fields are only present when storage backend is enabled
     storage: Optional[int] = None  # Tokens from L3 storage backend
     storage_backend: Optional[str] = None  # Type of storage backend used
+    # Hybrid Full-attention + recurrent-state accounting. These fields are
+    # omitted for non-hybrid models.
+    full_attention_cached_tokens: Optional[int] = None
+    recurrent_state_cached_tokens: Optional[int] = None
+    usable_cached_tokens: Optional[int] = None
+    trimmed_full_attention_tokens: Optional[int] = None
+    full_attention_recomputed_tokens: Optional[int] = None
+    recurrent_recomputed_tokens: Optional[int] = None
+    recurrent_replayed_tokens: Optional[int] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Remove None fields so they don't appear in response when L3 is disabled
-        if self.storage is None:
-            data.pop("storage", None)
-        if self.storage_backend is None:
-            data.pop("storage_backend", None)
+        # Remove optional fields when the corresponding cache feature is absent.
+        for key, value in tuple(data.items()):
+            if value is None:
+                data.pop(key, None)
         return data
 
 
