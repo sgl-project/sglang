@@ -794,7 +794,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
-        # These GPU DeepGEMM round_scale / use_ue8m0 options cause DeepEP
+        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
         # cutedsl kernel.
         fp8_deepgemm_scale_opts = (
