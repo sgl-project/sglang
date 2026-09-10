@@ -1053,6 +1053,45 @@ class TestRadixCache(unittest.TestCase):
         # The cache size should be within reasonable bounds of the actual allocated memory.
         self.assertLess(torch_allocated, cache_size_bytes * 2)
 
+    def test_total_size_o1_consistency(self):
+        """Test total_size() O(1) consistency across insertions, splits, lock/unlock, and evictions."""
+        mock_alloc = unittest.mock.MagicMock()
+        cache = RadixCache.create_simulated(mock_allocator=mock_alloc)
+        self.assertEqual(cache.total_size(), 0)
+        self.assertEqual(cache.total_size(), cache.evictable_size() + cache.protected_size())
+
+        # 1. Insert first sequence
+        cache.insert(InsertParams(key=RadixKey(array("q", [1, 2, 3, 4, 5]))))
+        self.assertEqual(cache.total_size(), 5)
+        self.assertEqual(cache.evictable_size(), 5)
+        self.assertEqual(cache.protected_size(), 0)
+
+        # 2. Insert second sequence sharing prefix [1, 2] (triggers node split)
+        cache.insert(InsertParams(key=RadixKey(array("q", [1, 2, 6, 7]))))
+        # Prefix [1, 2] (2 tokens), suffix1 [3, 4, 5] (3 tokens), suffix2 [6, 7] (2 tokens) -> Total = 7
+        self.assertEqual(cache.total_size(), 7)
+        self.assertEqual(cache.total_size(), cache.evictable_size() + cache.protected_size())
+
+        # 3. Lock a node
+        match_res = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2]))))
+        cache.inc_lock_ref(match_res.last_device_node)
+        self.assertEqual(cache.total_size(), 7)
+        self.assertEqual(cache.protected_size(), 2)
+        self.assertEqual(cache.evictable_size(), 5)
+        self.assertEqual(cache.total_size(), cache.evictable_size() + cache.protected_size())
+
+        # 4. Unlock the node
+        cache.dec_lock_ref(match_res.last_device_node)
+        self.assertEqual(cache.total_size(), 7)
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(cache.evictable_size(), 7)
+
+        # 5. Evict nodes
+        evict_res = cache.evict(EvictParams(num_tokens=2))
+        self.assertGreater(evict_res.num_tokens_evicted, 0)
+        self.assertEqual(cache.total_size(), 7 - evict_res.num_tokens_evicted)
+        self.assertEqual(cache.total_size(), cache.evictable_size() + cache.protected_size())
+
 
 if __name__ == "__main__":
     unittest.main()
