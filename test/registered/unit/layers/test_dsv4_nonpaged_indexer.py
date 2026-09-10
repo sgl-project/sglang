@@ -46,7 +46,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             metadata = PagedIndexerMetadata(
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
-                c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
                 use_topk_v2=False,
                 force_deep_gemm_metadata=True,
             )
@@ -68,7 +68,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             metadata = PagedIndexerMetadata(
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
-                c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
                 use_topk_v2=False,
             )
 
@@ -84,7 +84,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             metadata = PagedIndexerMetadata(
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
-                c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
                 use_topk_v2=False,
             )
 
@@ -253,7 +253,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
         )
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
         page_table = torch.tensor([[3, 1]], dtype=torch.int32).repeat(query_rows, 1)
         c4_seq_lens = torch.tensor([62, 63, 64, 65], dtype=torch.int32)
 
@@ -301,7 +301,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
         )
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
         page_table = torch.zeros((query_rows, 1), dtype=torch.int32)
         c4_seq_lens = torch.tensor(
             [124_997, 124_998, 124_999, 125_000], dtype=torch.int32
@@ -339,7 +339,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=can_use_nonpaged_indexer)
         backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
         c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=512)
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
 
         def build_plan(query_rows):
             batch = SimpleNamespace(
