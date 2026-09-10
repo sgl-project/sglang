@@ -805,6 +805,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",
+        "XingChen4ForCausalLM",
     }
 )
 
@@ -1001,6 +1002,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "XingChen4ForCausalLM",
     }
 )
 
@@ -1096,6 +1098,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "Glm4MoeLiteForCausalLM",
+            "XingChen4ForCausalLM",
         ]
     except Exception:
         return False

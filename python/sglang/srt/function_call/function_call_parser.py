@@ -52,6 +52,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.function_call.xingchen4_detector import XingChen4Detector
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class FunctionCallParser:
         "spark25": Spark25Detector,
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
+        "xingchen4": XingChen4Detector,
         "minimax-m2": MinimaxM2Detector,
         "minimax-m3": MinimaxM3Detector,
         "nanbeige": Qwen3CoderDetector,

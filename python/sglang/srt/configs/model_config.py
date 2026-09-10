@@ -142,6 +142,7 @@ def is_deepseek_dsa(config) -> bool:
             "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
+            "XingChen4ForCausalLM",
             "Dots3NoteForCausalLM",
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
@@ -754,6 +755,12 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        # XingChen4 bundles a DeepSeek-V3-compatible MTP head (layer index ==
+        # num_hidden_layers); reuse DeepseekV3ForCausalLMNextN as the draft arch.
+        if is_draft_model and self.hf_config.architectures[0] == "XingChen4ForCausalLM":
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
             self.hf_config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
 
@@ -1067,6 +1074,7 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "XingChen4ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1238,6 +1246,16 @@ class ModelConfig:
             self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
                 self.hf_config, self.hidden_size, hc_mult
             )
+            # Models that declare ``hc_contract_for_draft`` (e.g. XingChen4)
+            # merge the mHC streams back to hidden_size before the Eagle draft
+            # (so spec_hidden_size stays contracted, as resolved above) but
+            # still carry an mHC-internal residual stream (n * hidden_size)
+            # used to size the main model's activation buffers. Restore that
+            # width here; resolve_spec_hidden_size only sizes it for DSV4.
+            if hc_mult > 1 and getattr(
+                self.hf_text_config, "hc_contract_for_draft", False
+            ):
+                self.hc_hidden_size = self.hidden_size * hc_mult
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
