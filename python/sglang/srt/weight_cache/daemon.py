@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import dataclasses
+import datetime
 import logging
 import multiprocessing
 import os
@@ -49,6 +50,7 @@ import torch.distributed as dist
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -392,8 +394,7 @@ class WeightCacheDaemon:
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors as IPC handles. "
-            f"Ready to serve."
+            f"Exported {len(self.state_entries)} tensors as IPC handles."
         )
 
     @staticmethod
@@ -648,7 +649,30 @@ def run_weight_cache_daemon(
     )
 
     daemon.load()
+    _await_cluster_ready_to_serve(
+        timeout=resolving_view(server_args).weight_cache_timeout
+    )
     daemon.serve()
+
+
+def _await_cluster_ready_to_serve(timeout: int) -> None:
+    if timeout <= 0:
+        # Gloo reads timedelta(0) as its wait-forever sentinel.
+        raise ValueError(f"--weight-cache-timeout must be positive, got {timeout}")
+
+    try:
+        # Gate publication on the full PP×TP daemon world.
+        dist.monitored_barrier(
+            group=get_world_group().cpu_group,
+            timeout=datetime.timedelta(seconds=timeout),
+            wait_all_ranks=True,
+        )
+    except RuntimeError:
+        logger.exception(
+            "[weight_cache] cluster readiness barrier failed; exiting without serving."
+        )
+        # Process-group teardown can block after a failed collective.
+        os._exit(1)
 
 
 def spawn_weight_cache_daemon(
