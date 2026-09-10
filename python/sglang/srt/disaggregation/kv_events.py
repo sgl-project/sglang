@@ -279,6 +279,7 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    session_ids: Optional[list[str]] = None
 
 
 class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
@@ -294,6 +295,7 @@ class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
+    session_ids: Optional[list[str]] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
