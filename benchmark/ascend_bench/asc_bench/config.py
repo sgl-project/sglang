@@ -156,14 +156,22 @@ def _merge_axis_dict(
     return out
 
 
+GRAPH_BS_FLAGS = (
+    "--cuda-graph-bs",  # pre-0.5.x spelling, still seen in Ascend docs
+    "--cuda-graph-bs-decode",
+    "--cuda-graph-bs-prefill",
+)
+
+
 def _check_graph_bs(where: str, args: dict[str, Any], errors: list[str]) -> None:
-    value = args.get("--cuda-graph-bs")
-    if isinstance(value, (list, tuple)) and len(value) > MAX_GRAPH_BS_ENTRIES:
-        errors.append(
-            f"{where}: --cuda-graph-bs has {len(value)} entries; on Ascend NPU "
-            f"graph capture is limited to {MAX_GRAPH_BS_ENTRIES} batch sizes "
-            "(stream-conflict crash 507000)"
-        )
+    for flag in GRAPH_BS_FLAGS:
+        value = args.get(flag)
+        if isinstance(value, (list, tuple)) and len(value) > MAX_GRAPH_BS_ENTRIES:
+            errors.append(
+                f"{where}: {flag} has {len(value)} entries; on Ascend NPU "
+                f"graph capture is limited to {MAX_GRAPH_BS_ENTRIES} batch sizes "
+                "(stream-conflict crash 507000)"
+            )
 
 
 def _parse(raw: dict[str, Any], source: str | None) -> BenchConfig:
@@ -203,7 +211,7 @@ def _parse(raw: dict[str, Any], source: str | None) -> BenchConfig:
             # axis entries may bundle several flags (e.g. spec-decode sets)
             if isinstance(value, dict):
                 _check_graph_bs(f"server.axes[{axis_name}]", value, errors)
-            elif axis_name == "--cuda-graph-bs":
+            elif axis_name in GRAPH_BS_FLAGS:
                 _check_graph_bs(f"server.axes[{axis_name}]", {axis_name: value}, errors)
 
     workload_raw = raw.get("workload") or {}

@@ -22,8 +22,9 @@ server:
     HCCL_BUFFSIZE: "1200"
   axes:
     # Ascend NPU graph capture: keep <= 10 batch sizes (507000 crash guard;
-    # also enforced by config validation)
-    --cuda-graph-bs:
+    # also enforced by config validation).  sglang 0.5.x splits capture
+    # lists by phase; decode-phase sizes are what decode-heavy sweeps hit.
+    --cuda-graph-bs-decode:
       - [1, 2, 4, 8]
       - [1, 2, 4, 8, 16, 32]
     --chunked-prefill-size: [4096, 8192]

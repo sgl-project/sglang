@@ -91,9 +91,11 @@ thorough workflows.
 
 ## Ascend NPU pitfalls encoded in the tool
 
-- **NPU graph capture is limited**: keep `--cuda-graph-bs` to ≤ 10 batch
-  sizes or capture fails with stream-conflict error 507000. The config
-  loader rejects larger lists up front.
+- **NPU graph capture is limited**: keep each capture list to ≤ 10 batch
+  sizes or capture fails with stream-conflict error 507000. sglang 0.5.x
+  spells the flags `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`
+  (older docs say `--cuda-graph-bs`). The config loader rejects larger
+  lists up front.
 - **`--mem-fraction-static`**: start conservative (0.80–0.85) and
   increase; cookbook sweeps search the grid.
 - Ascend-documented environment knobs (`HCCL_BUFFSIZE`,
