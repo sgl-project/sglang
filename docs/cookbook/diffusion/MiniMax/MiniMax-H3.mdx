@@ -1264,6 +1264,59 @@ benchmark latency as well as visual and audio quality on the target workload.
 
 </Tab>
 
+<Tab title="SubBlock sparse attention">
+
+SubBlock sparse attention applies training-free block sparsity to MiniMax-H3's
+long, non-causal DiT self-attention. The BF16 path supports CUDA SM90, SM100,
+and SM120. Other compute capabilities, including SM103/B300, are rejected.
+Ulysses sequence parallelism is supported; Ring parallelism is not.
+
+The global backend selects the H3 DiT lazily, so keep the Qwen text encoder on
+its compatible dense backend with a component override:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --attention-backend subblock_sparse_attn \
+  --component-attention-backends text_encoder=fa \
+  --attention-backend-config '{"sparsity": 0.75, "skip_first_steps": 10}' \
+  --port 30010
+```
+
+Use `text_encoder=torch_sdpa` on SM120. The default configuration drops at
+most 75% of key blocks after the first 10 denoise forwards; short sequences,
+cross-attention, and unsupported shapes continue on the dense path. Tune
+`sparsity` and `skip_first_steps` together with visual and audio quality checks.
+
+On H100/H200 (SM90), `compute_mode=sage_fp8` switches the sparse kernel to
+online INT8 Q/K and FP8 P/V compute. Install the optional kernel and add the
+compute mode:
+
+```bash Command
+pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation
+
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --attention-backend subblock_sparse_attn \
+  --component-attention-backends text_encoder=fa \
+  --attention-backend-config '{"compute_mode": "sage_fp8", "sparsity": 0.75}' \
+  --port 30010
+```
+
+<Warning>
+Both SubBlock routing and `sage_fp8` are approximate. Use dense BF16 attention
+for consistency ground truth, and validate the selected sparsity on the target
+resolution, duration, task, and checkpoint.
+</Warning>
+
+</Tab>
+
 <Tab title="Encoder scheduling">
 
 The picker explicitly writes `--encoder-parallel auto` in every single-node
