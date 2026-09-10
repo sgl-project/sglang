@@ -18,6 +18,7 @@ from sglang.srt.parser.reasoning_parser import (
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
+    Step3p5Detector,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -215,6 +216,142 @@ class TestDeepSeekR1Detector(CustomTestCase):
         end = detector.finish()
         self.assertEqual(end.reasoning_text, "reasoning with no end token")
         self.assertEqual(end.normal_text, "")
+
+
+class TestStep3p5Detector(CustomTestCase):
+    TOOL_CALL = (
+        "<tool_call><function=bash><parameter=command>pwd</parameter>"
+        "</function></tool_call>"
+    )
+
+    def test_preserves_deepseek_always_on_reasoning_semantics(self):
+        detector = Step3p5Detector()
+        result = detector.detect_and_parse("reasoning without an opening tag")
+        self.assertEqual(result.reasoning_text, "reasoning without an opening tag")
+        self.assertEqual(result.normal_text, "")
+
+    def test_non_streaming_tool_implicitly_ends_reasoning(self):
+        detector = Step3p5Detector()
+        result = detector.detect_and_parse("inspect the repo" + self.TOOL_CALL)
+        self.assertEqual(result.reasoning_text, "inspect the repo")
+        self.assertEqual(result.normal_text, self.TOOL_CALL)
+
+    def test_explicit_reasoning_end_remains_supported(self):
+        detector = Step3p5Detector()
+        result = detector.detect_and_parse(
+            "inspect the repo</think>answer " + self.TOOL_CALL
+        )
+        self.assertEqual(result.reasoning_text, "inspect the repo")
+        self.assertEqual(result.normal_text, "answer " + self.TOOL_CALL)
+
+    def test_first_boundary_wins(self):
+        detector = Step3p5Detector()
+        result = detector.detect_and_parse(
+            "inspect the repo" + self.TOOL_CALL + "</think>late close"
+        )
+        self.assertEqual(result.reasoning_text, "inspect the repo")
+        self.assertEqual(result.normal_text, self.TOOL_CALL + "</think>late close")
+
+    def test_streaming_first_boundary_wins_at_every_split(self):
+        cases = (
+            (
+                "inspect the repo" + self.TOOL_CALL + "</think>late close",
+                "inspect the repo",
+                self.TOOL_CALL + "</think>late close",
+            ),
+            (
+                "inspect the repo</think>answer " + self.TOOL_CALL,
+                "inspect the repo",
+                "answer " + self.TOOL_CALL,
+            ),
+        )
+        for source, expected_reasoning, expected_normal in cases:
+            for split in range(1, len(source)):
+                detector = Step3p5Detector()
+                reasoning = ""
+                normal = ""
+                for chunk in (source[:split], source[split:]):
+                    result = detector.parse_streaming_increment(chunk)
+                    reasoning += result.reasoning_text
+                    normal += result.normal_text
+                end = detector.finish()
+                reasoning += end.reasoning_text
+                normal += end.normal_text
+                self.assertEqual(reasoning, expected_reasoning, msg=f"split={split}")
+                self.assertEqual(normal, expected_normal, msg=f"split={split}")
+
+    def test_streaming_tool_boundary_at_every_split(self):
+        source = "inspect the repo" + self.TOOL_CALL
+        for split in range(1, len(source)):
+            detector = Step3p5Detector()
+            reasoning = ""
+            normal = ""
+            for chunk in (source[:split], source[split:]):
+                result = detector.parse_streaming_increment(chunk)
+                reasoning += result.reasoning_text
+                normal += result.normal_text
+            end = detector.finish()
+            reasoning += end.reasoning_text
+            normal += end.normal_text
+            self.assertEqual(reasoning, "inspect the repo", msg=f"split={split}")
+            self.assertEqual(normal, self.TOOL_CALL, msg=f"split={split}")
+
+    def test_streaming_tool_boundary_one_character_at_a_time(self):
+        detector = Step3p5Detector()
+        reasoning = ""
+        normal = ""
+        for char in "inspect the repo" + self.TOOL_CALL:
+            result = detector.parse_streaming_increment(char)
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+        end = detector.finish()
+        reasoning += end.reasoning_text
+        normal += end.normal_text
+        self.assertEqual(reasoning, "inspect the repo")
+        self.assertEqual(normal, self.TOOL_CALL)
+
+    def test_streaming_incomplete_marker_prefix_is_flushed(self):
+        detector = Step3p5Detector()
+        result = detector.parse_streaming_increment("reasoning<tool_")
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "<tool_")
+        self.assertEqual(end.normal_text, "")
+
+    def test_buffered_reasoning_preserves_tool_boundary_at_every_split(self):
+        source = "reasoning" + self.TOOL_CALL + "</think>late close"
+        for split in range(len(source) + 1):
+            detector = Step3p5Detector(stream_reasoning=False)
+            results = [
+                detector.parse_streaming_increment(source[:split]),
+                detector.parse_streaming_increment(source[split:]),
+                detector.finish(),
+            ]
+            self.assertEqual("".join(r.reasoning_text for r in results), "reasoning")
+            self.assertEqual(
+                "".join(r.normal_text for r in results),
+                self.TOOL_CALL + "</think>late close",
+            )
+
+    def test_other_detectors_keep_explicit_end_precedence(self):
+        source = "reasoning" + self.TOOL_CALL + "</think>answer"
+        for detector in (DeepSeekR1Detector(), Qwen3Detector(force_reasoning=True)):
+            result = detector.detect_and_parse(source)
+            self.assertEqual(result.reasoning_text, "reasoning" + self.TOOL_CALL)
+            self.assertEqual(result.normal_text, "answer")
+
+    def test_streaming_multiple_tool_calls_are_preserved_for_tool_parser(self):
+        detector = Step3p5Detector()
+        source = "reasoning" + self.TOOL_CALL + self.TOOL_CALL
+        reasoning = ""
+        normal = ""
+        for char in source:
+            result = detector.parse_streaming_increment(char)
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+        self.assertEqual(reasoning, "reasoning")
+        self.assertEqual(normal, self.TOOL_CALL + self.TOOL_CALL)
 
 
 class TestQwen3Detector(CustomTestCase):
@@ -1373,7 +1510,7 @@ class TestReasoningParserAdvanced(CustomTestCase):
         alias_tests = {
             "deepseek-v3": Qwen3Detector,
             "step3": DeepSeekR1Detector,
-            "step3p5": DeepSeekR1Detector,
+            "step3p5": Step3p5Detector,
             "interns1": Qwen3Detector,
         }
         for model_type, expected_class in alias_tests.items():
