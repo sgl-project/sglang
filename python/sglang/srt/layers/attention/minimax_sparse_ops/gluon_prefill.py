@@ -239,9 +239,11 @@ def _build_gluon_sparse_bt_prefill_kernel(
     # Effective KV length the kernel will walk across the packed pages.
     tail_tokens = causal_len - self_blk * sparse_block_size
     has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
-    ctx = n_full * sparse_block_size + tl.where(has_tail, tail_tokens, 0)
-    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * sparse_block_size, causal_len))
-    tl.store(sparse_ctx_ptr + pid_n, ctx)
+    ctx_len = n_full * sparse_block_size + tl.where(has_tail, tail_tokens, 0)
+    ctx_len = tl.where(
+        has_tail, ctx_len, tl.minimum(n_valid * sparse_block_size, causal_len)
+    )
+    tl.store(sparse_ctx_ptr + pid_n, ctx_len)
 
 
 _META_CACHE: Optional[tuple] = None
