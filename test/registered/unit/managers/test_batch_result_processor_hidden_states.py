@@ -64,6 +64,7 @@ class _PrefillReq:
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
+        self.kv = SimpleNamespace(radix_inserted_at_launch=False)
 
     def finished(self):
         return False
