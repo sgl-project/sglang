@@ -2597,7 +2597,7 @@ def calculate_mla_kv_cache_dim(
 
         supported_configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
         config = supported_configs().get("glm53_nope") if supported_configs else None
-        return getattr(config, "compact_bytes_per_token", None) or 656
+        return getattr(config, "bytes_per_token", None) or 656
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.

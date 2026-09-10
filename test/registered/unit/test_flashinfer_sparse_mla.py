@@ -99,8 +99,8 @@ class TestFlashInferSparseMLARunnerCompatibility(unittest.TestCase):
         for config in (
             None,
             SimpleNamespace(),
-            SimpleNamespace(compact_bytes_per_token=None),
-            SimpleNamespace(compact_bytes_per_token=656),
+            SimpleNamespace(bytes_per_token=None),
+            SimpleNamespace(bytes_per_token=656),
         ):
             with (
                 self.subTest(config=config),
@@ -123,9 +123,7 @@ class TestFlashInferSparseMLARunnerCompatibility(unittest.TestCase):
             ) as wrapper,
             patch(
                 "flashinfer.mla.supported_sparse_mla_sm120_configs",
-                return_value={
-                    "glm53_nope": SimpleNamespace(compact_bytes_per_token=528)
-                },
+                return_value={"glm53_nope": SimpleNamespace(bytes_per_token=528)},
                 create=True,
             ),
         ):
@@ -229,8 +227,8 @@ class TestFlashInferSparseMLAKVLayout(unittest.TestCase):
             ("missing_api", 656),
             (None, 656),
             (SimpleNamespace(), 656),
-            (SimpleNamespace(compact_bytes_per_token=None), 656),
-            (SimpleNamespace(compact_bytes_per_token=528), 528),
+            (SimpleNamespace(bytes_per_token=None), 656),
+            (SimpleNamespace(bytes_per_token=528), 528),
         ]:
             with (
                 self.subTest(expected=expected),

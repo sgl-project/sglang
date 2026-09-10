@@ -755,9 +755,9 @@ def create_flashinfer_sparse_mla_runner(
     wrapper = getattr(mla, "SparseMLASm120Wrapper", None)
     configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
     config = configs().get("glm53_nope") if configs is not None else None
-    # Require the compact-capable native API. The FlashInfer dependency must
-    # include its masked-read and eight-head fixes as well as the row layout.
-    if wrapper is None or getattr(config, "compact_bytes_per_token", None) != 528:
+    # Require the canonical GLM NoPE payload. The FlashInfer dependency must
+    # also include the masked-read and eight-head fixes.
+    if wrapper is None or getattr(config, "bytes_per_token", None) != 528:
         raise RuntimeError(
             "GLM NoPE sparse MLA requires FlashInfer native SM120 support "
             "with compact GLM NoPE rows (glm53_nope). "
