@@ -117,9 +117,10 @@ class NPUCompressStatePool(CompressStatePool):
         swa_page_size: int,
     ):
         assert ratio in (
+            2,
             4,
             128,
-        ), f"NPUCompressStatePool only supports ratio in (4, 128); got {ratio}"
+        ), f"NPUCompressStatePool only supports ratio in (2, 4, 128); got {ratio}"
         assert dtype == torch.float32, (
             "Atlas A3 npu.compressor requires FP32 state_cache, "
             f"but NPUCompressStatePool got {dtype}."
@@ -215,6 +216,15 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                 )
                 for _ in range(self.layer_num)
             ]
+
+    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
+        """NPU indexer uses separate index_k_buffer and index_scale_buffer
+        (not the base packed index_k_with_scale_buffer). Flatten each to 2D
+        page rows so the base ratio-ordered PD loop picks them up correctly."""
+        return [
+            buf.view(torch.uint8).flatten(1)
+            for buf in (*self.index_k_buffer, *self.index_scale_buffer)
+        ]
 
     @property
     def has_npu_storage(self) -> bool:
@@ -397,6 +407,27 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             swa_page_size=self.swa_page_size,
         )
 
+    def _make_pair_state_pool(
+        self, enable_memory_saver: bool
+    ) -> NPUCompressStatePool:
+        """NPU ratio-2 pair-state ring: same explicit-location contract as the
+        c4/c128 attention state pools, FP32, request-scoped ring."""
+        ring_size = self.get_ring_size(2)
+        size = self.num_req_slots * ring_size
+        if is_npu_arch35():
+            size = max(size, self.num_req_slots * ring_size)
+        return NPUCompressStatePool(
+            size=size,
+            ring_size=ring_size,
+            overlap=False,
+            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+            dtype=torch.float32,
+            device=self.device,
+            enable_memory_saver=enable_memory_saver,
+            ratio=2,
+            swa_page_size=self.swa_page_size,
+        )
+
     def _make_indexer_pool(
         self,
         size: int,
@@ -418,19 +449,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device,
             enable_memory_saver,
             kernel_page_size=page_size,
-        )
-
-    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """Main PD buffers addressed by the full KV page id."""
-        buffers = (
-            self.c4_kv_pool.kv_buffer
-            + self.c4_indexer_kv_pool.index_k_buffer
-            + self.c4_indexer_kv_pool.index_scale_buffer
-        )
-        return (
-            [buf.data_ptr() for buf in buffers],
-            [buf.nbytes for buf in buffers],
-            [buf[0].nbytes for buf in buffers],
         )
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
@@ -490,12 +508,41 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_c128_kv_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        if self.c128_kv_pool is None:
+            return [], [], []  # V4.1 has no c128 pool
         buffers = self.c128_kv_pool.kv_buffer
         return (
             [buf.data_ptr() for buf in buffers],
             [buf.nbytes for buf in buffers],
             [buf[0].nbytes for buf in buffers],
         )
+
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """NPU override: NPUDeepSeekV4SingleKVPool buffers are 4D PA_ND
+        (num_pages, kernel_page_size, 1, dim), not the 2D (pages, dim) shape
+        the base class asserts. Flatten each buffer to 2D page rows so the
+        PD page-block transfer (one item = one FULL page = one KV row) keeps
+        working. V4.1 (ratios 1/2) reuses this path via the plain SWA
+        allocator, so we must respect the base ratio order (4, 128, 1, 2)."""
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for ratio in (4, 128, 1, 2):
+            if ratio not in self.kv_pools:
+                continue
+            for buf in self.kv_pools[ratio].kv_buffer:
+                flat = buf.view(torch.uint8).flatten(1) if buf.ndim > 2 else buf
+                data_ptrs.append(flat.data_ptr())
+                data_lens.append(flat.nbytes)
+                item_lens.append(flat[0].nbytes)
+            index_pool = self.index_pools.get(ratio)
+            if index_pool is None:
+                continue
+            for buf in index_pool.contiguous_page_row_buffers():
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes)
+        return data_ptrs, data_lens, item_lens
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
@@ -515,10 +562,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ratio = item.compress_ratio
         if ratio == 0:
             return self.swa_kv_pool.kv_buffer[item.compress_layer_id]
-        if ratio == 4:
-            return self.c4_kv_pool.kv_buffer[item.compress_layer_id]
-        if ratio == 128:
-            return self.c128_kv_pool.kv_buffer[item.compress_layer_id]
+        if ratio in self.kv_pools:
+            return self.kv_pools[ratio].kv_buffer[item.compress_layer_id]
         raise ValueError(f"unsupported compress_ratio={ratio} for get_key_buffer")
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
@@ -571,11 +616,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             kv = self.c128_kv_pool.kv_buffer[item.compress_layer_id]
         elif item.compress_ratio in (1, 2):
             assert not from_indexer, "low-ratio indexer K is read via get_low_ratio_index_k_dequant"
-            compress_pool = (
-                self.c1_kv_pool
-                if item.compress_ratio == 1
-                else self.c2_kv_pool
-            )
+            compress_pool = self.kv_pools[item.compress_ratio]
             assert compress_pool is not None, (
                 f"no c{item.compress_ratio} latent pool for layer {layer_id}"
             )
@@ -744,9 +785,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         if from_indexer:
             if ratio in (1, 2):
                 # V4.1 low-ratio indexer K lives in the per-ratio packed pool.
-                idx_pool = self.low_ratio_index_pools[ratio]
+                idx_pool = self.index_pools[ratio]
                 # compress_layer_id is already the pool-local index for the
-                # low-ratio pools (low_ratio_sources[ratio].index(source)).
+                # low-ratio pools (sources_by_ratio[ratio].index(source)).
                 _, compress_layer_id, _ = self.layer_mapping[layer_id]
                 idx_pool.set_index_k_scale(compress_layer_id, loc, kv, kv_scale)
                 return

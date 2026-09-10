@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
 from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
     pair_partners_decode as pair_partners_decode,
 )
+from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -51,21 +52,49 @@ def _rope_fq4(x, freqs, rope_dim):
     return fake_quant_fp4(rope_tail(x, freqs, rope_dim))
 
 
-def token_req_indices(forward_batch) -> torch.Tensor:
+class RMSNorm(nn.Module):
+    """fp32 statistics and fp32 weight multiply, cast back at the very end."""
+
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            x.is_cuda
+            and torch.version.cuda is not None
+            and x.dtype in (torch.bfloat16, torch.float32)
+            and self.weight.dtype in (torch.bfloat16, torch.float32)
+            and x.shape[-1] in (128, 512)
+            and x.numel() <= 64 * x.shape[-1]
+            and x.is_contiguous()
+            and self.weight.is_contiguous()
+        ):
+            from sglang.kernels.ops.attention.dsv4.rmsnorm_fp32 import rmsnorm_fp32
+
+            return rmsnorm_fp32(x, self.weight, self.eps)
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
+        return (self.weight * x).to(dtype)
+
+
+def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     """req_pool_indices repeated once per token of the batch."""
     req = forward_batch.req_pool_indices.to(torch.int64)
     if forward_batch.forward_mode.is_decode():
         return req
+    if forward_batch.forward_mode.is_target_verify():
+        return torch.repeat_interleave(
+            req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
+        )
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend and decode only"
     )
-    req = torch.repeat_interleave(
-        req, forward_batch.extend_seq_lens.to(torch.int64)
+    return torch.repeat_interleave(
+        req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
     )
-    target_len = forward_batch.positions.shape[0]
-    if req.shape[0] < target_len:
-        req = torch.cat([req, req.new_zeros(target_len - req.shape[0])])
-    return req
 
 
 def topk_from_scores(
@@ -118,6 +147,70 @@ def rope_tail(
     f = f.view(x.shape[0], *([1] * (x.ndim - 2)), rope_dim // 2)
     rotated = torch.view_as_real(tc * f).flatten(-2).to(x.dtype)
     return torch.cat([head, rotated], dim=-1)
+
+
+def pair_partners_decode(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    odd: torch.Tensor,
+    req: torch.Tensor,
+    state_kv: torch.Tensor,
+    state_score: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Ratio-2 pairing for decode, one token per request: an odd position reads
+    its partner from the per-request state, an even one parks itself there.
+    `req` must be unique per row (padded rows go to a spare row). A partner is
+    returned for every row; only odd rows complete a group."""
+    partner_kv = state_kv[req]
+    partner_score = state_score[req]
+    keep = odd.unsqueeze(-1)
+    state_kv[req] = torch.where(keep, partner_kv, kv)
+    state_score[req] = torch.where(keep, partner_score, score)
+    return partner_kv, partner_score
+
+
+class DeepseekV41Compressor(nn.Module):
+    """Pools compress_ratio consecutive tokens into one pre-RoPE KV latent.
+    Ratio 1 is a plain bf16 projection; ratio 2 gates two tokens with a softmax
+    over their fp32 scores.
+
+    The reference promotes the ratio-2 wkv/wgate to fp32 and upcasts the bf16
+    activation so the whole pooling chain runs in fp32. Both casts are exact
+    (the checkpoint stores bf16), so a bf16 x bf16 GEMM with fp32 accumulation
+    and fp32 output sums the same products; only the reduction order differs,
+    at ~1e-5 relative, two orders of magnitude under the bf16 rounding the
+    latent goes through in finish(). The weights therefore stay bf16 here and
+    the softmax pooling still sees fp32 inputs."""
+
+    def __init__(
+        self, hidden_size: int, head_dim: int, compress_ratio: int, eps: float
+    ):
+        super().__init__()
+        self.compress_ratio = compress_ratio
+        self.norm = RMSNorm(head_dim, eps)
+        self.wkv = nn.Linear(hidden_size, head_dim, bias=False, dtype=torch.bfloat16)
+        if compress_ratio > 1:
+            self.wgate = nn.Linear(
+                hidden_size, head_dim, bias=False, dtype=torch.bfloat16
+            )
+
+    def project(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.compress_ratio == 1:
+            return self.wkv(x), None
+        # Two GEMMs rather than one fused [2D, K] projection: the decode epilogue
+        # kernel (pair_pool_decode) reads kv and score as contiguous [n, D] fp32
+        # rows, which column slices of a fused output are not.
+        kv = linear_bf16_fp32(x, self.wkv.weight)
+        score = linear_bf16_fp32(x, self.wgate.weight)
+        return kv, score
+
+    def finish(self, kv: torch.Tensor) -> torch.Tensor:
+        return self.norm(kv.to(torch.bfloat16))
+
+    @staticmethod
+    def pool_pairs(kv2: torch.Tensor, score2: torch.Tensor) -> torch.Tensor:
+        """kv2, score2 [n, 2, D] fp32 -> [n, D]"""
+        return (kv2 * score2.softmax(dim=1)).sum(dim=1)
 
 
 class DeepseekV41Indexer(nn.Module):

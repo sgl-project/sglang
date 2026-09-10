@@ -20,7 +20,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
-    last_token_per_request,
     pair_partners_decode,
     rope_tail,
     token_req_indices,
@@ -40,9 +39,6 @@ from sglang.kernels.ops.attention.dsv4.low_ratio_index_score import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
     last_token_per_request,
-)
-from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
-    token_req_indices,
 )
 
 if TYPE_CHECKING:
@@ -1138,22 +1134,23 @@ class DeepseekV4AscendAttnBackend(
         block_tables_shape = self.graph_metadata["block_tables"].shape
         max_pages = block_tables_shape[1]
 
-        # -1 = invalid-page sentinel; full max_pages width keeps the replay
-        # in-place copy shape-aligned across seq lengths.
-        self.graph_metadata["swa_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        # 0 = dummy page (req_to_token init value); -1 would sign-extend to
+        # 0xFFFFFFFFFFFFFFFF in int64 inside NPU attention kernels,
+        # exceeding the 48-bit GM address space.
+        self.graph_metadata["swa_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c1_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c1_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c2_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c2_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c4_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c4_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c128_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c128_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
 
         # 1024 int32 per kernel-metadata buffer (fixed op metadata size).
@@ -1342,7 +1339,13 @@ class DeepseekV4AscendAttnBackend(
         if c < high:
             # Full height, not just this replay's slice: other buckets'
             # replays may have written rows beyond this bucket's row count.
-            full[:, c:high].fill_(-1)
+            # Use 0 (dummy page) instead of -1: NPU attention kernels compute
+            # GM addresses as page_id * page_size * dim; -1 sign-extends to
+            # 0xFFFFFFFFFFFFFFFF in int64, exceeding the 48-bit GM address
+            # space and triggering "GM address exceeds 48 bits" AI Core errors.
+            # Page 0 is the reserved dummy slot (req_to_token init value),
+            # guaranteeing a valid in-range address for out-of-bounds reads.
+            full[:, c:high].fill_(0)
         elif c > high:
             self._graph_table_high_water[key] = c
 
@@ -1593,7 +1596,11 @@ class DeepseekV4AscendAttnBackend(
             if ratio in (1, 2) and raw_loc is not None and raw_loc.numel() > 0:
                 # Derive c1/c2 loc from out_cache_loc: loc = full_loc // ratio
                 # for tokens that complete a group; matches the eager path.
+                # Graph replay pads positions to capture bucket width while
+                # out_cache_loc stays at raw_bs; align positions to loc length.
                 pos = ctx.forward_batch.positions.to(torch.int64)
+                n_loc = raw_loc.numel()
+                pos = pos[:n_loc]
                 completes = (pos + 1) % ratio == 0
                 loc = torch.where(
                     completes,
@@ -2772,7 +2779,7 @@ class DeepseekV4AscendAttnBackend(
         if forward_batch.forward_mode.is_idle():
             return
 
-        req = token_req_indices(forward_batch)
+        req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
         pos = positions.to(torch.int64)
         fm = self.forward_metadata
         if layer.compressor is not None:
@@ -2828,6 +2835,8 @@ class DeepseekV4AscendAttnBackend(
                 os.environ.get("SGLANG_COMPRESSOR_PREFILL_USE_TRITON", "0") == "1"
             )
             if use_triton:
+                # triton kernel path - needs ring_size kwarg update, env-gated off for now
+                state = pool.get_attention_compress_states(layer.layer_id)
                 pooled, compacted_out_loc, compacted_group_pos = (
                     low_ratio_compress_triton(
                         kv,
@@ -2835,8 +2844,8 @@ class DeepseekV4AscendAttnBackend(
                         pos,
                         req,
                         out_loc,
-                        pool.c2_pair_kv_state[layer.layer_id],
-                        pool.c2_pair_score_state[layer.layer_id],
+                        state.kv_score_buffer.kv,
+                        state.kv_score_buffer.score,
                     )
                 )
                 if pooled.shape[0] == 0:
@@ -2847,8 +2856,9 @@ class DeepseekV4AscendAttnBackend(
                 return
             odd = pos % 2 == 1
             is_pad = forward_batch.out_cache_loc == 0
+            state = pool.get_attention_compress_states(layer.layer_id)
             req_safe = torch.where(
-                is_pad, torch.full_like(req, pool.c2_pair_pad_row), req
+                is_pad, torch.full_like(req, state.dummy_state_loc), req
             )
             paired_in_batch = torch.zeros_like(odd)
             paired_in_batch[1:] = (
@@ -2859,8 +2869,8 @@ class DeepseekV4AscendAttnBackend(
             idx = (odd & paired_in_batch).nonzero().squeeze(1)
             kv_partner[idx] = kv[idx - 1]
             score_partner[idx] = score[idx - 1]
-            state_kv = pool.c2_pair_kv_state[layer.layer_id]
-            state_score = pool.c2_pair_score_state[layer.layer_id]
+            state_kv = state.kv_score_buffer.kv
+            state_score = state.kv_score_buffer.score
             idx = (odd & ~paired_in_batch).nonzero().squeeze(1)
             kv_partner[idx] = state_kv[req_safe[idx]]
             score_partner[idx] = state_score[req_safe[idx]]
@@ -2903,9 +2913,11 @@ class DeepseekV4AscendAttnBackend(
                     torch.full_like(out_loc_raw, -1),
                 )
                 raw_out_loc = forward_batch.out_cache_loc
-                pair_kv_state = pool.c2_pair_kv_state[layer.layer_id]
-                pair_score_state = pool.c2_pair_score_state[layer.layer_id]
-                pad_row = pool.c2_pair_pad_row
+                # triton kernel path - needs ring_size kwarg update, env-gated off for now
+                state = pool.get_attention_compress_states(layer.layer_id)
+                pair_kv_state = state.kv_score_buffer.kv
+                pair_score_state = state.kv_score_buffer.score
+                pad_row = state.dummy_state_loc
             latent, group_pos, slots = low_ratio_compress_decode(
                 kv,
                 score,
@@ -2931,16 +2943,17 @@ class DeepseekV4AscendAttnBackend(
         else:
             odd = pos % 2 == 1
             is_pad = forward_batch.out_cache_loc == 0
+            state = pool.get_attention_compress_states(layer.layer_id)
             req_safe = torch.where(
-                is_pad, torch.full_like(req, pool.c2_pair_pad_row), req
+                is_pad, torch.full_like(req, state.dummy_state_loc), req
             )
             partner_kv, partner_score = pair_partners_decode(
                 kv,
                 score,
                 odd,
                 req_safe,
-                pool.c2_pair_kv_state[layer.layer_id],
-                pool.c2_pair_score_state[layer.layer_id],
+                state.kv_score_buffer.kv,
+                state.kv_score_buffer.score,
             )
             pooled = layer.compressor.pool_pairs(
                 torch.stack([partner_kv, kv], dim=1),
@@ -2964,12 +2977,11 @@ class DeepseekV4AscendAttnBackend(
             k = layer.indexer.k_norm(layer.indexer.wk(latent))
             k = _npu_rope_tail(k, layer.freqs_cis, group_pos, layer.indexer.rope_head_dim)
             if is_npu_arch35():
-                source = pool.latent_source_layer(layer.layer_id)
-                source_slot = pool.low_ratio_sources[ratio].index(source)
-                idx_pool = pool.low_ratio_index_pools[ratio]
+                _, compress_layer_id, _ = pool.layer_mapping[layer.layer_id]
+                idx_pool = pool.index_pools[ratio]
                 torch.ops.custom.indexer_compress_epilog(
-                    indexer_compress_cache=idx_pool.get_index_k(source_slot),
-                    indexer_compress_scale=idx_pool.get_index_scale(source_slot),
+                    indexer_compress_cache=idx_pool.get_index_k(compress_layer_id),
+                    indexer_compress_scale=idx_pool.get_index_scale(compress_layer_id),
                     x=k,
                     slot_mapping=slots.to(torch.int32),
                 )
@@ -3182,12 +3194,11 @@ class DeepseekV4AscendAttnBackend(
                     )
                 consume = consume.to(torch.bool).contiguous()
 
-            source = pool.latent_source_layer(layer.layer_id)
-            source_slot = pool.low_ratio_sources[ratio].index(source)
+            _, compress_layer_id, _ = pool.layer_mapping[layer.layer_id]
             idx_pool = pool._indexer_pool(ratio)
             d = idx_pool.index_head_dim
-            k_buf = idx_pool.get_index_k(source_slot).reshape(-1, d)
-            k_scale = idx_pool.get_index_scale(source_slot).reshape(-1)
+            k_buf = idx_pool.get_index_k(compress_layer_id).reshape(-1, d)
+            k_scale = idx_pool.get_index_scale(compress_layer_id).reshape(-1)
 
             s, block_scores = low_ratio_index_score_triton(
                 q,

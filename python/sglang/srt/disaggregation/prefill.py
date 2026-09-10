@@ -46,10 +46,9 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
+    get_dsv4_request_state_indices,
     get_kv_class,
     is_aborted,
-    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
@@ -1329,19 +1328,10 @@ class SchedulerDisaggregationPrefillMixin:
                 return ring_rows.astype(np.int32)
 
             def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = (
-                    1
-                    if online
-                    else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
-                        128
-                    )
-                )
-                return get_dsv4_c128_state_indices(
+                return get_dsv4_request_state_indices(
+                    self.token_to_kv_pool_allocator.get_kvcache(),
                     int(req.kv.req_pool_idx),
                     c128_seq_len,
-                    online=online,
-                    ring_size=ring_size,
                 )
 
             state_types = (

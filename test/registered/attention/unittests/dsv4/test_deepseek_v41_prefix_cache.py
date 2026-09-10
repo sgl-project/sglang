@@ -89,7 +89,7 @@ class TestDeepseekV41PrefixCache(CustomTestCase):
         for ratio, source, consumer in ((2, 0, 1), (1, 2, 3)):
             with self.subTest(ratio=ratio):
                 slots = locs[::ratio] // ratio
-                index_pool = self.pool.low_ratio_index_pools[ratio]
+                index_pool = self.pool.index_pools[ratio]
                 capacity = (
                     index_pool.get_index_k_with_scale_buffer(0).shape[0]
                     * index_pool.page_size
@@ -108,7 +108,7 @@ class TestDeepseekV41PrefixCache(CustomTestCase):
                     .sub_(1)
                 )
                 self.pool.set_index_k_fp4(source, slots, keys)
-                self.assertEqual(self.pool.latent_source_layer(consumer), source)
+                self.assertEqual(self.pool.source_layer_of(consumer), source)
                 for layer in (source, consumer):
                     actual = self.pool.get_low_ratio_index_k_dequant(
                         layer, hit[::ratio] // ratio

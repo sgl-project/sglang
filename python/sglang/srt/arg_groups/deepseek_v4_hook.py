@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
+    model_config_of,
     resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -223,3 +225,45 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         f"dp_size={cfg.dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
         f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
     )
+
+
+def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
+    """Reject the server features DeepSeek-V4.1 cannot serve yet."""
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v4.1":
+        return
+    cfg = resolving_view(server_args)
+
+    unsupported = (
+        (
+            "speculative decoding other than DSpark",
+            cfg.speculative_algorithm is not None
+            and str(cfg.speculative_algorithm).upper() != "DSPARK",
+        ),
+        # The ratio-2 pair ring ships as one item per request and its ring size
+        # follows the speculative window, so prefill and decode layouts only
+        # agree when neither side speculates.
+        (
+            "PD disaggregation with speculative decoding",
+            cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None,
+        ),
+        ("hierarchical cache", cfg.enable_hierarchical_cache),
+        ("HiSparse", cfg.enable_hisparse),
+        ("the unified KV layout", is_unified_kv_triton()),
+        ("prefill context parallelism", cfg.enable_prefill_cp),
+        ("two-batch overlap", cfg.enable_two_batch_overlap),
+        (
+            "the prefill CUDA graph",
+            cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+        ),
+        ("pipeline parallelism", cfg.pp_size > 1),
+    )
+    for feature, enabled in unsupported:
+        if enabled:
+            raise ValueError(
+                f"DeepSeek-V4.1 does not support {feature} yet; disable it to "
+                "serve this model."
+            )
