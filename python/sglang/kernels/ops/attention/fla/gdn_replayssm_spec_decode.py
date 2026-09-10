@@ -46,8 +46,6 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
 from sglang.srt.utils import is_gfx95_supported
 
-# Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
-_DEFAULT_DOT_PRECISION = "tf32" if is_tf32_supported else "ieee"
 _IS_GFX95 = is_gfx95_supported()
 
 
@@ -1276,7 +1274,8 @@ def gdn_replayssm_spec_decode(
     num_stages_flush: int = 2,
     nk_flush: int = 2,
     launch_mode: str = "both",
-    dot_precision: str = _DEFAULT_DOT_PRECISION,
+    # Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
+    dot_precision: str = "tf32" if is_tf32_supported else "ieee",
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
