@@ -102,6 +102,39 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     return attention_backend in {"flashmla", "cutedsl_mla"}
 
 
+@eager_on_graph(True)
+def bcg_dcp_extend_kv_gather(
+    token_to_kv_pool,
+    attn_mqa,
+    forward_batch: ForwardBatch,
+    kv_lora_rank: int,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> None:
+    """Assemble the DCP extend KV buffer; an eager break under breakable graphs.
+    Reads the live batch from the forward context: replay re-supplies the capture-time arg."""
+    context = get_tc_piecewise_forward_context()
+    if context is not None:
+        forward_batch = context.forward_batch
+    metadata = forward_batch.attn_dcp_metadata
+    if metadata.dcp_extend_prefix_lens_sum == 0:
+        # No prefix KV on any DCP rank: skip the collective.
+        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope
+        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe
+        return
+    all_gather_kv_cache_for_mla_extend(
+        token_to_kv_pool,
+        attn_mqa,
+        forward_batch.extend_prefix_lens_cpu,
+        metadata.dcp_local_prefix_kv_indices,
+        metadata.dcp_extend_prefix_lens_sum,
+        metadata.dcp_kv_buffer,
+        kv_lora_rank,
+        k_nope,
+        k_pe,
+    )
+
+
 if _is_cuda:
     from sglang.kernels.ops.gemm import bmm_fp8
 
@@ -634,13 +667,10 @@ class DeepseekMLAForwardMixin:
                     )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
+                bcg_dcp_extend_kv_gather(
                     get_token_to_kv_pool(),
                     self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                    forward_batch,
                     self.kv_lora_rank,
                     k_nope,
                     k_pe,
