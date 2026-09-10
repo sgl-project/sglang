@@ -519,7 +519,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        *,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        assert pp_proxy_tensors is None, "DSpark does not support pipeline parallelism"
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()

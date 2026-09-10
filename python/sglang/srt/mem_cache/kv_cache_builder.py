@@ -44,7 +44,6 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
-    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
@@ -220,9 +219,8 @@ def build_kv_cache(
     )
 
     # Hybrid memory pool
-    is_hybrid_swa = (
-        tp_worker.is_hybrid_swa
-        and not get_exec().features.enable_encoder_swa_bounded_replay
+    is_hybrid_swa = tp_worker.is_hybrid_swa and getattr(
+        tp_worker.model_runner.token_to_kv_pool, "needs_paged_swa_allocator", True
     )
     is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)

@@ -17,6 +17,25 @@ class WindowLayout(msgspec.Struct, frozen=True):
     commit_mask: torch.Tensor
     size: int
 
+    def copy_(self, other: "WindowLayout") -> None:
+        # Graph replay refreshes a captured layout in place: the captured copy
+        # kernels read these tensors by address, so their contents move, not
+        # the object.
+        assert self.size == other.size, (self.size, other.size)
+        for name in (
+            "req",
+            "pos",
+            "write_loc",
+            "indices",
+            "lengths",
+            "history_req",
+            "history_pos",
+            "history_loc",
+            "history_valid",
+            "commit_mask",
+        ):
+            getattr(self, name).copy_(getattr(other, name))
+
 
 def _first_row_offsets(
     req: torch.Tensor,
@@ -155,6 +174,9 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        # Startup warmups and graph captures read synthetic history that no
+        # request wrote; the ownership check starts with the first real request.
+        self._serving = False
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -164,6 +186,7 @@ class RequestWindow:
         self.workspace = self.pool_factory(size, 1)
 
     def reset(self, slots):
+        self._serving = True
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
             self.capacity, device=slots.device
         )
@@ -175,7 +198,15 @@ class RequestWindow:
             return
         self.layout = layout
         self.prepared = None
-        self._ensure_workspace(layout.size)
+        if self.workspace is None:
+            self._ensure_workspace(layout.size)
+        elif self.workspace.size < layout.size:
+            # Captured graphs hold the workspace address; growing it here would
+            # leave them writing into a freed buffer. Size it at construction.
+            raise RuntimeError(
+                f"request-window workspace too small: {self.workspace.size} rows "
+                f"for a layout of {layout.size}"
+            )
 
     def initialize_dummy_history(self):
         layout = self.layout
@@ -199,7 +230,7 @@ class RequestWindow:
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
             src = self._history_src(layout)
-            if not _capturing():
+            if self._serving and not _capturing():
                 valid = layout.history_valid
                 if not torch.equal(
                     self.tags[layer, src][valid], layout.history_pos[valid]

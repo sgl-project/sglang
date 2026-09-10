@@ -244,9 +244,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             ("DP attention", cfg.enable_dp_attention),
-            # Note(kpham-sgl): DSpark keeps its paged SWA pool; encoder replay
-            # does not yet support speculative decoding.
-            ("speculative decoding", cfg.speculative_algorithm is not None),
             (
                 "context parallelism",
                 cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1,
