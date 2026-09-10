@@ -1820,6 +1820,34 @@ class DeepseekSparseAttnBackend(
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
+        self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
+
+        # Refresh the schedule because stale shape decomposition can deadlock
+        # DeepGEMM paged MQA.
+        if is_cuda():
+            if forward_mode.is_decode_or_idle():
+                seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
+            else:
+                seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_mode,
+                    metadata.cache_seqlens_int32,
+                    metadata.dsa_seqlens_expanded,
+                    bs,
+                )
+            self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
+            self._refresh_topk_v2_plan(metadata)
+            if metadata.paged_mqa_ctx_lens_2d is None:
+                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+            else:
+                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+
+        self._update_kpool_metadata_from_precomputed(
+            metadata, precomputed, forward_mode
+        )
+
+        self.forward_metadata = metadata
+
+    def _copy_base_replay_buffers(self, bs, metadata, precomputed, forward_mode):
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
 
@@ -1939,31 +1967,6 @@ class DeepseekSparseAttnBackend(
                 size = precomputed.seqlens_expanded_size
                 flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
                 flashmla_metadata.copy_(precomputed.flashmla_metadata)
-
-        # Refresh the schedule because stale shape decomposition can deadlock
-        # DeepGEMM paged MQA.
-        if is_cuda():
-            if forward_mode.is_decode_or_idle():
-                seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
-            else:
-                seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
-                    forward_mode,
-                    metadata.cache_seqlens_int32,
-                    metadata.dsa_seqlens_expanded,
-                    bs,
-                )
-            self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
-            self._refresh_topk_v2_plan(metadata)
-            if metadata.paged_mqa_ctx_lens_2d is None:
-                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
-            else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
-
-        self._update_kpool_metadata_from_precomputed(
-            metadata, precomputed, forward_mode
-        )
-
-        self.forward_metadata = metadata
 
     def forward_extend(
         self,
