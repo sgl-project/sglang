@@ -1813,6 +1813,40 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
+    def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
+        """Two calls to the same tool must be numbered 0 and 1, as the
+        streaming deltas number them; a detector's tool_index is the tool's
+        position in the request and is 0 for both."""
+        self.chat.tool_call_parser = "deepseekv41"
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            parser_instance = ParserMock.return_value
+            calls = []
+            for city in ("San Francisco", "London"):
+                call_info = Mock()
+                call_info.name = "get_weather"
+                call_info.parameters = json.dumps({"location": city})
+                call_info.tool_index = 0
+                calls.append(call_info)
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.parse_non_stream.return_value = ("", calls)
+
+            tool_calls, _, finish_reason = self.chat._process_tool_calls(
+                text="<｜DSML｜ calls>...",
+                tools=tools,
+                finish_reason={"type": "stop", "matched": None},
+                history_tool_calls_cnt=0,
+            )
+
+        self.assertEqual([tc.index for tc in tool_calls], [0, 1])
+        self.assertEqual(
+            [tc.function.arguments for tc in tool_calls],
+            [json.dumps({"location": "San Francisco"}), json.dumps({"location": "London"})],
+        )
+        self.assertEqual(finish_reason["type"], "tool_calls")
+
     def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
         """A structural-tag parser owns the output format, so a missing tool
         call must not be pushed through the json_schema array fallback."""

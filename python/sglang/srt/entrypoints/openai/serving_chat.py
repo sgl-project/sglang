@@ -2294,14 +2294,17 @@ class OpenAIServingChat(OpenAIServingBase):
                         return ToolCallProcessingResult(None, text, finish_reason)
 
                     tool_calls = []
-                    for call_info in call_info_list:
+                    for index, call_info in enumerate(call_info_list):
                         tool_id = self._process_tool_call_id(
                             call_info, history_tool_calls_cnt
                         )
+                        # index is the call's position in tool_calls, as in the
+                        # streaming deltas; tool_index is the tool's position
+                        # in the request for some detectors.
                         tool_calls.append(
                             ToolCall(
                                 id=tool_id,
-                                index=getattr(call_info, "tool_index", None),
+                                index=index,
                                 function=FunctionResponse(
                                     name=call_info.name,
                                     arguments=call_info.parameters,
