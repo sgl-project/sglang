@@ -6,7 +6,7 @@ ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG SGL_KERNEL_VERSION=0.4.6.post1
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.6
+ARG SGL_DEEP_GEMM_VERSION=0.1.7
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG SGL_NCCL_VERSION=2.30.7
@@ -744,6 +744,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     ca-certificates \
     netcat-openbsd \
     curl \
+    ffmpeg \
     git \
     # Runtime libraries
     libopenmpi3 \
