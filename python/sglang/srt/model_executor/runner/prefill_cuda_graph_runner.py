@@ -1509,7 +1509,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # Main's monolithic BCG runner never invokes
         # on_after_cuda_graph_warmup between warmup iterations — the BCG
-        # contract is to keep warmup state untouched and let
+        # contract is to keep warmup metadata untouched and let
         # init_forward_metadata_in_graph (recorded inside the captured
         # forward) do any raw->full upgrade. cg-refactor's runner_backend
         # abstraction exposes a post_warmup_hook for backends that need
@@ -1519,6 +1519,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # corrupt warmup iter 2's metadata read.
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
+            req_pool = self.model_runner.req_to_token_pool
+            mamba_pool = getattr(req_pool, "mamba_pool", None)
+            if mamba_pool is not None and not prefix_num_chunks:
+                capture_state_indices = req_pool.translate_mamba_indices(
+                    req_pool.get_mamba_indices(forward_batch.req_pool_indices)
+                ).unique()
+
+                def post_warmup_hook():
+                    mamba_pool.clear_slots(capture_state_indices)
+
+                post_warmup_hook()
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         self.backend.capture_one(
