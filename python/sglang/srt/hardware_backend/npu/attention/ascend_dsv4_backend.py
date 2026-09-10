@@ -1179,6 +1179,18 @@ class DeepseekV4AscendAttnBackend(
             device=device,
         )
 
+        # Persistent candidate_masks buffer: in graph mode the candidate-source
+        # layer writes masks that consumer layers read. Without a pre-allocated
+        # stable buffer the graph pool reuses the memory, corrupting the masks
+        # (observed as bool tensor with negative sum) and c2_kv_buf (NaN).
+        # Width covers the graph-mode max_lc upper bound (max_pages * page_size).
+        self.graph_metadata["candidate_masks"] = torch.zeros(
+            max_num_tokens,
+            max_pages * self.page_size,
+            dtype=torch.bool,
+            device=device,
+        )
+
         if self._is_dspark_draft_worker:
             block_size = self._dsv4_graph_tokens_per_req
             sparse_width = (
@@ -1302,6 +1314,12 @@ class DeepseekV4AscendAttnBackend(
 
         T = bs * tokens_per_req
         metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
+
+        max_pages = self.graph_metadata["c1_page_table"].shape[1]
+        max_lc_bound = max_pages * self.page_size
+        metadata.candidate_masks = self.graph_metadata[
+            "candidate_masks"
+        ][:T, :max_lc_bound]
 
         metadata.ori_sparse_indices = None
         metadata.ori_win_left = self._dsv4_sliding_window_size - 1
@@ -1794,6 +1812,104 @@ class DeepseekV4AscendAttnBackend(
         self._refresh_graph_kernel_metadata(ctx)
 
         self.forward_metadata = ctx.fm
+
+        if os.environ.get("SGLANG_DSV4_GRAPH_META_DEBUG", "0") == "1":
+            self._debug_dump_graph_metadata(ctx)
+
+    _debug_step = 0
+
+    def _debug_dump_graph_metadata(self, ctx) -> None:
+        fm = ctx.fm
+        step = self._debug_step
+        self._debug_step += 1
+        fb = ctx.forward_batch
+        tag = f"[DSV4-META step={step} bs={ctx.bs} raw_bs={ctx.raw_bs} mode={ctx.graph_mode}]"
+
+        seq_lens_cpu = ctx.live_seq_lens_cpu[: ctx.raw_bs].tolist()
+        logger.warning(
+            f"{tag} seq_lens_cpu={seq_lens_cpu} "
+            f"positions[:8]={fb.positions[:min(8,fb.positions.numel())].tolist()} "
+            f"out_cache_loc[:8]={fb.out_cache_loc[:min(8,fb.out_cache_loc.numel())].tolist()}"
+        )
+
+        actual_kv = fm.actual_seq_lengths_kv[: ctx.bs]
+        logger.warning(
+            f"{tag} actual_seq_lengths_kv={actual_kv.tolist()}"
+        )
+
+        for ratio in (1, 2, 4, 128):
+            pt = getattr(fm, f"c{ratio}_page_table", None)
+            if pt is not None:
+                pt_slice = pt[: ctx.raw_bs]
+                row0 = pt_slice[0].tolist() if pt_slice.numel() > 0 else []
+                valid_cnt = (pt_slice[0] >= 0).sum().item() if pt_slice.numel() > 0 else 0
+                logger.warning(
+                    f"{tag} c{ratio}_page_table[0]={row0[:20]}... valid_pages={valid_cnt}"
+                )
+
+            loc = getattr(fm, f"c{ratio}_loc", None)
+            if loc is not None:
+                loc_slice = loc[: min(16, loc.numel())]
+                logger.warning(f"{tag} c{ratio}_loc[:16]={loc_slice.tolist()}")
+
+            topk = getattr(fm, f"c{ratio}_topk_indices", None)
+            if topk is not None:
+                topk_slice = topk[: min(4, topk.shape[0])]
+                logger.warning(
+                    f"{tag} c{ratio}_topk_indices[:4]={topk_slice.tolist()}"
+                )
+
+        swa_pt = getattr(fm, "swa_page_table", None)
+        if swa_pt is not None:
+            swa_slice = swa_pt[: ctx.raw_bs]
+            valid_swa = (swa_slice[0] >= 0).sum().item() if swa_slice.numel() > 0 else 0
+            logger.warning(f"{tag} swa_page_table valid_pages={valid_swa}")
+
+        masks = getattr(fm, "candidate_masks", None)
+        if masks is not None:
+            if isinstance(masks, torch.Tensor):
+                logger.warning(
+                    f"{tag} candidate_masks shape={tuple(masks.shape)} "
+                    f"dtype={masks.dtype} sum={masks.sum().item()}"
+                )
+
+        for key in ("fulla_metadata", "c2a_metadata", "c4a_metadata"):
+            md = fm.kernel_metadata.get(key)
+            if md is not None and hasattr(md, "shape"):
+                logger.warning(f"{tag} {key} shape={tuple(md.shape)}")
+
+        if is_npu_arch35():
+            for ratio in (1, 2):
+                idx_pool = self.token_to_kv_pool.low_ratio_index_pools.get(ratio)
+                if idx_pool is not None:
+                    source = self.token_to_kv_pool.latent_source_layer(
+                        next(iter(self.token_to_kv_pool.low_ratio_sources.get(ratio, [0])))
+                    )
+                    source_slot = self.token_to_kv_pool.low_ratio_sources[ratio].index(source)
+                    k_buf = idx_pool.get_index_k(source_slot)
+                    k_head = k_buf.reshape(-1)[:256].float()
+                    has_nan = torch.isnan(k_head).any().item()
+                    has_inf = torch.isinf(k_head).any().item()
+                    logger.warning(
+                        f"{tag} c{ratio}_index_k slot={source_slot} "
+                        f"shape={tuple(k_buf.shape)} nan={has_nan} inf={has_inf}"
+                    )
+
+                cmp_pool = (
+                    self.token_to_kv_pool.c1_kv_pool if ratio == 1
+                    else self.token_to_kv_pool.c2_kv_pool
+                )
+                if cmp_pool is not None:
+                    for lid in range(min(3, len(cmp_pool.kv_buffer))):
+                        buf = cmp_pool.kv_buffer[lid]
+                        if buf is not None and buf.numel() > 0:
+                            head = buf.reshape(-1)[:256].float()
+                            has_nan = torch.isnan(head).any().item()
+                            has_inf = torch.isinf(head).any().item()
+                            logger.warning(
+                                f"{tag} c{ratio}_kv_buf layer={lid} "
+                                f"shape={tuple(buf.shape)} nan={has_nan} inf={has_inf}"
+                            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         self._dsv4_in_graph_ctx = False
@@ -2674,7 +2790,11 @@ class DeepseekV4AscendAttnBackend(
                 # the recorded [T, max_lc] score width covers every replay.
                 if self._dsv4_in_graph_ctx:
                     max_pages = self.graph_metadata["c1_page_table"].shape[1]
-                    max_lc = max_pages * self.page_size // layer.compress_ratio
+                    full_bound = max_pages * self.page_size
+                    cap = int(os.environ.get("SGLANG_DSV4_GRAPH_MAX_SEQ", "0")) # SGLANG_DSV4_GRAPH_MAX_SEQ >= 实际最大序列长度
+                    if cap > 0 and cap < full_bound:
+                        full_bound = cap
+                    max_lc = full_bound // layer.compress_ratio
                 else:
                     seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
                     if seq_lens_cpu is not None:
@@ -2757,46 +2877,6 @@ class DeepseekV4AscendAttnBackend(
             return
         self._low_ratio_write_group(layer, pooled, out_loc[group_mask], group_pos)
 
-    def _low_ratio_write_group_a5(self, layer, pooled, slots, group_pos, forward_batch):
-        """Pre-RoPE latent publishes indexer keys first, then rope + store.
-
-        A3 keeps the latent on the fp4 grid (reference parity) but stores the
-        bf16 PA_ND layout; A5 may swap in the fp4 store later.
-        """
-        from types import SimpleNamespace
-
-        latent = layer.compressor.finish(pooled)
-        if layer.indexer is not None and layer.indexer.owns_k:
-            k = layer.indexer.k_norm(layer.indexer.wk(latent))
-            index_k = _npu_rope_fq4(
-                k, layer.freqs_cis, group_pos, layer.indexer.rope_head_dim
-            )
-            self._compressor_epilog_npu(
-                SimpleNamespace(
-                    ratio=layer.compress_ratio,
-                    is_in_indexer=True,
-                    layer_id=layer.layer_id,
-                    li_kv_dtype=getattr(layer.indexer, "li_kv_dtype", "bf16"),
-                ),
-                index_k,
-                forward_batch,
-                override_loc=slots,
-            )
-        latent = _npu_rope_fq4(
-            latent, layer.freqs_cis, group_pos, layer.rope_head_dim
-        )
-        self._compressor_epilog_npu(
-            SimpleNamespace(
-                ratio=layer.compress_ratio,
-                is_in_indexer=False,
-                layer_id=layer.layer_id,
-                li_kv_dtype="bf16",
-            ),
-            latent,
-            forward_batch,
-            override_loc=slots,
-        )
-
     def _low_ratio_compress_decode(
         self, layer, x, req, pos, forward_batch
     ) -> None:
@@ -2841,7 +2921,7 @@ class DeepseekV4AscendAttnBackend(
                 pad_row=pad_row,
             )
             self._low_ratio_write_group(
-                layer, latent, slots, group_pos
+                layer, latent, slots, group_pos, already_normed=True
             )
             return
 
@@ -2875,10 +2955,10 @@ class DeepseekV4AscendAttnBackend(
         slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
         self._low_ratio_write_group(layer, pooled, slots, group_pos)
 
-    def _low_ratio_write_group(self, layer, pooled, slots, group_pos) -> None:
+    def _low_ratio_write_group(self, layer, pooled, slots, group_pos, already_normed=False) -> None:
         pool = self.token_to_kv_pool
         ratio = layer.compress_ratio
-        latent = layer.compressor.finish(pooled)
+        latent = pooled if already_normed else layer.compressor.finish(pooled)
 
         if layer.indexer is not None and layer.indexer.owns_k:
             k = layer.indexer.k_norm(layer.indexer.wk(latent))
@@ -3070,7 +3150,7 @@ class DeepseekV4AscendAttnBackend(
             # publish) or non-bool/non-contiguous — normalize to one [T, W]
             # bool tensor before use.
             consume = (
-                getattr(fm, "dsv41_candidate_masks", None)
+                getattr(fm, "candidate_masks", None)
                 if indexer.uses_candidates
                 else None
             )
@@ -3113,12 +3193,24 @@ class DeepseekV4AscendAttnBackend(
                 # kept outside the kernel by design. It runs on the kernel's
                 # [T, num_blocks] amax scores (newest block already +inf) via
                 # torch.topk with -inf value filtering.
-                fm.dsv41_candidate_masks = self._select_candidate_blocks_a5(
-                    block_scores,
-                    topk_blocks=indexer.candidate_topk_blocks,
-                    block_size=indexer.candidate_block_size,
-                    width=max_lc,
-                )
+                # In graph mode, write into the pre-allocated persistent buffer
+                # to avoid graph-pool memory reuse corruption.
+                masks_buf = getattr(fm, "candidate_masks", None)
+                if masks_buf is not None and masks_buf.shape[0] >= total and masks_buf.shape[1] >= max_lc:
+                    self._select_candidate_blocks_a5(
+                        block_scores,
+                        topk_blocks=indexer.candidate_topk_blocks,
+                        block_size=indexer.candidate_block_size,
+                        width=max_lc,
+                        out=masks_buf[:total, :max_lc],
+                    )
+                else:
+                    fm.candidate_masks = self._select_candidate_blocks_a5(
+                        block_scores,
+                        topk_blocks=indexer.candidate_topk_blocks,
+                        block_size=indexer.candidate_block_size,
+                        width=max_lc,
+                    )
 
             # Token-level top-k stays in torch: rows with lens < k_glob pick
             # -inf slots that `reach` maps to -1, matching the per-request
@@ -3136,7 +3228,7 @@ class DeepseekV4AscendAttnBackend(
         setattr(fm, f"c{ratio}_topk_indices", raw_indices)
 
     @staticmethod
-    def _select_candidate_blocks_a5(block_scores, topk_blocks, block_size, width):
+    def _select_candidate_blocks_a5(block_scores, topk_blocks, block_size, width, out=None):
         """Block-level candidate top-k, kept outside the score kernel by design.
 
         ``block_scores`` is the kernel's [T, num_blocks] fp32 per-block amax
@@ -3147,6 +3239,12 @@ class DeepseekV4AscendAttnBackend(
         shapes). Rows with fewer reachable blocks than k get -inf picks,
         filtered by value so unreachable blocks stay masked (positions beyond
         lens are causal-masked in the consumer kernel anyway).
+
+        If ``out`` is given (a pre-allocated [T, width] bool tensor), the
+        result is written there in place and ``out`` is returned; otherwise a
+        new contiguous tensor is allocated. The in-place path is required in
+        graph mode so the output lives in a stable buffer outside the graph
+        memory pool.
         """
         T, num_blocks = block_scores.shape
         k = min(topk_blocks, num_blocks)
@@ -3162,6 +3260,9 @@ class DeepseekV4AscendAttnBackend(
             .expand(T, num_blocks, block_size)
             .reshape(T, num_blocks * block_size)
         )[:, :width]
+        if out is not None:
+            out.copy_(keep)
+            return out
         return keep.contiguous()
 
     def _low_ratio_index_topk_loop_a5(self, layer, x, q_lora, req, pos, fm):
@@ -3189,7 +3290,7 @@ class DeepseekV4AscendAttnBackend(
         q = _npu_rope_tail(q, layer.freqs_cis, pos, indexer.rope_head_dim)
         weights = indexer.head_weights(x)
         publish = [] if indexer.is_candidate_source else None
-        consume_masks = getattr(fm, "dsv41_candidate_masks", None)
+        consume_masks = getattr(fm, "candidate_masks", None)
         for b, r in enumerate(torch.unique_consecutive(req).tolist()):
             tok = (req == r).nonzero().squeeze(1)
             lens = compress_lens[tok]
@@ -3232,7 +3333,7 @@ class DeepseekV4AscendAttnBackend(
         fm.dsv41_low_ratio_topk_raw = raw_indices
         setattr(fm, f"c{ratio}_topk_indices", raw_indices)
         if publish is not None:
-            fm.dsv41_candidate_masks = publish
+            fm.candidate_masks = publish
 
 
 def _get_kv_indices(

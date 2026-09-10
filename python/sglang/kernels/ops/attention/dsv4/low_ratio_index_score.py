@@ -81,8 +81,10 @@ def _index_score_kernel(
     r = tl.load(req_ptr + t)
     # Full-pool slot of each visible group's base token -> index-pool slot.
     rtt_off = r.to(tl.int64) * stride_rtt + offs_n * RATIO
+    rtt_off = tl.where(valid, rtt_off, 0)
     full = tl.load(req_to_token_ptr + rtt_off, mask=valid, other=0)
     slots = (full // RATIO).to(tl.int64)
+    slots = tl.where(valid, slots, 0)
 
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < D

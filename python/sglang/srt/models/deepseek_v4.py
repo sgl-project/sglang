@@ -1324,7 +1324,7 @@ class MQALayer(MqaAttentionBase):
             stream_q.wait_event(q_lora_ready)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
             )
@@ -1618,7 +1618,7 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
