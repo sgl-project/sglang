@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Hashable, Iterable, Optional, Protocol
 
 import torch
 
@@ -31,6 +31,20 @@ class SharedReadEnds(Enum):
     def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
         # Ordered by lateness: the latest end covers every child.
         return max(items, key=lambda x: x.value)
+
+
+class CudaGraphVariantManager(Protocol):
+    """Backend-owned CUDA graph variants exposed to a generic runner."""
+
+    def get_cuda_graph_capture_variants(
+        self, batch_size: int, forward_mode: ForwardMode
+    ) -> tuple[Optional[Hashable], ...]: ...
+
+    def select_cuda_graph_variant(
+        self, forward_batch: ForwardBatch, padded_batch_size: int
+    ) -> Optional[Hashable]: ...
+
+    def set_cuda_graph_variant(self, variant: Optional[Hashable]) -> None: ...
 
 
 class AttentionBackend(ABC):
@@ -219,6 +233,12 @@ class AttentionBackend(ABC):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
+
+    def get_cuda_graph_variant_manager(
+        self, forward_mode: ForwardMode
+    ) -> Optional[CudaGraphVariantManager]:
+        """Return the optional backend-owned graph variant manager."""
+        return None
 
     def on_after_cuda_graph_warmup(self):
         """Hook between cuda graph warmup pass and the actual capture.

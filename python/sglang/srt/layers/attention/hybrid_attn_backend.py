@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
+    CudaGraphVariantManager,
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
@@ -128,6 +129,13 @@ class HybridAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
+
+    def get_cuda_graph_variant_manager(
+        self, forward_mode: ForwardMode
+    ) -> Optional[CudaGraphVariantManager]:
+        return self._select_backend(forward_mode).get_cuda_graph_variant_manager(
+            forward_mode
+        )
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False

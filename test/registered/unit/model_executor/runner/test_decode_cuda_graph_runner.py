@@ -52,6 +52,25 @@ def _make_fake_self(capture_bs):
     return fake_self
 
 
+def test_decode_graph_rejects_batch_above_max_before_bucket_padding():
+    runner = SimpleNamespace(
+        ragged_verify_mode=False,
+        captured_req_width=6,
+        require_mlp_tp_gather=False,
+        disable_padding=False,
+        max_bs=256,
+    )
+    forward_batch = SimpleNamespace(
+        replace_embeds=None, spec_info=None, batch_size=8192
+    )
+
+    assert not DecodeCudaGraphRunner.can_run_graph(runner, forward_batch)
+
+
+def test_attention_graph_variant_hook_is_optional():
+    assert DecodeCudaGraphRunner._get_attention_variant_manager(object(), None) is None
+
+
 class TestInitProfileBatchMode(CustomTestCase):
     """SGLANG_GRAPH_BATCH_CAPTURE -> scheduled per-bs profiler."""
 
