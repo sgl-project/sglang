@@ -713,6 +713,41 @@ class TestAllSWAConfigurator(CustomTestCase):
 
 
 class TestEagleConfigurator(CustomTestCase):
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=656,
+    )
+    def test_sm120_chain_dcp_budgets_target_index_and_full_draft(self, _):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        for size in (1, 2, 4, 8):
+            with self.subTest(dcp_size=size):
+                runner = _make_model_runner(self, num_layers=78, use_mla_backend=True)
+                _configure_dsa_model(runner)
+                runner.model_config.hf_config.index_topk_freq = 4
+                runner.model_config.hf_config.index_skip_topk_offset = 3
+                runner.spec_algorithm.is_eagle.return_value = True
+                runner.spec_algorithm.is_none.return_value = False
+                runner.spec_aux_config.eagle_draft_num_layers = 1
+                _publish_config(
+                    self,
+                    dsa_prefill_backend="flashinfer_sparse_mla",
+                    dsa_decode_backend="flashinfer_sparse_mla",
+                )
+                with (
+                    mock_cpu_env(kv_size=1),
+                    get_parallel().override(attn_dcp_size=size),
+                ):
+                    configurator = DefaultPoolConfigurator(runner)
+                    config = configurator.calculate_pool_sizes(
+                        100_000_000, page_size=64
+                    )
+                expected = 78 * 656 + size * (21 * 132 + 656 + 132)
+                self.assertEqual(configurator._cell_size, expected)
+                self.assertLessEqual(
+                    config.max_total_num_tokens * expected, 100_000_000
+                )
+
     """EAGLE: draft KV cache must be accounted for so total allocation fits in budget."""
 
     def test_eagle_does_not_exceed_budget(self):

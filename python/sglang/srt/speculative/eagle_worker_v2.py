@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
+from sglang.srt.layers.dcp import draft_forward_guard
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -436,6 +437,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             f"draft-extend selection for layers {layer_ids}"
         )
 
+    @draft_forward_guard()
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
         self.cuda_graph_runner = None
@@ -622,7 +624,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx:
+        with canary_outside_ctx, draft_forward_guard():
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -1072,7 +1074,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with canary_ctx, draft_forward_guard():
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch, select_index

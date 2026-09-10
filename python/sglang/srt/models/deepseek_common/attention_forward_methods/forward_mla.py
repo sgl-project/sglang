@@ -723,6 +723,13 @@ class DeepseekMLAForwardMixin:
                 attn_output = fusion_plan.attn_output_buf
             elif is_dcp_mla_decode_phase(forward_batch):
                 # set return_lse=True to correct attn_output
+                verify_lse_args = (
+                    {"return_lse": True}
+                    if forward_batch.forward_mode.is_target_verify()
+                    and getattr(get_attn_backend(), "dcp_packed_kv_layout", None)
+                    is not None
+                    else {}
+                )
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
                     k_nope,
@@ -731,6 +738,7 @@ class DeepseekMLAForwardMixin:
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,
+                    **verify_lse_args,
                     **(
                         dict(topk_indices=topk_indices)
                         if topk_indices is not None

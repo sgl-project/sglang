@@ -369,14 +369,11 @@ class DeepseekSparseAttnBackend(
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dcp_packed_kv_layout = (
             SM120_DSA_LAYOUT
-            if uses_sm120_dsa_dcp(get_exec().kernel, get_parallel().attn_dcp_size)
+            if not model_runner.is_draft_worker
+            and uses_sm120_dsa_dcp(get_exec().kernel, get_parallel().attn_dcp_size)
             else None
         )
         if self.dcp_packed_kv_layout is not None:
-            if model_runner.is_draft_worker:
-                raise ValueError(
-                    "SM120 packed DSA DCP target-only path cannot run a draft worker"
-                )
             if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
                 raise ValueError("SM120 packed DSA DCP requires packed FP8 storage")
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
@@ -2018,7 +2015,8 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
@@ -2032,6 +2030,10 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
+        if return_lse and dsa_impl != "flashinfer_sparse_mla":
+            raise ValueError(
+                "DSA extend LSE is only supported by flashinfer_sparse_mla"
+            )
         if attn_sink is not None and dsa_impl != "flashmla_sparse":
             raise RuntimeError(
                 f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
@@ -2272,12 +2274,30 @@ class DeepseekSparseAttnBackend(
                 attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
+            sparse_lengths = metadata.dsa_cache_seqlens_int32
+            dcp_verify = (
+                self.dcp_packed_kv_layout is not None
+                and forward_batch.forward_mode.is_target_verify()
+            )
             if self.dcp_packed_kv_layout is not None:
-                if not forward_batch.forward_mode.is_extend_without_speculative():
-                    raise ValueError(
-                        "SM120 packed DSA DCP speculative verify is not enabled"
+                if dcp_verify:
+                    if not return_lse:
+                        raise ValueError(
+                            "Packed DSA DCP verify requires an LSE return schema"
+                        )
+                    parallel = get_parallel()
+                    page_table_1, sparse_lengths = localize_sparse_indices(
+                        page_table_1,
+                        self.kv_index_translator,
+                        parallel.attn_dcp_size,
+                        parallel.attn_dcp_rank,
                     )
-                kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
+                elif forward_batch.forward_mode.is_extend_without_speculative():
+                    kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
+                else:
+                    raise ValueError(
+                        "Draft extend cannot use the target packed DCP backend"
+                    )
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -2286,9 +2306,10 @@ class DeepseekSparseAttnBackend(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
-                seq_lens=metadata.dsa_cache_seqlens_int32,
+                seq_lens=sparse_lengths,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                return_lse=return_lse,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:

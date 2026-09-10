@@ -1,5 +1,4 @@
 import unittest
-from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import torch
@@ -10,11 +9,12 @@ from sglang.srt.layers.dcp.sm120_dsa import (
     validate_sm120_dsa_dcp,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestSM120DSADCP(unittest.TestCase):
+class TestSM120DSADCP(CustomTestCase):
     def test_indexer_and_attention_agree_on_topk_address_domain(self):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -85,6 +85,15 @@ class TestSM120DSADCP(unittest.TestCase):
             kv_cache_dtype="fp8_e4m3",
             page_size=64,
             speculative_algorithm=None,
+            speculative_eagle_topk=1,
+            speculative_draft_model_path=None,
+            speculative_draft_model_revision=None,
+            revision=None,
+            speculative_draft_attention_backend=None,
+            speculative_draft_kv_cache_dtype=None,
+            enable_multi_layer_eagle=False,
+            speculative_adaptive=False,
+            model_path="glm-native-mtp",
             enable_hisparse=False,
             enable_hierarchical_cache=False,
             enable_lmcache=False,
@@ -113,7 +122,7 @@ class TestSM120DSADCP(unittest.TestCase):
     def test_supported_and_unsupported_combinations(self):
         validate_sm120_dsa_dcp(self.config(), self.model(), 12)
         for field, value in (
-            ("speculative_algorithm", "EAGLE"),
+            ("speculative_algorithm", "EAGLE3"),
             ("enable_hisparse", True),
             ("enable_hierarchical_cache", True),
             ("enable_lmcache", True),
@@ -159,8 +168,27 @@ class TestSM120DSADCP(unittest.TestCase):
         cfg.dcp_size = 4
         cfg.dsa_prefill_backend = cfg.dsa_decode_backend = "trtllm"
         validate_sm120_dsa_dcp(cfg, self.model(), 10)
-        with self.assertRaises(FrozenInstanceError):
+        with self.assertRaises(AttributeError):
             SM120_DSA_LAYOUT.bytes_per_token = 576
+
+    def test_chain_mtp_scope(self):
+        cfg = self.config()
+        cfg.speculative_algorithm = "EAGLE"
+        validate_sm120_dsa_dcp(cfg, self.model(), 12)
+        for field, value in (
+            ("speculative_eagle_topk", 2),
+            ("speculative_draft_model_path", "another-model"),
+            ("speculative_draft_model_revision", "another-revision"),
+            ("speculative_draft_attention_backend", "trtllm_mla"),
+            ("speculative_draft_kv_cache_dtype", "bf16"),
+            ("enable_multi_layer_eagle", True),
+            ("speculative_adaptive", True),
+        ):
+            with self.subTest(field=field):
+                candidate = SimpleNamespace(**vars(cfg))
+                setattr(candidate, field, value)
+                with self.assertRaises(ValueError):
+                    validate_sm120_dsa_dcp(candidate, self.model(), 12)
 
 
 if __name__ == "__main__":

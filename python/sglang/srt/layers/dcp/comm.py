@@ -21,6 +21,7 @@ PR #25090 vs #14194):
 """
 
 import warnings
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -44,6 +45,21 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
 
 _is_hip = is_hip()
+
+
+@contextmanager
+def draft_forward_guard(enabled: bool = True):
+    """Run replicated draft execution outside target DCP, never pool allocation.
+
+    Uses the execution-guard design proposed in sglang PR #31785. Override all
+    three runtime fields: several cache consumers inspect size/rank directly.
+    Nested guards and exceptions must restore the enclosing target context.
+    """
+    if not enabled:
+        yield
+        return
+    with get_parallel().override(dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0):
+        yield
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:

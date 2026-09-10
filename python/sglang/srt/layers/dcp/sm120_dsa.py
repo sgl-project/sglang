@@ -1,12 +1,10 @@
 """The explicitly supported, static packed-DSA DCP storage contract."""
 
-from dataclasses import dataclass
-
+import msgspec
 import torch
 
 
-@dataclass(frozen=True)
-class PackedDSADCPLayout:
+class PackedDSADCPLayout(msgspec.Struct, frozen=True):
     page_size: int = 64
     bytes_per_token: int = 656
 
@@ -38,7 +36,20 @@ def validate_sm120_dsa_dcp(cfg, hf_config, sm_major: int) -> None:
     if cfg.dcp_size not in (2, 4, 8):
         unsupported.append("DCP size outside 2/4/8")
     if cfg.speculative_algorithm is not None:
-        unsupported.append("speculative decoding (chain MTP is a separate integration)")
+        if cfg.speculative_algorithm not in ("EAGLE", "NEXTN"):
+            unsupported.append("speculation other than native GLM chain MTP")
+        if cfg.speculative_eagle_topk not in (None, 1):
+            unsupported.append("tree speculation (topk > 1)")
+        if cfg.speculative_draft_model_path not in (None, cfg.model_path):
+            unsupported.append("draft model from a different checkpoint")
+        if cfg.speculative_draft_model_revision not in (None, cfg.revision):
+            unsupported.append("draft model from a different revision")
+        if cfg.speculative_draft_attention_backend not in (None, "dsa"):
+            unsupported.append("draft backend other than DSA")
+        if cfg.speculative_draft_kv_cache_dtype not in (None, "fp8_e4m3"):
+            unsupported.append("draft KV dtype different from target packed FP8")
+        if cfg.enable_multi_layer_eagle or cfg.speculative_adaptive:
+            unsupported.append("multi-layer or adaptive speculation")
     for flag in (
         "enable_hisparse",
         "enable_hierarchical_cache",

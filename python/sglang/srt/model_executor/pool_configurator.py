@@ -242,11 +242,20 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
                 if is_deepseek_dsa(kvc.model_config.hf_config):
+                    from sglang.srt.layers.dcp.sm120_dsa import uses_sm120_dsa_dcp
+
+                    replication = (
+                        get_parallel().attn_dcp_size
+                        if uses_sm120_dsa_dcp(
+                            get_exec().kernel, get_parallel().attn_dcp_size
+                        )
+                        else 1
+                    )
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
                     )
-                    target_kv_size = self._cell_size - target_indexer_size
+                    target_kv_size = self._cell_size - replication * target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
                     )
@@ -262,7 +271,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    self._cell_size += draft_kv_size + draft_indexer_size
+                    self._cell_size += replication * (
+                        draft_kv_size + draft_indexer_size
+                    )
                 else:
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))

@@ -377,6 +377,14 @@ class KVCacheConfigurator:
 
     @property
     def pool_page_size(self) -> int:
+        from sglang.srt.layers.dcp.sm120_dsa import uses_sm120_dsa_dcp
+
+        if self.is_draft_worker and uses_sm120_dsa_dcp(
+            get_exec().kernel, get_parallel().attn_dcp_size
+        ):
+            # Raw virtual capacity was widened by _derive_pool_sizes; the
+            # packed FlashInfer storage format still has physical page64.
+            return get_schedule().page_size
         return get_schedule().page_size * self.loc_space_scale
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
@@ -1599,7 +1607,16 @@ class KVCacheConfigurator:
         pool_kwargs = {}
         from sglang.srt.layers.dcp.sm120_dsa import uses_sm120_dsa_dcp
 
-        if uses_sm120_dsa_dcp(get_exec().kernel, get_parallel().attn_dcp_size):
+        if self.is_draft_worker and uses_sm120_dsa_dcp(
+            get_exec().kernel, get_parallel().attn_dcp_size
+        ):
+            # _derive_pool_sizes already widened the usable draft capacity.
+            # Retain the widened allocator's reserved-page span even though
+            # this packed draft pool adds only a physical page64 itself.
+            max_total_num_tokens += (
+                get_parallel().attn_dcp_size - 1
+            ) * self.pool_page_size
+        elif uses_sm120_dsa_dcp(get_exec().kernel, get_parallel().attn_dcp_size):
             # Latent KV is local; every rank's indexer addresses the full
             # widened token space. Match the byte budget in pool_configurator.
             pool_kwargs["index_buf_size"] = (

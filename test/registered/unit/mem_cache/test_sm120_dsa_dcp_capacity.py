@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -36,7 +37,9 @@ def make_storage(size, *, page_size, index_buf_size=None, **kwargs):
     return pool
 
 
-class TestSM120DSACapacity(unittest.TestCase):
+class TestSM120DSACapacity(CustomTestCase):
+    is_draft_worker = False
+
     def test_last_allocator_page_is_addressable(self):
         for size in (1, 2, 4, 8):
             with self.subTest(dcp_size=size):
@@ -59,7 +62,7 @@ class TestSM120DSACapacity(unittest.TestCase):
                     index_topk=2048,
                 )
                 kvc = SimpleNamespace(
-                    is_draft_worker=False,
+                    is_draft_worker=self.is_draft_worker,
                     pool_page_size=page,
                     kv_cache_dtype=torch.float8_e4m3fn,
                     device="cpu",
@@ -75,6 +78,7 @@ class TestSM120DSACapacity(unittest.TestCase):
                         dsa_prefill_backend="flashinfer_sparse_mla",
                         dsa_decode_backend="flashinfer_sparse_mla",
                         enable_hisparse=False,
+                        page_size=page,
                     ),
                     get_parallel().override(attn_dcp_size=size),
                     patch(
@@ -94,10 +98,18 @@ class TestSM120DSACapacity(unittest.TestCase):
                         side_effect=make_storage,
                     ),
                 ):
+                    kvc.loc_space_scale = KVCacheConfigurator.loc_space_scale.fget(kvc)
+                    kvc.pool_page_size = KVCacheConfigurator.pool_page_size.fget(kvc)
+                    self.assertEqual(kvc.pool_page_size, page)
                     pool = KVCacheConfigurator._build_dsa_kv_pool(
-                        kvc, max_total_num_tokens=n, max_running_requests=1
+                        kvc,
+                        max_total_num_tokens=n * size if self.is_draft_worker else n,
+                        max_running_requests=1,
                     )
-                self.assertEqual(pool.size, n, "Do not enlarge target latent capacity")
+                self.assertEqual(
+                    pool.size,
+                    n * size + (size - 1) * page if self.is_draft_worker else n,
+                )
                 # Verify both key and scale byte addresses in the actual buffer.
                 index_buffer = pool.index_cache.buffer[0]
                 last_page, offset = divmod(last_id, page)
@@ -107,8 +119,13 @@ class TestSM120DSACapacity(unittest.TestCase):
                 self.assertEqual(
                     int(index_buffer[last_page, page * 128 + offset * 4]), 29
                 )
-                pool.latent[last_id // size, 0] = 31
-                self.assertEqual(int(pool.latent[last_id // size, 0]), 31)
+                latent_id = last_id if self.is_draft_worker else last_id // size
+                pool.latent[latent_id, 0] = 31
+                self.assertEqual(int(pool.latent[latent_id, 0]), 31)
+
+
+class TestSM120DSADraftCapacity(TestSM120DSACapacity):
+    is_draft_worker = True
 
 
 if __name__ == "__main__":
