@@ -3031,8 +3031,9 @@ class DeepseekV4AscendAttnBackend(
             for start in range(0, tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
                 tok_c, lens_c = tok[rows], lens[rows]
-                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-                s = s.masked_fill(j[None, :] >= lens_c[:, None], float("-inf"))
+                # scores + the j >= lens mask; one fused launch when
+                # SGLANG_OPT_USE_DSV41_TRITON_INDEX_SCORE is on.
+                s = indexer.scores_masked(q[tok_c], index_k, weights[tok_c], lens_c)
                 if masks is not None:
                     from sglang.srt.layers.attention.dsv4.indexer import (
                         select_candidate_blocks,
@@ -3121,6 +3122,24 @@ class DeepseekV4AscendAttnBackend(
         fallback (debug only — it syncs and cannot be captured).
         """
         if os.environ.get("SGLANG_DSV4_INDEX_TOPK_TORCH", "0") == "1":
+            self._low_ratio_index_topk_loop_a5(layer, x, q_lora, req, pos, fm)
+            return
+
+        if (
+            envs.SGLANG_OPT_USE_DSV41_TRITON_INDEX_SCORE.get()
+            and not self._dsv4_in_graph_ctx
+        ):
+            # Eager only, and the `not in_graph_ctx` is the whole condition
+            # this flag needs -- the loop below syncs and cannot be captured,
+            # so routing graph context through it would silently turn decode
+            # capture off, which is what 00604d288e ("enable aclgraph") had
+            # just turned on. Graph context keeps the batched kernel.
+            #
+            # Eager is where the split shape wins anyway: the loop knows each
+            # request's exact lc, while a static shape would have to score out
+            # to max_lc, the page-table bound. And prefill is where the GEMM
+            # is big enough for reaching the Cube through aclnn to be worth
+            # the extra pass this kernel's split costs.
             self._low_ratio_index_topk_loop_a5(layer, x, q_lora, req, pos, fm)
             return
 
@@ -3307,9 +3326,13 @@ class DeepseekV4AscendAttnBackend(
             )
             k = min(topk, lc)
             idx, reach, masks = topk_from_scores(
-                indexer.scores(q[tok], index_k, weights[tok]),
+                # scores + the j >= lens mask topk_from_scores would otherwise
+                # apply; one fused launch when
+                # SGLANG_OPT_USE_DSV41_TRITON_INDEX_SCORE is on.
+                indexer.scores_masked(q[tok], index_k, weights[tok], lens),
                 lens,
                 topk,
+                pre_masked=True,
                 candidate_blocks=(
                     indexer.candidate_topk_blocks
                     if indexer.is_candidate_source
