@@ -1,0 +1,123 @@
+Block,BlockLayers,DecoderSubmodule,LeafModule,KernelName,Calls,Total_us,PerLayer_us
+A,3,AllReduce(TP),RowParallelLinear,"void quickreduce::allreduce_prototype_twoshot<quickreduce::AllReduceTwoshot<__half, quickreduce::CodecQ8<__half, 4>, true>, __half>(__half const*, __half*, unsigned int, unsigned int, int, unsigned ch",9,7447.2,2482.39
+A,3,AllReduce(TP),RowParallelLinear,"_ZN5aiter26cross_device_reduce_2stageIDF16bLi4ELb0EEEvPNS_8RankDataES2_NS_11RankSignalsEPNS_6SignalEPT_ii",3,1788.7,596.25
+A,3,DenseMLP,DeepseekV2MLP,"_fused_clamp_silu_mul_kernel_BLOCK_SIZE_N_4096_QUANT_BLOCK_SIZE_128_SCALE_FMT_FP32_HAVE_WEIGHTS_0_WEIGHT_BROADCAST_0_HAVE_SWIGLU_CLAMP_1_HAS_QUANT_1",12,683.4,227.81
+A,3,DenseMLP,MergedColumnParallelLinear,"_ZN7ck_tile6kentryINS_11kernel_attrILb1EEELi1ENS_21QuantGemmMultiDKernelINS_21GemmTile1DPartitionerINS_13TileGemmShapeINS_8sequenceIJLi192ELi256ELi128EEEENS6_IJLi4ELi2ELi1EEEENS6_IJLi16ELi16ELi128EEEE",9,3526.6,1175.52
+A,3,DenseMLP,MergedColumnParallelLinear,"_ZN7ck_tile6kentryINS_11kernel_attrILb1EEELi2ENS_21QuantGemmMultiDKernelINS_21GemmTile1DPartitionerINS_13TileGemmShapeINS_8sequenceIJLi192ELi256ELi128EEEENS6_IJLi4ELi2ELi1EEEENS6_IJLi16ELi16ELi128EEEE",3,652.8,217.59
+A,3,DenseMLP,MergedColumnParallelLinear,"_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb0EEEvPT0_PfPKT_PKfliilPKii",12,413.8,137.93
+A,3,DenseMLP,RowParallelLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",9,2117.4,705.79
+A,3,DenseMLP,RowParallelLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",3,919.6,306.52
+A,3,DenseMLP,RowParallelLinear,"Memcpy DtoD (Device -> Device)",3,61.5,20.49
+L,78,Attn(MLA),ColumnParallelLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",33,5448.0,69.85
+L,78,Attn(MLA),ColumnParallelLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",11,2357.4,30.22
+L,78,Attn(MLA),ColumnParallelLinear,"_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb0EEEvPT0_PfPKT_PKfliilPKii",44,566.3,7.26
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x32_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR0_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDS",44,4995.1,64.04
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1",44,4410.9,56.55
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"_ZN5aiter23fused_qk_rmsnorm_kernelIDF16bLi256ELi8ELb1ELi4EEEvPT_S2_PKS1_S4_S4_S4_ffiiiiiii",22,422.2,5.41
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDF16bLi256ELi8ELb0ELb0ELb1ELi1EEEvPT0_PT_PfS4_S4_S4_dbiiiiiiibb",22,374.8,4.81
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDF16bLi64ELi8ELb0ELb0ELb1ELi1EEEvPT0_PT_PfS4_S4_S4_dbiiiiiiibb",22,165.7,2.12
+L,78,Attn(MLA),IndexerKPool,"void sglang::(anonymous namespace)::kpool_topk_transform_kernel<512>(sglang::(anonymous namespace)::FastTopKParams, int*, long, int, int, int, int const*, long, int const*, int const*, int const*)",44,9874.6,126.60
+L,78,Attn(MLA),IndexerKPool,"void fast_hadamard_transform_kernel<fast_hadamard_transform_kernel_traits<16, 7, c10::BFloat16> >(HadamardParamsBase)",44,6679.6,85.64
+L,78,Attn(MLA),IndexerKPool,"triton_poi_fused__to_copy_gemm_a16w16_0",44,4479.3,57.43
+L,78,Attn(MLA),IndexerKPool,"_gluon_fp8_mqa_logits_kernel",44,4279.4,54.86
+L,78,Attn(MLA),IndexerKPool,"act_quant_kernel__kernel",44,1838.0,23.56
+L,78,Attn(MLA),IndexerKPool,"Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_MT32x64x128_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA4_GRVWB4_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDSTI0_",33,1802.9,23.11
+L,78,Attn(MLA),IndexerKPool,"void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int, at::native::FillFunctor<float>, std::array<char*, 1ul>)",44,1489.3,19.09
+L,78,Attn(MLA),IndexerKPool,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x64x128_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDS",33,1136.0,14.56
+L,78,Attn(MLA),IndexerKPool,"_kpool_assemble_softmax_rotate_write_cache_kernel",44,440.6,5.65
+L,78,Attn(MLA),IndexerKPool,"Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_MT32x32x256_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA4_GRVWB4_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDSTI0_",11,383.0,4.91
+L,78,Attn(MLA),IndexerKPool,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x256_MI16x16x1_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR0_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDST",11,247.9,3.18
+L,78,Attn(MLA),IndexerKPool,"triton_poi_fused_mul_unsqueeze_1",44,197.5,2.53
+L,78,Attn(MLA),IndexerKPool,"_gather_index_k_scale_prefix_into_kernel",44,196.5,2.52
+L,78,Attn(MLA),IndexerKPool,"_scatter_kpool_tail_updates_kernel",11,46.0,0.59
+L,78,Attn(MLA),LayerNorm,"void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<float, float, false>(int, float, float const*, float const*, float const*, float*, float*, float*)",44,793.5,10.17
+L,78,Attn(MLA),LayerNorm,"void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul> >(int, at::native::bfloat16",44,207.4,2.66
+L,78,Attn(MLA),LayerNorm,"void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::bfloat16_copy_kernel_cuda",44,190.0,2.44
+L,78,Attn(MLA),RadixAttention,"main_kernel",88,267608.9,3430.88
+L,78,Attn(MLA),RadixAttention,"set_mla_kv_buffer_kernel_norope",44,143554.2,1840.44
+L,78,Attn(MLA),RadixAttention,"void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 3, 64, 64>(at::native::(anonymous namespace)::OpaqueType<2u>*, at::native::",44,9841.6,126.17
+L,78,Attn(MLA),RadixAttention,"void at::native::(anonymous namespace)::CatArrayBatchedCopy_contig<at::native::(anonymous namespace)::OpaqueType<4u>, unsigned int, 2, 128, 1>(at::native::(anonymous namespace)::OpaqueType<4u>*, at::n",44,2410.9,30.91
+L,78,Attn(MLA),RadixAttention,"void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)",44,188.1,2.41
+L,78,Attn(MLA),ReplicatedLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1",44,6088.7,78.06
+L,78,Attn(MLA),ReplicatedLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",33,4899.9,62.82
+L,78,Attn(MLA),ReplicatedLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",11,2093.8,26.84
+L,78,Attn(MLA),ReplicatedLinear,"_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb0EEEvPT0_PfPKT_PKfliilPKii",44,1491.2,19.12
+L,78,Attn(MLA),ReplicatedLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x64x128_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDS",33,1236.2,15.85
+L,78,Attn(MLA),ReplicatedLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x256_MI16x16x1_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR0_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDST",11,246.0,3.15
+L,78,Attn(MLA),RowParallelLinear,"_ZN7ck_tile6kentryINS_11kernel_attrILb1EEELi1ENS_21QuantGemmMultiDKernelINS_21GemmTile1DPartitionerINS_13TileGemmShapeINS_8sequenceIJLi192ELi256ELi128EEEENS6_IJLi4ELi2ELi1EEEENS6_IJLi16ELi16ELi128EEEE",44,10010.2,128.34
+L,78,Attn(MLA),RowParallelLinear,"_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb0EEEvPT0_PfPKT_PKfliilPKii",44,1564.9,20.06
+B,75,AllReduce(TP),DeepseekV2MoE,"void quickreduce::allreduce_prototype_twoshot<quickreduce::AllReduceTwoshot<__half, quickreduce::CodecQ8<__half, 4>, true>, __half>(__half const*, __half*, unsigned int, unsigned int, int, unsigned ch",126,109360.5,1458.14
+B,75,AllReduce(TP),DeepseekV2MoE,"_ZN5aiter26cross_device_reduce_2stageIDF16bLi4ELb0EEEvPNS_8RankDataES2_NS_11RankSignalsEPNS_6SignalEPT_ii",42,25670.9,342.28
+B,75,MoE,DeepseekV2MLP,"_fused_clamp_silu_mul_kernel_BLOCK_SIZE_N_512_QUANT_BLOCK_SIZE_128_SCALE_FMT_FP32_HAVE_WEIGHTS_0_WEIGHT_BROADCAST_0_HAVE_SWIGLU_CLAMP_1_HAS_QUANT_1",168,1592.5,21.23
+B,75,MoE,DeepseekV2MoE,"void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",168,8799.9,117.33
+B,75,MoE,DeepseekV2MoE,"Memcpy DtoD (Device -> Device)",42,838.3,11.18
+B,75,MoE,FusedMoE,"aiter::fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256",168,389556.4,5194.09
+B,75,MoE,FusedMoE,"_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb0EEEvPT0_PfPKT_PKfliilPKii",168,6486.1,86.48
+B,75,MoE,FusedMoE,"void aiter::opus_moe_sorting_entry<aiter::MoeSortingMultiPhaseKernel_P23<aiter::MoeSortingProblemMp<int, float, unsigned char, 16, false, false, true> >, aiter::MoeSortingMultiPhaseKernel_P23<aiter::M",168,5453.7,72.72
+B,75,MoE,FusedMoE,"void aiter::opus_moe_sorting_entry<aiter::MoeSortingClearWorkspaceKernel<aiter::MoeSortingClearWorkspaceProblem<false, 1024, 1> >, aiter::MoeSortingClearWorkspaceKernel<aiter::MoeSortingClearWorkspace",168,717.9,9.57
+B,75,MoE,FusedMoE,"void aiter::opus_moe_sorting_entry<aiter::MoeSortingMultiPhaseKernel_P0_v1<aiter::MoeSortingProblemMp<int, float, unsigned char, 4, false, false, true> >, aiter::MoeSortingMultiPhaseKernel_P0_v1<aiter",168,684.5,9.13
+B,75,MoE,FusedMoE,"void aiter::opus_moe_sorting_entry<aiter::MoeSortingMultiPhaseKernel_P1<aiter::MoeSortingProblemMp<int, float, unsigned char, 16, false, false, true> >, aiter::MoeSortingMultiPhaseKernel_P1<aiter::Moe",168,681.8,9.09
+B,75,MoE,MergedColumnParallelLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",126,9864.6,131.53
+B,75,MoE,MergedColumnParallelLinear,"_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32ELi128ELb1ELi64ELb0EEEvPT0_PfPKT_PKfliilPKii",168,5793.4,77.25
+B,75,MoE,MergedColumnParallelLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",42,4161.2,55.48
+B,75,MoE,MoEGate,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT160x128x128_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LD",126,6914.2,92.19
+B,75,MoE,MoEGate,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT96x128x128_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDS",42,1478.0,19.71
+B,75,MoE,RowParallelLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",126,8581.9,114.43
+B,75,MoE,RowParallelLinear,"_ZN2ck59kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffleINS_58GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuffleINS_13tensor_layout4gemm8RowMajorENS3_11ColumnMajorENS_5TupleIJEEES4_",42,3461.1,46.15
+B,75,MoE,TopK,"void aiter::grouped_topk_kernel<hip_bfloat16, float __vector(4), 1, true, true, false>(hip_bfloat16*, hip_bfloat16 const*, float*, int*, unsigned long, unsigned long, int, int, int, int, float)",168,3316.5,44.22
+G,1,AllReduce(TP),Glm5NextDecoderLayer,"void quickreduce::allreduce_prototype_twoshot<quickreduce::AllReduceTwoshot<__half, quickreduce::CodecQ8<__half, 4>, true>, __half>(__half const*, __half*, unsigned int, unsigned int, int, unsigned ch",135,120116.0,120116.00
+G,1,AllReduce(TP),Glm5NextDecoderLayer,"_ZN5aiter26cross_device_reduce_2stageIDF16bLi4ELb0EEEvPNS_8RankDataES2_NS_11RankSignalsEPNS_6SignalEPT_ii",45,27580.6,27580.61
+G,1,AllReduce(TP),VocabParallelEmbedding,"void quickreduce::allreduce_prototype_twoshot<quickreduce::AllReduceTwoshot<__half, quickreduce::CodecQ8<__half, 4>, true>, __half>(__half const*, __half*, unsigned int, unsigned int, int, unsigned ch",3,4584.6,4584.61
+G,1,AllReduce(TP),VocabParallelEmbedding,"_ZN5aiter26cross_device_reduce_2stageIDF16bLi4ELb0EEEvPNS_8RankDataES2_NS_11RankSignalsEPNS_6SignalEPT_ii",1,595.6,595.61
+G,1,ColumnParallelLinear,ColumnParallelLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1",272,5499.4,5499.43
+G,1,ColumnParallelLinear,ColumnParallelLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x64x512_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDST",102,2455.3,2455.25
+G,1,ColumnParallelLinear,ColumnParallelLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x32x1024_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDS",34,505.9,505.85
+G,1,FusedRMSNormGated,FusedRMSNormGated,"layer_norm_gated_fwd_kernel",136,4900.7,4900.66
+G,1,Glm5NextDecoderLayer,Glm5NextDecoderLayer,"_ZN5aiter15mhc_post_kernelIDF16bLi4ELi4ELi1024ELb1EEEvPT_S2_S2_PfS3_iiiii",360,58603.6,58603.55
+G,1,Glm5NextDecoderLayer,Glm5NextDecoderLayer,"_ZN5aiter26mhc_pre_gemm_sqrsum_kernelIDF16bLi4ELi64ELi32ELi128ELb0EEEvPfS1_PT_S1_iiiiiii",360,50921.6,50921.58
+G,1,Glm5NextDecoderLayer,Glm5NextDecoderLayer,"void aiter::mhc_pre_big_fuse_rmsnorm_kernel<bool _Accum, int, ELi4E, 2, 4096, 512, 512, true>(float*, ELi4E, bool _Accum*, ELi4E, ELi4E, ELi4E, ELi4E, bool _Accum, bool _Accum, int, int, int, int, flo",360,37543.6,37543.62
+G,1,Glm5NextDecoderLayer,Glm5NextDecoderLayer,"void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#1",4,1202.7,1202.69
+G,1,Glm5NextDecoderLayer,Glm5NextDecoderLayer,"Memcpy DtoD (Device -> Device)",45,1115.4,1115.37
+G,1,Glm5NextDecoderLayer,Glm5NextDecoderLayer,"void at::native::reduce_kernel<128, 4, at::native::ReduceOp<c10::BFloat16, at::native::MeanOps<c10::BFloat16, float, float, c10::BFloat16>, unsigned int, c10::BFloat16, 4, 4> >(at::native::ReduceOp<c1",4,419.8,419.84
+G,1,Glm5NextModel,Glm5NextModel,"void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int, at::native::FillFunctor<float>, std::array<char*, 1ul>)",4,16.6,16.56
+G,1,LogitsProcessor,LogitsProcessor,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x16x128_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDS",4,260.9,260.92
+G,1,LogitsProcessor,LogitsProcessor,"_ZN5aiter13allgather_vecIDF16bLi4EEEvPNS_8RankDataENS_11RankSignalsEPNS_6SignalEPT_ii",4,34.6,34.60
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::oper",4,17.6,17.64
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul> >(int, at::native::bfloat16",4,17.0,17.00
+G,1,LogitsProcessor,LogitsProcessor,"Memcpy DtoD (Device -> Device)",4,16.9,16.92
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<long>, std::array<char*, 2ul> >(int, at::native::CUDAFunctorOnSelf_add<long>, std::array<char*, 2ul>)",4,16.6,16.64
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#1",3,16.4,16.44
+G,1,LogitsProcessor,LogitsProcessor,"void rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_NS::detail::wrapped_scan_config<rocprim::ROCPRIM_400200_NS::default_config, long>, (rocprim::ROCPRIM_400200_NS::detai",4,16.2,16.24
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)",3,12.4,12.36
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<lon",1,4.9,4.92
+G,1,QKVParallelLinear,QKVParallelLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1",136,64695.8,64695.77
+G,1,RMSNorm,RMSNorm,"_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDF16bLi256ELi16ELb0ELb0ELb1ELi1EEEvPT0_PT_PfS4_S4_S4_dbiiiiiiibb",4,145.6,145.56
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#1",408,639494.9,639494.85
+G,1,RadixLinearAttention,RadixLinearAttention,"chunk_gated_delta_rule_fwd_kernel_h_blockdim64",136,48053.9,48053.89
+G,1,RadixLinearAttention,RadixLinearAttention,"_causal_conv1d_fwd_kernel",136,22489.1,22489.10
+G,1,RadixLinearAttention,RadixLinearAttention,"chunk_gla_fwd_kernel_o",136,14011.3,14011.34
+G,1,RadixLinearAttention,RadixLinearAttention,"_recompute_w_u_fwd_kernel",136,12943.5,12943.46
+G,1,RadixLinearAttention,RadixLinearAttention,"chunk_kda_fwd_kernel_intra_sub_chunk",136,11999.3,11999.33
+G,1,RadixLinearAttention,RadixLinearAttention,"chunk_kda_fwd_kernel_inter_solve_fused",136,10128.4,10128.43
+G,1,RadixLinearAttention,RadixLinearAttention,"kda_gate_chunk_cumsum_vector_kernel",136,7465.7,7465.68
+G,1,RadixLinearAttention,RadixLinearAttention,"l2norm_fwd_kernel",272,6053.2,6053.20
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul> >(int, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul>)",136,966.0,966.00
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel<int>(at::TensorIteratorBase&, at::native::(anonymous namespace)::OpType, int)::{lambda(int)#1}, std::array<char*, 2u",136,698.3,698.35
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul> >(int, at::native::bfloat16",136,603.2,603.19
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::vectorized_elementwise_kernel<4, at::native::sigmoid_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::",136,521.3,521.27
+G,1,RadixLinearAttention,RadixLinearAttention,"Memcpy DtoD (Device -> Device)",136,443.5,443.51
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul> >(int, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul>)",16,42.5,42.55
+G,1,RadixLinearAttention,RadixLinearAttention,"Memcpy HtoD (Host -> Device)",8,33.4,33.43
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<int, int, int, at::native::binary_internal::div_floor_kernel_cuda(at::TensorIteratorBase&)::{lambda()#1}::operator()() const",8,27.3,27.31
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::oper",4,18.9,18.92
+G,1,RadixLinearAttention,RadixLinearAttention,"Memcpy DtoH (Device -> Host)",4,16.6,16.64
+G,1,RadixLinearAttention,RadixLinearAttention,"void rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_NS::detail::wrapped_scan_config<rocprim::ROCPRIM_400200_NS::default_config, long>, (rocprim::ROCPRIM_400200_NS::detai",4,14.9,14.88
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::unrolled_elementwise_kernel<at::native::CUDAFunctor_add<int>, std::array<char*, 3ul>, 4, TrivialOffsetCalculator<2, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native",4,14.2,14.24
+G,1,RadixLinearAttention,RadixLinearAttention,"void at::native::(anonymous namespace)::CatArrayBatchedCopy_contig<at::native::(anonymous namespace)::OpaqueType<4u>, unsigned int, 1, 128, 1>(at::native::(anonymous namespace)::OpaqueType<4u>*, at::n",4,11.5,11.48
+G,1,ReplicatedLinear,ReplicatedLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x64x128_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDS",204,7283.9,7283.89
+G,1,ReplicatedLinear,ReplicatedLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x256_MI16x16x1_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR0_CADS0_DTLA0_DTLB0_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LDST",68,1615.1,1615.07
+G,1,RowParallelLinear,RowParallelLinear,"aiter::bf16gemm_bf16_tn_256x256",102,20708.7,20708.66
+G,1,RowParallelLinear,RowParallelLinear,"Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1",34,3453.2,3453.24
+G,1,Sampler,Sampler,"void aiter::greedy_sample_kernel<float, 1024, 16>(float const*, int*, int, int)",4,48.8,48.80
+G,1,VocabParallelEmbedding,VocabParallelEmbedding,"_vocab_parallel_embedding_kernel",4,172.4,172.40
+G,1,VocabParallelEmbedding,VocabParallelEmbedding,"Memcpy DtoD (Device -> Device)",1,20.8,20.80

@@ -1,0 +1,35 @@
+{
+  "aggregate": {
+    "error_rate": 0.0,
+    "score": 0.9689158453373768,
+    "stop_rate": 0.9977255496588324,
+    "truncated_rate": 0.002274450341167551
+  },
+  "base_url": "http://127.0.0.1:30000/v1",
+  "gen": {
+    "chat_template_kwargs": {
+      "thinking": true
+    },
+    "extra_body": null,
+    "max_tokens": 4096,
+    "min_p": 0.0,
+    "reasoning_effort": null,
+    "repetition_penalty": 1.0,
+    "seed": 0,
+    "system_message": null,
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
+  "latency_seconds": 80.69009945401922,
+  "model": "/data2/hf_home/hub/models--zai-org--GLM-5.3-Flash/snapshots/03eb5366286afd40d2221b1d9c63a6dd1ba4832e",
+  "n_repeats": 1,
+  "name": "gsm8k",
+  "ns_commit_sha": "645cf567ff08c0ae9cc3fc8e1edbb975b3067816",
+  "num_examples": 1319,
+  "num_threads": 1200,
+  "output_throughput_tps": 1936.135920727487,
+  "sgl_eval_version": "0.0.1",
+  "timestamp": "20260909-234237",
+  "total_completion_tokens": 156227,
+  "total_prompt_tokens": 123963
+}

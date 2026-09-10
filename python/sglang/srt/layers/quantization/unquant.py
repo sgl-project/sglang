@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -67,6 +68,27 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _glm53_kda_ptpc_enabled(layer: torch.nn.Module) -> bool:
+    module_name = getattr(layer, "_glm53_kda_ptpc_module", None)
+    return (
+        module_name is not None
+        and module_name in envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get()
+        and _use_aiter
+        and is_gfx95_supported()
+    )
+
+
+def fp8_ptpc_linear_active(
+    layer: torch.nn.Module, num_tokens: Optional[int] = None
+) -> bool:
+    if not getattr(layer, "_fp8_ptpc_ready", False):
+        return False
+    if num_tokens is None:
+        return True
+    return num_tokens > getattr(layer, "_fp8_ptpc_bf16_max_m", 0)
+
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -387,15 +409,63 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _glm53_kda_ptpc_enabled(layer):
+            self._repack_bf16_to_fp8_ptpc(layer)
+            return
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+
+    @staticmethod
+    def _repack_bf16_to_fp8_ptpc(layer: torch.nn.Module) -> None:
+        import aiter
+        from aiter.ops.shuffle import shuffle_weight
+
+        if getattr(layer, "_fp8_ptpc_ready", False):
+            return
+        weight = layer.weight.data
+        if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+            module_name = getattr(layer, "_glm53_kda_ptpc_module", "unknown")
+            raise ValueError(
+                f"GLM-5.3 KDA PTPC requires a 2-D BF16 weight for {module_name}, "
+                f"got dtype={weight.dtype}, shape={tuple(weight.shape)}"
+            )
+        fp8_weight, weight_scale = aiter.pertoken_quant(
+            weight, quant_dtype=aiter.dtypes.fp8
+        )
+        layer.register_buffer(
+            "_fp8_ptpc_weight",
+            shuffle_weight(fp8_weight, (16, 16)).contiguous(),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_fp8_ptpc_weight_scale",
+            weight_scale.contiguous(),
+            persistent=False,
+        )
+        layer._fp8_ptpc_ready = True
 
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if fp8_ptpc_linear_active(layer):
+            use_bf16 = isinstance(x, torch.Tensor) and x.numel() // x.shape[
+                -1
+            ] <= getattr(layer, "_fp8_ptpc_bf16_max_m", 0)
+            if not use_bf16:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    apply_fp8_ptpc_linear,
+                )
+
+                return apply_fp8_ptpc_linear(
+                    x,
+                    layer._fp8_ptpc_weight,
+                    layer._fp8_ptpc_weight_scale,
+                    bias=bias,
+                )
+
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
