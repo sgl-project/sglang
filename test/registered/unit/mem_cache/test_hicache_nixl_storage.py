@@ -307,6 +307,7 @@ class TestNixlUnified(CustomTestCase):
 
     def test_storage_register_failure_closes_fds(self):
         """If NIXL register_memory raises after fds are opened, all fds are still closed."""
+        self.hicache._l3_cleaner.stop()
         files = [os.path.join(self.test_dir, f"fail_{i}.bin") for i in range(3)]
         buffers = [(0, 64) for _ in range(3)]
 
