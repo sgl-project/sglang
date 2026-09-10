@@ -2146,6 +2146,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    parallel_tool_calls=request.parallel_tool_calls,
                 )
 
             # Extract prompt_token_ids if requested
@@ -2301,6 +2302,7 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: Dict[str, Any],
         tool_choice: Optional[Union[str, ToolChoice]] = None,
         history_tool_calls_cnt: int = 0,
+        parallel_tool_calls: bool = True,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -2311,7 +2313,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
             parser = FunctionCallParser(
-                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+                tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                parallel_tool_calls=parallel_tool_calls,
             )
             detector_owns_format = (
                 parser.detector.supports_structural_tag()
@@ -2756,6 +2761,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=effective_tools,
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
+                        parallel_tool_calls=request.parallel_tool_calls,
                     )
                     use_native_parser = (
                         probe.detector.supports_structural_tag()
@@ -2770,6 +2776,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=effective_tools,
                     tool_call_parser=self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    parallel_tool_calls=request.parallel_tool_calls,
                 )
 
         parser = parser_dict[index]
