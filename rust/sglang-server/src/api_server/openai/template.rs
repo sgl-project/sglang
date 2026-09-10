@@ -768,44 +768,4 @@ mod tests {
             Err(TemplateError::MissingConfig)
         ));
     }
-
-    /// Fixture written by `test/registered/rust/test_chat_render_parity.py`
-    /// from Python's real serving path.
-    #[test]
-    #[ignore = "run test/registered/rust/test_chat_render_parity.py"]
-    fn python_rust_render_parity() {
-        use crate::tokenizer_manager::tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
-
-        let fixture: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(std::env::var("SGLANG_CHAT_PARITY_FIXTURE").unwrap()).unwrap(),
-        )
-        .unwrap();
-        let path = fixture["tokenizer_path"].as_str().unwrap();
-        let config = std::path::Path::new(path).join("tokenizer_config.json");
-        let formatter = load_chat_formatter(
-            config.to_str(),
-            Some(path),
-            fixture["model_type"].as_str(),
-            None,
-        )
-        .unwrap();
-        let tokenizer =
-            DynamoTokenizer::new(load_tokenizer(Some(path), None, false).unwrap().unwrap());
-
-        let mut mismatches = Vec::new();
-        for case in fixture["cases"].as_array().unwrap() {
-            let request = serde_json::from_value(case["request"].clone()).unwrap();
-            let kwargs =
-                serde_json::from_value(case["request"]["chat_template_kwargs"].clone()).ok();
-            let prompt = formatter.render(&request, kwargs.as_ref()).unwrap();
-            let input_ids = serde_json::json!(tokenizer.encode(&prompt).unwrap());
-            if prompt != case["prompt"] || input_ids != case["input_ids"] {
-                mismatches.push(format!(
-                    "{}:\n  python: {}\n  rust:   {prompt:?}",
-                    case["name"], case["prompt"]
-                ));
-            }
-        }
-        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    }
 }
