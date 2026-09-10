@@ -20,6 +20,12 @@ pub fn env_i64(name: &str, default: i64) -> i64 {
     read(name, default, |raw| raw.parse().ok())
 }
 
+/// Python `EnvStr`: unset gives the default. Every value parses, so unlike the
+/// typed readers there is nothing to warn about.
+pub fn env_str(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
 /// Shared read-or-default: unset → default; a set-but-unparsable value warns
 /// and falls back to the default (mirrors `EnvField.get`'s `warnings.warn`).
 fn read<T: Copy + std::fmt::Debug>(name: &str, default: T, parse: impl Fn(&str) -> Option<T>) -> T {
