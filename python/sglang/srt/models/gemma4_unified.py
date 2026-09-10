@@ -52,7 +52,11 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
-from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+from sglang.srt.models.gemma4_mm import (
+    Gemma4ForConditionalGeneration,
+    _is_cpu,
+    _is_cpu_amx_available,
+)
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -189,8 +193,17 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             prefix=add_prefix("language_model", add_prefix("model", prefix)),
         )
 
+        # __init__ above deliberately skips Gemma4ForConditionalGeneration's, so
+        # the lm_head_is_tied contract has to be reproduced here: forward() and
+        # load_weights() both read the attribute, and the CPU/AMX path must not
+        # tie because the packed head weights cannot alias the embedding table.
         text_tie = getattr(text_config, "tie_word_embeddings", True)
-        if self.pp_group.world_size == 1 and text_tie:
+        self.lm_head_is_tied = (
+            self.pp_group.world_size == 1
+            and text_tie
+            and not (_is_cpu and _is_cpu_amx_available)
+        )
+        if self.lm_head_is_tied:
             self.lm_head = self.language_model.embed_tokens
         elif self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
