@@ -321,6 +321,11 @@ async def async_request_openai_completions(
                         if not chunk_bytes:
                             continue
 
+                        # SSE comments (for example, keepalive pings) are not
+                        # JSON data events and must not be parsed as such.
+                        if chunk_bytes.startswith(b":"):
+                            continue
+
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
@@ -504,6 +509,11 @@ async def async_request_openai_chat_completions(
                         async for chunk_bytes in response.content:
                             chunk_bytes = chunk_bytes.strip()
                             if not chunk_bytes:
+                                continue
+
+                            # SSE comments (for example, keepalive pings) are not
+                            # JSON data events and must not be parsed as such.
+                            if chunk_bytes.startswith(b":"):
                                 continue
 
                             chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
