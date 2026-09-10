@@ -363,13 +363,22 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
+    b, s, _ = mixes.size()
+    if b * s == 0:
+        # DP attention's idle forward carries no tokens. Every backend below
+        # derives its grid from the token count, and CUDA rejects a launch with
+        # a zero-sized grid, so answer the empty batch directly.
+        return (
+            mixes.new_empty(b, s, hc_mult),
+            mixes.new_empty(b, s, hc_mult),
+            mixes.new_empty(b, s, hc_mult, hc_mult),
+        )
     if is_gfx1250_supported():
         # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
         # Triton port. _hc_split_sinkhorn_torch is kept as a reference fallback.
         return _hc_split_sinkhorn_triton(
             mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )
-    b, s, _ = mixes.size()
     pre = mixes.new_empty(b, s, hc_mult)
     post = mixes.new_empty(b, s, hc_mult)
     comb = mixes.new_empty(b, s, hc_mult, hc_mult)
