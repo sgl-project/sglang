@@ -477,12 +477,20 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
 
-        x_padded = torch.nn.functional.pad(
-            dispatch_output.hidden_states,
-            (0, self.hidden_pad),
-            mode="constant",
-            value=0.0,
-        )
+        # The preceding RMSNorm may already have fused this pad in (gated by
+        # SGLANG_AITER_FUSE_RMSNORM_PAD), in which case the input arrives at
+        # full width and padding again would double-pad it. Mirrors the guard
+        # on the native mxfp4 path.
+        hidden_states = dispatch_output.hidden_states
+        if hidden_states.shape[-1] == self.hidden_size:
+            x_padded = hidden_states
+        else:
+            x_padded = torch.nn.functional.pad(
+                hidden_states,
+                (0, self.hidden_pad),
+                mode="constant",
+                value=0.0,
+            )
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
