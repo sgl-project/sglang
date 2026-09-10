@@ -342,7 +342,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             ring_size=ring_size,
             overlap=ratio == 4,
             head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-            dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
+            dtype=self.state_pool_dtypes[ratio],
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
@@ -355,7 +355,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # c4 indexer shares the c4 state pool size budget but has its own
         # slot_dim (indexer_head_dim vs attention head_dim).
         ring_size = self.get_ring_size(ratio)
-        size = self.c4_state_pool_size
+        size = self._state_pool_size(ratio)
         if is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
@@ -364,7 +364,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             overlap=ratio == 4,
             head_dim=self.indexer_head_dim,
             device=self.device,
-            dtype=self.c4_state_dtype,
+            dtype=self.state_pool_dtypes[ratio],
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             swa_page_size=self.swa_page_size,

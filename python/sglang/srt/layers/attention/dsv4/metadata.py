@@ -45,7 +45,7 @@ positions:
 
 Some other notes:
     c4_ / c128_: means "compressed by 4" / "compressed by 128".
-    compressed_page_size: page_size // 4
+    compressed_page_size: physical indexer pool page size
     compressed_seq_lens: seq_lens // 4, but bounded by at least 1, due to flash_mla requirement.
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
@@ -114,6 +114,7 @@ class NonPagedIndexerPlan:
 @dataclass
 class PagedIndexerMetadata:
     page_size: int
+    compressed_page_size: int
     page_table: torch.Tensor
     compressed_seq_lens: torch.Tensor
     use_topk_v2: bool
@@ -178,10 +179,6 @@ class PagedIndexerMetadata:
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
     @property
-    def compressed_page_size(self) -> int:
-        return self.page_size // 4
-
-    @property
     def max_seq_len(self) -> int:
         return self.page_table.shape[1] * self.page_size
 
@@ -202,6 +199,7 @@ class PagedIndexerMetadata:
             dst=self,
             check_eq_fields=[
                 "page_size",
+                "compressed_page_size",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",
