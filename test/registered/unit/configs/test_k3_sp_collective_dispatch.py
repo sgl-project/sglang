@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -64,3 +65,7 @@ def test_world16_dispatch_requires_exact_device_table():
         assert (
             sp_collective.get_dispatch("reduce_scatter", 16, 7168, 512, device) is None
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
