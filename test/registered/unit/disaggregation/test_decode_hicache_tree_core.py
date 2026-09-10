@@ -25,6 +25,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
 
         tree_cache = SimpleNamespace(
             hicache_storage_pass_prefix_keys=True,
+            storage_prefetch_is_all_or_nothing=False,
             ongoing_prefetch=ongoing_prefetch,
             is_backuped=Mock(return_value=True),
             is_root=Mock(return_value=False),
@@ -36,6 +37,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         harness = SimpleNamespace(
             scheduler=SimpleNamespace(enable_decode_hicache=True),
             tree_cache=tree_cache,
+            _uses_swa_tail_prealloc=lambda: False,
         )
         req = SimpleNamespace(
             rid="req-0",

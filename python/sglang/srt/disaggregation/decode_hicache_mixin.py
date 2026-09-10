@@ -72,7 +72,13 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        if self.scheduler.enable_decode_hicache:
+        # Hybrid models skip L3 promises: the KV-only hit query cannot see
+        # SWA/mamba objects (present only at backed-up entry boundaries), and
+        # an unfulfillable promise fails the request post transfer-trim.
+        if (
+            self.scheduler.enable_decode_hicache
+            and not self.tree_cache.storage_prefetch_is_all_or_nothing
+        ):
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
                 last_host_node
@@ -91,6 +97,24 @@ class DecodeHiCachePreallocMixin:
                     last_hash,
                     prefix_keys,
                 )
+
+        # Cap the restored (L2/L3) range at the sliding-window start, like
+        # the L1 cap in pop_preallocated. L2 nodes cannot split mid-node
+        # (degrade to none); L3 trims to the page-aligned cap.
+        if (
+            l2_host_hit_length + l3_storage_hit_length > 0
+            and self._uses_swa_tail_prealloc()
+        ):
+            fill_len = self._pre_alloc_fill_len(req)
+            swa_prefix_cap = max(0, fill_len - self._swa_tail_len(fill_len))
+            if l1_prefix_len + l2_host_hit_length > swa_prefix_cap:
+                l2_host_hit_length = 0
+                l3_storage_hit_length = 0
+            else:
+                page_size = self.token_to_kv_pool_allocator.page_size
+                allowed = swa_prefix_cap - l1_prefix_len - l2_host_hit_length
+                l3_storage_hit_length = min(l3_storage_hit_length, allowed)
+                l3_storage_hit_length -= l3_storage_hit_length % page_size
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -138,6 +162,16 @@ class DecodeHiCachePreallocMixin:
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch
             )
+            if not prefix_match.prefetch_registered:
+                # A silently declined prefetch leaves the promised L3 range
+                # unrestorable; degrade to L2-only.
+                logger.warning(
+                    "HiCache L3 prefetch declined for rid=%s (len=%s); "
+                    "falling back to L2-only LoadingBack",
+                    req.rid,
+                    prefix_match.l3_storage_hit_length,
+                )
+                prefix_match.l3_storage_hit_length = 0
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",

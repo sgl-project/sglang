@@ -309,6 +309,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     cache_controller: Optional[HiCacheController] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # See UnifiedRadixCache.storage_prefetch_is_all_or_nothing.
+    storage_prefetch_is_all_or_nothing: bool = False
 
     def init_metrics_collector(self):
         labels = {"cache_type": self.__class__.__name__}
