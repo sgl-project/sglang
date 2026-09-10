@@ -22,16 +22,21 @@ from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
+    is_npu,
     is_xpu,
     support_triton,
 )
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
+
+if _is_npu:
+    import torch_npu
 
 if _is_xpu:
     from sgl_kernel import multimodal_rotary_embedding
@@ -280,7 +285,20 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert fused_set_kv_buffer_arg is None, (
             "fused_set_kv_buffer_arg is not supported for npu implementation"
         )
-        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
+        if positions.ndim == 2 and self.mrope_section:
+            return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
+
+        rotary_mode = "half" if self.is_neox_style else "interleave"
+        query_out, key_out = torch_npu.npu_mrope(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=[0, 0, 0],
+            rotary_mode=rotary_mode,
+        )
+        return query_out, key_out
 
     def forward_xpu(
         self,
