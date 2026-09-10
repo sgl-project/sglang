@@ -545,10 +545,8 @@ class MiniMaxM3MoE(nn.Module):
                 not get_exec().deterministic.enable_deterministic_inference
                 and hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens
             ):
-                # N is num_local_experts, so cuBLAS gets too few output tiles to fill
-                # the device and splits K, running the projection as an nvjet split-K
-                # plus a splitKreduce. The tiny GEMM does it in one launch. It takes w
-                # as [n, k] and computes x @ w.T, so no transpose here.
+                # N is num_local_experts, so cuBLAS splits K and runs the
+                # projection as two launches; the tiny GEMM does it in one.
                 return tiny_gemm_bf16(
                     hidden_states,
                     self.gate.weight,
