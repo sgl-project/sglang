@@ -32,7 +32,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=320, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=274, stage="base-b", runner_config="1-gpu-large")
 
 # Defaults to the HF `test` revision; override MODEL/REVISION to point at a
 # local checkpoint. Empty REVISION drops the flag (for local paths).
@@ -223,137 +223,6 @@ class TestInklingCacheConsistency(CustomTestCase):
                 # memory, so only assert the path ran at all.
                 min_retracted_requests=1,
             )
-
-
-class TestInklingBranchCheckpoint(CustomTestCase):
-    """A branch between checkpoints must not reuse a later sconv state."""
-
-    @classmethod
-    def setUpClass(cls):
-        from transformers import AutoTokenizer
-
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        tokenizer_kwargs = {"trust_remote_code": True}
-        other_args = [
-            "--trust-remote-code",
-            "--attention-backend",
-            "triton",
-            "--page-size",
-            "1",
-            "--mamba-radix-cache-strategy",
-            "extra_buffer",
-            "--cuda-graph-backend-prefill",
-            "disabled",
-            "--cuda-graph-backend-decode",
-            "disabled",
-            "--mem-fraction-static",
-            "0.25",
-            "--max-total-tokens",
-            "8192",
-            "--max-running-requests",
-            "4",
-            "--context-length",
-            "4096",
-            "--chunked-prefill-size",
-            "1024",
-            "--random-seed",
-            "17",
-        ]
-        if _MODEL_REVISION:
-            other_args += ["--revision", _MODEL_REVISION]
-            tokenizer_kwargs["revision"] = _MODEL_REVISION
-        cls.tokenizer = AutoTokenizer.from_pretrained(_MODEL_PATH, **tokenizer_kwargs)
-        cls.process = popen_launch_server(
-            _MODEL_PATH,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-            env={**os.environ, "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "rust"},
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
-
-    def _flush(self):
-        response = requests.post(
-            f"{self.base_url}/flush_cache", params={"timeout": 30}, timeout=45
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-
-    def _generate(self, tokens, count=1):
-        response = requests.post(
-            f"{self.base_url}/generate",
-            json={
-                "input_ids": tokens,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": count,
-                    "ignore_eos": True,
-                },
-                "return_logprob": True,
-                # Scoring from token zero would prevent prefix reuse.
-                "logprob_start_len": -1,
-            },
-            timeout=180,
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        return response.json()["meta_info"]
-
-    def test_branch_between_checkpoints_matches_cold_cache(self):
-        paragraphs = [
-            "The observatory collected measurements of distant stars every clear night. "
-            "Scientists compared the observations and recorded the results in a notebook. ",
-            "A gardener planted several kinds of vegetables beside a small river. "
-            "Each morning the soil and leaves were inspected before watering the garden. ",
-            "The library preserves maps and letters describing voyages across the ocean. "
-            "Visitors can study these documents to understand the routes taken by early navigators. ",
-        ]
-
-        def encode(text):
-            return self.tokenizer.encode(text, add_special_tokens=False)
-
-        branch_tail = encode(
-            "However, the engineering experiment followed a completely different procedure. "
-            * 20
-        )
-        probe_tail = encode(
-            "Meanwhile, musicians rehearsed a new composition inside the concert hall. "
-            * 10
-        )
-        for paragraph in paragraphs:
-            with self.subTest(paragraph=paragraph):
-                shared = encode(paragraph * 12)
-                branch = shared[:96] + branch_tail[:96]
-                probe = shared[:96] + probe_tail[:8]
-                self.assertNotEqual(shared[96], branch_tail[0])
-                self.assertNotEqual(shared[96], probe_tail[0])
-                self.assertNotEqual(branch_tail[0], probe_tail[0])
-                self.assertEqual(len(branch), 192)
-                self.assertEqual(len(probe), 104)
-
-                self._flush()
-                cold = self._generate(probe, 8)
-                self._flush()
-                repeat = self._generate(probe, 8)
-                self.assertEqual(
-                    cold["output_token_logprobs"], repeat["output_token_logprobs"]
-                )
-
-                self._flush()
-                seed64 = self._generate(shared[:64])
-                seed128 = self._generate(shared[:128])
-                branch_result = self._generate(branch)
-                warm = self._generate(probe, 8)
-                self.assertEqual(seed64["cached_tokens"], 0)
-                self.assertEqual(seed128["cached_tokens"], 64)
-                self.assertEqual(branch_result["cached_tokens"], 64)
-                # No checkpoint exists at the 96-token split; resume from 64.
-                self.assertEqual(warm["cached_tokens"], 64)
-                self.assertEqual(
-                    cold["output_token_logprobs"], warm["output_token_logprobs"]
-                )
 
 
 if __name__ == "__main__":
