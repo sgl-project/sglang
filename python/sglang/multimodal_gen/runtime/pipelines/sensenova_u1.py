@@ -15,9 +15,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
     load_model_and_tokenizer,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
-    ComposedPipelineBase,
-)
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1GenerationStage,
@@ -28,7 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-class SenseNovaU1Pipeline(ComposedPipelineBase):
+class SenseNovaU1Pipeline(LoRAPipeline):
     pipeline_name = "SenseNovaU1Pipeline"
     pipeline_config_cls = SenseNovaU1PipelineConfig
     sampling_params_cls = SenseNovaU1SamplingParams
@@ -47,15 +45,19 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, Any]:
         if loaded_modules is not None and {"model", "tokenizer"} <= set(loaded_modules):
-            return loaded_modules
+            modules = loaded_modules
+        else:
+            if server_args.num_gpus != 1:
+                raise ValueError(
+                    "SenseNovaU1Pipeline currently supports num_gpus=1. "
+                    "Native tensor/pipeline parallelism is not implemented yet."
+                )
+            modules = load_model_and_tokenizer(self.model_path, server_args)
+            logger.info("Loaded SenseNova-U1 model from %s", self.model_path)
 
-        if server_args.num_gpus != 1:
-            raise ValueError(
-                "SenseNovaU1Pipeline currently supports num_gpus=1. "
-                "Native tensor/pipeline parallelism is not implemented yet."
-            )
-        modules = load_model_and_tokenizer(self.model_path, server_args)
-        logger.info("Loaded SenseNova-U1 model from %s", self.model_path)
+        # LoRAPipeline looks the denoiser up as "transformer"; this pipeline loads
+        # one monolithic model, so alias it rather than load a second copy.
+        modules["transformer"] = modules["model"]
         return modules
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:

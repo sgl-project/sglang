@@ -849,3 +849,59 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+# ===== 8-step distilled LoRA =====
+
+
+def test_sensenova_u1_lora_name_mapping_canonicalizes_kohya_suffixes():
+    """The bundled adapter uses kohya suffixes; layer lookup needs lora_A / lora_B.
+
+    Without the mapping the adapter loads and then matches no layer, which only
+    logs a warning and yields base-model output that looks like a good LoRA run.
+    """
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        NEOChatModel,
+    )
+
+    map_name = get_param_names_mapping(NEOChatModel.lora_param_names_mapping)
+    layer = "language_model.model.layers.0.self_attn.q_proj_mot_gen"
+
+    assert map_name(f"{layer}.lora_down")[0] == f"{layer}.lora_A"
+    assert map_name(f"{layer}.lora_up")[0] == f"{layer}.lora_B"
+    # Per-layer alpha is read back as `<name>.alpha`, so it must pass through.
+    assert map_name(f"{layer}.alpha")[0] == f"{layer}.alpha"
+
+
+def test_sensenova_u1_pipeline_is_lora_capable_and_aliases_the_model():
+    from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
+        LoRAPipeline,
+    )
+
+    assert issubclass(SenseNovaU1Pipeline, LoRAPipeline)
+
+    # LoRAPipeline resolves the denoiser as modules["transformer"]; pre-loaded
+    # components must be aliased too, not only the ones this pipeline loads.
+    pipeline = SenseNovaU1Pipeline.__new__(SenseNovaU1Pipeline)
+    model, tokenizer = object(), object()
+    modules = pipeline.load_modules(None, {"model": model, "tokenizer": tokenizer})
+    assert modules["transformer"] is model
+    assert modules["model"] is model
+
+
+def test_sensenova_u1_distilled_recipe_stays_an_override():
+    """The 8-step recipe must not become the default: it changes every output.
+
+    Official distilled settings are num_inference_steps=8 and guidance_scale=1.0;
+    the field defaults stay on the 50-step / cfg 4.0 base configuration.
+    """
+    from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+        SenseNovaU1SamplingParams,
+    )
+
+    assert SenseNovaU1SamplingParams.num_inference_steps == 50
+    assert SenseNovaU1SamplingParams.guidance_scale == 4.0

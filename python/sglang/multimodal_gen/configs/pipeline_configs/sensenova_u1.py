@@ -100,11 +100,6 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
                 "SenseNovaU1Pipeline does not support torch.compile yet. "
                 "Please omit --enable-torch-compile."
             )
-        if getattr(server_args, "lora_path", None):
-            raise ValueError(
-                "SenseNovaU1Pipeline does not support LoRA adapters yet. "
-                "Please omit --lora-path."
-            )
         _set_compatible_runtime_defaults(server_args)
         if _is_arg_explicitly_set(
             server_args, "component_residency"
