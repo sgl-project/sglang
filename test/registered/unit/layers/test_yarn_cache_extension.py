@@ -20,15 +20,15 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class TestYaRNCacheExtension(CustomTestCase):
     def setUp(self):
         # Exercise cache construction without a serving context or accelerator.
-        self.enterContext(
-            patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
-        )
-        self.enterContext(
+        for boundary_patch in (
+            patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True),
             patch(
                 "sglang.srt.layers.rotary_embedding.base.publish_role",
                 return_value=None,
-            )
-        )
+            ),
+        ):
+            self.addCleanup(boundary_patch.stop)
+            boundary_patch.start()
 
     def make_rope(self, cls, dim=64, factor=1.0, dtype=torch.float32, **kwargs):
         if cls is DeepseekScalingRotaryEmbedding:
