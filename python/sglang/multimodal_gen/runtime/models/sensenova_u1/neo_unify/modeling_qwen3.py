@@ -1310,6 +1310,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        image_only: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
 
@@ -1317,7 +1318,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # assert cache_position is not None
         # assert past_key_values is not None
 
-        if image_gen_indicators is None:
+        # Denoising callers know the token type without reading GPU scalars.
+        if image_only:
+            exist_non_image_gen_tokens = False
+            exist_image_gen_tokens = True
+        elif image_gen_indicators is None:
             exist_non_image_gen_tokens = True
             exist_image_gen_tokens = False
         else:

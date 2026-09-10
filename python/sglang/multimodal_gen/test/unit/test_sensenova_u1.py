@@ -849,3 +849,122 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("image_only", [False, True])
+def test_sensenova_image_only_forward_preserves_outputs_and_prefix(device, image_only):
+    from transformers import Qwen3Config
+
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        prepare_flash_kv_cache,
+    )
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Model,
+        get_attn_backend,
+        set_attn_backend,
+    )
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        max_position_embeddings=128,
+    )
+    config.rope_theta_hw = 10000.0
+    config.max_position_embeddings_hw = 128
+    config._attn_implementation = "eager"
+    previous_backend = get_attn_backend()
+    set_attn_backend("sdpa")
+    try:
+        model = Qwen3Model(config).to(device).eval()
+        prefix_indexes = torch.tensor([[0, 1], [0, 0], [0, 0]], device=device)
+        indexes = torch.tensor([[2, 2], [0, 0], [0, 1]], device=device)
+        inputs = torch.randn(1, 2, 32, device=device)
+        with torch.no_grad():
+            cache = model(
+                input_ids=torch.tensor([[1, 2]], device=device),
+                indexes=prefix_indexes,
+                attention_mask={"full_attention": None},
+                use_cache=True,
+            ).past_key_values
+            prefix = [
+                (layer.keys.clone(), layer.values.clone()) for layer in cache.layers
+            ]
+            prepare_flash_kv_cache(cache, current_len=2, batch_size=1)
+            for _ in range(2):
+                common = dict(
+                    inputs_embeds=inputs,
+                    indexes=indexes,
+                    attention_mask={"full_attention": None},
+                    past_key_values=cache,
+                    use_cache=True,
+                    update_cache=False,
+                )
+                expected = model(
+                    image_gen_indicators=torch.ones(
+                        1, 2, dtype=torch.bool, device=device
+                    ),
+                    **common,
+                ).last_hidden_state
+                actual = model(
+                    image_only=image_only,
+                    image_gen_indicators=(
+                        None
+                        if image_only
+                        else torch.ones(1, 2, dtype=torch.bool, device=device)
+                    ),
+                    **common,
+                ).last_hidden_state
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert cache.get_seq_length() == 2
+                for layer, (keys, values) in zip(cache.layers, prefix):
+                    torch.testing.assert_close(layer.keys, keys, rtol=0, atol=0)
+                    torch.testing.assert_close(layer.values, values, rtol=0, atol=0)
+                inputs = actual
+    finally:
+        set_attn_backend(previous_backend)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("needs_cfg", [False, True])
+@pytest.mark.parametrize("shift", [1.0, 3.0])
+@pytest.mark.parametrize("interval", [(0.0, 1.0), (0.25, 0.75), (0.5, 0.5)])
+def test_sensenova_cfg_schedule_preserves_scalar_decisions(
+    device, needs_cfg, shift, interval
+):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        NEOChatModel,
+    )
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    timesteps = torch.linspace(0, 1, 9, device=device)
+    timesteps = NEOChatModel._apply_time_schedule(
+        SimpleNamespace(), timesteps, 4, shift
+    )
+    boundary = torch.tensor(0.5, device=device)
+    timesteps = torch.cat(
+        [
+            timesteps[:-1],
+            torch.stack(
+                [
+                    torch.nextafter(boundary, boundary.new_tensor(0.0)),
+                    boundary,
+                    torch.nextafter(boundary, boundary.new_tensor(1.0)),
+                ]
+            ),
+            timesteps[-1:],
+        ]
+    )
+    expected = [
+        bool(t >= interval[0] and t <= interval[1] and needs_cfg)
+        for t in timesteps[:-1]
+    ]
+    assert NEOChatModel._build_cfg_schedule(timesteps, interval, needs_cfg) == expected

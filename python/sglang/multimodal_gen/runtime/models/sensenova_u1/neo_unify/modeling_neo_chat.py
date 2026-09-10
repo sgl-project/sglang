@@ -511,6 +511,15 @@ class NEOChatModel(PreTrainedModel):
         z_next = z + (t_next - t) * v_pred
         return z_next
 
+    @staticmethod
+    def _build_cfg_schedule(timesteps, cfg_interval, needs_cfg):
+        # Compare on the original device to preserve rounding at boundaries.
+        if not needs_cfg:
+            return [False] * (timesteps.numel() - 1)
+        return (
+            (timesteps[:-1] >= cfg_interval[0]) & (timesteps[:-1] <= cfg_interval[1])
+        ).tolist()
+
     def _calculate_dynamic_mu(self, image_seq_len: int) -> float:
         denom = self.max_image_seq_len - self.base_image_seq_len
         if denom == 0:
@@ -706,11 +715,7 @@ class NEOChatModel(PreTrainedModel):
 
         outputs = self.language_model.model(
             inputs_embeds=input_embeds,
-            image_gen_indicators=torch.ones(
-                (input_embeds.shape[0], input_embeds.shape[1]),
-                dtype=torch.bool,
-                device=input_embeds.device,
-            ),
+            image_only=True,
             indexes=indexes_image,
             attention_mask=attn_mask,
             past_key_values=past_key_values,
@@ -2473,6 +2478,10 @@ class NEOChatModel(PreTrainedModel):
                 timesteps, token_h * token_w, timestep_shift
             )
 
+        # Preserve GPU timestep rounding and inclusive CFG boundaries, but
+        # transfer the decisions only once instead of synchronizing every step.
+        cfg_active = self._build_cfg_schedule(timesteps, cfg_interval, needs_cfg)
+
         for step_i in range(num_steps):
             t = timesteps[step_i]
             t_next = timesteps[step_i + 1]
@@ -2512,7 +2521,7 @@ class NEOChatModel(PreTrainedModel):
                 image_size=image_size,
             )
 
-            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
+            if cfg_active[step_i]:
                 v_pred_uncondition = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,
