@@ -96,9 +96,6 @@ class SchedulerInvariantChecker:
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
-        is_unified_mamba_swa = isinstance(
-            allocator, UnifiedMambaSWATokenToKVPoolAllocator
-        )
         full_capacity = (
             allocator.current_full_capacity
             if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
@@ -139,14 +136,14 @@ class SchedulerInvariantChecker:
                 // allocator.page_size
                 * allocator.page_size
             )
-        full_available_size = (
-            allocator.conserve_full_available_size()
-            if is_unified_mamba_swa
-            else ps.full_available_size
-        )
+        full_available = ps.full_available_size
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            # Pair the static per-layer total with the conserve view, never the
+            # byte-coordinated one -- see `conserve_full_available_size`.
+            full_available = allocator.conserve_full_available_size()
         leak, msg = self._check_pool_invariant(
             "full",
-            full_available_size,
+            full_available,
             full_evictable_size,
             protected,
             session_held,
@@ -172,24 +169,23 @@ class SchedulerInvariantChecker:
                 f"evictable={ps.swa_evictable_size}, "
                 f"total={self.swa_tokens_per_layer}"
             )
+        swa_available = ps.swa_available_size
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
-            available = allocator.conserve_swa_available_size()
-            total = self.swa_tokens_per_layer
-        else:
-            available = ps.swa_available_size
-            total = (
+            # Tri-pool: same floating-boundary phantom as the full pool -- use the
+            # slot-conservation view, not the byte-coordinated min (see _check_full_pool).
+            swa_available = allocator.conserve_swa_available_size()
+        return self._check_pool_invariant(
+            "swa",
+            swa_available,
+            ps.swa_evictable_size,
+            self.tree_cache.swa_protected_size(),
+            self.pool_stats_observer.session_held_swa_tokens(),
+            (
                 allocator.current_swa_capacity
                 if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
                 and allocator.supports_asymmetric_reservation
                 else self.swa_tokens_per_layer
-            )
-        return self._check_pool_invariant(
-            "swa",
-            available,
-            ps.swa_evictable_size,
-            self.tree_cache.swa_protected_size(),
-            self.pool_stats_observer.session_held_swa_tokens(),
-            total,
+            ),
             uncached,
         )
 

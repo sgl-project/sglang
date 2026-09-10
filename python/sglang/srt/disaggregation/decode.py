@@ -454,6 +454,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 EvictParams(swa_num_tokens=required - available)
             )
             available = self.token_to_kv_pool_allocator.swa_available_size()
+
         if available < required:
             return (
                 f"SWA eviction insufficient: needed={required}, "
@@ -855,6 +856,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
+
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
