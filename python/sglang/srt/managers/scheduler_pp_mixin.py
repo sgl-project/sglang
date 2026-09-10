@@ -14,6 +14,7 @@ from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -550,6 +551,14 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
+        # MoE A2A can leave hidden_states/residual token-sharded across TP ranks.
+        # Send-slice/all-gather assumes replicated tensors and corrupts those
+        # shards. Preserve each TP rank's complete local tensor instead.
+        # Proxy and output messages must use the same protocol: the typed
+        # receiver can consume and stash either kind before finding its target.
+        self.pp_all_gather_group = (
+            self.attn_tp_group if get_moe_a2a_backend().is_none() else None
+        )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -810,7 +819,7 @@ class SchedulerPPMixin:
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=(self.attn_tp_group),
+                all_gather_group=self.pp_all_gather_group,
                 async_send=async_send,
             )
         )
@@ -855,7 +864,7 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
-                    all_gather_group=(self.attn_tp_group),
+                    all_gather_group=self.pp_all_gather_group,
                 )
             )
         return pp_proxy_tensors
@@ -865,7 +874,7 @@ class SchedulerPPMixin:
     ) -> Dict[str, torch.Tensor]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=self.pp_all_gather_group,
         )
 
     def _pp_make_skip_output_result(
