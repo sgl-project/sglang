@@ -223,13 +223,13 @@ def _make_static_forward_batch(raw_batch, static_num_tokens: int, device: str):
             dim=0,
         )
 
-    raw_batch.num_token_non_padded_cpu = raw_num_tokens
+    raw_batch.global_num_token_non_padded_cpu = raw_num_tokens
     return replace(
         raw_batch,
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        num_token_non_padded_cpu=raw_num_tokens,
+        global_num_token_non_padded_cpu=raw_num_tokens,
     )
 
 

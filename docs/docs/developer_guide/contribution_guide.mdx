@@ -120,16 +120,19 @@ Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
 - `/tag-run-ci-label`: Adds the "run-ci" label. Only **future** commits trigger CI; the current commit is unaffected. Add the `extra` argument (`/tag-run-ci-label extra`) to additionally apply the "run-ci-extra" label, opting the PR into the extra test workflow (`pr-test-extra.yml`).
-- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed or skipped**.
+- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, skipped, cancelled, or timed out**.
 - `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won't. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
-- `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly. A spec may select a file, class, or method using `<file>::<TestClass>[.<test_method>]`. Multiple specs and file globs are supported. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py`, or `/rerun-test test_*backend*.py`.
-- `/rerun-group <group> [<group> ...]`: Expands one or more registered test groups (for example, `/rerun-group hicache`) and dispatches their tests through the same selective-rerun workflow.
+- `/run-full-ci`: Baseline **and** extra CI. Short form of `/tag-and-rerun-ci extra` — applies both labels, then reruns everything at the current commit that didn't succeed.
+- `/run-extra-ci`: Extra CI **only**. Applies both labels, then reruns just `PR Test Extra`, leaving baseline CI runs alone. Use it when baseline is already green and you only need the extra tier.
+- `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly. A spec may select a file, class, or method using `<file>::<TestClass>[.<test_method>]`. Multiple specs and file globs are supported. `--changed` (short form `-c`) adds every test file the PR itself adds or modifies (under `test/registered/` or the multimodal test directory), so a PR that touches several tests can rerun them all without listing them. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py`, `/rerun-test test_*backend*.py`, `/rerun-test --changed`, or `/rerun-test -c`.
+- `/rerun-group <group> [<group> ...]`: Expands one or more registered test groups (for example, `/rerun-group rust-server`) and dispatches their tests through the same selective-rerun workflow. Groups are defined in [`scripts/ci/rerun_test_groups.json`](https://github.com/sgl-project/sglang/blob/main/scripts/ci/rerun_test_groups.json).
 
 The rerun commands have the following permission rules:
 
 | Command | PR author | Other users | Additional rule for fork PRs |
 | --- | --- | --- | --- |
 | `/rerun-failed-ci` | Always allowed on their own PR | Must have `can_rerun_failed_ci` in `CI_PERMISSIONS.json` | None |
+| `/run-full-ci`, `/run-extra-ci` | Not auto-allowed -- these apply labels, which the PR-author allowance does not cover | Must have both `can_tag_run_ci_label` and `can_rerun_failed_ci` in `CI_PERMISSIONS.json` (every listed user has both) | None |
 | `/rerun-test`, `/rerun-group` | No special allowance; judged as any other commenter | Must have `cooldown_interval_minutes: 0` in `CI_PERMISSIONS.json`, or `write`/`admin` repository permission | None -- the same rule applies wherever the PR comes from |
 
 <Warning>
@@ -137,6 +140,8 @@ Selective reruns do not build or install a PR-local `sglang-kernel` wheel. If a 
 </Warning>
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
+
+If a command isn't recognized, the handler reacts 😕 instead, and replies with the closest matching command when there is one. A comment with no reaction at all means the handler never saw it — check the command is spelled as listed above.
 
 To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
 

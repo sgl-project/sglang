@@ -28,7 +28,9 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -54,21 +56,51 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              # Extend test/registered/ entries when adding a non-nightly register_xpu_ci.
+              - "python/sglang/!(multimodal_gen|kernels|cli|test)/**/!(*.md)"
+              - "python/sglang/test/*.py"
+              - "python/sglang/test/!(ascend|observability|mock_model|manual|external_models|kernels)/**/!(*.md)"
               - "python/pyproject_xpu.toml"
-              - "test/**/!(*.md)"
-              - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - "test/registered/xpu/**/!(*.md)"
+              - "test/registered/attention/test_chunk_gated_delta_rule.py"
+              - "test/registered/attention/test_deterministic.py"
+              - "test/registered/lora/test_moe_lora_info.py"
+              - "test/registered/lora/test_virtual_experts_kernels.py"
+              - "test/registered/unit/sampling/test_sampling_params.py"
+              - "test/registered/unit/spec/test_adaptive_spec_params.py"
+              - "test/run_suite.py"
+              - "test/pytest.ini"
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
+              - "scripts/ci/xpu/**"
+            multimodal_gen:
+              # Only paths imported by the 1-gpu-xpu suite; other-vendor and off-suite files are excluded.
+              - "python/sglang/multimodal_gen/*.py"
+              - "python/sglang/multimodal_gen/runtime/!(pipelines)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/runtime/*.py"
+              - "python/sglang/multimodal_gen/runtime/pipelines/__init__.py"
+              - "python/sglang/multimodal_gen/runtime/pipelines/@(zimage_pipeline|flux_2_klein|flux_2|wan_pipeline|diffusers_pipeline).py"
+              - "python/sglang/multimodal_gen/configs/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/apps/webui/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/benchmarks/compare_perf.py"
+              - "python/sglang/multimodal_gen/test/*.py"
+              - "python/sglang/multimodal_gen/test/runner/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/test/server/!(test_server_1_gpu_5090|test_server_4_gpu_h100|test_server_b200|test_server_2_gpu|test_request_logger).py"
+              - "python/sglang/multimodal_gen/test/server/common/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/test/server/perf_baselines/xpu_b60.json"
+              - "python/pyproject_xpu.toml"
+              - ".github/workflows/pr-test-xpu.yml"
+              - "docker/xpu.Dockerfile"
+              - "scripts/ci/xpu/**"
 
   # ==================== PR Gate ==================== #
   pr-gate:
     needs: check-changes
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
-  # ==================== Stage A ==================== #
+  # Runs the entire per-commit XPU test suite in one job (single install, single queue).
   stage-a-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
@@ -103,7 +135,7 @@ jobs:
         timeout-minutes: 60
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
           docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           # Fetch tags so setuptools_scm resolves a real version instead of
@@ -113,10 +145,11 @@ jobs:
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
-      - name: Run stage-a tests
-        timeout-minutes: 30
+      - name: Run tests
+        # Old stage-a (30) + stage-b (120) = 150; +20% headroom for --enable-retry.
+        timeout-minutes: 180
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu --enable-retry"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --enable-retry"
 
       - name: Cleanup container
         if: always()
@@ -157,18 +190,11 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
-  # ==================== Wait for Stage A ==================== #
-  wait-for-stage-a:
-    needs: [stage-a-test-1-gpu-xpu]
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "stage-a passed"
-
-  # ==================== Stage B ==================== #
-  stage-b-test-1-gpu-xpu:
-    needs: [check-changes, pr-gate, wait-for-stage-a]
-    if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: intel-bmg
+  # ==================== Multimodal Gen ==================== #
+  multimodal-gen-test-1-gpu-xpu:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: bmg-multigen-models
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
       DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
@@ -205,21 +231,16 @@ jobs:
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
-      - name: Run stage-b tests
-        timeout-minutes: 120
+      - name: Run diffusion server tests (1-GPU)
+        timeout-minutes: 60
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu --enable-retry"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
         run: |
-          # pip install ran as root inside the container against the
-          # bind-mounted workspace, so build artifacts are root-owned on
-          # the host. Chown them back before rm to avoid Permission denied.
           docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
             chown -R "$(id -u):$(id -g)" /w || true
-          # Wipe everything the run wrote into the workspace so the next
-          # job starts from a clean tree.
           rm -rf \
             python/build \
             python/dist \
@@ -251,19 +272,19 @@ jobs:
 
   finish:
     if: always()
-    needs: [stage-a-test-1-gpu-xpu, stage-b-test-1-gpu-xpu, pr-gate]
+    needs: [stage-a-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Check job status
         run: |
           stage_a="${{ needs.stage-a-test-1-gpu-xpu.result }}"
-          stage_b="${{ needs.stage-b-test-1-gpu-xpu.result }}"
+          multimodal_gen="${{ needs.multimodal-gen-test-1-gpu-xpu.result }}"
           if [ "$stage_a" != "success" ] && [ "$stage_a" != "skipped" ]; then
             echo "stage-a failed with result: $stage_a"
             exit 1
           fi
-          if [ "$stage_b" != "success" ] && [ "$stage_b" != "skipped" ]; then
-            echo "stage-b failed with result: $stage_b"
+          if [ "$multimodal_gen" != "success" ] && [ "$multimodal_gen" != "skipped" ]; then
+            echo "multimodal-gen failed with result: $multimodal_gen"
             exit 1
           fi
           echo "All jobs completed successfully"
