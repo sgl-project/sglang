@@ -3192,6 +3192,8 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.release_aborted_prefill_waiting_req(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(
                         req,
@@ -3311,7 +3313,10 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.cache_unfinished_disagg_prefill(req, chunked=True)
+        else:
+            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
@@ -5060,24 +5065,13 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                self.release_aborted_prefill_waiting_req(req)
 
             # For mamba radix cache
-            if (
-                req.kv.holds_mamba
-                and self.disaggregation_mode != DisaggregationMode.DECODE
+            if req.kv.holds_mamba and self.disaggregation_mode not in (
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.DECODE,
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")

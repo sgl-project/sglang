@@ -924,6 +924,44 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
+    def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
+        assert not self.supports_mamba()
+        token_ids = req.get_fill_ids()
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+        insert_params = InsertParams(
+            prev_prefix_len=req.kv.cache_protected_len,
+            chunked=chunked,
+            priority=getattr(req, "priority", 0) or 0,
+        )
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            cache_len = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=False,
+            )
+            if cache_len is not None:
+                effective_cache_len = min(effective_cache_len, cache_len)
+
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(
+                req, is_finished=False, insert_params=insert_params
+            )
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return

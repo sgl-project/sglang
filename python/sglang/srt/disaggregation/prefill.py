@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -524,6 +525,31 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def cache_unfinished_disagg_prefill(
+        self: Scheduler, req: Req, *, chunked: bool = False
+    ) -> None:
+        cache = self.tree_cache
+        if (
+            req.pending_bootstrap
+            and isinstance(cache, UnifiedRadixCache)
+            and cache.cache_controller is not None
+            and not cache.is_write_back
+        ):
+            cache.advance_unpublished_req(req, chunked=chunked)
+            return
+
+        maybe_cache_unfinished_req(req, cache, chunked=chunked)
+
+    def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
+        self.clear_pending_chunk_send(req)
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is not None and hasattr(sender, "abort"):
+            sender.abort()
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        req.pending_bootstrap = False
+
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -759,7 +785,7 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
-                maybe_cache_unfinished_req(req, self.tree_cache)
+                self.cache_unfinished_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -1037,7 +1063,7 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -1060,6 +1086,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Metadata buffer was allocated in pop_bootstrapped before
             # the request entered the waiting queue, so finalize should not fail.
             assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+            self.cache_unfinished_disagg_prefill(req)
             return True
         else:
             raise RuntimeError(
@@ -1086,7 +1113,7 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            self.cache_unfinished_disagg_prefill(req, chunked=True)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1352,8 +1379,7 @@ class SchedulerDisaggregationPrefillMixin:
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
-        maybe_cache_unfinished_req(req, self.tree_cache)
-        release_kv_cache(req, self.tree_cache)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
