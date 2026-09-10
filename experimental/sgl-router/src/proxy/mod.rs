@@ -178,7 +178,6 @@ impl Proxy {
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
-        on_inter_chunk: Option<Box<dyn Fn(f64) + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -231,7 +230,7 @@ impl Proxy {
             } else {
                 let breaker_for_hook = Arc::clone(breaker);
                 Some(Box::new(move |end: sse::StreamEnd| {
-                    // Breaker judges transport only; the in-band verdict
+                    // Breaker judges transport only; the SSE error event
                     // deliberately stays out of routing.
                     if end.transport_ok {
                         breaker_for_hook.record_success();
@@ -243,19 +242,18 @@ impl Proxy {
                     }
                 }))
             };
-        // Only record TTFT and ITL for successful streams; error-body chunks
-        // are not generated tokens.
-        let (first_byte_hook, inter_chunk_hook) = if status.is_success() {
-            (on_first_byte, on_inter_chunk)
+        // Only record TTFT for successful streams; error-body chunks are not
+        // generated tokens.
+        let first_byte_hook = if status.is_success() {
+            on_first_byte
         } else {
-            (None, None)
+            None
         };
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
             stream_guards,
             on_complete,
             first_byte_hook,
-            inter_chunk_hook,
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;

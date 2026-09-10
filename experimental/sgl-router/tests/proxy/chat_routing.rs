@@ -951,7 +951,6 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             None,
             None,
             None,
-            None,
         )
         .await;
 
@@ -1522,9 +1521,9 @@ async fn stream_chat_and_render(
     }
 }
 
-/// A clean transport carrying an in-band error records only the stream failure.
+/// A clean transport carrying an SSE error event records only the stream failure.
 #[tokio::test]
-async fn streaming_inband_error_records_stream_outcome_without_tripping_breaker() {
+async fn streaming_error_event_records_stream_outcome_without_tripping_breaker() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![
         "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
         "data: {\"error\": {\"message\": \"The request queue is full.\", \"code\": 503}}\n\n",
@@ -1532,7 +1531,7 @@ async fn streaming_inband_error_records_stream_outcome_without_tripping_breaker(
     ])
     .await;
     let expected = format!(
-        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="inband_error"}} 1"#,
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="stream_error_event"}} 1"#,
         worker.url,
     );
     let (ctx, metrics) = stream_chat_and_render(&worker.url, &expected).await;
@@ -1545,7 +1544,7 @@ async fn streaming_inband_error_records_stream_outcome_without_tripping_breaker(
             .all()
             .iter()
             .all(|worker| worker.breaker.would_allow()),
-        "in-band error must not trip the circuit breaker",
+        "SSE error event must not trip the circuit breaker",
     );
 }
 
@@ -1563,23 +1562,7 @@ async fn streaming_clean_completion_records_stream_outcome_ok() {
     );
     let (_, metrics) = stream_chat_and_render(&worker.url, &expected).await;
     assert!(
-        !metrics.contains(r#"outcome="inband_error""#),
-        "clean stream recorded an in-band error; got:\n{metrics}",
+        !metrics.contains(r#"outcome="stream_error_event""#),
+        "clean stream recorded an SSE error event; got:\n{metrics}",
     );
-}
-
-/// N chunks record N-1 inter-chunk gaps; the first chunk is TTFT.
-#[tokio::test]
-async fn streaming_2xx_request_records_itl_per_chunk_gap() {
-    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
-        vec![
-            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
-            "data: [DONE]\n\n",
-        ],
-        Duration::from_millis(20),
-    )
-    .await;
-    let expected = r#"sgl_router_itl_seconds_count{model_id="tiny"} 2"#;
-    stream_chat_and_render(&worker.url, expected).await;
 }

@@ -771,9 +771,9 @@ pub async fn chat_completions(
         let metrics = Arc::clone(&ctx.metrics);
         let model = metrics_model.clone();
         Box::new(move |end: StreamEnd| {
-            // Precedence: in-band verdict > transport fault > disconnect.
-            let outcome = if end.saw_inband_error {
-                StreamOutcome::InbandError
+            // Precedence: error event > transport fault > disconnect.
+            let outcome = if end.saw_error_event {
+                StreamOutcome::StreamErrorEvent
             } else if !end.transport_ok {
                 StreamOutcome::UpstreamError
             } else if end.client_disconnect {
@@ -783,13 +783,6 @@ pub async fn chat_completions(
             };
             metrics.record_stream_outcome(&worker_url, &model, outcome);
         })
-    };
-
-    // Builds the inter-chunk hook recording `sgl_router_itl_seconds`.
-    let make_itl_hook = || -> Box<dyn Fn(f64) + Send + 'static> {
-        let metrics = Arc::clone(&ctx.metrics);
-        let model = metrics_model.clone();
-        Box::new(move |gap| metrics.observe_itl(&model, gap))
     };
 
     // Forward the router-computed tokens to the engine as `input_ids` so it
@@ -933,7 +926,6 @@ pub async fn chat_completions(
                 Some(stream_guards),
                 Some(make_ttft_hook()),
                 Some(make_stream_end_hook(decode_worker.url.clone())),
-                Some(make_itl_hook()),
             );
             tokio::select! {
                 biased;
@@ -970,7 +962,6 @@ pub async fn chat_completions(
             Some(stream_guards),
             Some(make_ttft_hook()),
             Some(make_stream_end_hook(worker.url.clone())),
-            Some(make_itl_hook()),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing

@@ -23,7 +23,6 @@
 //! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
-//! | `sgl_router_itl_seconds` | Histogram | `model_id` |
 //! | `sgl_router_stream_outcome_total` | Counter | `worker_url`, `model_id`, `outcome` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
@@ -87,12 +86,6 @@ const TTFT_BUCKETS: &[f64] = &[
     400.0,
 ];
 
-/// Bucket bounds (seconds) for `sgl_router_itl_seconds`.
-const ITL_BUCKETS: &[f64] = &[
-    0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.060, 0.080,
-    0.100, 0.200, 0.400, 0.600, 0.800, 1.0, 2.0, 4.0, 6.0, 8.0,
-];
-
 /// Recordable outcome for a request — narrowed to a handful of variants so
 /// the label cardinality stays bounded.
 #[derive(Debug, Clone, Copy)]
@@ -117,8 +110,8 @@ impl RequestOutcome {
 pub enum StreamOutcome {
     /// Stream ended without errors.
     Ok,
-    /// The engine sent an in-band `data: {"error"...}` event.
-    InbandError,
+    /// The engine sent a `data: {"error"...}` SSE event.
+    StreamErrorEvent,
     /// The upstream byte stream failed.
     UpstreamError,
     /// The client disconnected before the stream finished.
@@ -129,7 +122,7 @@ impl StreamOutcome {
     fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            Self::InbandError => "inband_error",
+            Self::StreamErrorEvent => "stream_error_event",
             Self::UpstreamError => "upstream_error",
             Self::ClientDisconnect => "client_disconnect",
         }
@@ -265,7 +258,6 @@ pub struct MetricsRegistry {
     // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
-    itl_seconds: Mutex<HashMap<String, Histogram>>,
     stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -306,7 +298,7 @@ struct EdgeResponseKey {
 }
 
 /// Labels for `sgl_router_stream_outcome_total`. Per-worker so a single pod
-/// stuck in an accept-then-in-band-reject loop stands out.
+/// stuck in an accept-then-error-event loop stands out.
 #[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
 struct StreamOutcomeKey {
     worker_url: String,
@@ -470,18 +462,6 @@ impl MetricsRegistry {
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
         hist.observe(seconds);
-    }
-
-    /// Record an inter-chunk latency sample in seconds.
-    pub fn observe_itl(&self, model_id: &str, seconds: f64) {
-        if !seconds.is_finite() {
-            return;
-        }
-        self.itl_seconds
-            .lock()
-            .entry(model_id.to_owned())
-            .or_insert_with(|| Histogram::new(ITL_BUCKETS))
-            .observe(seconds);
     }
 
     /// Record the final outcome of a 2xx stream.
@@ -755,25 +735,8 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // itl histogram
-        out.push_str(
-            "# HELP sgl_router_itl_seconds Gap between successive chunks of a 2xx stream, in seconds.\n",
-        );
-        out.push_str("# TYPE sgl_router_itl_seconds histogram\n");
-        let guard = self.itl_seconds.lock();
-        let mut models: Vec<&String> = guard.keys().collect();
-        models.sort();
-        for model_id in models {
-            let hist = guard.get(model_id).unwrap();
-            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
-            render_histogram(&mut out, "sgl_router_itl_seconds", &label_body, hist);
-        }
-        drop(guard);
-
         // stream_outcome_total — end-of-stream truth for 2xx streaming responses
-        out.push_str(
-            "# HELP sgl_router_stream_outcome_total Final outcome of a 2xx stream.\n",
-        );
+        out.push_str("# HELP sgl_router_stream_outcome_total Final outcome of a 2xx stream.\n");
         out.push_str("# TYPE sgl_router_stream_outcome_total counter\n");
         let guard = self.stream_outcome_total.lock();
         let mut entries: Vec<(&StreamOutcomeKey, u64)> = guard
@@ -1267,52 +1230,17 @@ mod tests {
     }
 
     #[test]
-    fn observe_itl_writes_buckets_sum_and_count() {
-        let reg = MetricsRegistry::new();
-        reg.observe_itl("tiny", 0.009);
-        reg.observe_itl("tiny", 0.05);
-        let out = reg.render();
-        for expected in [
-            r#"sgl_router_itl_seconds_count{model_id="tiny"} 2"#,
-            r#"sgl_router_itl_seconds_bucket{model_id="tiny",le="0.01"} 1"#,
-            r#"sgl_router_itl_seconds_bucket{model_id="tiny",le="0.06"} 2"#,
-        ] {
-            assert_metric_line(&out, expected);
-        }
-    }
-
-    #[test]
-    fn itl_buckets_align_with_engine_grid() {
-        // Every engine ITL edge must appear verbatim, else a router-vs-engine
-        // `histogram_quantile` comparison interpolates on mismatched grids.
-        let reg = MetricsRegistry::new();
-        reg.observe_itl("m", 0.05);
-        let out = reg.render();
-        for le in [
-            "0.002", "0.004", "0.006", "0.008", "0.01", "0.015", "0.02", "0.025", "0.03", "0.035",
-            "0.04", "0.06", "0.08", "0.1", "0.2", "0.4", "0.6", "0.8", "1", "2", "4", "6", "8",
-        ] {
-            assert!(
-                out.contains(&format!(
-                    r#"sgl_router_itl_seconds_bucket{{model_id="m",le="{le}"}}"#
-                )),
-                "missing engine-aligned ITL bucket le={le}; got:\n{out}",
-            );
-        }
-    }
-
-    #[test]
     fn record_stream_outcome_emits_labelled_counter_lines() {
         let reg = MetricsRegistry::new();
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
-        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::InbandError);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::StreamErrorEvent);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
         let out = reg.render();
         for expected in [
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
-            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="inband_error"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="stream_error_event"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
         ] {
