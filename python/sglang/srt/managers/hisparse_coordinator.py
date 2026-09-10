@@ -696,16 +696,21 @@ class HiSparseCoordinator:
         if not backup_indices:
             return
 
-        backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
-        )
-        backup_req_indices = req_pool_indices[backup_indices_gpu]
+        if len(backup_indices) == len(seq_lens_cpu):
+            # Avoid materializing an identity index tensor for full-batch backup.
+            backup_req_indices = req_pool_indices
+            prev_seq_lens = seq_lens - 1
+        else:
+            backup_indices_device = torch.tensor(
+                backup_indices, dtype=torch.int64, device=req_pool_indices.device
+            )
+            backup_req_indices = req_pool_indices[backup_indices_device]
+            prev_seq_lens = seq_lens[backup_indices_device] - 1
 
         # The previous compressed token's position and its device buffer slot:
         #  compressed_pos = (seq_len - 1) // compress_ratio - 1
         #  - short: slot = compressed_pos          (within the regular buffer)
         #  - long:  slot = device_buffer_size      (the reserved slot)
-        prev_seq_lens = seq_lens[backup_indices_gpu] - 1
         compressed_prev_seq_lens = prev_seq_lens // self.compress_ratio
         actual_compressed_pos = compressed_prev_seq_lens - 1
 
