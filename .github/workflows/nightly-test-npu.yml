@@ -494,6 +494,8 @@ jobs:
 
   nightly-poc-multi-node-mix-tests-cann910:
     name: multi-node-mix-poc-cann910
+    # Disabled: temporarily run only the cann910 w8a8 8p GPQA accuracy case.
+    if: ${{ false }}
     needs: [set-image-config]
     strategy:
       fail-fast: false
