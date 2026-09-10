@@ -2125,13 +2125,17 @@ class DeepseekSparseAttnBackend(
             if q_rope is not None:
                 # Triton prefill kernel reads q_nope/q_rope directly, skipping
                 # the concat (it splits q into main/tail internally anyway).
-                # Gated to gfx950 + the validated shape (16 heads, d_v=512,
-                # tail=64, topk=2048); everything else uses TileLang.
+                # Gated to gfx950/gfx942 + the validated shape (8/16 heads,
+                # d_v=512, tail=64, topk=2048); everything else uses TileLang.
+                # 2026-09-10: gfx942 (MI308X) port from the MI350X TP4 validated
+                # config — the 8-heads case (TP8: 64 heads / 8 = 8 per card)
+                # merges 2 query tokens per program in the kernel wrapper so
+                # the MFMA M dimension stays 16 with zero wasted compute.
                 if (
                     _DSA_TRITON_PREFILL
-                    and _IS_GFX95
+                    and _is_hip
                     and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-                    and layer.tp_q_head_num == 16
+                    and layer.tp_q_head_num in (8, 16)
                     and layer.v_head_dim == 512
                     and (layer.head_dim - layer.v_head_dim) == 64
                     and page_table_1.shape[-1] == 2048
