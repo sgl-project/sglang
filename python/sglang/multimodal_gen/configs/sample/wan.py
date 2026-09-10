@@ -67,7 +67,10 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
             teacache_thresh=0.08,
             use_ret_steps=True,
             coefficients_callback=_wan_1_3b_coefficients,
-            start_skipping=5,
+            # Force-compute the first 6 steps: step 5 is still structurally
+            # decisive at 1.3B, and skipping it drops the CI fidelity gate
+            # (sim/SSIM/PSNR) just below threshold.
+            start_skipping=6,
             end_skipping=1.0,
         )
     )
