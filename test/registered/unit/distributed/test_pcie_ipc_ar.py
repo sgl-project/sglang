@@ -51,6 +51,27 @@ def _make_comm(world_size=8, workspace_cls=None, cpu_group=None, tune=None):
     return comm
 
 
+class TestWorldSizeGate(CustomTestCase):
+    def test_unsupported_world_size_disables(self):
+        """A world size the kernels have no IPC channels for must disable cleanly."""
+        for world_size in (1, 3, 5, 6, 7, 16):
+            with self.subTest(world_size=world_size):
+                with patch.object(
+                    pcie_ipc_ar.dist, "get_world_size", return_value=world_size
+                ):
+                    comm = PcieIpcCommunicator(group=MagicMock(), device=0)
+                self.assertTrue(comm.disabled)
+
+    def test_missing_flashinfer_disables_instead_of_raising(self):
+        """A build without pcie_ipc_comm must degrade to NCCL, not crash the server."""
+        with (
+            patch.object(pcie_ipc_ar.dist, "get_world_size", return_value=8),
+            patch("builtins.__import__", side_effect=ImportError("no pcie_ipc_comm")),
+        ):
+            comm = PcieIpcCommunicator(group=MagicMock(), device=0)
+        self.assertTrue(comm.disabled)
+
+
 class TestGroupEligibility(CustomTestCase):
     """Which groups get this backend, which is the rule that broke other models.
 
@@ -132,27 +153,6 @@ class TestWorkspaceRelease(CustomTestCase):
         self.assertEqual(order, ["process_group", "process_group"])
 
 
-class TestWorldSizeGate(CustomTestCase):
-    def test_unsupported_world_size_disables(self):
-        """A world size the kernels have no IPC channels for must disable cleanly."""
-        for world_size in (1, 3, 5, 6, 7, 16):
-            with self.subTest(world_size=world_size):
-                with patch.object(
-                    pcie_ipc_ar.dist, "get_world_size", return_value=world_size
-                ):
-                    comm = PcieIpcCommunicator(group=MagicMock(), device=0)
-                self.assertTrue(comm.disabled)
-
-    def test_missing_flashinfer_disables_instead_of_raising(self):
-        """A build without pcie_ipc_comm must degrade to NCCL, not crash the server."""
-        with (
-            patch.object(pcie_ipc_ar.dist, "get_world_size", return_value=8),
-            patch("builtins.__import__", side_effect=ImportError("no pcie_ipc_comm")),
-        ):
-            comm = PcieIpcCommunicator(group=MagicMock(), device=0)
-        self.assertTrue(comm.disabled)
-
-
 class TestWorkspaceSizing(CustomTestCase):
     def test_sized_for_decode_not_prefill(self):
         """The default bound is the decode width, so prefill chunks stay on NCCL.
@@ -163,11 +163,11 @@ class TestWorkspaceSizing(CustomTestCase):
         comm = _make_comm()
         with patch.object(pcie_ipc_ar, "_decode_width", return_value=64):
             self.assertTrue(
-                comm._ensure_workspace(torch.empty(1, HIDDEN))
+                comm._ensure_workspace(torch.empty(1, HIDDEN, dtype=torch.bfloat16))
             )
         self.assertEqual(comm.max_numel, 64 * HIDDEN)
 
-        prefill = torch.empty(16384, HIDDEN)
+        prefill = torch.empty(16384, HIDDEN, dtype=torch.bfloat16)
         self.assertGreater(prefill.numel(), comm.max_numel)
         self.assertFalse(comm.should_pcie_ipc_ar(prefill))
 
@@ -175,14 +175,14 @@ class TestWorkspaceSizing(CustomTestCase):
         """Embedded/unit use has no server args; the bound must still be finite."""
         comm = _make_comm()
         with patch.object(pcie_ipc_ar, "_decode_width", return_value=None):
-            comm._ensure_workspace(torch.empty(1, HIDDEN))
+            comm._ensure_workspace(torch.empty(1, HIDDEN, dtype=torch.bfloat16))
         self.assertEqual(comm.max_numel, pcie_ipc_ar._FALLBACK_DECODE_WIDTH * HIDDEN)
 
     def test_env_override_wins(self):
         comm = _make_comm()
         with envs.SGLANG_PCIE_IPC_MAX_NUMEL.override(123456):
             with patch.object(pcie_ipc_ar, "_decode_width", return_value=64):
-                comm._ensure_workspace(torch.empty(1, HIDDEN))
+                comm._ensure_workspace(torch.empty(1, HIDDEN, dtype=torch.bfloat16))
         self.assertEqual(comm.max_numel, 123456)
 
     def test_build_failure_disables_once(self):
@@ -191,10 +191,10 @@ class TestWorkspaceSizing(CustomTestCase):
         comm = _make_comm(workspace_cls=cls)
         with patch.object(pcie_ipc_ar, "_decode_width", return_value=64):
             self.assertFalse(
-                comm._ensure_workspace(torch.empty(1, HIDDEN))
+                comm._ensure_workspace(torch.empty(1, HIDDEN, dtype=torch.bfloat16))
             )
             self.assertFalse(
-                comm._ensure_workspace(torch.empty(1, HIDDEN))
+                comm._ensure_workspace(torch.empty(1, HIDDEN, dtype=torch.bfloat16))
             )
         self.assertTrue(comm.disabled)
         self.assertEqual(cls.call_count, 1)
@@ -204,14 +204,14 @@ class TestShapeGuard(CustomTestCase):
     def _ready_comm(self):
         comm = _make_comm()
         with patch.object(pcie_ipc_ar, "_decode_width", return_value=64):
-            comm._ensure_workspace(torch.empty(1, HIDDEN))
+            comm._ensure_workspace(torch.empty(1, HIDDEN, dtype=torch.bfloat16))
         comm._workspace.supports.return_value = True
         return comm
 
     def test_delegates_to_flashinfer_supports(self):
         """Coverage is FlashInfer's decision; a rejected shape keeps the NCCL path."""
         comm = self._ready_comm()
-        inp = torch.empty(4, HIDDEN)
+        inp = torch.empty(4, HIDDEN, dtype=torch.bfloat16)
         self.assertTrue(comm.should_pcie_ipc_ar(inp))
 
         comm._workspace.supports.return_value = False
@@ -220,18 +220,106 @@ class TestShapeGuard(CustomTestCase):
     def test_rejects_noncontiguous_and_1d(self):
         comm = self._ready_comm()
         self.assertFalse(
-            comm.should_pcie_ipc_ar(torch.empty(4, HIDDEN).t())
+            comm.should_pcie_ipc_ar(torch.empty(4, HIDDEN, dtype=torch.bfloat16).t())
         )
         self.assertFalse(
-            comm.should_pcie_ipc_ar(torch.empty(HIDDEN))
+            comm.should_pcie_ipc_ar(torch.empty(HIDDEN, dtype=torch.bfloat16))
         )
+
+    def test_rejects_dtypes_that_were_never_tuned(self):
+        """FlashInfer keys tuning results by dtype, so fp16 would run untuned.
+
+        This adapter only ever tunes bf16, so anything else must keep its NCCL
+        path rather than run the seed policy while looking tuned.
+        """
+        comm = self._ready_comm()
+        for dtype in (torch.float16, torch.float32):
+            with self.subTest(dtype=dtype):
+                self.assertFalse(
+                    comm.should_pcie_ipc_ar(torch.empty(4, HIDDEN, dtype=dtype))
+                )
 
     def test_disabled_communicator_never_claims_a_tensor(self):
         comm = self._ready_comm()
         comm.disabled = True
         self.assertFalse(
-            comm.should_pcie_ipc_ar(torch.empty(4, HIDDEN))
+            comm.should_pcie_ipc_ar(torch.empty(4, HIDDEN, dtype=torch.bfloat16))
         )
+
+
+class TestDecodeWidth(CustomTestCase):
+    """The width must come from the server's own decode config.
+
+    Reading it from ``ServerArgs`` raised ``AttributeError`` on every call once
+    upstream moved the resolved config onto the exec bag, and a bare ``except``
+    turned that into a permanent, silent fallback: whatever ``--cuda-graph-max-bs``
+    the operator passed, the workspace was sized for a fixed 64 rows.
+    """
+
+    def _context(self, max_bs, algorithm=None, draft_tokens=None):
+        cg = MagicMock()
+        cg.decode.max_bs = max_bs
+        exec_bag = MagicMock()
+        exec_bag.graph.cuda_graph_config = cg
+        spec = MagicMock()
+        spec.speculative_algorithm = algorithm
+        spec.speculative_num_draft_tokens = draft_tokens
+        return {
+            "sglang.srt.runtime_context": MagicMock(
+                get_exec=lambda: exec_bag, get_spec=lambda: spec
+            )
+        }
+
+    def test_width_follows_the_resolved_decode_max_bs(self):
+        with patch.dict("sys.modules", self._context(max_bs=128)):
+            self.assertEqual(pcie_ipc_ar._decode_width(), 128)
+
+    def test_width_multiplies_by_the_speculative_draft_width(self):
+        """max_bs counts requests; a verify pass carries several rows each."""
+        with patch.dict(
+            "sys.modules", self._context(max_bs=64, algorithm="EAGLE", draft_tokens=4)
+        ):
+            self.assertEqual(pcie_ipc_ar._decode_width(), 256)
+
+    def test_no_speculation_means_one_row_per_request(self):
+        with patch.dict(
+            "sys.modules", self._context(max_bs=64, algorithm=None, draft_tokens=4)
+        ):
+            self.assertEqual(pcie_ipc_ar._decode_width(), 64)
+
+    def test_absent_config_is_reported_not_swallowed(self):
+        """The fallback is fine; being quiet about it is what hid this."""
+        broken = MagicMock()
+        broken.graph.cuda_graph_config = None
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.runtime_context": MagicMock(get_exec=lambda: broken)},
+        ):
+            self.assertIsNone(pcie_ipc_ar._decode_width())
+
+    def test_the_attribute_path_it_reads_still_exists(self):
+        """Mocks cannot catch a field that upstream renamed or moved.
+
+        The defect this class covers was exactly that: the derivation kept
+        reading a path that had stopped existing, and the tests around it were
+        all mocked, so nothing noticed. Pin the real chain.
+        """
+        from sglang.srt import runtime_context
+        from sglang.srt.model_executor.cuda_graph_config import (
+            default_cuda_graph_config,
+        )
+
+        self.assertTrue(hasattr(runtime_context, "get_exec"))
+        self.assertTrue(hasattr(runtime_context, "get_spec"))
+        self.assertTrue(hasattr(default_cuda_graph_config().decode, "max_bs"))
+
+    def test_fallback_width_is_announced(self):
+        comm = _make_comm()
+        with patch.object(pcie_ipc_ar, "_decode_width", return_value=None):
+            with self.assertLogs(pcie_ipc_ar.logger, level="WARNING") as logs:
+                comm._ensure_workspace(torch.empty(1, HIDDEN, dtype=torch.bfloat16))
+        self.assertIn("fallback width", "\n".join(logs.output))
+        self.assertEqual(comm.max_numel, pcie_ipc_ar._FALLBACK_DECODE_WIDTH * HIDDEN)
 
 
 class TestTuning(CustomTestCase):

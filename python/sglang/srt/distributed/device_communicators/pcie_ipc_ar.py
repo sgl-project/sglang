@@ -24,15 +24,14 @@ Message    FlashInfer   NCCL        Speed-up
 100 MiB    8.5 ms       50.4 ms     5.9x
 =========  ===========  ==========  =========
 
-Shape coverage is decided by FlashInfer's own tuning table, reached through
-:meth:`PcieIpcAllReduceWorkspace.supports`. A shape the kernels do not beat is
-reported unsupported and falls back to NCCL, so this wrapper needs no size knob
-of its own -- it asks and obeys.
+:meth:`PcieIpcAllReduceWorkspace.supports` reports whether the kernels can run
+a shape, not whether they beat NCCL on it, so the workspace bound below is what
+keeps the reductions this backend should not serve on NCCL.
 
 Workspace sizing
 ----------------
-The workspace is sized for decode, ``cuda_graph_max_bs * hidden``, which leaves
-every prefill chunk on NCCL. That split is deliberate. These kernels win by
+The workspace is sized for decode, ``max_bs * draft_tokens * hidden``, which
+leaves every prefill chunk on NCCL. That split is deliberate. These kernels win by
 latency at small messages; a prefill chunk is three orders of magnitude larger,
 and there NCCL's ring is the better algorithm. Measured at 8 ranks, TP8, 8k
 context, against NCCL as the baseline:
@@ -52,14 +51,16 @@ measured. It is also ~250x smaller, which matters at long context: at 128k with
 4 concurrent requests the prefill-sized workspace regressed TPOT by 45%, and
 that regression disappears when it is sized for decode.
 
-The bound comes from the server args, but the hidden size is not known when the
-group is built, so the workspace is created on the first eligible tensor, whose
-trailing dimension is exactly that hidden size. Ranks run the same sequence of
-reductions, so they all reach that first call with the same shape and build the
-same workspace. ``SGLANG_PCIE_IPC_MAX_NUMEL`` overrides the derivation for
-deployments that want to hand larger reductions to the kernels anyway.
+The bound comes from the resolved decode config, but the hidden size is not
+known when the group is built, so the workspace is created on the first
+eligible tensor, whose trailing dimension is exactly that hidden size. Ranks
+run the same sequence of reductions, so they all reach that first call with the
+same shape and build the same workspace. ``SGLANG_PCIE_IPC_MAX_NUMEL`` overrides
+the derivation for deployments that want to hand larger reductions to the
+kernels anyway.
 """
 
+import functools
 import logging
 from typing import Any, Optional
 
@@ -79,7 +80,6 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _FALLBACK_DECODE_WIDTH = 64
 
 
-
 #: Exact names, not a substring test: attention_tp / moe_tp / pdmux_prefill_tp
 #: carry no pynccl or custom all-reduce communicator, and a reduction
 #: dispatched to them asserts rather than falling back.
@@ -88,27 +88,57 @@ _ELIGIBLE_GROUP_NAMES = frozenset({"tp"})
 
 def eligible_group(group_name: Optional[str], world_size: int) -> bool:
     """Whether ``GroupCoordinator`` should build this backend for a group."""
-    return (
+    if not (
         envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.get()
         and world_size > 1
         and group_name in _ELIGIBLE_GROUP_NAMES
+    ):
+        return False
+    return True
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_untuned_dtype(dtype: torch.dtype) -> None:
+    """Once per dtype: a per-layer warning would be issued thousands of times."""
+    logger.warning(
+        "FlashInfer PCIe-IPC all-reduce serves bf16 only; %s reductions stay on NCCL.",
+        dtype,
     )
 
 
 def _decode_width() -> Optional[int]:
-    """Rows in the widest decode reduction, or None when the server args are absent.
+    """Rows in the widest decode reduction, or None when the config is unavailable.
 
-    Decode runs inside a captured graph, so the largest captured batch bounds the
-    reduction. Speculative decoding verifies several tokens per sequence in one
-    forward, and the decode phase's ``max_bs`` is the batch the runner captures
-    for, which already accounts for that.
+    Decode runs inside a captured graph, so the largest captured batch bounds
+    the reduction. ``max_bs`` counts requests, not rows: a speculative forward
+    verifies several draft tokens per sequence, so the row count is
+    ``max_bs * draft tokens``, as in
+    ``runtime_context.max_num_tokens_for_cutedsl_moe``.
     """
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_exec, get_spec
 
-        config = get_global_server_args().cuda_graph_config
-        return config.decode.max_bs if config is not None else None
-    except Exception:
+        cg_config = get_exec().graph.cuda_graph_config
+        if cg_config is None:
+            return None
+        max_bs = cg_config.decode.max_bs
+        if not max_bs:
+            return None
+        spec = get_spec()
+        rows_per_req = (
+            (spec.speculative_num_draft_tokens or 1)
+            if spec.speculative_algorithm
+            else 1
+        )
+        return max_bs * rows_per_req
+    except Exception as e:
+        # Embedded and unit-test use have no runtime context; the caller then
+        # sizes from a fixed width that ignores the server args, so say so.
+        logger.warning(
+            "FlashInfer PCIe-IPC could not read the resolved decode width (%s); "
+            "falling back to a fixed bound.",
+            e,
+        )
         return None
 
 
@@ -208,7 +238,18 @@ class PcieIpcCommunicator:
         if override:
             max_numel = override
         else:
-            max_numel = (_decode_width() or _FALLBACK_DECODE_WIDTH) * hidden
+            width = _decode_width()
+            if width is None:
+                # This bound admits a different set of batches than the server
+                # will issue; every reduction outside it silently uses NCCL.
+                logger.warning(
+                    "FlashInfer PCIe-IPC is sizing its workspace from the fixed "
+                    "fallback width %d, not from this server's decode config; "
+                    "set SGLANG_PCIE_IPC_MAX_NUMEL to override.",
+                    _FALLBACK_DECODE_WIDTH,
+                )
+                width = _FALLBACK_DECODE_WIDTH
+            max_numel = width * hidden
 
         try:
             self._workspace = self._workspace_cls(
@@ -231,8 +272,7 @@ class PcieIpcCommunicator:
 
         self.max_numel = max_numel
         logger.info(
-            "FlashInfer PCIe-IPC workspace built (world=%d, max_numel=%d, "
-            "hidden=%d)",
+            "FlashInfer PCIe-IPC workspace built (world=%d, max_numel=%d, hidden=%d)",
             self._world_size,
             max_numel,
             hidden,
@@ -245,9 +285,7 @@ class PcieIpcCommunicator:
 
         Call this from warmup, before any other autotuning starts. Left to the
         first reduction instead, the build lands inside SGLang's own FlashInfer
-        autotune pass, and FlashInfer refuses to profile a collective from
-        inside an autotune context it did not open -- so the tuning call would
-        return having measured nothing.
+        autotune pass, and ``_tune`` then declines -- see there for why.
         """
         if self.disabled or self._workspace is not None:
             return
@@ -264,10 +302,9 @@ class PcieIpcCommunicator:
         from flashinfer.autotuner import AutoTuner
 
         if AutoTuner.get().is_tuning_mode:
-            # FlashInfer checks the *installed* autotune process group, which
-            # belongs to whoever opened the enclosing context, so it declines to
-            # profile and the call would measure nothing. Say so rather than
-            # report a tuning that did not happen.
+            # tune() mutates shared autotuner state (process group,
+            # warmup/repeat, bucket overrides) for the length of the call, so
+            # nesting would time the enclosing pass's candidates with ours.
             logger.warning(
                 "FlashInfer PCIe-IPC all-reduce reached its first reduction inside "
                 "another autotune context; skipping autotune and keeping the seed "
@@ -315,12 +352,18 @@ class PcieIpcCommunicator:
         )
 
     def should_pcie_ipc_ar(self, inp: torch.Tensor) -> bool:
-        """Whether FlashInfer has a tuned configuration for this exact shape.
+        """Whether this reduction should go to the kernels rather than NCCL.
 
-        ``supports`` consults the tuning table, so a shape the kernels lose on is
-        rejected here and the caller keeps its NCCL path.
+        ``supports`` answers whether the kernels can run the tensor, not
+        whether they beat NCCL on it, so the size bound above is what keeps
+        prefill-sized reductions on NCCL.
         """
         if self.disabled or not inp.is_contiguous() or inp.dim() < 2:
+            return False
+        # FlashInfer keys tuning results by dtype and only bf16 is tuned here,
+        # so anything else would run the seed policy while looking tuned.
+        if inp.dtype is not torch.bfloat16:
+            _warn_untuned_dtype(inp.dtype)
             return False
         if not self._ensure_workspace(inp):
             return False
