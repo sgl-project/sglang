@@ -1982,6 +1982,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if get_fp4_gemm_runner_backend().is_marlin():
+            if self.quant_config.is_awq:
+                x = x * layer.pre_quant_scale
             return apply_fp4_marlin_linear(
                 input=x,
                 weight=layer.weight,

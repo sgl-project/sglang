@@ -750,6 +750,9 @@ class DeepseekV2MoE(nn.Module):
                     self.shared_experts.down_proj.quant_method,
                     ModelOptFp4LinearMethod,
                 )
+                # Both input quantizations bypass the linear methods' AWQ prescales.
+                and not self.shared_experts.gate_up_proj.quant_method.quant_config.is_awq
+                and not self.shared_experts.down_proj.quant_method.quant_config.is_awq
                 and fc1_n % 128 == 0
                 and self.shared_experts.swiglu_limit is None
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)

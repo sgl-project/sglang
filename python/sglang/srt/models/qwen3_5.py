@@ -193,6 +193,9 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
         and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
     ):
         return
+    # The fused producer does not apply AWQ's per-input-channel scale.
+    if mlp.down_proj.quant_method.quant_config.is_awq:
+        return
     try:
         from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
     except ImportError:
