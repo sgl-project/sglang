@@ -15,7 +15,7 @@ carries the id of its run; the answer for a pair is one bit at
 a view or a frame is.
 
 Everything CuTe/CUTLASS is imported lazily: ``flash-attn-4`` is an optional
-Blackwell-only dependency, and the multiview module must stay importable on
+Hopper/Blackwell-only dependency, and the multiview module must stay importable on
 CPU-only hosts.
 """
 
@@ -27,6 +27,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
     MultiviewBlockSparsity,
+    fa4_sparse_block_sizes,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -111,7 +112,7 @@ def _load_fa4() -> _Fa4Entry:
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             "Cosmos3 multiview backend='fa4' requires the FlashAttention-4 CuTe "
-            "package (flash-attn-4), which is CUDA 13 and Blackwell specific. "
+            "package (flash-attn-4), which needs CUDA 13 and an SM90 or SM100 GPU. "
             f"Import failed: {exc}"
         ) from exc
 
@@ -262,10 +263,11 @@ def multiview_fa4_attention(
     """
     _validate(q, k, v, sparsity)
 
-    if (sparsity.q_block_size, sparsity.kv_block_size) != (256, 128):
+    expected = fa4_sparse_block_sizes(q.device)
+    if (sparsity.q_block_size, sparsity.kv_block_size) != expected:
         raise ValueError(
-            "Cosmos3 multiview FA4 requires a (256, 128) sparse block map to match the "
-            "SM100 forward tile and q_stage=2, got "
+            f"Cosmos3 multiview FA4 requires a {expected} sparse block map on compute "
+            f"capability {torch.cuda.get_device_capability(q.device)[0]}.x, got "
             f"({sparsity.q_block_size}, {sparsity.kv_block_size})."
         )
 

@@ -51,18 +51,42 @@ TRITON_KV_BLOCK_SIZE = 64
 TRITON_NUM_STAGES = 1
 TRITON_NUM_WARPS = 4
 
-# FlashAttention-4 runs a fixed 128x128 forward tile on SM100 and stages two Q
-# tiles per CTA whenever the query length exceeds one tile, so the sparse block
-# map it consumes must be (2 * tile_m, tile_n). These are not tunable: the
-# kernel derives the same numbers from its own heuristic and rejects metadata
-# that disagrees.
-FA4_SPARSE_Q_BLOCK_SIZE = 256
-FA4_SPARSE_KV_BLOCK_SIZE = 128
+TRITON_SPARSE_BLOCK_SIZES = (SPARSE_Q_BLOCK_SIZE, SPARSE_KV_BLOCK_SIZE)
 
-_BACKEND_BLOCK_SIZES: dict[str, tuple[int, int]] = {
-    "triton": (SPARSE_Q_BLOCK_SIZE, SPARSE_KV_BLOCK_SIZE),
-    "fa4": (FA4_SPARSE_Q_BLOCK_SIZE, FA4_SPARSE_KV_BLOCK_SIZE),
+# FlashAttention-4 runs a 128x128 forward tile for head_dim 128 on both Hopper
+# and Blackwell. SM100 stages two Q tiles per CTA whenever the query length
+# exceeds one tile, so its sparse map must be (2 * tile_m, tile_n) = (256, 128);
+# SM90 stages one, so (128, 128). The kernel derives these from its own
+# heuristic and rejects metadata that disagrees. SM120 (consumer Blackwell) has
+# no block-sparse forward kernel. See flash_attn/cute/interface.py and
+# flash_attn/cute/block_sparsity.py::infer_block_sparse_expected_shapes.
+FA4_SPARSE_BLOCK_SIZES_BY_CAPABILITY: dict[int, tuple[int, int]] = {
+    9: (128, 128),
+    10: (256, 128),
+    11: (256, 128),
 }
+
+
+def fa4_sparse_block_sizes(
+    device: torch.device | None = None, *, capability_major: int | None = None
+) -> tuple[int, int]:
+    """The ``(q, kv)`` sparse block map FlashAttention-4 demands on a device."""
+    if capability_major is None:
+        if device is None or device.type != "cuda":
+            raise ValueError(
+                "Cosmos3 multiview FA4 block geometry follows the CUDA device's compute "
+                "capability; pass a CUDA device or set MultiviewLayout.fa4_block_sizes."
+            )
+        capability_major = torch.cuda.get_device_capability(device)[0]
+    sizes = FA4_SPARSE_BLOCK_SIZES_BY_CAPABILITY.get(capability_major)
+    if sizes is None:
+        raise ValueError(
+            "FlashAttention-4 block-sparse attention is not available on compute "
+            f"capability {capability_major}.x; supported: SM90 (Hopper) and SM100 "
+            "(Blackwell). Use backend='triton' on this device."
+        )
+    return sizes
+
 
 # The UND (text) stream is padded to a fixed capacity rather than to the
 # nearest block above each prompt's real length. A pad that tracks the prompt
@@ -81,12 +105,12 @@ DEFAULT_MAX_UND_TOKENS = 4096 + 2
 
 _VALID_ATTENTION_SCOPES = frozenset({"all_views", "same_view", "decomposed"})
 
-MULTIVIEW_BACKENDS: tuple[str, ...] = tuple(sorted(_BACKEND_BLOCK_SIZES))
+MULTIVIEW_BACKENDS: tuple[str, ...] = ("fa4", "triton")
 
 
 def validate_multiview_backend(backend: str) -> str:
     """Reject an unknown backend name (exposed so callers fail at load time)."""
-    if backend not in _BACKEND_BLOCK_SIZES:
+    if backend not in MULTIVIEW_BACKENDS:
         raise ValueError(
             "Cosmos3 multiview attention backend must be one of "
             f"{list(MULTIVIEW_BACKENDS)}, got {backend!r}."
@@ -176,6 +200,9 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
     #: Capacity the UND stream is padded to, independent of any one prompt's
     #: length, so the compiled attention sees a single shape.
     max_und_tokens: int = DEFAULT_MAX_UND_TOKENS
+    #: Explicit FA4 sparse block map; None derives it from the device's compute
+    #: capability at plan time (see ``fa4_sparse_block_sizes``).
+    fa4_block_sizes: tuple[int, int] | None = None
 
     #: v1 always packs one fully-clean control (WSM) item then one RGB target.
     NUM_ITEMS: ClassVar[int] = 2
@@ -183,6 +210,17 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
     def __post_init__(self) -> None:
         _validate_attention_scope(self.attention_scope)
         validate_multiview_backend(self.backend)
+        if self.fa4_block_sizes is not None and (
+            len(self.fa4_block_sizes) != 2
+            or any(
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                for size in self.fa4_block_sizes
+            )
+        ):
+            raise ValueError(
+                "Cosmos3 multiview fa4_block_sizes must be two positive ints, "
+                f"got {self.fa4_block_sizes!r}."
+            )
         if self.backend == "fa4":
             # Importing here registers the FA4 custom op while we are still
             # host-side; the module defers every CuTe/CUTLASS import.
@@ -224,10 +262,13 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
     def gen_tokens(self) -> int:
         return self.item_tokens * self.NUM_ITEMS
 
-    @property
-    def block_sizes(self) -> tuple[int, int]:
-        """The ``(q, kv)`` sparse block granularity this backend demands."""
-        return _BACKEND_BLOCK_SIZES[self.backend]
+    def sparse_block_sizes(self, device: torch.device) -> tuple[int, int]:
+        """The ``(q, kv)`` sparse block granularity this backend demands on ``device``."""
+        if self.backend == "triton":
+            return TRITON_SPARSE_BLOCK_SIZES
+        if self.fa4_block_sizes is not None:
+            return self.fa4_block_sizes
+        return fa4_sparse_block_sizes(device)
 
     def mask_items(self) -> tuple[MaskItem, ...]:
         """Build the packed control and target items.
@@ -263,6 +304,7 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
             self.seconds_per_frame,
             self.backend,
             self.max_und_tokens,
+            self.fa4_block_sizes,
         )
 
 
@@ -822,7 +864,7 @@ def get_multiview_attention_plan(
             "Cosmos3 multiview UND stream exceeds the layout capacity the attention "
             f"was sized for: tokens={real_und_len}, max_und_tokens={layout.max_und_tokens}."
         )
-    q_block_size, kv_block_size = layout.block_sizes
+    q_block_size, kv_block_size = layout.sparse_block_sizes(device)
     padded_q_len = _round_up(real_q_len, q_block_size)
     padded_und_len = _round_up(layout.max_und_tokens, kv_block_size)
     geometry = PaddedAttentionGeometry(

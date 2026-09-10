@@ -208,7 +208,7 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
     use_system_prompt: bool = True
 
     # Sparse attention kernel. ``None`` follows the checkpoint's
-    # ``multiview.backend``; ``"fa4"`` needs Blackwell, CUDA 13, and flash-attn-4.
+    # ``multiview.backend``; ``"fa4"`` needs an SM90/SM100 GPU, CUDA 13, and flash-attn-4.
     # Both backends project the same visibility predicate, so overriding is
     # safe for A/B measurement without editing the checkpoint.
     multiview_attention_backend: str | None = None

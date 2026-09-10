@@ -33,6 +33,7 @@ from sglang.multimodal_gen.registry import (
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
     DEFAULT_MAX_UND_TOKENS,
+    TRITON_SPARSE_BLOCK_SIZES,
     MaskItem,
     MultiviewAttentionContext,
     MultiviewBlockSparsity,
@@ -40,6 +41,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention impor
     build_multiview_block_sparsity,
     build_multiview_flex_metadata,
     expand_multiview_condition_frame_indexes,
+    fa4_sparse_block_sizes,
     get_multiview_attention_plan,
     multiview_pair_predicate,
     padded_multiview_flex_attention,
@@ -71,8 +73,11 @@ DEPLOYMENT_BLOCK = {
 
 
 def _fa4_available() -> bool:
-    """FlashAttention-4 CuTe block-sparse kernels need an SM100 device and the package."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+    """FA4 CuTe block-sparse kernels exist for SM90 and SM100 and need the package."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (
+        9,
+        10,
+    ):
         return False
     try:
         import cutlass  # noqa: F401
@@ -574,7 +579,8 @@ class TestPaddedFlexAttention(unittest.TestCase):
         self._run(torch.device("cuda"), torch.bfloat16, atol=3e-2, rtol=3e-2)
 
     @unittest.skipUnless(
-        _fa4_available(), "needs an SM100 device with the flash-attn-4 CuTe package"
+        _fa4_available(),
+        "needs an SM90 or SM100 device with the flash-attn-4 CuTe package",
     )
     def test_cuda_fa4_kernel_matches_dense_oracle(self):
         context = self._run(
@@ -582,55 +588,94 @@ class TestPaddedFlexAttention(unittest.TestCase):
         )
         plan = next(iter(context.mask_cache.values()))
         self.assertIsInstance(plan, MultiviewBlockSparsity)
-        self.assertEqual((plan.q_block_size, plan.kv_block_size), (256, 128))
+        self.assertEqual(
+            (plan.q_block_size, plan.kv_block_size),
+            fa4_sparse_block_sizes(torch.device("cuda")),
+        )
 
     def test_fa4_block_map_matches_dense_projection(self):
-        """The (256, 128) map FA4 demands must classify tiles exactly like the 64x64 one."""
-        layout = MultiviewLayout(
-            num_views=2,
-            latent_frames=4,
-            patch_height=4,
-            patch_width=16,
-            control_attends_sensor=True,
-            backend="fa4",
-            max_und_tokens=100,
-        )
-        context = MultiviewAttentionContext(layout, {}, {})
-        plan, geometry = get_multiview_attention_plan(
-            context,
-            real_und_len=9,
-            real_q_len=layout.gen_tokens,
-            device=torch.device("cpu"),
-        )
-        self.assertIsInstance(plan, MultiviewBlockSparsity)
-        self.assertEqual((geometry.padded_q_len, geometry.padded_und_len), (512, 128))
-        self.assertEqual(plan.q_word_base.numel(), geometry.padded_q_len)
+        """Both FA4 geometries must classify tiles exactly like the 64x64 map does."""
+        for block_sizes in ((256, 128), (128, 128)):
+            with self.subTest(block_sizes=block_sizes):
+                layout = MultiviewLayout(
+                    num_views=2,
+                    latent_frames=4,
+                    patch_height=4,
+                    patch_width=16,
+                    control_attends_sensor=True,
+                    backend="fa4",
+                    max_und_tokens=100,
+                    fa4_block_sizes=block_sizes,
+                )
+                context = MultiviewAttentionContext(layout, {}, {})
+                plan, geometry = get_multiview_attention_plan(
+                    context,
+                    real_und_len=9,
+                    real_q_len=layout.gen_tokens,
+                    device=torch.device("cpu"),
+                )
+                self.assertIsInstance(plan, MultiviewBlockSparsity)
+                self.assertEqual((plan.q_block_size, plan.kv_block_size), block_sizes)
+                self.assertEqual(
+                    (geometry.padded_q_len, geometry.padded_und_len), (512, 128)
+                )
+                self.assertEqual(plan.q_word_base.numel(), geometry.padded_q_len)
+                self.assertEqual(
+                    plan.k_group_ids.numel(),
+                    geometry.padded_und_len + geometry.padded_q_len,
+                )
+                metadata = plan.metadata
+                dense = multiview_pair_predicate(
+                    metadata,
+                    torch.arange(metadata.q_len)[:, None],
+                    torch.arange(metadata.kv_len)[None, :],
+                )
+                q_block, kv_block = block_sizes
+                for qb in range(metadata.q_len // q_block):
+                    full = set(
+                        plan.full_indices[qb, : int(plan.full_counts[qb])].tolist()
+                    )
+                    partial = set(
+                        plan.partial_indices[
+                            qb, : int(plan.partial_counts[qb])
+                        ].tolist()
+                    )
+                    for kb in range(metadata.kv_len // kv_block):
+                        tile = dense[
+                            qb * q_block : (qb + 1) * q_block,
+                            kb * kv_block : (kb + 1) * kv_block,
+                        ]
+                        if tile.all():
+                            self.assertIn(kb, full, (qb, kb))
+                        elif tile.any():
+                            self.assertIn(kb, partial, (qb, kb))
+                        else:
+                            self.assertNotIn(kb, full | partial, (qb, kb))
+
+    def test_fa4_block_geometry_follows_compute_capability(self):
+        self.assertEqual(fa4_sparse_block_sizes(capability_major=9), (128, 128))
+        self.assertEqual(fa4_sparse_block_sizes(capability_major=10), (256, 128))
+        self.assertEqual(fa4_sparse_block_sizes(capability_major=11), (256, 128))
+        for unsupported in (8, 12):
+            with self.subTest(capability=unsupported):
+                with self.assertRaisesRegex(ValueError, "not available"):
+                    fa4_sparse_block_sizes(capability_major=unsupported)
+        with self.assertRaisesRegex(ValueError, "CUDA device"):
+            fa4_sparse_block_sizes(torch.device("cpu"))
+        common = dict(num_views=1, latent_frames=1, patch_height=1, patch_width=1)
         self.assertEqual(
-            plan.k_group_ids.numel(), geometry.padded_und_len + geometry.padded_q_len
+            MultiviewLayout(**common).sparse_block_sizes(torch.device("cpu")),
+            TRITON_SPARSE_BLOCK_SIZES,
         )
-        metadata = plan.metadata
-        dense = multiview_pair_predicate(
-            metadata,
-            torch.arange(metadata.q_len)[:, None],
-            torch.arange(metadata.kv_len)[None, :],
-        )
-        q_block, kv_block = plan.q_block_size, plan.kv_block_size
-        for qb in range(metadata.q_len // q_block):
-            full = set(plan.full_indices[qb, : int(plan.full_counts[qb])].tolist())
-            partial = set(
-                plan.partial_indices[qb, : int(plan.partial_counts[qb])].tolist()
+        pinned = MultiviewLayout(backend="fa4", fa4_block_sizes=(128, 128), **common)
+        self.assertEqual(pinned.sparse_block_sizes(torch.device("cpu")), (128, 128))
+        self.assertIn((128, 128), pinned.cache_key())
+        with self.assertRaisesRegex(ValueError, "CUDA device"):
+            MultiviewLayout(backend="fa4", **common).sparse_block_sizes(
+                torch.device("cpu")
             )
-            for kb in range(metadata.kv_len // kv_block):
-                tile = dense[
-                    qb * q_block : (qb + 1) * q_block,
-                    kb * kv_block : (kb + 1) * kv_block,
-                ]
-                if tile.all():
-                    self.assertIn(kb, full, (qb, kb))
-                elif tile.any():
-                    self.assertIn(kb, partial, (qb, kb))
-                else:
-                    self.assertNotIn(kb, full | partial, (qb, kb))
+        with self.assertRaisesRegex(ValueError, "fa4_block_sizes"):
+            MultiviewLayout(backend="fa4", fa4_block_sizes=(0, 128), **common)
 
 
 class TestLayoutHelpers(unittest.TestCase):
@@ -653,7 +698,7 @@ class TestLayoutHelpers(unittest.TestCase):
         self.assertEqual(layout.frames_per_view, 24)
         self.assertEqual(layout.item_tokens, 102_960)
         self.assertEqual(layout.gen_tokens, 205_920)
-        self.assertEqual(layout.block_sizes, (64, 64))
+        self.assertEqual(layout.sparse_block_sizes(torch.device("cpu")), (64, 64))
         self.assertEqual(layout.max_und_tokens, DEFAULT_MAX_UND_TOKENS)
         with self.assertRaisesRegex(ValueError, "divisible by num_views"):
             MultiviewLayout(
