@@ -2603,6 +2603,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, mix3[:, :m], mix3[:, m : 2 * m], mix3[:, 2 * m :].reshape(
                 -1, m, m
             )
+        if _is_npu and envs.SGLANG_OPT_USE_HC_TILELANG.get():
+            x_flat = x_flat.float()
+            rsqrt = torch.rsqrt(
+                x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
+            )
+            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
+            pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
+            if apply_pre is None:
+                y = x[:, 0, :].contiguous()
+            else:
+                y = hc_combine(x_flat, apply_pre, self.hc_mult, dtype)
+            return y, pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
         if _FUSED_HC_SINKHORN and x.is_cuda and torch.version.cuda is not None:
             # One kernel for the slice reduction and the sinkhorn instead of two.
             # The split-K partial still fixes the reduction order, so the

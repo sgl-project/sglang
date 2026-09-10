@@ -3,7 +3,8 @@ import importlib
 import logging
 import math
 import threading
-from typing import Tuple
+from typing import Tuple, Callable, Any
+import os
 
 import torch
 import triton
@@ -353,6 +354,111 @@ def _hc_split_sinkhorn_triton(
     comb = comb.reshape(b, s, hc, hc).to(mixes.dtype)
     return pre, post, comb
 
+from tilelang.utils import NPUUtils
+@tilelang.jit(target="npuir")
+def hc_split_sinkhorn_kernel_ascend(hc: int, sinkhorn_iters: int, eps: float):
+    n = T.symbolic("_n")
+    mix_hc = (2 + hc) * hc
+    dtype = FP32
+    block_M = 48
+    n_num = tilelang.cdiv(n, block_M)
+    num_cores = NPUUtils.get().get_aicore_num()
+    num_iter = T.ceildiv(n_num, num_cores)
+
+    @T.prim_func
+    def hc_split_sinkhorn_kernel_(
+        mixes: T.Tensor((n, mix_hc), dtype),
+        hc_scale: T.Tensor((3,), dtype),
+        hc_base: T.Tensor((mix_hc,), dtype),
+        pre: T.Tensor((n, hc), dtype),
+        post: T.Tensor((n, hc), dtype),
+        comb: T.Tensor((n, hc, hc), dtype),
+    ):
+        with T.Kernel(num_cores, is_npu=True) as (cid, _):
+            mixes_shared = T.alloc_shared((block_M, hc), dtype)
+            mixes_shared_2 = T.alloc_shared((block_M, mix_hc - 2 * hc), dtype)
+            hc_scaled = T.alloc_shared((3,), dtype)
+            hc_based = T.alloc_shared((1, hc), dtype)
+            hc_based_2 = T.alloc_shared((1, mix_hc - 2 * hc), dtype)
+            pre_ub = T.alloc_shared((block_M, hc), dtype)
+            post_ub = T.alloc_shared((block_M, hc), dtype)
+            comb_frag = T.alloc_shared((block_M, hc, hc), dtype)
+
+            for blk in T.serial(num_iter):
+                bid = cid + blk * num_cores
+                if bid < n_num:
+                    zero = 0.0
+                    T.vbrc(zero, comb_frag)
+                    BLOCK = T.min(block_M, n - bid * block_M)
+                    T.copy(hc_scale, hc_scaled)
+
+                    # calculate pre
+                    T.copy(mixes[bid * block_M, 0], mixes_shared, size=[BLOCK, hc])
+                    T.copy(hc_base[:hc], hc_based[0, :])
+                    for i, j in T.Parallel(block_M, hc):
+                        pre_ub[i, j] = (
+                            T.sigmoid(mixes_shared[i, j] * hc_scaled[0] + hc_based[0, j]) + eps
+                        )
+                    T.copy(pre_ub, pre[bid * block_M, 0], size=[BLOCK, hc])
+
+                    # calculate post
+                    T.copy(mixes[bid * block_M, hc], mixes_shared, size=[BLOCK, hc])
+                    T.copy(hc_base[hc : hc * 2], hc_based[0, :])
+                    for i, j in T.Parallel(block_M, hc):
+                        post_ub[i, j] = 2 * T.sigmoid(
+                            mixes_shared[i, j] * hc_scaled[1] + hc_based[0, j]
+                        )
+                    T.copy(post_ub, post[bid * block_M, 0], size=[BLOCK, hc])
+
+                    # calculate comb
+                    T.copy(
+                        mixes[bid * block_M, hc * 2],
+                        mixes_shared_2,
+                        size=[BLOCK, mix_hc - 2 * hc],
+                    )
+                    T.copy(hc_base[hc * 2 :], hc_based_2[0, :])
+                    for k, i, j in T.Parallel(BLOCK, hc, hc):
+                        comb_frag[k, i, j] = (
+                            mixes_shared_2[k, i * hc + j] * hc_scaled[2]
+                            + hc_based_2[0, i * hc + j]
+                        )
+
+                    row_sum = T.alloc_shared((block_M, hc, 1), dtype)
+                    col_sum = T.alloc_shared((block_M, 1, hc), dtype)
+                    row_max = T.alloc_shared((block_M, hc, 1), dtype)
+
+                    # comb = comb.softmax(-1) + eps
+                    T.reduce_max(comb_frag, row_max, dim=2)
+                    for k, i, j in T.Parallel(block_M, hc, hc):
+                        comb_frag[k, i, j] = T.exp(comb_frag[k, i, j] - row_max[k, i, 0])
+                    T.reduce_sum(comb_frag, row_sum, dim=2)
+                    for k, i, j in T.Parallel(block_M, hc, hc):
+                        comb_frag[k, i, j] = comb_frag[k, i, j] / row_sum[k, i, 0] + eps
+
+                    # comb = comb / (comb.sum(-2) + eps)
+                    T.reduce_sum(comb_frag, col_sum, dim=1)
+                    for k, i, j in T.Parallel(block_M, hc, hc):
+                        comb_frag[k, i, j] = comb_frag[k, i, j] / (col_sum[k, 0, j] + eps)
+
+                    eps_matrix = T.alloc_shared((block_M, hc, hc), dtype)
+                    num = eps
+                    T.vbrc(num, eps_matrix)
+
+                    for _ in T.serial(sinkhorn_iters - 1):
+                        T.reduce_sum(comb_frag, row_sum, dim=2)
+                        row_denom = T.alloc_shared((block_M, hc, hc), dtype)
+                        T.vadd(row_sum, eps_matrix, row_denom)
+                        T.vdiv(comb_frag, row_denom, comb_frag)
+
+                        T.reduce_sum(comb_frag, col_sum, dim=1)
+                        col_denom = T.alloc_shared((block_M, hc, hc), dtype)
+                        T.vadd(col_sum, eps_matrix, col_denom)
+                        T.vdiv(comb_frag, col_denom, comb_frag)
+
+                    T.copy(comb_frag[0, 0, 0], comb[bid * block_M, 0, 0], size=[BLOCK, hc, hc])
+
+    return hc_split_sinkhorn_kernel_
+
 
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
@@ -362,7 +468,7 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
-    if is_gfx1250_supported() or True:
+    if is_gfx1250_supported() or not envs.SGLANG_OPT_USE_HC_TILELANG.get():
         # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
         # Triton port. _hc_split_sinkhorn_torch is kept as a reference fallback.
         return _hc_split_sinkhorn_torch(
@@ -375,7 +481,11 @@ def hc_split_sinkhorn(
     pre = mixes.new_empty(b, s, hc_mult)
     post = mixes.new_empty(b, s, hc_mult)
     comb = mixes.new_empty(b, s, hc_mult, hc_mult)
-    kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
+    kernel: Callable[..., Any]
+    if is_npu():
+        kernel = hc_split_sinkhorn_kernel_ascend(hc_mult, sinkhorn_iters, eps)
+    else:
+        kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
     kernel(
         mixes.view(-1, (2 + hc_mult) * hc_mult),
         hc_scale,
