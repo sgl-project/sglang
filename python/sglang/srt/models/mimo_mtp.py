@@ -23,7 +23,6 @@ from sglang.srt.runtime_context import get_parallel
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
