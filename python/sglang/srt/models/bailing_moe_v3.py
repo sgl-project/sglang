@@ -103,7 +103,7 @@ from sglang.srt.utils import (
 _is_fp8_fnuz = is_fp8_fnuz()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize
+    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
