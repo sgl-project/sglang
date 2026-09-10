@@ -38,7 +38,7 @@ MODEL_OTHER_ARGS = [
     4096,
     "--max-prefill-tokens",
     16384,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,
