@@ -40,7 +40,6 @@ import functools
 import logging
 import tempfile
 import uuid
-from contextlib import contextmanager
 from typing import Any, NoReturn
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
@@ -53,7 +52,7 @@ from sglang.srt.arg_groups.argparse_actions import (
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
-    resolution_projection,
+    resolution_result,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -170,6 +169,24 @@ from sglang.srt.utils.common import (  # noqa: F401
 )
 
 
+def _plain(value: Any) -> Any:
+    """``dataclasses.asdict``'s conversion, applied to one value: dataclasses
+    become dicts, containers recurse, everything else is deep-copied (a caller
+    mutating the dump must not reach the live configuration)."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _plain(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
+    if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
+        return type(value)(*(_plain(item) for item in value))
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain(item) for item in value)
+    if isinstance(value, dict):
+        return type(value)((_plain(k), _plain(v)) for k, v in value.items())
+    return copy.deepcopy(value)
+
+
 class ServerArgs:
     """Server-wide configuration for SGLang.
 
@@ -252,9 +269,8 @@ class ServerArgs:
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
         # Sealed for the duration, not just afterwards: everything below this
-        # line reads the input and declares against it, and the one channel
-        # that still writes the record (`declare_direct_writes`, for
-        # out-of-tree platform plugins) asks for the seal to be lifted by name.
+        # line reads the input and declares against it. No exceptions -- even a
+        # resolver from outside this tree assigns onto a stand-in, not here.
         self._input_frozen = True
         try:
             run_resolution_pipeline(self)
@@ -298,58 +314,10 @@ class ServerArgs:
         `model_config` memo are not fields and do not appear.
         """
 
-        return resolution_projection(self)
-
-    def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
-        """A copy of this record that stays resolved, and says what it changed.
-
-        `dataclasses.replace` builds a new instance, so the copy carries none of
-        what makes a record resolved: no raw snapshot, no declarations, no
-        finished flag. The next publish therefore resolves it again, which
-        drops every decision the stash held -- the late ones (the auto-detected
-        parsers) and the direct ones alike -- and re-runs the device probes in
-        whatever process opened the copy. The Ray paths replace
-        `dist_init_addr` on a resolved record, which is how they reach this.
-
-        The change is appended to the stash rather than left on the field: the
-        projection reads the raw snapshot plus the declarations, so a field the
-        copy set on its own would publish the parent's raw value instead.
-
-        The carry is shallow. The containers are copied so the copy's own
-        declaration does not travel back into the parent, but everything inside
-        them -- the stash entries, the raw-input values, the memoized
-        `ModelConfig` -- is shared. That is fine for what this is for: a copy
-        that immediately crosses a process boundary (Ray actors, the gateway's
-        workers), where pickling severs the sharing. A caller that mutates the
-        copy's deep structure in-process mutates the parent's too.
-        """
-        replacement = dataclasses.replace(self, **changes)
-        # Provenance, not resolution state: a copy was still launched by
-        # whatever launched its parent, resolved or not.
-        object.__setattr__(replacement, "_launch_command", self.launch_command)
-        if not getattr(self, "_resolution_finished", False):
-            # Not resolved yet: the copy goes through the gate itself.
-            return replacement
-
-        # Everything outside the fields, enumerated from the instance: the raw
-        # snapshot, the stash, and what resolution memoized -- including the
-        # model-configuration memo, which the copy carries over rather than
-        # rebuild.
-        field_names = {field.name for field in dataclasses.fields(self)}
-        for name, value in vars(self).items():
-            if name in field_names or name == "_resolution_finished":
-                continue
-            if isinstance(value, (dict, list, set)):
-                value = copy.copy(value)
-            object.__setattr__(replacement, name, value)
-        stash = getattr(replacement, "_resolved_overrides", None)
-        if stash is None:
-            stash = []
-            object.__setattr__(replacement, "_resolved_overrides", stash)
-        if changes:
-            stash.append((source, dict(changes)))
-        object.__setattr__(replacement, "_resolution_finished", True)
-        return replacement
+        return {
+            field.name: _plain(resolution_result(self, field.name))
+            for field in dataclasses.fields(self)
+        }
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -661,27 +629,6 @@ def get_global_server_args() -> NoReturn:
         "(sglang.srt.runtime_context). For the operator's raw input, which is a "
         "different question, `get_server_args()` still answers it."
     )
-
-
-@contextmanager
-def record_writable(server_args: Any):
-    """Lift the input seal for a resolver that genuinely writes the record.
-
-    There is exactly one: `declare_direct_writes`, which hands the record to an
-    out-of-tree platform plugin that sets fields on it. Those implementations
-    live outside this tree and cannot be converted by editing a resolver here,
-    so the write stays and is captured into the stash afterwards. Naming the
-    exception is the point -- an in-tree resolver that reaches for this is
-    doing something it should be declaring instead.
-    """
-    frozen = getattr(server_args, "_input_frozen", False)
-    if frozen:
-        object.__setattr__(server_args, "_input_frozen", False)
-    try:
-        yield
-    finally:
-        if frozen:
-            object.__setattr__(server_args, "_input_frozen", True)
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:

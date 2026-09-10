@@ -112,7 +112,7 @@ _MATRIX = (
     {"enable_mis": True, "attention_backend": "flashinfer"},
 )
 
-# `declare_late_resolution` call sites whose keyword expansion is built
+# `declare_resolution` call sites whose keyword expansion is built
 # dynamically; the written fields are spelled out here and drift-guarded.
 _LATE_RESOLUTION_DYNAMIC_SITES = {
     "parser/template_detection.py": frozenset({"reasoning_parser", "tool_call_parser"}),
@@ -341,10 +341,10 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         union does not depend on matrix order; and the ambient CI marker is
         cleared, so a runner's identity cannot leak into the measurement --
         the CI-conditioned writes come from `_ENV_MATRIX`'s explicit entry.
-        Late resolution counts too: `declare_late_resolution` writers run at
-        launcher stage (LoRA normalization, parser auto-detection), so their
-        target fields are collected statically from the call sites -- they are
-        resolution writes by definition, just staged after `__post_init__`.
+        Declarers outside `arg_groups/` count too: the parser auto-detection
+        runs at launcher stage and the NPU helper is called by the pipeline, so
+        their target fields are collected statically from the call sites --
+        resolution writes by definition, just not reached by the matrix.
         """
         pristine = (dict(os.environ), self._env_field_flags())
         written = set()
@@ -383,7 +383,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         for extra, env in _ENV_MATRIX:
             resolve_one(extra, env)
         self._restore_process_state(pristine)
-        written |= self._late_resolution_written_fields()
+        written |= self._declared_outside_the_pipeline()
         written |= self._hook_assignment_targets()
         written |= self._record_method_assignment_targets()
         written |= self._declarative_override_fields()
@@ -607,22 +607,32 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                         fields.add(key.value)
         return fields
 
-    def _late_resolution_written_fields(self) -> set:
-        """Fields `declare_late_resolution` writes, collected statically.
+    def _declared_outside_the_pipeline(self) -> set:
+        """Fields declared by a `declare_resolution` caller outside
+        `arg_groups/`, collected statically.
 
-        These are resolution's launcher-stage writes (they need a tokenizer or
-        adapter load, so they cannot run in `__post_init__`), which the
-        construct-and-diff pass above never sees. The keywords at the call
-        sites are the written fields; an expansion this cannot resolve fails
-        loudly like the override collector's, except the named dynamic sites
-        below, whose field sets are spelled out and drift-guarded (each name
-        must still appear as a constant in the file)."""
+        Resolution's launcher-stage writes live here -- the auto-detected
+        parsers need a tokenizer or chat-template load, so they cannot run in
+        `__post_init__` -- alongside the NPU default helper and the expert-pack
+        loader, which the pipeline calls the same way. The construct-and-diff
+        pass above never sees any of them.
+
+        `arg_groups/` is deliberately excluded: `_hook_assignment_targets`
+        covers it exactly, and it resolves the pipeline's own computed
+        expansions (`record_foreign_defaults` declares a `**` dict this
+        collector's resolver cannot read). The keywords at the call sites are
+        the written fields; an expansion this cannot resolve fails loudly like
+        the override collector's, except the named dynamic sites below, whose
+        field sets are spelled out and drift-guarded (each name must still
+        appear as a constant in the file)."""
         written = set()
         root = _PACKAGE_ROOT
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(root).as_posix()
+            if rel.startswith("arg_groups/"):
+                continue
             source = path.read_text(encoding="utf-8-sig")
-            if "declare_late_resolution" not in source:
+            if "declare_resolution" not in source:
                 continue
             try:
                 tree = ast.parse(source)
@@ -634,12 +644,12 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     and (
                         (
                             isinstance(node.func, ast.Name)
-                            and node.func.id == "declare_late_resolution"
+                            and node.func.id == "declare_resolution"
                         )
                         or (
                             isinstance(node.func, ast.Attribute)
                             and node.func.attr
-                            in ("declare_late_resolution", "_late_resolution")
+                            in ("declare_resolution", "_declare_resolution")
                         )
                     )
                 ):

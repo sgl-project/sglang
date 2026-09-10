@@ -2886,17 +2886,32 @@ class TestTheInputIsSealedDuringResolution(CustomTestCase):
         with self.assertRaisesRegex(AttributeError, "after resolution"):
             server_args.tp_size = 4
 
-    def test_the_named_exception_lifts_it(self):
-        """`declare_direct_writes` hands the record to an out-of-tree platform
-        plugin that sets fields on it; that is the only channel."""
-        from sglang.srt.server_args import record_writable
+    def test_it_has_no_exception(self):
+        """A resolver from outside this tree assigns fields -- an interface this
+        tree does not own -- and it still does not reach the record.
+
+        `record_foreign_defaults` hands it a stand-in: the assignment is
+        captured and declared, the field keeps the operator's input, and the
+        seal stays armed for the whole call. There used to be a named lift for
+        this, which made the record the one thing resolution could write.
+        """
+        from sglang.srt.arg_groups.overrides import (
+            record_foreign_defaults,
+            resolution_result,
+        )
 
         server_args = ServerArgs(model_path="dummy", device="cuda")
         object.__setattr__(server_args, "_input_frozen", True)
-        with record_writable(server_args):
-            server_args.tp_size = 4
-        self.assertEqual(server_args.tp_size, 4)
-        # and it goes back on afterwards
+
+        def foreign(config):
+            # What a plugin does: read what is decided, assign a default.
+            assert config.tp_size == 1
+            config.tp_size = 4
+
+        record_foreign_defaults(server_args, "platform:probe", foreign)
+
+        self.assertEqual(resolution_result(server_args, "tp_size"), 4)
+        self.assertEqual(server_args.tp_size, 1, "the record is the input")
         with self.assertRaisesRegex(AttributeError, "during resolution"):
             server_args.tp_size = 8
 
@@ -2939,15 +2954,6 @@ class TestLaunchCommand(CustomTestCase):
         server_args = prepare_server_args(["--model-path", "/tmp/x"])
         self.assertEqual(
             pickle.loads(pickle.dumps(server_args)).launch_command,
-            server_args.launch_command,
-        )
-
-    def test_a_copy_keeps_it(self):
-        """`replace_resolved` is how the Ray paths rewrite `dist_init_addr`;
-        the copy was launched by whatever launched its parent."""
-        server_args = prepare_server_args(["--model-path", "/tmp/x"])
-        self.assertEqual(
-            server_args.replace_resolved("test").launch_command,
             server_args.launch_command,
         )
 

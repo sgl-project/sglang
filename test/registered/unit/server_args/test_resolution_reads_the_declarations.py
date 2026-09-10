@@ -86,8 +86,7 @@ def _field_reads(fn, holders):
 _DECLARERS = frozenset(
     {
         "declare_resolution",
-        "declare_late_resolution",
-        "declare_direct_writes",
+        "record_foreign_defaults",
     }
 )
 
@@ -271,7 +270,7 @@ def _record_aliases(function):
                 aliases.add(target.id)
         elif (
             isinstance(func, ast.Attribute)
-            and func.attr in ("from_cli_args", "replace_resolved")
+            and func.attr == "from_cli_args"
             and isinstance(func.value, ast.Name)
             and func.value.id == "ServerArgs"
         ):

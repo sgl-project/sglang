@@ -1282,7 +1282,7 @@ class _ServerArgsOverride:
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
-            declare_late_resolution,
+            declare_resolution,
         )
 
         server_args = ServerArgs(model_path="dummy")
@@ -1306,7 +1306,7 @@ class _ServerArgsOverride:
         fields = set(type(server_args).__dataclass_fields__)
         declared = {n: v for n, v in self._fields.items() if n in fields}
         if declared:
-            declare_late_resolution(server_args, "override_server_args", **declared)
+            declare_resolution(server_args, "override_server_args", **declared)
         # What is left seeds the record's own private caches (`_model_config`
         # and friends), which are not configuration and never were.
         seeds = {n: v for n, v in self._fields.items() if n not in fields}
