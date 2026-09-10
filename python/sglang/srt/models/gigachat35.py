@@ -432,15 +432,15 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             build_norm(config, config.hidden_size) if self._use_post else None
         )
 
-        self._attn_prepare_layernorm = (
+        attn_prepare_layernorm = (
             self.input_layernorm if self._use_pre else GigaChat35PassthroughNorm()
         )
-        self._mlp_prepare_layernorm = GigaChat35MlpPrepNorm(
+        mlp_prepare_layernorm = GigaChat35MlpPrepNorm(
             pre_layernorm=self.post_attention_layernorm if self._use_pre else None,
             post_layernorm=self.post_self_attn_layernorm,
         )
-        self.layer_communicator.input_layernorm = self._attn_prepare_layernorm
-        self.layer_communicator.post_attention_layernorm = self._mlp_prepare_layernorm
+        self.layer_communicator.input_layernorm = attn_prepare_layernorm
+        self.layer_communicator.post_attention_layernorm = mlp_prepare_layernorm
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         if is_nextn:
