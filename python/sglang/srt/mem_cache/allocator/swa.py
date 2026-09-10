@@ -461,6 +461,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._free_swa_pages(free_index, start_pos=start_pos)
 
     def _free_swa_pages(self, free_index: torch.Tensor, *, start_pos: int):
+        if self._swa_req_ring:
+            # mapping unwritten in ring mode; page reps would free padding slot 0
+            return
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
         # First token of every page the segment touches; the caller allocated
