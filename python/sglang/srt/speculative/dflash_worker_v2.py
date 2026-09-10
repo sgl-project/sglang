@@ -1959,4 +1959,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
+            kv_weight_version_record=target_out.kv_weight_version_record,
         )

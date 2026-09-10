@@ -686,6 +686,9 @@ class SchedulerDisaggregationPrefillMixin:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        if (record := result.kv_weight_version_record) is not None:
+            record.finalize(tracker=self.kv_weight_version_tracker)
+            result.kv_weight_version_record = None
 
         logprob_pt = 0
         assert batch.spec_info is result.next_draft_input

@@ -3556,6 +3556,11 @@ class ServerArgs:
         "Enable returning indexer topk indices of layers with indexer with responses.",
         NS("exec.features"),
     ] = False
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+        NS("exec.features"),
+    ] = False
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -8196,6 +8201,20 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+
+        if self.enable_prefill_weight_versions:
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "The argument enable-prefill-weight-versions cannot be combined with "
+                    "enable-hierarchical-cache: KV restored from the host or storage tiers carries "
+                    "no weight version, so the reported prompt versions would be wrong."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "The argument enable-prefill-weight-versions is not supported in disaggregation "
+                    f"mode {self.disaggregation_mode!r}: prefill workers do not report prompt weight "
+                    "versions yet."
+                )
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":

@@ -1331,6 +1331,32 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
+    def test_prefill_weight_versions_rejects_hierarchical_cache(self):
+        """KV restored from a host or storage tier carries no weight version, so the two cannot combine."""
+        args = self._make_args(
+            enable_prefill_weight_versions=True,
+            enable_hierarchical_cache=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
+            args._handle_cache_compatibility()
+
+    def test_prefill_weight_versions_rejects_disaggregation(self):
+        """PD prefill workers do not stamp prompt tokens yet, so the flag is refused there."""
+        args = self._make_args(
+            enable_prefill_weight_versions=True,
+            disaggregation_mode="prefill",
+        )
+
+        with self.assertRaisesRegex(ValueError, "disaggregation"):
+            args._handle_cache_compatibility()
+
+    def test_prefill_weight_versions_alone_is_accepted(self):
+        """A plain engine may report prompt weight versions."""
+        args = self._make_args(enable_prefill_weight_versions=True)
+
+        args._handle_cache_compatibility()
+
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
             disaggregation_mode="decode",

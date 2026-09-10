@@ -540,6 +540,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                kv_weight_version_record=out.kv_weight_version_record,
             )
 
             if is_verify:
