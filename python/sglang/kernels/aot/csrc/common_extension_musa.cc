@@ -230,6 +230,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kMUSA, &transfer_kv_per_layer_mla_pf_lf);
   m.def(
+      "transfer_kv_per_layer_mla_lf_pf(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int layer_id, "
+      "int item_size, int dst_layout_dim, int block_quota, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_mla_lf_pf", torch::kMUSA, &transfer_kv_per_layer_mla_lf_pf);
+  m.def(
       "transfer_kv_all_layer_mla(Tensor src_layers, Tensor dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "item_size, int num_layers, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_mla", torch::kMUSA, &transfer_kv_all_layer_mla);
