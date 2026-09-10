@@ -1375,7 +1375,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
         #   so no rank hits this path while others proceed to the allgather.
         # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
-        # - CUDA graph warmup: not applicable when --disable-piecewise-cuda-graph is used.
+        # - CUDA graph warmup: not applicable when --cuda-graph-backend-prefill=disabled is used.
         if hidden_states.shape[0] == 0:
             return hidden_states, residual
 
