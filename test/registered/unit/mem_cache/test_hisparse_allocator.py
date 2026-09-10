@@ -46,7 +46,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             seq_lens_cpu=seq_lens_cpu,
             last_loc=last_loc,
             extend_num_tokens=512,
-            swa_tail_len=128,
+            swa_tail_lens=[128],
         )
 
         self.assertIs(result, expected)
@@ -58,7 +58,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertIs(kwargs["seq_lens_cpu"], seq_lens_cpu)
         self.assertIs(kwargs["last_loc"], last_loc)
         self.assertEqual(kwargs["extend_num_tokens"], 512)
-        self.assertEqual(kwargs["swa_tail_len"], 128)
+        self.assertEqual(kwargs["swa_tail_lens"], [128])
 
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
@@ -157,7 +157,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator.alloc_logical_only.assert_not_called()
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
         self.assertEqual(kwargs["extend_num_tokens"], fill_len)
-        self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
+        self.assertEqual(kwargs["swa_tail_lens"], [swa_tail_len])
         self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
