@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
+    ComponentType,
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     TreeComponent,
@@ -46,6 +47,14 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+_EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
+    {
+        ComponentType.FULL,
+        ComponentType.SWA,
+    }
+)
 
 
 class UnifiedCacheLinker(ABC):
@@ -139,6 +148,16 @@ class UnifiedCacheLinkerWrapper:
         cache: UnifiedRadixCache,
         cache_linker: UnifiedCacheLinker,
     ):
+        unsupported = set(cache.tree_components) - _EXTERNAL_LINKER_SUPPORTED_COMPONENTS
+        if unsupported:
+            names = ", ".join(
+                component.name for component in sorted(unsupported, key=int)
+            )
+            raise ValueError(
+                "External cache linker supports only Full and SWA tree "
+                f"components; unsupported: {names}"
+            )
+
         self.cache = cache
         self.cache_linker = cache_linker
         # rid -> what match found, consumed by the next init_load_back.
@@ -162,6 +181,7 @@ class UnifiedCacheLinkerWrapper:
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
+        key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
         if device_hit_len >= len(key):
@@ -343,10 +363,9 @@ class UnifiedCacheLinkerWrapper:
 
         self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
-        node = cache.resolve_node_handle(insert_result.last_device_node)
-        while node.id != req.last_node:
-            node.external_cache_stored = True
-            node = node.parent
+        cache.tree_core.mark_external_cache_stored_path(
+            insert_result.last_device_node, req.last_node
+        )
         return canonical_tail, insert_result.last_device_node
 
     def _queue_load(
@@ -461,20 +480,14 @@ class UnifiedCacheLinkerWrapper:
     def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
         """Persist a write-through chain, skipping nodes already in the store."""
         for node_id in node_ids:
-            if not self.cache.resolve_node_handle(node_id).external_cache_stored:
-                self._offload_node(node_id)
-
-    def _offload_node(self, node_id: NodeId) -> None:
-        cache = self.cache
-        node = cache.resolve_node_handle(node_id)
-        transfers = []
-        for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.OFFLOAD, node, None
+            transfers = self.cache.tree_core.build_external_linker_offload_transfers(
+                node_id
             )
-            if transfer is not None:
-                transfers.append(transfer)
+            if transfers is not None:
+                self._offload_node(node_id, transfers)
 
+    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
+        cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
             queued = self.cache_linker.offload(transfers)
@@ -485,8 +498,7 @@ class UnifiedCacheLinkerWrapper:
             cache.dec_lock_ref(node_id, lock_params)
             return
 
-        cache.tree_core.mark_write_through_pending(node_id)
-        node.external_cache_stored = True
+        cache.tree_core.mark_external_linker_offload_pending(node_id)
         self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
 
     def replace_pending_offload_node(
@@ -528,11 +540,9 @@ class UnifiedCacheLinkerWrapper:
         assert len(successes) <= len(self.pending_offloads)
         for success in successes:
             pending = self.pending_offloads.pop(0)
-            for node_id in pending.publish_node_ids:
-                node = self.cache.resolve_node_handle(node_id)
-                if node.write_through_pending_id == pending.lock_node_id:
-                    node.write_through_pending_id = None
-                node.external_cache_stored = success
+            self.cache.tree_core.finish_external_linker_offload(
+                pending.publish_node_ids, pending.lock_node_id, success
+            )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
@@ -550,11 +560,9 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
         for pending in self.pending_offloads:
-            for node_id in pending.publish_node_ids:
-                node = self.cache.resolve_node_handle(node_id)
-                if node.write_through_pending_id == pending.lock_node_id:
-                    node.write_through_pending_id = None
-                node.external_cache_stored = False
+            self.cache.tree_core.finish_external_linker_offload(
+                pending.publish_node_ids, pending.lock_node_id, False
+            )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
 

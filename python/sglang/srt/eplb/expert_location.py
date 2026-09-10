@@ -447,8 +447,7 @@ def format_physical_to_logical_map(
         row = physical_to_logical_map[layer_id].tolist()
         if remainder != 0:
             lines.append(
-                f"layer={layer_id}: "
-                f"physical={json.dumps(row, separators=(',', ':'))}"
+                f"layer={layer_id}: physical={json.dumps(row, separators=(',', ':'))}"
             )
             continue
 

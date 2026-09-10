@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph,
 )
@@ -26,7 +27,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeAttentionBackend:
@@ -93,6 +94,52 @@ class _FakeBatchRegistry:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    @patch(
+        "sglang.srt.model_executor.model_runner.require_gathered_buffer",
+        return_value=True,
+    )
+    def test_default_attn_tp_sequence_sharded_uses_runtime_predicate(
+        self, mock_require_gathered_buffer
+    ):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.server_args = object()
+
+        self.assertTrue(runner.attn_tp_sequence_sharded(num_tokens=4))
+        mock_require_gathered_buffer.assert_called_once_with()
+
+    def test_dummy_batch_sharding_tracks_forward_token_width(self):
+        """Warmup must use the runner's SP policy, including embedding widths."""
+
+        class TokenGatedRunner(ModelRunner):
+            def attn_tp_sequence_sharded(self, num_tokens):
+                return num_tokens == 4
+
+        runner = TokenGatedRunner.__new__(TokenGatedRunner)
+        for num_ids, num_embeds, expected in (
+            (4, None, True),
+            (5, None, False),
+            (5, 4, True),
+            (4, 5, False),
+            (0, None, False),
+        ):
+            with self.subTest(num_ids=num_ids, num_embeds=num_embeds):
+                batch = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=1,
+                    input_ids=torch.arange(num_ids),
+                    input_embeds=(
+                        torch.empty(num_embeds, 8) if num_embeds is not None else None
+                    ),
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens=torch.tensor([num_ids]),
+                    out_cache_loc=torch.arange(num_ids),
+                    seq_lens_sum=num_ids,
+                    attn_tp_sequence_sharded=not expected,
+                )
+
+                self.assertIs(runner.prepare_dummy_forward_batch(batch), batch)
+                self.assertEqual(batch.attn_tp_sequence_sharded, expected)
+
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()
@@ -121,6 +168,13 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
             layer_info=SimpleNamespace(start_layer=0, end_layer=1),
             req_to_token_pool=SimpleNamespace(size=1),
+            get_cuda_graph_layers=lambda _layer_model: (
+                [object()],
+                [],
+                [],
+                [],
+                [None],
+            ),
         )
         language_model = SimpleNamespace(layers=[object()])
 
@@ -128,11 +182,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
             patch.object(
                 graph_setup, "resolve_language_model", return_value=language_model
-            ),
-            patch.object(
-                graph_setup,
-                "compute_attention_and_moe_layers",
-                return_value=([object()], [], [], [], [None]),
             ),
             patch.object(
                 graph_setup,
@@ -196,7 +245,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.buffer_registry = _FakeBatchRegistry()
-        runner.enable_cp_v2_bcg_capture = False
+        runner.model_runner = SimpleNamespace(attn_tp_sequence_sharded=lambda _: False)
+        runner.enable_cp_bcg_capture = False
         runner._is_full_backend = False
         runner.backend = SimpleNamespace()
         runner.has_mha_companion_layers = False
@@ -441,6 +491,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             forward_mode=SimpleNamespace(is_target_verify=lambda: False),
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
+            dp_prefill_cuda_graph_max_prefix_len=0,
             return_logprob=False,
             extend_prefix_lens_cpu=[8],
         )

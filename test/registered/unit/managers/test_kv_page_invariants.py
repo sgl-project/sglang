@@ -9,7 +9,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _PAGE_SIZE = 256
 
@@ -22,7 +22,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
     alloc = SimpleNamespace(
         page_size=page_size,
         free_pages=free_pages,
-        release_pages=torch.empty(0, dtype=torch.int64),
+        get_all_free_pages=lambda: free_pages,
     )
     tc = SimpleNamespace(slots={})
     _ps, _rtp, _alloc, _tc = page_size, rtp, alloc, tc

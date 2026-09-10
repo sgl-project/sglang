@@ -106,13 +106,6 @@ def _compute_clip_score(image_bytes: bytes, prompt: str) -> float | None:
 class TestZImageTurboAMD(DiffusionServerBase):
     """AMD nightly test for Z-Image-Turbo text-to-image generation."""
 
-    @classmethod
-    def teardown_class(cls):
-        try:
-            super().teardown_class()
-        except AttributeError:
-            pass
-
     @pytest.fixture(params=AMD_ZIMAGE_CASES, ids=lambda c: c.id)
     def case(self, request) -> DiffusionTestCase:
         return request.param

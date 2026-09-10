@@ -1,7 +1,7 @@
 from sglang.srt.runtime_context import get_context, get_observability
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import math
 import types
@@ -405,6 +405,109 @@ class TestIdleMetrics(unittest.TestCase):
         self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
         self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
         self.assertEqual(self.published_occupancies, [])
+
+
+class TestSchedulerTimeAccounting(CustomTestCase):
+    def setUp(self):
+        self.reporter = _make_reporter(self, types.SimpleNamespace())
+        self.idle_seconds = []
+        self.process_cpu_seconds = []
+        self.stage_seconds = []
+        self.reporter.enable_metrics = True
+        self.reporter.scheduler_stage_metrics.enabled = True
+        self.reporter.metrics_collector = types.SimpleNamespace(
+            increment_scheduler_idle_seconds=self.idle_seconds.append,
+            increment_scheduler_process_cpu_seconds=self.process_cpu_seconds.append,
+            increment_scheduler_stage_seconds=lambda **kwargs: (
+                self.stage_seconds.append(kwargs)
+            ),
+        )
+
+    def test_counts_idle_wall_time_and_process_cpu_time(self):
+        wall_timestamps = [
+            0,
+            1_200_000_000,
+            1_500_000_000,
+            2_700_000_000,
+            3_000_000_000,
+            4_100_000_000,
+        ]
+        process_cpu_timestamps = [
+            0,
+            400_000_000,
+            1_200_000_000,
+            1_900_000_000,
+        ]
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=wall_timestamps,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=process_cpu_timestamps,
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            self.reporter.record_scheduler_idle()
+            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_idle()
+            self.reporter.record_scheduler_idle()
+
+        self.assertAlmostEqual(sum(self.idle_seconds), 2.6)
+        self.assertAlmostEqual(sum(self.process_cpu_seconds), 1.9)
+        self.assertAlmostEqual(
+            sum(sample["seconds"] for sample in self.stage_seconds), 4.1
+        )
+        self.assertEqual({sample["stage"] for sample in self.stage_seconds}, {"other"})
+
+    def test_state_transitions_accumulate_until_periodic_update(self):
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=[0, 200_000_000, 400_000_000, 700_000_000, 1_100_000_000],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[0, 300_000_000],
+            ) as process_time,
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            accounting = self.reporter._scheduler_time_accounting
+            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_idle()
+            self.reporter.record_scheduler_active()
+            self.assertEqual(self.idle_seconds, [])
+            self.assertEqual(self.process_cpu_seconds, [])
+            self.assertEqual(
+                self.reporter._scheduler_time_accounting.accumulate_idle_ns,
+                500_000_000,
+            )
+            self.reporter.record_scheduler_active()
+
+        self.assertIs(self.reporter._scheduler_time_accounting, accounting)
+        self.assertEqual(process_time.call_count, 2)
+        self.assertEqual(self.idle_seconds, [0.5])
+        self.assertAlmostEqual(self.process_cpu_seconds[0], 0.3)
+
+    def test_periodic_update_skips_zero_idle_but_records_cpu_sample(self):
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=[0, 0, 1_000_000_000],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[0, 0],
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            self.reporter.record_scheduler_active()
+            self.reporter.record_scheduler_active()
+
+        self.assertEqual(self.idle_seconds, [])
+        self.assertEqual(self.process_cpu_seconds, [0.0])
 
 
 class TestEstimatedPrefillPerf(CustomTestCase):
