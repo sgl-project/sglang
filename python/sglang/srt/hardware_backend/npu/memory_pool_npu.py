@@ -833,7 +833,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        """Select this rank's tokens out of a DCP-widened loc and compact them.
+        """Redirect a DCP-widened loc so this rank's tokens land on its rows.
 
         The allocator hands every rank the same *virtual* locations, spanning
         the whole sequence. The latent KV is sharded, so a rank keeps only the
@@ -845,20 +845,34 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         There the filter and the divide happen inside the store. Here they
         cannot: `npu_scatter_nd_update_` is a fused vendor operator with no body
-        to edit, so both have to run as tensor ops before the call. That makes
-        the mask a real gather -- an allocation and a copy per buffer per layer
-        per write -- rather than a predicate folded into an existing load. It is
-        the price of this path, and it belongs in the decode-step budget rather
-        than being assumed free.
+        to edit, so both have to run as tensor ops before the call.
 
-        CUDA also passes a `reserved_skip_index` (slot 0, CUDA-graph padding).
-        No equivalent is needed here. The allocator seeds `free_pages` from 1
-        (allocator/paged.py:339-343), so no real token is ever issued a virtual
-        loc below one page; with the widened page of `page_size * dcp_size`, the
-        smallest real virtual loc divides down to `page_size`. Physical page 0
-        therefore stays the padding page on every rank, and a padding write at
-        virtual loc 0 either lands there (rank 0) or is filtered out (all
-        others). Both are harmless, which is why the filter alone suffices.
+        **This rewrites the destination rather than dropping rows, and that is
+        load-bearing.** The first version selected -- ``loc[owned]``,
+        ``cache_k[owned]``, ``cache_v[owned]`` -- which is the obvious reading of
+        the contract above and cannot be captured into a graph. A boolean index
+        has a data-dependent output shape, so torch_npu resolves it with
+        ``aclnnNonzeroV2`` and must synchronize the stream to learn how many rows
+        survived; synchronizing a captured stream is refused outright
+        (``rtStreamSynchronize ... reason=stream is captured``), so decode graph
+        capture died here on every rank. Nothing about it degrades gracefully:
+        the shape is genuinely unknown until the data is read.
+
+        So every row is written and the non-owned ones are aimed at physical row
+        0 instead. That row is the padding row -- the allocator seeds
+        ``free_pages`` from 1 (allocator/paged.py:339-343), so no real token is
+        ever issued a virtual loc below one page, and with the widened page of
+        ``page_size * dcp_size`` the smallest real virtual loc divides down to
+        ``page_size``. Physical page 0 is therefore never allocated on any rank,
+        which is precisely what CUDA's ``reserved_skip_index`` reserves it for.
+        Duplicate destinations are fine: every colliding write carries a value
+        nothing reads, so last-write-wins is deterministic in the only sense that
+        matters.
+
+        It costs ``dcp_size`` times the write volume -- 5.7 MB per decode step at
+        batch 64, dcp16, 78 layers, against 0.36 MB -- and buys back three
+        boolean gathers per layer, each of which allocated, copied, and launched
+        a NonZero. Eager mode should not be slower for it, and may be faster.
         """
         dcp_size = get_parallel().attn_dcp_size
         # Bounds are checked against the WIDENED space, matching the CUDA
@@ -875,7 +889,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             return loc, cache_k, cache_v
 
         owned = (loc % dcp_size) == get_parallel().attn_dcp_rank
-        return loc[owned] // dcp_size, cache_k[owned], cache_v[owned]
+        # Static shape, no NonZero, no stream sync: capturable. See the note
+        # above for why row 0 is the right place to send the rest.
+        return (
+            torch.where(owned, loc // dcp_size, loc.new_zeros(())),
+            cache_k,
+            cache_v,
+        )
 
     def set_kv_buffer(
         self,
