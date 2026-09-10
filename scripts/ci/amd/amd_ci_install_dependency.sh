@@ -157,6 +157,9 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
+# Accuracy gates require sgl-eval even when optional test dependencies are skipped.
+install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "sgl-eval==0.1.0"
+
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else

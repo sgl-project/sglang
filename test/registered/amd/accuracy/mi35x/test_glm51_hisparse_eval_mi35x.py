@@ -69,11 +69,9 @@ class TestGLM51HiSparseEvalMI35x(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=4000,
             num_examples=500,
             num_threads=100,
-            num_shots=24,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")

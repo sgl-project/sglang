@@ -1441,7 +1441,7 @@ Median ITL (ms):                         15.11
   </tbody>
 </table>
 
-> **Note**: These GSM8K numbers use the raw few-shot completion harness (`sglang.test.few_shot_gsm8k`). `gemma-4-12B-it` is reasoning-oriented and is under-elicited by raw few-shot prompting; with the chat template it scores **0.950** on the same 1319 GSM8K test questions (`sglang.test.run_eval --eval-name gsm8k`).
+> **Note**: These GSM8K numbers use the raw few-shot completion harness (now removed). `gemma-4-12B-it` is reasoning-oriented and is under-elicited by raw few-shot prompting; with the chat template it scores **0.950** on the same 1319 GSM8K test questions (also measured before the sgl-eval migration).
 
 #### gemma-4-12B-it with sgl-eval
 
@@ -1464,6 +1464,8 @@ sgl-eval ping --base-url http://localhost:30000/v1
 sgl-eval run gsm8k --base-url http://localhost:30000/v1
 sgl-eval run mmlu  --base-url http://localhost:30000/v1 --num-examples 2000
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 #### MMMU
 

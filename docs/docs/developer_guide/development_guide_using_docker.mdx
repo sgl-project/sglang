@@ -114,10 +114,9 @@ nsys profile -o deepseek_v3 python3 -m sglang.bench_one_batch --batch-size 1 --i
 ## Evaluation
 
 ```bash Command
-# GSM8K via the Chat API: 8-shot, 1311 held-out questions
-python3 -m sglang.test.run_eval \
-  --eval-name gsm8k --api chat \
-  --host 127.0.0.1 --port 30000 \
-  --num-examples 1311 --num-threads 2000 \
-  --num-shots 8
+# GSM8K via sgl-eval: all 1319 test questions
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 1319 \
+  --num-threads 2000
 ```

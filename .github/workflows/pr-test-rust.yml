@@ -305,7 +305,7 @@ jobs:
 
       - name: Install e2e test dependencies
         run: |
-          python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking numpy
+          python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking numpy sgl-eval==0.1.0
           if [ -n "${{ matrix.extra_deps }}" ]; then
             if echo "${{ matrix.extra_deps }}" | grep -q "genai-bench"; then
               # genai-bench's transitive deps (oci/locust) pull

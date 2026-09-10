@@ -973,14 +973,13 @@ Document model accuracy on standard benchmarks:
 - Benchmark Command
 
 ```bash Command
-python3 -m sglang.test.run_eval \
-  --eval-name gsm8k --api chat \
-  --host 127.0.0.1 --port 30000 \
-  --num-examples 1311 --num-threads 1316 \
-  --num-shots 8
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 1319 \
+  --num-threads 1316
 ```
 
-Historical results below use the removed harness and are not measurements of the Chat API command above.
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 **Test Results:**
 

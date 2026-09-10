@@ -178,7 +178,6 @@ class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
             base_url=self.base_url,
             model=DSV4_FLASH_MODEL_PATH,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=64,

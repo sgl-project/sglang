@@ -56,7 +56,6 @@ class TestQwen330BAttnCP(GSM8KAscendMixin, CustomTestCase):
     accuracy = 0.92  # GSM8K accuracy ≥0.92
     gsm8k_parallel = 32
     num_questions = 100
-    gsm8k_num_shots = 5
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """MI30x DeepSeek-V4-Flash FP8 Accuracy Test (8-GPU)
 
-GSM8K few-shot accuracy for DeepSeek-V4-Flash FP8 on MI30x (gfx942) ROCm 7.2.
+sgl-eval GSM8K accuracy for DeepSeek-V4-Flash FP8 on MI30x (gfx942) ROCm 7.2.
 
 The launch config is the cookbook's MI300X Flash FP8 low-latency single-node
 recipe, verbatim -- the one the docs tell users to run, marked `verified: true`
@@ -33,7 +33,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -116,15 +116,14 @@ class TestDeepseekV4FlashFp8Mi30x(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=1319,
-            parallel=1319,
-            max_new_tokens=512,
+            eval_name="gsm8k",
+            num_examples=1319,
+            num_threads=1319,
+            max_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():

@@ -1,6 +1,6 @@
 """Qwen3.5-9B GSM8K accuracy on Intel XPU (TP=4).
 
-Scored by ``simple_eval_gsm8k.GSM8KEval``. Covers both the opt-in fused GDN
+Scored by ``sgl-eval``. Covers both the opt-in fused GDN
 SYCL kernel path (``--linear-attn-backend intel_xpu``) and the default Triton
 GDN path (``triton``, unchanged from other platforms).
 """
@@ -11,7 +11,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
+from sglang.test.xpu.sgl_eval_gsm8k_xpu_mixin import SglEvalGSM8KXPUMixin
 
 register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
 
@@ -20,7 +20,7 @@ register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
     torch.xpu.is_available(),
     "Intel XPU not available (torch.xpu.is_available() returned False)",
 )
-class Qwen3_5_9BXPUBase(SimpleEvalGSM8KXPUMixin, CustomTestCase):
+class Qwen3_5_9BXPUBase(SglEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
     tp_size = 1
     accuracy = 0.90
@@ -29,7 +29,7 @@ class Qwen3_5_9BXPUBase(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     num_threads = 4
     max_tokens = 8192
 
-    other_args = SimpleEvalGSM8KXPUMixin.other_args + [
+    other_args = SglEvalGSM8KXPUMixin.other_args + [
         "--page-size",
         "128",
         "--max-total-tokens",

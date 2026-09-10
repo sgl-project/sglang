@@ -12,18 +12,17 @@ perf benchmark lives separately in test_qwen35_fp8_perf_mi35x.py.
 """
 
 import os
-import re
-import subprocess
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -31,7 +30,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file
 
 register_amd_ci(est_time=4800, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
@@ -42,15 +40,6 @@ QWEN35_FP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 ACCURACY_THRESHOLD = 0.94
-
-# bench_sglang.py lives at the repo root (this file is 5 levels below), not under
-# test/. Resolve it absolutely so it works regardless of the CI working directory.
-REPO_ROOT = Path(__file__).resolve().parents[5]
-GSM8K_BENCH_SCRIPT = REPO_ROOT / "benchmark" / "gsm8k" / "bench_sglang.py"
-GSM8K_DATA_URL = (
-    "https://raw.githubusercontent.com/openai/grade-school-math/"
-    "master/grade_school_math/data/test.jsonl"
-)
 
 
 @dataclass
@@ -115,21 +104,6 @@ def get_fusion_variants() -> List[FusionVariant]:
     ]
 
 
-def _parse_gsm8k_metrics(stdout: str) -> Dict[str, float]:
-    metrics = {}
-    for key, pattern in {
-        "accuracy": r"Accuracy:\s*([0-9.]+)",
-        "invalid": r"Invalid:\s*([0-9.]+)",
-        "latency": r"Latency:\s*([0-9.]+)\s*s",
-        "output_throughput": r"Output throughput:\s*([0-9.]+)\s*token/s",
-    }.items():
-        match = re.search(pattern, stdout)
-        if match is None:
-            raise AssertionError(f"Could not parse {key} from GSM8K output:\n{stdout}")
-        metrics[key] = float(match.group(1))
-    return metrics
-
-
 class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
     """Validate Qwen3.5-FP8 AR-fusion accuracy and throughput on MI35x."""
 
@@ -137,35 +111,22 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
     def setUpClass(cls):
         cls.model = QWEN35_FP8_MODEL_PATH
         cls.variants = get_fusion_variants()
-        # Pre-fetch the dataset once (single-threaded) so the two parallel
-        # benchmark subprocesses don't race writing the shared /tmp cache file.
-        cls.gsm8k_data_path = download_and_cache_file(GSM8K_DATA_URL)
+        from sgl_eval.evals._loader import load_via_prepare
+
+        # Populate sgl-eval's shared cache before the parallel evaluations.
+        load_via_prepare("gsm8k", ["test"])(1)
 
     def _run_gsm8k(self, base_url: str) -> Dict[str, float]:
-        port = int(base_url.rsplit(":", 1)[-1])
-        command = [
-            "python3",
-            str(GSM8K_BENCH_SCRIPT),
-            "--num-questions",
-            str(GSM8K_NUM_QUESTIONS),
-            "--parallel",
-            str(GSM8K_NUM_QUESTIONS),
-            "--num-shots",
-            "5",
-            "--data-path",
-            str(self.gsm8k_data_path),
-            "--port",
-            str(port),
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise AssertionError(
-                "GSM8K benchmark failed:\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
+        return run_eval(
+            SimpleNamespace(
+                eval_name="gsm8k",
+                base_url=base_url,
+                model=self.model,
+                num_examples=GSM8K_NUM_QUESTIONS,
+                num_threads=GSM8K_NUM_QUESTIONS,
+                sgl_eval_thinking=True,
             )
-        print(result.stdout)
-        return _parse_gsm8k_metrics(result.stdout)
+        )
 
     def _run_variant(self, variant: FusionVariant) -> Dict[str, float]:
         env = os.environ.copy()

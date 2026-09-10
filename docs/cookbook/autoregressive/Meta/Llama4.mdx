@@ -488,8 +488,12 @@ Max ITL (ms):                            268.17
 - **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
  - Llama-4-Scout-17B-16E-Instruct
 ```text Output
 Accuracy: 0.945

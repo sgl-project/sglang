@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -65,16 +65,15 @@ class TestAscendTp1Bf16(CustomTestCase):
                         print(f"##=== Testing accuracy: {model} ===##")
 
                         args = SimpleNamespace(
-                            num_shots=5,
-                            data_path=None,
-                            num_questions=1319,
-                            max_new_tokens=512,
-                            parallel=32,
+                            eval_name="gsm8k",
+                            num_examples=1319,
+                            max_tokens=512,
+                            num_threads=32,
                             host=f"http://{self.url.hostname}",
                             port=int(self.url.port),
                         )
 
-                        metrics = run_eval_few_shot_gsm8k(args)
+                        metrics = run_gsm8k_eval(args)
                         self.assertGreaterEqual(
                             metrics["accuracy"],
                             TEST_MODEL_MATRIX[model]["accuracy"],

@@ -333,11 +333,13 @@ shapes to create a distinct symbol which signifies copyright protection.
 #### GSM8K
 
 ```bash Command
-python3 -m sglang.test.run_eval \
-  --eval-name gsm8k --api chat \
-  --host 127.0.0.1 --port 30000 \
-  --num-examples 200 --num-threads 64
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200 \
+  --num-threads 64
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 **Results:**
 

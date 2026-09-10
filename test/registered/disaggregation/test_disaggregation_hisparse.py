@@ -38,7 +38,6 @@ def _has_nixl():
 class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.93
     gsm8k_num_questions = 200
-    gsm8k_num_shots = 20
 
     @classmethod
     def setUpClass(cls):

@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
-    generate_gsm8k_dataset,
     generate_mm_dataset,
     generate_random_dataset,
     save_jsonl,
@@ -51,19 +50,11 @@ logger = logging.getLogger(__name__)
 AISBENCHMARK = "aisbench"
 BENCHSERVING = "bench-serving"
 BENCHMARK_TOOL_DEFAULT = BENCHSERVING
-AISBENCHMARK_DATASET_GSM8K = "gsm8k"
 AISBENCHMARK_DATASET_SHAREGPT = "sharegpt"
 AISBENCHMARK_DATASET_MM_CUSTOM_GEN = "mm-custom-gen"
-AISBENCHMARK_DATASET_DEFAULT = AISBENCHMARK_DATASET_GSM8K
+AISBENCHMARK_DATASET_DEFAULT = AISBENCHMARK_DATASET_SHAREGPT
 
 SHAREGPT_DATASET_TEST_FILE = "/tmp/ShareGPT_V3_unfiltered_cleaned_split.json"
-GSM8K_DATASET_TEST_FILE = (
-    "/root/.cache/modelscope/hub/datasets/grade_school_math/test.jsonl"
-)
-GSM8K_DATASET_TRAIN_FILE = (
-    "/root/.cache/modelscope/hub/datasets/grade_school_math/train.jsonl"
-)
-
 PYTHON_FOR_TEST_TOOL = "python_venv_for_test_tool/bin/python"
 if not os.path.exists(PYTHON_FOR_TEST_TOOL) or not os.access(
     PYTHON_FOR_TEST_TOOL, os.X_OK
@@ -619,30 +610,11 @@ def run_aisbench(
         dataset_path = dataset_file
         logger.info(f"Dataset generated: {dataset_path}")
 
-    elif dataset_type == AISBENCHMARK_DATASET_GSM8K and not dataset_path:
-        dataset_file = f"/tmp/datasets/test.jsonl"
-        if not os.path.exists(dataset_file):
-            logger.info(
-                f"Generating gsm8k dataset: {dataset_file}, "
-                f"model_path={model_path}, batch_size={num_prompts}, input_len={input_len}"
-            )
-            generate_gsm8k_dataset(
-                model_path=model_path,
-                source_dataset_path=GSM8K_DATASET_TEST_FILE,
-                batch_size=num_prompts,
-                input_len=input_len,
-                output_file=dataset_file,
-            )
-        dataset_path = dataset_file
-        logger.info(f"Dataset generated: {dataset_path}")
-
     elif dataset_type == AISBENCHMARK_DATASET_MM_CUSTOM_GEN and not dataset_path:
         dataset_file = f"/tmp/datasets/mm.jsonl"
         if not os.path.exists(dataset_file):
             image_dir = f"/tmp/datasets/images"
             data = generate_mm_dataset(
-                train_path=GSM8K_DATASET_TRAIN_FILE,
-                test_path=GSM8K_DATASET_TEST_FILE,
                 tokenizer_path=model_path,
                 target_tokens=input_len,
                 num_prompts=num_prompts,
@@ -949,7 +921,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     backend = "sglang"
     dataset_name = "random"
     dataset_path = SHAREGPT_DATASET_TEST_FILE
-    dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
+    dataset_type = "sharegpt"  # sharegpt | mm-custom-gen
     other_args = None
     timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
@@ -1198,7 +1170,7 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     backend = "sglang"
     dataset_name = "random"
     dataset_path = SHAREGPT_DATASET_TEST_FILE
-    dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
+    dataset_type = "sharegpt"  # sharegpt | mm-custom-gen
     max_attempts = 2
     request_rate = None
     repeat_rate = None
@@ -1331,7 +1303,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     backend = "sglang"
     dataset_name = "random"
     dataset_path = SHAREGPT_DATASET_TEST_FILE
-    dataset_type = "gsm8k"  # gsm8k | mm-custom-gen
+    dataset_type = "sharegpt"  # sharegpt | mm-custom-gen
     max_attempts = 2
     request_rate = None
     repeat_rate = None

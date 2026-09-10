@@ -67,6 +67,9 @@ jobs:
           docker exec ci_sglang_xpu cp \
             /sglang-checkout/python/sglang/test/ci/ci_utils.py \
             "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/run_eval.py "$dest/test/run_eval.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/sgl_eval.py "$dest/test/sgl_eval.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/xpu/sgl_eval_gsm8k_xpu_mixin.py "$dest/test/xpu/sgl_eval_gsm8k_xpu_mixin.py"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
             "import sglang.test.ci.ci_utils; print('overlay ok')"
 
@@ -75,7 +78,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.0"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
@@ -174,6 +177,9 @@ jobs:
           docker exec ci_sglang_xpu cp \
             /sglang-checkout/python/sglang/test/ci/ci_utils.py \
             "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/run_eval.py "$dest/test/run_eval.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/sgl_eval.py "$dest/test/sgl_eval.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/xpu/sgl_eval_gsm8k_xpu_mixin.py "$dest/test/xpu/sgl_eval_gsm8k_xpu_mixin.py"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
             "import sglang.test.ci.ci_utils; print('overlay ok')"
 
@@ -182,7 +188,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.0"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
@@ -270,6 +276,9 @@ jobs:
           docker exec ci_sglang_xpu cp \
             /sglang-checkout/python/sglang/test/ci/ci_utils.py \
             "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/run_eval.py "$dest/test/run_eval.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/sgl_eval.py "$dest/test/sgl_eval.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/xpu/sgl_eval_gsm8k_xpu_mixin.py "$dest/test/xpu/sgl_eval_gsm8k_xpu_mixin.py"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
             "import sglang.test.ci.ci_utils; print('overlay ok')"
 
@@ -278,7 +287,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.0"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
@@ -366,6 +375,9 @@ jobs:
           docker exec ci_sglang_xpu cp \
             /sglang-checkout/python/sglang/test/ci/ci_utils.py \
             "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/run_eval.py "$dest/test/run_eval.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/sgl_eval.py "$dest/test/sgl_eval.py"
+          docker exec ci_sglang_xpu cp /sglang-checkout/python/sglang/test/xpu/sgl_eval_gsm8k_xpu_mixin.py "$dest/test/xpu/sgl_eval_gsm8k_xpu_mixin.py"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
             "import sglang.test.ci.ci_utils; print('overlay ok')"
 
@@ -374,7 +386,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.0"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
           # Diffusion extras
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].

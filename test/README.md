@@ -142,6 +142,13 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 
 ## Other Notes
 
+### GSM8K and MMLU
+
+Use `sgl-eval` for GSM8K and MMLU. CI may call `sglang.test.run_eval` or an
+accuracy mixin, but the dataset, chat prompt, answer extraction and grading must
+come from `sgl-eval`. Do not add a separate evaluator or dataset copy. Test long
+prefixes and cache behavior with synthetic requests, independently of accuracy.
+
 ### Adding New Models to Nightly CI
 - **Text models**: Extend the [global model list variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`.
 - **VLMs**: Extend the `MODEL_THRESHOLDS` dictionary in `test/registered/accuracy/models/test_vlms_mmmu_eval.py`.

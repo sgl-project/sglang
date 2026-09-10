@@ -233,7 +233,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 256
 ```
 
-- **Test Results:**
+- **Historical lm-eval results (not measurements of the sgl-eval command above):**
 
 ```text Output
 ============ Serving Benchmark Result ============
@@ -302,7 +302,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 256
 ```
 
-- **Test Results:**
+- **Historical lm-eval results (not measurements of the sgl-eval command above):**
 
 ```text Output
 ============ Serving Benchmark Result ============
@@ -359,14 +359,16 @@ python3 -m sglang.launch_server \
   --reasoning-parser nemotron_3
 ```
 
-**Run Benchmark with lm-eval**
+**Run Benchmark with sgl-eval**
 ```bash Command
-pip install lm-eval[api]==0.4.9.2
+pip install sgl-eval
 
-lm_eval --model local-completions --tasks gsm8k --model_args "model=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16,base_url=http://127.0.0.1:30000/v1/completions,num_concurrent=4,max_retries=3,tokenized_requests=False,max_lengths=16384" --gen_kwargs '{"chat_template_kwargs":{"thinking":true}}' --batch_size 256
+sgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1 --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 --num-threads 4 --max-tokens 16384 --thinking
 ```
 
-**Test Results:**
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
+
+**Historical lm-eval results (not measurements of the sgl-eval command above):**
 ```text Output
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|

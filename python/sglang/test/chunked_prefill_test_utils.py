@@ -4,6 +4,8 @@ import time
 from types import SimpleNamespace
 from typing import ClassVar, List, Optional
 
+import requests
+
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -21,11 +23,9 @@ DEFAULT_MODEL: str = "Qwen/Qwen3-0.6B"
 
 DEFAULT_CHUNKED_PREFILL_SIZE: int = 256
 DEFAULT_NUM_EXAMPLES: int = 100
-DEFAULT_NUM_SHOTS: int = 10
-LONG_PROMPT_NUM_SHOTS: int = 24
+DEFAULT_PREFIX_REPETITIONS: int = 320
 DEFAULT_NUM_THREADS: int = 128
 DEFAULT_MAX_TOKENS: int = 512
-DEFAULT_SEED: int = 42
 
 KV_CANARY_ARGS: List[str] = [
     "--kv-canary",
@@ -45,7 +45,7 @@ class ChunkedGsm8kMixin:
     feature_args: ClassVar[List[str]] = []
 
     chunked_prefill_size: ClassVar[int] = DEFAULT_CHUNKED_PREFILL_SIZE
-    num_shots: ClassVar[int] = DEFAULT_NUM_SHOTS
+    prefix_repetitions: ClassVar[int] = DEFAULT_PREFIX_REPETITIONS
     num_examples: ClassVar[int] = DEFAULT_NUM_EXAMPLES
     num_threads: ClassVar[int] = DEFAULT_NUM_THREADS
     max_tokens: ClassVar[int] = DEFAULT_MAX_TOKENS
@@ -59,21 +59,52 @@ class ChunkedGsm8kMixin:
             + canary
         )
 
-    def test_mixed_prefix_gsm8k_chunked(self):
+    def test_mixed_prefix_chunked(self):
+        base_url = self.base_url.removesuffix("/v1").rstrip("/")
+        prefix = (
+            "The following is a synthetic cache stress document. "
+            * self.prefix_repetitions
+        )
+        prompts = [
+            prefix
+            + (f"Section {i % 3}: additional context. " * 64)
+            + f"\nWrite the number {i} and stop."
+            for i in range(8)
+        ]
+        sampling_params = {"temperature": 0, "max_new_tokens": 16}
+
+        def generate(text):
+            response = requests.post(
+                base_url + "/generate",
+                json={"text": text, "sampling_params": sampling_params},
+                timeout=300,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        expected = []
+        for prompt in prompts:
+            requests.get(base_url + "/flush_cache", timeout=30).raise_for_status()
+            expected.append(generate(prompt)["text"])
+        requests.get(base_url + "/flush_cache", timeout=30).raise_for_status()
+        for _ in range(2):
+            results = generate(prompts)
+            self.assertEqual([result["text"] for result in results], expected)
+            for result in results:
+                self.assertGreater(
+                    result["meta_info"]["prompt_tokens"], self.chunked_prefill_size
+                )
+
+    def test_gsm8k_chunked(self):
         fixture_name = type(self).__name__
 
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mixed_prefix_gsm8k",
-            api="chat_completion",
+            eval_name="gsm8k",
             max_tokens=self.max_tokens,
             num_examples=self.num_examples,
             num_threads=self.num_threads,
-            num_shots=self.num_shots,
-            mixed_prefix_gsm8k_secondary_pool_size=15,
-            mixed_prefix_gsm8k_seed=DEFAULT_SEED,
-            gsm8k_data_path=None,
             temperature=0.0,
         )
         tic = time.perf_counter()
@@ -100,7 +131,7 @@ class ChunkedTestBase(ChunkedGsm8kMixin, CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=cls.launch_timeout,
-            other_args=cls("test_mixed_prefix_gsm8k_chunked").build_prefill_side_args(),
+            other_args=cls("test_gsm8k_chunked").build_prefill_side_args(),
         )
 
     @classmethod
@@ -115,9 +146,7 @@ class ChunkedTestPDBase(ChunkedGsm8kMixin, PDDisaggregationServerBase):
 
     @classmethod
     def setUpClass(cls):
-        cls.extra_prefill_args = cls(
-            "test_mixed_prefix_gsm8k_chunked"
-        ).build_prefill_side_args()
+        cls.extra_prefill_args = cls("test_gsm8k_chunked").build_prefill_side_args()
         canary = list(KV_CANARY_ARGS) if cls.use_kv_canary else []
         cls.extra_decode_args = canary + list(cls.decode_feature_args)
         PDDisaggregationServerBase.setUpClass()

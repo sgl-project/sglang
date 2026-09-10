@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -93,11 +93,10 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=512,
+            num_threads=128,
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )
@@ -187,11 +186,10 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=512,
+            num_threads=128,
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )
@@ -282,11 +280,10 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=512,
+            num_threads=128,
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )

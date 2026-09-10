@@ -1,7 +1,7 @@
-"""simple-evals GSM8K accuracy mixin for Intel XPU nightly tests.
+"""sgl-eval GSM8K accuracy mixin for Intel XPU nightly tests.
 
 Launches an SGLang server with XPU flags, then calls ``sglang.test.run_eval``
-with ``eval_name="gsm8k"`` so the ``simple_eval_gsm8k.GSM8KEval`` evaluator
+with ``eval_name="gsm8k"`` so the ``sgl-eval`` evaluator
 scores the run.
 
 Subclasses set ``model``, ``tp_size``, ``accuracy``, and may override
@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 from sglang.test.xpu.test_xpu_utils import write_results_to_github_step_summary
 
 
-class SimpleEvalGSM8KXPUMixin(ABC):
+class SglEvalGSM8KXPUMixin(ABC):
     model: str = ""
     tp_size: int = 1
 
@@ -81,7 +81,7 @@ class SimpleEvalGSM8KXPUMixin(ABC):
 
         model_metrics = {
             "server": self.server_cmd,
-            "client": "simple_eval_gsm8k",
+            "client": "sgl-eval",
             "accuracy_threshold": getattr(self, "accuracy", "N/A"),
             "output_throughput_threshold": getattr(self, "output_throughput", "N/A"),
             "num_prompts": self.num_examples,

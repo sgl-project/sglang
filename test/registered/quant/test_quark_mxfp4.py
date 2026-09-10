@@ -15,7 +15,7 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike, is_gfx95_supported
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -163,11 +163,10 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     def _test_gsm8k(self, accuracy_threshold):
         """Helper method to test GSM8K accuracy against a threshold."""
         args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=500,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=500,
+            max_tokens=512,
+            num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )

@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
@@ -22,6 +23,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     launch_router,
     wait_server_ready,
 )
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -105,7 +107,7 @@ def get_max_retries(datasets):
     return 1
 
 
-def run_evalscope(
+def run_accuracy_benchmark(
     host,
     port,
     model,
@@ -119,6 +121,32 @@ def run_evalscope(
     stream=True,
     eval_type="openai_api",
 ):
+
+    if any(dataset in {"gsm8k", "mmlu"} for dataset in datasets):
+        if len(datasets) != 1:
+            raise ValueError(
+                "Run sgl-eval benchmarks separately to keep accuracy gates distinct"
+            )
+        if dataset_args or dataset_dir:
+            raise ValueError(
+                "GSM8K/MMLU dataset and prompt configuration belongs to sgl-eval"
+            )
+        generation = dict(generation_config or {"max_tokens": 2048})
+        extra_body = dict(generation.pop("extra_body", {}))
+        chat_kwargs = extra_body.pop("chat_template_kwargs", {})
+        return run_sgl_eval(
+            SimpleNamespace(
+                eval_name=datasets[0],
+                host=host,
+                port=port,
+                model=model,
+                num_examples=limit,
+                num_threads=eval_batch_size,
+                chat_template_kwargs=chat_kwargs,
+                extra_body=extra_body,
+                **generation,
+            )
+        )
 
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_path = "./evalscope_result" if not metrics_path else metrics_path
@@ -481,7 +509,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
             max_retries = get_max_retries(self.datasets)
             best_metrics = None
             for attempt in range(max_retries):
-                metrics = run_evalscope(
+                metrics = run_accuracy_benchmark(
                     host=host,
                     port=port,
                     model=model_name,
@@ -583,7 +611,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
             max_retries = get_max_retries(self.datasets)
             best_metrics = None
             for attempt in range(max_retries):
-                metrics = run_evalscope(
+                metrics = run_accuracy_benchmark(
                     host=self.host,
                     port=self.port,
                     model=model_name,
@@ -700,7 +728,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
             max_retries = get_max_retries(self.datasets)
             best_metrics = None
             for attempt in range(max_retries):
-                metrics = run_evalscope(
+                metrics = run_accuracy_benchmark(
                     host=host,
                     port=port,
                     model=model_name,

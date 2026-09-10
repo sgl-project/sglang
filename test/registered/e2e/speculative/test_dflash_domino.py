@@ -96,7 +96,6 @@ class TestDFlashDomino(TestDFlashDominoFullVocab, GSM8KMixin):
     gsm8k_num_examples = 200
     gsm8k_accept_length_thres = 4.0
     gsm8k_num_threads = 128
-    gsm8k_num_shots = 5
     candidate_pool_size = 2048
 
 

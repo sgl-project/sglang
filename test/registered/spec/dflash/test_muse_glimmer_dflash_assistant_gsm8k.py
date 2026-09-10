@@ -51,9 +51,6 @@ class TestMuseGlimmerDflashAssistantGSM8K(CustomTestCase, GSM8KMixin):
     """
 
     model = TARGET_MODEL
-    gsm8k_backend = (
-        "sgl_eval"  # chat completions API, not /generate or raw /completions
-    )
     gsm8k_score_threshold = 0.85
     gsm8k_num_examples = 200
     gsm8k_accept_length_thres = 2.5

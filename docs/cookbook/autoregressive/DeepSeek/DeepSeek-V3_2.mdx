@@ -709,8 +709,12 @@ Max ITL (ms):                            975.03
 - **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 - **Test Results**:
   - DeepSeek-V3.2-Exp
@@ -721,17 +725,16 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
     Output throughput: 965.919 token/s
     ```
 
-- **Full held-out GSM8K (1311 questions)** — use eight examples as the few-shot prefix and evaluate the remaining questions via the Chat API:
+- **Full GSM8K (1319 questions)** — evaluate the complete test set with sgl-eval:
 
 ```shell Command
-python3 -m sglang.test.run_eval \
-  --eval-name gsm8k --api chat \
-  --host 127.0.0.1 --port 30000 \
-  --num-examples 1311 --num-threads 1319 \
-  --num-shots 8
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 1319 \
+  --num-threads 1319
 ```
 
-Historical results below use the removed harness and are not measurements of the Chat API command above.
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
   - 8-shot:
     ```

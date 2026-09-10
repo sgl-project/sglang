@@ -79,7 +79,6 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     # GSM8K Configs
     accuracy = 0.9  # GSM8K accuracy ≥0.9
     num_questions = 200
-    gsm8k_num_shots = 5
 
 
 if __name__ == "__main__":

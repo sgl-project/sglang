@@ -100,7 +100,6 @@ class TestQwen35WithHiCache(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
             num_examples=100,
             max_tokens=16000,
             num_threads=50,

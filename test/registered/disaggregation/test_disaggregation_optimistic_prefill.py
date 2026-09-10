@@ -97,7 +97,6 @@ class TestOptimisticPrefill(
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,

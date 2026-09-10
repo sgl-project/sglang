@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -49,15 +49,14 @@ class FP4GemmSM120Base:
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1319,
-            max_new_tokens=512,
-            parallel=200,
+            eval_name="gsm8k",
+            num_examples=1319,
+            max_tokens=512,
+            num_threads=200,
             host=parsed_url.hostname,
             port=parsed_url.port,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.64)
 

@@ -88,7 +88,6 @@ class TestGLM51MXFP4TP2GSM8KMI35x(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=GSM8K_NUM_THREADS,
             max_tokens=512,

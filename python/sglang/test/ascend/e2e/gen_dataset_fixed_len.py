@@ -8,17 +8,6 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 
-def load_jsonl(path):
-    """Load data from a JSONL file, one JSON object per line."""
-    data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                data.append(json.loads(line))
-    return data
-
-
 def save_jsonl(data, file_path):
     """Save a list of dicts to a JSONL file, one JSON object per line."""
     file_dir = os.path.dirname(file_path)
@@ -29,145 +18,25 @@ def save_jsonl(data, file_path):
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
-def format_qa(item):
-    """Format a GSM8K data entry into QA text for the few-shot pool."""
-    question = item["question"]
-    answer = item["answer"]
-    return f"Question: {question}\nLet's think step by step\nAnswer:\n{answer}\n\n"
-
-
-def pad_to_target_tokens(
-    question,
-    few_shot_pool_token_ids,
-    tokenizer,
-    target_tokens,
-    test_template="Question: {question}\nLet's think step by step\nAnswer:\n",
-):
-    """Pad a question text to the target token length.
-
-    Tokenizes the question using the test_template, calculates the remaining tokens
-    needed, and prepends randomly sampled few-shot token ids from the pool to reach
-    target_tokens. If the few-shot pool is insufficient, repeats the first sample
-    to fill the remaining gap.
-
-    Args:
-        question: The test question text.
-        few_shot_pool_token_ids: List of token id lists from the few-shot training pool.
-        tokenizer: The tokenizer instance.
-        target_tokens: Target input token length.
-        test_template: Question template string, defaults to GSM8K format.
-    """
-    test_prompt = test_template.format(question=question)
-    test_token_ids = tokenizer.encode(test_prompt, add_special_tokens=False)
-
-    remaining_tokens = target_tokens - len(test_token_ids)
-    if remaining_tokens <= 0:
-        return tokenizer.decode(
-            test_token_ids[:target_tokens], skip_special_tokens=True
-        )
-
-    shuffled_ids = list(range(len(few_shot_pool_token_ids)))
-    random.shuffle(shuffled_ids)
-
-    prefix_ids = []
-    for idx in shuffled_ids:
-        fs_ids = few_shot_pool_token_ids[idx]
-        if len(prefix_ids) + len(fs_ids) <= remaining_tokens:
-            prefix_ids.extend(fs_ids)
-        else:
-            partial_gap = remaining_tokens - len(prefix_ids)
-            if partial_gap > 0:
-                prefix_ids.extend(fs_ids[:partial_gap])
-            break
-
-    if len(prefix_ids) < remaining_tokens and few_shot_pool_token_ids:
-        padding_source_ids = few_shot_pool_token_ids[shuffled_ids[0]]
-        repeat_count = (remaining_tokens // len(padding_source_ids)) + 1
-        padding_ids = (padding_source_ids * repeat_count)[
-            : remaining_tokens - len(prefix_ids)
-        ]
-        prefix_ids.extend(padding_ids)
-
-    full_ids = prefix_ids + test_token_ids
-    return tokenizer.decode(full_ids[:target_tokens], skip_special_tokens=True)
-
-
 def generate_custom_dataset(
-    train_path,
-    test_path,
     tokenizer_path,
     target_tokens,
     num_prompts,
     trust_remote_code=False,
-    test_template="Question: {question}\nLet's think step by step\nAnswer:\n",
 ):
-    """Generate a custom dataset with a fixed input token length.
-
-    Builds a few-shot pool from the training set and pads test questions to the
-    specified token length. If the test set has fewer samples than num_prompts,
-    it cycles and repeats to fill the required count.
-
-    Args:
-        train_path: Path to the GSM8K training JSONL file.
-        test_path: Path to the GSM8K test JSONL file.
-        tokenizer_path: Path to the tokenizer.
-        target_tokens: Target input token length.
-        num_prompts: Number of prompts to generate; 0 means use all test samples.
-        trust_remote_code: Whether to trust remote code when loading the tokenizer.
-        test_template: Question template string.
-
-    Returns:
-        list[dict]: Each item contains fields defined in test_template.
-    """
+    """Generate synthetic fixed-length text for throughput measurements."""
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path, trust_remote_code=trust_remote_code
     )
-
-    train_data = load_jsonl(train_path)
-    test_data = load_jsonl(test_path)
-    if num_prompts > 0 and num_prompts > len(test_data):
-        multiplier = (num_prompts // len(test_data)) + 1
-        test_data = (test_data * multiplier)[:num_prompts]
-    elif num_prompts > 0:
-        test_data = test_data[:num_prompts]
-
-    few_shot_pool = [format_qa(item) for item in train_data]
-    few_shot_pool_token_ids = [
-        tokenizer.encode(fs, add_special_tokens=False) for fs in few_shot_pool
-    ]
-
-    output_data = []
-    for i, test_item in enumerate(test_data):
-        padded_question = pad_to_target_tokens(
-            question=test_item["question"],
-            few_shot_pool_token_ids=few_shot_pool_token_ids,
-            tokenizer=tokenizer,
-            target_tokens=target_tokens,
-            test_template=test_template,
+    output = []
+    for index in range(num_prompts):
+        tokens = tokenizer.encode(
+            f"Document {index}: This is synthetic input for a serving performance test. ",
+            add_special_tokens=False,
         )
-        output_data.append(
-            {
-                "question": padded_question,
-                "answer": test_item["answer"],
-            }
-        )
-        if (i + 1) % 100 == 0:
-            actual_tokens = len(
-                tokenizer.encode(padded_question, add_special_tokens=False)
-            )
-            print(
-                f"Processed {i + 1}/{len(test_data)}, last item tokens: {actual_tokens}"
-            )
-
-    token_counts = [
-        len(tokenizer.encode(item["question"], add_special_tokens=False))
-        for item in output_data
-    ]
-    print(
-        f"Token count stats: min={min(token_counts)}, max={max(token_counts)}, avg={sum(token_counts) / len(token_counts):.1f}"
-    )
-
-    return output_data
+        padded = (tokens * (target_tokens // len(tokens) + 1))[:target_tokens]
+        output.append({"question": tokenizer.decode(padded), "answer": "none"})
+    return output
 
 
 def generate_random_images(mm_dataset_data, size):
@@ -210,13 +79,10 @@ def generate_random_images(mm_dataset_data, size):
 
 
 def generate_mm_dataset(
-    train_path,
-    test_path,
     tokenizer_path,
     target_tokens=3500,
     num_prompts=1024,
     trust_remote_code=False,
-    test_template="Question: {question}\nLet's think step by step\nAnswer:\n",
     image_dir="/tmp/datasets/image",
     size=None,
 ):
@@ -227,13 +93,10 @@ def generate_mm_dataset(
     the corresponding random image files.
 
     Args:
-        train_path: Path to the GSM8K training JSONL file.
-        test_path: Path to the GSM8K test JSONL file.
         tokenizer_path: Path to the tokenizer.
         target_tokens: Target input token length.
         num_prompts: Number of prompts to generate.
         trust_remote_code: Whether to trust remote code when loading the tokenizer.
-        test_template: Question template string.
         image_dir: Directory to save generated image files.
         size: Image size string in "widthxheight" format, e.g. "1080x1920".
 
@@ -242,13 +105,10 @@ def generate_mm_dataset(
     """
     output_data = []
     text_data = generate_custom_dataset(
-        train_path,
-        test_path,
         tokenizer_path,
         target_tokens,
         num_prompts,
         trust_remote_code,
-        test_template,
     )
 
     for item in text_data:
@@ -262,74 +122,6 @@ def generate_mm_dataset(
     size = tuple(map(int, size.split("x")))
     generate_random_images(output_data, size)
     return output_data
-
-
-def generate_gsm8k_dataset(
-    model_path, source_dataset_path, batch_size, input_len, output_file
-):
-    """Generate a dataset with a fixed input token length from GSM8K (JSONL format).
-
-    Reads GSM8K source data, repeats or truncates each question's tokens to input_len,
-    then trims or replicates the dataset to batch_size entries, shuffles, and writes
-    to the output file.
-
-    Args:
-        model_path: Model path used to load the tokenizer.
-        source_dataset_path: Path to the GSM8K source JSONL file.
-        batch_size: Number of samples to generate.
-        input_len: Target input token length.
-        output_file: Output JSONL file path.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    dataset = []
-    with open(source_dataset_path, "r", encoding="utf-8") as f:
-        for line in f:
-            data = json.loads(line)
-            dataset.append(data["question"])
-
-    dataset_new = []
-    for sentence in dataset:
-        words = tokenizer.tokenize(sentence)
-        len_num = len(words) // input_len
-        if len_num == 0:
-            multiplier = (input_len // len(words)) + 1
-            repeated_len = words * multiplier
-            words = repeated_len[:input_len]
-            decoded_text = tokenizer.convert_tokens_to_string(words)
-            if len(words) != input_len:
-                print(
-                    f"Generate DataSet Error: the length of new input is {len(words)}, not {input_len}"
-                )
-            dataset_new.append(decoded_text)
-
-    batch_num = len(dataset_new) // batch_size
-    if batch_num == 0:
-        multiplier = (batch_size // len(dataset_new)) + 1
-        repeated_batch = dataset_new * multiplier
-        dataset_new = repeated_batch[:batch_size]
-    else:
-        dataset_new = dataset_new[:batch_size]
-
-    random.shuffle(dataset_new)
-
-    if len(dataset_new) != batch_size:
-        print(
-            f"Generate DataSet Error: the size of new dataset is {len(dataset_new)}, not {batch_size}"
-        )
-
-    output_dir = os.path.dirname(output_file)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    with open(output_file, "w", encoding="utf-8") as f:
-        for i in range(len(dataset_new)):
-            f.write(
-                json.dumps(
-                    {"question": f"{dataset_new[i]}", "answer": "none"},
-                    ensure_ascii=False,
-                )
-            )
-            f.write("\n")
 
 
 def generate_random_dataset(
@@ -475,13 +267,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Generate GSM8K dataset with exact input token length"
-    )
-    parser.add_argument(
-        "--train_path", type=str, required=True, help="Path to GSM8K train.jsonl"
-    )
-    parser.add_argument(
-        "--test_path", type=str, required=True, help="Path to GSM8K test.jsonl"
+        description="Generate synthetic text with fixed input token length"
     )
     parser.add_argument(
         "--output_path", type=str, required=True, help="Output jsonl path"
@@ -500,14 +286,12 @@ def main():
     parser.add_argument(
         "--num_prompts",
         type=int,
-        default=0,
-        help="Number of prompts to generate, 0 means all",
+        default=1024,
+        help="Number of prompts to generate",
     )
     args = parser.parse_args()
 
     output_data = generate_custom_dataset(
-        train_path=args.train_path,
-        test_path=args.test_path,
         tokenizer_path=args.tokenizer_path,
         target_tokens=args.target_tokens,
         num_prompts=args.num_prompts,

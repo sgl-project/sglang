@@ -79,7 +79,6 @@ class TestFlashinferCutlassFlashinferA2A(CustomTestCase):
             max_tokens=10240,
             repeat=1,
             num_threads=1319,
-            num_shots=8,
             temperature=0.6,
             top_p=0.95,
             top_k=20,

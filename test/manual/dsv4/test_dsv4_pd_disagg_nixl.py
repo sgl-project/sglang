@@ -9,7 +9,7 @@ path, so any layout mismatch would trip the item_len assert in
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -131,11 +131,10 @@ class TestDSV4FlashPDDisaggNIXL(PDDisaggregationServerBase):
     def test_gsm8k(self):
         """End-to-end PD-disagg accuracy through the LB."""
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=64,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=512,
+            num_threads=64,
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )

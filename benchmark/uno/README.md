@@ -81,22 +81,18 @@ run_tree_uno() {
 }
 ```
 
-Run the six batch-64 AR and linear `B/K/V = 8/1/8` rows:
+Run the four batch-64 AR and linear `B/K/V = 8/1/8` rows:
 
 ```bash
-run_ar         gsm8k   1  64 ar-gsm8k-c64
-run_linear_uno gsm8k   1  64 uno-linear-b8-k1-v8-gsm8k-c64
 run_ar         math500 1  64 ar-math500-c64
 run_linear_uno math500 1  64 uno-linear-b8-k1-v8-math500-c64
 run_ar         aime25  10 64 ar-aime25-c64
 run_linear_uno aime25  10 64 uno-linear-b8-k1-v8-aime25-c64
 ```
 
-Run the six batch-1 AR and tree `B/K/V = 16/32/32` rows:
+Run the four batch-1 AR and tree `B/K/V = 16/32/32` rows:
 
 ```bash
-run_ar       gsm8k   1  1 ar-gsm8k-c1
-run_tree_uno gsm8k   1  1 uno-tree-b16-k32-v32-gsm8k-c1
 run_ar       math500 1  1 ar-math500-c1
 run_tree_uno math500 1  1 uno-tree-b16-k32-v32-math500-c1
 run_ar       aime25  10 1 ar-aime25-c1
@@ -146,3 +142,5 @@ PYTHONPATH=python python -m benchmark.uno.run_math_eval \
 
 For EAGLE and DFLASH, TPF follows SGLang's acceptance-length convention and
 counts generated tokens per target verification forward.
+
+For GSM8K accuracy, serve the model and run `sgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1`.

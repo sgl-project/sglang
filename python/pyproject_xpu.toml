@@ -104,7 +104,6 @@ test = [
   "pymupdf",
   "expecttest",
   "jsonlines",
-  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   "pandas",
   "parameterized",
@@ -112,6 +111,7 @@ test = [
   "polars",
   "pytest",
   "sentence_transformers",
+  "sgl-eval==0.1.0",
   "tabulate",
 ]
 

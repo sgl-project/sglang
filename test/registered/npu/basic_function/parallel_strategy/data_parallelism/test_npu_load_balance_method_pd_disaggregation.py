@@ -16,7 +16,7 @@ from sglang.test.ascend.test_ascend_utils import (
     QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
@@ -138,16 +138,15 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             run_npu_pr_smoke(self.lb_url)
             return
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=512,
+            num_threads=128,
             host=f"http://{self.url.hostname}",
             port=int(self.url.port),
         )
 
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         self.assertGreaterEqual(
             metrics["accuracy"],
             # 0.95 with 0.02 tolerable fluctuation

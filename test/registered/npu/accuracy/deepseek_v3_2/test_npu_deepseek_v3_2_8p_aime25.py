@@ -36,7 +36,6 @@ class TestNPUDeepSeek_V3_2_8P_AIME2025(TestNpuAccuracyTestCaseBase):
     other_args = OTHER_ARGS
     accuracy = 0.936
     datasets = ["gsm8k"]
-    few_shot_num = 0
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
     eval_batch_size = 64
 

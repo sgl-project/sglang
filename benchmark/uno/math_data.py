@@ -24,7 +24,6 @@ BENCHMARKS = {
         chat_template_kwargs={"reasoning_effort": "high"},
     )
     for name, expected_rows in (
-        ("gsm8k", 1319),
         ("math500", 500),
         ("aime24", 30),
         ("aime25", 30),
@@ -33,7 +32,6 @@ BENCHMARKS = {
 }
 
 DATASET_REVISIONS = {
-    "openai/gsm8k": "740312add88f781978c0658806c59bc2815b9866",
     "HuggingFaceH4/MATH-500": "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be",
     "hypaai/Hypa_AIME2024": "11ab79f0eed5f4fdf3d469b466663ab86bbd77c8",
     "math-ai/aime25": "563bb8404243c5f09de6ec262f2db674fe5bce9b",
@@ -64,21 +62,6 @@ def _load_dataset(
         revision=DATASET_REVISIONS[repo_id],
     )
     return [dict(row) for row in dataset]
-
-
-def _prepare_gsm8k() -> list[dict[str, Any]]:
-    rows = _load_dataset("openai/gsm8k", "main", split="test")
-    records = []
-    for index, row in enumerate(rows):
-        prompt = f"Q: {row['question']}\nA: Let's think step by step."
-        records.append(
-            {
-                "row": index,
-                "ground_truth": row["answer"],
-                "chat_input": [{"role": "user", "content": prompt}],
-            }
-        )
-    return records
 
 
 def _prepare_math500() -> list[dict[str, Any]]:
@@ -120,7 +103,6 @@ def _prepare_aime26() -> list[dict[str, Any]]:
 
 
 BUILDERS = {
-    "gsm8k": _prepare_gsm8k,
     "math500": _prepare_math500,
     "aime24": _prepare_aime24,
     "aime25": _prepare_aime25,

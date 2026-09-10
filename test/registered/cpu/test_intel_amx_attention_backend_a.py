@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -104,15 +104,14 @@ class TestDPAttention(CustomTestCase):
 
     def test_dp_attention_DP2TP2(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=32,
-            parallel=32,
-            max_new_tokens=512,
+            eval_name="gsm8k",
+            num_examples=32,
+            num_threads=32,
+            max_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
         self.assertGreater(metrics["accuracy"], 0.7)

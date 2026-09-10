@@ -40,25 +40,23 @@ class TestUnifiedQwenHybridTriton(DefaultServerBase):
     # leaves noise margin and still catches a corrupted prefill state (~0.61).
     gsm8k_threshold = 0.80
     num_gsm8k_questions = 200
-    num_shots = 5
     parallel = 32
 
     other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "triton"]
 
     def test_gsm8k(self):
-        from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
+        from sglang.test.run_eval import run_eval as run_gsm8k_eval
 
         url = urlparse(self.base_url)
         args = SimpleNamespace(
-            num_shots=self.num_shots,
-            data_path=None,
-            num_questions=self.num_gsm8k_questions,
-            max_new_tokens=512,
-            parallel=self.parallel,
+            eval_name="gsm8k",
+            num_examples=self.num_gsm8k_questions,
+            max_tokens=512,
+            num_threads=self.parallel,
             host=f"http://{url.hostname}",
             port=int(url.port),
         )
-        metrics = run_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(
             f"[{self.__class__.__name__}] GSM8K accuracy: {metrics['accuracy']:.3f} "
             f"(threshold: {self.gsm8k_threshold})"

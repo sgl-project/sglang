@@ -192,7 +192,6 @@ emit("NPF", bn["num_prompts_factor"])
 emit("RRR", bn["random_range_ratio"])
 acc = bn.get("accuracy", {}) or {}
 emit("ACC_ENABLED", 1 if acc.get("enabled") else 0)
-emit("ACC_SHOTS", acc.get("num_shots", 8))
 emit("ACC_NQ", acc.get("num_questions", 1319))
 emit("ACC_THR", acc.get("threshold", 0.91))
 PY
@@ -253,21 +252,34 @@ else
     echo "SGLANG_USE_CHECKOUT_RUNTIME=0; using sglang package baked into image."
 fi
 
-# Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
-# shared NFS from the login node (which has internet) so the in-container eval
-# doesn't depend on compute-node connectivity; fall back to in-container
-# download if the pre-fetch fails.
+# Stage the canonical sgl-eval dataset on the login node for offline compute nodes.
 if [[ "$ACC_ENABLED" == "1" ]]; then
-    GSM8K_URL="https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    curl -fsSL "$GSM8K_URL" -o "$WORKDIR/gsm8k_test.jsonl" 2>/dev/null \
-        && echo "gsm8k dataset staged at $WORKDIR/gsm8k_test.jsonl" \
-        || echo "WARN: gsm8k pre-stage failed; in-container download will be attempted"
-    cat > "$WORKDIR/check_acc.py" <<'PY'
+    python3 - "$WORKDIR/gsm8k_test.jsonl" <<'PYDATA' || echo "WARN: sgl-eval pre-stage failed; compute nodes will use its dataset loader"
+import json
 import sys
-acc, thr = float(sys.argv[1]), float(sys.argv[2])
-print(f"[gsm8k] accuracy={acc:.3f} threshold={thr}")
+from pathlib import Path
+from sgl_eval.evals._loader import load_via_prepare
+
+examples = load_via_prepare("gsm8k", ["test"])(None)
+output = Path(sys.argv[1])
+temporary = output.with_suffix(".tmp")
+with temporary.open("w") as handle:
+    for example in examples:
+        handle.write(json.dumps({"id": example.id, **example.inputs, "expected_answer": example.target}) + "\n")
+temporary.replace(output)
+PYDATA
+    cat > "$WORKDIR/check_acc.py" <<'PYMETRICS'
+import json
+import sys
+from pathlib import Path
+paths = list(Path(sys.argv[1]).glob("sgl_eval_gsm8k_*/metrics.json"))
+if not paths:
+    sys.exit("sgl-eval produced no metrics.json")
+payload = json.loads(max(paths, key=lambda p: p.stat().st_mtime).read_text())
+acc, thr = payload["aggregate"]["score"], float(sys.argv[2])
+print(f"[sgl-eval gsm8k] accuracy={acc:.3f} threshold={thr}")
 sys.exit(0 if acc > thr else 1)
-PY
+PYMETRICS
 fi
 
 # DSV4 load-bearing env (see test/registered/amd/test_deepseek_v4_flash_fp8.py).
@@ -824,16 +836,17 @@ $PREFILL_WAIT_ROUTER
     # is no point spending ~15min measuring how fast it is wrong, so a failure
     # here exits immediately and the sweep never runs.
     if [ "$ACC_ENABLED" = "1" ]; then
-      echo "=== GSM8K accuracy gate (num_questions=$ACC_NQ shots=$ACC_SHOTS) ==="
+      echo "=== sgl-eval GSM8K accuracy gate (num_examples=$ACC_NQ) ==="
       DP_ARG=""
-      [ -s \$CIDIR/gsm8k_test.jsonl ] && DP_ARG="--data-path \$CIDIR/gsm8k_test.jsonl"
-      python3 -m sglang.test.few_shot_gsm8k \
-        --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \
-        --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \
-        \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log
-      ACC=\$(grep -oE "Accuracy: [0-9.]+" \$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
-      [ -n "\$ACC" ] || { echo "[gsm8k] could not parse accuracy from harness output"; exit 1; }
-      python3 \$CIDIR/check_acc.py "\$ACC" "$ACC_THR" || { echo "[gsm8k] accuracy below threshold -- failing before sweep"; exit 1; }
+      [ -s \$CIDIR/gsm8k_test.jsonl ] && DP_ARG="--from-dataset \$CIDIR/gsm8k_test.jsonl"
+      set -o pipefail
+      sgl-eval run gsm8k \
+        --num-examples $ACC_NQ --num-threads $MAXREQ \
+        --max-tokens 2048 --base-url http://127.0.0.1:$LBPORT/v1 \
+        --out-dir \$CIDIR/gsm8k_eval \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log \
+        || { echo "[gsm8k] sgl-eval failed"; exit 1; }
+      python3 \$CIDIR/check_acc.py \$CIDIR/gsm8k_eval "$ACC_THR" \
+        || { echo "[gsm8k] accuracy below threshold -- failing before sweep"; exit 1; }
     fi
     for C in ${CONCS//,/ }; do
       echo "=== concurrency=\$C ==="

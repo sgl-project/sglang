@@ -787,13 +787,13 @@ Tool Call: None
 
 - Benchmark Command
 ```bash Command
-python3 -m sglang.test.run_eval \
-  --eval-name gsm8k --api chat \
-  --host 127.0.0.1 --port 30000 \
-  --num-examples 200 --num-threads 64
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200 \
+  --num-threads 64
 ```
 
-Historical results below use the removed harness and are not measurements of the Chat API command above.
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 - Test Result
 ```text Output
@@ -804,20 +804,16 @@ Latency: 31.784 s
 Output throughput: 998.166 token/s
 ```
 
-#### 5.1.2 GSM8K with lm-eval (5-shot)
-
-Evaluate using the industry-standard `lm-eval` harness for reproducible accuracy reporting:
+#### 5.1.2 Full GSM8K with sgl-eval
 
 ```bash Command
-pip install lm-eval[api]
-
-lm_eval --model local-completions \
-    --model_args '{"base_url": "http://localhost:30000/v1/completions", "model": "Qwen/Qwen3.5-397B-A17B", "num_concurrent": 256, "max_retries": 10, "max_gen_toks": 2048}' \
-    --tasks gsm8k \
-    --batch_size auto \
-    --num_fewshot 5 \
-    --trust_remote_code
+sgl-eval run gsm8k \
+  --base-url http://localhost:30000/v1 \
+  --model Qwen/Qwen3.5-397B-A17B \
+  --num-examples 1319 --num-threads 256 --max-tokens 2048 --thinking
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 #### 5.1.3 MMMU Benchmark
 

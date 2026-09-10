@@ -298,7 +298,6 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     args_initial = SimpleNamespace(
         base_url=f"http://{test_instance.base_host}:{test_instance.base_port}",
         eval_name="gsm8k",
-        api="completion",
         max_tokens=512,
         num_examples=200,
         num_threads=64,

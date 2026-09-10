@@ -81,7 +81,6 @@ class TestGLM53FlashH200LowLatency(
     # 5-shot defaults leave a single question worth 0.5 percentage points and
     # make this tight quality floor unnecessarily sensitive to kernel numerics.
     gsm8k_num_examples = 500
-    gsm8k_num_shots = 20
     accept_length_thres = 4.0
     bs_1_speed_thres = 200
     server_args = [
@@ -104,7 +103,6 @@ class TestGLM53FlashH200HighThroughput(
 ):
     gsm8k_score_threshold = 0.93
     gsm8k_num_examples = 500
-    gsm8k_num_shots = 20
     server_args = [
         *COMMON_SERVER_ARGS,
         "--enable-dp-attention",

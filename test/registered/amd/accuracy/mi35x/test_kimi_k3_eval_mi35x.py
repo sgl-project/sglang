@@ -1,6 +1,6 @@
-"""MI35x Kimi-K3 GSM8K Completion Evaluation Test (8-GPU)
+"""MI35x Kimi-K3 sgl-eval GSM8K Chat Evaluation Test (8-GPU)
 
-Tests moonshotai/Kimi-K3 with GSM8K few-shot benchmark on MI35x.
+Tests moonshotai/Kimi-K3 with sgl-eval GSM8K benchmark on MI35x.
 
 Server arguments follow the Day-0 recipe in the AMD tracking issue
 (sgl-project/sglang#32548) for the non-speculative config: TP8 with the
@@ -21,12 +21,8 @@ MXFP4, roughly 192 GB of the 288 GB on each of the 8 GPUs, which is why
 `--mem-fraction-static` stays at the cookbook's 0.85 and concurrency is
 capped rather than left unbounded.
 
-The eval uses the few-shot *completion* harness that every sibling Kimi MI35x
-test uses (K2, K2.5, K2.6). It deliberately bypasses the chat template: K3
-has thinking permanently enabled and routes its answer through
-`reasoning_content` on the chat path, which would leave `message.content`
-empty and score 0. Scoring raw completions keeps this test measuring what it
-is meant to measure -- whether the ROCm kernels produce correct tokens.
+GSM8K uses sgl-eval chat prompts and grading. The server uses its Kimi-K3
+reasoning parser; generation must reach the final answer within the token budget.
 
 Registry: nightly-amd-accuracy-8-gpu-mi35x-kimi-k3 suite
 """
@@ -39,7 +35,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -69,16 +65,16 @@ MAX_RUNNING_REQUESTS = 64
 
 
 class TestKimiK3EvalMI35x(CustomTestCase):
-    """Kimi-K3 GSM8K Completion Evaluation Test for AMD MI35x."""
+    """Kimi-K3 sgl-eval GSM8K Chat Evaluation Test for AMD MI35x."""
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
-        cls.max_new_tokens = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "512"))
+        cls.max_new_tokens = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "16384"))
 
     def test_kimi_k3_gsm8k_accuracy(self):
-        """Test Kimi-K3 with GSM8K few-shot completion benchmark."""
+        """Test Kimi-K3 with sgl-eval sgl-eval GSM8K chat benchmark."""
         other_args = [
             "--tp",
             str(TP_SIZE),
@@ -128,15 +124,14 @@ class TestKimiK3EvalMI35x(CustomTestCase):
             requests.get(self.base_url + "/flush_cache")
 
             args = SimpleNamespace(
-                num_shots=8,
-                data_path=None,
-                num_questions=self.num_questions,
-                parallel=self.num_questions,
-                max_new_tokens=self.max_new_tokens,
+                eval_name="gsm8k",
+                num_examples=self.num_questions,
+                num_threads=self.num_questions,
+                max_tokens=self.max_new_tokens,
                 host="http://127.0.0.1",
                 port=int(self.base_url.split(":")[-1]),
             )
-            metrics = run_eval_few_shot_gsm8k(args)
+            metrics = run_gsm8k_eval(args)
             acc = metrics["accuracy"]
 
             passed = acc >= ACCURACY_THRESHOLD

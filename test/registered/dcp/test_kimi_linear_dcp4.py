@@ -47,7 +47,6 @@ class TestKimiLinearDCP4(GSM8KMixin, CustomTestCase):
     # Keep accuracy evaluation within the captured decode batch sizes so its
     # score is batch-invariant.
     gsm8k_num_threads = 128
-    gsm8k_num_shots = 5
 
     @classmethod
     def setUpClass(cls):

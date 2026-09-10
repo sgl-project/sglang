@@ -83,11 +83,9 @@ class TestFrozenKVMTP(CustomTestCase):
             base_url=cls.base_url,
             model="google/gemma-4-E4B-it",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
-            num_shots=5,
         )
 
     @staticmethod

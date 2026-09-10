@@ -40,6 +40,7 @@ dependencies = [
 dev = [
     "requests>=2.25.0",
     "pytest>=7.0.0",
+    "sgl-eval==0.1.0",
 ]
 
 [project.scripts]
