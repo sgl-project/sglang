@@ -1,31 +1,9 @@
-"""Correctness tests for the flashinfer GVR top-k DSv4 decode path.
+"""DSv4 GVR_2 chained-decode and physical-page transform regressions.
 
-Exercises ``gvr_topk_transform_decode`` (srt/layers/attention/dsv4/gvr_topk.py)
-- the exact production state machine behind ``--dsa-topk-backend
-flashinfer-gvr`` - over chained decode steps: gather previous-step hints per
-request slot, run ``flashinfer.top_k_varlen(backend="gvr", compress_ratio=4)``,
-scatter the output back as next-step hints, and page-transform the raw indices.
-
-Derived properties pinned down here:
-
-* GVR output is EXACT top-k regardless of hint quality (cold iota hints,
-  chained unordered hints, stale clamped hints) - the guess/hint only seeds
-  the threshold search. Verified by value-multiset comparison against
-  ``torch.topk`` (immune to equal-score tie swaps).
-* The documented ``pre_idx[:, 0] == argmax`` convention is a speed hint, not a
-  correctness requirement: chaining GVR's own unordered output (which does not
-  keep the argmax in column 0) must still be exact. If this test ever fails
-  while the col0-forced variant passes, the production path needs a col0
-  fixup.
-* Cross-step hint bookkeeping: ``state.hints[layer, slot]`` must hold exactly
-  the step's selected indices. A broken scatter would be *silent* in
-  end-to-end output (hints only affect speed), so it is asserted directly.
-* Rows with ``c4_len <= top_k`` emit exactly positions ``0..c4_len-1`` and pad
-  with -1 (the downstream flash_mla contract); surplus kernel writes must not
-  leak past the range mask.
-
-Requires Blackwell (sm_100+) and a flashinfer build with ``top_k_varlen``
-(flashinfer PR #3901); skipped otherwise.
+Raw previous-step hints are indexed by layer and request slot. Tests compare
+selected value multisets (allowing ties), validate nonidentity page mappings,
+and check that stale hints and short rows preserve exact selection and padding.
+Requires FlashInfer with hint-free top_k_varlen backend='gvr_2'.
 """
 
 from __future__ import annotations
@@ -37,6 +15,7 @@ import torch
 
 flashinfer = pytest.importorskip("flashinfer")
 
+from sglang.srt.layers.attention.dsa.gvr_topk import gvr_available
 from sglang.srt.layers.attention.dsv4.indexer import (
     GvrTopkState,
     gvr_topk_transform_decode,
@@ -52,11 +31,8 @@ NUM_LAYERS = 2
 
 
 def _require_gvr():
-    if not hasattr(flashinfer, "top_k_varlen"):
-        pytest.skip("flashinfer build lacks top_k_varlen (PR #3901)")
-    major, _ = torch.cuda.get_device_capability()
-    if major < 10:
-        pytest.skip("GVR top-k requires Blackwell (sm_100+)")
+    if not torch.cuda.is_available() or not gvr_available(torch.device("cuda")):
+        pytest.skip("Requires hint-free FlashInfer GVR_2 on a supported GPU")
 
 
 def _make_page_table(bs, num_pages, mode, device):

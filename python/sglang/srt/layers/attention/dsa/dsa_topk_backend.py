@@ -21,12 +21,34 @@ class TopkTransformMethod(IntEnum):
 
 
 class DSATopKBackend(Enum):
+    AUTO = "auto"
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
-    # GVR (Guess-Verify-Refine) top-k via flashinfer.top_k_varlen, warm-started
-    # from the previous decode step's indices. DeepSeek V4 decode only, SM100+.
+    # Explicit GVR_2 override; AUTO delegates tuning to FlashInfer.
     FLASHINFER_GVR = "flashinfer-gvr"
+
+    @classmethod
+    def from_server_args(cls, server_args):
+        backend = cls(server_args.dsa_topk_backend)
+        if not backend.uses_varlen():
+            return backend
+        if server_args.enable_deterministic_inference:
+            if backend.is_flashinfer_gvr():
+                raise ValueError(
+                    "flashinfer-gvr does not support deterministic inference"
+                )
+            return cls.SGL_KERNEL
+        if (
+            envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get()
+            or _flashinfer_tie_break_value() != 0
+        ):
+            if backend.is_flashinfer_gvr():
+                raise ValueError(
+                    "flashinfer-gvr does not support deterministic/tie-break overrides"
+                )
+            return cls.FLASHINFER
+        return backend
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
@@ -40,13 +62,47 @@ class DSATopKBackend(Enum):
     def is_flashinfer_gvr(self) -> bool:
         return self == DSATopKBackend.FLASHINFER_GVR
 
+    def uses_varlen(self) -> bool:
+        return self in (DSATopKBackend.AUTO, DSATopKBackend.FLASHINFER_GVR)
+
+    def use_varlen(self, logits, topk, row_starts=None) -> bool:
+        if not self.uses_varlen():
+            return False
+        from .gvr_topk import can_use_gvr
+
+        supported = (
+            not envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get()
+            and _flashinfer_tie_break_value() == 0
+            and can_use_gvr(logits, topk)
+        )
+        if self.is_flashinfer_gvr() and not supported:
+            raise RuntimeError(
+                "flashinfer-gvr requires hint-free FlashInfer GVR_2, supported "
+                "FP32 row-prefix logits, k=512/1024/2048, and no tie-break override."
+            )
+        return supported
+
     def topk_func(
         self,
         score: torch.Tensor,
         lengths: torch.Tensor,
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
+        **hint_args,
     ) -> torch.Tensor:
+        if self.use_varlen(score, topk, row_starts):
+            from .gvr_topk import flashinfer_sparse_topk
+
+            return flashinfer_sparse_topk(
+                score,
+                lengths,
+                topk,
+                row_starts=row_starts,
+                backend="gvr_2" if self.is_flashinfer_gvr() else "auto",
+                **hint_args,
+            )
+        if self == DSATopKBackend.AUTO:
+            return DSATopKBackend.SGL_KERNEL.topk_func(score, lengths, topk, row_starts)
         if self.is_sgl_kernel():
             from sgl_kernel import fast_topk_v2
 
@@ -90,22 +146,66 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        hint_args: Optional[dict] = None,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
-            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            return self.topk_func(
+                logits, lengths, topk, row_starts=row_starts, **(hint_args or {})
+            )
+
+        if self.use_varlen(logits, topk, row_starts):
+            from .gvr_topk import flashinfer_sparse_topk
+
+            transform = {}
+            if topk_transform_method == TopkTransformMethod.PAGED:
+                from sglang.srt.model_executor.forward_context import (
+                    get_token_to_kv_pool,
+                )
+
+                mapping, local_starts = _build_flashinfer_paged_args(
+                    attn_metadata,
+                    row_starts,
+                    cu_seqlens_q_topk,
+                    batch_idx_list,
+                    logits.device,
+                    logits.shape[0],
+                )
+                transform = dict(
+                    page_table=attn_metadata.real_page_table,
+                    page_size=get_token_to_kv_pool().page_size,
+                    row_to_batch=mapping,
+                    page_offsets=local_starts,
+                )
+            elif topk_transform_method == TopkTransformMethod.RAGGED:
+                if topk_indices_offset is None:
+                    raise RuntimeError("RAGGED top-k requires offsets")
+                transform = dict(offsets=topk_indices_offset)
+            else:
+                raise RuntimeError(f"Unsupported {topk_transform_method=}")
+            return flashinfer_sparse_topk(
+                logits,
+                lengths,
+                topk,
+                row_starts=row_starts,
+                backend="gvr_2" if self.is_flashinfer_gvr() else "auto",
+                **transform,
+                **(hint_args or {}),
+            )
+
+        if self == DSATopKBackend.AUTO:
+            self = DSATopKBackend.SGL_KERNEL
 
         # Decode-shaped PAGED top-k (plain decode AND spec verify / draft-extend,
         # whose expanded rows match the same shape) routes to the DeepSeek-V4 top-k
         # v2 JIT kernel, which fuses top-k selection and the page-table transform in
         # one launch and consumes the indexer's own page_size>=1 table directly, so
         # no page_size=1 table is materialized. Shared by DeepSeek-V3.2 and GLM DSA.
-        # This is a deterministic dispatch on the work shape, not a best-effort
-        # attempt: the fused-decode CUDA graph drops the page_size=1 table for
-        # exactly this case (see dsa_drop_wide_page_table), so once the shape
-        # matches we commit to v2 and never silently fall back to the legacy
-        # page_size=1 path from here.
+        # The fused-decode graph may omit page_table_1. Both the GVR path above
+        # and this fallback consume real_page_table directly. Explicit backend
+        # choices retain the wide table and must not be overridden by v2.
         if (
-            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            self.is_sgl_kernel()
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None
@@ -331,7 +431,9 @@ def _build_flashinfer_paged_args(
         q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
             dtype=torch.int32, device=device
         )
-        row_to_batch = torch.repeat_interleave(row_to_batch, q_lens)
+        row_to_batch = torch.repeat_interleave(
+            row_to_batch, q_lens, output_size=num_rows
+        )
 
     if row_to_batch is None and cu_seqlens_q_topk is not None:
         # Decode-like case (one query row per batch) does not need an explicit mapping.
@@ -344,6 +446,7 @@ def _build_flashinfer_paged_args(
             row_to_batch = torch.repeat_interleave(
                 torch.arange(q_lens.shape[0], dtype=torch.int32, device=device),
                 q_lens,
+                output_size=num_rows,
             )
 
     if row_starts is not None and row_to_batch is None:

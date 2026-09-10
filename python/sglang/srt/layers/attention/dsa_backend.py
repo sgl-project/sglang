@@ -279,6 +279,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
+    hint_args: Optional[dict] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -348,6 +349,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             row_starts=ks,
             batch_idx_list=batch_idx_list,
             force_unfused_topk=self.force_unfused_topk,
+            hint_args=self.hint_args,
         )
 
 
@@ -413,9 +415,30 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
-            model_runner.server_args.dsa_topk_backend
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.from_server_args(
+            model_runner.server_args
         )
+        self.gvr_state = None
+        if self.dsa_topk_backend.uses_varlen():
+            from sglang.srt.layers.attention.dsa.gvr_topk import (
+                GvrTopkState,
+                check_flashinfer_gvr_available,
+                gvr_available,
+            )
+
+            if self.dsa_topk_backend.is_flashinfer_gvr():
+                check_flashinfer_gvr_available(self.device)
+            if (
+                gvr_available(torch.device(self.device))
+                and self.dsa_index_topk in (512, 1024, 2048)
+                and model_runner.server_args.speculative_algorithm is None
+            ):
+                self.gvr_state = GvrTopkState(
+                    num_layers=model_runner.model_config.num_hidden_layers,
+                    num_slots=self.req_to_token.shape[0],
+                    top_k=self.dsa_index_topk,
+                    device=self.device,
+                )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -802,6 +825,7 @@ class DeepseekSparseAttnBackend(
         if (
             self.dsa_topk_backend.is_sgl_kernel()
             or self.dsa_topk_backend.is_flashinfer()
+            or self.dsa_topk_backend.uses_varlen()
         ):
             return topk_indices
         raise RuntimeError(
@@ -839,6 +863,8 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self.gvr_state is not None and not in_capture:
+            self.gvr_state.sync_generations(self.req_to_token_pool.req_generation)
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -855,6 +881,8 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        if self.gvr_state is not None:
+            self.gvr_state.sync_generations(self.req_to_token_pool.req_generation)
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -1263,6 +1291,12 @@ class DeepseekSparseAttnBackend(
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
             and self.use_fused_topk
+            and self.dsa_topk_backend
+            in (
+                DSATopKBackend.AUTO,
+                DSATopKBackend.SGL_KERNEL,
+                DSATopKBackend.FLASHINFER_GVR,
+            )
             and envs.SGLANG_OPT_USE_TOPK_V2.get()
             and self.dsa_index_topk is not None
             and self.dsa_index_topk <= 2048
@@ -3444,6 +3478,16 @@ class DeepseekSparseAttnBackend(
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )
+        hint_args = None
+        if self.gvr_state is not None:
+            if forward_batch.forward_mode.is_decode():
+                hint_args = dict(
+                    state=self.gvr_state,
+                    layer_id=layer_id,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                )
+            else:
+                self.gvr_state.reset(layer_id, forward_batch.req_pool_indices)
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
@@ -3453,6 +3497,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
+            hint_args=hint_args,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):

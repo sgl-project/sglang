@@ -41,6 +41,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsa.gvr_topk import (
+    GvrTopkState,
+    check_flashinfer_gvr_available,
+    gvr_available,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -48,8 +53,6 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
-    GvrTopkState,
-    check_flashinfer_gvr_available,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
@@ -533,19 +536,17 @@ class DeepseekV4AttnBackend(
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
         )
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
-            model_runner.server_args.dsa_topk_backend
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.from_server_args(
+            model_runner.server_args
         )
         if self.dsa_topk_backend.is_flashinfer_gvr():
-            check_flashinfer_gvr_available()
-            assert self.hisparse_coordinator is None, (
-                "--dsa-topk-backend flashinfer-gvr does not support hisparse "
-                "(it consumes raw indices via a different top-k path)."
-            )
-            assert model_runner.server_args.speculative_algorithm is None, (
-                "--dsa-topk-backend flashinfer-gvr does not support "
-                "speculative decoding (MTP) yet."
-            )
+            check_flashinfer_gvr_available(self.device)
+        if (
+            self.dsa_topk_backend.uses_varlen()
+            and gvr_available(torch.device(self.device))
+            and self.c4_topk in (512, 1024, 2048)
+            and model_runner.server_args.speculative_algorithm is None
+        ):
             self.gvr_state = GvrTopkState(
                 num_layers=model_runner.model_config.num_hidden_layers,
                 num_slots=model_runner.req_to_token_pool.req_to_token.shape[0],
@@ -1189,6 +1190,8 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ) -> None:
+        if self.gvr_state is not None and not in_capture:
+            self.gvr_state.sync_generations(self.req_to_token_pool.req_generation)
         bucket = _GraphBucket.of(forward_batch.forward_mode)
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
@@ -1370,6 +1373,8 @@ class DeepseekV4AttnBackend(
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        if self.gvr_state is not None:
+            self.gvr_state.sync_generations(self.req_to_token_pool.req_generation)
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         if self.mtp_enabled and logical_forward_mode.is_idle():
             self.online_c128_mtp.clear()
