@@ -5,7 +5,6 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import (
     AccuracyTwoPassMixin,
@@ -17,9 +16,10 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=738, stage="base-c", runner_config="4-gpu-h100")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
@@ -28,9 +28,9 @@ def _assert_pp_decode_cached_tokens(result, history_len, output_len, label):
     expected = history_len + output_len
     actual = result["meta_info"]["cached_tokens"]
     lower = max(0, expected - 1)
-    assert (
-        lower <= actual <= expected
-    ), f"{label}: expected cached_tokens in [{lower}, {expected}], got {actual}"
+    assert lower <= actual <= expected, (
+        f"{label}: expected cached_tokens in [{lower}, {expected}], got {actual}"
+    )
 
 
 class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -86,7 +86,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 str(cls.max_running_requests),
                 "--max-total-tokens",
                 "14000",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 "--enable-hierarchical-cache",
@@ -105,7 +105,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 
 class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
@@ -130,11 +130,11 @@ class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.8",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "32",
                 "--max-total-tokens",
                 "14000",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 "--enable-hierarchical-cache",
@@ -157,7 +157,7 @@ class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 
