@@ -2319,6 +2319,17 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIn("<｜Assistant｜>", out)
 
+    def test_dsv41_reasoning_effort_none_uses_default_without_warning(self):
+        self.chat._dsv41_default_reasoning_effort = "high"
+
+        with self.assertNoLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+        ):
+            effort = self.chat._resolve_dsv41_reasoning_effort("none")
+
+        self.assertEqual(effort, "high")
+        self.assertNotIn("'none'", self.chat._dsv41_unsupported_efforts_warned)
+
     def test_dsv4_reasoning_effort_profiles(self):
         from sglang.srt.entrypoints.openai import encoding_dsv4
 
