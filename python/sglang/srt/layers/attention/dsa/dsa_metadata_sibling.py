@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-from sglang.srt.utils import is_hip
+from typing import TYPE_CHECKING
+
+from sglang.srt.utils import is_cuda, is_hip
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
+        PrecomputedMetadata,
+    )
+    from sglang.srt.layers.attention.dsa_backend import (
+        DeepseekSparseAttnBackend,
+        DSAMetadata,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 _is_hip = is_hip()
 
 
 class DSAMetadataSiblingMixin:
-    pass
-
     def _copy_base_replay_buffers(self, bs, metadata, precomputed, forward_mode):
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
@@ -130,3 +140,121 @@ class DSAMetadataSiblingMixin:
                 size = precomputed.seqlens_expanded_size
                 flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
                 flashmla_metadata.copy_(precomputed.flashmla_metadata)
+
+    @staticmethod
+    def _sibling_replay_metadata_compatible(dst: DSAMetadata, src: DSAMetadata) -> bool:
+        """Check that both sides expose the same optional derived buffers."""
+
+        def _match(a, b) -> bool:
+            return (a is None) == (b is None)
+
+        if not (
+            _match(dst.paged_mqa_schedule_metadata, src.paged_mqa_schedule_metadata)
+            and _match(dst.topk_v2_plan, src.topk_v2_plan)
+            and _match(dst.pooled_cache_seqlens_int32, src.pooled_cache_seqlens_int32)
+            and _match(dst.pooled_real_page_table, src.pooled_real_page_table)
+            and _match(
+                dst.pooled_paged_mqa_schedule_metadata,
+                src.pooled_paged_mqa_schedule_metadata,
+            )
+            and _match(dst.kpool_write_plan, src.kpool_write_plan)
+        ):
+            return False
+        dst_plan, src_plan = dst.kpool_write_plan, src.kpool_write_plan
+        if dst_plan is not None and not (
+            _match(dst_plan.pool_seqlens_per_q, src_plan.pool_seqlens_per_q)
+            and _match(dst_plan.seqlens_per_q, src_plan.seqlens_per_q)
+            and _match(dst_plan.pool_schedule_metadata, src_plan.pool_schedule_metadata)
+            and _match(dst_plan.effective_n_per_batch, src_plan.effective_n_per_batch)
+        ):
+            return False
+        return True
+
+    def _copy_replay_metadata_from_sibling(
+        self,
+        src_backend: DeepseekSparseAttnBackend,
+        bs: int,
+        precomputed: PrecomputedMetadata,
+        forward_mode: ForwardMode,
+    ) -> None:
+        """Copy replay metadata from a sibling using the same precomputed input."""
+        metadata = self.decode_cuda_graph_metadata.get(bs)
+        src_metadata = src_backend.decode_cuda_graph_metadata.get(bs)
+        if (
+            # The derived-copy body below is CUDA-only; any other platform
+            # must take the full recompute, not a partial copy that would
+            # leave the DeepGEMM schedule / top-k plan / kpool metadata
+            # stale.
+            not is_cuda()
+            or _is_hip
+            or not forward_mode.is_decode_or_idle()
+            or metadata is None
+            or src_metadata is None
+            # `src_backend` must have run the full recompute path for this bs
+            # in this replay, so its derived buffers are fresh.
+            or src_backend.forward_metadata is not src_metadata
+            or not self._sibling_replay_metadata_compatible(metadata, src_metadata)
+        ):
+            self.init_forward_metadata_replay_cuda_graph_from_precomputed(
+                bs=bs, precomputed=precomputed, forward_mode=forward_mode
+            )
+            return
+
+        self.set_dsa_prefill_impl(forward_batch=None)
+        self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
+
+        if is_cuda():
+            if metadata.paged_mqa_schedule_metadata is not None:
+                metadata.paged_mqa_schedule_metadata.copy_(
+                    src_metadata.paged_mqa_schedule_metadata
+                )
+            if metadata.topk_v2_plan is not None:
+                metadata.topk_v2_plan.copy_(src_metadata.topk_v2_plan)
+            # Decode: the 2D ctx lens are a (bs, 1) view of this backend's own
+            # cache_seqlens_int32 (just refreshed by the base copy above); keep
+            # the exact refresh the recompute path performs -- it is a single
+            # small view/copy, not part of the duplicated derived work.
+            seqlens_32_2d = metadata.cache_seqlens_int32.contiguous().view(bs, 1)
+            if metadata.paged_mqa_ctx_lens_2d is None:
+                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+            else:
+                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+
+        self._copy_kpool_metadata_from_sibling(metadata, src_metadata)
+
+        self.forward_metadata = metadata
+
+    def _copy_kpool_metadata_from_sibling(
+        self, metadata: DSAMetadata, src_metadata: DSAMetadata
+    ) -> None:
+        """Copy KPool metadata derived from identical inputs from a sibling."""
+        if self.dsa_index_kpool <= 1 or not is_cuda():
+            return
+
+        if metadata.pooled_cache_seqlens_int32 is not None:
+            metadata.pooled_cache_seqlens_int32.copy_(
+                src_metadata.pooled_cache_seqlens_int32
+            )
+        if metadata.pooled_real_page_table is not None:
+            metadata.pooled_real_page_table.copy_(src_metadata.pooled_real_page_table)
+        if metadata.pooled_paged_mqa_schedule_metadata is not None:
+            metadata.pooled_paged_mqa_schedule_metadata.copy_(
+                src_metadata.pooled_paged_mqa_schedule_metadata
+            )
+
+        dst_plan = metadata.kpool_write_plan
+        src_plan = src_metadata.kpool_write_plan
+        if dst_plan is None:
+            return
+        dst_plan.req.copy_(src_plan.req)
+        dst_plan.write_start.copy_(src_plan.write_start)
+        dst_plan.tail_logical_start.copy_(src_plan.tail_logical_start)
+        dst_plan.write_loc.copy_(src_plan.write_loc)
+        if dst_plan.pool_seqlens_per_q is not None:
+            dst_plan.pool_seqlens_per_q.copy_(src_plan.pool_seqlens_per_q)
+        if dst_plan.seqlens_per_q is not None:
+            dst_plan.seqlens_per_q.copy_(src_plan.seqlens_per_q)
+        if dst_plan.pool_schedule_metadata is not None:
+            dst_plan.pool_schedule_metadata.copy_(src_plan.pool_schedule_metadata)
+        if dst_plan.effective_n_per_batch is not None:
+            dst_plan.effective_n_per_batch.copy_(src_plan.effective_n_per_batch)

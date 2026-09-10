@@ -35,11 +35,6 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
-from sglang.kernels.ops.attention.dsa_metadata import (
-    fused_dsa_decode_metadata,
-    fused_dsa_draft_extend_metadata,
-    fused_dsa_target_verify_metadata,
-)
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -50,8 +45,6 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
-    get_dsa_index_topk,
-    is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -65,6 +58,9 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_metadata_fusion import (
+    DSAKPoolMetadataFusionMixin,
+)
 from sglang.srt.layers.attention.dsa.dsa_metadata_sibling import DSAMetadataSiblingMixin
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
@@ -89,7 +85,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -309,6 +304,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
 
 
 class DeepseekSparseAttnBackend(
+    DSAKPoolMetadataFusionMixin,
     DSAMetadataSiblingMixin,
     DeepseekSparseAttnBackendKPoolMixin,
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
@@ -348,6 +344,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
+        self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -1532,8 +1529,10 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
-                fused_dsa_decode_metadata(
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
+                self._fused_decode_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
                     req_to_token=self.req_to_token,
@@ -1572,7 +1571,9 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
@@ -1585,7 +1586,7 @@ class DeepseekSparseAttnBackend(
                 ):
                     paged_mqa_ctx_lens_2d = metadata.paged_mqa_ctx_lens_2d
 
-                fused_dsa_target_verify_metadata(
+                self._fused_verify_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
                     req_to_token=self.req_to_token,
@@ -1668,8 +1669,10 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
-                fused_dsa_draft_extend_metadata(
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
+                self._fused_draft_extend_metadata(
                     seq_lens=seq_lens,
                     extend_seq_lens=extend_seq_lens,
                     req_pool_indices=req_pool_indices,
@@ -3660,6 +3663,20 @@ class DeepseekSparseAttnMultiStepBackend:
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             forward_mode=ForwardMode.DECODE,
         )
+
+        if self.attn_backends[0].experimental_kpool_metadata_fusion:
+            first = self.attn_backends[0]
+            first.init_forward_metadata_replay_cuda_graph_from_precomputed(
+                bs=bs, precomputed=precomputed, forward_mode=ForwardMode.DECODE
+            )
+            for backend in self.attn_backends[1 : self.speculative_num_steps - 1]:
+                backend._copy_replay_metadata_from_sibling(
+                    src_backend=first,
+                    bs=bs,
+                    precomputed=precomputed,
+                    forward_mode=ForwardMode.DECODE,
+                )
+            return
 
         # Use multi-backend fused copy when we have 3 or more backends
         # This is 3x faster than calling the single-backend copy 3 times
