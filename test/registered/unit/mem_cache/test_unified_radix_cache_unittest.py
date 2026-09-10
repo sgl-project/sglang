@@ -848,6 +848,9 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
     )
 
     def test_l3_prefetch_uses_bigram_radix_key(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchSubmission,
+        )
         from sglang.srt.mem_cache.utils import get_hash_str
 
         cache, allocator, _ = build_fixture(self.cfg)
@@ -878,28 +881,33 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             def prefetch_rate_limited(self):
                 return False
 
-            def prefetch(
+            def get_prefetch_submission(self, rid):
+                return None
+
+            def submit_prefetch(
                 self,
-                request_id,
-                new_input_tokens,
-                last_hash=None,
-                prefix_keys=None,
-                extra_pools=None,
+                rid,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                matched_prefix_tokens,
+                pool_transfers,
             ):
                 self.prefetch_args = (
-                    request_id,
-                    new_input_tokens,
+                    rid,
+                    prefetch_key,
                     last_hash,
                     prefix_keys,
-                    extra_pools,
+                    matched_prefix_tokens,
+                    pool_transfers,
                 )
-                return mock.Mock()
+                return PrefetchSubmission(operation=mock.Mock())
 
         controller = FakeCacheController()
         cache.cache_controller = controller
         cache.prefetch_from_storage("req", cache.root_node_handle(), tokens)
 
-        _, storage_key, _, _, _ = controller.prefetch_args
+        _, storage_key, _, _, _, _ = controller.prefetch_args
         self.assertIsInstance(storage_key, RadixKey)
         self.assertTrue(storage_key.is_bigram)
         self.assertEqual(len(storage_key), len(tokens) - 1)
