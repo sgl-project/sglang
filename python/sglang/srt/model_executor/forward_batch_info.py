@@ -869,6 +869,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if _is_npu:
             from sglang.srt.configs.model_config import is_deepseek_dsa
 
+            # FIXME: On NPU, keep pin_memory=False fallback on ForwardBatch
+            #  for non-DSA models to prevent dp-attn hangs.
             if is_deepseek_dsa(model_runner.model_config.hf_config):
                 pin_memory = True
         ret.device_use_pin_memory = pin_memory
