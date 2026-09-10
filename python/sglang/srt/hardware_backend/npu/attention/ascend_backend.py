@@ -643,6 +643,23 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+        if get_parallel().dcp_enabled:
+            # The second page table, on the same footing as the first: sparse
+            # attention reads the sharded latent KV while the indexer reads the
+            # replicated span, so a captured graph needs persistent storage for
+            # both. Without this the capture path leaves it None, the call drops
+            # `block_table`, and the operator refuses with "the layout_kv is
+            # PA_BSND, blockTable must be provided" -- at capture time, so the
+            # server never starts rather than degrading quietly.
+            #
+            # Strided by page_size * dcp_size, matching dcp_local_kv_block_table,
+            # so it is 1/dcp_size the width of the table above.
+            stride = self.page_size * get_parallel().attn_dcp_size
+            self.graph_metadata["dcp_local_block_tables"] = torch.empty(
+                (max_bs, (total_context_len + stride - 1) // stride),
+                dtype=torch.int32,
+                device=self.device,
+            )
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, total_context_len // self.page_size),
@@ -690,6 +707,10 @@ class AscendAttnBackend(AttentionBackend):
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+        if get_parallel().dcp_enabled:
+            metadata.dcp_local_block_tables = self.graph_metadata[
+                "dcp_local_block_tables"
+            ][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
@@ -811,6 +832,20 @@ class AscendAttnBackend(AttentionBackend):
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
+
+        if get_parallel().dcp_enabled:
+            # Same refill, at the rank-local stride. Read from req_to_token with
+            # the same slice arithmetic dcp_local_kv_block_table uses on the
+            # eager path, so capture and eager cannot drift apart: one is
+            # loc_rows[:, ::stride] // stride over a materialised slice, this is
+            # the same stride applied in the indexer.
+            stride = self.page_size * get_parallel().attn_dcp_size
+            max_local_pages = (max_len + stride - 1) // stride
+            metadata.dcp_local_block_tables[:bs, :max_local_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0:max_len:stride] // stride
+            )
+            metadata.dcp_local_block_tables[:bs, max_local_pages:].fill_(0)
+            metadata.dcp_local_block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
