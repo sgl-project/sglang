@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.configs.task_type import ModelTaskType as Task
@@ -184,15 +186,16 @@ def test_multi_task_warmup_uses_default_without_optional_image(monkeypatch):
     assert reqs[0].image_path is None
 
 
-@pytest.fixture
-def http_client(monkeypatch, tmp_path):
-    config = MultiConfig()
+@pytest.fixture(params=[(MultiConfig, SamplingParams)])
+def http_client(monkeypatch, tmp_path, request):
+    config_cls, sampling_cls = request.param
+    config = config_cls()
     args = make_args(config, str(tmp_path))
     for module in (image_api, video_api, utils):
         monkeypatch.setattr(module, "get_global_server_args", lambda: args)
     for module in (image_api, video_api):
         monkeypatch.setattr(
-            module, "resolve_sampling_params_cls", lambda _: SamplingParams
+            module, "resolve_sampling_params_cls", lambda _: sampling_cls
         )
     monkeypatch.setattr(
         SamplingParams, "from_pretrained", classmethod(lambda cls, *a, **kw: cls())
@@ -232,6 +235,65 @@ def png_bytes():
     buf = io.BytesIO()
     Image.new("RGB", (64, 64)).save(buf, format="PNG")
     return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    "http_client", [(Cosmos3Config, Cosmos3SamplingParams)], indirect=True
+)
+@pytest.mark.parametrize("task", [None, "t2i"])
+def test_cosmos3_image_endpoint_selects_image_task(http_client, task):
+    client, admitted, config = http_client
+    response = client.post(
+        "/v1/images/generations",
+        json={"prompt": "text", "size": "64x64", "task_type": task},
+    )
+    assert response.status_code == 200, response.text
+    assert admitted[-1].task_type == Task.T2I
+    assert admitted[-1].data_type == DataType.IMAGE
+    assert admitted[-1].num_frames == 1
+    assert config.task_type == Task.TI2V
+
+
+@pytest.mark.parametrize(
+    "http_client", [(Cosmos3Config, Cosmos3SamplingParams)], indirect=True
+)
+@pytest.mark.parametrize(
+    "conditioning,task",
+    [
+        ({}, Task.TI2V),
+        ({"image_path": "/tmp/image.png"}, Task.TI2V),
+        ({"video_path": "/tmp/clip.mp4"}, Task.V2V),
+    ],
+)
+def test_cosmos3_video_endpoint_preserves_conditioning(http_client, conditioning, task):
+    client, admitted, config = http_client
+    response = client.post(
+        "/v1/videos", json={"prompt": "video", "size": "64x64", **conditioning}
+    )
+    assert response.status_code == 200, response.text
+    assert admitted[-1].task_type == task
+    assert admitted[-1].data_type == DataType.VIDEO
+    assert config.task_type == Task.TI2V
+
+
+@pytest.mark.parametrize(
+    "frames,conditioning,task",
+    [
+        (1, {}, Task.T2I),
+        (81, {}, Task.TI2V),
+        (81, {"image_path": "/tmp/image.png"}, Task.TI2V),
+        (81, {"video_path": "/tmp/clip.mp4"}, Task.V2V),
+    ],
+)
+def test_cosmos3_sampling_resolves_existing_modes(frames, conditioning, task, tmp_path):
+    config = Cosmos3Config()
+    sp = Cosmos3SamplingParams(prompt="test", num_frames=frames, **conditioning)
+    sp._adjust(make_args(config, str(tmp_path)))
+    sp._validate_with_pipeline_config(config)
+    assert sp.task_type == task
+    assert sp.data_type == task.data_type()
+    assert sp.output_file_path().endswith(sp.data_type.get_default_extension())
+    assert config.task_type == Task.TI2V
 
 
 def test_image_json_and_multipart_choose_tasks_on_video_default(http_client):
