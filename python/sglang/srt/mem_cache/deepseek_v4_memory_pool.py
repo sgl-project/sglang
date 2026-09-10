@@ -42,9 +42,8 @@ def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
-    # Online c128 keeps a single (max, sum, kv) state per index instead of a
-    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
-    # is incompatible with speculative decode for now.
+    # Online C128 stores one (max, sum, kv) state per index;
+    # speculative decoding requires the experimental online C128 MTP path.
     if compress_ratio == 128 and ONLINE_C128:
         if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             raise AssertionError("online c128 does not support MTP")
@@ -56,9 +55,8 @@ def get_compress_state_ring_size(
 
 
 def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
-    """Largest draft-token count this ring can serve; mirrors `mtp_pad` in `c_plan.cuh`
-    (the bound is derived there). Zero for a non-speculative ring, which is exactly one
-    window wide."""
+    # Draft-token capacity must match mtp_pad in c_plan.cuh;
+    # a non-speculative ring has no write padding.
     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
     return ring_size - window_size + 2 if ring_size > window_size else 0
 
@@ -620,9 +618,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self.max_num_reqs = max_num_reqs
-        # SWA ring needs one slot per addressable req_pool_idx. PD decode inflates
-        # req_to_token past max_num_reqs (pre-alloc), so the caller passes the real
-        # capacity; sizing as max_num_reqs+1 overflows ("length out of range").
+        # PD preallocation can exceed max_num_reqs;
+        # the SWA ring must cover every addressable req_pool_idx.
         self.num_req_slots = (
             num_req_slots if num_req_slots is not None else max_num_reqs + 1
         )
@@ -648,9 +645,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
-            # Request-scoped online C128 state is indexed by req_pool_idx.
-            # PD decode can allocate pre-transfer slots beyond
-            # max_num_reqs, so size to the actual req_to_token row count.
+            # Request-scoped C128 state must also cover PD preallocation slots.
             c128_state_pool_size = max(c128_state_pool_size, self.num_req_slots)
         else:
             # Offline C128 keeps a per-request raw state ring.
@@ -860,8 +855,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """SWA-ring region [0, swa_pages) of every unified_kv layer, addressed
-        per-row by ring slot. Shipped as the StateType.SWA_RING PD component."""
+        # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;
+        # its indices address individual ring rows.
         # TODO(billishyahao): validate PP layer-slicing for SWA_RING.
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -878,12 +873,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return data_ptrs, data_lens, item_lens
 
     def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
-        """
-        In unified_kv, swa/c4/c128 share one buffer with one slot per row. But the
-        HiCache host pool transfers a whole page per indexed row, so we reshape the
-        compressed region into the layout it expects: skip the SWA segment, reshape to
-        one row per page, then cast to uint8.
-        """
+        # HiCache expects byte rows containing whole pages;
+        # the unified pool stores individual token rows after its SWA region.
         assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
         assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
 
@@ -1188,9 +1179,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         accept_lens: torch.Tensor,
         num_draft_tokens: int,
     ) -> None:
-        """Clear offline C128 ring slots written for rejected speculative tokens.
-        C4 needs no counterpart: its draft states are overwritten in position order
-        before any read; a C128 compression boundary can read a stale draft slot."""
+        # C128 compression can read rejected draft slots at a boundary;
+        # C4 overwrites its draft slots before reading them.
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 

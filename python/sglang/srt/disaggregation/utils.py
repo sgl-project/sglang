@@ -89,13 +89,8 @@ def get_dsv4_c4_state_indices(
     *,
     ring_size: int,
 ) -> np.ndarray:
-    """Return physical rows for the live C4 compressor history.
-
-    Prefill and decode may use different C4 ring sizes (8 without speculative
-    decoding and 16 with EAGLE/MTP).  State transfer must therefore pair rows
-    by logical token position instead of copying a whole request-local bank.
-    The C4 overlap compressor keeps ``seq_len % 4 + 4`` live rows.
-    """
+    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
+    # pair the overlap compressor's live rows by logical token position.
     if ring_size < 8 or ring_size % 4 != 0:
         raise ValueError(
             f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
@@ -1276,10 +1271,6 @@ def setup_state_kv_args(
     total_kv_layers: int = None,
     req_to_token_pool=None,
 ) -> None:
-    """Populate ``kv_args`` state-buffer fields from the given pool.
-    Shared by prefill and decode bootstrap paths so the state_type dispatch
-    lives in one place.
-    """
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool

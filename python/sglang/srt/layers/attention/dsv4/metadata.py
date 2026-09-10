@@ -148,9 +148,7 @@ class PagedIndexerMetadata:
             if compressed_seq_lens.dim() == 1:
                 compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
             if _IS_SM120 and compressed_seq_lens.shape[0] > _SM120_INDEXER_M_CHUNK:
-                # Chunk metadata is identical for every layer in the forward
-                # pass; compute the per-chunk list once here instead of per
-                # layer in the indexer.
+                # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
                     get_paged_mqa_logits_metadata(
                         compressed_seq_lens[_s : _s + _SM120_INDEXER_M_CHUNK],
