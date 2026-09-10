@@ -853,6 +853,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        # Retraction also enters here: retain its ticket until actual finish.
+        if (
+            self.cache_controller is not None
+            and self.cache_controller.pp_prefetch_command_group is not None
+            and req.finished()
+        ):
+            self.cache_controller.release_pp_prefetch(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 

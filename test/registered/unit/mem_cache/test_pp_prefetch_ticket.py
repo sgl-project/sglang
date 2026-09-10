@@ -443,11 +443,84 @@ class TestPPPrefetchTicket(unittest.TestCase):
         state.ready_event = Mock(spec=threading.Event)
         self.assertIs(c.take_ready_pp_prefetch("hit"), state)
         state.ready_event.wait.assert_called_once_with()
-        self.assertIsNone(c.get_prefetch_submission("hit"))
+        self.assertTrue(state.consumed)
+        self.assertIs(c.pp_prefetch_states["hit"], state)
+        self.assertFalse(c.is_pp_prefetch_ready("hit"))
+        self.assertFalse(c.get_prefetch_submission("hit").decision)
         self.assertIsNone(c.take_ready_pp_prefetch("hit"))
         self.assertFalse(c.release_pp_prefetch("hit"))
+        self.assertNotIn("hit", c.pp_prefetch_states)
+        self.assertIsNone(c.get_prefetch_submission("hit"))
         c.mem_pool_host.free.assert_not_called()
         self.assertEqual(c.prefetch_tokens_occupied, 8)  # Now owned by buffer mode.
+
+    def test_repeated_prefetch_reuses_issued_ticket_before_and_after_consumption(self):
+        c = self.controller
+        operation = self.submit().operation
+        state = c.pp_prefetch_states["hit"]
+        c._allocate_pp_prefetch_buffers(state.ticket, operation)
+        operation.completed_tokens = 8
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True)
+        cache.cache_controller = c
+        cache.ongoing_prefetch = {}
+        cache._all_reduce = Mock()
+        for phase in ("pending", "ready", "consumed"):
+            with self.subTest(phase=phase):
+                if phase == "ready":
+                    state.ready_event.set()
+                elif phase == "consumed":
+                    c.take_ready_pp_prefetch("hit")
+                for _ in range(2):
+                    self.assertEqual(
+                        cache.prefetch_from_storage("hit", 0, list(range(8))),
+                        phase != "consumed",
+                    )
+        self.assertTrue(cache.check_prefetch_progress("hit"))
+        cache._all_reduce.assert_not_called()
+        self.assertEqual(
+            c._storage_hit_query.call_count, 2
+        )  # Original PP0 query shards.
+        c.pp_prefetch_command_queue.put.assert_called_once()
+        c.mem_pool_host.free.assert_not_called()
+
+    def test_consumed_ticket_abort_still_releases_buffer_mode_hold(self):
+        c = self.controller
+        self.submit()
+        state = c.pp_prefetch_states["hit"]
+        state.ready_event.set()
+        c.take_ready_pp_prefetch("hit")
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = c
+        cache.linker = None
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.prefetch_loaded_storage_start_by_reqid = {}
+        cache._storage_prefetch_missed_rids = set()
+        cache.buffer_pipeline = Mock()
+        cache.buffer_pipeline.release_staged_hold.return_value = True
+        cache.release_aborted_request("hit")
+        self.assertNotIn("hit", c.pp_prefetch_states)
+        cache.buffer_pipeline.release_staged_hold.assert_called_once_with("hit")
+        c.mem_pool_host.free.assert_not_called()
+
+    def test_finished_request_retires_ticket_but_retraction_preserves_it(self):
+        c = self.controller
+        self.submit()
+        state = c.pp_prefetch_states["hit"]
+        state.ready_event.set()
+        c.take_ready_pp_prefetch("hit")
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = c
+        cache.session = Mock()
+        cache.session.try_cache_finished_req.return_value = True
+        req = Mock(rid="hit")
+        req.finished.return_value = False
+        cache.cache_finished_req(req, kv_len_to_handle=0)
+        self.assertIs(c.pp_prefetch_states["hit"], state)
+        req.finished.return_value = True
+        cache.cache_finished_req(req, kv_len_to_handle=0)
+        self.assertNotIn("hit", c.pp_prefetch_states)
+        c.mem_pool_host.free.assert_not_called()
 
     def test_take_zero_completion_releases_buffers(self):
         c = self.controller
@@ -458,6 +531,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertIs(c.take_ready_pp_prefetch("hit"), state)
         self.assertIsNone(operation.host_indices)
         self.assertEqual(c.prefetch_tokens_occupied, 0)
+        self.assertFalse(c.get_prefetch_submission("hit").decision)
+        self.assertFalse(c.release_pp_prefetch("hit"))
         c.mem_pool_host.free.assert_called_once()
 
 

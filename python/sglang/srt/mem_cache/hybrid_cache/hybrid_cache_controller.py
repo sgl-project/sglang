@@ -88,6 +88,7 @@ class PPPrefetchState:
     operation: PrefetchOperation
     release_requested: bool = False
     ready_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    consumed: bool = False
 
 
 class StorageOperation(BaseStorageOperation):
@@ -685,6 +686,9 @@ class HybridCacheController(BaseHiCacheController):
         if self.pp_rank != 0:
             return PrefetchSubmission()
         with self.pp_prefetch_state_lock:
+            state = self.pp_prefetch_states.get(rid)
+            if state is not None:
+                return PrefetchSubmission(decision=not state.consumed)
             if rid not in self.pp_prefetch_decisions:
                 return None
             decision = self.pp_prefetch_decisions[rid]
@@ -866,18 +870,21 @@ class HybridCacheController(BaseHiCacheController):
     def is_pp_prefetch_ready(self, rid: str) -> bool:
         with self.pp_prefetch_state_lock:
             state = self.pp_prefetch_states.get(rid)
-            return state is not None and state.ready_event.is_set()
+            return (
+                state is not None and not state.consumed and state.ready_event.is_set()
+            )
 
     def take_ready_pp_prefetch(self, rid: str) -> Optional[PPPrefetchState]:
         with self.pp_prefetch_state_lock:
             state = self.pp_prefetch_states.get(rid)
-        if state is None:
+        if state is None or state.consumed:
             return None
         state.ready_event.wait()
         with self.pp_prefetch_state_lock:
-            if self.pp_prefetch_states.get(rid) is not state:
+            if self.pp_prefetch_states.get(rid) is not state or state.consumed:
                 return None
-            self.pp_prefetch_states.pop(rid)
+            # Keep the ticket for deduplication until the request finishes.
+            state.consumed = True
             self.pp_prefetch_decisions.pop(rid, None)
             if (
                 state.operation.host_indices is None
@@ -887,12 +894,15 @@ class HybridCacheController(BaseHiCacheController):
             return state
 
     def release_pp_prefetch(self, rid: str) -> bool:
-        """Release a ticket that has not transferred ownership to buffer mode."""
+        """Retire a ticket; free only buffers not handed to buffer mode."""
         with self.pp_prefetch_state_lock:
             self.pp_prefetch_decisions.pop(rid, None)
             state = self.pp_prefetch_states.get(rid)
             if state is None:
                 return False
+            if state.consumed:
+                self.pp_prefetch_states.pop(rid)
+                return False  # Buffer mode owns any remaining staging buffers.
             state.release_requested = True
             if state.ready_event.is_set():
                 self._free_pp_prefetch_state(state)
