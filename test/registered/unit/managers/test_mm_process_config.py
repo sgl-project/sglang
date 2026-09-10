@@ -75,12 +75,28 @@ class TestMmProcessConfigValidation(CustomTestCase):
 class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
 
+    def _patch_platform(self, cuda_alike, device_type):
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: cuda_alike,
+                device_type=device_type,
+            )
+        )
+        return patch.multiple(
+            "sglang.srt.multimodal.processors.base_processor",
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=False,
+            platforms=platforms,
+        )
+
     def _make_processor(
         self,
         mm_process_config,
         mm_processor_worker_num=0,
         mm_io_worker_num=0,
         image_processor=None,
+        processor=None,
     ):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
         from sglang.srt.multimodal.processors.base_processor import (
@@ -118,7 +134,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         )
 
         hf_config = MagicMock()
-        mock_hf_processor = MagicMock()
+        mock_hf_processor = MagicMock() if processor is None else processor
         if image_processor is not None:
             mock_hf_processor.image_processor = image_processor
 
@@ -210,11 +226,47 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         9.30 -> 4.02 req/s on GB300 for full-page images."""
         from transformers import BaseImageProcessor
 
-        proc = self._make_processor(
-            {}, image_processor=MagicMock(spec=BaseImageProcessor)
-        )
+        with self._patch_platform(cuda_alike=True, device_type="cuda"):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
+
+    def test_non_accelerator_fast_processor_gets_two_workers(self):
+        from transformers import BaseImageProcessor
+
+        with self._patch_platform(cuda_alike=False, device_type="custom"):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
+
+    def test_npu_worker_count_follows_processor_device(self):
+        from transformers import BaseImageProcessor
+
+        class Glm4vProcessor:
+            tokenizer = MagicMock()
+            image_processor = MagicMock(spec=BaseImageProcessor)
+
+        class NpuProcessor:
+            tokenizer = MagicMock()
+            image_processor = MagicMock(spec=BaseImageProcessor)
+
+        with patch.multiple(
+            "sglang.srt.multimodal.processors.base_processor",
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=True,
+        ):
+            cpu_proc = self._make_processor({}, processor=Glm4vProcessor())
+            npu_proc = self._make_processor({}, processor=NpuProcessor())
+
+        self.assertEqual(cpu_proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(cpu_proc.mm_processor_executor)
+        self.assertEqual(npu_proc.mm_processor_worker_num, 1)
+        self.assertIsNone(npu_proc.mm_processor_executor)
 
     def test_explicit_request_overrides_the_path_decision(self):
         """The server argument wins: an operator who measured their own workload
@@ -240,7 +292,10 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             BaseMultimodalProcessor,
         )
 
-        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+        with (
+            patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3),
+            self._patch_platform(cuda_alike=True, device_type="cuda"),
+        ):
             proc = self._make_processor(
                 {}, image_processor=MagicMock(spec=BaseImageProcessor)
             )

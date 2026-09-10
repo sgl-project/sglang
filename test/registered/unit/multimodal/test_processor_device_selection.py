@@ -51,10 +51,16 @@ class TestFastImageProcessorDevice(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    def _device(self, processor, **platform):
+    def _device(self, processor, cuda_alike=True, device_type="cuda", **platform):
         flags = {"_is_cpu": False, "_is_xpu": False, "_is_npu": False}
         flags.update(platform)
-        with patch.multiple(BASE, **flags):
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: cuda_alike,
+                device_type=device_type,
+            )
+        )
+        with patch.multiple(BASE, platforms=platforms, **flags):
             return processor._fast_image_processor_device(_Processor())
 
     def test_device_follows_the_instance_base_gpu_id(self):
@@ -91,6 +97,24 @@ class TestFastImageProcessorDevice(CustomTestCase):
         with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
         self.assertIsNone(device)
+
+    def test_platform_respects_cuda_compatibility(self):
+        processor = _make(base_gpu_id=3)
+        for cuda_alike, device_type, expected in (
+            (False, "other", None),
+            (True, "cuda", "cuda:3"),
+            (False, "cuda", "cuda:3"),
+            (True, "musa", "musa:3"),
+        ):
+            with self.subTest(cuda_alike=cuda_alike, device_type=device_type):
+                self.assertEqual(
+                    self._device(
+                        processor,
+                        cuda_alike=cuda_alike,
+                        device_type=device_type,
+                    ),
+                    expected,
+                )
 
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):

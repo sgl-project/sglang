@@ -23,6 +23,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
+from sglang.srt import platforms
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -716,20 +717,29 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
-    def _preprocessing_competes_with_the_scheduler(self) -> bool:
-        """Whether image preprocessing submits its work to the serving GPU.
-
-        The fast image processor runs inside the tokenizer process but on
-        ``cuda:{base_gpu_id}`` -- the device the scheduler serves from. A second
-        preprocessing worker there is one more competitor for that device rather
-        than added parallelism.
-        """
+    def _fast_image_processor_device_type(self, processor) -> Optional[str]:
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
-            return False
+            return "cpu"
+        if _is_xpu:
+            return "xpu"
+        if _is_npu:
+            if processor.__class__.__name__ == "Glm4vProcessor":
+                return None
+            return "npu"
+        platform = platforms.current_platform
+        if platform.is_cuda_alike() or platform.device_type == "cuda":
+            return platform.device_type
+        return None
+
+    def _preprocessing_competes_with_the_scheduler(self) -> bool:
+        """Whether image preprocessing submits work to the serving accelerator."""
         if self.disable_fast_image_processor:
             return False
         image_processor = getattr(self._processor, "image_processor", None)
-        return isinstance(image_processor, BaseImageProcessor)
+        if not isinstance(image_processor, BaseImageProcessor):
+            return False
+        device_type = self._fast_image_processor_device_type(self._processor)
+        return device_type is not None and device_type != "cpu"
 
     def _resolve_auto_mm_processor_worker_num(self) -> int:
         """The worker count to use when the user did not ask for one.
@@ -759,15 +769,13 @@ class BaseMultimodalProcessor(ABC):
         Resolved from this processor's own ``server_args``: engines sharing a
         tokenizer process each carry their own ``base_gpu_id``.
         """
-        server_args = self.server_args
-        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
-            return "cpu"
-        if _is_xpu:
-            return "xpu"
-        if not _is_npu:
+        device_type = self._fast_image_processor_device_type(processor)
+        if device_type is None or device_type in ("cpu", "xpu"):
+            return device_type
+        if device_type != "npu":
             # Per-worker placement travels as a constructor argument, and
             # this record is that argument.
-            return f"cuda:{server_args.base_gpu_id}"
+            return f"{device_type}:{self.server_args.base_gpu_id}"
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
             # patch extraction, exceeding the Ascend 8-dim limit; patch them
@@ -783,8 +791,13 @@ class BaseMultimodalProcessor(ABC):
                 and processor.video_processor is not None
             ):
                 npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
-            return "npu"
-        if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
+        elif processor.__class__.__name__ == "Glm46VProcessor":
+            from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
+                npu_apply_glm46v_image_preprocess_patch,
+            )
+
+            npu_apply_glm46v_image_preprocess_patch()
+        else:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.
             from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
@@ -792,15 +805,7 @@ class BaseMultimodalProcessor(ABC):
             )
 
             npu_apply_qwen_image_preprocess_patch()
-            return "npu"
-        if processor.__class__.__name__ == "Glm46VProcessor":
-            from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
-                npu_apply_glm46v_image_preprocess_patch,
-            )
-
-            npu_apply_glm46v_image_preprocess_patch()
-            return "npu"
-        return None
+        return "npu"
 
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
