@@ -194,6 +194,7 @@ class ExecKernel(msgspec.Struct):
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -223,6 +224,7 @@ class ExecKernel(msgspec.Struct):
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -636,6 +638,7 @@ class ExecMoe(msgspec.Struct):
             "deepep_v2",
             "ascend_tp",
             "pplx",
+            "flashinfer_megamoe",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -651,6 +654,7 @@ class ExecMoe(msgspec.Struct):
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
+                "flashinfer_megamoe",
             ],
             resolvable=True,
         ),
@@ -695,6 +699,10 @@ class ExecMoe(msgspec.Struct):
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
+    flashinfer_a2a_dispatch_type: A[
+        Optional[Literal["auto", "bf16", "nvfp4", "mxfp8"]],
+        "Select FlashInfer A2A dispatcher activation dtype.",
+    ] = None
     ep_num_redundant_experts: A[
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
