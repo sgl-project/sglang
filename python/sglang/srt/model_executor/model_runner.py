@@ -1425,6 +1425,29 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
+            nccl_ep_admission = None
+            if self.server_args.enable_nccl_ep_cuda_graph:
+                from sglang.srt.distributed.parallel_state import get_moe_ep_group
+                from sglang.srt.layers.moe.token_dispatcher.nccl_ep_admission import (
+                    NcclEpGraphAdmission,
+                )
+
+                admission = getattr(self, "_nccl_ep_graph_admission", None)
+                if admission is None:
+                    admission = self._nccl_ep_graph_admission = NcclEpGraphAdmission(
+                        get_moe_ep_group().cpu_group
+                    )
+                runner = self.decode_cuda_graph_runner
+                nccl_ep_admission = admission.decide(
+                    eligible=can_run_graph,
+                    required_mode=(
+                        runner.required_capture_hidden_mode(forward_batch)
+                        if runner
+                        else 0
+                    ),
+                    captured_mode=(runner.capture_hidden_mode if runner else -1),
+                )
+                can_run_graph = nccl_ep_admission.can_run
 
             if (
                 forward_batch.forward_mode.is_decode()
@@ -1436,9 +1459,15 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
+                graph_kwargs = (
+                    {"nccl_ep_admission": nccl_ep_admission}
+                    if nccl_ep_admission is not None
+                    else {}
+                )
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
+                    **graph_kwargs,
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

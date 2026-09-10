@@ -34,3 +34,21 @@ Before two-GPU integration, run the same gate on one PRO 6000, adding
 and replay time. SM120, real EP and model serving remain pending until their
 respective hardware gates pass. The former server's Torch 2.11 environment
 and the local Torch 2.13 environment are separate validation records.
+
+## Zero-token rank integration
+
+The first certified configuration targets one node, TP=DP=EP=2, DP attention,
+dense TP=1 and DP LM head. Independent local buckets are retained where
+`require_mlp_tp_gather` is false. Gathered configurations retain their existing
+common bucket behavior. Logical empty ranks replay the smallest positive bucket
+with zero valid tokens and return zero local rows, while continuing EP work.
+
+One fixed-size exchange on the existing EP CPU/Gloo group precedes the runtime
+Graph/eager decision, including IDLE and prefill. It coordinates both admission
+and capture-hidden mode: no peer may rebuild the native group while another
+replays its old generation. This control overhead must be measured on the pair.
+
+Local tests cover real Gloo agreement with two CPU processes, production
+ModelRunner branch ordering, actual zero-length IDLE runner inputs, scheduler
+idle creation and coordinated recapture. They do not establish that independent
+buckets interoperate on native EP; that remains a two-GPU acceptance gate.
