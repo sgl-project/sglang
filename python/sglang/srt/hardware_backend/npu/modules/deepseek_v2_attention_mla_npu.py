@@ -17,6 +17,11 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache_finalize,
+    cp_all_gather_rerange_kv_cache_launch,
+)
+from sglang.srt.utils import get_current_device_stream_fast
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -357,6 +362,8 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
+    cp_handle = None
+    cp_kv_full = None
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
         (
             q_pe,
@@ -442,7 +449,15 @@ def forward_dsa_prepare_npu(
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
-
+        if dsa_use_prefill_cp(forward_batch):
+            latent_cache[..., : m.kv_lora_rank] = k_nope.squeeze(1)
+            latent_cache[..., m.kv_lora_rank:] = k_pe.squeeze(1)
+            _, cp_hidden_size = latent_cache.contiguous().shape
+            cp_handle, cp_kv_full = cp_all_gather_rerange_kv_cache_launch(
+                latent_cache.contiguous(),
+                m.cp_size,
+                forward_batch,
+            )
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
@@ -453,12 +468,6 @@ def forward_dsa_prepare_npu(
             )
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
-
-        if dsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = m.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
@@ -472,7 +481,14 @@ def forward_dsa_prepare_npu(
         )
     else:
         topk_indices = prev_topk_indices
-
+    if cp_handle is not None:
+        cp_handle.wait()
+        latent_cache_output = cp_all_gather_rerange_kv_cache_finalize(
+            cp_kv_full, forward_batch
+        )
+        latent_cache_output = latent_cache_output.view(-1, cp_hidden_size)
+        k_nope = latent_cache_output[..., : m.kv_lora_rank].unsqueeze(1)
+        k_pe = latent_cache_output[..., m.kv_lora_rank :].unsqueeze(1)
     return (
         q_pe,
         k_pe,
