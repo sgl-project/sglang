@@ -324,11 +324,7 @@ class EagerRunner(BaseRunner):
                 forward_batch,
                 num_qo_tokens=len(forward_batch.input_ids),
             )
-            maybe_publish_prefill_shared_read_done(
-                model_runner,
-                forward_batch,
-                torch.get_device_module(model_runner.device),
-            )
+            maybe_publish_prefill_shared_read_done(model_runner, forward_batch)
 
         if not cp_active:
             forward_batch.attn_cp_metadata = None

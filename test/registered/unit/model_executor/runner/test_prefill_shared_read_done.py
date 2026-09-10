@@ -42,9 +42,6 @@ def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
     )
 
 
-_DEVICE_MODULE = SimpleNamespace(Event=_Event)
-
-
 def _batch(mode=ForwardMode.EXTEND):
     return SimpleNamespace(forward_mode=mode)
 
@@ -52,7 +49,7 @@ def _batch(mode=ForwardMode.EXTEND):
 def test_publishes_recorded_event_when_enabled():
     runner = _model_runner()
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+        maybe_publish_prefill_shared_read_done(runner, _batch())
     published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
 
@@ -60,7 +57,7 @@ def test_publishes_recorded_event_when_enabled():
 def test_disabled_when_flag_is_false():
     runner = _model_runner()
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False):
-        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+        maybe_publish_prefill_shared_read_done(runner, _batch())
     assert runner.shared_read_done_event is None
 
 
@@ -70,7 +67,7 @@ def test_disabled_when_flag_is_false():
 def test_dflash_family_target_prefill_publishes(algorithm):
     runner = _model_runner(spec_algorithm=algorithm)
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+        maybe_publish_prefill_shared_read_done(runner, _batch())
     published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
 
@@ -87,7 +84,7 @@ def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backen
             # Backend has not declared a pre-replay prefill read end.
             (_model_runner(compliant=False), _batch()),
         ):
-            maybe_publish_prefill_shared_read_done(runner, batch, _DEVICE_MODULE)
+            maybe_publish_prefill_shared_read_done(runner, batch)
             assert runner.shared_read_done_event is None
 
 
