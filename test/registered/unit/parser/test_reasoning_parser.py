@@ -1655,6 +1655,14 @@ class TestGraniteThinkingDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "only reasoning no end token")
         self.assertEqual(result.reasoning_text, "")
 
+    def test_force_nonempty_swaps_when_text_ends_at_think_end(self):
+        """Content absent right after </think> (e.g. max_tokens cut there) swaps
+        like the truncated case; newline-only content still does not."""
+        detector = GraniteThinkingDetector(force_nonempty_content=True)
+        result = detector.detect_and_parse("<think>reasoning</think>")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "reasoning")
+
     def test_force_nonempty_content_no_swap_when_content_exists(self):
         detector = GraniteThinkingDetector(force_nonempty_content=True)
         text = "<think>reasoning</think>\nreal answer"
@@ -1733,6 +1741,44 @@ class TestGraniteThinkingDetector(CustomTestCase):
     def test_streaming_no_strip_without_reasoning(self):
         result = self.detector.parse_streaming_increment("\nHello")
         self.assertEqual(result.normal_text, "\nHello")
+
+    def test_streaming_result_is_chunking_independent(self):
+        """A whole think block in one chunk must strip the leading newline the
+        same as tag-by-tag chunking."""
+        # The empty think block only trips stripped_think_start evidence:
+        # reasoning text and pre/post _in_reasoning are all empty/False there.
+        for text, exp_r, exp_c in (
+            ("<think>r</think>\nHello", "r", "Hello"),
+            ("<think></think>\nHello", "", "Hello"),
+        ):
+            for stream_reasoning in (True, False):
+                for chunks in (
+                    [text],
+                    [text[: text.index("</think>") + len("</think>")], "\nHello"],
+                    [
+                        "<think>",
+                        text[len("<think>") : text.index("</think>")],
+                        "</think>",
+                        "\nHello",
+                    ],
+                    list(text),
+                ):
+                    with self.subTest(
+                        text=text, stream_reasoning=stream_reasoning, chunks=chunks
+                    ):
+                        detector = GraniteThinkingDetector(
+                            stream_reasoning=stream_reasoning
+                        )
+                        all_r = all_c = ""
+                        for chunk in chunks:
+                            ret = detector.parse_streaming_increment(chunk)
+                            all_r += ret.reasoning_text
+                            all_c += ret.normal_text
+                        end = detector.finish()
+                        all_r += end.reasoning_text
+                        all_c += end.normal_text
+                        self.assertEqual(all_r, exp_r)
+                        self.assertEqual(all_c, exp_c)
 
     def test_reasoning_parser_integration(self):
         parser = ReasoningParser("granite_thinking_parser")
