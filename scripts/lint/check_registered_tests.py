@@ -39,7 +39,7 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # no suite any workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
 
-_TEST_KINDS = {"unit", "kernel", "e2e", "accuracy", "perf", "stress"}
+_TEST_KINDS = {"unit", "kernels", "e2e", "accuracy", "perf", "stress"}
 
 # Flat vendor trees. Vendor-only coverage fits no kind above: no XPU/NPU suite
 # carries the `-kernel-` infix `kernel` needs, and these launch device work.
