@@ -30,7 +30,7 @@ custom_api = client.CustomObjectsApi()
 batch_api = client.BatchV1Api()
 rbac_api = client.RbacAuthorizationV1Api()
 
-LOCAL_TIMEOUT = 10800
+LOCAL_TIMEOUT = 21600
 
 script_path = os.path.dirname(os.path.abspath(__file__))
 

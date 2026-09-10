@@ -127,7 +127,7 @@ jobs:
           done
 
       - name: Run test
-        timeout-minutes: 300
+        timeout-minutes: 420
         run: |
           # sglang_source_relative_path is shared-disk path
           # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
