@@ -1499,8 +1499,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 x, (0, self.hidden_pad), mode="constant", value=0.0
             )
         quant_info = build_marlin_moe_quant_info(layer)
-        return self.runner.run(
+        output = self.runner.run(
             dispatch_output._replace(hidden_states=x_padded), quant_info
+        )
+        return output._replace(
+            hidden_states=output.hidden_states[..., : x.shape[-1]].contiguous()
         )
 
     def _apply_sm120_cutlass(self, layer, dispatch_output):
@@ -1602,6 +1605,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if _use_aiter and DispatchOutputChecker.format_is_deepep(dispatch_output):
             return self._apply_aiter(layer, dispatch_output)
 
+        if self.use_marlin:
+            return self._apply_marlin(layer, dispatch_output)
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         if _is_cpu:
@@ -1671,10 +1677,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 swiglu_limit=moe_runner_config.swiglu_limit,
             )
             return StandardCombineInput(hidden_states=output)
-
-        if self.use_marlin:
-            assert TopKOutputChecker.format_is_standard(topk_output)
-            return self._apply_marlin(layer, dispatch_output)
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)

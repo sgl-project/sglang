@@ -588,7 +588,8 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
 )
-def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference(has_bias):
     torch.manual_seed(0)
 
     m = 17
@@ -640,6 +641,11 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     layer.w2_weight_scale_2 = torch.nn.Parameter(
         torch.stack(w2_gscale_l), requires_grad=False
     )
+    if has_bias:
+        bias1 = torch.randn(e, intermediate_size, device="cuda", dtype=dtype) / 20
+        bias2 = torch.randn(e, hidden_size, device="cuda", dtype=dtype) / 20
+        layer.w13_bias = torch.nn.Parameter(bias1, requires_grad=False)
+        layer.w2_bias = torch.nn.Parameter(bias2, requires_grad=False)
     prepare_moe_nvfp4_layer_for_marlin(layer)
 
     # Scale activations down so relu² doesn't blow up intermediate magnitudes;
@@ -660,6 +666,8 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
         topk_ids=topk_ids,
         w1_global_scale=layer.w13_weight_scale_2,
         w2_global_scale=layer.w2_weight_scale_2,
+        w1_bias=getattr(layer, "w13_bias", None),
+        w2_bias=getattr(layer, "w2_bias", None),
         workspace=layer.workspace,
         num_bits=4,
         is_k_full=True,
@@ -675,8 +683,12 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
         for route_idx in range(topk):
             expert_id = topk_ids[token_idx, route_idx]
             intermediate = hidden_states[token_idx] @ w13_ref[expert_id].T
+            if has_bias:
+                intermediate += bias1[expert_id]
             intermediate = torch.square(torch.relu(intermediate))
             routed = intermediate @ w2_ref[expert_id].T
+            if has_bias:
+                routed += bias2[expert_id]
             output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
     output_ref *= routed_scaling_factor
 
