@@ -1,7 +1,7 @@
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -277,6 +278,76 @@ class TestCPZigzagStrategy(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
 
+    def test_full_sequence_cp_preserves_model_entry_and_global_batch_layout(self):
+        """MLA-local CP must plan attention without sharding the model/MM entry."""
+        for full_sequence in (False, True):
+            with self.subTest(full_sequence=full_sequence):
+                batch = SimpleNamespace(
+                    input_ids=torch.arange(142),
+                    positions=torch.arange(142),
+                    forward_mode=ForwardMode.EXTEND,
+                    seq_lens_cpu=[81, 109],
+                    extend_seq_lens_cpu=[65, 77],
+                    attn_cp_metadata=None,
+                    global_num_tokens_cpu=[144],
+                    out_cache_loc=torch.arange(144),
+                    needs_forward_metadata_init=lambda: True,
+                )
+                embeds = torch.randn(142, 8)
+                model = SimpleNamespace(
+                    supports_full_sequence_cp=full_sequence, forward=Mock()
+                )
+                backend = Mock()
+                runner = EagerRunner.__new__(EagerRunner)
+                runner.enable_pdmux = False
+                runner.load_batch = Mock(return_value=batch)
+                runner._execute_extend_cp = Mock()
+                runner.model_runner = SimpleNamespace(
+                    model=model,
+                    _extend_forward_kwargs=Mock(return_value={"input_embeds": embeds}),
+                    ps=SimpleNamespace(attn_dcp_size=1),
+                    attn_backend=backend,
+                    device="cpu",
+                    device_timer=None,
+                    prefill_cuda_graph_runner=None,
+                )
+                with (
+                    get_parallel().override(attn_cp_rank=1, attn_cp_size=4),
+                    patch(
+                        "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                        return_value=4,
+                    ),
+                    patch(
+                        "sglang.srt.layers.dp_attention.set_local_dp_buffer_len"
+                    ) as set_buffer_len,
+                    patch(
+                        "sglang.srt.model_executor.runner.eager_runner.device_timer_ctx",
+                        return_value=nullcontext(),
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.runner.eager_runner.maybe_publish_prefill_shared_read_done"
+                    ),
+                ):
+                    result = runner._execute_extend(batch)
+                backend.init_forward_metadata.assert_called_once_with(batch)
+                self.assertIsNotNone(batch.attn_cp_metadata)
+                self.assertEqual(batch.out_cache_loc.numel(), 142)
+                self.assertEqual(batch.extend_seq_lens_cpu, [65, 77])
+                if full_sequence:
+                    set_buffer_len.assert_not_called()
+                    runner._execute_extend_cp.assert_not_called()
+                    model.forward.assert_called_once_with(
+                        batch.input_ids, batch.positions, batch, input_embeds=embeds
+                    )
+                    self.assertIs(result, model.forward.return_value)
+                else:
+                    set_buffer_len.assert_called_once_with(
+                        sum(batch.attn_cp_metadata.per_rank_actual_token)
+                    )
+                    model.forward.assert_not_called()
+                    runner._execute_extend_cp.assert_called_once()
+                    self.assertIs(result, runner._execute_extend_cp.return_value)
+
     def _metadata_for_rank(self, rank, *, cp_size, seq_lens, extend_seq_lens):
         strategy = ZigzagCPStrategy(cp_size=cp_size)
         with get_parallel().override(attn_cp_rank=rank):
@@ -509,6 +580,69 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertTrue(torch.equal(local_positions, expected_positions))
             self.assertTrue(torch.equal(helper_x, expected_x))
             self.assertTrue(torch.equal(helper_positions, expected_positions))
+
+    def test_zigzag_balanced_gather_reuses_collective_output(self):
+        # Include physical alignment padding: the collective only transports
+        # the equal logical rows, so its output still needs no compaction.
+        for logical, physical in ((None, [3, 3]), ([3, 3], [4, 4])):
+            with self.subTest(logical=logical, physical=physical):
+                meta = SimpleNamespace(
+                    per_rank_logical_token=logical,
+                    per_rank_actual_token=physical,
+                )
+                fb = SimpleNamespace(attn_cp_metadata=meta)
+                expected = torch.arange(12).view(6, 2)
+                local = torch.full((physical[0], 2), -1, dtype=expected.dtype)
+                local[:3] = expected[:3]
+                group = Mock()
+                collective_output = []
+
+                def gather(output, input_tensor):
+                    self.assertTrue(torch.equal(input_tensor, expected[:3]))
+                    output.copy_(expected)
+                    collective_output.append(output)
+
+                group.all_gather_into_tensor.side_effect = gather
+                with get_parallel().override(attn_cp_rank=0, attn_cp_group=group):
+                    result = ZigzagCPStrategy(cp_size=2)._all_gather_reorganized(
+                        local, fb
+                    )
+
+                self.assertTrue(torch.equal(result, expected))
+                self.assertIs(result, collective_output[0])
+
+    def test_zigzag_unequal_gather_compacts_rank_padding(self):
+        for logical, physical in ((None, [3, 2]), ([3, 2], [4, 4])):
+            with self.subTest(logical=logical, physical=physical):
+                meta = SimpleNamespace(
+                    per_rank_logical_token=logical,
+                    per_rank_actual_token=physical,
+                )
+                fb = SimpleNamespace(attn_cp_metadata=meta)
+                # A sentinel in rank 1's collective padding must disappear.
+                payload = torch.arange(18).view(6, 1, 3)
+                payload[-1].fill_(-1)
+                expected = payload[:5]
+                local = torch.full((physical[1], 1, 3), -2, dtype=payload.dtype)
+                local[:2] = payload[3:5]
+                group = Mock()
+                collective_output = []
+
+                def gather(output, input_tensor):
+                    self.assertTrue(torch.equal(input_tensor[:2], payload[3:5]))
+                    self.assertEqual(input_tensor.shape[0], 3)
+                    self.assertEqual(torch.count_nonzero(input_tensor[2]).item(), 0)
+                    output.copy_(payload)
+                    collective_output.append(output)
+
+                group.all_gather_into_tensor.side_effect = gather
+                with get_parallel().override(attn_cp_rank=1, attn_cp_group=group):
+                    result = ZigzagCPStrategy(cp_size=2)._all_gather_reorganized(
+                        local, fb
+                    )
+
+                self.assertTrue(torch.equal(result, expected))
+                self.assertNotEqual(result.data_ptr(), collective_output[0].data_ptr())
 
     def test_zigzag_gathers_hidden_states_to_original_order(self):
         cp_size = 4

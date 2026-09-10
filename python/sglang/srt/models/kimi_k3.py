@@ -38,6 +38,14 @@ from sglang.srt.layers import (
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_shard_hidden_states,
+    cp_shard_position_ids,
+    get_cp_strategy,
+    is_cp_active,
+)
+from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -93,9 +101,13 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -124,6 +136,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    linear_attn_tp_rank,
+    linear_attn_tp_size,
 )
 from sglang.srt.utils import is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
@@ -1414,12 +1428,11 @@ class KimiK3DeltaAttention(nn.Module):
             else 0
         )
         self.tp_size = get_parallel().tp_size
-        # KDA is an attention layer: all head-sharded params must follow the
-        # attention-TP group (= tp under plain TP, = 1 under DP attention),
-        # matching the mamba state cache sizing (KimiLinearCacheParams uses
-        # get_attention_tp_size). Mirrors GLM5-next's head_shard_size pattern.
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
+        # KDA keeps full sequences and shards its heads over the linear-attention
+        # TP group, including CP ranks. These helpers also match the state cache
+        # partition and retain attention-TP ownership under attention DP.
+        self.attn_tp_size = linear_attn_tp_size()
+        self.attn_tp_rank = linear_attn_tp_rank()
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -1614,7 +1627,14 @@ class KimiK3DeltaAttention(nn.Module):
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {
+                "weight_loader": sharded_weight_loader(
+                    0, tp_rank_getter=linear_attn_tp_rank
+                )
+            },
+        )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
@@ -1640,7 +1660,7 @@ class KimiK3DeltaAttention(nn.Module):
         def _a_log_weight_loader(
             param: torch.Tensor, loaded_weight: torch.Tensor
         ) -> None:
-            tp_rank = get_parallel().attn_tp_rank
+            tp_rank = linear_attn_tp_rank()
             shard_size = param.data.shape[2]  # local_num_heads
             start_idx = tp_rank * shard_size
 
@@ -1671,17 +1691,12 @@ class KimiK3DeltaAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            # Reduce within the attn-TP group: the default reduce path uses
-            # the full-TP collective, which at attn_tp>1 is both the wrong
-            # group (sums across DP groups) and asymmetric vs idle DP ranks
-            # (deadlocks the per-layer DP gather). Off under all_reduce_fusion:
-            # the fused AR does the reduce itself (reduce_results=False) and the
-            # forward hands o_proj a slice of a persistent symmetric region —
-            # leaving this True would wrap the GEMM in
-            # use_symmetric_memory(attn_tp), which allocates its own output and
-            # so defeats the caller-owned buffer. At the fusion config
-            # attn_tp==tp so the fused full-TP reduce is the same group anyway.
-            use_dp_attention_reduce=not self.all_reduce_fusion,
+            # Full-sequence CP uses full-TP head shards and their native sum.
+            # Attention DP retains its within-replica attention-TP reduction.
+            # The fused AR owns its reduction and caller-provided output buffer.
+            use_dp_attention_reduce=(
+                not self.all_reduce_fusion and not get_parallel().enable_linear_attn_cp
+            ),
             prefix=f"{prefix}.o_proj",
         )
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
@@ -1689,8 +1704,11 @@ class KimiK3DeltaAttention(nn.Module):
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
-            self.o_proj.use_dp_attention_reduce = True
-        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
+            self.o_proj.use_dp_attention_reduce = (
+                not get_parallel().enable_linear_attn_cp
+            )
+        if not get_parallel().enable_linear_attn_cp:
+            k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2073,6 +2091,15 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         split_gguf_kv_b = _uses_split_gguf_kv_b(quant_config)
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
+        self._cp_mha_max_workspace_bytes = (
+            max(0, envs.SGLANG_K3_CP_MHA_MAX_WORKSPACE_MB.get()) * 1024 * 1024
+        )
+        self._cp_kv_overlap = (
+            envs.SGLANG_K3_CP_KV_OVERLAP.get()
+            and get_parallel().enable_linear_attn_cp
+            and not _is_hip
+            and not _is_npu
+        )
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
         self._disable_npu_fused_split_qk_norm = True
@@ -2145,7 +2172,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
-        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
+        if not get_parallel().enable_linear_attn_cp:
+            k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         if self.all_reduce_fusion:
             # reduce_results=False was passed through super().__init__ above;
             # the fused all-reduce does the reduce itself and reduces the o_proj
@@ -2253,8 +2281,73 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
         param.data.copy_(loaded_weight)
 
+    def _cp_mha_workspace_size(self, forward_batch: ForwardBatch) -> int:
+        """Conservative tensor workspace estimate, identical across CP ranks."""
+        num_kv = sum(int(length) for length in forward_batch.seq_lens_cpu)
+        num_q = max(forward_batch.attn_cp_metadata.per_rank_actual_token)
+        heads = self.num_local_heads
+        latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        # V retains the full [K_nope, V] projection, while concatenated K
+        # owns another allocation. Include both rather than just visible K/V.
+        expanded_kv = (
+            num_kv
+            * heads
+            * (2 * self.qk_nope_head_dim + self.v_head_dim + self.qk_rope_head_dim)
+        )
+        # Query copies, prev/next outputs, concatenation, output gate and
+        # output projection can coexist before attention returns.
+        query_and_output = num_q * (
+            2 * heads * self.qk_head_dim
+            + 6 * heads * self.v_head_dim
+            + self.q_lora_rank
+            + 2 * self.hidden_size
+        )
+        # Compressed gather padding, reordering, and complete-cache fetch.
+        latent_staging = 4 * (num_kv + get_parallel().attn_cp_size * num_q) * latent_dim
+        # Both eligible cache dtypes use two bytes. Include KV indices and
+        # fixed headroom for attention/projection scratch allocations.
+        return (
+            2 * (expanded_kv + query_and_output + latent_staging)
+            + 8 * num_kv
+            + 64 * 1024 * 1024
+        )
+
+    def _can_use_cp_mha(self, forward_batch: ForwardBatch) -> bool:
+        if (
+            self._cp_mha_max_workspace_bytes <= 0
+            or self.current_attention_backend not in ("fa3", "fa4")
+            or self.rotary_emb is not None
+            or self.q_lora_rank is None
+            or self.use_dsa
+            or getattr(self, "_kimi_split_gguf_kv_b", False)
+            or not callable(getattr(self, "kv_b_proj", None))
+            or get_is_capture_mode()
+            or get_exec().deterministic.enable_deterministic_inference
+            or is_in_breakable_cuda_graph()
+            or is_in_tc_piecewise_cuda_graph()
+            or not is_cp_active(forward_batch)
+            or forward_batch.seq_lens_cpu is None
+        ):
+            return False
+        # Reading newly materialized cache must preserve the normal prefill
+        # projection's precision. Quantized cache retains absorbed MLA.
+        if get_token_to_kv_pool().dtype not in (torch.bfloat16, torch.float16):
+            return False
+        return (
+            self._cp_mha_workspace_size(forward_batch)
+            <= self._cp_mha_max_workspace_bytes
+        )
+
     def dispatch_attn_forward_method(self, forward_batch) -> AttnForwardMethod:
         method = super().dispatch_attn_forward_method(forward_batch)
+        if is_cp_active(forward_batch):
+            # These flags are shared across layers. Clear one-shot state
+            # before a layer can fall back to the absorbed cache-read path.
+            forward_batch.mha_one_shot = False
+            forward_batch.attn_attend_prefix_cache = None
+            forward_batch.mha_return_lse = False
+            if self._can_use_cp_mha(forward_batch):
+                return AttnForwardMethod.MHA_ONE_SHOT
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return AttnForwardMethod.MLA
         return method
@@ -2281,6 +2374,62 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 gate, _ = self.g_proj(hidden_states)
             self._gate_precomputed = (gate, alt)
 
+    def record_mla_cp_kv_producer_event(
+        self, forward_batch: ForwardBatch, k_nope: torch.Tensor
+    ) -> Optional[torch.cuda.Event]:
+        """Mark KV readiness before independent query kernels are submitted."""
+        if (
+            not self._cp_kv_overlap
+            or self.current_attention_backend not in ("fa3", "fa4")
+            or self.rotary_emb is not None
+            or not k_nope.is_cuda
+            or get_is_capture_mode()
+            or is_in_breakable_cuda_graph()
+            or is_in_tc_piecewise_cuda_graph()
+            or not is_cp_active(forward_batch)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        return event
+
+    def prepare_mla_cp_kv(
+        self,
+        forward_batch: ForwardBatch,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        *,
+        producer_event: Optional[torch.cuda.Event] = None,
+        prepare_only: bool = False,
+    ) -> bool:
+        if (
+            not self._cp_kv_overlap
+            or self.current_attention_backend not in ("fa3", "fa4")
+            or self.rotary_emb is not None
+            or get_is_capture_mode()
+            or not is_cp_active(forward_batch)
+        ):
+            return False
+        strategy = get_cp_strategy()
+        if isinstance(strategy, ZigzagCPStrategy):
+            return strategy.start_mla_kv_materialization(
+                forward_batch,
+                self.attn_mqa,
+                k_nope,
+                k_rope,
+                producer_event=producer_event,
+                prepare_only=prepare_only,
+            )
+        return False
+
+    def launch_mla_cp_kv(self, forward_batch: ForwardBatch) -> bool:
+        # Called only after successful preparation. Keep this path small so
+        # NCCL is submitted while the already-queued Q-B GEMM is still running.
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        return strategy.launch_mla_kv_materialization(forward_batch, self.attn_mqa)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2292,9 +2441,17 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
             self._precompute_output_gate(hidden_states)
-        return super().forward(
-            positions, hidden_states, forward_batch, zero_allocator, **kwargs
-        )
+        try:
+            return super().forward(
+                positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
+        finally:
+            # Also join and release the launch if query preparation or attention
+            # fails before the backend's normal materialization call.
+            if self._cp_kv_overlap and is_cp_active(forward_batch):
+                strategy = get_cp_strategy()
+                if isinstance(strategy, ZigzagCPStrategy):
+                    strategy.finish_mla_kv_materialization(forward_batch, self.attn_mqa)
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -2312,6 +2469,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.is_moe = config.is_moe
         self.layer_idx = layer_idx
+        self.is_kda_layer = config.is_kda_layer(layer_idx)
         self._dp_attention = is_dp_attention_enabled()
         # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
         # attn_tp multiples; attention must then run on the real rows only.
@@ -2353,6 +2511,7 @@ class KimiK3DecoderLayer(nn.Module):
                 or _a2a_backend.is_mori()
             )
             and self._is_moe_layer
+            and not get_parallel().enable_linear_attn_cp
             and get_parallel().attn_tp_group.world_size > 1
         )
 
@@ -2364,17 +2523,23 @@ class KimiK3DecoderLayer(nn.Module):
         # produces the full batch in a symm buffer — an SP-MoE layer builds
         # o_proj in the plain deferred-reduce config (reduce_results forced off
         # below) and reduce-scatters instead.
-        attn_tp_size = get_parallel().attn_tp_size
+        # KDA retains full rows and full-TP head ownership under CP, so
+        # its deferred output reduction still belongs to the native TP sum.
+        # MLA alone uses CP-local rows and must retain its attention-TP sum.
+        reduction_tp_size = (
+            linear_attn_tp_size() if self.is_kda_layer else get_parallel().attn_tp_size
+        )
         self.all_reduce_fusion = (
             not self._sp_moe
-            and attn_tp_size > 1
-            and attn_tp_size == get_parallel().tp_size
+            and (self.is_kda_layer or not get_parallel().enable_linear_attn_cp)
+            and reduction_tp_size > 1
+            and reduction_tp_size == get_parallel().tp_size
             and config.attn_res_block_size is not None
             and k3_ar_fusion.enabled()
         )
 
         # Attention
-        if config.is_kda_layer(layer_idx):
+        if self.is_kda_layer:
             self.self_attn = KimiK3DeltaAttention(
                 layer_idx=layer_idx,
                 hidden_size=config.hidden_size,
@@ -2572,21 +2737,33 @@ class KimiK3DecoderLayer(nn.Module):
             get_attn_tp_context,
         )
 
+        # Residuals, KDA and MoE retain full rows. MLA alone takes a CP shard,
+        # before either the lazy input projection or output gate captures it.
+        mla_cp_active = not self.is_kda_layer and is_cp_active(forward_batch)
+        if mla_cp_active:
+            hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
+            positions = cp_shard_position_ids(positions, forward_batch)
+
         qkv_latent_func = getattr(self.self_attn, "prepare_qkv_latent", None)
         if qkv_latent_func is not None:
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        result = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-        )
+        try:
+            result = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+        finally:
+            if qkv_latent_func is not None:
+                get_attn_tp_context().clear_attn_inputs()
 
-        if qkv_latent_func is not None:
-            get_attn_tp_context().clear_attn_inputs()
-
+        # o_proj has already summed over MLA's attention-TP group. Restore
+        # global token order before residual aggregation and full-TP MoE.
+        if mla_cp_active:
+            result = cp_gather_after_forward(result, forward_batch)
         return result
 
     def forward(
@@ -3023,6 +3200,8 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    supports_full_sequence_cp = True
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -3400,6 +3579,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+    supports_full_sequence_cp = True
 
     # Fused runtime module -> checkpoint shard names, so quant configs can
     # match fused prefixes against per-shard exclude_modules

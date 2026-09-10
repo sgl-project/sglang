@@ -31,7 +31,7 @@ After all-gather, the blocks are reranged back to their original order:
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import Any, List, Optional
 
@@ -54,6 +54,27 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_device, get_parallel
+
+
+@dataclass
+class _RankMajorAllGather:
+    send_buffer: torch.Tensor
+    output_buffer: torch.Tensor
+    per_rank_token: tuple[int, ...]
+    max_len: int
+
+
+@dataclass
+class _PendingMLAKVMaterialization:
+    stream: torch.cuda.Stream
+    group: Any
+    inputs: tuple[torch.Tensor, ...]
+    gather: _RankMajorAllGather
+    reverse_split_len: tuple[int, ...]
+    cp_reverse_index: tuple[int, ...]
+    kv_lora_rank: int
+    producer_event: Optional[torch.cuda.Event] = None
+    launched: bool = False
 
 
 @dataclass
@@ -97,6 +118,11 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     kv_len_next_list: Optional[List[int]] = None
     actual_seq_q_prev_list: Optional[List[int]] = None
     actual_seq_q_next_list: Optional[List[int]] = None
+
+    # A launch belongs to this forward and layer, never to the next batch.
+    pending_mla_kv_materializations: dict[int, _PendingMLAKVMaterialization] = field(
+        default_factory=dict, repr=False
+    )
 
 
 ContextParallelMetadata = ZigzagContextParallelMetadata
@@ -348,9 +374,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         attn_fn,
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
-        assert attention_backend in self.get_supported_attention_backend(), (
-            f"{self.name} CP does not support {attention_backend=}"
-        )
+        assert (
+            attention_backend in self.get_supported_attention_backend()
+        ), f"{self.name} CP does not support {attention_backend=}"
 
         meta = forward_batch.attn_cp_metadata
         q_prev = q[: meta.total_q_prev_tokens]
@@ -425,9 +451,141 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             layer.v_scale,
         )
 
+    def start_mla_kv_materialization(
+        self,
+        forward_batch,
+        layer: Any,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        *,
+        producer_event: Optional[torch.cuda.Event] = None,
+        prepare_only: bool = False,
+    ) -> bool:
+        """Prepare KV transfer buffers and optionally launch the collective."""
+        if not k_nope.is_cuda or torch.cuda.is_current_stream_capturing():
+            return False
+        group = get_parallel().attn_cp_group
+        pynccl = group.pynccl_comm
+        if pynccl is None or not pynccl.available:
+            return False
+        pending = forward_batch.attn_cp_metadata.pending_mla_kv_materializations
+        assert layer.layer_id not in pending, "MLA KV materialization already pending"
+        stream = getattr(self, "_mla_kv_stream", None)
+        if stream is None:
+            stream = self._mla_kv_stream = torch.cuda.Stream(device=k_nope.device)
+        current_stream = torch.cuda.current_stream()
+        if producer_event is None:
+            stream.wait_stream(current_stream)
+        else:
+            # Q may already be queued on current_stream. Only the earlier
+            # KV producer must precede this stream's packing and transfer.
+            stream.wait_event(producer_event)
+        inputs = (k_nope, k_rope, forward_batch.out_cache_loc)
+        # Keep producer allocations alive on the communication stream, including
+        # on exceptions before the backend can consume the completion event.
+        for tensor in inputs:
+            tensor.record_stream(stream)
+        # Keep partially prepared buffers alive if packing raises after
+        # enqueueing work. The exception handler joins before these locals die.
+        prepared = None
+        pending_kv = None
+        try:
+            with torch.cuda.stream(stream):
+                latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
+                prepared = self._prepare_all_gather_rank_major(latent, forward_batch)
+                meta = forward_batch.attn_cp_metadata
+                pending_kv = _PendingMLAKVMaterialization(
+                    stream=stream,
+                    group=group,
+                    inputs=inputs,
+                    gather=prepared,
+                    reverse_split_len=tuple(meta.reverse_split_len),
+                    cp_reverse_index=tuple(meta.cp_reverse_index),
+                    kv_lora_rank=k_nope.shape[-1],
+                    producer_event=producer_event,
+                )
+        except BaseException:
+            current_stream.wait_stream(stream)
+            raise
+        pending[layer.layer_id] = pending_kv
+        if not prepare_only:
+            return self.launch_mla_kv_materialization(forward_batch, layer)
+        return True
+
+    def launch_mla_kv_materialization(self, forward_batch, layer: Any) -> bool:
+        """Submit only NCCL after independent Q kernels are already queued."""
+        pending_by_layer = (
+            forward_batch.attn_cp_metadata.pending_mla_kv_materializations
+        )
+        pending = pending_by_layer.get(layer.layer_id)
+        if pending is None:
+            return False
+        if pending.launched:
+            return True
+        try:
+            with (
+                torch.cuda.stream(pending.stream),
+                pending.group.pynccl_comm.change_state(enable=True),
+            ):
+                pending.group.all_gather_into_tensor(
+                    pending.gather.output_buffer, pending.gather.send_buffer
+                )
+            pending.launched = True
+        except BaseException:
+            pending_by_layer.pop(layer.layer_id, None)
+            # Retain all staging allocations until any partially submitted
+            # collective is ordered before subsequent work on the caller.
+            torch.cuda.current_stream().wait_stream(pending.stream)
+            raise
+        return True
+
+    def finish_mla_kv_materialization(self, forward_batch, layer: Any) -> bool:
+        """Queue gather consumers after Q was submitted, then join cache readiness."""
+        pending = forward_batch.attn_cp_metadata.pending_mla_kv_materializations.pop(
+            layer.layer_id, None
+        )
+        if pending is None:
+            return False
+        current_stream = torch.cuda.current_stream()
+        if not pending.launched:
+            # Query preparation may fail before launch. Drain only packing;
+            # never read the uninitialized gather output or write it to cache.
+            # A normal backend call can then use synchronous materialization.
+            current_stream.wait_stream(pending.stream)
+            return False
+        try:
+            # The original producer wait and this stream's own ordering already
+            # protect the gathered data. Waiting on current_stream here would
+            # serialize this tail behind the query work we want to overlap.
+            with torch.cuda.stream(pending.stream):
+                gathered = self._compact_all_gather_rows(pending.gather)
+                chunks = torch.split(gathered, pending.reverse_split_len, dim=0)
+                latent_full = torch.cat(
+                    [chunks[index] for index in pending.cp_reverse_index], dim=0
+                )
+                get_token_to_kv_pool().set_mla_kv_buffer(
+                    layer,
+                    pending.inputs[2],
+                    latent_full[..., : pending.kv_lora_rank],
+                    latent_full[..., pending.kv_lora_rank :],
+                )
+                event = torch.cuda.Event()
+                event.record(pending.stream)
+            current_stream.wait_event(event)
+        except BaseException:
+            # The local pending object retains producers and staging buffers
+            # until the queued operations are ordered before subsequent work.
+            current_stream.wait_stream(pending.stream)
+            raise
+        return True
+
     def materialize_full_mla_kv(
         self, forward_batch, layer: Any, k_nope: Any, k_rope: Any
     ) -> None:
+        # The normal backend call consumes an early launch instead of gathering
+        # or writing twice. Without a launch this retains the synchronous path.
+        if self.finish_mla_kv_materialization(forward_batch, layer):
+            return
         kv_lora_rank = k_nope.shape[-1]
         latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
         latent_full = self.gather_kv_cache(latent, forward_batch)
@@ -439,6 +597,15 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
     def _all_gather_reorganized(self, x: torch.Tensor, forward_batch):
+        prepared = self._prepare_all_gather_rank_major(x, forward_batch)
+        get_parallel().attn_cp_group.all_gather_into_tensor(
+            prepared.output_buffer, prepared.send_buffer
+        )
+        return self._compact_all_gather_rows(prepared)
+
+    def _prepare_all_gather_rank_major(
+        self, x: torch.Tensor, forward_batch
+    ) -> _RankMajorAllGather:
         meta = forward_batch.attn_cp_metadata
         per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
         max_len = max(per_rank_token)
@@ -466,9 +633,20 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 device=x.device,
                 dtype=x.dtype,
             )
-        group.all_gather_into_tensor(gathered, x)
+        return _RankMajorAllGather(x, gathered, tuple(per_rank_token), max_len)
 
-        chunks = torch.split(gathered, [max_len] * self.cp_size, dim=0)
+    @staticmethod
+    def _compact_all_gather_rows(prepared: _RankMajorAllGather) -> torch.Tensor:
+        gathered = prepared.output_buffer
+        per_rank_token = prepared.per_rank_token
+        max_len = prepared.max_len
+
+        # Balanced ranks need no padding removal. Keep the collective output
+        # for the caller's zigzag reorder instead of copying every row twice.
+        if all(per_rank_len == max_len for per_rank_len in per_rank_token):
+            return gathered
+
+        chunks = torch.split(gathered, [max_len] * len(per_rank_token), dim=0)
         return torch.cat(
             [
                 chunks[rank][:per_rank_len]

@@ -1631,6 +1631,11 @@ class Envs:
     # kernel computes the TP-local o_proj partial and the cross-rank sum over
     # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
     SGLANG_K3_GEMM_AR = EnvBool(False)
+    # Overlap K3 zigzag prefill's latent KV gather/cache write with query preparation.
+    SGLANG_K3_CP_KV_OVERLAP = EnvBool(False)
+    # Opt in to expanded MHA for K3 CP prefill when its estimated temporary
+    # workspace fits this MiB budget. Zero keeps the absorbed MLA path.
+    SGLANG_K3_CP_MHA_MAX_WORKSPACE_MB = EnvInt(0)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.

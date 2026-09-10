@@ -235,9 +235,9 @@ class FlashAttentionBackend(AttentionBackend):
             "on the fa3/fa4 backend."
         )
         if self.has_local_attention:
-            assert model_runner.attention_chunk_size is not None, (
-                "Attention chunk size is required for local attention"
-            )
+            assert (
+                model_runner.attention_chunk_size is not None
+            ), "Attention chunk size is required for local attention"
             self.attention_chunk_size = model_runner.attention_chunk_size
 
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
@@ -930,7 +930,9 @@ class FlashAttentionBackend(AttentionBackend):
                 # create expand page table
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
+                ).unsqueeze(
+                    0
+                )  # shape: (1, self.speculative_num_draft_tokens)
                 cols = offsets.expand(
                     forward_batch.seq_lens.numel(), -1
                 ) + forward_batch.seq_lens.unsqueeze(1)
@@ -1073,7 +1075,9 @@ class FlashAttentionBackend(AttentionBackend):
             )
             text_col = forward_batch.encoder_lens.long().unsqueeze(
                 1
-            ) + arange_text.unsqueeze(0)  # (bs, max_seq_len_k)
+            ) + arange_text.unsqueeze(
+                0
+            )  # (bs, max_seq_len_k)
             text_row = forward_batch.req_pool_indices.unsqueeze(1).expand(-1, text_max)
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 text_row, text_col
@@ -1220,6 +1224,54 @@ class FlashAttentionBackend(AttentionBackend):
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
+
+    def _forward_cp_mha(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        *,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_k: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Attend full expanded KV with local zigzag queries and causal offsets."""
+        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype)
+
+        def attend(q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp):
+            # cu_seqlens_k gives the full request-major storage offsets;
+            # seqused_k truncates each request to this query block's end.
+            # The bottom-right causal mask then gives each query its exact
+            # global position, including any previously cached prefix.
+            return flash_attn_varlen_func(
+                q=q_chunk,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q_cp,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_k=cache_seqlens_cp,
+                max_seqlen_q=max_seqlen_q_cp,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+                causal=True,
+                return_softmax_lse=False,
+                ver=self.fa_impl_ver,
+                **kwargs,
+            )
+
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        return strategy.run_attention(
+            q,
+            forward_batch,
+            self.device,
+            attend,
+            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+        )
 
     def forward_extend(
         self,
@@ -1588,6 +1640,23 @@ class FlashAttentionBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
+                if cp_active:
+                    # K3's bounded expanded path materializes prefix+new KV
+                    # in one shot. Other CP MLA calls use the absorbed path.
+                    assert forward_batch.mha_one_shot
+                    assert not forward_batch.attn_attend_prefix_cache
+                    assert not forward_batch.mha_return_lse
+                    assert not use_local_attn and not use_cascade_attn
+                    return self._forward_cp_mha(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        forward_batch,
+                        cu_seqlens_k=metadata.cu_seqlens_k,
+                        max_seqlen_k=metadata.max_seq_len_k,
+                        **kwargs,
+                    )
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
                     assert not get_schedule().disable_chunked_prefix_cache
@@ -1684,9 +1753,9 @@ class FlashAttentionBackend(AttentionBackend):
                     # Concat q_nope + q_rope along dim=-1 so the wrapper's
                     # chunk(2, dim=0) keeps their alignment; split back
                     # inside the closure.
-                    assert not use_cascade_attn, (
-                        "Cascade attention under MLA CP is not supported."
-                    )
+                    assert (
+                        not use_cascade_attn
+                    ), "Cascade attention under MLA CP is not supported."
                     q_fused = torch.cat([q_nope, q_rope], dim=-1)
 
                     def _mla_cp_attn(
@@ -2949,7 +3018,9 @@ class FlashAttentionBackend(AttentionBackend):
                 # metadata_expand.cu_seqlens_q already set in capture
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
+                ).unsqueeze(
+                    0
+                )  # shape: (1, self.speculative_num_draft_tokens)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
                 cum_len = torch.nn.functional.pad(
@@ -3300,9 +3371,9 @@ class FlashAttentionBackend(AttentionBackend):
         metadata_swa: Optional[FlashAttentionMetadata] = None,
     ):
         # TODO: support page_size > 1 for swa spec
-        assert self.page_size == 1, (
-            "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
-        )
+        assert (
+            self.page_size == 1
+        ), "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
 
         cache_seqlens_int32 = (
             metadata.cache_seqlens_int32.repeat_interleave(
@@ -3605,9 +3676,9 @@ def make_local_attention_virtual_batches(
     #   k_seqstarts_absolute = [0, 4, 4, 8, 12, 16, 4, 8]
     block_starts = k_seqstarts_absolute // page_size
 
-    assert attn_chunk_size % page_size == 0, (
-        f"attn_chunk_size {attn_chunk_size} is not divisible by page_size {page_size}"
-    )
+    assert (
+        attn_chunk_size % page_size == 0
+    ), f"attn_chunk_size {attn_chunk_size} is not divisible by page_size {page_size}"
     pages_per_local_batch = attn_chunk_size // page_size
 
     # Create a block_table for the local attention blocks

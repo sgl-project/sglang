@@ -326,6 +326,8 @@ class DeepseekMLAForwardMixin:
         q_pe = None
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
+        cp_kv_producer_event = None
+        cp_kv_prepared = False
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -337,8 +339,35 @@ class DeepseekMLAForwardMixin:
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
-            # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            prepare_mla_cp_kv = getattr(self, "prepare_mla_cp_kv", None)
+            if (
+                prepare_mla_cp_kv is not None
+                and getattr(self, "_cp_kv_overlap", False)
+                and not get_is_capture_mode()
+            ):
+                k_nope = self.kv_a_layernorm(k_nope)
+                record_producer = getattr(self, "record_mla_cp_kv_producer_event", None)
+                if record_producer is not None:
+                    cp_kv_producer_event = record_producer(forward_batch, k_nope)
+                if cp_kv_producer_event is None:
+                    # Preserve the immediate API for unsupported/event-free callers.
+                    prepare_mla_cp_kv(
+                        forward_batch,
+                        k_nope.unsqueeze(1),
+                        latent_cache[..., self.kv_lora_rank :].unsqueeze(1),
+                    )
+                else:
+                    # Allocation and packing precede Q submission; the thin
+                    # post-Q launch below only submits the prepared collective.
+                    cp_kv_prepared = prepare_mla_cp_kv(
+                        forward_batch,
+                        k_nope.unsqueeze(1),
+                        latent_cache[..., self.kv_lora_rank :].unsqueeze(1),
+                        producer_event=cp_kv_producer_event,
+                        prepare_only=True,
+                    )
+                q = self.q_a_layernorm(q)
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -393,6 +422,9 @@ class DeepseekMLAForwardMixin:
                     )
                 else:
                     q = self.q_b_proj_forward(q)
+
+                if cp_kv_prepared:
+                    self.launch_mla_cp_kv(forward_batch)
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
