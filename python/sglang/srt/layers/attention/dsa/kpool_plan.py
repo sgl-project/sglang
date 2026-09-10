@@ -731,6 +731,7 @@ def update_kpool_write_plan(
     forward_mode: ForwardMode,
     slots_per_page: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
+    include_deep_gemm_schedule: bool = True,
 ) -> None:
     if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_cuda():
         return
@@ -766,7 +767,8 @@ def update_kpool_write_plan(
             effective_n_per_batch.to(torch.int32)
         )
 
-    if plan.pool_schedule_metadata is not None:
+    # In-graph mode may leave schedule construction to a pre-replay helper.
+    if include_deep_gemm_schedule and plan.pool_schedule_metadata is not None:
         new_schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
             slots_per_page=slots_per_page,

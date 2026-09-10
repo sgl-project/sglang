@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from functools import cache
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
@@ -38,6 +38,7 @@ class _DSAInGraphVerifyMetadataState:
 
     __slots__ = (
         "prefill_impl_state",
+        "residual_launch",
         "_seq_lens_ptr",
         "_seq_lens_stride",
         "_req_pool_indices_ptr",
@@ -48,10 +49,12 @@ class _DSAInGraphVerifyMetadataState:
         self,
         *,
         prefill_impl_state: Tuple[bool, str],
+        residual_launch: Optional[Callable[[], None]],
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
     ):
         self.prefill_impl_state = prefill_impl_state
+        self.residual_launch = residual_launch
         self._seq_lens_ptr = seq_lens.data_ptr()
         self._seq_lens_stride = seq_lens.stride(0)
         self._req_pool_indices_ptr = req_pool_indices.data_ptr()
@@ -71,10 +74,14 @@ class _DSAInGraphVerifyMetadataState:
 
 class DSAInGraphVerifyMetadataMixin:
     ingraph_verify_metadata_enabled = False
+    ingraph_verify_metadata_dg_out_of_graph = False
 
     def _init_ingraph_verify_metadata(self):
         self.ingraph_verify_metadata_enabled = (
             envs.SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA.get()
+        )
+        self.ingraph_verify_metadata_dg_out_of_graph = (
+            envs.SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA_DG_OUT_OF_GRAPH.get()
         )
 
     def _replay_ingraph_verify_metadata(
@@ -91,6 +98,8 @@ class DSAInGraphVerifyMetadataMixin:
                 "for seq_lens and req_pool_indices used during capture"
             )
         self.use_mha, self.dsa_prefill_impl = state.prefill_impl_state
+        if state.residual_launch is not None:
+            state.residual_launch()
         self.forward_metadata = metadata
         return True
 
@@ -199,11 +208,12 @@ class DSAInGraphVerifyMetadataMixin:
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
         )
 
-        metadata.paged_mqa_schedule_metadata.copy_(
-            deep_gemm.get_paged_mqa_logits_metadata(
-                schedule_src_2d, 64, deep_gemm.get_num_sms()
+        dg_in_graph = not self.ingraph_verify_metadata_dg_out_of_graph
+        num_sms = deep_gemm.get_num_sms()
+        if dg_in_graph:
+            metadata.paged_mqa_schedule_metadata.copy_(
+                deep_gemm.get_paged_mqa_logits_metadata(schedule_src_2d, 64, num_sms)
             )
-        )
         if ctx_lens_copy_src is not None:
             metadata.paged_mqa_ctx_lens_2d.copy_(ctx_lens_copy_src)
 
@@ -216,11 +226,23 @@ class DSAInGraphVerifyMetadataMixin:
             seq_lens,
             req_pool_indices,
             ForwardMode.TARGET_VERIFY,
+            include_deep_gemm_schedule=dg_in_graph,
         )
+
+        residual_launch = None
+        if not dg_in_graph:
+            from sglang.srt.layers.attention.dsa.dsa_metadata_deepgemm import (
+                build_verify_deepgemm_residual,
+            )
+
+            residual_launch = build_verify_deepgemm_residual(
+                self, metadata, next_n, seq_lens, num_sms, ctx_lens_written
+            )
 
         self.set_dsa_prefill_impl(forward_batch=None)
         state = _DSAInGraphVerifyMetadataState(
             prefill_impl_state=(self.use_mha, self.dsa_prefill_impl),
+            residual_launch=residual_launch,
             seq_lens=seq_lens,
             req_pool_indices=req_pool_indices,
         )
@@ -229,8 +251,9 @@ class DSAInGraphVerifyMetadataMixin:
         object.__setattr__(metadata, "_ingraph_verify_metadata", state)
         logger.info(
             "DSA in-graph verify metadata recorded: bs=%d next_n=%d "
-            "ctx_lens_written=%s",
+            "ctx_lens_written=%s dg_in_graph=%s",
             bs,
             next_n,
             ctx_lens_written,
+            dg_in_graph,
         )

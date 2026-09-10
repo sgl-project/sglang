@@ -212,6 +212,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
         req_pool_indices: torch.Tensor,
         forward_mode: ForwardMode,
         effective_n_per_batch: Optional[torch.Tensor] = None,
+        include_deep_gemm_schedule: bool = True,
     ) -> None:
         if self.dsa_index_kpool <= 1:
             return
@@ -257,6 +258,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             forward_mode=forward_mode,
             slots_per_page=slots_per_page,
             effective_n_per_batch=effective_n_per_batch,
+            include_deep_gemm_schedule=include_deep_gemm_schedule,
         )
 
     def _update_kpool_metadata_from_precomputed(
