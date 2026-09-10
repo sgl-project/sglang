@@ -1,0 +1,275 @@
+{
+  "schema_version": "attune/1",
+  "fingerprint": "402f591ae7eec7d5",
+  "device": {
+    "name": "NVIDIA_H100_80GB_HBM3",
+    "sm": 90,
+    "cuda_version": "12.4",
+    "driver_version": "550.00",
+    "sm_clock_max_mhz": 1980,
+    "pcie_gen": 5,
+    "pcie_width": 16
+  },
+  "profile": {
+    "family": "mla",
+    "qo": 128,
+    "kv": 128,
+    "hd": 576,
+    "dtype": "bfloat16",
+    "kv_dtype": "auto",
+    "tp": 8,
+    "ep": 1,
+    "dp": 1
+  },
+  "provenance": {
+    "attune_version": "0.1.0-prototype"
+  },
+  "decode": {
+    "1:1024": {
+      "backend": "trtllm_mla",
+      "latency_us": 41.04,
+      "page_size": 32
+    },
+    "2:1024": {
+      "backend": "trtllm_mla",
+      "latency_us": 41.16,
+      "page_size": 32
+    },
+    "4:1024": {
+      "backend": "trtllm_mla",
+      "latency_us": 41.4,
+      "page_size": 32
+    },
+    "8:1024": {
+      "backend": "trtllm_mla",
+      "latency_us": 41.88,
+      "page_size": 32
+    },
+    "16:1024": {
+      "backend": "trtllm_mla",
+      "latency_us": 42.84,
+      "page_size": 32
+    },
+    "32:1024": {
+      "backend": "trtllm_mla",
+      "latency_us": 44.76,
+      "page_size": 32
+    },
+    "64:1024": {
+      "backend": "trtllm_mla",
+      "latency_us": 48.6,
+      "page_size": 32
+    },
+    "128:1024": {
+      "backend": "fa3",
+      "latency_us": 56.28,
+      "page_size": 1
+    },
+    "256:1024": {
+      "backend": "fa3",
+      "latency_us": 71.64,
+      "page_size": 1
+    },
+    "1:4096": {
+      "backend": "trtllm_mla",
+      "latency_us": 43.81,
+      "page_size": 32
+    },
+    "2:4096": {
+      "backend": "trtllm_mla",
+      "latency_us": 43.93,
+      "page_size": 32
+    },
+    "4:4096": {
+      "backend": "trtllm_mla",
+      "latency_us": 44.17,
+      "page_size": 32
+    },
+    "8:4096": {
+      "backend": "trtllm_mla",
+      "latency_us": 44.65,
+      "page_size": 32
+    },
+    "16:4096": {
+      "backend": "trtllm_mla",
+      "latency_us": 45.61,
+      "page_size": 32
+    },
+    "32:4096": {
+      "backend": "trtllm_mla",
+      "latency_us": 47.53,
+      "page_size": 32
+    },
+    "64:4096": {
+      "backend": "trtllm_mla",
+      "latency_us": 51.37,
+      "page_size": 32
+    },
+    "128:4096": {
+      "backend": "fa3",
+      "latency_us": 59.05,
+      "page_size": 1
+    },
+    "256:4096": {
+      "backend": "fa3",
+      "latency_us": 74.41,
+      "page_size": 1
+    },
+    "1:16384": {
+      "backend": "trtllm_mla",
+      "latency_us": 54.87,
+      "page_size": 32
+    },
+    "2:16384": {
+      "backend": "trtllm_mla",
+      "latency_us": 54.99,
+      "page_size": 32
+    },
+    "4:16384": {
+      "backend": "trtllm_mla",
+      "latency_us": 55.23,
+      "page_size": 32
+    },
+    "8:16384": {
+      "backend": "trtllm_mla",
+      "latency_us": 55.71,
+      "page_size": 32
+    },
+    "16:16384": {
+      "backend": "trtllm_mla",
+      "latency_us": 56.67,
+      "page_size": 32
+    },
+    "32:16384": {
+      "backend": "trtllm_mla",
+      "latency_us": 58.59,
+      "page_size": 32
+    },
+    "64:16384": {
+      "backend": "trtllm_mla",
+      "latency_us": 62.43,
+      "page_size": 32
+    },
+    "128:16384": {
+      "backend": "fa3",
+      "latency_us": 70.11,
+      "page_size": 1
+    },
+    "256:16384": {
+      "backend": "flashinfer",
+      "latency_us": 84.99,
+      "page_size": 1
+    },
+    "1:65536": {
+      "backend": "flashinfer",
+      "latency_us": 97.95,
+      "page_size": 1
+    },
+    "2:65536": {
+      "backend": "flashinfer",
+      "latency_us": 98.06,
+      "page_size": 1
+    },
+    "4:65536": {
+      "backend": "flashinfer",
+      "latency_us": 98.29,
+      "page_size": 1
+    },
+    "8:65536": {
+      "backend": "flashinfer",
+      "latency_us": 98.75,
+      "page_size": 1
+    },
+    "16:65536": {
+      "backend": "flashinfer",
+      "latency_us": 99.66,
+      "page_size": 1
+    },
+    "32:65536": {
+      "backend": "flashinfer",
+      "latency_us": 101.48,
+      "page_size": 1
+    },
+    "64:65536": {
+      "backend": "flashinfer",
+      "latency_us": 105.13,
+      "page_size": 1
+    },
+    "128:65536": {
+      "backend": "flashinfer",
+      "latency_us": 112.43,
+      "page_size": 1
+    },
+    "256:65536": {
+      "backend": "flashinfer",
+      "latency_us": 127.02,
+      "page_size": 1
+    }
+  },
+  "prefill": {
+    "1:128": {
+      "backend": "fa3",
+      "latency_us": 38.3
+    },
+    "4:128": {
+      "backend": "fa3",
+      "latency_us": 45.22
+    },
+    "16:128": {
+      "backend": "fa3",
+      "latency_us": 72.86
+    },
+    "1:512": {
+      "backend": "fa3",
+      "latency_us": 45.22
+    },
+    "4:512": {
+      "backend": "fa3",
+      "latency_us": 72.86
+    },
+    "16:512": {
+      "backend": "fa3",
+      "latency_us": 183.46
+    },
+    "1:2048": {
+      "backend": "fa3",
+      "latency_us": 72.86
+    },
+    "4:2048": {
+      "backend": "fa3",
+      "latency_us": 183.46
+    },
+    "16:2048": {
+      "backend": "fa3",
+      "latency_us": 625.82
+    },
+    "1:8192": {
+      "backend": "fa3",
+      "latency_us": 183.46
+    },
+    "4:8192": {
+      "backend": "fa3",
+      "latency_us": 625.82
+    },
+    "16:8192": {
+      "backend": "fa3",
+      "latency_us": 2395.3
+    },
+    "1:32768": {
+      "backend": "flashinfer",
+      "latency_us": 594.46
+    },
+    "4:32768": {
+      "backend": "flashinfer",
+      "latency_us": 2265.62
+    },
+    "16:32768": {
+      "backend": "flashinfer",
+      "latency_us": 8950.3
+    }
+  },
+  "skipped": {
+    "decode/cutlass_mla": "cutlass_mla requires Blackwell",
+    "prefill/cutlass_mla": "cutlass_mla requires Blackwell"
+  }
+}
