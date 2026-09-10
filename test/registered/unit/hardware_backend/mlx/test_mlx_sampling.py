@@ -134,7 +134,8 @@ class TestTokenPenalties(CustomTestCase):
         import torch
 
         raw_logits = [
-            [-2.0, 3.0, 1.0, -4.0],
+            # Token 2 crosses from +0.5 raw to -0.25 after additive penalties.
+            [-2.0, 3.0, 0.5, -4.0],
             [2.0, -2.0, 0.5, -1.0],
         ]
         raw_counts = [
@@ -167,12 +168,16 @@ class TestTokenPenalties(CustomTestCase):
         presence = torch.tensor([0.25, -0.25], dtype=torch.float32)[:, None]
         repetition = torch.tensor([2.0, 1.5], dtype=torch.float32)[:, None]
         seen = torch_counts > 0
-        expected = torch_logits - torch_counts * frequency
-        expected = expected - seen * presence
+        adjusted = torch_logits - torch_counts * frequency
+        adjusted = adjusted - seen * presence
+        self.assertGreater(float(torch_logits[0, 2]), 0.0)
+        self.assertLess(float(adjusted[0, 2]), 0.0)
         expected = torch.where(
             seen,
-            torch.where(expected < 0, expected * repetition, expected / repetition),
-            expected,
+            torch.where(
+                adjusted < 0, adjusted * repetition, adjusted / repetition
+            ),
+            adjusted,
         )
         torch.testing.assert_close(
             torch.tensor(actual.tolist()), expected, atol=1e-5, rtol=1e-5
