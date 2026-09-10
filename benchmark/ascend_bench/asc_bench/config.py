@@ -198,8 +198,13 @@ def _parse(raw: dict[str, Any], source: str | None) -> BenchConfig:
         errors.append("server.env must be a mapping of str to scalar")
         env = {}
     _check_graph_bs("server.args", server_args, errors)
-    for combo in server_axes.values():
-        _check_graph_bs("server.axes", dict(zip(server_axes, combo)), errors)
+    for axis_name, values in server_axes.items():
+        for value in values:
+            # axis entries may bundle several flags (e.g. spec-decode sets)
+            if isinstance(value, dict):
+                _check_graph_bs(f"server.axes[{axis_name}]", value, errors)
+            elif axis_name == "--cuda-graph-bs":
+                _check_graph_bs(f"server.axes[{axis_name}]", {axis_name: value}, errors)
 
     workload_raw = raw.get("workload") or {}
     workload_args = _require_flag_dict("workload", workload_raw, "args", errors)
@@ -255,11 +260,14 @@ def _parse(raw: dict[str, Any], source: str | None) -> BenchConfig:
         bench_timeout_s=int(run_raw.get("bench_timeout_s", 3600)),
         hbm_budget_mb=int(run_raw.get("hbm_budget_mb", 500)),
         hbm_timeout_s=int(run_raw.get("hbm_timeout_s", 240)),
+        hbm_poll_s=float(run_raw.get("hbm_poll_s", 5.0)),
         python=run_raw.get("python"),
         gsm8k=gsm8k,
     )
     if run.repeats < 1:
         errors.append("run.repeats must be >= 1")
+    if run.hbm_poll_s <= 0:
+        errors.append("run.hbm_poll_s must be > 0")
     if "--max-concurrency" not in workload_axes and mult is not None:
         errors.append(
             "workload.num_prompts_mult requires --max-concurrency in workload.axes"
