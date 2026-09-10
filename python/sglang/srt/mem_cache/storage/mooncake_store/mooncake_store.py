@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.unified_layout import KVCacheLayoutAdapter
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -594,8 +595,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
+            if storage_config is not None and storage_config.unified_suffix is not None:
+                # unified key scheme: topology-free chunk coordinates
+                # replace the rank/pp suffixes. A list means the layout
+                # adapter is active (one suffix per owned chunk).
+                self.mha_suffix = storage_config.unified_suffix
+                self.mla_suffix = storage_config.unified_suffix
 
             self.registered_pools = {}
+            # Backend-neutral unified-layout staging
+            # (pool_host.unified_layout.KVCacheLayoutAdapter); constructed in
+            # register_mem_pool_host for partitioned namespaces.
+            self.layout_adapter = None
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -695,6 +706,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+        if (
+            self.storage_config is not None
+            and self.storage_config.unified_layer_ranges is not None
+        ):
+            # The adapter owns no buffers: both directions address the host
+            # pool, which is already registered above.
+            self.layout_adapter = KVCacheLayoutAdapter(
+                self.mem_pool_host, self.storage_config
+            )
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -961,9 +982,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
+        # One shard per entry of the mha_suffix list (legacy split-heads
+        # virtual ranks).
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
-                indices, self.split_factor
+                indices, len(self.mha_suffix)
             )
         )
         key_list = []
@@ -1024,13 +1047,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        if self.layout_adapter is not None:
+            # Unified layout: the compiled plan already names byte runs of the
+            # host pool, so there is nothing to pack -- both directions address
+            # pool memory directly. Producing (keys, ptrs, sizes) here is what
+            # lets get/set stay on the ordinary v1 path.
+            ptrs, sizes = self.layout_adapter.chunk_metas(host_indices)
+            return self.layout_adapter.chunk_keys(keys), ptrs, sizes
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
-        else:
-            if self.should_split_heads:
-                return self._get_mha_split_heads_buffer_meta(keys, host_indices)
-            else:
-                return self._get_mha_buffer_meta(keys, host_indices)
+        if isinstance(self.mha_suffix, list):
+            # Legacy split-heads (rank-suffix tp_lcm_size).
+            return self._get_mha_split_heads_buffer_meta(keys, host_indices)
+        return self._get_mha_buffer_meta(keys, host_indices)
 
     def _batch_postprocess(
         self, results: List[int], is_set_operate=False, key_multiplier=None
@@ -1044,11 +1073,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = 1
+                key_multiplier = (
+                    len(self.mla_suffix) if isinstance(self.mla_suffix, list) else 1
+                )
             else:
                 key_multiplier = 2
-                if self.should_split_heads:
-                    key_multiplier *= self.split_factor
+                if isinstance(self.mha_suffix, list):
+                    key_multiplier *= len(self.mha_suffix)
 
         result_groups = [
             results[i : i + key_multiplier]
@@ -1090,7 +1121,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        return self._batch_postprocess(get_results, is_set_operate=False)
+        # Derive the multiplier from the keys actually produced, as batch_set_v1
+        # does: it is the same value the suffix-shape default computes, and it
+        # keeps the unified adapter (whose fan-out is the compiled plan's, not
+        # the suffix list's) correct by construction rather than by coincidence.
+        return self._batch_postprocess(
+            get_results,
+            is_set_operate=False,
+            key_multiplier=len(key_strs) // len(keys),
+        )
 
     def batch_set_v1(
         self,
@@ -1280,16 +1319,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
+            if isinstance(self.mla_suffix, list):
+                query_keys = [
+                    f"{key}_{suffix}_k" for key in keys for suffix in self.mla_suffix
+                ]
+                key_multiplier = len(self.mla_suffix)
+            else:
+                query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+                key_multiplier = 1
         else:
             query_keys = []
-            if self.should_split_heads:
+            if isinstance(self.mha_suffix, list):
                 for key in keys:
                     for suffix in self.mha_suffix:
                         query_keys.append(f"{key}_{suffix}_k")
                         query_keys.append(f"{key}_{suffix}_v")
-                key_multiplier = 2 * self.split_factor
+                key_multiplier = 2 * len(self.mha_suffix)
             else:
                 for key in keys:
                     query_keys.append(f"{key}_{self.mha_suffix}_k")

@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.pool_host.unified_layout import UnifiedKVLayoutHostMixin
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -50,6 +51,7 @@ if _is_cuda or _is_hip:
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
+        transfer_kv_all_layer_lf_pfdhg,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
@@ -58,6 +60,7 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
+        transfer_kv_per_layer_pfdhg_lf,
         transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
@@ -66,7 +69,7 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
-class MHATokenToKVPoolHost(HostKVCache):
+class MHATokenToKVPoolHost(UnifiedKVLayoutHostMixin, HostKVCache):
     device_pool: MHATokenToKVPool | None = None
     mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
 
@@ -324,6 +327,24 @@ class MHATokenToKVPoolHost(HostKVCache):
                     page_size=self.page_size,
                     head_num=self.head_num,
                 )
+            elif self.layout == "page_first_direct":
+                # Head-group-major page blocks (the unified L3 grid cuts the kv
+                # head axis). head_num here is the head GROUP count, so the
+                # kernel's per-head-group run is one L3 chunk's worth of a
+                # token. With one group this is page_first_direct's own order.
+                transfer_kv_per_layer_pfdhg_lf(
+                    src_k=self.k_buffer,
+                    dst_k=device_pool.k_buffer[device_layer_id],
+                    src_v=self.v_buffer,
+                    dst_v=device_pool.v_buffer[device_layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=host_layer_id,
+                    item_size=self.token_stride_size,
+                    src_layout_dim=self.layout_dim,
+                    page_size=self.page_size,
+                    head_num=self.unified_head_groups,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -468,6 +489,23 @@ class MHATokenToKVPoolHost(HostKVCache):
                     page_size=self.page_size,
                     head_num=self.head_num,
                 )
+            elif self.layout == "page_first_direct":
+                # Mirror of the H2D arm: write back in the SAME head-group-major
+                # order the L3 grid reads, so a page's byte order does not
+                # depend on whether it came from the device or from L3.
+                transfer_kv_all_layer_lf_pfdhg(
+                    src_k_layers=device_k_data_ptrs,
+                    dst_k=self.k_buffer,
+                    src_v_layers=device_v_data_ptrs,
+                    dst_v=self.v_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    dst_layout_dim=self.layout_dim,
+                    num_layers=self.layer_num,
+                    page_size=self.page_size,
+                    head_num=self.unified_head_groups,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -609,6 +647,35 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         element_size_list = [element_size] * len(ptr_list)
         return ptr_list, element_size_list
+
+    def _unified_page_view(self, index: int):
+        """One page's KV as a (2, layer, page_size, head, dim) view.
+
+        The view is normalized, not necessarily contiguous: its STRIDES carry
+        the host layout, and the unified layout coalesces them into byte runs.
+        So every layout serves the same L3 object bytes, and only the number of
+        descriptors differs:
+
+        * ``page_first_direct`` -- ``(layer, token, head, dim)`` page blocks
+          already ARE the unified order, so a chunk is one range. This is also
+          the layout that can be stored head-group-major for a cut head axis
+          (see unified_layout), keeping it one range.
+        * ``page_first`` -- ``(token, layer, head, dim)``: layer and token are
+          transposed relative to the object order, so a chunk is one run per
+          (layer, token).
+        ``layer_first`` is refused even though a view of it is expressible:
+        see ``ADAPTER_LAYOUTS`` for why, and note it IS reachable here, so
+        this raise is load-bearing rather than defensive.
+        """
+        if self.layout == "page_first_direct":
+            return self.kv_buffer[:, index // self.page_size]
+        if self.layout == "page_first":
+            page = self.kv_buffer[:, index : index + self.page_size]
+            return page.permute(0, 2, 1, 3, 4)
+        raise ValueError(
+            f"the unified key scheme does not support the {self.layout!r} host "
+            f"layout; use page_first or page_first_direct."
+        )
 
     def get_page_buffer_meta(self, indices):
         """

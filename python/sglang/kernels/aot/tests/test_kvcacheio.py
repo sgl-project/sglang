@@ -6,12 +6,14 @@ from sgl_kernel.kvcacheio import (
     transfer_embedding_ranges_direct,
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_lf_pfdhg,
     transfer_kv_all_layer_lf_ph,
     transfer_kv_all_layer_mla,
     transfer_kv_direct,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_pfdhg_lf,
 )
 
 from sglang.srt.utils import get_cuda_version, is_hip
@@ -769,6 +771,343 @@ def test_transfer_kv_page_head(
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
     torch.set_default_dtype(original_dtype)
+
+
+# Head-group-major page blocks, as a set of unified L3 chunks lands them.
+# page_first_direct stores a page as (L, P, H, D); when the unified L3 grid cuts
+# the kv-head axis, a page reassembled from those chunks is (HG, L, P, hg, D) --
+# the same bytes, permuted. The pfdhg kernels absorb that permutation into the
+# transfer they were already running.
+#
+# (head_num, head_groups, layers, page_size, head_dim)
+HEAD_GROUP_CONFIGS = [
+    # The motivating cross-TP GQA case: one kv head per group, at
+    # DeepSeek-V3's prime layer count.
+    (8, 8, 61, 16, 128),
+    (8, 4, 4, 8, 64),
+    (16, 2, 5, 16, 128),
+    (16, 4, 61, 8, 128),
+    # head_groups == 1: the block is (page, 1, L, P, H, D), i.e. exactly
+    # page_first_direct's own order, so this case pins that the kernel
+    # degenerates to a plain token gather.
+    (8, 1, 3, 4, 32),
+    # Degenerate shapes.
+    (4, 4, 1, 4, 64),
+]
+
+
+def _head_group_host(shape, seed, dtype):
+    """Seeded noise, NOT a counter.
+
+    A counter taken mod 2048 is periodic and the layer stride
+    (page_size * hg * head_dim) is an exact multiple of that period in several
+    configs -- adjacent layers would hold identical values and a layer mix-up
+    would pass. bf16 also carries 8 mantissa bits, so a counter is not exactly
+    representable past 256.
+    """
+    n = 1
+    for d in shape:
+        n *= d
+    gen = torch.Generator().manual_seed(seed)
+    # randn has no fp8 kernel, so generate in fp32 and narrow. The kernels move
+    # bytes, so any exactly-representable pattern is a valid oracle.
+    return torch.randn(n, generator=gen).to(dtype).reshape(shape).contiguous()
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "head_num, head_groups, layers, page_size, head_dim", HEAD_GROUP_CONFIGS
+)
+def test_transfer_kv_head_group(
+    dtype: torch.dtype,
+    head_num: int,
+    head_groups: int,
+    layers: int,
+    page_size: int,
+    head_dim: int,
+):
+    """H2D: device[d] == host[s // P, :, layer, s % P, :, :].reshape(H, D).
+
+    The oracle is built from the *logical* host tensor with torch indexing, so
+    it catches drift between the offset functor and the layout it claims to
+    read (a Python transcription of the functor would not).
+    """
+    hg = head_num // head_groups
+    num_pages = 3
+    rows = num_pages * page_size
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    item_size = head_num * head_dim * itemsize
+
+    shape = (num_pages, head_groups, layers, page_size, hg, head_dim)
+    host_k = _head_group_host(shape, 0, dtype).pin_memory()
+    host_v = _head_group_host(shape, 1024, dtype).pin_memory()
+    dev_k = torch.zeros(layers, rows, head_num, head_dim, dtype=dtype, device="cuda")
+    dev_v = torch.zeros_like(dev_k)
+
+    # non-identity permutation so the index tensors are actually exercised
+    src = torch.arange(rows, dtype=torch.int64)
+    dst = torch.flip(src, [0]).contiguous()
+
+    for layer in range(layers):
+        transfer_kv_per_layer_pfdhg_lf(
+            src_k=host_k.view(-1),
+            dst_k=dev_k[layer],
+            src_v=host_v.view(-1),
+            dst_v=dev_v[layer],
+            src_indices=src.cuda(),
+            dst_indices=dst.cuda(),
+            layer_id=layer,
+            item_size=item_size,
+            src_layout_dim=item_size * layers,
+            page_size=page_size,
+            head_num=head_groups,
+        )
+    torch.cuda.synchronize()
+
+    for layer in range(layers):
+        exp_k = torch.empty(rows, head_num, head_dim, dtype=dtype)
+        exp_v = torch.empty(rows, head_num, head_dim, dtype=dtype)
+        for i in range(rows):
+            s, d = int(src[i]), int(dst[i])
+            page, tok = s // page_size, s % page_size
+            exp_k[d] = host_k[page, :, layer, tok, :, :].reshape(head_num, head_dim)
+            exp_v[d] = host_v[page, :, layer, tok, :, :].reshape(head_num, head_dim)
+        torch.testing.assert_close(dev_k[layer].cpu(), exp_k, atol=0, rtol=0)
+        torch.testing.assert_close(dev_v[layer].cpu(), exp_v, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize("block_quota", [2, 8, 32, 132])
+def test_transfer_kv_head_group_quota_does_not_change_results(block_quota: int):
+    """block_quota only caps the grid (num_blocks <= quota); it must not change
+    the bytes moved. It is purely a bandwidth knob -- measured on B200 + PCIe
+    Gen5, H2D goes 11.9 -> 49.9 GB/s from quota 2 to 32 -- so a caller may tune
+    it freely, and this pins that doing so stays correct."""
+    dtype = torch.float16
+    head_num, head_groups, layers, page_size, head_dim = 8, 4, 4, 8, 64
+    hg = head_num // head_groups
+    num_pages = 3
+    rows = num_pages * page_size
+    item_size = head_num * head_dim * 2
+
+    shape = (num_pages, head_groups, layers, page_size, hg, head_dim)
+    host = _head_group_host(shape, 5, dtype).pin_memory()
+    dev = torch.zeros(layers, rows, head_num, head_dim, dtype=dtype, device="cuda")
+    src = torch.arange(rows, dtype=torch.int64)
+    dst = torch.flip(src, [0]).contiguous()
+
+    for layer in range(layers):
+        transfer_kv_per_layer_pfdhg_lf(
+            src_k=host.view(-1),
+            dst_k=dev[layer],
+            src_v=host.view(-1),
+            dst_v=dev[layer],
+            src_indices=src.cuda(),
+            dst_indices=dst.cuda(),
+            layer_id=layer,
+            item_size=item_size,
+            src_layout_dim=item_size * layers,
+            page_size=page_size,
+            head_num=head_groups,
+            block_quota=block_quota,
+        )
+    torch.cuda.synchronize()
+
+    for layer in range(layers):
+        exp = torch.empty(rows, head_num, head_dim, dtype=dtype)
+        for i in range(rows):
+            s_i, d_i = int(src[i]), int(dst[i])
+            page, tok = s_i // page_size, s_i % page_size
+            exp[d_i] = host[page, :, layer, tok, :, :].reshape(head_num, head_dim)
+        torch.testing.assert_close(dev[layer].cpu(), exp, atol=0, rtol=0)
+
+
+def _head_group_write_back(head_num, head_groups, layers, page_size, head_dim, dtype):
+    hg = head_num // head_groups
+    num_pages = 3
+    rows = num_pages * page_size
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    item_size = head_num * head_dim * itemsize
+
+    dev_shape = (layers, rows, head_num, head_dim)
+    dev_k = _head_group_host(dev_shape, 0, dtype).cuda()
+    dev_v = _head_group_host(dev_shape, 1024, dtype).cuda()
+    host_shape = (num_pages, head_groups, layers, page_size, hg, head_dim)
+    host_k = torch.zeros(host_shape, dtype=dtype).pin_memory()
+    host_v = torch.zeros_like(host_k)
+
+    src = torch.arange(rows, dtype=torch.int64)
+    dst = torch.flip(src, [0]).contiguous()
+
+    def layer_table(pool):
+        return torch.tensor(
+            [pool[i].data_ptr() for i in range(layers)], dtype=torch.uint64
+        ).cuda()
+
+    transfer_kv_all_layer_lf_pfdhg(
+        src_k_layers=layer_table(dev_k),
+        dst_k=host_k.view(-1),
+        src_v_layers=layer_table(dev_v),
+        dst_v=host_v.view(-1),
+        src_indices=src.cuda(),
+        dst_indices=dst.cuda(),
+        item_size=item_size,
+        dst_layout_dim=item_size * layers,
+        num_layers=layers,
+        page_size=page_size,
+        head_num=head_groups,
+    )
+    torch.cuda.synchronize()
+    return host_k, host_v, dev_k, dev_v, src, dst, hg
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "head_num, head_groups, layers, page_size, head_dim", HEAD_GROUP_CONFIGS
+)
+def test_transfer_kv_head_group_write_back(
+    dtype: torch.dtype,
+    head_num: int,
+    head_groups: int,
+    layers: int,
+    page_size: int,
+    head_dim: int,
+):
+    """D2H, the inverse contract:
+
+        host[d // P, g, layer, d % P, j, :] == device[layer][s, g * hg + j, :]
+
+    It exists so the host pool has ONE byte order: if write-back kept
+    page_first_direct's natural order while the L3 grid reads head-group-major,
+    a page's order would depend on whether it arrived from the device or from
+    L3, and the H2D would have no way to tell.
+    """
+    host_k, host_v, dev_k, dev_v, src, dst, hg = _head_group_write_back(
+        head_num, head_groups, layers, page_size, head_dim, dtype
+    )
+    for host, dev, label in ((host_k, dev_k, "K"), (host_v, dev_v, "V")):
+        want = torch.zeros_like(host)
+        for i in range(len(src)):
+            s, d = int(src[i]), int(dst[i])
+            page, tok = d // page_size, d % page_size
+            for layer in range(layers):
+                row = dev[layer, s].cpu()
+                for g in range(head_groups):
+                    want[page, g, layer, tok] = row[g * hg : (g + 1) * hg]
+        torch.testing.assert_close(host, want, atol=0, rtol=0, msg=f"{label} mismatch")
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize(
+    "head_num, head_groups, layers, page_size, head_dim", HEAD_GROUP_CONFIGS
+)
+def test_transfer_kv_head_group_round_trip(
+    head_num: int, head_groups: int, layers: int, page_size: int, head_dim: int
+):
+    """D2H then H2D over the same slots must return the original bytes.
+
+    This is the property the host pool actually relies on: a page written back
+    by the device and later loaded again is unchanged, whatever the head-group
+    count.
+    """
+    dtype = torch.bfloat16
+    host_k, host_v, dev_k, dev_v, src, dst, _ = _head_group_write_back(
+        head_num, head_groups, layers, page_size, head_dim, dtype
+    )
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    item_size = head_num * head_dim * itemsize
+    out_k, out_v = torch.zeros_like(dev_k), torch.zeros_like(dev_v)
+
+    # read back along the inverse index mapping
+    for layer in range(layers):
+        transfer_kv_per_layer_pfdhg_lf(
+            src_k=host_k.view(-1),
+            dst_k=out_k[layer],
+            src_v=host_v.view(-1),
+            dst_v=out_v[layer],
+            src_indices=dst.cuda(),
+            dst_indices=src.cuda(),
+            layer_id=layer,
+            item_size=item_size,
+            src_layout_dim=item_size * layers,
+            page_size=page_size,
+            head_num=head_groups,
+        )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_k, dev_k, atol=0, rtol=0)
+    torch.testing.assert_close(out_v, dev_v, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize(
+    "overrides, error",
+    [
+        ({"block_quota": 0}, "block_quota"),
+        ({"page_size": 0}, "page_size"),
+        ({"head_num": 0}, "head_num"),
+        ({"head_num": 3}, "item_size"),
+        ({"item_size": 24, "src_layout_dim": 24, "head_num": 2}, "Per-head-group"),
+        ({"src_layout_dim": 513}, "src_layout_dim"),
+    ],
+)
+def test_transfer_kv_head_group_rejects_invalid_geometry(overrides, error):
+    """Reject invalid divisors and copy widths instead of truncating."""
+    host = torch.zeros(4 * 4 * 4 * 64, dtype=torch.float16).pin_memory()
+    dev = torch.zeros(16, 4, 64, dtype=torch.float16, device="cuda")
+    idx = torch.arange(16, dtype=torch.int64, device="cuda")
+    args = {
+        "item_size": 4 * 64 * 2,
+        "src_layout_dim": 4 * 64 * 2,
+        "page_size": 4,
+        "head_num": 4,
+        "block_quota": 2,
+        "indices": idx,
+    }
+    args.update(overrides)
+
+    def launch(**kw):
+        torch.ops.sgl_kernel.transfer_kv_per_layer_pfdhg_lf(
+            host.view(-1),
+            dev,
+            host.view(-1),
+            dev,
+            kw["indices"],
+            kw["indices"],
+            0,
+            kw["item_size"],
+            kw["src_layout_dim"],
+            kw["page_size"],
+            kw["head_num"],
+            kw["block_quota"],
+            32,
+        )
+
+    with pytest.raises(RuntimeError, match=error):
+        launch(**args)
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+def test_transfer_kv_head_group_empty_is_a_noop():
+    """An empty transfer is a valid no-op, not a grid-size division by zero."""
+    host = torch.zeros(4 * 4 * 4 * 64, dtype=torch.float16).pin_memory()
+    dev = torch.zeros(16, 4, 64, dtype=torch.float16, device="cuda")
+    empty = torch.arange(0, dtype=torch.int64, device="cuda")
+    transfer_kv_per_layer_pfdhg_lf(
+        src_k=host.view(-1),
+        dst_k=dev,
+        src_v=host.view(-1),
+        dst_v=dev,
+        src_indices=empty,
+        dst_indices=empty,
+        layer_id=0,
+        item_size=4 * 64 * 2,
+        src_layout_dim=4 * 64 * 2,
+        page_size=4,
+        head_num=4,
+    )
+    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

@@ -181,6 +181,20 @@ class Memory(msgspec.Struct):
         int,
         "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
     ] = 4
+    hicache_storage_key_scheme: A[
+        str,
+        Arg(
+            help="How L3 storage object keys encode what an object holds. "
+            "'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, "
+            "so only bit-identical topologies can share cache. "
+            "'unified': keys carry topology-free canonical cell "
+            "coordinates (namespace digest + layer/head group indices), so "
+            "any topology whose shards tile the same grid shares cache. "
+            "v1 supports the file and mooncake backends with plain KV pools "
+            "only.",
+            choices=["rank-suffix", "unified"],
+        ),
+    ] = "rank-suffix"
 
     # -------------------------------------------------------------------------
     # Unified Radix Cache
