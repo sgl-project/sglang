@@ -2991,6 +2991,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is None:
             return
         io_backend = self.cache_controller.io_backend
+        # same fence start_loading uses: previous forward may still write these rows
+        fence = self.cache_controller.load_fence_stream
+        if fence is not None:
+            torch.get_device_module(fence.device).current_stream().wait_stream(fence)
         idx = req_pool_indices_cpu.tolist()
         for i, req in enumerate(reqs):
             if getattr(req, "_swa_restore_windows", None):
