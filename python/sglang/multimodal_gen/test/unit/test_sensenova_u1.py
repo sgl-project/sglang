@@ -1162,3 +1162,43 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+@pytest.mark.parametrize("explicit_first", [False, True])
+def test_sensenova_cache_dit_effective_defaults_reuse_mount(
+    monkeypatch, explicit_first
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+    # Pin the environment independently of the developer's cache settings.
+    monkeypatch.setenv("SGLANG_CACHE_DIT_RDT", "0.24")
+    explicit = {"residual_diff_threshold": 0.24}
+    batch = SimpleNamespace(
+        num_inference_steps=8,
+        guidance_scale=1.0,
+        sampling_params=SimpleNamespace(
+            enable_cache_dit=True,
+            cache_dit_params=explicit if explicit_first else None,
+        ),
+    )
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    batch.sampling_params.cache_dit_params = None if explicit_first else explicit
+    batch.num_inference_steps = 12
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    assert len(calls["enable"]) == 1
+    assert calls["enable"][0][1].kwargs["residual_diff_threshold"] == 0.24
+    assert calls["refresh"] == [(transformer, 12)]
+    assert calls["disable"] == []
+
+    batch.sampling_params.cache_dit_params = {"residual_diff_threshold": 0.1}
+    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    assert len(calls["enable"]) == 2
+    assert calls["enable"][1][1].kwargs["residual_diff_threshold"] == 0.1
+    assert calls["disable"] == [transformer]
