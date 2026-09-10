@@ -95,6 +95,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
     ] = False
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "

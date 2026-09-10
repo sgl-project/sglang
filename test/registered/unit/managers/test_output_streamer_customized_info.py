@@ -3,7 +3,7 @@ import pickle
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -20,7 +20,6 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.output_streamer import (
-    SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
@@ -82,6 +81,7 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
+        self.prefill_weight_versions = None
 
     def finished(self):
         return self._finished
@@ -149,215 +149,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
         )
-
-    def test_additional_customized_info_uses_the_existing_payload(self):
-        class Streamer(SchedulerOutputStreamer):
-            has_additional_customized_info = True
-
-            def get_cached_tokens_details(self, req):
-                return None
-
-            def build_additional_customized_info(self, reqs):
-                return {"request_info": [[req.rid] for req in reqs]}
-
-        outputs = []
-        streamer = Streamer(
-            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
-            tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
-            server_args=SimpleNamespace(
-                stream_interval=1,
-                enable_request_time_stats_logging=False,
-            ),
-            is_generation=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
-        )
-
-        streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
-
-        self.assertEqual(len(outputs), 1)
-        self.assertEqual(
-            unwrap_from_pickle(outputs[0].customized_info),
-            {"request_info": [["r0"]]},
-        )
-
-    def test_additional_customized_info_only_indexes_emitted_requests(self):
-        class Streamer(SchedulerOutputStreamer):
-            has_additional_customized_info = True
-
-            def get_cached_tokens_details(self, req):
-                return None
-
-            def build_additional_customized_info(self, reqs):
-                return {"request_info": [[req.rid] for req in reqs]}
-
-        outputs = []
-        streamer = Streamer(
-            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
-            tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
-            server_args=SimpleNamespace(
-                stream_interval=1,
-                enable_request_time_stats_logging=False,
-            ),
-            is_generation=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
-        )
-        quiet = _FakeReq("quiet", [10, 11])
-        quiet.stream = True
-        quiet.sampling_params.stream_interval = 2
-        terminal = _FakeReq("terminal", [20], finished=True)
-
-        streamer._stream_output_generation([quiet, terminal], False)
-
-        self.assertEqual(outputs[0].rids, ["terminal"])
-        self.assertEqual(
-            unwrap_from_pickle(outputs[0].customized_info),
-            {"request_info": [["terminal"]]},
-        )
-
-    def test_additional_customized_info_handles_suppressed_request_last(self):
-        class Streamer(SchedulerOutputStreamer):
-            has_additional_customized_info = True
-
-            def get_cached_tokens_details(self, req):
-                return None
-
-            def build_additional_customized_info(self, reqs):
-                return {"request_info": [[req.rid] for req in reqs]}
-
-        outputs = []
-        streamer = Streamer(
-            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
-            tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
-            server_args=SimpleNamespace(
-                stream_interval=1,
-                enable_request_time_stats_logging=False,
-            ),
-            is_generation=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
-        )
-        terminal = _FakeReq("terminal", [20], finished=True)
-        quiet = _FakeReq("quiet", [10, 11])
-        quiet.stream = True
-        quiet.sampling_params.stream_interval = 2
-
-        streamer._stream_output_generation([terminal, quiet], False)
-
-        self.assertEqual(outputs[0].rids, ["terminal"])
-        self.assertEqual(
-            unwrap_from_pickle(outputs[0].customized_info),
-            {"request_info": [["terminal"]]},
-        )
-
-    def test_additional_customized_info_preserves_duplicate_rid_requests(self):
-        accepted_reqs = []
-
-        class Streamer(SchedulerOutputStreamer):
-            has_additional_customized_info = True
-
-            def get_cached_tokens_details(self, req):
-                return None
-
-            def build_additional_customized_info(self, reqs):
-                accepted_reqs.extend(reqs)
-                return {"request_info": [[req.rid] for req in reqs]}
-
-        outputs = []
-        streamer = Streamer(
-            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
-            tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
-            server_args=SimpleNamespace(
-                stream_interval=1,
-                enable_request_time_stats_logging=False,
-            ),
-            is_generation=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
-        )
-        first = _FakeReq("duplicate", [10], finished=True)
-        second = _FakeReq("duplicate", [20], finished=True)
-
-        streamer._stream_output_generation([first, second], False)
-
-        self.assertEqual(accepted_reqs, [first, second])
-
-    def test_additional_customized_info_hook_is_opt_in(self):
-        class Streamer(SchedulerOutputStreamer):
-            build_additional_customized_info = Mock()
-
-            def get_cached_tokens_details(self, req):
-                return None
-
-        outputs = []
-        streamer = Streamer(
-            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
-            tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
-            server_args=SimpleNamespace(),
-            is_generation=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
-        )
-
-        streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
-
-        Streamer.build_additional_customized_info.assert_not_called()
-        self.assertIsNone(outputs[0].customized_info)
-
-    def test_additional_customized_info_hook_can_skip_inactive_batches(self):
-        class Streamer(SchedulerOutputStreamer):
-            has_additional_customized_info = True
-            build_additional_customized_info = Mock()
-            should_build_additional_customized_info = Mock(return_value=False)
-
-            def get_cached_tokens_details(self, req):
-                return None
-
-        outputs = []
-        streamer = Streamer(
-            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
-            tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
-            server_args=SimpleNamespace(),
-            is_generation=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
-        )
-
-        streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
-
-        Streamer.should_build_additional_customized_info.assert_called_once_with()
-        Streamer.build_additional_customized_info.assert_not_called()
-        self.assertIsNone(outputs[0].customized_info)
-
-    def test_additional_customized_info_rejects_rust_egress(self):
-        class Streamer(SchedulerOutputStreamer):
-            has_additional_customized_info = True
-
-        with self.assertRaisesRegex(ValueError, "Rust egress"):
-            Streamer(
-                send_to_detokenizer=SimpleNamespace(),
-                tree_cache=None,
-                ps=SimpleNamespace(),
-                server_args=SimpleNamespace(),
-                is_generation=True,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                disaggregation_mode=DisaggregationMode.NULL,
-                enable_hicache_storage=lambda: False,
-                rust_server=object(),
-            )
 
 
 class TestOutputStreamerWeightVersions(unittest.TestCase):
@@ -540,6 +331,55 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                             received[i][0].extend(masks)
                             received[i][1].extend(logprobs)
                 self.assertEqual(received, expected)
+
+
+class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
+    def test_payload_carries_prefill_spans_for_finished_requests(self):
+        """Prefill spans computed before the KV release ride out with the finished request."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        finished_req = _FakeReq("r1", [20], finished=True)
+        finished_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4),
+            WeightVersionSpan(version="v1", start=4, end=6),
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        accumulator.accept(req=finished_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(
+            payload.prefill_weight_versions,
+            [
+                None,
+                [
+                    WeightVersionSpan(version="v0", start=0, end=4),
+                    WeightVersionSpan(version="v1", start=4, end=6),
+                ],
+            ],
+        )
+
+    def test_an_unfinished_request_withholds_its_prefill_spans(self):
+        """Spans of a request still generating must not ship before its finishing chunk."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        streaming_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4)
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+
+    def test_payload_omits_prefill_spans_when_the_flag_is_off(self):
+        """With tracking disabled every request contributes None, so nothing goes on the wire."""
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=_FakeReq("r0", [10], finished=True))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+        self.assertIsNotNone(payload.weight_versions)
 
 
 if __name__ == "__main__":

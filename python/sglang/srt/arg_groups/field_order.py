@@ -505,5 +505,6 @@ POSITIONAL_FIELD_ORDER = (
     "weight_cache_timeout",
     "forward_hooks",
     "msprobe_dump_config",
+    "enable_prefill_weight_versions",
 )
 # fmt: on

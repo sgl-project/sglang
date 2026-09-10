@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import sys
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List
 
 import msgspec
@@ -96,15 +97,19 @@ def add_weight_versions_to_meta_info(
         span for span in spans if span.start < num_output_tokens or span.start == 0
     ]
 
-    meta_info["weight_versions"] = [
-        {
-            "version": span.version,
-            "start": span.start,
-            "end": min(span.end, num_output_tokens),
-        }
-        for span in visible
-    ]
+    meta_info["weight_versions"] = weight_version_spans_to_json(
+        visible, end_limit=num_output_tokens
+    )
     meta_info["weight_version"] = visible[-1].version
+
+
+def weight_version_spans_to_json(
+    spans: WeightVersionSpans, end_limit: int = sys.maxsize
+) -> List[Dict[str, Any]]:
+    return [
+        {"version": span.version, "start": span.start, "end": min(span.end, end_limit)}
+        for span in spans
+    ]
 
 
 # ======================================================================
@@ -114,4 +119,6 @@ def build_endpoint_weight_version_metadata(meta_info: Dict[str, Any]) -> Dict[st
     metadata = {"weight_version": meta_info["weight_version"]}
     if "weight_versions" in meta_info:
         metadata["weight_versions"] = meta_info["weight_versions"]
+    if "prefill_weight_versions" in meta_info:
+        metadata["prefill_weight_versions"] = meta_info["prefill_weight_versions"]
     return metadata
