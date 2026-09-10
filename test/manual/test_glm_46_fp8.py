@@ -50,7 +50,7 @@ class TestGLM46FP8(unittest.TestCase):
             test_name="GLM-4.6-FP8",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.80),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_glm_4_6_fp8",
+                result_dir="performance_results_glm_4_6_fp8",
             ),
         )
 

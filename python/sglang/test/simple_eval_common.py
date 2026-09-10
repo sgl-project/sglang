@@ -254,6 +254,100 @@ class CompletionSampler(SamplerBase):
         return ""
 
 
+class GenerateSampler(SamplerBase):
+    """
+    Sample from SGLang's native ``/generate`` endpoint (not the OpenAI-compatible
+    API). Sends raw text prompts with `sampling_params`, so it exercises the same
+    path as `bench_serving` rather than the `/v1/completions` wrapper.
+
+    `base_url` is the OpenAI-style URL the eval harness builds (``.../v1``); the
+    trailing ``/v1`` is stripped to reach the server root's ``/generate``.
+    """
+
+    def __init__(
+        self,
+        base_url: str = None,
+        model: Optional[str] = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        max_tokens: int = 2048,
+        stop: Optional[List[str]] = None,
+    ):
+        self.client = LargerHttpxClient()
+
+        # The harness passes the OpenAI base (`.../v1`); `/generate` lives at root.
+        root = (base_url or "http://127.0.0.1:30000/v1").rstrip("/")
+        if root.endswith("/v1"):
+            root = root[: -len("/v1")]
+        self.generate_url = f"{root}/generate"
+
+        # `/generate` serves the loaded model and ignores a model field, so `model`
+        # is informational only; fill it from `/get_model_info` when unset.
+        if model is None:
+            try:
+                info = self.client.get(f"{root}/get_model_info").json()
+                model = info.get("model_path")
+            except Exception:
+                model = None
+
+        self.model = model
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        self.stop = stop
+        self._completion_tokens: list[int] = []
+        print(
+            f"GenerateSampler initialized with {self.generate_url=} {self.model=} "
+            f"{self.temperature=} {self.max_tokens=} {self.stop=}"
+        )
+
+    def _pack_message(self, role: str, content: Any):
+        return {"role": str(role), "content": content}
+
+    def __call__(self, message_list: MessageList) -> str:
+        # Extract raw text from message list (eval objects pack prompt as a single user message)
+        prompt = "\n".join(
+            msg["content"]
+            for msg in message_list
+            if isinstance(msg.get("content"), str)
+        )
+        payload = {
+            "text": prompt,
+            "sampling_params": {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "max_new_tokens": self.max_tokens,
+                "stop": self.stop,
+            },
+            "stream": False,
+        }
+        trial = 0
+        while trial < 6:
+            try:
+                response = self.client.post(self.generate_url, json=payload)
+                # A 400 is a malformed request, not a transient failure — don't retry.
+                if response.status_code == 400:
+                    print("Bad Request Error", response.text)
+                    return ""
+                response.raise_for_status()
+                data = response.json()
+                meta_info = data.get("meta_info") or {}
+                completion_tokens = meta_info.get("completion_tokens")
+                if completion_tokens is not None:
+                    self._completion_tokens.append(completion_tokens)
+                return data.get("text") or ""
+            except Exception as e:
+                exception_backoff = 2**trial
+                print(
+                    f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
+                    e,
+                )
+                time.sleep(exception_backoff)
+                trial += 1
+        print(f"All retry attempts exhausted for request. Returning empty response.")
+        return ""
+
+
 QUERY_TEMPLATE_MULTICHOICE = """
 Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
 

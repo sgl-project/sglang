@@ -10,11 +10,14 @@ import triton.language as tl
 
 _tma_keep_alive_buf = deque(maxlen=200)
 
-# Q is always bf16/fp16. The paged main K/V cache may be fp8 (unit-scaled) under
-# --kv-cache-dtype fp8_*; the kernel widens it to the Q dtype on load (IS_FP8
-# branch). Accepted on both HIP and CUDA (the bf16->fp8 cache write is unit-scaled,
-# so the widening cast is the exact inverse dequant). The bf16/fp16-only MSA
-# (fmha_sm100) kernel is excluded for fp8 KV by the backend use_msa gate.
+# The paged main K/V cache may be fp8 (unit-scaled) under --kv-cache-dtype
+# fp8_*; with a bf16/fp16 Q the kernel widens K/V to the Q dtype on load
+# (IS_FP8 branch — the bf16->fp8 cache write is unit-scaled, so the widening
+# cast is the exact inverse dequant). Under fp8 attn-GEMM mode Q itself is
+# fp8_e4m3: the IS_FP8 casts become no-ops and tl.dot runs fp8x8 on tensor
+# cores (P is quantized to the V dtype for the PV MMA, same contract as the
+# fmha_sm100 fp8 kernel). Accepted on both HIP and CUDA. MSA (fmha_sm100)
+# accepts fp8 only in the uniform-e4m3 fp8 attn-GEMM mode (backend gate).
 SPARSE_KV_FP8_DTYPES = (
     torch.float8_e4m3fn,
     torch.float8_e5m2,
@@ -25,24 +28,54 @@ SPARSE_KV_FP8_DTYPES = (
 def check_sparse_kv_fp8(
     q: torch.Tensor,
     k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    v_cache: Optional[torch.Tensor],
     *,
     label: str,
 ) -> bool:
-    """Validate the sparse-attention KV cache dtype contract.
+    """Validate the sparse-attention Q/KV dtype contract.
 
-    Returns True iff the K cache is fp8 (then widened to Q dtype in the kernel).
-    Raises AssertionError otherwise, mirroring the contract the decode and prefill
-    topk kernels both enforce. fp8 is accepted on both HIP and CUDA.
+    Returns True iff the K cache is fp8 (drives the kernels' IS_FP8 constexpr).
+    Two fp8 modes are allowed:
+      * widening (Q bf16/fp16, K/V any fp8): K/V widened to Q dtype on load;
+      * all-fp8 GEMM (fp8 attn-GEMM mode): Q/K/V all fp8_e4m3fn. e5m2 Q is
+        rejected — fmha_sm100's variant lookup silently mis-dispatches e5m2
+        to the e4m3 kernel, so uniform e4m3 is enforced on the sglang side.
     """
-    assert q.dtype in (torch.bfloat16, torch.float16)
     is_fp8 = k_cache.dtype in SPARSE_KV_FP8_DTYPES
-    assert k_cache.dtype == q.dtype or is_fp8, (
-        f"sparse {label} expects K cache dtype == Q dtype ({q.dtype}) "
-        f"or fp8, got {k_cache.dtype}"
-    )
-    assert v_cache.dtype == k_cache.dtype
+    if q.dtype == torch.float8_e4m3fn:
+        assert k_cache.dtype == torch.float8_e4m3fn, (
+            f"sparse {label} with fp8 Q requires an fp8_e4m3fn K cache, "
+            f"got {k_cache.dtype}"
+        )
+    else:
+        assert q.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ), f"sparse {label} expects Q dtype bf16/fp16/fp8_e4m3fn, got {q.dtype}"
+        assert k_cache.dtype == q.dtype or is_fp8, (
+            f"sparse {label} expects K cache dtype == Q dtype ({q.dtype}) "
+            f"or fp8, got {k_cache.dtype}"
+        )
+    if v_cache is not None:
+        assert v_cache.dtype == k_cache.dtype
     return is_fp8
+
+
+def sparse_out_dtype(q: torch.Tensor) -> torch.dtype:
+    """Attention output dtype: bf16 for fp8 Q (fp8 accumulates to bf16 out,
+    matching fmha_sm100's fp8 variant), else the Q dtype."""
+    return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+
+
+def unit_scale(scale: Optional[float]) -> float:
+    """Normalize an optional per-tensor dequant scale: None means unit scale.
+
+    All sparse-op entry points take ``Optional[float] = None`` scales (matching
+    ``k_scale_float`` / ``v_scale_float`` on RadixAttention, which are None
+    unless a checkpoint provides them) and normalize here at the kernel-launch
+    boundary, where a concrete float is needed.
+    """
+    return 1.0 if scale is None else scale
 
 
 try:
@@ -260,3 +293,26 @@ def _bitonic_merge(
     for i in tl.static_range(stage):
         x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
     return x, ids
+
+
+@triton.jit
+def _sort_ids_ascending(ids, valid_n, BLOCK_SIZE_T: tl.constexpr):
+    """Sort a top-k id row ascending, invalids packed as -1 at the tail.
+
+    ``ids``: int32 [BLOCK_SIZE_T] block ids (0-indexed, -1 = invalid); entries at
+    positions >= ``valid_n`` are also treated as invalid. Valid ids must be
+    distinct and < 2**30 (block ids always are). The MSA fmha_sm100 consumer
+    requires kv_block_indexes strictly ascending with -1 tail padding — its
+    sorted-order early-exit otherwise mis-masks the partial last block.
+
+    O(T^2) rank sort (T = BLOCK_SIZE_T <= 64): invalid entries get unique keys
+    above every valid id so ranks form a permutation.
+    """
+    off = tl.arange(0, BLOCK_SIZE_T)
+    invalid = (off >= valid_n) | (ids < 0)
+    key = tl.where(invalid, 0x40000000 + off, ids)
+    rank = tl.sum(tl.where(key[None, :] < key[:, None], 1, 0), axis=1)
+    sorted_key = tl.sum(
+        tl.where(rank[None, :] == off[:, None], key[None, :], 0), axis=1
+    )
+    return tl.where(sorted_key >= 0x40000000, -1, sorted_key)

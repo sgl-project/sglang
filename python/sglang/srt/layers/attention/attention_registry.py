@@ -2,7 +2,12 @@ import logging
 import warnings
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
+    resolved_view,
+)
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -12,6 +17,11 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
+)
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
+    get_spec,
 )
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
@@ -48,7 +58,7 @@ def create_flashinfer_backend(runner):
         )
 
         # Init streams
-        if runner.server_args.speculative_algorithm == "EAGLE":
+        if get_spec().speculative_algorithm == "EAGLE":
             if (
                 not hasattr(runner, "plan_stream_for_flashinfer")
                 or not runner.plan_stream_for_flashinfer
@@ -69,6 +79,15 @@ def create_flashinfer_backend(runner):
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
+    if get_parallel().dcp_enabled and get_spec().speculative_algorithm is not None:
+        _, decode_backend = attention_backends_of(resolved_view(runner.server_args))
+        if decode_backend == "trtllm_mla":
+            raise ValueError(
+                "trtllm_mla cannot serve decode context parallelism with speculative "
+                "decoding: it does not forward the cyclic DCP metadata to its decode "
+                "kernel and returns no rank-local LSE for the cross-rank merge. "
+                "Select cutedsl_mla or tokenspeed_mla."
+            )
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
     return TRTLLMMLABackend(runner)
@@ -89,9 +108,9 @@ def create_tokenspeed_mla_backend(runner):
 def create_cutedsl_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("cutedsl_mla backend can only be used with MLA models.")
-    from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+    from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 
-    return TRTLLMMLABackend(runner, backend="cute-dsl")
+    return CuteDslMLABackend(runner)
 
 
 @register_attention_backend("aiter")
@@ -124,6 +143,15 @@ def create_dsa_backend(runner):
     return DeepseekSparseAttnBackend(runner)
 
 
+@register_attention_backend("qsa")
+def create_qsa_backend(runner):
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+
+    return QwenSparseAttnBackend(runner)
+
+
 @register_attention_backend("nsa")
 def _create_nsa_compat(runner):
     warnings.warn(
@@ -153,12 +181,15 @@ def create_dsv4_backend(runner):
         )
         return DeepseekV4HipRadixBackend(runner)
     else:
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            create_deepseek_v4_attn_backend,
         )
 
-        logger.info("Using DeepseekV4AttnBackend for dsv4 attention backend (CUDA).")
-        return DeepseekV4AttnBackend(runner)
+        backend = create_deepseek_v4_attn_backend(runner)
+        logger.info(
+            f"Using {type(backend).__name__} for dsv4 attention backend (CUDA)."
+        )
+        return backend
 
 
 @register_attention_backend("triton")
@@ -228,13 +259,6 @@ def create_flashattention_v4_backend(runner):
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
 
-@register_attention_backend("cutlass_mla")
-def create_cutlass_mla_backend(runner):
-    from sglang.srt.layers.attention.cutlass_mla_backend import CutlassMLABackend
-
-    return CutlassMLABackend(runner)
-
-
 @register_attention_backend("trtllm_mha")
 def create_trtllm_mha_backend(runner):
     if runner.use_mla_backend:
@@ -244,6 +268,23 @@ def create_trtllm_mha_backend(runner):
     return TRTLLMHAAttnBackend(runner)
 
 
+@register_attention_backend("hpc_ops")
+def create_hpc_ops_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("hpc_ops backend can only be used with non-MLA models.")
+    if runner.model_config.is_encoder_decoder:
+        raise ValueError(
+            "Cross attention is not supported in the hpc_ops attention backend."
+        )
+    if get_spec().speculative_algorithm is not None:
+        raise ValueError(
+            "hpc_ops backend does not support speculative decoding for now."
+        )
+    from sglang.srt.layers.attention.hpc_ops_backend import HPCOpsAttnBackend
+
+    return HPCOpsAttnBackend(runner)
+
+
 @register_attention_backend("intel_amx")
 def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
@@ -251,13 +292,49 @@ def create_intel_amx_backend(runner):
     return IntelAMXAttnBackend(runner)
 
 
-@register_attention_backend("dual_chunk_flash_attn")
-def create_dual_chunk_flash_attn_backend(runner):
-    from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
-        DualChunkFlashAttentionBackend,
-    )
+def attn_backend_wrapper_for_draft_extend(
+    runner: "ModelRunner", full_attn_backend: "AttentionBackend"
+):
+    """Apply the model's attention wrapper to a DRAFT-EXTEND backend, if it needs one.
 
-    return DualChunkFlashAttentionBackend(runner)
+    ``DraftBackendFactory`` skips :func:`attn_backend_wrapper`, which is right for
+    the mamba hybrids whose MTP draft is all softmax attention. Inkling's draft has
+    its own short convs, so it must expose ``conv_state_metadata`` too.
+    """
+    from sglang.srt.configs.dots3 import Dots3Config
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)):
+        return attn_backend_wrapper(runner, full_attn_backend)
+    if isinstance(runner.model_config.hf_text_config, Dots3Config):
+        return attn_backend_wrapper(runner, full_attn_backend)
+    return full_attn_backend
+
+
+def attn_backend_wrapper_for_draft_decode(runner: "ModelRunner", backend):
+    """Apply the Dots model wrapper to per-step draft backends."""
+    from sglang.srt.configs.dots3 import Dots3Config
+
+    if not hasattr(runner, "model_config"):
+        return backend
+    hf_text_config = runner.model_config.hf_text_config
+    if isinstance(hf_text_config, Dots3Config):
+        return hf_text_config.wrap_draft_decode_attention_backend(backend)
+    return backend
+
+
+@register_attention_backend("minicpm_flashattn")
+def create_minicpm_flashattn_backend(runner):
+    from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(runner, use_flashinfer=False)
+
+
+@register_attention_backend("minicpm_flashinfer")
+def create_minicpm_flashinfer_backend(runner):
+    from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(runner, use_flashinfer=True)
 
 
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
@@ -269,7 +346,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         hybrid_gdn_config(runner.model_config) is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
 
+    from sglang.srt.configs.dots3 import Dots3Config
     from sglang.srt.configs.model_config import is_minimax_sparse
+
+    if isinstance(runner.model_config.hf_text_config, Dots3Config):
+        return runner.model_config.hf_text_config.wrap_attention_backend(
+            runner, full_attn_backend
+        )
 
     if is_minimax_sparse(runner.model_config.hf_config):
         from sglang.srt.layers.attention.minimax_sparse_backend import (
@@ -288,7 +371,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if isinstance(
             runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)
         ):
-            return full_attn_backend
+            from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
+                InklingShortConvAttnBackend,
+                InklingShortConvHybridAttnBackend,
+            )
+
+            return InklingShortConvHybridAttnBackend(
+                full_attn_backend,
+                InklingShortConvAttnBackend(runner),
+                cfg.full_attention_layer_ids,
+            )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
@@ -296,12 +388,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             LightningAttentionBackend,
         )
         from sglang.srt.layers.attention.linear.utils import (
-            initialize_linear_attn_config,
+            resolve_linear_attn_backends,
         )
         from sglang.srt.utils import (
             is_blackwell,
             is_npu,
-            is_sm120_supported,
+            is_xpu,
         )
 
         if not is_npu():
@@ -311,8 +403,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
             from sglang.srt.layers.attention.linear.gdn_backend import (
                 GDNAttnBackend,
-                maybe_set_default_flashinfer_gdn_prefill,
+                flashinfer_gdn_prefill_default,
             )
+
+            if is_xpu():
+                from sglang.srt.hardware_backend.xpu.attention.xpu_gdn_backend import (
+                    XpuGDNAttnBackend as GDNAttnBackend,
+                )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
@@ -325,36 +422,43 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         check_environments()
+        prefill_default = None
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
-            maybe_set_default_flashinfer_gdn_prefill(runner)
-        initialize_linear_attn_config(runner.server_args)
+            prefill_default = flashinfer_gdn_prefill_default(runner)
+        runner.linear_attn_backends = resolve_linear_attn_backends(
+            prefill_default=prefill_default
+        )
         hybrid_backend_cls = HybridLinearAttnBackend
         if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():
-                if is_sm120_supported():
+                if get_platform().is_sm120:
                     allowed = {"triton", "trtllm_mha", "flashinfer"}
                 else:
                     allowed = {"triton", "trtllm_mha", "fa4"}
-                attn_be = runner.server_args.attention_backend
-                prefill_be = runner.server_args.prefill_attention_backend
-                decode_be = runner.server_args.decode_attention_backend
-                # When using split prefill/decode backends, check each individually
-                if prefill_be and decode_be:
-                    assert prefill_be in allowed and decode_be in allowed, (
-                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
-                        f"Got prefill={prefill_be}, decode={decode_be}."
-                    )
-                else:
-                    assert attn_be in allowed, (
-                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
-                        f"Got attention_backend={attn_be}."
-                    )
+                prefill_be = runner.prefill_attention_backend_str
+                decode_be = runner.decode_attention_backend_str
+                assert prefill_be in allowed and decode_be in allowed, (
+                    f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
+                    f"Got prefill={prefill_be}, decode={decode_be}."
+                )
             elif is_npu():
                 assert (
-                    runner.server_args.attention_backend == "ascend"
-                ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
+                    runner.prefill_attention_backend_str == "ascend"
+                    and runner.decode_attention_backend_str == "ascend"
+                ), (
+                    "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
+                )
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+            if is_qwen_qsa(runner.model_config.hf_config):
+                from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+                    QwenSparseAttnBackend,
+                )
+
+                logger.info("Using QSA for sparse full-attention layers.")
+                full_attn_backend = QwenSparseAttnBackend(runner)
         elif mamba2_config(runner.model_config) is not None:
             from sglang.srt.configs.lfm2 import Lfm2Config
             from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
@@ -397,6 +501,17 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
         elif kimi_linear_config(runner.model_config) is not None:
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
+                    AscendKDAAttnBackend,
+                    AscendKDAHybridLinearAttnBackend,
+                )
+
+                linear_attn_backend = AscendKDAAttnBackend(runner)
+                hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
+            else:
+                linear_attn_backend = KDAAttnBackend(runner)
+        elif glm5_next_config(runner.model_config) is not None:
             linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
@@ -404,8 +519,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
                 spec, _ = spec_result
+                cfg = runner.model_config
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = BackendClass(runner)
+                if spec.hybrid_backend_class_name is not None:
+                    hybrid_backend_cls = import_backend_class(
+                        spec.hybrid_backend_class_name
+                    )
             else:
                 raise ValueError(
                     "Expected hybrid GDN or NemotronH models, but got unknown model. "

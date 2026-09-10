@@ -38,6 +38,20 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_gro
 _original_similarity = None
 
 
+def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
+    """Remove Cache-DiT hooks so subsequent requests use the native forward."""
+
+    logger.info("Disabling cache-dit on %s", type(transformer).__name__)
+    target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
+    cache_dit.disable_cache(target)
+    if target is not transformer:
+        del transformer._sglang_cache_dit_adapter
+    for name in ("_is_parallelized", "_parallelism_config"):
+        if hasattr(transformer, name):
+            delattr(transformer, name)
+    return transformer
+
+
 def _patch_cache_dit_similarity():
     from cache_dit.caching.cache_contexts import cache_manager
 
@@ -63,7 +77,9 @@ def _patch_cache_dit_similarity():
         tp_sp_group = getattr(self, "_sglang_tp_sp_group", None)
         target_group = tp_sp_group or sp_group or tp_group
 
-        if target_group is None:
+        # Averaging over a one-rank group returns the input, so skip the
+        # collective rather than pay for a round trip that cannot change it.
+        if target_group is None or dist.get_world_size(target_group) == 1:
             return _original_similarity(
                 self,
                 t1,
@@ -178,6 +194,75 @@ def get_scm_mask(
     return mask
 
 
+# Keys accepted in SamplingParams.cache_dit_params; "secondary" nests the
+# DBCache knobs for the second transformer of dual-DiT models.
+CACHE_DIT_REQUEST_KNOB_KEYS = frozenset(
+    {
+        "Fn_compute_blocks",
+        "Bn_compute_blocks",
+        "max_warmup_steps",
+        "residual_diff_threshold",
+        "max_continuous_cached_steps",
+        "enable_taylorseer",
+        "taylorseer_order",
+    }
+)
+CACHE_DIT_REQUEST_SCM_KEYS = frozenset(
+    {
+        "scm_preset",
+        "scm_compute_bins",
+        "scm_cache_bins",
+        "scm_policy",
+    }
+)
+CACHE_DIT_REQUEST_PARAM_KEYS = (
+    CACHE_DIT_REQUEST_KNOB_KEYS | CACHE_DIT_REQUEST_SCM_KEYS | {"secondary"}
+)
+
+
+def resolve_cache_dit_request_overrides(raw: dict | None) -> dict:
+    """Validate cache_dit_params and return a copy; unknown keys fail the request."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"cache_dit_params must be a dict, got {type(raw).__name__}.")
+    unknown = set(raw) - CACHE_DIT_REQUEST_PARAM_KEYS
+    if unknown:
+        raise ValueError(
+            f"Unknown cache_dit_params keys: {sorted(unknown)}. "
+            f"Valid keys: {sorted(CACHE_DIT_REQUEST_PARAM_KEYS)}."
+        )
+    overrides = dict(raw)
+    secondary = overrides.get("secondary")
+    if secondary is not None:
+        if not isinstance(secondary, dict):
+            raise ValueError(
+                "cache_dit_params['secondary'] must be a dict, got "
+                f"{type(secondary).__name__}."
+            )
+        unknown = set(secondary) - CACHE_DIT_REQUEST_KNOB_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown cache_dit_params['secondary'] keys: {sorted(unknown)}. "
+                f"Valid keys: {sorted(CACHE_DIT_REQUEST_KNOB_KEYS)}."
+            )
+        overrides["secondary"] = dict(secondary)
+    return overrides
+
+
+def cache_dit_overrides_key(overrides: dict) -> tuple:
+    """Hashable snapshot of request overrides, for mount-change detection."""
+
+    def _freeze(value):
+        if isinstance(value, dict):
+            return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(_freeze(v) for v in value)
+        return value
+
+    return _freeze(overrides)
+
+
 @dataclass
 class CacheDitConfig:
     """Configuration for cache-dit integration.
@@ -259,15 +344,26 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 }
 
 
-# Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
-# Value: (blocks attr, forward_pattern). forward_pattern must
-# match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
-# uses Pattern_3). has_separate_cfg follows the run (passed by
-# enable_cache_on_transformer); cache-dit auto-resolves the remaining
-# fields.
-_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
-    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
-    "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
+@dataclass(frozen=True)
+class CustomBlockAdapterSpec:
+    blocks_attr: str
+    forward_pattern: ForwardPattern
+
+
+# Custom BlockAdapter metadata for models absent from cache-dit's registry.
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
+    "ErnieImageTransformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "Krea2Transformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="transformer_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "MiniMaxH3DiTModel": CustomBlockAdapterSpec(
+        blocks_attr="blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
 }
 
 
@@ -280,17 +376,16 @@ def _build_custom_block_adapter(
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
-    blocks_attr, forward_pattern = spec
-    blocks = getattr(transformer, blocks_attr, None)
+    blocks = getattr(transformer, spec.blocks_attr, None)
     if blocks is None:
         raise ValueError(
             f"Transformer {transformer.__class__.__name__} has no attribute "
-            f"{blocks_attr!r} for cache-dit blocks."
+            f"{spec.blocks_attr!r} for cache-dit blocks."
         )
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
-        forward_pattern=forward_pattern,
+        forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
     )
 
@@ -412,6 +507,8 @@ def enable_cache_on_transformer(
         calibrator_config=calibrator_config,
         parallelism_config=None,
     )
+    if custom_adapter is not None:
+        transformer._sglang_cache_dit_adapter = custom_adapter
 
     if parallelism_config is not None:
         context_manager = getattr(transformer, "_context_manager", None)

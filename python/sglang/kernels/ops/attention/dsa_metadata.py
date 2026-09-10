@@ -71,6 +71,16 @@ def _fused_dsa_decode_metadata_kernel(
         mask=row < bs,
         other=0,
     )
+    # Skip column blocks past the request's kv length: no consumer reads there
+    # (attention and the indexer both stay within cache_seqlens). Loaded after
+    # req_idx so the two scalar loads pipeline (no added latency when live).
+    kv_len = tl.load(
+        seq_lens + row * seq_lens_stride,
+        mask=row < bs,
+        other=0,
+    ).to(tl.int32)
+    if col_block * BLOCK_N >= kv_len:
+        return
     vals = tl.load(
         req_to_token + req_idx * req_to_token_stride_0 + offs_n * req_to_token_stride_1,
         mask=mask,
@@ -80,7 +90,9 @@ def _fused_dsa_decode_metadata_kernel(
     # fused decode CUDA graph drops it and consumes real_page_table alone.
     if HAS_PAGE_TABLE_1:
         tl.store(
-            page_table_1 + row * page_table_stride_0 + offs_n * page_table_stride_1,
+            page_table_1
+            + row.to(tl.int64) * page_table_stride_0
+            + offs_n * page_table_stride_1,
             vals,
             mask=mask,
         )
@@ -90,7 +102,7 @@ def _fused_dsa_decode_metadata_kernel(
         real_cols = offs_n // real_page_size
         tl.store(
             real_page_table
-            + row * real_page_table_stride_0
+            + row.to(tl.int64) * real_page_table_stride_0
             + real_cols * real_page_table_stride_1,
             vals // real_page_size,
             mask=real_mask,
@@ -120,6 +132,10 @@ def fused_dsa_decode_metadata(
     where the wide table is never read (attention uses topk_indices, the indexer
     uses real_page_table); ``real_page_size`` must be >1 in that case. When a
     tensor is passed, behavior is unchanged (both tables are written).
+
+    Contract: each page-table row is written only over its live prefix
+    ([:cache_seqlens]); the tail keeps stale values across CUDA-graph replays, so
+    consumers must bound reads by cache_seqlens.
     """
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
@@ -283,6 +299,20 @@ def _fused_dsa_target_verify_metadata_kernel(
         mask=out_row < expanded_size,
         other=0,
     )
+    # Skip column blocks past the request's kv length (seq_len + next_n): no
+    # consumer reads there (attention and the indexer stay within cache_seqlens).
+    # Loaded after req_idx so the two scalar loads pipeline (no added latency
+    # when live).
+    kv_len = (
+        tl.load(
+            seq_lens + req_row * seq_lens_stride,
+            mask=out_row < expanded_size,
+            other=0,
+        ).to(tl.int32)
+        + next_n
+    )
+    if col_block * BLOCK_N >= kv_len:
+        return
     vals = tl.load(
         req_to_token + req_idx * req_to_token_stride_0 + offs_n * req_to_token_stride_1,
         mask=mask,
@@ -292,7 +322,9 @@ def _fused_dsa_target_verify_metadata_kernel(
     # fused_dsa_decode_metadata for the optional-page_table_1 contract).
     if HAS_PAGE_TABLE_1:
         tl.store(
-            page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
+            page_table_1
+            + out_row.to(tl.int64) * page_table_stride_0
+            + offs_n * page_table_stride_1,
             vals,
             mask=mask,
         )
@@ -302,7 +334,7 @@ def _fused_dsa_target_verify_metadata_kernel(
         real_cols = offs_n // real_page_size
         tl.store(
             real_page_table
-            + out_row * real_page_table_stride_0
+            + out_row.to(tl.int64) * real_page_table_stride_0
             + real_cols * real_page_table_stride_1,
             vals // real_page_size,
             mask=real_mask,
@@ -524,6 +556,15 @@ def _fused_dsa_draft_extend_metadata_kernel(
         mask=req_row < bs,
         other=0,
     ).to(tl.int32)
+    # Skip column blocks past the request's kv length: no consumer reads there
+    # (attention and the indexer both stay within cache_seqlens).
+    kv_len = tl.load(
+        seq_lens + req_row * seq_lens_stride,
+        mask=req_row < bs,
+        other=0,
+    ).to(tl.int32)
+    if col_block * BLOCK_N >= kv_len:
+        return
     if STATIC_EXTEND_LEN:
         prefix = req_row * qo_len
     else:
@@ -555,7 +596,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     if HAS_PAGE_TABLE_1:
         tl.store(
             page_table_1
-            + out_rows[:, None] * page_table_stride_0
+            + out_rows.to(tl.int64)[:, None] * page_table_stride_0
             + offs_n[None, :] * page_table_stride_1,
             vals[None, :],
             mask=mask,
@@ -566,7 +607,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
         real_cols = offs_n // real_page_size
         tl.store(
             real_page_table
-            + out_rows[:, None] * real_page_table_stride_0
+            + out_rows.to(tl.int64)[:, None] * real_page_table_stride_0
             + real_cols[None, :] * real_page_table_stride_1,
             (vals // real_page_size)[None, :],
             mask=real_mask,

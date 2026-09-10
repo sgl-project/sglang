@@ -78,18 +78,18 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanTimeTextImageEmbedding,
     WanTransformer3DModel,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
+from sglang.multimodal_gen.runtime.realtime.lingbot_world import (
     LINGBOT_C2WS_PLUCKER_EMB_CACHE,
     LINGBOT_CAM_CONDITIONER_CACHE,
     LINGBOT_ROPE_CACHE,
     LINGBOT_SEQUENCE_SHARD_ROPE_CACHE,
     LINGBOT_TIME_EMBEDDINGS_CACHE,
 )
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
-from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
@@ -97,6 +97,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
+
+
+def is_lingbot_block(name: str, _module: object) -> bool:
+    return "blocks" in name and name.split(".")[-1].isdigit()
+
+
 _is_cuda = current_platform.is_cuda()
 
 
@@ -574,11 +580,8 @@ class LingBotWorldTransformerBlock(nn.Module):
 
 
 class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = LingBotWorldVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = LingBotWorldVideoConfig()._compile_conditions
-    _supported_attention_backends = (
-        LingBotWorldVideoConfig()._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_lingbot_block]
+    _compile_conditions = [is_lingbot_block]
     param_names_mapping = LingBotWorldVideoConfig().param_names_mapping
     reverse_param_names_mapping = LingBotWorldVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotWorldVideoConfig().lora_param_names_mapping
@@ -1133,11 +1136,8 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
 
 
 class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
-    _fsdp_shard_conditions = LingBotWorldVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = LingBotWorldVideoConfig()._compile_conditions
-    _supported_attention_backends = (
-        LingBotWorldVideoConfig()._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_lingbot_block]
+    _compile_conditions = [is_lingbot_block]
     param_names_mapping = LingBotWorldVideoConfig().param_names_mapping
     reverse_param_names_mapping = LingBotWorldVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotWorldVideoConfig().lora_param_names_mapping

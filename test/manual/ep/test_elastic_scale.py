@@ -238,8 +238,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         join_end = rank_offset + join_tp
         if join_end > len(visible_devices):
             raise RuntimeError(
-                f"Scale-up requires {join_end} visible GPUs, got "
-                f"{len(visible_devices)}"
+                f"Scale-up requires {join_end} visible GPUs, got {len(visible_devices)}"
             )
         env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices[rank_offset:join_end])
         base_joining_log = os.environ.get(
@@ -407,6 +406,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         self._generate_logprob_ok("post-scale")
 
         self._run_post_scale_gsm8k()
+        self._generate_logprob_ok("after post-scale workload")
 
 
 @unittest.skipUnless(
@@ -458,6 +458,7 @@ class TestElasticScaleUp4To5To6(_ElasticScaleUpEndToEndBase):
         self._generate_ok("after second scale")
         self._generate_logprob_ok("after second scale")
         self._run_post_scale_gsm8k()
+        self._generate_logprob_ok("after post-scale workload")
 
 
 @unittest.skipUnless(

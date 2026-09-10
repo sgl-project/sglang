@@ -24,17 +24,20 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
-from sglang.jit_kernel.rope import FusedSetKVBufferArg
+from sglang.kernels.ops.attention.rope import FusedSetKVBufferArg
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -293,13 +296,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and pool.dtype == torch.bfloat16
         and not isinstance(pool, SWAKVPool)
-        and not is_prefill_context_parallel_enabled()
+        and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (
-        _is_hip
-        and not is_prefill_context_parallel_enabled()
-        and getattr(forward_batch, "dcp_kv_mask", None) is None
-    )
+    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
 
 
 def create_fused_set_kv_buffer_arg(
@@ -379,9 +378,9 @@ def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
     Returns:
         cu_seqlens: 1D int32 tensor on CPU, shape [N + 1]
     """
-    assert (
-        grid_thw.device.type == "cpu"
-    ), "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    assert grid_thw.device.type == "cpu", (
+        "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    )
     arr = grid_thw.numpy()
 
     cu_seqlens = np.repeat(arr[:, 1] * arr[:, 2], arr[:, 0]).cumsum(
@@ -444,7 +443,7 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
 
     if (
         _is_cuda
-        and get_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
+        and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
     ):
         return x.view(*x.shape[:-1], -1, head_dim)
     return x.reshape(-1, head_dim)
@@ -485,7 +484,7 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and get_server_args().cuda_graph_config.prefill.tc_compiler
+        and get_exec().graph.cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
@@ -589,6 +588,9 @@ def fused_qk_gemma_rmsnorm(
 
     q_out = torch.empty(q_rows, head_dim, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
+
+    if _is_hip and q_rows == 0:
+        return q_out, k_out
 
     BLOCK_HD = triton.next_power_of_2(head_dim)
 
@@ -705,6 +707,9 @@ def fused_qk_gemma_rmsnorm_with_gate(
     q_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
     gate_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+
+    if _is_hip and q_rows == 0:
+        return q_out, k_out, gate_out
 
     BLOCK_HD = triton.next_power_of_2(head_dim)
 

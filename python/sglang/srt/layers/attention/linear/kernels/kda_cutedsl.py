@@ -3,7 +3,9 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.cutedsl_kda import cutedsl_fused_sigmoid_gating_kda_update
+from sglang.kernels.ops.attention.cutedsl_kda import (
+    cutedsl_fused_sigmoid_gating_kda_update,
+)
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -27,6 +29,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
     ``head_k_dim`` must be 128). On SM90 the prefill path is unsupported; callers
     query :attr:`supports_prefill` and fall back to Triton.
     """
+
+    supports_safe_gate: bool = False
 
     def __init__(self):
         self.supports_prefill = _is_blackwell()
@@ -73,6 +77,11 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        if kwargs.get("lower_bound") is not None:
+            raise NotImplementedError(
+                "KDA safe gate (lower_bound) is not implemented in the CuTe DSL "
+                "decode kernel; use --linear-attn-decode-backend triton."
+            )
         return cutedsl_fused_sigmoid_gating_kda_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -106,6 +115,10 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> torch.Tensor:
         if kwargs.get("return_intermediate_states"):
+            # The mamba radix extra_buffer track path needs per-chunk states
+            # (h), which chunk_kda_cutedsl does not expose. Refuse instead of
+            # silently skipping the snapshot (that corrupts prefix-cache
+            # restores). Use the Triton prefill backend with extra_buffer.
             raise NotImplementedError(
                 "CuteDSLKDAKernel.extend cannot return intermediate chunk "
                 "states required by mamba_radix_cache_strategy=extra_buffer; "
@@ -125,6 +138,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         num_tokens = q_n.shape[0]
         g_in = g[0][:num_tokens]  # raw forget gate; activated inside chunk_kda_cutedsl
         beta_in = beta[0][:num_tokens].to(torch.float32)
+        if kwargs.get("beta_is_raw"):
+            beta_in = beta_in.sigmoid()
         cu_seqlens = query_start_loc.to(torch.int32)
 
         # Pool state I/O is fused into the h kernel's TMA load/store: pass the
@@ -150,8 +165,9 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
             h0_indices=ssm_cache_indices,
         )
 
-        # Match chunk_kda's output layout [1, T, HV, V].
-        return o.unsqueeze(0)
+        # CuTeDSL does not emit intermediate chunk states; pairing with None
+        # keeps the upstream extra-buffer radix track contract.
+        return o.unsqueeze(0), None
 
     def target_verify(self, *args, **kwargs):
         raise NotImplementedError("CuteDSLKDAKernel does not support target_verify")

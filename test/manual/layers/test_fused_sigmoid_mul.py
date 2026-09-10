@@ -3,7 +3,7 @@ import itertools
 import pytest
 import torch
 
-from sglang.kernels.ops.layernorm.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
 DTYPES = [torch.float16, torch.bfloat16]
 TOKEN_COUNTS = [1, 2, 4, 8, 16, 64, 512, 1024, 2048, 4096, 8192]

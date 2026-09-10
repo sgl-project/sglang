@@ -47,11 +47,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
 ) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
-    from sglang.jit_kernel.trtllm_lora_temp import (
+    from sglang.kernels.ops.moe.trtllm_lora_temp import (
         trtllm_fp8_block_scale_moe_lora_finalize,
         trtllm_fp8_block_scale_routed_moe_lora,
     )
-    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -314,8 +314,8 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     down grouped GEMM -> finalize, then the virtual-experts down-LoRA is merged into
     the output. Single-stream version (no two-stream overlap yet — phase 2).
     """
-    from sglang.jit_kernel.trtllm_lora_temp import trtllm_bf16_routed_moe_lora
-    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp import trtllm_bf16_routed_moe_lora
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -328,9 +328,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     from sglang.srt.layers.moe.utils import RoutingMethodType
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
-    assert (
-        runner_config.activation == "silu" and runner_config.is_gated
-    ), "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
+    )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -470,10 +470,10 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     then the virtual-experts down-LoRA is merged into the output. Single-stream
     version; ``moe_overlap.py`` provides the two-stream variant.
     """
-    from sglang.jit_kernel.trtllm_lora_temp import (
+    from sglang.kernels.ops.moe.trtllm_lora_temp import (
         trtllm_fp4_block_scale_routed_moe_lora,
     )
-    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -484,9 +484,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
-    assert (
-        runner_config.activation == "silu" and runner_config.is_gated
-    ), "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output

@@ -7,7 +7,8 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from operator import attrgetter
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -35,13 +36,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
-from sglang.multimodal_gen.utils import (
+from sglang.multimodal_gen.runtime.utils.argparse import (
     FlexibleArgumentParser,
     StoreBoolean,
-    shallow_asdict,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
 
 logger = init_logger(__name__)
 
@@ -198,8 +198,15 @@ def maybe_unpad_latents(latents, batch):
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
+    native_only_components: ClassVar[tuple[str, ...]] = ()
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
+    # False when changing component placement after a calibration request is
+    # known to alter the pipeline's numerical path.
+    supports_auto_residency: bool = True
+    # Components that cannot fall back to a native Transformers/Diffusers
+    # implementation because their pipeline requires SGLang-specific behavior.
+    native_only_components: tuple[str, ...] = ()
 
     model_path: str = ""
     pipeline_config_path: str | None = None
@@ -224,9 +231,20 @@ class PipelineConfig:
     # VAE configuration
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
+    vae_decode_precision: str | None = None
+    # Optional request-scoped override. The loader keeps the reference decode
+    # dtype resident so lossless requests never consume pre-rounded weights.
+    vae_decode_precision_high: str | None = None
     vae_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
+
+    # Diffusion Decoder configuration
+    # Bounds the attention grid the diffusion decoder's stages see, which is
+    # what makes a full-length decode tractable.
+    diffusion_decoder_tiling: bool = True
+    # Splits those tiles across the decode-parallel ranks.
+    diffusion_decoder_parallel_tiling: bool = True
 
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
@@ -265,6 +283,21 @@ class PipelineConfig:
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # return the model-specific config for optimal deployment setting
         return ModelDeploymentConfig()
+
+    def validate_server_args(self, server_args: Any) -> None:
+        """Validate model-owned constraints after server args are normalized."""
+
+        del server_args
+
+    def supports_action_endpoint(self) -> bool:
+        """Whether this pipeline exposes the generic action generation API."""
+
+        return self.task_type.is_action_gen()
+
+    def supports_openpi_endpoint(self) -> bool:
+        """Whether this pipeline implements the OpenPI policy websocket."""
+
+        return False
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
@@ -351,7 +384,7 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def adjust_num_frames(self, num_frames):
+    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         return num_frames
 
     # tokenize the prompt
@@ -393,8 +426,21 @@ class PipelineConfig:
         """
         return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
 
+    def supports_disaggregation(self) -> bool:
+        """Return whether multi-service disaggregated deployment is supported."""
+
+        return True
+
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
+        return False
+
+    def supports_sequential_dit_inference(self):
+        """Return whether batched AR is followed by per-request DiT inference."""
+        return False
+
+    def supports_sequential_multi_output_inference(self):
+        """Return whether one request's outputs run through DiT/VAE sequentially."""
         return False
 
     def estimate_request_cost(self, batch) -> float:
@@ -799,11 +845,42 @@ class PipelineConfig:
             help="Precision for VAE",
         )
         parser.add_argument(
+            f"--{prefix_with_dot}vae-decode-precision",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_decode_precision",
+            default=PipelineConfig.vae_decode_precision,
+            choices=["fp32", "fp16", "bf16"],
+            help=(
+                "Optional decode-only VAE precision override. "
+                "Defaults to --vae-precision when unset."
+            ),
+        )
+        parser.add_argument(
             f"--{prefix_with_dot}vae-tiling",
             action=StoreBoolean,
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}diffusion-decoder-tiling",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_tiling",
+            default=PipelineConfig.diffusion_decoder_tiling,
+            help="Enable tiling for the LTX-2.5 diffusion decoder",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}diffusion-decoder-parallel-tiling",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_parallel_tiling",
+            default=PipelineConfig.diffusion_decoder_parallel_tiling,
+            help=(
+                "Split the LTX-2.5 diffusion decoder's tiles across the "
+                "decode-parallel ranks (TP/SP/PP/CFG within a replica). "
+                "Requires --diffusion-decoder-tiling, since the tiles it "
+                "splits only exist on that path; inert otherwise, and at a "
+                "single rank"
+            ),
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-slicing",
@@ -1077,7 +1154,7 @@ class PipelineConfig:
             )
 
     def dump_to_json(self, file_path: str):
-        output_dict = shallow_asdict(self)
+        output_dict = {f.name: attrgetter(f.name)(self) for f in fields(self)}
         del_keys = []
         for key, value in output_dict.items():
             if isinstance(value, ModelConfig):
@@ -1123,9 +1200,9 @@ class PipelineConfig:
                 elif isinstance(current_value, tuple) and all(
                     isinstance(v, ModelConfig) for v in current_value
                 ):
-                    assert len(current_value) == len(
-                        new_value
-                    ), "Users shouldn't delete or add text encoder config objects in your json"
+                    assert len(current_value) == len(new_value), (
+                        "Users shouldn't delete or add text encoder config objects in your json"
+                    )
                     for target_config, source_config in zip(
                         current_value, new_value, strict=True
                     ):

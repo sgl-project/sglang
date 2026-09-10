@@ -195,11 +195,9 @@ class NVILAForConditionalGeneration(nn.Module):
             for x, block_size in zip(vision_features_list, block_sizes)
         ]
 
-        vision_features = torch.stack(
+        vision_features = torch.cat(
             [einops.rearrange(x, "1 c h w -> (h w) c") for x in vision_features_list]
         )
-
-        vision_features = einops.rearrange(vision_features, "n p d -> (n p) d")
 
         return vision_features
 
@@ -329,9 +327,9 @@ def merge_features_for_dynamic_s2(
                     )
                 )
 
-    assert block_cnt == len(
-        image_features
-    ), f"The number of blocks ({block_cnt}) does not match length of image_features ({len(image_features)})!"
+    assert block_cnt == len(image_features), (
+        f"The number of blocks ({block_cnt}) does not match length of image_features ({len(image_features)})!"
+    )
 
     return image_features_each_image, new_block_sizes
 

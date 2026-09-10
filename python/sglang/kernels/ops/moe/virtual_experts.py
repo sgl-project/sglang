@@ -9,7 +9,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
+from sglang.kernels.ops.moe.moe_align import (
+    moe_align_block_size as jit_moe_align_block_size,
+)
 
 
 @triton.jit

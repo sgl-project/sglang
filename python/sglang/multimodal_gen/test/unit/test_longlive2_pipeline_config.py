@@ -17,6 +17,10 @@ class TestLongLive2AdjustNumFrames(unittest.TestCase):
     def test_rounds_to_causal_block_aligned_latents(self):
         self.assertEqual(self.config.adjust_num_frames(65), 61)
 
+    def test_preserves_bf16_vae_decode_precision(self):
+        self.assertEqual(self.config.vae_precision, "bf16")
+        self.assertEqual(self.config.vae_decode_precision, "bf16")
+
 
 if __name__ == "__main__":
     unittest.main()

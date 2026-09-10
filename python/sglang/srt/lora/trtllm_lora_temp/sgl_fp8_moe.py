@@ -27,7 +27,7 @@ def fused_experts_fp8_sgl(
     # <-> quantization import cycle at load time.
     from flashinfer.fused_moe import Fp8QuantizationType
 
-    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         get_tp_group,
         is_allocation_symmetric,
@@ -111,9 +111,9 @@ def fused_experts_fp8_sgl(
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
         if use_routed_topk:
-            assert (
-                runner_config.top_k is not None
-            ), "runner_config.top_k is required for flashinfer_trtllm_routed."
+            assert runner_config.top_k is not None, (
+                "runner_config.top_k is required for flashinfer_trtllm_routed."
+            )
             assert TopKOutputChecker.format_is_standard(topk_output)
             packed_topk_ids = fused_pack_topk(
                 topk_ids=topk_output.topk_ids,

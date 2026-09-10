@@ -6,7 +6,13 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import check_sparse_kv_fp8, get_cu_seqblocks, robust_allocator
+from ..common.utils import (
+    check_sparse_kv_fp8,
+    get_cu_seqblocks,
+    robust_allocator,
+    sparse_out_dtype,
+    unit_scale,
+)
 
 
 @triton.heuristics(
@@ -66,6 +72,9 @@ def _gqa_share_sparse_fwd_kernel(
     num_q_loop,
     # sm_scale
     sm_scale,
+    # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
+    k_scale,
+    v_scale,
     # stride
     stride_qn,
     stride_qh,
@@ -201,8 +210,10 @@ def _gqa_share_sparse_fwd_kernel(
                 other=0.0,
             )
             if IS_FP8:
-                # fp8 main K cache is unit-scaled; widen to the Q compute dtype
-                # before the tl.dot (compiled out when the cache is bf16).
+                # fp8 main K cache: widening cast with bf16/fp16 Q (unit-scaled
+                # cache -> exact inverse dequant; k_scale covers calibrated
+                # caches), no-op with fp8 Q (fp8 attn-GEMM mode) so tl.dot runs
+                # fp8x8. Compiled out when the cache is bf16.
                 k = k.to(q.dtype)
             # compute qk
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
@@ -211,7 +222,7 @@ def _gqa_share_sparse_fwd_kernel(
             qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
             # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
             #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
-            qk += tl.dot(q, k) * sm_scale_log2e
+            qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
             # K boundary mask: positions beyond seq_len contribute -inf
             qk += tl.where(pos_mask[None, :], 0, float("-inf"))
             # compute m_ij and l_ij
@@ -231,11 +242,13 @@ def _gqa_share_sparse_fwd_kernel(
                 other=0.0,
             )
             if IS_FP8:
-                # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather
-                # than to fp8 (which would wreck attention-weight precision).
+                # Cast V to the compute dtype: widening with bf16/fp16 Q (so
+                # `p.to(v.dtype)` keeps P in the compute dtype), no-op with fp8
+                # Q where P is quantized to e4m3 for the fp8 PV MMA — the same
+                # accuracy contract as fmha_sm100's fp8 kernel.
                 v = v.to(q.dtype)
             p = p.to(v.dtype)
-            acc_o += tl.dot(p, v)
+            acc_o += tl.dot(p, v) * v_scale
             # update statistics
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -273,9 +286,14 @@ def flash_prefill_with_gqa_share_sparse(
     use_tma: bool = True,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
+    k_scale = unit_scale(k_scale)
+    v_scale = unit_scale(v_scale)
     assert block_size_q in {1, 2, 4, 8, 16, 32, 64}
     assert block_size_k in {16, 32, 64, 128}
     # shape
@@ -292,12 +310,17 @@ def flash_prefill_with_gqa_share_sparse(
     assert gqa_group_size * block_size_q <= 128
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
+    # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into
+    # sm_scale; k_scale must not touch the sink term and stays a kernel arg.
+    sm_scale = sm_scale * unit_scale(q_scale)
     if cu_seqblocks_q is None or max_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, _, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
     # output tensor
-    o = torch.empty(total_q, num_q_heads, v_head_dim, device=q.device, dtype=q.dtype)
+    o = torch.empty(
+        total_q, num_q_heads, v_head_dim, device=q.device, dtype=sparse_out_dtype(q)
+    )
     # launch kernel
     num_q_loop = (
         max_seqblock_q // 131072 + 1
@@ -330,6 +353,8 @@ def flash_prefill_with_gqa_share_sparse(
         topk,
         num_q_loop,
         sm_scale,
+        k_scale,
+        v_scale,
         q.stride(0),
         q.stride(1),
         q.stride(2),

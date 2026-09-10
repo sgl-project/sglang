@@ -78,6 +78,7 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         self.has_sent = True
         logger.debug(
@@ -98,6 +99,8 @@ class FakeKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
     ):
+        self.kv_mgr = mgr
+        self.abort_notified: bool = False
         self.bootstrap_done = False
         self.has_sent_metadata = False
         self.require_staging: bool = False
