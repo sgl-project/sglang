@@ -16,7 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
-from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.context import ScriptedContext, queries
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
     OutOfBandError,
@@ -105,8 +105,11 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
 
     ctx._release_exhausted_pools()
     ctx.abort_all()
+    epochs = tuple(ctx._request_epochs.values())
     for _ in range(RESET_DRAIN_MAX_STEPS):
         yield
+        for epoch in epochs:
+            queries._check_epoch_post_result(ctx, epoch=epoch)
         if scheduler.is_fully_idle():
             break
     else:
@@ -115,14 +118,16 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
             f"within {RESET_DRAIN_MAX_STEPS} steps"
         )
 
-    futures = tuple(epoch.post_future for epoch in ctx._request_epochs.values())
-    for _ in range(RESET_DRAIN_MAX_STEPS):
-        if all(future.done() for future in futures):
+    futures = tuple(epoch.post_future for epoch in epochs)
+    for step in range(RESET_DRAIN_MAX_STEPS + 1):
+        # Check every completed response even if another response is still pending.
+        ready = [queries._check_epoch_post_result(ctx, epoch=epoch) for epoch in epochs]
+        if all(ready):
             break
+        if step == RESET_DRAIN_MAX_STEPS:
+            raise RuntimeError("scripted_runtime reset: HTTP responses did not finish")
         yield
         wait(futures, timeout=0.005)
-    if not all(future.done() for future in futures):
-        raise RuntimeError("scripted_runtime reset: HTTP responses did not finish")
 
     ctx.flush_cache()
     yield

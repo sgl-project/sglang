@@ -8,6 +8,7 @@ import orjson
 from aiohttp import ClientResponseError
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.test.scripted_runtime.context import queries
 from sglang.test.scripted_runtime.context.http_post import (
     _http_post_and_await_recv_msg,
 )
@@ -51,6 +52,8 @@ class ScriptedContextReqStarter:
                 f"Request ID {rid!r} still has an open HTTP response; "
                 "use yield from start_req_with_retry(...) to wait before reusing it"
             )
+        if previous is not None:
+            queries._check_epoch_post_result(ctx, epoch=previous)
 
         sampling_params = {"max_new_tokens": max_new_tokens, "ignore_eos": ignore_eos}
         if stop_token_ids is not None:
@@ -104,6 +107,9 @@ class ScriptedContextReqStarter:
                 yield
                 wait((previous.post_future,), timeout=0.005)
                 continue
+            # An old response failure must not be retried as a new rejection.
+            if previous is not None:
+                queries._check_epoch_post_result(self._ctx, epoch=previous)
             try:
                 return self._ctx.start_req(rid=rid, **kwargs)
             except ClientResponseError as error:
