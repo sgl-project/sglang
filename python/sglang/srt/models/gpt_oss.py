@@ -66,7 +66,10 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    RUNAI_STREAMER_TENSOR_ATTR,
+    default_weight_loader,
+)
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
@@ -953,20 +956,27 @@ class GptOssForCausalLM(nn.Module):
             )
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
-        mxfp4_weights = []
         normal_weights = []
 
-        for name, weight in weights:
-            if (
-                ".experts" in name
-                and self.quant_config is not None
-                and self.quant_config.get_name() == "mxfp4"
-            ):
-                mxfp4_weights.append((name, weight))
-            else:
-                normal_weights.append((name, weight))
+        def experts(weights):
+            # The RunAI streamer reuses one staging buffer across tensors, so a
+            # tensor read after later ones arrive can be read back as garbage.
+            # Expert weights are copied into their parameter as they are
+            # yielded; the rest are held until afterwards and need their own
+            # memory.
+            for name, weight in weights:
+                if (
+                    ".experts" in name
+                    and self.quant_config is not None
+                    and self.quant_config.get_name() == "mxfp4"
+                ):
+                    yield name, weight
+                else:
+                    normal_weights.append(
+                        (name, _clone_if_runai_streamed_tensor(weight))
+                    )
 
-        mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(experts(weights))
         self._load_normal_weights(
             normal_weights,
             is_nextn=is_nextn,
@@ -1377,6 +1387,12 @@ class GptOssForCausalLM(nn.Module):
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
+
+
+def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.clone().detach()
+    return tensor
 
 
 def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]):
