@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     empty_context,
     get_available_cpu_memory,
+    get_used_cpu_memory,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -730,7 +731,7 @@ class CPUGraphRunner:
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = (
-                    get_available_cpu_memory() - psutil.virtual_memory().used
+                    get_available_cpu_memory() - get_used_cpu_memory()
                 ) / (1 << 30)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"

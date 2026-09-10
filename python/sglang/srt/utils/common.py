@@ -483,7 +483,7 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = get_available_cpu_memory() - psutil.virtual_memory().used
+        total_free_memory = get_available_cpu_memory() - get_used_cpu_memory()
         n_numa_node: int = len(get_cpu_ids_by_node())
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
@@ -772,6 +772,22 @@ def get_available_cpu_memory():
 
     except (PermissionError, FileNotFoundError, ValueError):
         return psutil.virtual_memory().total
+
+
+def get_used_cpu_memory():
+    # Current memory usage of this cgroup (bytes), read from
+    # /sys/fs/cgroup/memory.current. Falls back to the host-wide
+    # psutil.virtual_memory().used so it pairs with the same-scoped fallback in
+    # get_available_cpu_memory(): inside a cgroup-limited container both are
+    # container-scoped, on bare metal both are host-scoped. Using the host-wide
+    # value here while get_available_cpu_memory() returns the per-container
+    # limit would make the "free memory" estimate negative once a sibling
+    # container on the same host is also resident.
+    try:
+        with open("/sys/fs/cgroup/memory.current", "r") as f:
+            return int(f.read().strip())
+    except (PermissionError, FileNotFoundError, ValueError):
+        return psutil.virtual_memory().used
 
 
 def get_cpu_memory_capacity():
