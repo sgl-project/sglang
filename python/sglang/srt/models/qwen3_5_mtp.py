@@ -68,17 +68,36 @@ def _mtp_quant_config(quant_config):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
         return None
-    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
-    # every `mtp.*` layer appears under the quantization exclude list. Detect
-    # that and skip quantization here so linear/MoE weight loaders allocate
-    # bf16 shapes (see sgl-project/sglang#23113).
+    # Quark checkpoints may keep all MTP weights in bf16, or only exclude
+    # non-expert MTP layers while routed experts are MXFP4. Disable MTP
+    # quantization only when the routed experts themselves are excluded.
     if quant_config and quant_config.get_name() == "quark":
         exclude_layers = getattr(quant_config, "exclude_layers", [])
         if any(
-            isinstance(layer, str) and layer.startswith("mtp.")
+            isinstance(layer, str)
+            and (
+                layer == "mtp.*"
+                or layer.startswith("mtp.layers.0.mlp.experts")
+            )
             for layer in exclude_layers
         ):
             return None
+
+        expanded_exclude_layers = list(exclude_layers)
+        for layer in exclude_layers:
+            if not isinstance(layer, str):
+                continue
+            if layer.startswith("mtp.layers.") and ".self_attn." in layer:
+                if layer.endswith((".q_proj", ".k_proj", ".v_proj")):
+                    expanded_exclude_layers.append(
+                        layer.rsplit(".", 1)[0] + ".qkv_proj"
+                    )
+            if layer.startswith("mtp.layers.") and ".mlp.shared_expert." in layer:
+                if layer.endswith((".gate_proj", ".up_proj")):
+                    expanded_exclude_layers.append(
+                        layer.rsplit(".", 1)[0] + ".gate_up_proj"
+                    )
+        quant_config.exclude_layers = list(dict.fromkeys(expanded_exclude_layers))
     return quant_config
 
 
