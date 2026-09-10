@@ -16,7 +16,7 @@ register_npu_ci(
 )
 
 register_npu_ci(
-    est_time=7200,
+    est_time=10800,
     suite="nightly-acc-16-npu-a3-cann910",
     nightly=True,
 )
@@ -69,7 +69,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.7,
+    0.75,
     "--prefill-max-requests",
     32,
     "--max-prefill-tokens",
