@@ -732,6 +732,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_time_to_first_token=get_observability().bucket_time_to_first_token,
                 bucket_e2e_request_latency=get_observability().bucket_e2e_request_latency,
                 bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
+                bucket_decode_throughput=get_observability().bucket_decode_throughput,
             )
 
             start_cpu_monitor_thread("tokenizer")
@@ -2987,6 +2988,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
+                decode_throughput=state.time_stats.get_decode_throughput(
+                    completion_tokens
+                ),
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

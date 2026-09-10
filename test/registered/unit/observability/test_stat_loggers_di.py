@@ -63,6 +63,7 @@ class _RecordingMetric:
     def __init__(self, *args, name=None, labelnames=(), **kwargs):
         self.name = name if name is not None else args[0]
         self.labelnames = tuple(labelnames)
+        self.kwargs = kwargs
         self.increments = []
         self.observations = []
         self.sets = []
@@ -221,6 +222,58 @@ class TestHiCacheMetrics(unittest.TestCase):
         self.assertEqual(
             collector.storage_prefetch_unfulfilled_tokens_total.increments,
             [({**labels, "reason": "storage_transfer"}, 4)],
+        )
+
+
+class TestDecodeThroughputHistogram(unittest.TestCase):
+
+    def _make_collector(self, labels, **kwargs):
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        ):
+            return _RecordingTokenizerMetricsCollector(labels=labels, **kwargs)
+
+    def test_observed_when_positive(self):
+        labels = {"model_name": "test"}
+        collector = self._make_collector(labels)
+
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=10,
+            generation_tokens=50,
+            cached_tokens=0,
+            e2e_latency=2.0,
+            has_grammar=False,
+            is_streaming=True,
+            decode_throughput=32.5,
+        )
+
+        self.assertEqual(
+            collector.histogram_decode_throughput.observations,
+            [({**labels, "is_streaming": "true"}, 32.5)],
+        )
+
+    def test_skipped_when_undefined(self):
+        labels = {"model_name": "test"}
+        collector = self._make_collector(labels)
+
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=10,
+            generation_tokens=1,
+            cached_tokens=0,
+            e2e_latency=0.5,
+            has_grammar=False,
+        )
+
+        self.assertEqual(collector.histogram_decode_throughput.observations, [])
+
+    def test_bucket_override_plumbed_through(self):
+        labels = {"model_name": "test"}
+        collector = self._make_collector(labels, bucket_decode_throughput=[10.0, 100.0])
+
+        self.assertEqual(
+            collector.histogram_decode_throughput.kwargs["buckets"], [10.0, 100.0]
         )
 
 

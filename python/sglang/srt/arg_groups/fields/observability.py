@@ -120,6 +120,10 @@ class Observability:
         Optional[List[float]],
         "The buckets of end-to-end request latency, specified as a list of floats.",
     ] = None
+    bucket_decode_throughput: A[
+        Optional[List[float]],
+        "The buckets of per-request decode throughput (tokens/s), specified as a list of floats.",
+    ] = None
     prompt_tokens_buckets: A[
         Optional[List[str]],
         "The buckets rule of prompt tokens. "
