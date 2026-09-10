@@ -610,18 +610,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
 
-        if is_multimodal and self.chat_encoding_spec == "kimi_k3":
-            # The kimi_k3 custom encoder yields non-empty prompt_ids but leaves
-            # prompt == "" (decode only runs in the prompt_ids-is-None branch).
-            # Pass input_ids so the MM processor expands placeholders instead of
-            request_prompts = [processed_messages.prompt_ids]
-            engine_prompts = [processed_messages.prompt_ids]
-        elif is_multimodal:
-            request_prompts = [processed_messages.prompt]
-            engine_prompts = [processed_messages.prompt]
-        else:
-            request_prompts = [processed_messages.prompt_ids]
-            engine_prompts = [processed_messages.prompt_ids]
+        _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
+        request_prompts = [engine_prompt]
+        engine_prompts = [engine_prompt]
 
         return messages, request_prompts, engine_prompts, processed_messages
 
