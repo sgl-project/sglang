@@ -7,7 +7,7 @@ cross-attends from noisy visual tokens to that cache at every denoising step.
 """
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 import torch
@@ -42,6 +42,13 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precision import (
+    MODELOPT_FP8_QUANT_CONFIGS,
+    StepMixedPrecisionController,
+    install_step_mixed_precision,
+    read_checkpoint_step_policy,
+    resolve_step_policy,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
@@ -1281,6 +1288,12 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.cached_kv: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
         self.cached_gen_rope_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
+        # Installed in post_load_weights when step mixed precision is enabled.
+        self.step_precision_controller: StepMixedPrecisionController | None = None
+        self.modelopt_fp8_checkpoint = isinstance(
+            quant_config, MODELOPT_FP8_QUANT_CONFIGS
+        )
+
         self.__post_init__()
 
         self.layer_names = ["gen_layers", "language_model.layers"]
@@ -1333,12 +1346,30 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_frames: int = 0,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        control_frames: int | Sequence[int] = 0,
+        share_vision_temporal_positions: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute mRoPE position IDs for UND text and GEN visual + action + sound tokens."""
+        """Compute mRoPE position IDs for UND text and GEN tokens.
+
+        The GEN sequence is ordered ``[control, video, action, sound]``.
+        Control and target videos either share matching temporal coordinates or
+        occupy consecutive temporal ranges, according to
+        ``share_vision_temporal_positions``.
+        """
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
         text_lengths = text_mask.sum(dim=1).long()
         effective_fps = fps if fps is not None and T > 1 else None
+        control_frame_counts = (
+            [control_frames]
+            if isinstance(control_frames, int) and control_frames > 0
+            else (
+                [int(count) for count in control_frames if int(count) > 0]
+                if not isinstance(control_frames, int)
+                else []
+            )
+        )
+        vision_frame_counts = [*control_frame_counts, T]
 
         text_pos_list = []
         vis_pos_list = []
@@ -1348,16 +1379,28 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 real_len, temporal_offset=0, device=device
             )
             media_offset = t_offset + self.temporal_margin
-            v_pos, _ = compute_mrope_position_ids_vision(
-                T,
-                Hp,
-                Wp,
-                temporal_offset=media_offset,
-                device=device,
-                fps=effective_fps,
-                base_fps=self.base_fps,
-                temporal_compression_factor=self.temporal_compression_factor,
-            )
+            vision_offset = media_offset
+            vision_pos_blocks = []
+            for frame_count in vision_frame_counts:
+                temporal_offset = (
+                    media_offset if share_vision_temporal_positions else vision_offset
+                )
+                vision_pos, vision_offset = compute_mrope_position_ids_vision(
+                    frame_count,
+                    Hp,
+                    Wp,
+                    temporal_offset=temporal_offset,
+                    device=device,
+                    fps=effective_fps,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor=self.temporal_compression_factor,
+                )
+                vision_pos_blocks.append(vision_pos)
+
+            pos_dtype = vision_pos_blocks[0].dtype
+            for pos in vision_pos_blocks[1:]:
+                pos_dtype = torch.promote_types(pos_dtype, pos.dtype)
+            v_pos = torch.cat([pos.to(pos_dtype) for pos in vision_pos_blocks], dim=1)
             if action_frames > 0:
                 a_pos, _ = compute_mrope_position_ids_action(
                     action_frames,
@@ -1394,9 +1437,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             text_pos_list.append(t_pos)
             vis_pos_list.append(v_pos)
 
-        text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)  # [3, B, S_text]
-        vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)  # [3, B, S_gen]
-
+        text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)
+        vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)
         return text_pos_ids, vis_pos_ids
 
     def reset_cache(self, cache_key: str | None = None):
@@ -1443,6 +1485,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        control_latents: torch.Tensor | list[torch.Tensor] | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1473,6 +1517,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 Defaults to the video fps when None.
             action_start_frame_offset: Temporal offset applied to action
                 position IDs relative to the video's media_offset (default 1).
+            control_latents: Optional [B, C, T_ctrl, H, W] control-video latents
+                (transfer / control-net conditioning). They are patchified and
+                projected with the shared ``proj_in``, prepended to the GEN
+                sequence as clean (noise-free) tokens that share the video's
+                temporal positions, and excluded from the output projection.
 
         Returns:
             [B, C, T, H, W] velocity prediction, or a tuple
@@ -1505,8 +1554,44 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     device=action_latents.device,
                 )
 
+        # Transfer / control-video conditioning: one or more control clips
+        # (e.g. edge + depth) are packed as clean vision tokens that prefix the
+        # target clip in the GEN sequence. Each clip reuses ``proj_in`` and the
+        # shared transformer; blocks are concatenated in input order.
+        control_clips: list[torch.Tensor] = []
+        if control_latents is not None:
+            control_clips = (
+                list(control_latents)
+                if isinstance(control_latents, (list, tuple))
+                else [control_latents]
+            )
+        control_frame_counts: list[int] = []
+        hidden_control_blocks: list[torch.Tensor] = []
+        control_token_len = 0
+        for clip in control_clips:
+            _, _, c_frames, Hc, Wc = clip.shape
+            if (Hc, Wc) != (H, W):
+                raise ValueError(
+                    "control_latents spatial dims "
+                    f"{(Hc, Wc)} must match hidden_states {(H, W)}"
+                )
+            block, _ = self.proj_in(
+                self.patchify(clip.to(hidden_states.dtype), c_frames, Hc, Wc)
+            )
+            hidden_control_blocks.append(block)
+            control_frame_counts.append(c_frames)
+            control_token_len += block.shape[1]
+        has_control = len(hidden_control_blocks) > 0
+        hidden_control = (
+            torch.cat(hidden_control_blocks, dim=1) if has_control else None
+        )
+
         extra_frames = action_frames + sound_frames
         sequence_shard_enabled = self.sp_size > 1
+        # When a control clip is present we always assemble the combined GEN
+        # stream (control prefix + video [+ action] [+ sound]) instead of the
+        # video-only fast path.
+        use_assembly_path = extra_frames > 0 or has_control
 
         # Add timestep embedding (computed in float32 for numerical stability, then cast back)
         time_embed = self.time_embedder(timestep.float())
@@ -1531,7 +1616,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 .to(hidden_gen.dtype)
             )
 
-        if extra_frames == 0:
+        if not use_assembly_path:
             # Video-only: shard the visual tokens, then add the timestep
             # embedding on the local shard.
             if sequence_shard_enabled:
@@ -1567,14 +1652,20 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1)
         else:
             # Multi-modal: assemble the full GEN sequence
-            # (video[, action][, sound]) with timestep embeddings, then shard
-            # the combined stream so sequence parallelism splits every modality
-            # evenly. The per-modality output heads run after the post-loop
-            # all-gather reassembles the sequence.
+            # ([control,] video[, action][, sound]) with timestep embeddings,
+            # then shard the combined stream so sequence parallelism splits
+            # every modality evenly. The per-modality output heads run after the
+            # post-loop all-gather reassembles the sequence.
             if token_noisy_mask is not None:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
             else:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1)
+
+            # Control tokens are clean conditioning: prepend them WITHOUT a
+            # timestep embedding so the GEN tokens can attend to the raw control
+            # map. They are stripped before the output projection.
+            if has_control:
+                hidden_gen = torch.cat([hidden_control, hidden_gen], dim=1)
 
             if action_latents is not None:
                 hidden_action = self.action_proj_in(
@@ -1648,6 +1739,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 action_frames=action_frames,
                 action_fps=action_fps if action_fps is not None else fps,
                 action_start_frame_offset=action_start_frame_offset,
+                control_frames=control_frame_counts,
+                share_vision_temporal_positions=(
+                    transfer_share_vision_temporal_positions
+                ),
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN
@@ -1722,7 +1817,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_gen = hidden_gen + residual
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
-        if extra_frames == 0:
+        if not use_assembly_path:
             # Video-only: project on the local shard and gather the (much
             # smaller) patch-space output. With patch_latent_dim ~=
             # hidden_size / 21 for cosmos3, this cuts the post-loop SP
@@ -1741,12 +1836,15 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             if seq_shard_pad > 0:
                 hidden_gen = hidden_gen[:, :seq_len_orig, :]
 
-        s_video = seq_len_orig - extra_frames
-        output, _ = self.proj_out(hidden_gen[:, :s_video, :])
+        # Sequence layout: [control prefix | video | action | sound]. Control
+        # tokens are conditioning only and produce no output.
+        s_video = seq_len_orig - extra_frames - control_token_len
+        video_start = control_token_len
+        output, _ = self.proj_out(hidden_gen[:, video_start : video_start + s_video, :])
         video_pred = self.unpatchify(output, T, H, W)
 
         extra_outputs: list[torch.Tensor] = []
-        idx = s_video
+        idx = video_start + s_video
         if action_frames > 0:
             action_hidden = hidden_gen[:, idx : idx + action_frames, :]
             extra_outputs.append(self.action_proj_out(action_hidden, action_domain_ids))
@@ -1756,6 +1854,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             sound_output, _ = self.audio_proj_out(sound_hidden)
             extra_outputs.append(sound_output.permute(0, 2, 1).contiguous())
 
+        # Control-only conditioning (no action/sound): keep the bare-tensor
+        # return type identical to the video-only path.
+        if not extra_outputs:
+            return video_pred
         return (video_pred, *extra_outputs)
 
     def preprocess_loaded_state_dict(
@@ -1913,6 +2015,77 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         for module in self.modules():
             if isinstance(module, RMSNorm):
                 module.to(target_dtype)
+
+        self._maybe_install_step_mixed_precision()
+
+    def _maybe_install_step_mixed_precision(self) -> None:
+        """Wrap ModelOpt FP8 linears for per-denoising-step W8A16 dispatch.
+
+        The checkpoint owns the behavior: mixed precision runs only when the
+        checkpoint carries a diffusion_step_policy
+        (quantization_config.runtime in config.json). Explicitly-set env vars
+        act as a manual override, and
+        SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION=0 disables. Runs
+        at the end of post_load_weights so the base quant method has already
+        transposed weights and collapsed scales.
+        """
+        checkpoint_quant_config = self.hf_config.get("quantization_config")
+        if not self.modelopt_fp8_checkpoint:
+            # A checkpoint that carries a step policy the runtime cannot honor
+            # must fail closed rather than silently run without it.
+            if read_checkpoint_step_policy(checkpoint_quant_config) is not None:
+                raise ValueError(
+                    "Checkpoint carries a diffusion_step_policy but was not "
+                    "loaded as a ModelOpt FP8 checkpoint; step mixed precision "
+                    "supports only ModelOpt FP8 in sglang."
+                )
+            return
+        policy, source = resolve_step_policy(checkpoint_quant_config)
+        if policy is None:
+            logger.info(
+                "Step mixed precision off (%s); running W8A8 on every denoising step.",
+                source,
+            )
+            return
+        controller = StepMixedPrecisionController(
+            first_steps=policy.first_steps,
+            last_steps=policy.last_steps,
+            reasoner_a16=policy.reasoner_a16,
+        )
+        reasoner_wrapped, generation_wrapped = install_step_mixed_precision(
+            reasoner_modules=[self.language_model.layers],
+            generation_modules=[self.gen_layers],
+            controller=controller,
+        )
+        if reasoner_wrapped + generation_wrapped == 0:
+            logger.warning(
+                "ModelOpt FP8 quant config detected but no ModelOpt FP8 "
+                "linears were found; running without step mixed precision."
+            )
+            return
+        self.step_precision_controller = controller
+        logger.info(
+            "Step mixed precision enabled (policy source: %s): %d generation "
+            "FP8 linears run W8A16 on the first %d and last %d denoising "
+            "steps; %d reasoner FP8 linears run %s.",
+            source,
+            generation_wrapped,
+            controller.first_steps,
+            controller.last_steps,
+            reasoner_wrapped,
+            "W8A16" if controller.reasoner_a16 else "W8A8",
+        )
+
+    def set_denoising_step(self, step_index: int, num_steps: int) -> None:
+        """Select this step's precision before any transformer call for it."""
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.set_step(
+                step_index=step_index, num_steps=num_steps
+            )
+
+    def reset_denoising_step(self) -> None:
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.reset()
 
 
 EntryClass = Cosmos3OmniTransformer

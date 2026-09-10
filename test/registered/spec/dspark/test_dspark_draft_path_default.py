@@ -11,7 +11,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _BUNDLED_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 _PLAIN_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
@@ -40,7 +40,7 @@ def _make_dspark_server_args(
     server_args.speculative_algorithm = "DSPARK"
     server_args.speculative_draft_model_path = None
     server_args.speculative_dspark_block_size = 5
-    server_args.model_config = SimpleNamespace(hf_config=hf_config)
+    server_args._model_config = SimpleNamespace(hf_config=hf_config)
     return server_args
 
 

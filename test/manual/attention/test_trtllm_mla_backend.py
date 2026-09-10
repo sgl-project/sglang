@@ -274,12 +274,12 @@ def compare_outputs(trtllm_out, reference_out, tolerance=1e-2):
     """Compare outputs with detailed analysis."""
 
     # Basic checks
-    assert (
-        trtllm_out.shape == reference_out.shape
-    ), f"Shape mismatch: {trtllm_out.shape} vs {reference_out.shape}"
-    assert (
-        trtllm_out.dtype == reference_out.dtype
-    ), f"Dtype mismatch: {trtllm_out.dtype} vs {reference_out.dtype}"
+    assert trtllm_out.shape == reference_out.shape, (
+        f"Shape mismatch: {trtllm_out.shape} vs {reference_out.shape}"
+    )
+    assert trtllm_out.dtype == reference_out.dtype, (
+        f"Dtype mismatch: {trtllm_out.dtype} vs {reference_out.dtype}"
+    )
 
     # Check for NaN/Inf
     assert not torch.isnan(trtllm_out).any(), "TRTLLM output contains NaN"
@@ -310,7 +310,7 @@ def compare_outputs(trtllm_out, reference_out, tolerance=1e-2):
             trt_val = trtllm_out[idx_tuple].item()
             ref_val = reference_out[idx_tuple].item()
             print(
-                f"  [{idx_tuple}]: TRTLLM={trt_val:.6f}, Reference={ref_val:.6f}, diff={abs(trt_val-ref_val):.6f}"
+                f"  [{idx_tuple}]: TRTLLM={trt_val:.6f}, Reference={ref_val:.6f}, diff={abs(trt_val - ref_val):.6f}"
             )
 
     return all_close

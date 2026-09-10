@@ -99,6 +99,8 @@ class FakeKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
     ):
+        self.kv_mgr = mgr
+        self.abort_notified: bool = False
         self.bootstrap_done = False
         self.has_sent_metadata = False
         self.require_staging: bool = False

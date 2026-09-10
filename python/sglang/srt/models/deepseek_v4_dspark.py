@@ -50,7 +50,10 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
     run_markov_block,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
@@ -59,7 +62,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_blackwell_supported, is_npu
+from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
@@ -90,7 +93,6 @@ def apply_rotary_emb(
 
 
 class DSparkAttention(MqaAttentionBase):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -113,9 +115,9 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
-        assert (
-            self.compress_ratio == 0
-        ), "DSpark draft attention requires compress_ratio == 0."
+        assert self.compress_ratio == 0, (
+            "DSpark draft attention requires compress_ratio == 0."
+        )
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )
@@ -132,7 +134,7 @@ class DSparkAttention(MqaAttentionBase):
 
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
-        self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
         if _is_npu:
             self.register_buffer(
                 "_q_post_norm_weight",
@@ -351,7 +353,6 @@ def _resolve_dspark_pool() -> DeepSeekV4TokenToKVPool:
 
 
 class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
-
     tp_size: int
     org_vocab_start: int
     org_vocab_end: int
@@ -360,7 +361,6 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
 
 
 class DSparkV4MarkovHead(nn.Module):
-
     markov_head_type = "vanilla"
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -528,7 +528,6 @@ def build_dspark_v4_confidence_head(
 
 
 class DSparkV4Stage(DeepseekV4DecoderLayer):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -758,7 +757,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.embed_tokens: Optional[nn.Module] = None
@@ -1015,12 +1014,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         stage_id, rest = parts[1], parts[2]
 
         if rest.startswith("markov_head."):
-            return f"markov_head.{rest[len('markov_head.'):]}"
+            return f"markov_head.{rest[len('markov_head.') :]}"
 
         if rest.startswith("confidence_head."):
             if self.confidence_head is None:
                 return None
-            return f"confidence_head.{rest[len('confidence_head.'):]}"
+            return f"confidence_head.{rest[len('confidence_head.') :]}"
 
         mapped_rest = rest
         mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
@@ -1066,12 +1065,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
 
         if rest.startswith("markov_head."):
-            return f"markov_head.{rest[len('markov_head.'):]}"
+            return f"markov_head.{rest[len('markov_head.') :]}"
 
         if rest.startswith("confidence_head."):
             if self.confidence_head is None:
                 return None
-            return f"confidence_head.{rest[len('confidence_head.'):]}"
+            return f"confidence_head.{rest[len('confidence_head.') :]}"
 
         mapped_rest = rest
         if mapped_rest.startswith("attn."):

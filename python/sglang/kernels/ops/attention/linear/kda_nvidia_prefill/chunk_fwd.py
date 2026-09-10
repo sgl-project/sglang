@@ -922,8 +922,7 @@ def chunk_kda_fwd(
     if needs_eqlen_pad:
         if B != 1 and T % BT != 0:
             raise NotImplementedError(
-                f"eqlen with B>1 and T % {BT} != 0 not supported "
-                f"(got B={B}, T={T})."
+                f"eqlen with B>1 and T % {BT} != 0 not supported (got B={B}, T={T})."
             )
         T_padded = ((T + CPB_BT - 1) // CPB_BT) * CPB_BT
         # Pre-allocated padded scratch buffers (per (B,T_padded,H,K,dtype) cache
