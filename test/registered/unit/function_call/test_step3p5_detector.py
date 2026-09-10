@@ -5,6 +5,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.step3p5_detector import Step3p5Detector
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -81,6 +82,54 @@ class TestStep3p5Detector(CustomTestCase):
                 expected,
                 msg=f"split={split}",
             )
+
+    def test_reasoning_then_malformed_tool_non_stream(self):
+        tool = "<tool_call><function bash><parameter=command>pwd</parameter></function></tool_call>"
+        for suffix in ("", "</think>late close"):
+            reasoning, content = ReasoningParser("step3p5").parse_non_stream(
+                "inspect the repo" + tool + suffix
+            )
+            normal, calls = FunctionCallParser(self.tools, "step3p5").parse_non_stream(
+                content
+            )
+            self.assertEqual(reasoning, "inspect the repo")
+            self.assertEqual(normal, suffix)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0].name, "bash")
+            self.assertEqual(json.loads(calls[0].parameters), {"command": "pwd"})
+
+    def test_reasoning_then_malformed_tool_stream_at_every_split(self):
+        tool = "<tool_call><function bash><parameter=command>pwd</parameter></function></tool_call>"
+        for suffix in ("", "</think>late close"):
+            source = "inspect the repo" + tool + suffix
+            chunkings = [list(source)] + [
+                [source[:i], source[i:]] for i in range(len(source) + 1)
+            ]
+            for chunks in chunkings:
+                reasoning_parser = ReasoningParser("step3p5")
+                tool_parser = FunctionCallParser(self.tools, "step3p5")
+                reasoning, normal, calls = "", "", []
+                for chunk in chunks:
+                    thinking, content = reasoning_parser.parse_stream_chunk(chunk)
+                    reasoning += thinking
+                    text, updates = tool_parser.parse_stream_chunk(content)
+                    normal += text
+                    calls.extend(updates)
+                thinking, content = reasoning_parser.parse_stream_end()
+                reasoning += thinking
+                text, updates = tool_parser.parse_stream_chunk(content)
+                normal += text
+                calls.extend(updates)
+                text, updates = tool_parser.parse_stream_end()
+                normal += text
+                calls.extend(updates)
+                self.assertEqual(reasoning, "inspect the repo")
+                self.assertEqual(normal, suffix)
+                self.assertEqual([c.name for c in calls if c.name], ["bash"])
+                self.assertTrue(all(c.tool_index == 0 for c in calls))
+                self.assertEqual(
+                    json.loads("".join(c.parameters for c in calls)), {"command": "pwd"}
+                )
 
     def test_registry_isolated_from_qwen3_coder(self):
         self.assertIs(FunctionCallParser.ToolCallParserEnum["step3p5"], Step3p5Detector)
