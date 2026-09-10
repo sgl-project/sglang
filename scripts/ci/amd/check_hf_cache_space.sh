@@ -25,6 +25,11 @@
 # Never fails the job: a full cache is not necessarily fatal (the checkpoint may
 # already be cached, which is the common case), and when it is fatal the
 # download says so itself -- now against a log that already explained why.
+#
+# "Cached" is decided by bytes on disk, not by the model directory existing. An
+# ENOSPC failure leaves a partial checkpoint behind, so the directory test alone
+# reports the next run's 300 GiB shortfall as "already cached, no download
+# needed" and suppresses the one warning that run needs.
 
 set -uo pipefail
 
@@ -41,6 +46,13 @@ avail_gib() {
     df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'
 }
 
+# Only the blobs hold real data -- snapshot entries are symlinks into them, and
+# du counts a symlink's target once -- so this is the checkpoint's true
+# footprint. Timed out because it walks a fleet-shared network volume.
+cached_gib() {
+    timeout 300 du -sBG "$1" 2>/dev/null | cut -f1 | tr -dc '0-9'
+}
+
 report() {
     echo "=== HF cache space ($1) ==="
     df -h "$HF_CACHE" 2>/dev/null || df -h /sgl-data 2>/dev/null || true
@@ -54,13 +66,6 @@ check_hf_cache_space() {
     fi
 
     report "before"
-
-    if [[ -d "$MODEL_DIR" ]]; then
-        echo "✓ ${MODEL_REPO_ID} is already cached at ${MODEL_DIR};" \
-             "no download needed regardless of free space."
-    else
-        echo "${MODEL_REPO_ID} is NOT cached; it must be downloaded."
-    fi
 
     # Abandoned partial downloads are pure waste and safe to drop. This is the
     # shared helper the CUDA runner prep already uses; it only touches
@@ -78,14 +83,40 @@ check_hf_cache_space() {
     fi
     echo "Free space: ${avail} GiB."
 
-    if [[ -d "$MODEL_DIR" ]] || (( REQUIRED_GIB == 0 )) || (( avail >= REQUIRED_GIB )); then
+    local cached=0
+    if [[ -d "$MODEL_DIR" ]]; then
+        cached=$(cached_gib "$MODEL_DIR")
+        # A size we cannot read is indistinguishable from a complete download,
+        # so assume the common case rather than warn about a download that may
+        # never be attempted.
+        if [[ -z "$cached" ]]; then
+            echo "✓ ${MODEL_REPO_ID} is cached at ${MODEL_DIR}, size unreadable;" \
+                 "assuming it is complete."
+            return 0
+        fi
+    fi
+
+    local remaining=$(( REQUIRED_GIB > cached ? REQUIRED_GIB - cached : 0 ))
+
+    if (( cached == 0 )); then
+        echo "${MODEL_REPO_ID} is NOT cached; it must be downloaded."
+    elif (( remaining == 0 )); then
+        echo "✓ ${MODEL_REPO_ID} is already cached at ${MODEL_DIR} (${cached} GiB);" \
+             "no download needed regardless of free space."
+    else
+        echo "${MODEL_REPO_ID} is only PARTIALLY cached at ${MODEL_DIR}:" \
+             "${cached} GiB of roughly ${REQUIRED_GIB} GiB, so about ${remaining} GiB" \
+             "still has to be downloaded."
+    fi
+
+    if (( remaining == 0 )) || (( avail >= remaining )); then
         return 0
     fi
 
     echo "=============================================================="
-    echo "WARNING: ${MODEL_REPO_ID} is not cached and only ${avail} GiB is"
-    echo "         free, against roughly ${REQUIRED_GIB} GiB of weights. The"
-    echo "         download will likely fail with ENOSPC partway through."
+    echo "WARNING: ${MODEL_REPO_ID} still needs roughly ${remaining} GiB against"
+    echo "         only ${avail} GiB free. The download will likely fail with"
+    echo "         ENOSPC partway through."
     echo ""
     echo "         /sgl-data is shared by the whole AMD fleet, so this is a"
     echo "         capacity problem rather than something this job can clear:"
