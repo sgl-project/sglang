@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
+import aiohttp
+import orjson
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.context.api import ScriptedContext
+    from sglang.test.scripted_runtime.req_handle import _RequestEpoch
 
 
 def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
@@ -71,69 +75,130 @@ def last_batch_forward_mode(ctx: ScriptedContext) -> Optional[str]:
     return None
 
 
-def find_req_by_rid(ctx: ScriptedContext, rid: str) -> Optional[Req]:
-    req = next((r for r in _get_all_reqs(ctx) if r.rid == rid), None)
-    if req is not None:
-        ctx._seen_rids.add(rid)
-    return req
+def _resolve_epoch_req(ctx: ScriptedContext, *, epoch: _RequestEpoch) -> Optional[Req]:
+    if epoch.req is not None or epoch.closed:
+        return epoch.req
+    candidates = list(_get_all_reqs(ctx))
+    for record in ctx._scheduler_hook._batch_log[epoch.batch_start :]:
+        candidates.extend(record.reqs)
+        if record.chunked_req is not None:
+            candidates.append(record.chunked_req)
+    for req in candidates:
+        if req.rid == epoch.rid and all(req is not old for old in epoch.excluded_reqs):
+            epoch.req = req
+            return req
+    return None
 
 
-def is_finished(ctx: ScriptedContext, rid: str) -> bool:
-    req = find_req_by_rid(ctx, rid)
-    if req is not None:
-        return req.finished()
-    if rid in ctx._seen_rids:
+def _resolve_req(
+    ctx: ScriptedContext, *, rid: str, epoch: Optional[_RequestEpoch] = None
+) -> Optional[Req]:
+    if epoch is None:
+        epoch = ctx._request_epochs.get(rid)
+    if epoch is not None:
+        return _resolve_epoch_req(ctx, epoch=epoch)
+    return next((r for r in _get_all_reqs(ctx) if r.rid == rid), None)
+
+
+def find_req_by_rid(
+    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
+) -> Optional[Req]:
+    req = _resolve_req(ctx, rid=rid, epoch=epoch)
+    return next((r for r in _get_all_reqs(ctx) if r is req), None)
+
+
+def is_finished(
+    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
+) -> bool:
+    if epoch is None:
+        epoch = ctx._request_epochs.get(rid)
+    req = _resolve_req(ctx, rid=rid, epoch=epoch)
+    if req is not None and req.finished():
         return True
-    # Fallback: if the req ran in a forward batch (recorded in _batch_log) but
-    # is now absent from all active scheduler sets, it must have finished.
-    # This catches requests that completed without ever being observed via
-    # find_req_by_rid (e.g. when Python short-circuit evaluation prevents the
-    # query while another request is still running).
-    log = ctx._scheduler_hook._batch_log
-    if any(rid in record.rids for record in log):
-        ctx._seen_rids.add(rid)
-        return True
-    return False
+    if epoch is None or not epoch.post_future.done():
+        return False
+    try:
+        epoch.post_future.result()
+    except aiohttp.ClientResponseError as exc:
+        if (
+            not epoch.abort_requested
+            or exc.status != 400
+            or any(r is req for r in _get_all_reqs(ctx))
+        ):
+            raise
+        try:
+            payload = orjson.loads(exc.message)
+        except orjson.JSONDecodeError:
+            raise exc from None
+        if not (
+            isinstance(payload, dict)
+            and isinstance(payload.get("error"), dict)
+            and payload["error"].get("message") in ("Aborted", "Abort in waiting queue")
+        ):
+            raise
+    return True
 
 
-def is_chunking(ctx: ScriptedContext, rid: str) -> bool:
-    s = ctx.scheduler
-    return s.chunked_req is not None and s.chunked_req.rid == rid
+def is_chunking(
+    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
+) -> bool:
+    req = _resolve_req(ctx, rid=rid, epoch=epoch)
+    return req is not None and ctx.scheduler.chunked_req is req
 
 
-def status(ctx: ScriptedContext, rid: str) -> str:
-    s = ctx.scheduler
-    if rid in {r.rid for r in s.waiting_queue}:
-        return "waiting"
-    req = find_req_by_rid(ctx, rid)
-    if req is not None:
-        return "finished" if req.finished() else "running"
-    if rid in ctx._seen_rids:
+def status(
+    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
+) -> str:
+    if is_finished(ctx, rid=rid, epoch=epoch):
         return "finished"
-    return "unknown"
+    req = find_req_by_rid(ctx, rid=rid, epoch=epoch)
+    if req is None:
+        return "unknown"
+    if any(r is req for r in ctx.scheduler.waiting_queue):
+        return "waiting"
+    return "running"
 
 
-def remaining_prompt_tokens(ctx: ScriptedContext, rid: str) -> int:
-    req = find_req_by_rid(ctx, rid)
+def remaining_prompt_tokens(
+    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
+) -> int:
+    req = find_req_by_rid(ctx, rid=rid, epoch=epoch)
     if req is None:
         return 0
     return max(0, len(req.origin_input_ids) - req.kv.kv_committed_len)
 
 
-def chunks_done(ctx: ScriptedContext, rid: str) -> int:
+def chunks_done(
+    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
+) -> int:
+    req = _resolve_req(ctx, rid=rid, epoch=epoch)
+    if req is None:
+        return 0
     log = ctx._scheduler_hook._batch_log
-    held = sum(1 for record in log if record.chunked_rid == rid and rid in record.rids)
+    held = sum(
+        1
+        for record in log
+        if record.chunked_req is req and any(r is req for r in record.reqs)
+    )
     if held == 0:
         return 0
     completed = any(
-        rid in record.extend_rids and record.chunked_rid != rid for record in log
+        req.rid in record.extend_rids
+        and any(r is req for r in record.reqs)
+        and record.chunked_req is not req
+        for record in log
     )
     return held + (1 if completed else 0)
 
 
-def chunked_parks(ctx: ScriptedContext, rid: str) -> int:
+def chunked_parks(
+    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
+) -> int:
+    req = _resolve_req(ctx, rid=rid, epoch=epoch)
+    if req is None:
+        return 0
     return sum(
         1
         for record in ctx._scheduler_hook._batch_log
-        if record.chunked_rid == rid and rid not in record.rids
+        if record.chunked_req is req and all(r is not req for r in record.reqs)
     )

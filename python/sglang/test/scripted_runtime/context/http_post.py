@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 if TYPE_CHECKING:
@@ -19,13 +20,17 @@ def _http_post_and_await_recv_msg(
     predicate: Callable[[Any], bool],
     description: str,
     timeout_s: float = RECV_MSG_ARRIVAL_TIMEOUT_S,
-) -> None:
-    _submit_post(ctx, path=path, json=json)
+    allow_no_arrival: Callable[[], bool] | None = None,
+) -> Future:
+    future = _submit_post(ctx, path=path, json=json)
     ctx._tokenizer_recv_proxy.wait_until_arrived(
         predicate,
         timeout_s=timeout_s,
         description=description,
+        post_future=future,
+        allow_no_arrival=allow_no_arrival,
     )
+    return future
 
 
 def _http_post_fire_and_forget(
@@ -42,11 +47,11 @@ def _submit_post(
     *,
     path: str,
     json: Optional[Dict[str, Any]],
-) -> None:
+) -> Future:
     server_args = ctx.scheduler.server_args
     url = f"http://{server_args.host}:{server_args.port}{path}"
 
     async def _post() -> None:
         await ctx._http_poster.post(url, json)
 
-    ctx._http_poster.submit_coro(_post())
+    return ctx._http_poster.submit_coro(_post())

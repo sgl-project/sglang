@@ -4,7 +4,12 @@ import asyncio
 import threading
 import unittest
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import orjson
+from aiohttp import ClientResponseError, web
+from aiohttp.test_utils import TestServer
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime import background_http_poster as bg_poster
@@ -15,12 +20,18 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeResponse:
+    content_type = "application/json"
+    status = 200
+
     def __init__(self) -> None:
         self.read_called = False
 
     async def read(self) -> bytes:
         self.read_called = True
         return b"chunk-1chunk-2"
+
+    def raise_for_status(self) -> None:
+        pass
 
 
 class _FakePostCM:
@@ -167,6 +178,109 @@ class TestBackgroundHttpPosterPost(CustomTestCase):
 
         self.assertEqual(session.calls, [("http://h/flush", {"a": 1})])
         self.assertTrue(session.response.read_called)
+
+    def test_stream_error_split_across_chunks(self):
+        """A rejection split across transport chunks must still reach the caller."""
+        poster = BackgroundHttpPoster()
+        self.addCleanup(poster.close)
+        session = _FakeSession()
+
+        async def chunks():
+            for chunk in (
+                b"da",
+                b'ta: {"text": "ok"}\n\ndata: {"er',
+                b'ror": {"message": "rejected"}}\r',
+                b"\n\ndata: [DONE]\n\n",
+            ):
+                yield chunk
+
+        session.response.content_type = "text/event-stream"
+        session.response.content = SimpleNamespace(iter_any=chunks)
+        poster._ensure_session = lambda: session
+
+        with self.assertRaisesRegex(RuntimeError, "rejected"):
+            self._run_on_loop(
+                poster, poster.post("http://h/generate", {"stream": True})
+            )
+
+
+class TestBackgroundHttpPosterErrors(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.poster = BackgroundHttpPoster()
+        self.addCleanup(self.poster.close)
+
+    async def _post_to(self, handler):
+        self.release_response = asyncio.Event()
+        app = web.Application()
+        app.router.add_post("/generate", handler)
+        async with TestServer(app) as server:
+            future = asyncio.run_coroutine_threadsafe(
+                self.poster.post(str(server.make_url("/generate")), {"stream": True}),
+                self.poster._loop,
+            )
+            try:
+                return await asyncio.wait_for(asyncio.wrap_future(future), timeout=5)
+            finally:
+                self.release_response.set()
+
+    def test_http_error_is_reported(self):
+        """An HTTP rejection must raise instead of appearing to complete normally."""
+
+        async def handler(request):
+            return web.Response(status=503, text="Service unavailable")
+
+        with self.assertRaisesRegex(ClientResponseError, "503"):
+            asyncio.run(self._post_to(handler))
+
+    def test_streamed_error_is_reported_before_response_ends(self):
+        """An SSE rejection must reach the caller even while the response stays open."""
+
+        async def handler(request):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            # Fragment an SSE event across writes, as a real transport can do.
+            await response.write(b'data: {"error": {"message": "Duplicate request ID')
+            await response.write(b' detected: reuse-rid"}}\n\n')
+            await self.release_response.wait()
+            return response
+
+        with self.assertRaisesRegex(RuntimeError, "Duplicate request ID detected"):
+            asyncio.run(self._post_to(handler))
+
+    def test_http_error_preserves_structured_rejection(self):
+        """RID retries must distinguish duplicate rejection from other HTTP 400s."""
+        payload = {"error": {"message": "Duplicate request ID detected: reused"}}
+
+        async def handler(request):
+            return web.json_response(payload, status=400)
+
+        with self.assertRaises(ClientResponseError) as caught:
+            asyncio.run(self._post_to(handler))
+
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(orjson.loads(caught.exception.message), payload)
+
+    def test_successful_stream_is_drained(self):
+        async def handler(request):
+            return web.Response(
+                content_type="text/event-stream",
+                body=(
+                    b': keepalive\n\ndata: {"text": "error is ordinary output"}\n\n'
+                    b'data: {"text": "finished"}\n\ndata: [DONE]\n\n'
+                ),
+            )
+
+        asyncio.run(self._post_to(handler))
+
+    def test_large_stream_event_is_drained(self):
+        async def handler(request):
+            return web.Response(
+                content_type="text/event-stream",
+                body=b'data: {"text": "' + b"x" * 150_000 + b'"}\n\ndata: [DONE]\n\n',
+            )
+
+        asyncio.run(self._post_to(handler))
 
 
 if __name__ == "__main__":
