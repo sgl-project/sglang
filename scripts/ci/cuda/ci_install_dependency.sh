@@ -136,6 +136,18 @@ cleanup_stale_shm() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+is_apt_package_installed() {
+    local name
+    # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
+    # apt-get follows the Provides alias, dpkg -l does not.
+    for name in "$1" "${1}t64"; do
+        if dpkg -l "$name" 2>/dev/null | grep -q "^ii"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 install_apt_packages() {
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
@@ -152,7 +164,7 @@ install_apt_packages() {
     local pkg
     local -a MISSING_APT_PACKAGES=()
     for pkg in "${CI_APT_PACKAGES[@]}"; do
-        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+        is_apt_package_installed "$pkg" || MISSING_APT_PACKAGES+=("$pkg")
     done
 
     if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
@@ -748,6 +760,8 @@ install_extra_deps() {
         $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+
+    $PIP_CMD install "helion==1.4.0" $PIP_INSTALL_SUFFIX
 
     NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
