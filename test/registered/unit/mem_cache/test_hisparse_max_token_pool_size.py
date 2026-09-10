@@ -15,10 +15,11 @@ from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _make_model_runner(**attrs):
@@ -77,9 +78,11 @@ class TestMaxTokenPoolSize(CustomTestCase):
         self.assertEqual(instance.max_token_pool_size, 1024)
 
     def test_non_hisparse_hybrid_swa_prefers_full_max(self):
+        self.enterContext(
+            get_context().override_server_args(enable_unified_memory=False)
+        )
         instance = _make_model_runner(
             enable_hisparse=False,
-            server_args=SimpleNamespace(enable_unified_memory=False),
             token_to_kv_pool_allocator=SimpleNamespace(),
             is_hybrid_swa=True,
             max_total_num_tokens=1024,
