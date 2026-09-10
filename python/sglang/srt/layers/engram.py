@@ -280,7 +280,7 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
-        req_slots = forward_batch.req_pool_indices.to(torch.int64)
+        req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
         # Which request each token belongs to and where its run starts; tokens at or
@@ -314,6 +314,10 @@ class EngramHasher(nn.Module):
             commit_last = (starts + lens - 1).clamp(0, num_tokens - 1)
 
         if input_ids.is_cuda and torch.version.cuda is not None:
+            # Decode commits its history rows inside the kernel; extend commits below.
+            commit_out_loc = (
+                forward_batch.out_cache_loc if kmode == MODE_DECODE else None
+            )
             hash_ids, tokens = engram_hash_ids(
                 input_ids,
                 forward_batch.positions,
@@ -331,7 +335,10 @@ class EngramHasher(nn.Module):
                 starts=starts,
                 image_token_id=self.image_token_id,
                 mm_pad_shift=MM_PAD_SHIFT_VALUE,
+                commit_out_loc=commit_out_loc,
             )
+            if commit_out_loc is not None:
+                commit_rows = None
         else:
             hash_ids, tokens = self._torch_hash_ids(
                 input_ids,

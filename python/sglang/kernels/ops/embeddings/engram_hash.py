@@ -93,6 +93,7 @@ def _engram_hash_kernel(
     mult_ptr,
     primes_ptr,
     offsets_ptr,
+    out_loc_ptr,
     tokens_out_ptr,
     out_ptr,
     num_tokens,
@@ -104,6 +105,7 @@ def _engram_hash_kernel(
     BLOCK: tl.constexpr,
     HIST_VIA_SLOTS: tl.constexpr,
     HAS_IMAGE: tl.constexpr,
+    COMMIT: tl.constexpr,
     N: tl.constexpr,
     L: tl.constexpr,
     H: tl.constexpr,
@@ -153,6 +155,16 @@ def _engram_hash_kernel(
     # Once a shift is blocked every older shift is too (cummax along s).
     blocked = tl.cumsum(blk.to(tl.int32), axis=1) > 0
     tl.store(tokens_out_ptr + t2 * N + s, tok.to(tl.int32), mask=tmask2)
+    if COMMIT:
+        # Decode: the token and its n - 2 newest predecessors become the request's
+        # history, oldest first. Graph-padded rows (out_cache_loc 0) write nothing.
+        live = tl.load(out_loc_ptr + t, mask=real, other=0) != 0
+        cmask = real2 & live[:, None] & (s <= N - 2)
+        tl.store(
+            hist_ptr + hrow[:, None] * (N - 1) + (N - 2 - s),
+            tok.to(tl.int32),
+            mask=cmask,
+        )
     mapped = tl.load(token_map_ptr + tok, mask=tmask2, other=0).to(tl.int64)
     comp = tl.where(blocked, pad_id, mapped)
 
@@ -190,6 +202,7 @@ def engram_hash_ids(
     starts: Optional[torch.Tensor] = None,
     image_token_id: Optional[int] = None,
     mm_pad_shift: int = 0,
+    commit_out_loc: Optional[torch.Tensor] = None,
     block_t: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Hash ids [T, L, (n - 1) * heads] int64 and the predecessor table [T, n] int32.
@@ -199,6 +212,8 @@ def engram_hash_ids(
     the run's first token). ``history`` is [rows, n - 1] oldest first; with
     ``req_slots`` given it is indexed by ``req_slots[row]``, else by ``row``.
     Tokens at or past ``num_real`` are padding: PAD ids, zero predecessors.
+    ``commit_out_loc`` (decode via ``req_slots`` only) makes the kernel also write each
+    live request's new history row; rows whose out_cache_loc is 0 are padding.
     """
     num_tokens = input_ids.shape[0]
     L, N = multipliers.shape
@@ -208,6 +223,9 @@ def engram_hash_ids(
     assert history.dim() == 2 and history.shape[1] == N - 1, history.shape
     if mode == MODE_EXTEND:
         assert row is not None and starts is not None
+    if commit_out_loc is not None:
+        assert mode == MODE_DECODE and req_slots is not None, "commit is decode-only"
+        assert commit_out_loc.shape[0] == num_tokens, commit_out_loc.shape
     if num_real is None:
         num_real = num_tokens
     device = input_ids.device
@@ -227,6 +245,7 @@ def engram_hash_ids(
         multipliers,
         primes,
         offsets,
+        commit_out_loc if commit_out_loc is not None else dummy,
         tokens,
         out,
         num_tokens,
@@ -238,6 +257,7 @@ def engram_hash_ids(
         BLOCK=block,
         HIST_VIA_SLOTS=req_slots is not None,
         HAS_IMAGE=image_token_id is not None,
+        COMMIT=commit_out_loc is not None,
         N=N,
         L=L,
         H=H,
