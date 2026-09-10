@@ -20,10 +20,11 @@ use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
-    TopLogprobs,
+    FinishReason as OpenAIFinishReason, ReasoningEffort, ResponseFormat, Role,
+    ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -48,16 +49,38 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
+#[derive(Deserialize)]
+struct ChatRequest {
+    #[serde(flatten)]
+    request: CreateChatCompletionRequest,
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+#[derive(Deserialize)]
+struct ChatTemplateKwargs {
+    thinking: Option<bool>,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let ChatRequest {
+        mut request,
+        chat_template_kwargs,
+    } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    let thinking = chat_template_kwargs.and_then(|kwargs| {
+        if let Some(effort) = kwargs.reasoning_effort {
+            request.reasoning_effort = Some(effort);
+        }
+        kwargs.thinking
+    });
     if request.model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -141,7 +164,7 @@ async fn chat_completions(
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) = match prepare_chat_request(&state, request).await {
+    let (request, prompt) = match prepare_chat_request(&state, request, thinking).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
@@ -254,6 +277,7 @@ async fn chat_completions(
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
+    thinking: Option<bool>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
@@ -267,7 +291,7 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request).map_err(|error| {
+    let prompt = formatter.render(&request, thinking).map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),

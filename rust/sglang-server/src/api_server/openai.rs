@@ -15,11 +15,9 @@ mod models;
 mod reasoning;
 mod template;
 mod template_builtins;
+mod template_dsv4;
 mod template_legacy;
 mod template_loader;
-mod template_native;
-#[cfg(test)]
-mod template_native_tests;
 mod tools;
 
 pub(super) use template::ChatFormatter;
@@ -56,26 +54,18 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
+    // Python's native encoder selection takes precedence over every template source.
+    if let Some(prompts) = &server_args.model_config.dsv4_effort_prompts {
+        return Some(ChatFormatter::DeepSeekV4(prompts.clone()));
+    }
     let config_file = tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
         "tokenizer_config.json",
     );
-    // `config.json` carries the architecture list, which is what selects a
-    // built-in prompt encoder for the models that ship no chat template.
-    let model_config_file = (!server_args.model_path.is_empty())
-        .then(|| {
-            tokenizer::resolve_model_file(
-                &server_args.model_path,
-                server_args.revision.as_deref(),
-                "config.json",
-            )
-        })
-        .flatten();
 
     match template::load_chat_formatter(
         config_file.as_deref(),
-        model_config_file.as_deref(),
         (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
         server_args.chat_template.as_deref(),
     ) {
