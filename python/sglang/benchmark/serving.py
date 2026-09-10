@@ -149,6 +149,13 @@ def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
     return reasoning + (message.get("content") or "")
 
 
+def _raise_for_stream_error(data: Dict[str, Any]) -> None:
+    # Streaming responses may report an error after committing HTTP 200.
+    # Let the request's exception handler exclude it from successful metrics.
+    if "error" in data:
+        raise RuntimeError(f"Server returned an error: {data['error']}")
+
+
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
     """Wait for the server to become ready by polling the given URL."""
     print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
@@ -327,6 +334,7 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
+                            _raise_for_stream_error(data)
 
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
@@ -512,6 +520,7 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                _raise_for_stream_error(data)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
                                 output_len = (data.get("usage") or {}).get(
@@ -724,6 +733,7 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = orjson.loads(sse_data)
+                            _raise_for_stream_error(data)
 
                             _meta_info = data.get("meta_info") or {}
                             if _meta_info.get("spec_accept_length") is not None:
