@@ -2180,6 +2180,9 @@ class Envs:
     # adds, attention-residual bank, MoE router / latent projections / shared
     # experts) runs on N/cp rows; the TP-sharded experts see an all-gathered
     # latent and reduce-scatter their partials; KDA gathers full rows.
+    # Memory: the shared experts are then built tp1-replicated for the whole
+    # process (decode included), +(tp-1)/tp of their bf16 weights per rank
+    # (K3 at TP8: ~231 MB per MoE layer); the total is logged at startup.
     SGLANG_K3_CP_SP_RESIDUAL = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one

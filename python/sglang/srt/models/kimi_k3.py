@@ -620,6 +620,7 @@ def _uses_ep_a2a() -> bool:
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
+    # SP residual stream over the CP group; set per instance in __init__.
     _sp_cp: bool = False
 
     def __init__(
@@ -771,7 +772,12 @@ class KimiK3MoE(nn.Module):
             raise ValueError("Independent shared-expert TP requires an EP a2a backend.")
         self._sp_cp = _sp_cp_static_enabled(config)
         # Shared experts run on the local CP rows, so their weights must be
-        # complete on every rank; decode uses this same static layout.
+        # complete on every rank. Keeping them TP-sharded would need an
+        # all-gather of the [N, H] rows and reduce-scatter of their partials,
+        # roughly doubling the SP collective bytes. Decode uses this same
+        # static layout: +(tp-1)/tp of the bf16 shared-expert weights per rank
+        # and layer (about 231 MB per K3 MoE layer at TP8). The model logs the
+        # total extra weight memory once after constructing the layers.
         self._shared_experts_tp1 = (
             self._ep_a2a and shared_tp in (None, 1)
         ) or self._sp_cp
@@ -1274,14 +1280,15 @@ class KimiK3MoE(nn.Module):
     ) -> torch.Tensor:
         """MoE on this CP rank's token shard (SGLANG_K3_CP_SP_RESIDUAL).
 
-        Row-wise work (router, latent down/up projections, latent norm, tp1
-        shared experts, residual add) runs on the local rows only. The
-        TP-sharded routed experts need every token: all-gather the routed
+        Row-wise work (router + top-k, latent down/up projections, latent
+        norm, tp1 shared experts, residual add) runs on the local rows only.
+        The TP-sharded routed experts need every token: all-gather the routed
         latent [N/cp, L] -> [N, L] (rank-major; the MoE is token-wise so the
-        zigzag order is irrelevant) plus the fp32 router logits the trtllm
-        runner routes from, then reduce-scatter the TP-partial latent sums back
-        to the local rows. Compared with the full-row block this replaces the
-        [N, L+H] all-reduce (2*(P-1)/P*(L+H)) with (P-1)/P*(2L+E*2) bytes and
+        zigzag order is irrelevant) together with the STANDARD top-k output
+        (fp32 weights + int32 ids, [N/cp, k] -> [N, k]; router logits are not
+        shipped), then reduce-scatter the TP-partial latent sums back to the
+        local rows. Per token and rank this replaces the fused [L+H] bf16
+        all-reduce (2*(P-1)/P*2*(L+H) bytes) with (P-1)/P*(4L+8k) bytes and
         removes the P-fold replicated front/back GEMMs."""
         if TYPE_CHECKING:
             assert (
@@ -2943,6 +2950,7 @@ def _stage_facts(
 class KimiK3DecoderLayer(nn.Module):
     """Decoder layer carrying the K3 attention-residual stream."""
 
+    # SP residual stream over the CP group; set per instance in __init__.
     _sp_cp: bool = False
 
     def __init__(
@@ -3197,6 +3205,7 @@ class KimiK3DecoderLayer(nn.Module):
 class KimiK3LinearModel(nn.Module):
     """K3 language-model backbone."""
 
+    # SP residual stream over the CP group; set per instance in __init__.
     _sp_cp: bool = False
 
     def __init__(
@@ -3298,6 +3307,21 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
+        if self._sp_cp:
+            # Replication is a static weight layout, including during decode.
+            tp_size = get_parallel().tp_size
+            shared_bytes = sum(
+                p.numel() * p.element_size()
+                for layer in self.layers
+                if isinstance(getattr(layer, "mlp", None), KimiK3MoE)
+                and layer.mlp.shared_experts is not None
+                for p in layer.mlp.shared_experts.parameters()
+            )
+            logger.info(
+                "SGLANG_K3_CP_SP_RESIDUAL: shared experts are tp1-replicated, "
+                "+%.0f MiB of weights on this rank vs the TP-sharded layout",
+                shared_bytes * (tp_size - 1) / tp_size / 2**20,
+            )
 
     def forward(
         self,
