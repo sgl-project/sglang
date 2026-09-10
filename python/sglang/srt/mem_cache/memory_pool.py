@@ -378,6 +378,35 @@ class ReqToTokenPool:
             )
 
 
+def _clear_state_slots(state: torch.Tensor, indices: torch.Tensor) -> None:
+    if _is_npu:
+        state[:, indices] = 0
+    else:
+        state.index_fill_(1, indices, 0)
+
+
+def _state_slot_indices(indices: torch.Tensor) -> torch.Tensor:
+    return indices if _is_npu else indices.to(dtype=torch.long)
+
+
+def _store_state_slots(
+    state: torch.Tensor, indices: torch.Tensor, values: torch.Tensor
+) -> None:
+    if _is_npu:
+        state[:, indices] = values
+    else:
+        state.index_copy_(1, indices, values)
+
+
+def _copy_state_slots(
+    state: torch.Tensor, src_indices: torch.Tensor, dst_indices: torch.Tensor
+) -> None:
+    if _is_npu:
+        state[:, dst_indices] = state[:, src_indices]
+    else:
+        _store_state_slots(state, dst_indices, state.index_select(1, src_indices))
+
+
 class MambaPool:
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
@@ -988,36 +1017,22 @@ class MambaPool:
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
+        indexed_indices = _state_slot_indices(indices)
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
             fused_clear_conv_slots(self._conv_slot_desc, indices)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                temporal[:, indices] = 0
-            return
-        if not _is_npu:
-            need_size = len(indices)
-            for i in range(len(self.mamba_cache.conv)):
-                t = self.mamba_cache.conv[i]
-                z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-                    t.shape[0], need_size, *t.shape[2:]
-                )
-                t[:, indices] = z
-            t = self.mamba_cache.temporal
-            z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-                t.shape[0], need_size, *t.shape[2:]
-            )
-            t[:, indices] = z
         else:
             for i in range(len(self.mamba_cache.conv)):
-                t = self.mamba_cache.conv[i]
-                t[:, indices] = 0
-            t = self.mamba_cache.temporal
-            t[:, indices] = 0
+                _clear_state_slots(self.mamba_cache.conv[i], indexed_indices)
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() > 0:
+            _clear_state_slots(temporal, indexed_indices)
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
+
+        Destination indices must be unique.
 
         ReplaySSM invariant: the SOURCE must be a fully-flushed checkpoint
         (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
@@ -1027,6 +1042,15 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        indexed_src_indices = _state_slot_indices(src_indices)
+        indexed_dst_indices = _state_slot_indices(dst_indices)
+        dst_slots = (
+            dst_indices.tolist() if envs.SGLANG_DEBUG_MEMORY_POOL.get() else None
+        )
+        if dst_slots is not None:
+            assert len(dst_slots) == len(set(dst_slots)), (
+                f"copy_from requires unique destination slots, got {dst_slots}"
+            )
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1038,26 +1062,26 @@ class MambaPool:
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
 
-            if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-                overlap = set(src_indices.tolist()) & set(dst_indices.tolist())
+            if dst_slots is not None:
+                overlap = set(src_indices.tolist()) & set(dst_slots)
                 assert not overlap, (
                     "fused copy_from requires disjoint src/dst slots; "
                     f"overlap={sorted(overlap)}"
                 )
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
         else:
             for i in range(len(self.mamba_cache.conv)):
-                self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
-                    :, src_indices
-                ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
+                _copy_state_slots(
+                    self.mamba_cache.conv[i], indexed_src_indices, indexed_dst_indices
+                )
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() > 0:
+            _copy_state_slots(temporal, indexed_src_indices, indexed_dst_indices)
         if self.replayssm_write_pos is not None:
-            self.replayssm_write_pos[dst_indices] = 0
+            if _is_npu:
+                self.replayssm_write_pos[dst_indices] = 0
+            else:
+                self.replayssm_write_pos.index_fill_(0, indexed_dst_indices, 0)
         for sibling in self._slot_siblings:
             sibling.copy_slots(src_indices, dst_indices)
 
@@ -1090,11 +1114,20 @@ class MambaPool:
         else:
             conv_cpu, temporal_cpu = mamba_cache_cpu
         current_platform.synchronize()
+        indexed_indices = _state_slot_indices(indices)
         for i, conv in enumerate(self.mamba_cache.conv):
-            conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
-        self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
-            self.mamba_cache.temporal.device, non_blocking=True
-        )
+            _store_state_slots(
+                conv,
+                indexed_indices,
+                conv_cpu[i].to(conv.device, non_blocking=True),
+            )
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() > 0:
+            _store_state_slots(
+                temporal,
+                indexed_indices,
+                temporal_cpu.to(temporal.device, non_blocking=True),
+            )
         if siblings_cpu is not None:
             for sibling, data in zip(self._slot_siblings, siblings_cpu):
                 sibling.load_cpu_slots(data, indices)
