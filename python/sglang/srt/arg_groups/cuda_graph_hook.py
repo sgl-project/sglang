@@ -40,8 +40,8 @@ def parse_cuda_graph_config(server_args: Any):
     Precedence (highest first): explicit JSON > convenience > legacy > defaults.
     Also populates server_args._cuda_graph_config_locked — the set of
     (phase, key) tuples that came from non-default sources; the
-    auto-disable cascade respects this lock (the old
-    --enforce-piecewise-cuda-graph semantics generalized).
+    auto-disable cascade respects this lock (an explicitly supplied prefill
+    backend skips the cascade, whichever value it is).
     """
     cfg = resolving_view(server_args)
     raw_input = cfg.cuda_graph_config
@@ -107,8 +107,8 @@ def apply_cuda_graph_compatibility(server_args: Any):
     """Auto-disable prefill cuda graph for incompatible configs.
     Rules are split per backend — TcPiecewise and Breakable have
     different constraints. Skipped when the user explicitly set the
-    prefill backend (this folds in the old
-    --enforce-piecewise-cuda-graph contract).
+    prefill backend, whichever value they chose (the contract the removed
+    --enforce-piecewise-cuda-graph used to spell).
     """
 
     cfg = resolving_view(server_args)
@@ -244,10 +244,6 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             lambda: resolved_view(server_args).attn_cp_size > 1,
         ),
         ("CUDA graph debug mode", lambda: cfg.debug_cuda_graph),
-        (
-            "DSA prefill context parallelism",
-            lambda: cfg.enable_dsa_prefill_context_parallel,
-        ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.
         (
             "decode context parallel (dcp_size > 1)",
@@ -275,10 +271,19 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     """
 
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.configs.model_config import (
+        is_deepseek_v4,
+        uses_kda_attention,
+    )
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     rules = [
+        (
+            "KDA hybrid linear attention",
+            # GLM-5.3 Flash supports explicit BCG opt-in, but stays off by
+            # default like other KDA models. Explicit backends skip these rules.
+            lambda: uses_kda_attention(model_config_of(server_args).hf_config),
+        ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
         (
@@ -394,6 +399,51 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
         ),
     )
+
+
+def apply_glm5_chunked_prefill_default(server_args: Any):
+    """Set the opted-in GLM BCG chunk default before memory budgeting."""
+    cfg = resolving_view(server_args)
+    if (
+        get_platform().is_cuda
+        and (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
+        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+        and cfg.chunked_prefill_size is None
+        and "Glm5NextForConditionalGeneration"
+        in model_config_of(server_args).hf_config.architectures
+    ):
+        declare_resolution(
+            server_args,
+            "_apply_glm5_chunked_prefill_default",
+            chunked_prefill_size=4096,
+        )
+
+
+def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
+    """Set capture sizes for explicitly enabled GLM breakable prefill graphs."""
+    cfg = resolving_view(server_args)
+    if (
+        cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE
+        or "Glm5NextForConditionalGeneration"
+        not in model_config_of(server_args).hf_config.architectures
+    ):
+        return
+    locked = server_args._cuda_graph_config_locked
+    if any((Phase.PREFILL, key) in locked for key in ("max_bs", "bs")):
+        return
+    # Capacity defaults have already populated buckets. Replace the unlocked
+    # ceiling and its buckets together.
+    declare_resolution(
+        server_args,
+        "_apply_glm5_prefill_cuda_graph_policy",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config,
+            Phase.PREFILL,
+            max_bs=4096,
+            bs=generate_prefill_cuda_graph_batch_sizes(4096),
+        ),
+    )
+    apply_deepep_adjustments(server_args)
 
 
 def apply_deepep_adjustments(server_args: Any):
