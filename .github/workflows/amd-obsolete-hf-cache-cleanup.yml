@@ -17,6 +17,10 @@ on:
 permissions:
   contents: read
 
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
 concurrency:
   group: amd-obsolete-hf-cache-cleanup-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -26,6 +30,9 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     strategy:
       fail-fast: false
+      # The runner pools can share one PVC, so a parallel leg would race
+      # another's rm -rf over the same directories.
+      max-parallel: 1
       matrix:
         include:
           - runner: linux-mi300-1gpu-sglang
@@ -41,11 +48,23 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Remove obsolete HF checkpoints
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      # The weights are owned by root because the CI container downloads them,
+      # so the unprivileged runner user cannot unlink them. Delete from inside
+      # the same container, which mounts the cache PVC at /sgl-data.
+      - name: Setup docker
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
-          REQUIRE_HF_CACHE: "1"
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Remove obsolete HF checkpoints
         run: |
-          bash scripts/ci/amd/cleanup_obsolete_hf_checkpoints.sh
-          if [[ -f github_summary.md ]]; then
-            cat github_summary.md >> "$GITHUB_STEP_SUMMARY"
-          fi
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e REQUIRE_HF_CACHE=1 \
+            bash scripts/ci/amd/cleanup_obsolete_hf_checkpoints.sh || TEST_EXIT_CODE=$?
+          cat github_summary.md >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
