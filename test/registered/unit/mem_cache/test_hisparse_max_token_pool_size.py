@@ -78,9 +78,6 @@ class TestMaxTokenPoolSize(CustomTestCase):
         self.assertEqual(instance.max_token_pool_size, 1024)
 
     def test_non_hisparse_hybrid_swa_prefers_full_max(self):
-        self.enterContext(
-            get_context().override_server_args(enable_unified_memory=False)
-        )
         instance = _make_model_runner(
             enable_hisparse=False,
             token_to_kv_pool_allocator=SimpleNamespace(),
@@ -89,8 +86,9 @@ class TestMaxTokenPoolSize(CustomTestCase):
             full_max_total_num_tokens=3000,
             swa_max_total_num_tokens=500,
         )
-        self.assertEqual(instance.max_token_pool_size, 3000)
-        self.assertEqual(instance.effective_max_total_num_tokens, 3000)
+        with get_context().override_server_args(enable_unified_memory=False):
+            self.assertEqual(instance.max_token_pool_size, 3000)
+            self.assertEqual(instance.effective_max_total_num_tokens, 3000)
 
 
 def _make_prealloc_queue(
