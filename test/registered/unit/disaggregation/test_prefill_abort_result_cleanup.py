@@ -16,6 +16,8 @@ class _Req:
     def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
         self.rid = "aborted-prefill"
         self.inflight_middle_chunks = inflight_middle_chunks
+        self.mm_embedding_abort_pending = False
+        self.mm_embedding_validation_count = 0
         self.kv = ReqKvInfo(
             req_pool_idx=1 if allocated else None,
             kv_allocated_len=1 if allocated else 0,

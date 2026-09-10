@@ -59,13 +59,7 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
-from sglang.srt.utils import (
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -588,6 +582,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
+    mm_embedding_errors: Optional[List[Tuple[int, int, int]]] = None
 
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None

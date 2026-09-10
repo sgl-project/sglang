@@ -1,9 +1,11 @@
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -34,7 +36,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         enable_overlap_mlx=False,
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
-        tree_cache=None,
+        tree_cache=Mock(),
         hisparse_coordinator=None,
         req_to_token_pool=None,
         decode_offload_manager=None,
@@ -64,12 +66,21 @@ class _PrefillReq:
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
+        self.finished_reason = None
+        self.to_finish = None
+        self.mm_embedding_abort_pending = False
+        self.mm_embedding_validation_count = 0
+        self.kv = ReqKvInfo(req_pool_idx=0)
+        self.multimodal_inputs = None
+        self.session = None
 
     def finished(self):
-        return False
+        return self.finished_reason is not None
 
     def update_finish_state(self):
-        return None
+        if self.to_finish is not None:
+            self.finished_reason = self.to_finish
+            self.to_finish = None
 
 
 class _DecodeReq:
@@ -94,6 +105,140 @@ class _DecodeReq:
 
 
 class TestPrefillHiddenStateOffsets(CustomTestCase):
+    def test_failed_row_advances_logprob_cursor_for_following_request(self):
+        failed = _PrefillReq(
+            rid="failed", inflight_middle_chunks=0, return_hidden_states=False
+        )
+        failed.mm_embedding_abort_pending = True
+        failed.mm_embedding_validation_count = 1
+        failed.to_finish = FINISH_ABORT(
+            "bad embedding", HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        failed.return_logprob = True
+        good = _PrefillReq(
+            rid="good", inflight_middle_chunks=0, return_hidden_states=False
+        )
+        good.return_logprob = True
+        batch = SimpleNamespace(
+            reqs=[failed, good],
+            decoding_reqs=[],
+            return_logprob=True,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        logits_output = SimpleNamespace(hidden_states=None, customized_info=None)
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=logits_output,
+            next_token_ids=torch.tensor([0, 1]),
+            extend_input_len_per_req=[2, 2],
+            extend_logprob_start_len_per_req=[0, 0],
+            mm_embedding_errors=torch.tensor([[1, 1, 2, 1], [0, 0, 0, 0]]),
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+        processor = _make_processor(self)
+        object.__setattr__(processor, "logprob_result_processor", Mock())
+        processor.logprob_result_processor.calculate_num_input_logprobs.return_value = 2
+
+        with (
+            patch.object(SchedulerBatchResultProcessor, "move_logprobs_to_cpu"),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.release_kv_cache"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.maybe_cache_unfinished_req"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        add_call = (
+            processor.logprob_result_processor.add_logprob_return_values.call_args
+        )
+        self.assertEqual(add_call.args[1], good)
+        self.assertEqual(add_call.args[2], 2)
+
+    def test_failed_row_advances_hidden_cursor_without_storing_hidden_state(self):
+        failed = _PrefillReq(
+            rid="failed", inflight_middle_chunks=0, return_hidden_states=True
+        )
+        failed.mm_embedding_abort_pending = True
+        failed.mm_embedding_validation_count = 1
+        failed.to_finish = FINISH_ABORT(
+            "bad embedding", HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        good = _PrefillReq(
+            rid="good", inflight_middle_chunks=0, return_hidden_states="last"
+        )
+        batch = SimpleNamespace(
+            reqs=[failed, good],
+            decoding_reqs=[],
+            return_logprob=False,
+            return_hidden_states=True,
+            return_hidden_states_mode=CaptureHiddenMode.FULL,
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(
+                hidden_states=torch.tensor([[10.0], [11.0], [20.0], [21.0]]),
+                customized_info=None,
+            ),
+            next_token_ids=torch.tensor([0, 1]),
+            extend_input_len_per_req=[2, 2],
+            extend_logprob_start_len_per_req=None,
+            mm_embedding_errors=torch.tensor([[1, 1, 2, 1], [0, 0, 0, 0]]),
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+        processor = _make_processor(self)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.release_kv_cache"
+            ) as release_kv_cache,
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.maybe_cache_unfinished_req"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(failed.hidden_states, [])
+        self.assertEqual(good.hidden_states, [[21.0]])
+        self.assertEqual(
+            failed.finished_reason.status_code, HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        release_kv_cache.assert_called_once_with(
+            failed, processor.tree_cache, is_insert=False
+        )
+
     def test_active_middle_chunk_advances_before_new_last_request(self):
         cases = (
             (
@@ -132,6 +277,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 )
                 result = SimpleNamespace(
                     copy_done=None,
+                    mm_embedding_errors=None,
                     auxiliary_host_output=None,
                     routed_experts_output=None,
                     indexer_topk_output=None,
