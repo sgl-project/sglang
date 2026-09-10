@@ -83,6 +83,31 @@ class TestKimiK3CPMHAWorkspace(CustomTestCase):
                 self.attention._cp_mha_max_workspace_bytes = budget
                 self.assertEqual(self.attention._can_use_cp_mha(self.batch), eligible)
 
+    def test_default_budget_admits_k3_geometry_up_to_128k(self):
+        # The env default (SGLANG_K3_CP_MHA_MAX_WORKSPACE_MB) must let real K3
+        # (96 heads, q_lora 1536, hidden 7168) take expanded MHA for a 128K
+        # prefill at CP8 and CP4, and stop at 256K/CP8.
+        from sglang.srt.environ import envs
+
+        budget = envs.SGLANG_K3_CP_MHA_MAX_WORKSPACE_MB.get() * 1024 * 1024
+        self.attention.hidden_size = 7168
+        for cp, heads, tokens, expect in (
+            (8, 96, 131072, True),
+            (4, 48, 131072, True),
+            (8, 96, 262144, False),
+        ):
+            self.attention.num_local_heads = heads
+            batch = SimpleNamespace(
+                seq_lens_cpu=[tokens],
+                attn_cp_metadata=SimpleNamespace(
+                    per_rank_actual_token=[tokens // cp] * cp
+                ),
+            )
+            with get_parallel().override(attn_cp_size=cp):
+                needed = self.attention._cp_mha_workspace_size(batch)
+            with self.subTest(cp=cp, tokens=tokens):
+                self.assertEqual(needed <= budget, expect, (needed, budget))
+
     def test_cached_prefix_growth_can_force_absorbed_fallback(self):
         self.attention._cp_mha_max_workspace_bytes = (
             self.attention._cp_mha_workspace_size(self.batch)
