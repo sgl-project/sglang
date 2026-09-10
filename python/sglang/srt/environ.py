@@ -1403,6 +1403,10 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # DeepSeek-V4.1 two-level indexer on DeepGEMM's paged sparse MQA logits for the
+    # index-source layers after the candidate source (decode). Needs a DeepGEMM
+    # with fp8_fp4_paged_sparse_mqa_logits on SM100; off = the torch masks.
+    SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

@@ -1,0 +1,222 @@
+"""Decode two-level indexer on DeepGEMM's paged sparse MQA logits.
+
+The block table layer 20 publishes (``amax_topk_blocks``) is checked against
+the model code's ``select_candidate_blocks``; a consumer's sparse logits
+are checked against DeepGEMM's dense bf16 paged logits gathered at the published
+positions, which the kernel is documented to match bitwise; its selection is
+checked against a torch top-k of those. The kernel path needs a DeepGEMM with
+``fp8_fp4_paged_sparse_mqa_logits`` on an SM100 device; it skips elsewhere.
+"""
+
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=120, stage="stage-b-test-small-1-gpu", runner_config="1-gpu")
+
+HEADS = 32
+HEAD_DIM = 128
+PAGE = 128  # index pool page on SM100: 128 * 68 bytes = 17 * 512
+TOPK = 512
+BLOCKS = 2048
+
+
+def _sparse_indexer_available() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return hasattr(deep_gemm, "fp8_fp4_paged_sparse_mqa_logits")
+
+
+def _reference_blocks(logits, lens, block_size=8):
+    """Block ids the model code keeps, per row, ascending."""
+    from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+
+    width = logits.shape[1]
+    reach = torch.arange(width, device=logits.device)[None, :] < lens[:, None]
+    mask = select_candidate_blocks(
+        logits.masked_fill(~reach, -torch.inf),
+        lens[:, None],
+        topk_blocks=BLOCKS,
+        block_size=block_size,
+    )
+    return [m.view(-1, block_size).any(-1).nonzero().flatten() for m in mask]
+
+
+class TestSparseIndexer(CustomTestCase):
+    def test_amax_topk_blocks_matches_reference(self):
+        from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
+            amax_topk_blocks,
+            valid_lens,
+        )
+
+        torch.manual_seed(0)
+        lens = torch.tensor(
+            [1, 37, 16384, 16389, 40000, 131072], dtype=torch.int32, device="cuda"
+        )
+        bs, width = lens.numel(), 131072
+        logits = torch.randn(bs, width, device="cuda")
+        # the tail past the length is garbage in production: make it loud
+        logits.masked_fill_(
+            torch.arange(width, device="cuda")[None, :] >= lens[:, None], 1e4
+        )
+        blocks = amax_topk_blocks(logits, lens, BLOCKS)
+        valid = valid_lens(lens, BLOCKS)
+        keys = logits.view(bs, -1, 8).amax(-1)
+        for b, ref in enumerate(_reference_blocks(logits, lens)):
+            nb = (int(lens[b]) + 7) // 8
+            n = min(nb, BLOCKS)
+            got = blocks[b, :n].long()
+            self.assertTrue(torch.equal(got, got.sort().values), "not ascending")
+            self.assertEqual(got.unique().numel(), n)
+            self.assertIn(nb - 1, got.tolist(), "newest block not kept")
+            self.assertTrue(bool((got < nb).all()))
+            # equal keys may swap blocks: compare the key multiset (the forced
+            # block excluded, its key is arbitrary garbage)
+            keep = got != nb - 1
+            keep_ref = ref != nb - 1
+            self.assertTrue(
+                torch.equal(
+                    keys[b][got[keep]].sort().values,
+                    keys[b][ref[keep_ref]].sort().values,
+                ),
+                msg=f"row {b}",
+            )
+            # past the valid count nothing looks like a block DeepGEMM could read
+            self.assertTrue(bool((blocks[b, n:] >= nb).all()))
+            expect_valid = 8 * (n - 1) + ((int(lens[b]) - 1) % 8 + 1)
+            self.assertEqual(int(valid[b]), expect_valid)
+
+    @unittest.skipUnless(
+        _sparse_indexer_available(), "needs DeepGEMM's paged sparse MQA logits on SM100"
+    )
+    def test_sparse_chain_matches_dense_logits(self):
+        """Layer 20 publishes from its dense fp32 logits; a consumer's sparse bf16
+        logits equal the dense bf16 logits at the published positions bitwise."""
+        import deep_gemm
+
+        from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
+            DeepGemmCandidateIndexer,
+            valid_lens,
+        )
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import IndexerInputs
+
+        torch.manual_seed(1)
+        lens = torch.tensor(
+            [300, 16384, 70000, 131072], dtype=torch.int32, device="cuda"
+        )
+        bs = lens.numel()
+        max_pages = (int(lens.max()) + PAGE - 1) // PAGE
+        num_pages = bs * max_pages
+        # fp4 index-K pool, the store kernel's page layout: PAGE * 64 payload bytes
+        # then PAGE * 4 packed-ue8m0 scale bytes. Random codes with small scales
+        # (2^-9 .. 2^-5) keep the logits inside the fp16 range the top-k's coarse
+        # keys resolve; production indexer logits are O(1-100).
+        pool = torch.randint(
+            0, 255, (num_pages, PAGE * 68), dtype=torch.uint8, device="cuda"
+        )
+        pool[:, PAGE * 64 :] = torch.randint(
+            118, 123, (num_pages, PAGE * 4), dtype=torch.uint8, device="cuda"
+        )
+        k_cache = pool.view(num_pages, PAGE, 1, 68)
+        self.assertEqual(k_cache.stride(0) % 512, 0)
+        page_table = (
+            torch.randperm(num_pages, device="cuda").view(bs, max_pages).to(torch.int32)
+        )
+        q_fp4 = torch.randint(
+            0, 255, (bs, 1, HEADS, HEAD_DIM // 2), dtype=torch.uint8, device="cuda"
+        ).view(torch.int8)
+        q_sf = (
+            torch.randint(118, 123, (bs, 1, HEADS, 4), dtype=torch.uint8, device="cuda")
+            .view(torch.int32)
+            .squeeze(-1)
+        )
+        weights = (torch.rand(bs, HEADS, device="cuda") * 0.05).to(torch.bfloat16)
+
+        sched = deep_gemm.get_paged_mqa_logits_metadata(
+            lens.view(-1, 1), PAGE, deep_gemm.get_num_sms()
+        )
+        dense = lambda dtype: deep_gemm.fp8_fp4_paged_mqa_logits(
+            (q_fp4, q_sf),
+            k_cache,
+            weights.float() if dtype == torch.float32 else weights,
+            lens.view(-1, 1),
+            page_table,
+            sched,
+            int(lens.max()),
+            False,
+            dtype,
+        )
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+        impl = DeepGemmCandidateIndexer(BLOCKS, 8)
+        inputs = IndexerInputs(
+            q_fp4,
+            q_sf,
+            k_cache,
+            weights.float(),
+            SimpleNamespace(
+                c4_seq_lens=lens,
+                page_table=page_table,
+                c4_page_size=PAGE,
+                deep_gemm_metadata=sched,
+                max_c4_seq_len=int(lens.max()),
+                use_topk_v2=True,
+                topk_metadata=plan_topk_v2(lens),
+            ),
+        )
+        source_slots = torch.empty(bs, TOPK, dtype=torch.int32, device="cuda")
+        table = impl.publish_decode(inputs, source_slots)
+        # the source's own selection: min(k, len) slots per row, the rest -1
+        for b in range(bs):
+            self.assertEqual(int((source_slots[b] >= 0).sum()), min(TOPK, int(lens[b])))
+        sparse = impl.scores(table, inputs)
+        self.assertEqual(sparse.shape, (bs, BLOCKS * 8))
+        dense16 = dense(torch.bfloat16)
+        reach = torch.arange(dense16.shape[1], device="cuda")[None, :] < lens[:, None]
+        seen = dense16.float()[reach]
+        self.assertTrue(
+            bool(torch.isfinite(seen).all()) and float(seen.max()) < 65504.0
+        )
+        cols = torch.arange(BLOCKS * 8, device="cuda")
+        pos = table.blocks.long().repeat_interleave(8, dim=1) * 8 + (cols % 8)[None, :]
+        row_valid = valid_lens(lens, BLOCKS)
+        valid = cols[None, :] < row_valid[:, None].long()
+        ref = dense16.gather(1, pos.clamp(max=dense16.shape[1] - 1))
+        self.assertTrue(
+            torch.equal(sparse[valid], ref[valid]), "sparse logits differ from dense"
+        )
+        # the consumer's selection: per row the top-k of the valid columns as
+        # slots (any order), -1 padded; bf16 ties may swap positions, so the picked
+        # scores are compared as a multiset. Slots invert through the page table.
+        page_indices = torch.empty(bs, TOPK, dtype=torch.int32, device="cuda")
+        impl.select_decode(table, inputs, page_indices)
+        slot_to_pos = torch.empty(bs, num_pages * PAGE, dtype=torch.int64, device="cuda")
+        for b in range(bs):
+            n_valid = min(TOPK, int(row_valid[b]))
+            chosen = page_indices[b] >= 0
+            self.assertEqual(int(chosen.sum()), n_valid)
+            slots = page_indices[b][chosen].long()
+            pages_b = page_table[b].long()
+            slot_to_pos[b].fill_(-1)
+            slot_to_pos[b][
+                (pages_b[:, None] * PAGE + torch.arange(PAGE, device="cuda")[None, :]).flatten()
+            ] = torch.arange(pages_b.numel() * PAGE, device="cuda")
+            p = slot_to_pos[b][slots]
+            self.assertTrue(bool((p >= 0).all()) and bool((p < lens[b]).all()))
+            self.assertEqual(p.unique().numel(), n_valid)
+            row = sparse[b].float().masked_fill(~valid[b], -torch.inf)
+            ref_vals = row.topk(n_valid).values.sort().values
+            got_vals = dense16[b].float()[p].sort().values
+            self.assertTrue(torch.equal(got_vals, ref_vals), f"row {b}")
+
+
+if __name__ == "__main__":
+    unittest.main()

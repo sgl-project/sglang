@@ -61,6 +61,39 @@ def _jit_topk_v2_module():
     )
 
 
+@cache_once
+def _jit_topk_bf16_small_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("topk_bf16_small"),
+        *args,
+        cuda_files=["deepseek_v4/topk_bf16_small.cuh"],
+        cuda_wrappers=[("topk_transform", f"TopKBF16Kernel<{args}>::transform")],
+    )
+
+
+def topk_transform_bf16_small(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """bf16 top-k for rows of at most 16384 scores (the DeepSeek-V4.1 sparse
+    indexer's consumer rows), fused with a page-table transform.
+
+    Row ``b`` selects the ``k = out_page_indices.shape[1]`` best of its first
+    ``seq_lens[b]`` scores; a selected index ``i`` is written as
+    ``page_table[b, i // page_size] * page_size + i % page_size``, in no
+    particular order, and ``-1`` fills the slots past ``min(k, seq_lens[b])``.
+    Selection is by a 13-bit fp16-derived key, exact for bf16 in fp16's normal
+    range; ties within a key are broken arbitrarily.
+    """
+    _jit_topk_bf16_small_module().topk_transform(
+        scores, seq_lens, page_table, out_page_indices, page_size
+    )
+
+
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,

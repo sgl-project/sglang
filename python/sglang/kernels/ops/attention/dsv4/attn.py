@@ -43,7 +43,10 @@ def _jit_fused_store_module(
 
 
 def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm: int):
-    assert page_size == 64
+    # The schedule only depends on the sequence lengths (256-token splits), not
+    # on the page size; DeepGEMM takes 32 / 64 / 128 on SM100 and we page at 64
+    # or 128 slots.
+    assert page_size in (64, 128), page_size
     seq_lens = seq_lens.view(-1).to(torch.int32)
     bs = int(seq_lens.shape[0])
     metadata = seq_lens.new_empty(num_sm + 1, 2)
