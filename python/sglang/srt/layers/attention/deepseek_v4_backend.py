@@ -205,7 +205,7 @@ class DSV4AttnMetadata:
     trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
     trtllm_prefill_c128: Optional[tuple] = None
 
-    c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
+    c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
 
@@ -215,7 +215,7 @@ class DSV4AttnMetadata:
 
     def get_flashmla_metadata(self, compress_ratio: Literal[0, 4, 128]):
         if compress_ratio == 0:
-            return self.c1_flashmla_metadata
+            return self.c0_flashmla_metadata
         elif compress_ratio == 4:
             return self.c4_flashmla_metadata
         elif compress_ratio == 128:
@@ -258,7 +258,7 @@ class DSV4AttnMetadata:
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
-                "c1_flashmla_metadata",
+                "c0_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
                 # Eager-only lazy caches are assigned, not content-copied.
@@ -296,7 +296,7 @@ class DSV4AttnMetadata:
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
-            "c1_flashmla_metadata",
+            "c0_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
             # Reset eager-only caches so a replay cannot reuse another shape.
@@ -428,7 +428,7 @@ class DSV4AttnMetadata:
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
         if is_prefill:
             self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
-        self.c1_flashmla_metadata = _create_flashmla_metadata()
+        self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
 
@@ -1703,7 +1703,7 @@ class DeepseekV4AttnBackend(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
             core = metadata.core_attn_metadata
-            core.c1_flashmla_metadata = _create_flashmla_metadata()
+            core.c0_flashmla_metadata = _create_flashmla_metadata()
             core.c4_flashmla_metadata = _create_flashmla_metadata()
             core.c128_flashmla_metadata = _create_flashmla_metadata()
 
@@ -2366,7 +2366,7 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
             core_attn_metadata.c4_sparse_raw_indices = None
-            core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
+            core_attn_metadata.c0_flashmla_metadata = _create_flashmla_metadata()
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
             if self.trtllm_attn:
