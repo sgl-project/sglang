@@ -455,7 +455,7 @@ class FlashAttentionBackend(AttentionBackend):
     def supports_draft_extend_metadata_staging(self) -> bool:
         return (
             self.topk == 1
-            and not self._unified_dense
+            and not self.kv_index_translator.is_translating
             and self.draft_extend_metadata_captured_in_graph()
         )
 
