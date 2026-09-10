@@ -3,7 +3,7 @@
 # clear stale download artifacts.
 #
 # Usage (inside the ci_sglang container, where /sgl-data is the cache mount):
-#   check_hf_cache_space.sh <model_repo_id> [required_gib]
+#   check_hf_cache_space.sh <model_repo_id> [required_gib] [--strict]
 #
 # Why this exists: run 32196787596 died 40 minutes into a 1.2 TB download with
 # "OSError: [Errno 28] No space left on device", and the only way to find that
@@ -22,9 +22,20 @@
 # infrastructure problem and a per-job script cannot fix it by deleting things
 # other jobs still need.
 #
-# Never fails the job: a full cache is not necessarily fatal (the checkpoint may
+# Warn-only by default: a full cache is not necessarily fatal (the checkpoint may
 # already be cached, which is the common case), and when it is fatal the
 # download says so itself -- now against a log that already explained why.
+#
+# `--strict` makes a predicted shortfall fail the job instead. Warning and
+# proceeding is only harmless when the download's failure is confined to this
+# job, and for a checkpoint far larger than the free space it is not: run
+# 34487053976 warned that amd/GLM-5.2-MXFP4 needed 314 GiB against 120 GiB free,
+# proceeded anyway, and spent eleven minutes turning that 120 GiB into a
+# checkpoint that was still incomplete -- ending with 832 MB free on a volume the
+# whole AMD fleet shares. Every byte it consumed came out of some other job's
+# headroom, and it could not have finished no matter how long it ran. Pass
+# --strict when the caller knows the download is all-or-nothing, so the job stops
+# at the check instead of draining the volume on the way to the same failure.
 #
 # "Cached" is decided by bytes on disk, not by the model directory existing. An
 # ENOSPC failure leaves a partial checkpoint behind, so the directory test alone
@@ -35,8 +46,27 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-MODEL_REPO_ID="${1:?model repo id, e.g. amd/Qwen3.8-2.4T-A95B-Quark-MXFP4}"
-REQUIRED_GIB="${2:-0}"
+STRICT=0
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --strict) STRICT=1 ;;
+        # An empty positional is how a caller says "no expected size".
+        "") ;;
+        -*)
+            echo "Unknown argument: $arg (expected --strict)" >&2
+            exit 2
+            ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+
+MODEL_REPO_ID="${ARGS[0]:?model repo id, e.g. amd/Qwen3.8-2.4T-A95B-Quark-MXFP4}"
+REQUIRED_GIB="${ARGS[1]:-0}"
+if [[ ! "$REQUIRED_GIB" =~ ^[0-9]+$ ]]; then
+    echo "Expected size in GiB to be a whole number, got: $REQUIRED_GIB" >&2
+    exit 2
+fi
 
 HF_CACHE="${HF_HOME:-/sgl-data/hf-cache}/hub"
 # HuggingFace stores `org/name` as `models--org--name`.
@@ -124,6 +154,14 @@ check_hf_cache_space() {
     echo "         failure onto whichever job needed them next. Raising it"
     echo "         needs the runner owners."
     echo "=============================================================="
+
+    if (( STRICT )); then
+        echo "Stopping here (--strict). Starting the download would spend the"
+        echo "remaining ${avail} GiB on a checkpoint that would still be"
+        echo "incomplete, leaving the shared volume with nothing for any other"
+        echo "job and failing anyway."
+        return 1
+    fi
     return 0
 }
 
