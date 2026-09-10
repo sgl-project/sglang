@@ -483,8 +483,9 @@ crate-type = ["cdylib"]
             self.assertEqual(build.environment["LIBTORCH_CXX11_ABI"], "1")
             self.assertEqual(build.environment["LIBTORCH_BYPASS_VERSION_CHECK"], "1")
             self.assertIn(str(compat_header), build.environment["CXXFLAGS"])
-            # Torch 2.14 headers need C++20, and the flag only wins over the
-            # `-std=c++17` torch-sys sets if it trails the inherited CXXFLAGS.
+            # Trailing the inherited CXXFLAGS is what lets this beat a `-std=`
+            # the caller already set; cc-rs puts all of CXXFLAGS after the
+            # `-std=c++17` torch-sys sets, so that one loses either way.
             self.assertRegex(build.environment["CXXFLAGS"], r"^-O2\b.*\s-std=c\+\+20\b")
             self.assertIn(
                 "$ORIGIN/../../../../torch/lib", build.environment["RUSTFLAGS"]
@@ -505,14 +506,21 @@ crate-type = ["cdylib"]
             )
             self.assertFalse(wheel_build.fingerprint["include_absolute_rpath"])
 
-            fake_torch.__version__ = "2.13.0+cu129"
-            older_build = torch_build_configuration(
-                compat_header=compat_header,
-                python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
-                torch_module=fake_torch,
-                base_environment={},
-            )
-            self.assertNotIn("-std=", older_build.environment["CXXFLAGS"])
+            # libtorch declares CXX_STANDARD 20 from 2.12 on, so the flag
+            # starts there; 2.11 is the one supported release still on C++17.
+            for version, expected in (("2.12.0+cu128", True), ("2.11.0+cu128", False)):
+                fake_torch.__version__ = version
+                older_build = torch_build_configuration(
+                    compat_header=compat_header,
+                    python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+                    torch_module=fake_torch,
+                    base_environment={},
+                )
+                self.assertEqual(
+                    "-std=c++20" in older_build.environment["CXXFLAGS"],
+                    expected,
+                    msg=version,
+                )
 
             fake_torch.__version__ = "2.15.0"
             with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.14"):
