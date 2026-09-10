@@ -10,7 +10,6 @@ use crate::message::types::OneOrMany;
 use super::template::{ChatFormatter, TemplateError};
 use super::template_builtins::builtin_template;
 use super::template_legacy::{LegacyFormatter, LegacySpec};
-use super::template_native::NativeEncoder;
 
 const SUPPORTED_STYLES: &[&str] = &[
     "ADD_COLON_SINGLE",
@@ -44,24 +43,9 @@ const SUPPORTED_STYLES: &[&str] = &[
 
 pub(super) fn load_chat_formatter(
     config_file: Option<&str>,
-    model_config_file: Option<&str>,
     model_path: Option<&str>,
     chat_template_arg: Option<&str>,
 ) -> Result<ChatFormatter, TemplateError> {
-    // Python resolves the chat-encoding spec from the model architecture
-    // BEFORE any template source: a model whose prompt the engine builds in
-    // code (DeepSeek-V4 and friends) ignores every template, including an
-    // explicit `--chat-template`, so this branch comes first.
-    if let Some(encoder) = model_config_file.and_then(|file| native_encoder(file, model_path)) {
-        if chat_template_arg.is_some() {
-            tracing::warn!(
-                "model has a built-in prompt encoder; ignoring --chat-template \
-                 (the Python entrypoint also selects the encoder from the model architecture)"
-            );
-        }
-        return Ok(ChatFormatter::Native(encoder));
-    }
-
     // Python resolves registry names before looking at the filesystem — and
     // before touching the tokenizer config, so a built-in name works even when
     // `tokenizer_config.json` is absent.
@@ -225,16 +209,6 @@ pub(super) fn infer_legacy_template_from_model_path(model_path: &str) -> Option<
         _ => return None,
     };
     builtin_template(name)
-}
-
-/// The built-in prompt encoder for this model, if it has one. A `config.json`
-/// that cannot be read or parsed is not an error here; it only means no encoder
-/// is selected and the template paths run as before.
-fn native_encoder(model_config_file: &str, model_path: Option<&str>) -> Option<NativeEncoder> {
-    let path = Path::new(model_config_file);
-    let text = read_to_string(path, "model config").ok()?;
-    let config = parse_json(&text, path, "model config").ok()?;
-    NativeEncoder::detect(&config, model_path)
 }
 
 /// Python `get_model_type`: the `model_type` field of the model's `config.json`.

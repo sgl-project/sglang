@@ -6,13 +6,13 @@
 //! `Conversation.get_prompt()` so there is exactly one implementation of the
 //! per-style formatting logic (no Jinja translation to drift).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dynamo_protocols::types::CreateChatCompletionRequest;
 use dynamo_renderer::PromptFormatter;
 use thiserror::Error;
 
-use super::template_native::NativeEncoder;
 use crate::message::types::OneOrMany;
 
 #[cfg(test)]
@@ -24,14 +24,13 @@ pub(super) use super::template_legacy::LegacySpec;
 use super::template_loader::infer_legacy_template_from_model_path;
 pub(super) use super::template_loader::load_chat_formatter;
 
-/// A chat prompt formatter: the model's HuggingFace Jinja template, a legacy
-/// SGLang conversation template, or a built-in encoder for the models that
-/// ship no template because the engine builds their prompt in code.
+/// A chat prompt formatter: either the model's HuggingFace Jinja template or a
+/// legacy SGLang conversation template.
 #[derive(Clone)]
 pub enum ChatFormatter {
     HuggingFace(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
-    Native(NativeEncoder),
+    DeepSeekV4(BTreeMap<String, String>),
 }
 
 impl ChatFormatter {
@@ -39,6 +38,7 @@ impl ChatFormatter {
     pub(super) fn render(
         &self,
         request: &CreateChatCompletionRequest,
+        thinking: Option<bool>,
     ) -> Result<String, TemplateError> {
         match self {
             ChatFormatter::HuggingFace(formatter) => {
@@ -50,7 +50,9 @@ impl ChatFormatter {
                     })
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request),
-            ChatFormatter::Native(encoder) => encoder.render_request(request),
+            ChatFormatter::DeepSeekV4(prompts) => {
+                super::template_dsv4::render(request, prompts, thinking)
+            }
         }
     }
 
@@ -60,9 +62,7 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            // Both renderer paths carry no template-level stops, matching
-            // Python's jinja path, which keeps only the request's own stops.
-            ChatFormatter::HuggingFace(_) | ChatFormatter::Native(_) => None,
+            ChatFormatter::HuggingFace(_) | ChatFormatter::DeepSeekV4(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -197,7 +197,7 @@ mod tests {
         let formatter = ChatFormatter::Legacy(Box::new(LegacyFormatter {
             spec: builtin_template("chatml").unwrap(),
         }));
-        let rendered = formatter.render(&request()).unwrap();
+        let rendered = formatter.render(&request(), None).unwrap();
         assert_eq!(
             rendered,
             "<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
@@ -426,7 +426,6 @@ mod tests {
         let formatter = load_chat_formatter(
             Some(base.to_str().unwrap()),
             None,
-            None,
             Some(base.to_str().unwrap()),
         )
         .unwrap();
@@ -463,11 +462,10 @@ mod tests {
         let formatter = load_chat_formatter(
             Some(base.to_str().unwrap()),
             None,
-            None,
             Some(legacy.to_str().unwrap()),
         )
         .unwrap();
-        let rendered = formatter.render(&request()).unwrap();
+        let rendered = formatter.render(&request(), None).unwrap();
         assert_eq!(rendered, "System\nBe concise.\nUSER: Hello\nASSISTANT:");
 
         let _ = std::fs::remove_file(base);
@@ -565,7 +563,7 @@ mod tests {
     /// A built-in `--chat-template` name resolves without any tokenizer config.
     #[test]
     fn builtin_argument_works_without_tokenizer_config() {
-        let formatter = load_chat_formatter(None, None, None, Some("chatml")).unwrap();
+        let formatter = load_chat_formatter(None, None, Some("chatml")).unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
             panic!("expected a legacy formatter");
         };
@@ -591,7 +589,6 @@ mod tests {
         // Path matcher: vicuna/llava-v1.5-style paths.
         let formatter = load_chat_formatter(
             Some(base.to_str().unwrap()),
-            None,
             Some("models/vicuna-7b-v1.5"),
             None,
         )
@@ -601,7 +598,7 @@ mod tests {
         };
         assert_eq!(formatter.spec.name, "vicuna_v1.1");
         // No config at all + path matcher.
-        let formatter = load_chat_formatter(None, None, Some("deepseek-vl2-7b"), None).unwrap();
+        let formatter = load_chat_formatter(None, Some("deepseek-vl2-7b"), None).unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
             panic!("expected a legacy formatter");
         };
@@ -618,8 +615,7 @@ mod tests {
             r#"{"model_type":"phi4mm","architectures":["Phi4MMForCausalLM"]}"#,
         )
         .unwrap();
-        let formatter =
-            load_chat_formatter(None, None, Some(model_dir.to_str().unwrap()), None).unwrap();
+        let formatter = load_chat_formatter(None, Some(model_dir.to_str().unwrap()), None).unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
             panic!("expected a legacy formatter");
         };
@@ -663,106 +659,8 @@ mod tests {
     fn minicpm_4_6_skips_legacy_inference() {
         assert!(infer_legacy_template_from_model_path("minicpm-v-4.6").is_none());
         assert!(matches!(
-            load_chat_formatter(None, None, Some("minicpm-v-4.6"), None),
+            load_chat_formatter(None, Some("minicpm-v-4.6"), None),
             Err(TemplateError::MissingConfig)
         ));
-    }
-
-    /// A DeepSeek-V4-Flash-shaped model directory: `tokenizer_config.json`
-    /// verbatim from `deepseek-ai/DeepSeek-V4-Flash-0731`, which ships no
-    /// `chat_template`, plus the `config.json` fields encoder selection reads.
-    pub(super) fn write_dsv4_flash_model_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("sglang-server-dsv4-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("tokenizer_config.json"),
-            r#"{
-          "add_bos_token": false,
-          "add_eos_token": false,
-          "bos_token": {
-            "__type": "AddedToken",
-            "content": "<｜begin▁of▁sentence｜>",
-            "lstrip": false,
-            "normalized": true,
-            "rstrip": false,
-            "single_word": false
-          },
-          "clean_up_tokenization_spaces": false,
-          "eos_token": {
-            "__type": "AddedToken",
-            "content": "<｜end▁of▁sentence｜>",
-            "lstrip": false,
-            "normalized": true,
-            "rstrip": false,
-            "single_word": false
-          },
-          "legacy": true,
-          "model_max_length": 1048576,
-          "pad_token": {
-            "__type": "AddedToken",
-            "content": "<｜end▁of▁sentence｜>",
-            "lstrip": false,
-            "normalized": true,
-            "rstrip": false,
-            "single_word": false
-          },
-          "sp_model_kwargs": {},
-          "unk_token": null,
-          "tokenizer_class": "PreTrainedTokenizerFast"
-        }
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("config.json"),
-            r#"{"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"}"#,
-        )
-        .unwrap();
-        dir
-    }
-
-    /// DeepSeek-V4-Flash ships no `chat_template`, so before the built-in
-    /// encoder existed this was `TemplateError::Missing` and
-    /// `load_chat_support` turned it into "OpenAI chat completions disabled".
-    #[test]
-    fn deepseek_v4_flash_uses_the_builtin_encoder() {
-        let dir = write_dsv4_flash_model_dir("builtin-encoder");
-        let formatter = load_chat_formatter(
-            Some(dir.join("tokenizer_config.json").to_str().unwrap()),
-            Some(dir.join("config.json").to_str().unwrap()),
-            Some(dir.to_str().unwrap()),
-            None,
-        )
-        .expect("V4-Flash resolves to the built-in encoder");
-        assert!(matches!(formatter, ChatFormatter::Native(_)));
-        assert_eq!(
-            formatter.render(&request()).unwrap(),
-            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>Be concise.\
-             <\u{ff5c}User\u{ff5c}>Hello<\u{ff5c}Assistant\u{ff5c}></think>"
-        );
-    }
-
-    /// The guard the encoder must not swallow: a template-less model with no
-    /// built-in encoder still disables chat rather than rendering something.
-    #[test]
-    fn template_less_model_without_an_encoder_still_fails() {
-        let dir = write_dsv4_flash_model_dir("no-encoder");
-        std::fs::write(
-            dir.join("config.json"),
-            r#"{"architectures": ["LlamaForCausalLM"], "model_type": "llama"}"#,
-        )
-        .unwrap();
-        let result = load_chat_formatter(
-            Some(dir.join("tokenizer_config.json").to_str().unwrap()),
-            Some(dir.join("config.json").to_str().unwrap()),
-            Some(dir.to_str().unwrap()),
-            None,
-        );
-        assert!(
-            matches!(result, Err(TemplateError::Missing)),
-            "expected the missing-template error, got {:?}",
-            result.map(|_| "a formatter")
-        );
     }
 }
