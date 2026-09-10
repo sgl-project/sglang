@@ -809,6 +809,9 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         return arguments
 
+    def parses_required_natively(self) -> bool:
+        return True
+
     def supports_structural_tag(self) -> bool:
         return _glm47_native_structural_tag_available()
 

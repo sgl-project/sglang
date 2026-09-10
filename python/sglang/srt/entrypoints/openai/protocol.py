@@ -253,6 +253,7 @@ StructuralTagResponseFormat: TypeAlias = Union[
 ToolCallConstraint: TypeAlias = Union[
     Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
     Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
+    Tuple[Literal["ebnf"], str],
 ]
 
 
@@ -1170,8 +1171,9 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            if self.tool_choice == "required" or isinstance(
-                self.tool_choice, ToolChoice
+            if tool_call_constraint[0] != "ebnf" and (
+                self.tool_choice == "required"
+                or isinstance(self.tool_choice, ToolChoice)
             ):
                 raise ValueError(
                     "tool_choice 'required' or a named tool cannot be combined with "
@@ -1845,6 +1847,12 @@ class ResponsesRequest(BaseModel):
             or params.get("json_schema")
         )
         if tool_call_constraint and has_existing_constraints:
+            if tool_call_constraint[0] == "ebnf":
+                # Explicit output constraints take precedence over the default EBNF.
+                logger.warning(
+                    "Constrained decoding is not compatible with tool calls."
+                )
+                return params
             # Refuse rather than silently drop the tool-call grammar.
             raise ValueError(
                 "Cannot combine tool calls with constrained decoding "

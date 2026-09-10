@@ -439,6 +439,7 @@ def create_grammar_backend(
             reasoning_parser,
             tokenizer,
             enable_strict_thinking=get_serving().enable_strict_thinking,
+            skip_ebnf=get_serving().tool_call_parser == "glm47",
         )
 
     return grammar_backend
