@@ -424,7 +424,7 @@ jobs:
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-  
+
   nightly-poc-multi-node-tests-cann910:
     name: multi-node-poc-cann910
     # Disabled: temporarily run only the cann910 w8a8 8p GPQA accuracy case.
