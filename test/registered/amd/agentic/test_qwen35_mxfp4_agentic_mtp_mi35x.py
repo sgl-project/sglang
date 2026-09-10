@@ -102,6 +102,19 @@ HICACHE_WRITE_POLICY = os.environ.get("HICACHE_WRITE_POLICY", "write_through")
 HICACHE_IO_BACKEND = os.environ.get("HICACHE_IO_BACKEND", "direct")
 HICACHE_MEM_LAYOUT = os.environ.get("HICACHE_MEM_LAYOUT", "page_first_direct")
 
+# This checkpoint has 32 q / 2 kv heads, so tp4 gives a 8:1 GQA ratio, which is
+# the one shape where aiter_backend routes target-verify into the hand-written
+# gfx950 assembly kernel (vattn_asm_gfx950; the 16:1 branch does not need it).
+# That kernel is assembled and hipModuleLoad-ed on first use, and its first
+# launch lands inside decode CUDA graph capture, where it returns HIP 709
+# (context is destroyed) and takes the server down before it ever serves a
+# request -- reproduced on both launch attempts of
+# https://github.com/sgl-project/sglang/actions/runs/34448150604. Turning the
+# kernel off drops the 8:1 branch of that gate, so verify falls back to the same
+# generic unified_attention path a tp8 run takes. Set this to 1 to measure the
+# assembly kernel again once it survives capture.
+ASM_VERIFY_ATTN = os.environ.get("AGENTIC_ASM_VERIFY_ATTN", "0")
+
 SERVER_LAUNCH_TIMEOUT = int(os.environ.get("AGENTIC_SERVER_TIMEOUT", "5400"))
 BENCH_TIMEOUT = int(os.environ.get("AGENTIC_BENCH_TIMEOUT", "7200"))
 
@@ -117,6 +130,7 @@ COMMON_ENV = {
     "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
     "ROCM_QUICK_REDUCE_QUANTIZATION": "INT8",
     "SGLANG_TIMEOUT_KEEP_ALIVE": "1800",
+    "SGLANG_ASM_VERIFY_ATTN": ASM_VERIFY_ATTN,
 }
 
 
@@ -259,9 +273,12 @@ def render_report(result: dict, trace_summary: str) -> str:
         f"### Qwen3.5-397B-A17B MXFP4 + EAGLE MTP, AgentX agentic replay "
         f"[{os.getenv('GPU_CONFIG', 'MI35x')}]\n\n"
         f"| workload | value |\n| --- | --- |\n"
+        f"| parallelism | tp{TP_SIZE} / ep{EP_SIZE} |\n"
         f"| concurrency | {CONCURRENCY} |\n"
         f"| max turns / conversation | {MAX_TURNS} |\n"
         f"| kv offloading | {KV_OFFLOADING} |\n"
+        f"| gfx950 asm verify attention | "
+        f"{'on' if ASM_VERIFY_ATTN == '1' else 'off'} |\n"
         f"{trace_summary}\n"
         f"| metric | value |\n| --- | --- |\n"
         f"| completed turns | {result.get('completed')} |\n"
