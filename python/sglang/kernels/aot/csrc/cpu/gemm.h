@@ -80,16 +80,21 @@ inline CPUActMethod select_act_func(const std::optional<double>& alpha, const st
   return alpha.has_value() ? CPUActMethod::swiglu : CPUActMethod::clamped_silu_and_mul;
 }
 
-// swiglu is selected by its (alpha, limit) parameters rather than by name and
-// takes precedence; the name is still validated, so it cannot pass silently.
-inline CPUActMethod act_method_from_string(const std::optional<std::string>& activation, bool has_swiglu_params) {
+// The clamped activations are selected by their (alpha, limit) parameters rather
+// than by name and take precedence; the name is still validated, so it cannot
+// pass silently. Everything else is selected by name.
+inline CPUActMethod act_method_from_string(
+    const std::optional<std::string>& activation,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit) {
   const bool unnamed_or_silu = !activation.has_value() || activation.value() == "silu";
-  if (has_swiglu_params) {
+  if (limit.has_value()) {
+    const CPUActMethod clamped = select_act_func(alpha, limit);
     TORCH_CHECK(
-        unnamed_or_silu || activation.value() == "swiglu",
-        "Unsupported activation with clamped swiglu parameters: ",
+        unnamed_or_silu || (clamped == CPUActMethod::swiglu && activation.value() == "swiglu"),
+        "Unsupported activation with clamped activation parameters: ",
         activation.value());
-    return CPUActMethod::swiglu;
+    return clamped;
   }
   if (unnamed_or_silu) {
     return CPUActMethod::silu_and_mul;

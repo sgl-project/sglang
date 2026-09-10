@@ -295,7 +295,9 @@ class TestGemm(CustomTestCase):
             mat1, mat2, bias, False, torch.float32
         )
         self.assertEqual(out.dtype, torch.float32)
-        atol = rtol = precision[torch.float32]
+        # Tolerance follows the input dtype, not the output one: the inputs are
+        # bf16 and brgemm accumulates in a different order than torch's matmul.
+        atol = rtol = precision[mat1.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
         packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)

@@ -895,7 +895,7 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation) {
-  const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
+  const CPUActMethod act_func = act_method_from_string(activation, alpha, limit);
   // the int8 and int4 kernels hardcode silu in their fused store step
   const bool is_int_quant =
       moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8;
@@ -1076,7 +1076,6 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
-      auto act_func = select_act_func(alpha, limit);
 
       CHECK_MOE_SCALES_FP8(1, 2);
       fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
@@ -1116,7 +1115,6 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
-      auto act_func = select_act_func(alpha, limit);
 
       // mxfp4 supports only group size of 32 (2^5)
       constexpr int64_t group_size = 32;
@@ -1201,7 +1199,6 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       bool with_bias = w1_bias.has_value();
-      auto act_func = select_act_func(alpha, limit);
 
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
