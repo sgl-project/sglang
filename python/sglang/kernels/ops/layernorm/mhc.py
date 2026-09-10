@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
@@ -2143,6 +2144,14 @@ def _block_m_for(m: int) -> int:
     return _HC_MIX_BLOCK_M
 
 
+def _num_stages_for(m: int, k: int) -> int:
+    # GB300 verify batches benefit from a smaller shared-memory footprint.
+    # This changes memory scheduling only; K tiles and reduction order stay fixed.
+    if get_platform().is_blackwell and k == 20480 and 64 <= m <= 384:
+        return 1
+    return _HC_MIX_NUM_STAGES
+
+
 def _num_slices_for(k: int) -> int:
     """Slice count depends only on K, never on batch size M."""
     blocks = k // _HC_MIX_BLOCK_K
@@ -2193,7 +2202,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_HC_MIX_NUM_STAGES,
+        num_stages=_num_stages_for(m, k),
     )
     _hc_mix_stats_reduce_kernel[(grid_m,)](
         part_mix,
@@ -2319,7 +2328,7 @@ def hc_mix_stats_sinkhorn(
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_HC_MIX_NUM_STAGES,
+        num_stages=_num_stages_for(m, k),
     )
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,

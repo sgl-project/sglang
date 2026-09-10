@@ -40,6 +40,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     MqaAttentionBase,
+    _apply_wo_a_bf16_matmul,
     _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
@@ -253,7 +254,6 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         if _is_npu and forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
 
@@ -353,7 +353,12 @@ class DSparkAttention(MqaAttentionBase):
         )
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if self._use_fast_kernel:
-            o = torch.einsum("bgd,grd->bgr", o, wo_a)
+            o = _apply_wo_a_bf16_matmul(
+                o,
+                wo_a,
+                is_decode=forward_batch.forward_mode.is_decode(),
+                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
         out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
@@ -572,6 +577,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        hc_stats_stream: Optional[torch.cuda.Stream] = None,
+        moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__(
             config=_dspark_stage_config(config),
@@ -580,6 +587,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             prefix=prefix,
             is_nextn=True,
             alt_streams=alt_streams,
+            hc_stats_stream=hc_stats_stream,
+            moe_routed_quant_stream=moe_routed_quant_stream,
         )
         self.stage_id = stage_id
         self.dim = config.hidden_size
@@ -685,6 +694,7 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         forward_batch: ForwardBatch,
         prev_pre: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
         x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
             hidden_states,
@@ -692,10 +702,13 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             self.hc_attn_scale,
             self.hc_attn_base,
             apply_pre=prev_pre,
+            stats_stream=stats_stream,
         )
         x = self.input_layernorm(x)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(positions, x, forward_batch)
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
@@ -705,9 +718,12 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             self.hc_ffn_scale,
             self.hc_ffn_base,
             apply_pre=attn_pre,
+            stats_stream=stats_stream,
         )
         x = self.post_attention_layernorm(x)
         x = self._run_ffn(x, forward_batch)
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
 
@@ -797,6 +813,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
             [torch.cuda.Stream()] if use_multi_stream else None
         )
+        self.moe_routed_quant_stream = (
+            torch.cuda.Stream()
+            if use_multi_stream and torch.version.cuda is not None
+            else None
+        )
+        self.hc_stats_stream = (
+            torch.cuda.Stream()
+            if use_multi_stream
+            and torch.version.cuda is not None
+            and get_platform().is_blackwell
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
+            else None
+        )
         self.stages = nn.ModuleList(
             [
                 DSparkV4Stage(
@@ -808,6 +837,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"stages.{stage_id}", prefix),
                     alt_streams=self.alt_streams,
+                    hc_stats_stream=self.hc_stats_stream,
+                    moe_routed_quant_stream=self.moe_routed_quant_stream,
                 )
                 for stage_id in range(self.num_stages)
             ]
