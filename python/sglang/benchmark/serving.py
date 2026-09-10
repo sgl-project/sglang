@@ -93,6 +93,9 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    # Multi-turn only: per-round output lengths, consumed by
+    # wrap_multi_turn_request_func. `output_len` stays the single-round value.
+    output_lens: Optional[List[int]] = None
 
 
 @dataclass
@@ -1305,6 +1308,7 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
         pbar: Optional[tqdm] = None,
     ) -> List[RequestFuncOutput]:
         prompts = request_func_input.prompt
+        output_lens = request_func_input.output_lens
         prev_messages: List[Dict[str, str]] = []
         outputs = []
 
@@ -1318,8 +1322,15 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
                 )
             prev_messages.extend(normalized)
 
+            round_output_len = (
+                output_lens[round_index]
+                if output_lens is not None and round_index < len(output_lens)
+                else request_func_input.output_len
+            )
             inner_input = replace(
-                copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
+                copy.deepcopy(request_func_input),
+                prompt=copy.deepcopy(prev_messages),
+                output_len=round_output_len,
             )
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
@@ -1552,6 +1563,7 @@ async def benchmark(
             api_url=api_url,
             prompt_len=request.prompt_len,
             output_len=request.output_len,
+            output_lens=request.output_lens,
             lora_name=lora_name,
             image_data=request.image_data,
             extra_request_body=merged_extra_body,

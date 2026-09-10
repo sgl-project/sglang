@@ -39,6 +39,11 @@ class AgenticTraceDataset(BaseDataset):
     multi-turn and replays each conversation round by round, feeding the
     server's real assistant reply back into the next round's history.
 
+    A turn may also carry ``output_tokens``, the reply length recorded for it.
+    Traces that provide it are replayed with that per-turn decode length, since
+    agentic replies range over two orders of magnitude within one conversation.
+    ``--sharegpt-output-len`` overrides it with a uniform length.
+
     Use with a chat backend (``--backend sglang-oai-chat``).
     """
 
@@ -82,11 +87,19 @@ class AgenticTraceDataset(BaseDataset):
             if self.num_requests > 0 and len(filtered_dataset) >= self.num_requests:
                 break
 
-            prompt = [turn["messages"] for turn in conversation if turn.get("messages")]
+            turns = [turn for turn in conversation if turn.get("messages")]
             if self.max_turns:
-                prompt = prompt[: self.max_turns]
-            if not prompt:
+                turns = turns[: self.max_turns]
+            if not turns:
                 continue
+            prompt = [turn["messages"] for turn in turns]
+
+            # A uniform --sharegpt-output-len wins over the recorded lengths.
+            output_lens = None
+            if self.fixed_output_len is None and all(
+                turn.get("output_tokens") for turn in turns
+            ):
+                output_lens = [int(turn["output_tokens"]) for turn in turns]
 
             # Informational only: multi-turn replay ignores per-row prompt_len.
             prompt_len = int(conversation[0].get("prompt_tokens", 0))
@@ -95,7 +108,8 @@ class AgenticTraceDataset(BaseDataset):
                 DatasetRow(
                     prompt=prompt,
                     prompt_len=prompt_len,
-                    output_len=output_len,
+                    output_len=output_lens[0] if output_lens else output_len,
+                    output_lens=output_lens,
                 )
             )
 
@@ -110,5 +124,12 @@ class AgenticTraceDataset(BaseDataset):
             f"(offset={offset}, turns/conv min={min(num_turns)} "
             f"max={max(num_turns)} avg={np.mean(num_turns):.1f})"
         )
-        print(f"#Output tokens per turn: {output_len}")
+        recorded = [n for row in filtered_dataset for n in (row.output_lens or [])]
+        if recorded:
+            print(
+                f"#Output tokens per turn: recorded, min={min(recorded)} "
+                f"max={max(recorded)} avg={np.mean(recorded):.1f}"
+            )
+        else:
+            print(f"#Output tokens per turn: {output_len}")
         return filtered_dataset

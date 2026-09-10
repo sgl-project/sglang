@@ -23,6 +23,10 @@ class DatasetRow:
     prompt: Any
     prompt_len: int
     output_len: int
+    # Multi-turn rows only: per-round output lengths, one per entry in `prompt`.
+    # Agentic traces record a reply length per turn and they vary by two orders
+    # of magnitude, so a single `output_len` misstates the decode work.
+    output_lens: Optional[List[int]] = None
     text_prompt_len: Optional[int] = None
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
