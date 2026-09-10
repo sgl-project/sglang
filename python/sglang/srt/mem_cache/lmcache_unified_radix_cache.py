@@ -1214,8 +1214,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.prefix_indices = canonical
         req.kv.cache_protected_len = total_hit
         req.last_node = matched.last_device_node
-        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
-        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+        req.lock_receipt = lock_result.to_dec_params()
         req.swa_prefix_lock_released = False
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
