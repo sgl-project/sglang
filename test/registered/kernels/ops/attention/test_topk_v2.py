@@ -352,7 +352,56 @@ def test_topk_v2_ragged_window(name: str, rows, k: int, offset_shift: int) -> No
     ref_raw = _reference(windows, lengths.cpu(), k)
     _assert_topk_close(windows, ref_raw, our_raw, len(rows), lengths.cpu(), k)
 
-    assert torch.equal(scores, before)
+
+def _assert_topk_values(window, indices, k):
+    indices = indices.cpu().long()
+    window = window.cpu()
+    assert indices.numel() == k
+    assert ((indices >= 0) & (indices < window.numel())).all(), indices
+    assert indices.unique().numel() == k
+    expected = window.topk(k).values.sort().values
+    actual = window[indices].sort().values
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("num_ties", [48, 96])
+@torch.inference_mode()
+def test_topk_v2_negative_infinity_ties(num_ties: int) -> None:
+    """Inactive entries must not displace valid -inf scores or leave slots unwritten."""
+    k = 16
+    length = num_ties + 3
+    scores = torch.full((1, (length + 3) & ~3), -torch.inf, device="cuda")
+    scores[0, :3] = torch.tensor([1.0, 2.0, 3.0], device="cuda")
+    lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
+    out = torch.full((1, k), -2, dtype=torch.int32, device="cuda")
+
+    topk_transform_paged_v2(scores, lengths, None, out, PAGE_SIZE, _plan(lengths))
+
+    _assert_topk_values(scores[0, :length], out[0], k)
+
+
+@pytest.mark.parametrize("length", [257, 8193, 16385])
+@torch.inference_mode()
+def test_topk_v2_ragged_negative_infinity(length: int) -> None:
+    """Columns before an unaligned window must never beat its valid -inf scores."""
+    k = 16
+    scores = torch.full((3, (length + 6) & ~3), OUTSIDE_SCORE, device="cuda")
+    starts = torch.tensor([1, 2, 3], dtype=torch.int32, device="cuda")
+    lengths = torch.full((3,), length, dtype=torch.int32, device="cuda")
+    offsets = starts + 1024
+    out = torch.full((3, k), -2, dtype=torch.int32, device="cuda")
+    for row, start in enumerate((1, 2, 3)):
+        scores[row, start : start + length] = -torch.inf
+        scores[row, start : start + 3] = torch.tensor([1.0, 2.0, 3.0], device="cuda")
+
+    topk_transform_ragged_v2(
+        scores, lengths, out_offsets=offsets, out_indices=out, row_starts=starts
+    )
+
+    for row, start in enumerate((1, 2, 3)):
+        _assert_topk_values(
+            scores[row, start : start + length], out[row] - offsets[row], k
+        )
 
 
 @pytest.mark.parametrize("k", [512, 2048])

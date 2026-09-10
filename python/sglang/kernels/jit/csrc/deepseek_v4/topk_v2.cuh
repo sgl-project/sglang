@@ -23,7 +23,6 @@
 #include <climits>
 #include <cstdint>
 #include <iterator>
-#include <limits>
 
 namespace sglang {
 
@@ -216,16 +215,17 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
     device::PDLWaitPrimary<kPDL>();
     static_assert(kVecSize <= kBlockSize, "not enough threads ");
     if (const auto tx = threadIdx.x; tx < rem) {
-      score[row_start - rem + tx] = -std::numeric_limits<float>::max();
+      score[row_start - rem + tx] = impl::padding_value();
     }
   }
-
+  using device::topk::broadcast;
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
       .out = out,
       .topk = topk,
       .seq_len = seq_len + rem,
-      .bias = offset - static_cast<int32_t>(rem),
+      .bias = broadcast(offset - static_cast<int32_t>(rem)),
+      .input_start = broadcast(rem),
   };
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
   if (problem.seq_len <= Register2::kMaxSeqLen) {

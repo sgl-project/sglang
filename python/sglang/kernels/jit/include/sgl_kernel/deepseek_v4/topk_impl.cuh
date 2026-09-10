@@ -76,6 +76,14 @@ SGL_DEVICE uint32_t extract_exact_bin(float x) {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
+constexpr float padding_value() {
+  return std::numeric_limits<float>::quiet_NaN();
+}
+
+constexpr float infinity_value() {
+  return std::numeric_limits<float>::infinity();
+}
+
 // template <uint32_t kBits>
 // SGL_DEVICE uint32_t extract_coarse_bin(float x) {
 //   static_assert(0 < kBits && kBits < 15);
@@ -107,7 +115,6 @@ SGL_DEVICE uint16_t coarse_bin_to_bits_finite(uint32_t bin) {
 template <uint32_t kBits>
 SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   constexpr uint32_t kShift = 16 - kBits;
-  constexpr float kInf = std::numeric_limits<float>::infinity();
   constexpr uint32_t kInfBin = 0xFC00u >> kShift;  // bin holding the +inf key
   const uint32_t key = bin << kShift;              // ordered16 key at the low edge
   // ordered16 -> fp16 value (inverse of the transform in extract_coarse_bin);
@@ -136,10 +143,10 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   // [0x0400, 0xFC00) finite, 0xFC00 = +inf, (0xFC00, 0xFFFF] positive-NaN
   // space. The +/-inf keys stand in as +/-65536, one ideal step past fp16 max,
   // so the midpoint lands on the +/-65520 fp32 -> fp16 overflow threshold.
-  if (bin == 0) return -kInf;      // every value bins at >= 0
-  if (bin > kInfBin) return kInf;  // NaN key space: nothing bins that high
+  if (bin == 0) return -infinity_value();      // every value bins at >= 0
+  if (bin > kInfBin) return infinity_value();  // NaN key space: nothing bins that high
   const auto to_val = [&](uint32_t okey) -> float {
-    if (okey < 0x03FFu) return -kInf;
+    if (okey < 0x03FFu) return -infinity_value();
     if (okey == 0x03FFu) return -65536.0f;
     if (okey == 0xFC00u) return 65536.0f;
     return to_finite_val(okey);
@@ -180,7 +187,7 @@ struct alignas(8) TieValue {
   float value;
   uint32_t idx;
   inline static constexpr TieValue invalid() {
-    return TieValue{-FLT_MAX, 0xFFFFFFFFu};
+    return TieValue{padding_value(), 0xFFFFFFFFu};
   }
 };
 
@@ -193,7 +200,8 @@ struct TopKProblem {
   int32_t* __restrict__ out;  // page_indices [topk]
   uint32_t topk;
   uint32_t seq_len;
-  int32_t bias = 0;  // needed by ragged mode
+  int32_t bias = 0;
+  uint32_t input_start = 0;  // needed by ragged mode
 
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
@@ -590,13 +598,18 @@ struct TopKRegister : TopKRadixBase<12> {
       if (vi == num_full - 1) {
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
-          if (j >= tail_start) local_vecs[i][j] = -FLT_MAX;
+          if (j >= tail_start) local_vecs[i][j] = padding_value();
         }
       }
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
       }
+    }
+    const auto num_padding = kVecSize - tail_start + problem.input_start;
+    if (tx == 0 && num_padding > 0) {
+      atomicSub(&smem->histogram[kHistSize - 1], num_padding);
+      atomicAdd(&smem->histogram[0], num_padding);
     }
     __syncthreads();
 
@@ -672,6 +685,11 @@ struct TopKStreaming : TopKRadixBase<12> {
       const auto bin = extract_coarse_bin<kHistBits>(val);
       atomicAdd(&smem->histogram[bin], 1);
     });
+    const auto num_padding = problem.input_start;
+    if (tx == 0 && num_padding != 0) {
+      atomicSub(&smem->histogram[kHistSize - 1], num_padding);
+      atomicAdd(&smem->histogram[0], num_padding);
+    }
     __syncthreads();
 
     // Phase 2: Find the threshold bin
