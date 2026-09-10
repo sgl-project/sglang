@@ -572,7 +572,7 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BLO
       ldc,                                                                            \
       block_size_K);
 
-#define LAUNCH_TINYGEMM_KERNEL_NN2(MB_SIZE, NB_SIZE)                \
+#define LAUNCH_TINYGEMM_KERNEL_NN2(MB_SIZE, NB_SIZE)                          \
   tinygemm_kernel_nn2<scalar_t, packed_t, has_bias, MB_SIZE, NB_SIZE>::apply( \
       A + mb_start * lda,                                                     \
       B + nb_start * 2,                                                       \
