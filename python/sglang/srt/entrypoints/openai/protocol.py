@@ -1724,15 +1724,16 @@ class ResponsesRequest(BaseModel):
         if isinstance(item.get("id"), str) and item.get("content") is not None:
             item = {k: v for k, v in item.items() if k != "id"}
 
-        content = item.get("content")
-        if not isinstance(content, list):
-            return item
-
-        item = dict(item)
-        item["content"] = [
-            ResponsesRequest._normalize_content_part_for_validation(part)
-            for part in content
-        ]
+        # tool-output items carry their parts under "output" instead of "content".
+        for key in ("content", "output"):
+            parts = item.get(key)
+            if not isinstance(parts, list):
+                continue
+            item = dict(item)
+            item[key] = [
+                ResponsesRequest._normalize_content_part_for_validation(part)
+                for part in parts
+            ]
         return item
 
     @staticmethod

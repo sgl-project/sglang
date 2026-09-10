@@ -2,8 +2,10 @@ import json
 import sys
 
 import pytest
+from openai.types.responses.response_output_text import Logprob
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.entrypoints.openai.protocol import Function, ResponsesRequest, Tool
+from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
@@ -11,8 +13,11 @@ from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
+    THINK_CLOSE,
+    THINK_OPEN,
     TOOLS_CLOSE,
     TOOLS_OPEN,
+    strip_response_wrappers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -247,6 +252,190 @@ def test_detector_capabilities_and_registration() -> None:
     parser = FunctionCallParser([_make_tool("python")], "kimi_k3")
     assert isinstance(parser.detector, KimiK3Detector)
     assert parser.get_structure_constraint("required") is not None
+
+
+LEAKED_TOOLS_SECTION = (
+    f'{TOOLS_OPEN}<|open|>call tool="read_agent" index="1"<|sep|>'
+    f'<|open|>argument key="id" type="string"<|sep|>worker_1'
+    f"<|close|>argument<|sep|><|close|>call<|sep|>{TOOLS_CLOSE}{MESSAGE_CLOSE}"
+)
+
+
+def _strip(text: str, reasoning_separated: bool = True) -> str:
+    return KimiK3Detector().strip_template_artifacts(text, reasoning_separated)
+
+
+def test_strip_template_artifacts_whitespace_behavior() -> None:
+    detector = KimiK3Detector()
+
+    assert detector.strip_template_artifacts("   ") == "   "
+
+    marker_only = f"{RESPONSE_OPEN}   {RESPONSE_CLOSE}"
+    assert detector.strip_template_artifacts(marker_only) == ""
+
+
+def test_strip_response_wrappers_preserves_whitespace() -> None:
+    text = " \t\n "
+
+    assert strip_response_wrappers(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<|open|>",
+        "<|close|>",
+        "<|",
+        "<|open|>tools",
+        "<|close|>response",
+        f"{RESPONSE_OPEN}<|close|",
+    ],
+)
+def test_truncated_markers_leave_no_text(text: str) -> None:
+    assert _strip(text) == ""
+
+
+def test_unparsed_tools_section_dropped_with_reply_kept() -> None:
+    assert _strip(LEAKED_TOOLS_SECTION) == ""
+    assert (
+        _strip(f"{RESPONSE_OPEN}on it{RESPONSE_CLOSE}{LEAKED_TOOLS_SECTION}") == "on it"
+    )
+
+
+def test_narration_before_truncated_marker_survives() -> None:
+    assert (
+        _strip("I am delegating the docs subagent.<|close|>response")
+        == "I am delegating the docs subagent."
+    )
+
+
+def test_think_channel_content_is_dropped_not_unwrapped() -> None:
+    assert _strip(f"{THINK_OPEN}secret{THINK_CLOSE}visible") == "visible"
+    assert _strip(f"{THINK_OPEN}cut off mid-thought") == ""
+
+
+def test_think_content_kept_when_reasoning_is_not_separated() -> None:
+    assert (
+        _strip(f"weighing{THINK_CLOSE}visible", reasoning_separated=False)
+        == "weighingvisible"
+    )
+    assert (
+        _strip(f"{THINK_OPEN}weighing{THINK_CLOSE}visible", reasoning_separated=False)
+        == "weighingvisible"
+    )
+
+
+def test_response_channel_kept_inline_when_reasoning_is_not_separated() -> None:
+    assert (
+        _strip(
+            f"trace{THINK_CLOSE}{RESPONSE_OPEN}answer{RESPONSE_CLOSE}",
+            reasoning_separated=False,
+        )
+        == "traceanswer"
+    )
+    assert (
+        _strip(f"trace{THINK_CLOSE}{RESPONSE_OPEN}answer{RESPONSE_CLOSE}") == "answer"
+    )
+
+
+def test_think_close_without_open_drops_reasoning() -> None:
+    assert _strip(f"deliberating{THINK_CLOSE}visible") == "visible"
+    assert _strip(f"deliberating{THINK_CLOSE}{LEAKED_TOOLS_SECTION}") == ""
+
+
+def test_quoted_call_token_without_attributes_survives() -> None:
+    assert (
+        _strip("calls open with <|open|>call, then attributes")
+        == "calls open with , then attributes"
+    )
+
+
+def test_markers_only_strip_keeps_reasoning_text() -> None:
+    detector = KimiK3Detector()
+    assert (
+        detector.strip_template_markers(f"weighing options{THINK_CLOSE}")
+        == "weighing options"
+    )
+    assert (
+        detector.strip_template_markers("weighing options<|open|>argu")
+        == "weighing options"
+    )
+    assert detector.strip_template_markers('weighing <|open|>call tool="rea') == (
+        "weighing "
+    )
+
+
+@pytest.mark.parametrize(
+    "text", ["", "hello world", "a < b and c |> d", "is 3 < 4? yes <"]
+)
+def test_plain_text_is_untouched(text: str) -> None:
+    assert _strip(text) == text
+
+
+def test_parser_strips_when_detection_misses() -> None:
+    parser = FunctionCallParser([_make_tool("python")], "kimi_k3")
+    assert parser.parse_non_stream("done<|open|>tool") == ("done", [])
+
+
+def test_parser_strips_when_no_tools_declared() -> None:
+    parser = FunctionCallParser([], "kimi_k3")
+    assert parser.parse_non_stream(LEAKED_TOOLS_SECTION) == ("", [])
+
+
+def _logprobs(*tokens: str) -> list[Logprob]:
+    return [
+        Logprob(
+            token=token,
+            logprob=-0.5,
+            bytes=list(token.encode("utf-8")),
+            top_logprobs=[],
+        )
+        for token in tokens
+    ]
+
+
+def _output_items(text: str, output_logprobs: list[Logprob] | None = None):
+    server = object.__new__(OpenAIServingResponses)
+    server.reasoning_parser = None
+    server.tool_call_parser = None
+    server._artifact_detector = KimiK3Detector()
+    return server._make_response_output_items(
+        ResponsesRequest(input="hi"),
+        text,
+        tokenizer=None,
+        output_logprobs=output_logprobs,
+        require_reasoning=False,
+    )
+
+
+def test_syntax_only_text_still_yields_a_message() -> None:
+    items = _output_items(f"{RESPONSE_OPEN}<|close|")
+    assert len(items) == 1
+    assert items[0].content[0].text == ""
+
+
+def test_logprobs_dropped_when_cleanup_changes_text() -> None:
+    items = _output_items(
+        f"trace{THINK_CLOSE}answer",
+        output_logprobs=_logprobs("trace", THINK_CLOSE, "answer"),
+    )
+    assert items[0].content[0].text == "traceanswer"
+    assert items[0].content[0].logprobs is None
+
+
+def test_logprobs_kept_verbatim_when_cleanup_changes_nothing() -> None:
+    items = _output_items("answer", output_logprobs=_logprobs("something", "else"))
+    assert [entry.token for entry in items[0].content[0].logprobs] == [
+        "something",
+        "else",
+    ]
+
+
+def test_logprobs_dropped_when_they_cannot_be_reconciled() -> None:
+    items = _output_items(
+        f"trace{THINK_CLOSE}answer", output_logprobs=_logprobs("something", "else")
+    )
+    assert items[0].content[0].logprobs is None
 
 
 if __name__ == "__main__":
