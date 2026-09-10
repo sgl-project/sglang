@@ -511,12 +511,10 @@ class MoEGate(nn.Module):
 
         if get_exec().deterministic.enable_deterministic_inference:
             if _is_cuda or _is_hip:
-                from sglang.srt.batch_invariant_ops import matmul_persistent
-
-                return matmul_persistent(
+                return torch.mm(
                     hidden_states, self.weight.t(), out_dtype=torch.float32
                 )
-            return F.linear(hidden_states, self.weight, None)
+            return F.linear(hidden_states.float(), self.weight.float(), None)
 
         if (
             not self.is_deepseek_v4
