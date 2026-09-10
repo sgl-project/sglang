@@ -2081,7 +2081,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.tp_rank = tp_rank
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
-        self.token_to_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()

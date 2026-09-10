@@ -346,7 +346,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.enable_staging = False
         queue.enable_deferred_kv_release = False
-        queue.token_to_kv_pool = object()
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
