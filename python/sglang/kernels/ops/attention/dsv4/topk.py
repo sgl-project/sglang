@@ -18,11 +18,6 @@ from .utils import make_name
 
 @cache_once
 def _jit_topk_v1_module():
-    # topk (<= 1024) is a runtime argument, not a compile-time constant, so a
-    # single module serves every k. Baking it in via -DSGL_TOPK used to build one
-    # module per k, and since the macro fed a `constexpr` rather than a template
-    # parameter every module exported identically mangled symbols -- see the
-    # comment in topk_v1.cuh for how that broke the second module's launch.
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
         make_name("topk_v1"),
@@ -34,15 +29,34 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
-    # v2 is universal: topk (<= 2048) is a runtime argument, not a compile-time
-    # constant, so a single module serves every k.
+    from sglang.kernels.ops.misc import get_max_active_clusters
+
+    args = make_cpp_args(is_arch_support_pdl())
+    # Leave these undefined if the probe fails: topk_v2.cuh carries per-arch
+    # defaults, and a 0 would size the persistent pool to an empty grid.
+    extra_cuda_cflags = []
+    if is_arch_support_pdl():  # set the persistent cluster size after hopper
+        occ_8_2, occ_16_1 = 0, 0
+        try:
+            occ_8_2 = get_max_active_clusters(8, occupancy=2)
+            # NOTE: cluster 16 might fail, but at least cluster 8 is ok
+            occ_16_1 = get_max_active_clusters(16, occupancy=1)
+        except Exception:
+            pass
+        extra_cuda_cflags = [
+            f"-DSGL_TOPK_V2_MAX_C8_OCC2={occ_8_2}",
+            f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}",
+        ]
+    kernel = f"TopKKernel<{args}>"
     return load_jit(
         make_name("topk_v2"),
+        *args,
+        extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
-            ("topk_transform_paged", "TopKKernel::transform_paged"),
-            ("topk_transform_ragged", "TopKKernel::transform_ragged"),
-            ("topk_plan", "TopKKernel::plan"),
+            ("topk_transform_paged", f"{kernel}::transform_paged"),
+            ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+            ("topk_plan", f"{kernel}::plan"),
         ],
     )
 
@@ -75,15 +89,14 @@ def topk_transform_paged(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
-    """Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
+def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Tensor:
+    """
+    Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
+    NOTE: every entry of ``seq_lens`` must be NON-NEGATIVE.
 
-    IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE. The device
-    kernel reads the int32 buffer as ``uint32_t``, so a negative length (e.g.
-    -4 from a DP-padded / idle-companion row) reinterprets as ~4e9, poisons
-    the plan, and drives the transform kernel into an illegal memory access.
-    Producers of padded rows must clamp their lengths to 0 (0 selects the
-    trivial all-(-1) output path, which is safe).
+    :param static_threshold: If a batch item has `seq_len` > `static_threshold`,
+                             prefer the cluster implementation.
+                             Negative number means internal heuristic.
     """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
@@ -111,6 +124,9 @@ def topk_transform_ragged_v2(
     Unlike :func:`topk_transform_paged_v2` this needs no page table and no plan
     (the cluster path only pays off for very few rows, and prefill has many).
 
+    NOTE: ``scores`` is written in place -- the <= 3 columns ahead of each
+    row's window that the 16-byte-aligned read base pulls in are masked out.
+    They are invalid for that row and the buffer must have no other consumer.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
     if is_xpu():
@@ -145,14 +161,10 @@ def topk_transform_paged_v2(
     * ``page_tables`` given -- ``out_page_indices`` receives the page-table
       transform of them.
 
-    IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
-    ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
-    values. The kernel reads lengths as ``uint32_t``: a negative entry
-    reinterprets as a ~4e9-token sequence, sending the row down the cluster
-    path over garbage scores and crashing with an illegal memory access
-    (GLM 5.2 MTP DP-idle companion rows hit exactly this). A length of 0 is
-    the valid way to express "no tokens": the row takes the trivial path and
-    the output is all -1.
+    NOTE: every entry of `seq_lens` must be NON-NEGATIVE, and `metadata` must
+    come from :func:`plan_topk_v2` over the same `seq_lens` values.
+    A length of 0 is the valid way to express "no tokens": the row takes the
+    trivial path and the output is guaranteed to be all -1.
     """
     if is_xpu():
         torch.ops.sgl_kernel.topk_transform_paged(
