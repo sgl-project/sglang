@@ -123,6 +123,16 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
         result = generate_completion_prompt_from_request(request)
         self.assertEqual(result, "just code")
 
+    def test_none_suffix_returns_prompt_directly(self):
+        """A None suffix (the default) must bypass FIM, not inject 'None'."""
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "deepseek_coder",
+        ):
+            request = CompletionRequest(prompt="just code", suffix=None)
+            result = generate_completion_prompt_from_request(request)
+            self.assertEqual(result, "just code")
+
     def test_nonempty_suffix_uses_fim_template(self):
         """Test that non-empty suffix triggers FIM formatting."""
         with patch(
