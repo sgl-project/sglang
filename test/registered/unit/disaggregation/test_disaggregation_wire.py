@@ -54,6 +54,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -469,9 +470,14 @@ class TestMooncakePPStaging(unittest.TestCase):
         )
 
 
-class TestEagleDsaSeedTransfer(unittest.TestCase):
+class TestEagleDsaSeedTransfer(CustomTestCase):
     @staticmethod
-    def _make_req(seed, metadata_buffer_index=0):
+    def _make_req(
+        seed,
+        metadata_buffer_index=0,
+        sampling_mask=None,
+        sampling_logprob=None,
+    ):
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
             output_ids=[101],
@@ -481,7 +487,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             cached_tokens_storage=0,
             multimodal_inputs=None,
             return_logprob=False,
-            return_sampling_mask=False,
+            return_sampling_mask=sampling_mask is not None,
+            output_token_sampling_mask=(
+                None if sampling_mask is None else [sampling_mask]
+            ),
+            output_token_sampling_logprobs=(
+                None if sampling_logprob is None else [sampling_logprob]
+            ),
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
             output_topk_index=torch.tensor([7]),
@@ -494,6 +506,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             size=2,
             hidden_size=2,
             hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=16,
             output_dsa_topk_indices_dim=3,
         )
         seed = torch.tensor([4, 5, 6], dtype=torch.int32)
@@ -511,6 +524,46 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
+
+    def test_sampling_mask_metadata_is_opt_in(self):
+        """Disabled masks stay off the wire; enabled masks round-trip at capacity."""
+        schemas = []
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(enabled),
+            ):
+                buffers = MetadataBuffers(
+                    size=1,
+                    hidden_size=2,
+                    hidden_states_dtype=torch.float32,
+                    max_sampling_mask_tokens=3,
+                )
+                buffers.set_buf(
+                    self._make_req(
+                        None,
+                        sampling_mask=[7, 8, 9] if enabled else None,
+                        sampling_logprob=-1.25 if enabled else None,
+                    )
+                )
+                schemas.append(buffers.get_buf_infos())
+                if enabled:
+                    self.assertEqual(
+                        buffers.output_token_sampling_mask_idx.shape, (1, 3)
+                    )
+                    length, mask, logprob = buffers.get_buf(0)[6:9]
+                    self.assertEqual(length[0].item(), 3)
+                    self.assertEqual(mask.tolist(), [7, 8, 9])
+                    self.assertAlmostEqual(logprob[0].item(), -1.25)
+                else:
+                    self.assertIsNone(buffers.output_token_sampling_mask_len)
+                    self.assertIsNone(buffers.output_token_sampling_mask_idx)
+                    self.assertIsNone(buffers.output_token_sampling_logprobs)
+                    self.assertEqual(buffers.get_buf(0)[6:9], (None, None, None))
+        disabled_ptrs, _, disabled_sizes = schemas[0]
+        enabled_ptrs, _, enabled_sizes = schemas[1]
+        self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 3)
+        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 3 * 4 + 128)
 
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
@@ -735,7 +788,7 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.get_unified_swa_ring_buf_infos = lambda: (
         _buf_infos(12) if unified else ([], [], [])
     )
-    pool.get_c128_state_buf_infos = lambda: ([], [], [])
+    pool.get_request_state_buf_infos = lambda: ([], [], [])
     return pool
 
 

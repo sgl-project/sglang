@@ -2498,14 +2498,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.QSA_PENDING,
                 StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
-                StateType.C128_STATE,
+                StateType.DSV4_REQUEST_STATE,
             ):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
                 if (
-                    st == StateType.C128_STATE
+                    st == StateType.DSV4_REQUEST_STATE
                     and len(src_indices) == 0
                     and len(dst_indices) == 0
                 ):

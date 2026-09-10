@@ -1346,7 +1346,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
-            StateType.C128_STATE,
+            StateType.DSV4_REQUEST_STATE,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
         )
@@ -1357,7 +1357,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
-            StateType.C128_STATE,
+            StateType.DSV4_REQUEST_STATE,
         )
 
     def maybe_send_extra(
@@ -1547,7 +1547,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (
-                    st == StateType.C128_STATE
+                    st == StateType.DSV4_REQUEST_STATE
                     and len(src_indices) == 0
                     and len(dst_indices_local) == 0
                 ):
