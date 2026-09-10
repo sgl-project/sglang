@@ -73,7 +73,8 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    notes: "2×GB300, TP=2, flashinfer_mxfp4 MoE backend (explicit flag at measurement time; auto-selected by sglang dev image v4+). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Without the MXFP4 runner the default auto path enters Triton FP8 MoE and fails during decode graph warmup. Full accuracy suite pending.",
+    accuracy: { mmmu_pro_pct: 76.24, gsm8k_pct: 96.66 },
+    notes: "2×GB300, TP=2, flashinfer_mxfp4 MoE backend (auto-selected). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Accuracy measured on 2×B300, TP=2, no-flag serve on the current dev image (sgl-eval, single-shot, thinking on): MMMU-Pro 76.24% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.66% (stop 100%).",
   },
   { match: { hw: "b300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" } },
@@ -86,7 +87,8 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 32 },
         ttft_ms: 23622.31, tpot_ms: 111.61, tokens_per_sec_per_gpu: 1069.73 },
     ],
-    notes: "DGX Spark GB10, TP=1, flashinfer_mxfp4 MoE backend (SM120 CUTLASS W4A8 path), auto-selected on the current dev image — verified with a no-flag serve on GB10. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Speed: bench_serving --flush-cache, temperature 0, TTFT/TPOT are P50; tok/s = total (input + output) token throughput on one GPU. Image workload (one 720p JPEG per request, 883 vision tokens, in/out=1024/1024): conc 1 (8 prompts): TTFT 318.70 ms, TPOT 30.70 ms, 96.26 tok/s; conc 16 (32 prompts): TTFT 9476.07 ms, TPOT 82.39 ms, 510.44 tok/s. Full accuracy suite pending.",
+    accuracy: { mmmu_pro_pct: 76.24, gsm8k_pct: 96.66 },
+    notes: "DGX Spark GB10, TP=1, flashinfer_mxfp4 MoE backend (SM120 CUTLASS W4A8 path), auto-selected on the current dev image — verified with a no-flag serve on GB10. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Speed: bench_serving --flush-cache, temperature 0, TTFT/TPOT are P50; tok/s = total (input + output) token throughput on one GPU. Image workload (one 720p JPEG per request, 883 vision tokens, in/out=1024/1024): conc 1 (8 prompts): TTFT 318.70 ms, TPOT 30.70 ms, 96.26 tok/s; conc 16 (32 prompts): TTFT 9476.07 ms, TPOT 82.39 ms, 510.44 tok/s. Accuracy measured on 2×B300, TP=2 (sgl-eval, single-shot, thinking on): MMMU-Pro 76.24% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.66% (stop 100%).",
   },
   {
     match: { hw: "dgx-spark", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
