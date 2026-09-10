@@ -6780,9 +6780,16 @@ class UnifiedRadixCacheSuite:
         c = chain[-1]
         c_swa = _device_value(cache, c, ComponentType.SWA).clone()
 
-        # First transfer: publish Full for C only, leaving SWA dirty while the
-        # write-through ack is still pending.
+        # First transfer: publish Full for C only. C's SWA is a device tombstone
+        # (decode-evicted, never backed up), so the write-through ack stays
+        # pending on a node the SWA backup window has nothing to send for.
         cache.tree_core.set_component_device_value_raw(c, ComponentType.SWA, None)
+        if cache.tree_core.is_node_in_device_lru(c, ComponentType.SWA):
+            cache.tree_core.remove_node_from_device_lru(c, ComponentType.SWA)
+        cache.tree_core.set_component_evictable_size(
+            ComponentType.SWA,
+            cache.tree_core.component_evictable_size(ComponentType.SWA) - len(c_swa),
+        )
         self.assertGreater(
             cache._execute_and_commit_kv_backup(BackupKV(node_ids=[c])),
             0,
@@ -6791,10 +6798,12 @@ class UnifiedRadixCacheSuite:
         self.assertIsNotNone(_host_value(cache, c, ComponentType.FULL))
         self.assertIsNone(_host_value(cache, c, ComponentType.SWA))
 
-        # Simulate SWA being reconstructed on device before the first ack. The
-        # next incremental SWA backup must treat C as the boundary and back up
-        # only the newly inserted descendant.
-        cache.tree_core.set_component_device_value_raw(c, ComponentType.SWA, c_swa)
+        # SWA is reconstructed on device before the first ack, the way a
+        # load-back commit stores it: under the pending segment lock the value
+        # counts as protected until the ack releases it. The next incremental
+        # SWA backup must treat C as the boundary and back up only the newly
+        # inserted descendant.
+        cache.tree_core.set_component_device_value(c, ComponentType.SWA, c_swa)
         tokens = self._match_tokens_for_chain(cache, chain)
         next_tokens = tokens + self._make_seq(9000, 1)
         cache.write_through_threshold = 1
@@ -6812,6 +6821,7 @@ class UnifiedRadixCacheSuite:
         cache.writing_check(write_back=True)
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(c))
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(d))
+        cache.sanity_check()
 
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
