@@ -620,6 +620,80 @@ def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
     assert any("sampling_observer_output" in key for key in tensors)
 
 
+def test_pipeline_parallel_dspark_commit_round_trip():
+    from sglang.srt.speculative.dspark_components.dspark_draft import (
+        make_next_draft_input,
+    )
+    from sglang.srt.speculative.dspark_components.dspark_pp import (
+        PPDSparkIdentity,
+        pack_proposal,
+    )
+
+    req = SimpleNamespace(
+        rid="req-0", bootstrap_room=12, retraction_count=0, spec_verify_ct=0
+    )
+    commit_state = SimpleNamespace(identities=(PPDSparkIdentity.from_req(req),))
+    batch = SimpleNamespace(
+        reqs=[req],
+        return_logprob=False,
+        return_hidden_states=False,
+        req_pool_indices=torch.tensor([3]),
+        input_ids=torch.tensor([5]),
+        seq_lens=torch.tensor([9]),
+        seq_lens_cpu=torch.tensor([9]),
+        seq_lens_sum=9,
+        spec_info=None,
+    )
+    next_draft_input = make_next_draft_input(
+        bonus_tokens=torch.tensor([11]),
+        new_seq_lens=torch.tensor([11]),
+    )
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([10, 11]),
+        accept_lens=torch.tensor([2], dtype=torch.int32),
+        block_accept_lens=torch.tensor([2], dtype=torch.int32),
+        cap_lens=torch.tensor([3], dtype=torch.int32),
+        new_seq_lens=torch.tensor([11]),
+        next_draft_input=next_draft_input,
+        pp_dspark_projected_context=torch.ones(3, 4),
+        pp_dspark_commit_state=commit_state,
+        pp_dspark_next_proposal={"identities": []},
+    )
+    tensors = Scheduler._pp_prepare_tensor_dict(
+        object.__new__(Scheduler), result, batch
+    )
+    tensors.update(pack_proposal(0, {"identities": []}))
+
+    receiver = object.__new__(Scheduler)
+    receiver.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
+    receiver.ps = SimpleNamespace(pp_size=2)
+    receiver.model_worker = SimpleNamespace(
+        commit_pp_draft_context=Mock(), install_pp_draft=Mock()
+    )
+    receiver.device_module = SimpleNamespace(Event=CopyDone)
+    metadata = PPBatchMetadata(
+        can_run_cuda_graph=False,
+        fwd_batch=batch,
+        dspark_commit_state=commit_state,
+        speculative_num_draft_tokens=2,
+    )
+
+    output_result = Scheduler._pp_prep_batch_result(
+        receiver,
+        batch,
+        metadata,
+        PPProxyTensors(tensors),
+    )
+
+    receiver.model_worker.commit_pp_draft_context.assert_not_called()
+    assert receiver.model_worker.install_pp_draft.call_count == 2
+    assert torch.equal(batch.seq_lens, torch.tensor([11]))
+    assert torch.equal(batch.spec_info.bonus_tokens, torch.tensor([11]))
+    assert output_result.next_token_ids.is_cpu
+    assert output_result.accept_lens.is_cpu
+    assert output_result.speculative_num_draft_tokens == 2
+
+
 def test_pipeline_parallel_auxiliary_output_requires_receiver_observer():
     device_output = DeviceOutput(torch.tensor([1.0]))
     result = GenerationBatchResult(

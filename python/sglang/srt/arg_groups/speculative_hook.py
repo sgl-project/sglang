@@ -557,9 +557,85 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {cfg.speculative_moe_a2a_backend!r})."
             )
 
-    if cfg.pp_size != 1:
+    replicated_pp_draft = cfg.speculative_dspark_pp_replicated_draft
+    if replicated_pp_draft:
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if cfg.pp_size != 2:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "--pp-size 2."
+            )
+        if cfg.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "PD disaggregation."
+            )
+        if (
+            "DeepseekV4ForCausalLM"
+            not in model_config_of(server_args).hf_config.architectures
+            or not _target_checkpoint_bundles_dspark_draft(server_args)
+            or cfg.speculative_draft_model_path not in (None, cfg.model_path)
+        ):
+            raise ValueError(
+                "PP DSpark currently requires a bundled DeepSeek-V4 DSpark "
+                "checkpoint with the same target and draft model path."
+            )
+        if cfg.attn_cp_size != 1:
+            raise ValueError("PP DSpark currently requires attention CP=1.")
+        if not cfg.disable_radix_cache:
+            raise ValueError(
+                "PP DSpark currently requires --disable-radix-cache because "
+                "draft context is owned by a request, not by a shared prefix."
+            )
+        if cfg.enable_mixed_chunk:
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                enable_mixed_chunk=False,
+            )
+            logger.warning("Mixed chunked prefill is disabled for PP DSpark.")
+        if cfg.enable_dp_attention:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft does not support "
+                "--enable-dp-attention."
+            )
+        if not cfg.disable_cuda_graph:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "--disable-cuda-graph."
+            )
+        if cfg.pp_async_batch_depth != 0:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "--pp-async-batch-depth 0."
+            )
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft currently requires "
+                "SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+        if cfg.speculative_use_rejection_sampling:
+            raise ValueError(
+                "--speculative-dspark-pp-replicated-draft does not support "
+                "rejection sampling."
+            )
+
+    if cfg.pp_size != 1 and cfg.disaggregation_mode not in ("prefill", "decode"):
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "Currently DSpark speculative decoding with pp_size > 1 is only "
+            "supported under PD disaggregation."
+        )
+    if (
+        cfg.pp_size > 1
+        and cfg.disaggregation_mode == "decode"
+        and not replicated_pp_draft
+    ):
+        raise ValueError(
+            "DSpark PP decode requires --speculative-dspark-pp-replicated-draft."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -813,7 +889,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
-
     cfg = resolving_view(server_args)
 
     if (

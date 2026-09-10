@@ -108,6 +108,14 @@ class Spec(msgspec.Struct):
         "it into extra real verification at the same step time. Off by default; when "
         "off the schedule is byte-for-byte unchanged.",
     ] = False
+    speculative_dspark_pp_replicated_draft: A[
+        bool,
+        "Experimental DSPARK mode for PP2. Replicate the TP draft model on both "
+        "pipeline stages, with a fixed owner per request and next-round proposal "
+        "relay. Requires a bundled DeepSeek-V4 checkpoint, PD on both endpoints, "
+        "greedy sampling, static verify, disabled CUDA graphs and radix cache, "
+        "and no mixed chunk, DP attention, or context parallelism.",
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

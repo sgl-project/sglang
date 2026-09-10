@@ -120,5 +120,47 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
                 _handle_dspark(server_args)
 
 
+class TestDsparkReplicatedPPDraft(CustomTestCase):
+    def _replicated_args(self, mode: str) -> ServerArgs:
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.pp_size = 2
+        server_args.disaggregation_mode = mode
+        server_args.speculative_dspark_pp_replicated_draft = True
+        server_args.disable_cuda_graph = True
+        server_args.pp_async_batch_depth = 0
+        server_args.enable_dp_attention = False
+        server_args.speculative_use_rejection_sampling = False
+        server_args.disable_radix_cache = True
+        server_args.attn_cp_size = 1
+        server_args.enable_mixed_chunk = True
+        return server_args
+
+    def test_prefill_and_decode_are_admitted(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            for mode in ("prefill", "decode"):
+                args = self._replicated_args(mode)
+                _handle_dspark(args)
+                self.assertFalse(resolution_result(args, "enable_mixed_chunk"))
+
+    def test_non_pd_mode_is_rejected(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+                _handle_dspark(self._replicated_args("null"))
+
+    def test_unbundled_draft_is_rejected(self):
+        args = self._replicated_args("decode")
+        args.speculative_draft_model_path = "separate/draft"
+        with self.assertRaisesRegex(ValueError, "bundled DeepSeek-V4"):
+            _handle_dspark(args)
+
+    def test_radix_cache_is_rejected(self):
+        args = self._replicated_args("decode")
+        args.disable_radix_cache = False
+        with self.assertRaisesRegex(ValueError, "disable-radix-cache"):
+            _handle_dspark(args)
+
+
 if __name__ == "__main__":
     unittest.main()
