@@ -351,7 +351,7 @@ Header fields:
 **Encodings.** `application/x-raw-rgb` is uncompressed RGB24 (3 × uint8, `bytes_per_frame = width*height*3`). `application/x-raw-rgb-delta-gzip` is the zlib-compressed **per-frame XOR delta** against the preceding frame (each frame in the batch is XOR'd against the previous one; sent by default). `realtime_output_format: "raw"` forces uncompressed RGB; `"webp"` / `"jpeg"` send preview-encoded frames.
 
 <Note>
-delta-gzip must be restored **frame-by-frame**: decompress the payload, then for each frame XOR it against the already-restored previous frame (the first frame of a batch references the last frame of the previous batch). See `restore_delta_gzip_raw_rgb_payload` in `runtime/utils/realtime_video.py`. The `"raw"` format below avoids this.
+delta-gzip must be restored **frame-by-frame**: decompress the payload, then for each frame XOR it against the already-restored previous frame (the first frame of a batch references the last frame of the previous batch). See `restore_delta_gzip_raw_rgb_payload` in `runtime/realtime/video.py`. The `"raw"` format below avoids this.
 </Note>
 
 ### Minimal client example

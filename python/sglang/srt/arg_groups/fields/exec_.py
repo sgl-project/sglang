@@ -10,12 +10,13 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 from typing import (
     List,
     Literal,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -38,8 +39,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 
 
-@dataclasses.dataclass
-class ExecFeatures:
+class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
@@ -105,8 +105,7 @@ class ExecFeatures:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecKernel:
+class ExecKernel(msgspec.Struct):
     """Namespace ``exec.kernel``."""
 
     _NS_PATH = "exec.kernel"
@@ -241,6 +240,19 @@ class ExecKernel:
             resolvable=True,
         ),
     ] = None
+    dsv4_attn_backend: A[
+        str,
+        Arg(
+            help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
+            "'flashmla'. 'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
+            "switches the SWA/compressed KV pools to a "
+            "uniform 512-dim FP8 layout and runs decode and sparse prefill "
+            "through the flashinfer trtllm-gen sparse MLA kernel. The backend "
+            "choice is shared by prefill and decode.",
+            choices=["auto", "flashmla", "trtllm"],
+            resolvable=True,
+        ),
+    ] = "auto"
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
@@ -300,8 +312,7 @@ class ExecKernel:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecMamba:
+class ExecMamba(msgspec.Struct):
     """Namespace ``exec.mamba``."""
 
     _NS_PATH = "exec.mamba"
@@ -441,8 +452,7 @@ class ExecMamba:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecGraph:
+class ExecGraph(msgspec.Struct):
     """Namespace ``exec.graph``."""
 
     _NS_PATH = "exec.graph"
@@ -531,8 +541,7 @@ class ExecGraph:
     ] = 32
 
 
-@dataclasses.dataclass
-class ExecComm:
+class ExecComm(msgspec.Struct):
     """Namespace ``exec.comm``."""
 
     _NS_PATH = "exec.comm"
@@ -607,8 +616,7 @@ class ExecComm:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecMoe:
+class ExecMoe(msgspec.Struct):
     """Namespace ``exec.moe``."""
 
     _NS_PATH = "exec.moe"
@@ -810,8 +818,7 @@ class ExecMoe:
     ] = None
 
 
-@dataclasses.dataclass
-class ExecOverlap:
+class ExecOverlap(msgspec.Struct):
     """Namespace ``exec.overlap``."""
 
     _NS_PATH = "exec.overlap"
@@ -832,8 +839,7 @@ class ExecOverlap:
     ] = 0.48
 
 
-@dataclasses.dataclass
-class ExecOffload:
+class ExecOffload(msgspec.Struct):
     """Namespace ``exec.offload``."""
 
     _NS_PATH = "exec.offload"
@@ -870,8 +876,7 @@ class ExecOffload:
     ] = None
 
 
-@dataclasses.dataclass
-class ExecDllm:
+class ExecDllm(msgspec.Struct):
     """Namespace ``exec.dllm``."""
 
     _NS_PATH = "exec.dllm"
@@ -895,8 +900,7 @@ class ExecDllm:
     ] = True
 
 
-@dataclasses.dataclass
-class ExecDeterministic:
+class ExecDeterministic(msgspec.Struct):
     """Namespace ``exec.deterministic``."""
 
     _NS_PATH = "exec.deterministic"
