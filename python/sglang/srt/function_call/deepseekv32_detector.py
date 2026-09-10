@@ -259,9 +259,20 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
-        # Only recovered for the first call: the DSML guard above never releases a
-        # buffer that still holds a marker, so later prose stays buffered.
-        preamble = ""
+        normal_text_parts: list[str] = []
+
+        def normal_prefix(end: int) -> str:
+            """Return ordinary text before an invoke, excluding DSML wrappers."""
+            prefix = current_text[:end]
+            bot_pos = current_text.rfind(self.bot_token, 0, end)
+            if bot_pos != -1:
+                prefix = current_text[:bot_pos]
+            for token in (self.eot_token, self.invoke_end_token):
+                prefix = prefix.replace(token, "")
+            if self.eot_token in current_text[:end]:
+                prefix = prefix.lstrip("\n")
+            return prefix.removesuffix("\n\n")
+
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -278,8 +289,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_match
                 )
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
+                # Record the text before each invoke.  The first call's
+                # preamble and any text between later calls are both normal
+                # response content, not part of the tool-call payload.
+                first_tool_call = self.current_tool_id == -1
+                if first_tool_call:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
@@ -288,7 +302,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     if bot_pos != -1:
                         call_start = bot_pos
                     # Same trailing-newline trim as detect_and_parse, so both agree.
-                    preamble = current_text[:call_start].removesuffix("\n\n")
+                    normal_text_parts.append(normal_prefix(call_start))
+                else:
+                    normal_text_parts.append(normal_prefix(invoke_match.start()))
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -363,8 +379,29 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Wait for more chunks until we see </｜DSML｜invoke>
                     break
 
-            # No more invoke blocks found
-            return StreamingParseResult(normal_text=preamble, calls=all_calls)
+            # Preserve ordinary text after a completed invoke.  Previously this
+            # suffix stayed in ``_buffer`` but was omitted from the result, so
+            # streaming responses lost text generated after a tool call.
+            postamble = current_text
+            had_wrapper_end = self.eot_token in postamble
+            for token in (self.eot_token, self.invoke_end_token):
+                postamble = postamble.replace(token, "")
+            if had_wrapper_end:
+                postamble = postamble.lstrip("\n")
+
+            if (
+                postamble
+                and not any(marker in postamble for marker in dsml_markers)
+                and not any(
+                    postamble.rstrip().endswith(prefix) for prefix in dsml_prefixes
+                )
+            ):
+                normal_text_parts.append(postamble)
+                self._buffer = ""
+
+            return StreamingParseResult(
+                normal_text="".join(normal_text_parts), calls=all_calls
+            )
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
@@ -373,8 +410,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # Calls are dropped on purpose: the failure can land between a tool's
             # name and its arguments, and a half-formed call is worse than none.
             self._buffer = ""
-            if not current_text.startswith(preamble):
-                current_text = preamble + current_text
+            normal_text = "".join(normal_text_parts)
+            if not current_text.startswith(normal_text):
+                current_text = normal_text + current_text
             return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
