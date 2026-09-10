@@ -1434,6 +1434,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # Opt-in PTPC FP8 repacking for selected BF16 GLM-5.3-Flash KDA
+    # projections. Comma-separated module names; empty keeps BF16.
+    SGLANG_OPT_GLM53_KDA_PTPC_MODULES = EnvTuple(tuple())
     # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.

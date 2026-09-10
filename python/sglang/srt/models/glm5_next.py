@@ -49,6 +49,10 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    fp8_ptpc_linear_active,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -302,6 +306,11 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+GLM53_KDA_PTPC_BF16_MAX_M = {
+    "qkv_proj": 4095,
+}
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -468,6 +477,8 @@ class Glm5NextLinearAttention(nn.Module):
             tp_size=head_shard_size,
         )
 
+        self._configure_ptpc_modules()
+
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -487,8 +498,34 @@ class Glm5NextLinearAttention(nn.Module):
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
 
+    def _configure_ptpc_modules(self) -> None:
+        ptpc_modules = set(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get())
+        supported_ptpc_modules = set(GLM53_KDA_PTPC_BF16_MAX_M)
+        unknown_ptpc_modules = ptpc_modules - supported_ptpc_modules
+        if unknown_ptpc_modules:
+            raise ValueError(
+                "Unsupported GLM-5.3-Flash KDA PTPC modules: "
+                f"{sorted(unknown_ptpc_modules)}; supported: "
+                f"{sorted(supported_ptpc_modules)}"
+            )
+        for module_name in ptpc_modules:
+            module = getattr(self, module_name, None)
+            if module is None:
+                raise ValueError(
+                    f"GLM-5.3-Flash KDA PTPC module {module_name!r} is unavailable "
+                    f"for fused_qkvbfg={self.do_fuse_qkvbfg}"
+                )
+            if not isinstance(module.quant_method, UnquantizedLinearMethod):
+                raise ValueError(
+                    f"GLM-5.3-Flash KDA PTPC requires UnquantizedLinearMethod for "
+                    f"{module_name}, got {type(module.quant_method).__name__}"
+                )
+            module._glm53_kda_ptpc_module = module_name
+            module._fp8_ptpc_bf16_max_m = GLM53_KDA_PTPC_BF16_MAX_M[module_name]
+
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv_input = self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+        qkv, _ = self.qkv_proj(qkv_input)
 
         beta = self.b_proj(hidden_states)[0]
         forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
@@ -500,6 +537,15 @@ class Glm5NextLinearAttention(nn.Module):
             forget_gate,
             g_proj_states,
         )
+
+    @staticmethod
+    def _maybe_quantize_ptpc_input(layer, x: torch.Tensor):
+        if not fp8_ptpc_linear_active(layer, x.numel() // x.shape[-1]):
+            return x
+        import aiter
+
+        x_2d = x.view(-1, x.shape[-1])
+        return aiter.per_token_quant_hip(x_2d, quant_dtype=aiter.dtypes.fp8)
 
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -552,7 +598,8 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
-        return self.o_proj(core_attn_out)[0]
+        o_proj_input = self._maybe_quantize_ptpc_input(self.o_proj, core_attn_out)
+        return self.o_proj(o_proj_input)[0]
 
 
 class Glm5NextDecoderLayer(nn.Module):
