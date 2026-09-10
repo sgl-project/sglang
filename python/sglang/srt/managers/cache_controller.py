@@ -343,8 +343,8 @@ class HiCacheController:
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
         self.device = self.mem_pool_device.device
-        self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.transfer_layer_id_limit = self.mem_pool_device.layer_num
+        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_limit)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -934,7 +934,7 @@ class HiCacheController:
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
-            layer_num=self.layer_num,
+            transfer_layer_id_limit=self.transfer_layer_id_limit,
         )
 
         self.ack_load_queue.append(

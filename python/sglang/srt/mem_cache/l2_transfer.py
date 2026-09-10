@@ -75,7 +75,7 @@ class L2TransferEngine:
         self,
         transfers: list[L2Transfer],
         *,
-        layer_num: int,
+        transfer_layer_id_limit: int,
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
@@ -85,7 +85,7 @@ class L2TransferEngine:
         with device_module.stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
-            for layer_id in range(layer_num):
+            for layer_id in range(transfer_layer_id_limit):
                 for transfer in transfers:
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)

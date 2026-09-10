@@ -133,7 +133,7 @@ _ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
 
 
 class TestTransferLayerSpan(CustomTestCase):
-    """``transfer_layer_num`` must span global layer ids, not count the mapped ones.
+    """``transfer_layer_id_limit`` must span global layer ids, not count the mapped ones.
 
     A hybrid model with an uncached layer type keys its mappings non-contiguously,
     and the per-layer transfer loop then never reaches the high layer ids.
@@ -160,7 +160,10 @@ class TestTransferLayerSpan(CustomTestCase):
             )
 
         self.assertEqual(
-            [c.kwargs["transfer_layer_num"] for c in build_pool_entry.call_args_list],
+            [
+                c.kwargs["transfer_layer_id_limit"]
+                for c in build_pool_entry.call_args_list
+            ],
             [7, 7],
         )
 

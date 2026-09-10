@@ -106,7 +106,7 @@ class HybridCacheController(BaseHiCacheController):
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        transfer_layer_num: Optional[int] = None,
+        transfer_layer_id_limit: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
     ):
@@ -130,11 +130,14 @@ class HybridCacheController(BaseHiCacheController):
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
         )
-        # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
-        # not just the full attention layers reported by full_kv_pool.
-        if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
-            self.layer_num = transfer_layer_num
-            self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        # Hybrid transfer IDs span every component pool, including holes for
+        # uncached layers that the anchor pool alone cannot describe.
+        if (
+            transfer_layer_id_limit is not None
+            and transfer_layer_id_limit != self.transfer_layer_id_limit
+        ):
+            self.transfer_layer_id_limit = transfer_layer_id_limit
+            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_limit)
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -435,7 +438,9 @@ class HybridCacheController(BaseHiCacheController):
             if target_transfer is None or target_transfer.layer_mapper is None:
                 continue
             for depth, draft_device_pool in enumerate(entry.packed_draft_device_pools):
-                draft_host_layer = target_transfer.layer_mapper(self.layer_num + depth)
+                draft_host_layer = target_transfer.layer_mapper(
+                    self.transfer_layer_id_limit + depth
+                )
                 if draft_host_layer is None:
                     continue
 

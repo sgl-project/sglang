@@ -236,7 +236,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             start_event=object(), finish_event=object(), timing_enabled=False
         )
         controller.l2_transfer_engine.submit_host_to_device.return_value = completion
-        controller.layer_num = 2
+        controller.transfer_layer_id_limit = 2
         controller.ack_load_queue = []
 
         self.assertEqual(HybridCacheController.start_loading(controller), 0)
@@ -302,7 +302,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             layer_mapper={1: 0, 3: 1}.get,
         )
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
-            L2TransferEngine("kernel").submit_host_to_device([transfer], layer_num=4)
+            L2TransferEngine("kernel").submit_host_to_device(
+                [transfer], transfer_layer_id_limit=4
+            )
 
         self.assertEqual(
             [
@@ -327,7 +329,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             anchor_entry=entry,
             entry_map={entry.name: entry},
         )
-        controller.layer_num = 2
+        controller.transfer_layer_id_limit = 2
 
         self.assertEqual(
             len(controller._l2_transfers(_indices(0, 2), _indices(2, 4))), 1
@@ -338,7 +340,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertFalse(transfers[0].is_draft)
         self.assertTrue(transfers[1].is_draft)
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
-            L2TransferEngine("kernel").submit_host_to_device(transfers, layer_num=2)
+            L2TransferEngine("kernel").submit_host_to_device(
+                transfers, transfer_layer_id_limit=2
+            )
         self.assertEqual(
             [
                 call.args[3]
