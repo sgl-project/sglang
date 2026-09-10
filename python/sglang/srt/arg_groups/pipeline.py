@@ -8,18 +8,16 @@ it.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any
 
+from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
-    declare_direct_writes,
     resolving_view,
     run_post_process_pass,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_device_memory_capacity
 
 
@@ -51,7 +49,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # stash is the resolution result the projection reads.
     server_args._raw_input = {
         field.name: getattr(server_args, field.name)
-        for field in dataclasses.fields(server_args)
+        for field in record_fields(type(server_args))
     }
 
     # Preserve launcher-stage declarations made before Engine starts. They are
@@ -91,6 +89,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_hicache_ratio_default(server_args)
+    from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
+
+    handle_offload_compatibility(server_args)
     from sglang.srt.arg_groups.validation_hook import (
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
@@ -174,6 +175,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # resolution (the declarative registry materializes too late to affect
     # it). Inkling opts into full-graph prefill capture here.
     from sglang.srt.arg_groups.cuda_graph_hook import (
+        apply_glm5_chunked_prefill_default,
+        apply_glm5_prefill_cuda_graph_policy,
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
@@ -187,6 +190,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_dwdp(server_args)
 
     handle_cuda_graph_config(server_args)
+    # Requires the parsed backend and explicit-input locks, and must precede
+    # handle_gpu_memory_settings so the chunk size feeds memory budgeting.
+    apply_glm5_chunked_prefill_default(server_args)
 
     # Handle device-specific backends.
     from sglang.srt.arg_groups.platform_hook import (
@@ -196,6 +202,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_mps_backends,
         handle_nccl_pre_warm,
         handle_npu_backends,
+        handle_platform_defaults,
         handle_symm_mem_device_support,
         handle_xpu_backends,
     )
@@ -209,13 +216,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # keys off enable_symm_mem.
     handle_symm_mem_device_support(server_args)
 
-    # OOT platform plugins set fields directly (an interface this tree
-    # does not own); the diff records what they applied.
-    declare_direct_writes(
-        server_args,
-        f"platform:{current_platform.device_name}",
-        current_platform.apply_server_args_defaults,
-    )
+    handle_platform_defaults(server_args)
 
     gpu_mem = get_device_memory_capacity(cfg.device)
 
@@ -231,6 +232,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_model_specific_adjustments(server_args)
+    # After the model overrides: Qwen4-Exp declares the PLE offload default there.
+    handle_offload_compatibility(server_args)
 
     # Set kernel backends.
     run_post_process_pass(server_args, _sampling_backend_default)
@@ -256,6 +259,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_mamba_backend(server_args)
     handle_int8_mamba_checkpoint(server_args)
     handle_linear_attn_backend(server_args)
+    apply_glm5_prefill_cuda_graph_policy(server_args)
     handle_kv4_compatibility(server_args)
     handle_mxfp8_kv_cache_compatibility(server_args)
     run_post_process_pass(server_args, _page_size_default)
