@@ -11,8 +11,6 @@ Semantics mirror ``top_k_top_p_min_p_sampling_from_probs_torch`` /
 
 Gaps against that backend:
 
-* Penalties (frequency/presence/repetition) are not applied (warned once
-  per process).
 * Custom logit processors run on pure-decode steps only: the first
   generated token and decode steps mixed into an extend batch are not
   processed (``apply_custom_logit_processor`` requires logits rows to
@@ -26,13 +24,10 @@ Gaps against that backend:
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
-
-logger = logging.getLogger(__name__)
 
 # Seed given to rows without an explicit ``sampling_seed`` when
 # --enable-deterministic-inference is on.  Mirrors the literal in
@@ -44,8 +39,6 @@ DEFAULT_SAMPLING_SEED = 42
 # meaningfully cheaper than the [B, vocab] one it replaces.
 MAX_BOUNDED_TOP_K = 1024
 
-_warned_ignored_penalties = False
-
 
 @dataclass(frozen=True)
 class MlxSamplingParams:
@@ -56,23 +49,15 @@ class MlxSamplingParams:
     top_p: float
     min_p: float
     seed: int | None
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
 
     @classmethod
     def from_req(
         cls, req: Any, deterministic_seeding: bool = False
     ) -> MlxSamplingParams:
         sp = req.sampling_params
-        global _warned_ignored_penalties
-        if not _warned_ignored_penalties and (
-            sp.frequency_penalty != 0.0
-            or sp.presence_penalty != 0.0
-            or sp.repetition_penalty != 1.0
-        ):
-            _warned_ignored_penalties = True
-            logger.warning(
-                "MLX sampling ignores frequency/presence/repetition penalties; "
-                "a request specified them. (Warning logged once.)"
-            )
         # Seed contract, identical to every other backend: SamplingBatchInfo
         # populates sampling_seed only under --enable-deterministic-inference,
         # and then seeds every row (default DEFAULT_SAMPLING_SEED).  Outside
@@ -90,6 +75,17 @@ class MlxSamplingParams:
             top_p=sp.top_p,
             min_p=sp.min_p,
             seed=seed,
+            frequency_penalty=sp.frequency_penalty,
+            presence_penalty=sp.presence_penalty,
+            repetition_penalty=sp.repetition_penalty,
+        )
+
+    @property
+    def has_penalties(self) -> bool:
+        return (
+            self.frequency_penalty != 0.0
+            or self.presence_penalty != 0.0
+            or self.repetition_penalty != 1.0
         )
 
     @property
@@ -98,7 +94,14 @@ class MlxSamplingParams:
 
 
 GREEDY_PARAMS = MlxSamplingParams(
-    temperature=1.0, top_k=1, top_p=1.0, min_p=0.0, seed=None
+    temperature=1.0,
+    top_k=1,
+    top_p=1.0,
+    min_p=0.0,
+    seed=None,
+    frequency_penalty=0.0,
+    presence_penalty=0.0,
+    repetition_penalty=1.0,
 )
 
 
@@ -150,6 +153,41 @@ def lazy_logprob_arrays(lazy_logprobs: MlxLazyLogprobs | None) -> list[mx.array]
 
 def all_greedy(params: list[MlxSamplingParams]) -> bool:
     return all(p.is_greedy for p in params)
+
+
+def apply_token_penalties(
+    logits: mx.array,
+    token_counts: mx.array,
+    params: list[MlxSamplingParams],
+) -> mx.array:
+    """Apply output-token penalties to ``[B, V]`` logits from counts."""
+    if not any(p.has_penalties for p in params):
+        return logits
+
+    frequency = mx.array(
+        [p.frequency_penalty for p in params], dtype=mx.float32
+    )[:, None]
+    presence = mx.array(
+        [p.presence_penalty for p in params], dtype=mx.float32
+    )[:, None]
+    repetition = mx.array(
+        [p.repetition_penalty for p in params], dtype=mx.float32
+    )[:, None]
+    seen = token_counts > 0
+    adjusted = (
+        logits.astype(mx.float32)
+        - token_counts.astype(mx.float32) * frequency
+        - seen * presence
+    )
+    scaled = mx.where(adjusted < 0, adjusted * repetition, adjusted / repetition)
+    return mx.where(seen, scaled, adjusted)
+
+
+def increment_token_counts(token_counts: mx.array, tokens: mx.array) -> mx.array:
+    """Return counts with each row's sampled token incremented once."""
+    indices = tokens.astype(mx.uint32)[:, None]
+    next_values = mx.take_along_axis(token_counts, indices, axis=-1) + 1
+    return mx.put_along_axis(token_counts, indices, next_values, axis=-1)
 
 
 def sanitize_logits(logits: mx.array) -> mx.array:

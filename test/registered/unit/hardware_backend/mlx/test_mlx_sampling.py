@@ -27,7 +27,9 @@ if _HAS_MLX:
         _gumbel_noise,
         _murmur_hash32,
         all_greedy,
+        apply_token_penalties,
         compute_logprobs,
+        increment_token_counts,
         sample_tokens,
         sanitize_logits,
     )
@@ -60,10 +62,148 @@ def _reference_murmur3(seed: int, pos: int, col: int) -> int:
     return h
 
 
-def _params(temperature=1.0, top_k=1 << 30, top_p=1.0, min_p=0.0, seed=None):
+def _params(
+    temperature=1.0,
+    top_k=1 << 30,
+    top_p=1.0,
+    min_p=0.0,
+    seed=None,
+    frequency_penalty=0.0,
+    presence_penalty=0.0,
+    repetition_penalty=1.0,
+):
     return MlxSamplingParams(
-        temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, seed=seed
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        min_p=min_p,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
     )
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestSamplingParams(CustomTestCase):
+    def test_penalty_fields_and_default_fast_path(self):
+        """Penalty defaults are a no-op, while every non-default is enabled."""
+        self.assertFalse(GREEDY_PARAMS.has_penalties)
+        self.assertEqual(GREEDY_PARAMS.frequency_penalty, 0.0)
+        self.assertEqual(GREEDY_PARAMS.presence_penalty, 0.0)
+        self.assertEqual(GREEDY_PARAMS.repetition_penalty, 1.0)
+
+        for kwargs in (
+            {"frequency_penalty": 0.25},
+            {"presence_penalty": 0.5},
+            {"repetition_penalty": 1.2},
+            {"frequency_penalty": -0.25, "presence_penalty": -0.5},
+        ):
+            with self.subTest(kwargs=kwargs):
+                self.assertTrue(_params(**kwargs).has_penalties)
+
+    def test_from_req_copies_penalties_without_warning(self):
+        from types import SimpleNamespace
+
+        req = SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                temperature=0.8,
+                top_k=32,
+                top_p=0.9,
+                min_p=0.1,
+                sampling_seed=None,
+                frequency_penalty=-0.25,
+                presence_penalty=0.5,
+                repetition_penalty=1.2,
+            )
+        )
+        with self.assertNoLogs(
+            "sglang.srt.hardware_backend.mlx.sampling", level="WARNING"
+        ):
+            params = MlxSamplingParams.from_req(req)
+
+        self.assertEqual(params.frequency_penalty, -0.25)
+        self.assertEqual(params.presence_penalty, 0.5)
+        self.assertEqual(params.repetition_penalty, 1.2)
+        self.assertTrue(params.has_penalties)
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestTokenPenalties(CustomTestCase):
+    def test_matches_additive_then_sign_dependent_repetition_reference(self):
+        import torch
+
+        raw_logits = [
+            [-2.0, 3.0, 1.0, -4.0],
+            [2.0, -2.0, 0.5, -1.0],
+        ]
+        raw_counts = [
+            [2, 0, 1, 1],
+            [0, 3, 2, 0],
+        ]
+        params = [
+            _params(
+                frequency_penalty=0.5,
+                presence_penalty=0.25,
+                repetition_penalty=2.0,
+            ),
+            _params(
+                frequency_penalty=-0.5,
+                presence_penalty=-0.25,
+                repetition_penalty=1.5,
+            ),
+        ]
+
+        actual = apply_token_penalties(
+            mx.array(raw_logits),
+            mx.array(raw_counts, dtype=mx.uint32),
+            params,
+        )
+        mx.eval(actual)
+
+        torch_logits = torch.tensor(raw_logits, dtype=torch.float32)
+        torch_counts = torch.tensor(raw_counts, dtype=torch.float32)
+        frequency = torch.tensor([0.5, -0.5], dtype=torch.float32)[:, None]
+        presence = torch.tensor([0.25, -0.25], dtype=torch.float32)[:, None]
+        repetition = torch.tensor([2.0, 1.5], dtype=torch.float32)[:, None]
+        seen = torch_counts > 0
+        expected = torch_logits - torch_counts * frequency
+        expected = expected - seen * presence
+        expected = torch.where(
+            seen,
+            torch.where(expected < 0, expected * repetition, expected / repetition),
+            expected,
+        )
+        torch.testing.assert_close(
+            torch.tensor(actual.tolist()), expected, atol=1e-5, rtol=1e-5
+        )
+
+    def test_default_params_return_original_logits_object(self):
+        logits = mx.zeros((2, 8))
+        counts = mx.zeros((2, 8), dtype=mx.uint32)
+
+        actual = apply_token_penalties(logits, counts, [GREEDY_PARAMS, _params()])
+
+        self.assertIs(actual, logits)
+
+    def test_increment_token_counts_updates_each_row_once(self):
+        counts = mx.zeros((2, 8), dtype=mx.uint32)
+        counts = increment_token_counts(
+            counts, mx.array([3, 5], dtype=mx.uint32)
+        )
+        counts = increment_token_counts(
+            counts, mx.array([3, 1], dtype=mx.uint32)
+        )
+        mx.eval(counts)
+
+        self.assertEqual(counts.dtype, mx.uint32)
+        self.assertEqual(
+            counts.tolist(),
+            [
+                [0, 0, 0, 2, 0, 0, 0, 0],
+                [0, 1, 0, 0, 0, 1, 0, 0],
+            ],
+        )
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
