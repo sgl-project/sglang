@@ -90,10 +90,14 @@ def torch_build_configuration(
         filter(None, (os.fspath(torch_lib), environment.get("LD_LIBRARY_PATH")))
     )
 
-    cxxflags = environment.get("CXXFLAGS", "")
-    environment["CXXFLAGS"] = (
-        f"{cxxflags} -include {shlex.quote(os.fspath(compat_header.resolve()))}"
-    ).strip()
+    # torch-sys 0.24 hardcodes `-std=c++17`, which Torch 2.14 headers reject;
+    # cc-rs appends CXXFLAGS after a build script's own flags, so this wins.
+    # Older Torch ships a C++17 libtorch, so leave those builds alone.
+    cxxflags = [environment.get("CXXFLAGS", "")]
+    if major_minor >= (2, 14):
+        cxxflags.append("-std=c++20")
+    cxxflags.append(f"-include {shlex.quote(os.fspath(compat_header.resolve()))}")
+    environment["CXXFLAGS"] = " ".join(filter(None, cxxflags)).strip()
 
     package_depth = len(python_module.split(".")) - 1
     bundled_torch_lib = "$ORIGIN/" + "../" * package_depth + "torch/lib"
