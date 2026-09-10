@@ -100,11 +100,15 @@ curl http://127.0.0.1:30000/generate \
 ```
 
 Frequency and presence penalties are applied additively from the current
-request's generated-token counts, followed by repetition-penalty scaling for
-tokens already generated. Only generated output tokens are counted, so prompt
-and cached-prefix tokens are excluded. Penalty state remains lazy across
-overlap-scheduled decode steps, and this feature does not require a custom Metal
-kernel.
+request's generated-token counts. For tokens already generated, the repetition
+penalty then multiplies negative adjusted logits and divides nonnegative
+adjusted logits. Penalties run before grammar masks, `logit_bias`, and custom
+logit processors.
+
+Only generated output tokens are counted, so prompt and cached-prefix tokens are
+excluded. Penalty state remains lazy across chain-safe overlap-scheduled decode
+steps. Custom logit processors run on pure-decode steps only and disable decode
+chaining. This feature does not require a custom Metal kernel.
 
 ## Quantization
 
