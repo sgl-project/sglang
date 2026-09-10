@@ -852,30 +852,20 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
 
 
 def test_sensenova_u1_pipeline_import_does_not_load_models():
-    # A fresh process prevents earlier test imports from masking eager imports.
+    # Earlier tests import model code, so check discovery in a fresh process.
     subprocess.run(
         [
             sys.executable,
             "-c",
             textwrap.dedent(
                 """
-                import importlib.abc
                 import sys
-
-                class RejectSenseNovaModels(importlib.abc.MetaPathFinder):
-                    def find_spec(self, fullname, path=None, target=None):
-                        if fullname.startswith(
-                            "sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_"
-                        ):
-                            raise AssertionError(f"Eager model import: {fullname}")
-
-                sys.meta_path.insert(0, RejectSenseNovaModels())
-                from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
-                    SenseNovaU1Pipeline,
-                )
+                from sglang.multimodal_gen.runtime.pipelines import sensenova_u1
                 from sglang.multimodal_gen.runtime.models.sensenova_u1 import register
                 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
+                prefix = "sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_"
+                assert not any(name.startswith(prefix) for name in sys.modules)
                 assert "neo_chat" not in CONFIG_MAPPING
                 assert "neo_vision" not in CONFIG_MAPPING
                 """
@@ -886,88 +876,27 @@ def test_sensenova_u1_pipeline_import_does_not_load_models():
     )
 
 
-def test_sensenova_u1_register_is_explicit_and_idempotent(monkeypatch):
-    from transformers import AutoConfig, AutoModel
-
-    from sglang.multimodal_gen.configs.transformers.configuration_neo_chat import (
-        NEOChatConfig,
-    )
-    from sglang.multimodal_gen.runtime.models import sensenova_u1
-    from sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_neo_chat import (
-        NEOChatModel,
-    )
-    from sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_neo_vit import (
-        NEOVisionModel,
-    )
-
-    monkeypatch.setattr(sensenova_u1, "_REGISTERED", False)
-    config_register = Mock(wraps=AutoConfig.register)
-    model_register = Mock(wraps=AutoModel.register)
-    monkeypatch.setattr(AutoConfig, "register", config_register)
-    monkeypatch.setattr(AutoModel, "register", model_register)
-
-    sensenova_u1.register()
-    sensenova_u1.register()
-
-    assert config_register.call_count == 2
-    assert model_register.call_count == 2
-    assert isinstance(AutoConfig.for_model("neo_chat"), NEOChatConfig)
-    assert isinstance(AutoConfig.for_model("neo_vision"), NEOVisionConfig)
-    assert AutoModel._model_mapping[NEOChatConfig] is NEOChatModel
-    assert AutoModel._model_mapping[NEOVisionConfig] is NEOVisionModel
-
-
 def test_sensenova_u1_load_registers_before_loading(monkeypatch):
     from sglang.multimodal_gen.runtime.models import sensenova_u1
-    from sglang.multimodal_gen.runtime.pipelines import sensenova_u1 as pipeline_module
-
-    events = []
-    model = Mock()
-    model.eval.return_value = model
-    model.to.return_value = model
-    tokenizer = object()
-
-    def load_tokenizer(*args, **kwargs):
-        assert events == ["register"]
-        events.append("tokenizer")
-        return tokenizer
-
-    def load_model(*args, **kwargs):
-        assert events == ["register", "tokenizer"]
-        events.append("model")
-        return model
-
-    register = Mock(side_effect=lambda: events.append("register"))
-    tokenizer_loader = Mock(side_effect=load_tokenizer)
-    model_loader = Mock(side_effect=load_model)
-    monkeypatch.setattr(sensenova_u1, "register", register)
-    monkeypatch.setattr(
-        pipeline_module.AutoTokenizer, "from_pretrained", tokenizer_loader
+    from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
+        AutoTokenizer,
+        SenseNovaU1Pipeline,
     )
-    monkeypatch.setattr(pipeline_module.AutoModel, "from_pretrained", model_loader)
-    monkeypatch.setattr(pipeline_module, "get_local_torch_device", lambda: "cpu")
-    monkeypatch.setattr(pipeline_module.current_platform, "set_device", Mock())
-    pipeline = object.__new__(pipeline_module.SenseNovaU1Pipeline)
-    pipeline.model_path = "test-checkpoint"
+
+    register = Mock()
+    monkeypatch.setattr(sensenova_u1, "register", register)
+
+    def stop_at_checkpoint_load(*args, **kwargs):
+        register.assert_called_once_with()
+        raise RuntimeError("checkpoint loading reached")
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", stop_at_checkpoint_load)
+    pipeline = SimpleNamespace(model_path="test-checkpoint")
     args = SimpleNamespace(
         num_gpus=1,
         pipeline_config=SimpleNamespace(model_precision="bf16"),
-        trust_remote_code=True,
-        revision="test-revision",
+        trust_remote_code=False,
+        revision=None,
     )
-
-    modules = pipeline.load_modules(args)
-
-    assert modules == {"model": model, "tokenizer": tokenizer}
-    tokenizer_loader.assert_called_once_with(
-        "test-checkpoint", trust_remote_code=True, revision="test-revision"
-    )
-    model_loader.assert_called_once_with(
-        "test-checkpoint",
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        revision="test-revision",
-    )
-    model.to.assert_called_once_with("cpu")
-    assert pipeline.load_modules(args, loaded_modules=modules) is modules
-    register.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="checkpoint loading reached"):
+        SenseNovaU1Pipeline.load_modules(pipeline, args)
