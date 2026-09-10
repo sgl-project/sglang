@@ -101,21 +101,9 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        # Local import: multi_ended_allocator imports this module lazily for
-        # eviction; a module-level import here would be a cycle hazard.
-        from sglang.srt.mem_cache.multi_ended_allocator import (
-            UnifiedSWATokenToKVPoolAllocator,
+        token_to_kv_pool_allocator.free_swa_segment(
+            free_slots, start_pos=req.kv.swa_evicted_seqlen
         )
-
-        if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
-            # Contiguous range with host-int bounds: hand the composite its
-            # start position so the free stays host-sync-free (`free_segment`
-            # derives page reps by stride math instead of `torch.unique`).
-            token_to_kv_pool_allocator.free_swa(
-                free_slots, start_pos=req.kv.swa_evicted_seqlen
-            )
-        else:
-            token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
@@ -172,7 +160,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
             UnifiedSWATokenToKVPoolAllocator,
         )
 

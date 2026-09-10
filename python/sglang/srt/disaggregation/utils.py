@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs.model_config import get_dsa_index_topk
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -71,12 +71,41 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
         return 0
-    return get_dsa_index_topk(hf_config)
+    # QSA models reuse the same flag for their draft-side index sharing but
+    # carry no DSA seed metadata over PD.
+    if not is_deepseek_dsa(hf_config):
+        return 0
+    return get_dsa_mtp_topk_width(hf_config)
 
 
 def is_dsv4_c128_online_enabled() -> bool:
     """Return whether DSV4 C128 uses request-scoped online state."""
     return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def get_dsv4_c4_state_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    ring_size: int,
+) -> np.ndarray:
+    """Return physical rows for the live C4 compressor history.
+
+    Prefill and decode may use different C4 ring sizes (8 without speculative
+    decoding and 16 with EAGLE/MTP).  State transfer must therefore pair rows
+    by logical token position instead of copying a whole request-local bank.
+    The C4 overlap compressor keeps ``seq_len % 4 + 4`` live rows.
+    """
+    if ring_size < 8 or ring_size % 4 != 0:
+        raise ValueError(
+            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
+        )
+
+    seq_len = max(0, int(seq_len))
+    state_len = seq_len % 4 + 4
+    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
+    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
+    return rows.astype(np.int32)
 
 
 def get_dsv4_c128_state_indices(
@@ -300,18 +329,14 @@ class MetadataBuffers:
         size: int,
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
+        max_sampling_mask_tokens: int,
         max_top_logprobs_num: int = 128,
-        max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
-        if max_sampling_mask_tokens is None:
-            max_sampling_mask_tokens = (
-                envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
-            )
-        self.enable_sampling_mask = max_sampling_mask_tokens > 0
+        self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -394,38 +419,23 @@ class MetadataBuffers:
             self.output_token_logprobs_idx,
             self.output_top_logprobs_val,
             self.output_top_logprobs_idx,
+            self.output_token_sampling_mask_len,
+            self.output_token_sampling_mask_idx,
+            self.output_token_sampling_logprobs,
+            self.output_topk_p,
+            self.output_topk_index,
+            self.output_hidden_states,
         ]
-        if self.enable_sampling_mask:
-            bufs.extend(
-                [
-                    self.output_token_sampling_mask_len,
-                    self.output_token_sampling_mask_idx,
-                    self.output_token_sampling_logprobs,
-                ]
-            )
-        bufs.extend(
-            [
-                self.output_topk_p,
-                self.output_topk_index,
-                self.output_hidden_states,
-            ]
-        )
         if self.output_dsa_topk_indices is not None:
             bufs.append(self.output_dsa_topk_indices)
         bufs.append(self.bootstrap_room)
+        bufs = [buf for buf in bufs if buf is not None]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
-        sampling_mask_len = None
-        sampling_mask_idx = None
-        sampling_logprobs = None
-        if self.enable_sampling_mask:
-            sampling_mask_len = self.output_token_sampling_mask_len[idx].clone()
-            sampling_mask_idx = self.output_token_sampling_mask_idx[idx].clone()
-            sampling_logprobs = self.output_token_sampling_logprobs[idx].clone()
         return (
             self.output_ids[idx].clone(),
             self.cached_tokens[idx].clone(),
@@ -433,9 +443,21 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
-            sampling_mask_len,
-            sampling_mask_idx,
-            sampling_logprobs,
+            (
+                self.output_token_sampling_mask_len[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_mask_idx[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_logprobs[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
@@ -503,11 +525,6 @@ class MetadataBuffers:
                     device="cpu",
                 )
         if req.return_sampling_mask:
-            if not self.enable_sampling_mask:
-                raise RuntimeError(
-                    "return_sampling_mask with disaggregation requires "
-                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-                )
             # Sentinel -1: the decode side records None for this handoff token.
             self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
             sampling_masks = req.output_token_sampling_mask
@@ -522,7 +539,7 @@ class MetadataBuffers:
                         raise RuntimeError(
                             f"Sampling mask length {mask_len} exceeds disaggregation "
                             f"metadata capacity {max_mask_len}. Increase "
-                            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
+                            "--sampling-mask-max-tokens."
                         )
                     self.output_token_sampling_mask_len[req.metadata_buffer_index][
                         0
@@ -1067,6 +1084,191 @@ def append_state_component(
     kv_args.state_layer_ids.append(layer_ids or [])
 
 
+def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
+    if getattr(pool, "use_dsa", False):
+        pool = pool.full_kv_pool
+    if not pool.kpool_use_compress:
+        return []
+
+    pool_size = int(pool.index_kpool)
+    tail_size = pool_size + int(getattr(pool, "tail_extra_slots", 0))
+    if pool_size <= 1 or tail_size < pool_size:
+        raise ValueError(
+            "DSA kpool-compress requires pool_size > 1 and "
+            f"tail_size >= pool_size, got pool_size={pool_size}, "
+            f"tail_size={tail_size}"
+        )
+
+    n_valid = int(seq_len) % pool_size
+    if n_valid == 0:
+        return []
+    start_phys = (int(seq_len) - n_valid) % tail_size
+    first_n = min(n_valid, tail_size - start_phys)
+    second_n = n_valid - first_n
+    return [
+        int(req_pool_idx),
+        start_phys,
+        first_n,
+        0,
+        second_n,
+        tail_size,
+    ]
+
+
+def slice_dsa_tail_dst_ptrs_for_pp(
+    src_ptrs: List[int],
+    dst_ptrs: List[int],
+    start_layer: int,
+    end_layer: Optional[int],
+) -> List[int]:
+    if len(src_ptrs) == len(dst_ptrs):
+        return list(dst_ptrs)
+    if len(src_ptrs) % 2 != 0 or len(dst_ptrs) % 2 != 0:
+        raise ValueError(
+            "DSA tail pointer lists must contain equal key/score halves, got "
+            f"src={len(src_ptrs)}, dst={len(dst_ptrs)}"
+        )
+
+    src_layers = len(src_ptrs) // 2
+    dst_layers = len(dst_ptrs) // 2
+    expected_end = start_layer + src_layers
+    if end_layer is not None and end_layer - start_layer == src_layers:
+        expected_end = end_layer
+    if start_layer < 0 or expected_end > dst_layers:
+        raise ValueError(
+            "DSA tail pointer count mismatch: "
+            f"src={len(src_ptrs)}, dst={len(dst_ptrs)}, "
+            f"prefill_layers=[{start_layer}, {expected_end})"
+        )
+
+    return list(dst_ptrs[start_layer:expected_end]) + list(
+        dst_ptrs[dst_layers + start_layer : dst_layers + expected_end]
+    )
+
+
+def build_dsa_tail_transfer_blocks(
+    src_ptrs: List[int],
+    src_item_lens: List[int],
+    dst_ptrs: List[int],
+    src_indices: List[int],
+    dst_indices: List[int],
+    dst_item_lens: Optional[List[int]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Remap live DSA tail tokens between rings with different speculative-slot counts."""
+    if not src_indices and not dst_indices:
+        return []
+    if not src_indices or not dst_indices:
+        raise ValueError(
+            f"DSA tail slot index missing: src={src_indices}, dst={dst_indices}"
+        )
+    if len(src_indices) != 6 or len(dst_indices) != 6:
+        raise ValueError(
+            "DSA tail slot indices must be 6-tuples, "
+            f"got src={src_indices}, dst={dst_indices}"
+        )
+    if dst_item_lens is None:
+        dst_item_lens = src_item_lens
+    if not (len(src_ptrs) == len(dst_ptrs) == len(src_item_lens) == len(dst_item_lens)):
+        raise ValueError(
+            "DSA tail pointer metadata mismatch: "
+            f"src_ptrs={len(src_ptrs)}, dst_ptrs={len(dst_ptrs)}, "
+            f"src_item_lens={len(src_item_lens)}, "
+            f"dst_item_lens={len(dst_item_lens)}"
+        )
+
+    src_tail_size = int(src_indices[5])
+    dst_tail_size = int(dst_indices[5])
+    if src_tail_size <= 0 or dst_tail_size <= 0:
+        raise ValueError(
+            "DSA tail ring sizes must be positive: "
+            f"src={src_tail_size}, dst={dst_tail_size}"
+        )
+
+    def parse_segments(indices: List[int], tail_size: int, side: str):
+        segments = []
+        for seg in (1, 2):
+            off = int(indices[seg * 2 - 1])
+            n = int(indices[seg * 2])
+            if min(off, n) < 0:
+                raise ValueError(
+                    f"DSA tail {side} offsets and lengths must be non-negative"
+                )
+            if off + n > tail_size:
+                raise ValueError(
+                    f"DSA tail {side} segment {seg} exceeds ring size "
+                    f"{tail_size}: ({off}, {n})"
+                )
+            if n:
+                segments.append((off, n))
+        return segments
+
+    src_segments = parse_segments(src_indices, src_tail_size, "source")
+    dst_segments = parse_segments(dst_indices, dst_tail_size, "destination")
+    src_count = sum(n for _, n in src_segments)
+    dst_count = sum(n for _, n in dst_segments)
+    if src_count != dst_count:
+        raise ValueError(
+            f"DSA tail live-token count mismatch: src={src_count}, dst={dst_count}"
+        )
+
+    src_idx = int(src_indices[0])
+    dst_idx = int(dst_indices[0])
+    if src_idx < 0 or dst_idx < 0:
+        raise ValueError("DSA tail request row indices must be non-negative")
+
+    transfer_blocks = []
+    for src_ptr, src_row_bytes, dst_ptr, dst_row_bytes in zip(
+        src_ptrs, src_item_lens, dst_ptrs, dst_item_lens
+    ):
+        src_row_bytes = int(src_row_bytes)
+        dst_row_bytes = int(dst_row_bytes)
+        if src_row_bytes == 0 and dst_row_bytes == 0:
+            continue
+        if src_row_bytes <= 0 or src_row_bytes % src_tail_size != 0:
+            raise ValueError(
+                f"DSA source tail row size {src_row_bytes} is not divisible by "
+                f"{src_tail_size}"
+            )
+        if dst_row_bytes <= 0 or dst_row_bytes % dst_tail_size != 0:
+            raise ValueError(
+                f"DSA destination tail row size {dst_row_bytes} is not "
+                f"divisible by {dst_tail_size}"
+            )
+        src_slot_bytes = src_row_bytes // src_tail_size
+        dst_slot_bytes = dst_row_bytes // dst_tail_size
+        if src_slot_bytes != dst_slot_bytes:
+            raise ValueError(
+                "DSA tail slot-size mismatch: "
+                f"src={src_slot_bytes}, dst={dst_slot_bytes}"
+            )
+
+        slot_bytes = src_slot_bytes
+        src_row_base = int(src_ptr) + src_row_bytes * src_idx
+        dst_row_base = int(dst_ptr) + dst_row_bytes * dst_idx
+        src_seg_idx = dst_seg_idx = 0
+        src_consumed = dst_consumed = 0
+        while src_seg_idx < len(src_segments):
+            src_off, src_n = src_segments[src_seg_idx]
+            dst_off, dst_n = dst_segments[dst_seg_idx]
+            n = min(src_n - src_consumed, dst_n - dst_consumed)
+            transfer_blocks.append(
+                (
+                    src_row_base + (src_off + src_consumed) * slot_bytes,
+                    dst_row_base + (dst_off + dst_consumed) * slot_bytes,
+                    n * slot_bytes,
+                )
+            )
+            src_consumed += n
+            dst_consumed += n
+            if src_consumed == src_n:
+                src_seg_idx += 1
+                src_consumed = 0
+            if dst_consumed == dst_n:
+                dst_seg_idx += 1
+                dst_consumed = 0
+    return transfer_blocks
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -1099,6 +1301,19 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+
+    def append_dsa_tail(pool) -> None:
+        if not pool.kpool_use_compress:
+            return
+        tail_ptrs, tail_lens, tail_item_lens = pool.get_compress_tail_buf_infos()
+        if tail_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.DSA_TAIL,
+                tail_ptrs,
+                tail_lens,
+                tail_item_lens,
+            )
 
     if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
         append_state_component(
@@ -1203,7 +1418,25 @@ def setup_state_kv_args(
                 slice_outer_counts,
                 layer_ids,
             )
+            # Hybrid DSA pools keep their index cache and kpool tail in the
+            # full-attention sub-pool rather than in the Mamba state above.
+            if getattr(token_to_kv_pool, "use_dsa", False):
+                dsa_pool = token_to_kv_pool.full_kv_pool
+                dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
+                append_state_component(
+                    kv_args,
+                    StateType.DSA,
+                    dsa_ptrs,
+                    dsa_lens,
+                    dsa_item_lens,
+                )
+                append_dsa_tail(dsa_pool)
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
+            tail_ptrs, tail_lens, tail_item_lens = [], [], []
+            if isinstance(token_to_kv_pool, DSATokenToKVPool):
+                tail_ptrs, tail_lens, tail_item_lens = (
+                    token_to_kv_pool.get_compress_tail_buf_infos()
+                )
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
             ):
@@ -1215,15 +1448,32 @@ def setup_state_kv_args(
                 data_ptrs = data_ptrs + draft_data_ptrs
                 data_lens = data_lens + draft_data_lens
                 item_lens = item_lens + draft_item_lens
+                draft_tail_ptrs, draft_tail_lens, draft_tail_item_lens = (
+                    draft_token_to_kv_pool.get_compress_tail_buf_infos()
+                )
+                tail_ptrs = tail_ptrs + draft_tail_ptrs
+                tail_lens = tail_lens + draft_tail_lens
+                tail_item_lens = tail_item_lens + draft_tail_item_lens
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
-                kv_args.total_kv_layers = total_kv_layers
+                kv_args.hidden_kv_layers = total_kv_layers
+                kv_args.draft_kv_layers = (
+                    draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
+                )
             else:
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
+                if tail_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.DSA_TAIL,
+                        tail_ptrs,
+                        tail_lens,
+                        tail_item_lens,
+                    )
 
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
@@ -1237,6 +1487,22 @@ def setup_state_kv_args(
                 c128_lens,
                 c128_item_lens,
             )
+
+        # On A5 (CYCLE cache_mode), C4 state uses request-local ring rows rather
+        # than SWA pages.  Register it separately so P and D can independently
+        # map logical positions when their local ring sizes differ.
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if is_npu_arch35():
+            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
+            if c4_ptrs:
+                append_state_component(
+                    kv_args,
+                    AscendStateType.DSV4_C4_STATE,
+                    c4_ptrs,
+                    c4_lens,
+                    c4_item_lens,
+                )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

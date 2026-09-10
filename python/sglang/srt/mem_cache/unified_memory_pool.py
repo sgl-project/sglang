@@ -1063,11 +1063,35 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape=None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
         # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
+        if short_conv_layer_ids or ngram_context_len:
+            raise ValueError(
+                "Qwen4-Exp PLE side states are not supported with "
+                "--enable-unified-memory"
+            )
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        self.short_conv_pool = ShortConvPool(
+            size=0,
+            state_shape=None,
+            layer_ids=[],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.ngram_pool = NGramPool(
+            size=0,
+            context_len=0,
+            eos_token_id=0,
+            device=device,
+        )
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
             f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "
@@ -1106,6 +1130,15 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
                     device=self.device,
                 )
             )
+
+    @property
+    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
+        """This pool's ids ARE virtual; page_size is 1, so the translate is the
+        plain gather this table serves, which keeps `mamba_translate_is_fusable`
+        true despite the override."""
+        if self.mamba_allocator is None:
+            return None
+        return self.mamba_allocator.virtual_to_physical
 
     def translate_mamba_indices(self, virtual_ids: torch.Tensor) -> torch.Tensor:
         """Virtual mamba ids -> physical slot ids."""
@@ -1193,7 +1226,7 @@ def init_unified_mamba_pools(
     unified_total_bytes: Optional[int] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_mamba import (
         UnifiedMambaTokenToKVPoolAllocator,
     )
 
@@ -1621,23 +1654,29 @@ class UnifiedSWAKVPool(SWAKVPool):
         phys_pages = allocator.virtual_to_physical[virt_pages]
         return phys_pages * ps + offsets
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         assert self._full_allocator is not None
         assert self._swa_allocator is not None
         # `indices` are virtual TOKEN ids; translate per sub-pool.
         full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
         swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
-        full_cpu = self.full_kv_pool.get_cpu_copy(full_phys)
+        full_cpu = self.full_kv_pool.get_cpu_copy(
+            full_phys, req_pool_index=req_pool_index
+        )
         valid = swa_phys >= 0
         swa_cpu = None
         if bool(valid.any().item()):
             swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_phys[valid])
         return {"full": full_cpu, "swa": swa_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         assert self._full_allocator is not None
         full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
-        self.full_kv_pool.load_cpu_copy(kv_cache_cpu["full"], full_phys)
+        self.full_kv_pool.load_cpu_copy(
+            kv_cache_cpu["full"], full_phys, req_pool_index=req_pool_index
+        )
         if kv_cache_cpu.get("swa") is not None:
             assert self._swa_allocator is not None
             swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
@@ -1677,7 +1716,7 @@ def init_unified_swa_pools(
     sliding_window_size: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWATokenToKVPoolAllocator,
     )
 
@@ -1872,7 +1911,7 @@ def init_unified_mamba_swa_pools(
     fed until the byte configurator lands); the buffer budget is their byte
     sum and the runtime split floats.
     """
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedMambaSWATokenToKVPoolAllocator,
     )
 
