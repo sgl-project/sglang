@@ -145,6 +145,11 @@ jobs:
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
+      - name: Install checkpoint-engine extra (optional; tests skip if unavailable)
+        continue-on-error: true
+        run: |
+          docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir ".[checkpoint-engine]" --extra-index-url https://download.pytorch.org/whl/xpu
+
       - name: Run tests
         # Old stage-a (30) + stage-b (120) = 150; +20% headroom for --enable-retry.
         timeout-minutes: 180
