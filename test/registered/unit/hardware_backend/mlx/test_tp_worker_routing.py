@@ -74,6 +74,9 @@ class _FakeRunner:
     def flush_all_decode_kv(self):
         pass
 
+    def note_committed_len(self, rid, seq_len):
+        pass
+
     def ops_for(self, rid):
         return [op for op, r in self.calls if r == rid]
 
@@ -169,7 +172,9 @@ class _FakeReq:
         self.rid = rid
         self.prefix_indices = torch.empty(0, dtype=torch.long)
         self.fill_ids = [0]
-        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
+        self.kv = ReqKvInfo(
+            req_pool_idx=req_pool_idx, kv_committed_len=len(self.fill_ids)
+        )
         # Mirrors Req's chunk-finality contract read by
         # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
         # "not truncated" (final chunk / plain prefill).
