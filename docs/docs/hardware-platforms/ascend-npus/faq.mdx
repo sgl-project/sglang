@@ -303,3 +303,44 @@ Docker images for Ascend NPU are available in two types:
   if you need the latest features or bug fixes that have not yet been included in a stable release.
 
 If you encounter issues with a stable release, try switching to a daily build to see if the issue has been resolved in the latest development version.
+
+## 9. NNAL library not found when loading the torch_npu ATB extension
+
+### Error message
+
+When launching the SGLang server on Ascend NPU (e.g., while running an OCR model
+that uses `torch_npu._npu_reshape_and_cache`), the engine fails with:
+
+```text
+OSError: [Errno None] Please check that the nnal package is installed.
+Please run 'source set_env.sh' in the NNAL installation path.
+```
+
+The failing call chain is:
+
+```text
+torch_npu._npu_reshape_and_cache
+  -> torch_npu/op_plugin/atb/_atb_ops.py  _register_atb_extensions()
+    -> torch.ops.load_library(.../torch_npu/lib/libop_plugin_atb.so)
+      -> libatb.so: cannot open shared object file
+```
+
+### Cause
+
+`libop_plugin_atb.so` (the ATB operator plugin shipped with `torch_npu`) depends
+on `libatb.so`, which is provided by the **NNAL** (Ascend Neural Network
+Acceleration Library) package. When NNAL is not installed, or its library
+directory is not present in `LD_LIBRARY_PATH`, loading the ATB extension fails.
+
+### Solution
+
+- Make sure NNAL is installed, typically under `<ascend_root>/nnal`, with
+  `libatb.so` located at `nnal/atb/<version>/atb/cxx_abi_1/lib/`.
+- Add the NNAL library directory to `LD_LIBRARY_PATH`:
+
+```bash
+export LD_LIBRARY_PATH=/path/to/Ascend/nnal/atb/<version>/atb/cxx_abi_1/lib:$LD_LIBRARY_PATH
+```
+
+- On `aarch64` hosts, use the `cxx_abi_1` (GLIBCXX 3.4.30+) variant; pick the
+  matching `cxx_abi_N` directory if your toolchain uses a different ABI.

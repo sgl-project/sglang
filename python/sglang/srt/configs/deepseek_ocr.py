@@ -23,7 +23,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 DeepseekOCRImage = Union[Image.Image, torch.Tensor]
 
 BASE_SIZE = 1024
-IMAGE_SIZE = 640
+IMAGE_SIZE = 768
 CROP_MODE = True
 MIN_CROPS = 2
 MAX_CROPS = 6  # max:9; If your GPU memory is small, it is recommended to set it to 6.
@@ -218,7 +218,7 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
 
 
 def dynamic_preprocess(
-    image, min_num=MIN_CROPS, max_num=MAX_CROPS, image_size=640, use_thumbnail=False
+    image, min_num=MIN_CROPS, max_num=MAX_CROPS, image_size=768, use_thumbnail=False
 ):
     orig_width, orig_height = get_image_size(image)
     aspect_ratio = orig_width / orig_height
@@ -543,7 +543,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
             img_w, img_h = get_image_size(image)
             image_shapes.append((img_w, img_h))
 
-            if img_w <= 640 and img_h <= 640:
+            if img_w <= 768 and img_h <= 768:
                 crop_ratio = [1, 1]
             else:
                 if cropping:
