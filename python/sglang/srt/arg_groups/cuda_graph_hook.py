@@ -563,12 +563,10 @@ def validate_cuda_graph_config(server_args: Any):
 def _resolve_max_context_size(
     *, requested_size: Any, page_size: int, model_context_len: Optional[int]
 ) -> int:
-    if isinstance(requested_size, bool) or not isinstance(requested_size, int):
-        raise ValueError("--cuda-graph-prefill-max-context accepts exactly one integer")
     if requested_size <= 0:
         raise ValueError("--cuda-graph-prefill-max-context must be a positive integer")
 
-    aligned_size = ((requested_size + page_size - 1) // page_size) * page_size
+    aligned_size = int((requested_size + page_size - 1) // page_size * page_size)
     if (
         model_context_len is not None
         and model_context_len > 0
