@@ -348,6 +348,9 @@ class SchedulerWeightUpdaterManager:
                         break
                 if success:
                     self._weight_update_loaded = True
+            if recv_req.load_format == "flattened_bucket":
+                # Finish reads from imported CUDA IPC storage before returning.
+                torch.get_device_module().synchronize()
             if success:
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)

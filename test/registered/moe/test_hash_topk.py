@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
@@ -13,6 +14,9 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.state_capturer.routed_experts import (
+    disable_routed_experts_capture_for_draft,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-b-test-cpu")
@@ -78,6 +82,134 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     assert output.topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(output.topk_weights[:, -1], torch.full((2,), 0.4))
     assert recorded["topk_ids"].tolist() == [[0, 65], [63, 127]]
+
+
+def test_hash_topk_captures_logical_expert_ids(monkeypatch):
+    captured = {}
+
+    class FakeCapturer:
+        def capture(self, *, layer_id, topk_indices):
+            captured["layer_id"] = layer_id
+            captured["topk_ids"] = topk_indices.clone()
+
+    monkeypatch.setattr(
+        hash_topk_module,
+        "capture_routed_experts_if_allowed",
+        lambda allow_capture, layer_id, topk_ids, _num_token_non_padded=None: (
+            FakeCapturer().capture(layer_id=layer_id, topk_indices=topk_ids)
+            if allow_capture
+            else None
+        ),
+    )
+
+    topk = HashTopK(
+        topk=2,
+        num_experts=8,
+        num_fused_shared_experts=0,
+        vocab_size=2,
+        scoring_func="sqrtsoftplus",
+        layer_id=3,
+    )
+    with torch.no_grad():
+        topk.tid2eid.copy_(torch.tensor([[1, 5], [2, 7]], dtype=torch.int32))
+
+    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+        output = topk(
+            hidden_states=torch.empty(2, 4),
+            router_logits=torch.ones(2, 8),
+            input_ids=torch.tensor([0, 1], dtype=torch.int64),
+        )
+
+    assert output.topk_ids.tolist() == [[1, 5], [2, 7]]
+    assert captured["layer_id"] == 3
+    assert torch.equal(
+        captured["topk_ids"],
+        torch.tensor([[1, 5], [2, 7]], dtype=torch.int32),
+    )
+
+
+def test_hash_topk_capture_masks_padded_tokens(monkeypatch):
+    captured = {}
+
+    class FakeCapturer:
+        def capture(self, *, layer_id, topk_indices):
+            captured["layer_id"] = layer_id
+            captured["topk_ids"] = topk_indices.clone()
+
+    monkeypatch.setattr(
+        topk_module, "get_global_experts_capturer", lambda: FakeCapturer()
+    )
+
+    def mask_padded_rows(topk_ids, num_token_non_padded, fill_value=-1):
+        topk_ids[int(num_token_non_padded.item()) :].fill_(fill_value)
+
+    monkeypatch.setattr(topk_module, "_mask_topk_ids_padded_region", mask_padded_rows)
+
+    topk = HashTopK(
+        topk=2,
+        num_experts=8,
+        num_fused_shared_experts=0,
+        vocab_size=2,
+        scoring_func="sqrtsoftplus",
+        layer_id=4,
+    )
+    with torch.no_grad():
+        topk.tid2eid.copy_(torch.tensor([[1, 5], [2, 7]], dtype=torch.int32))
+
+    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+        topk(
+            hidden_states=torch.empty(2, 4),
+            router_logits=torch.ones(2, 8),
+            input_ids=torch.tensor([0, 1], dtype=torch.int64),
+            num_token_non_padded=torch.tensor(1),
+        )
+
+    assert captured["layer_id"] == 4
+    assert torch.equal(
+        captured["topk_ids"],
+        torch.tensor([[1, 5], [-1, -1]], dtype=torch.int32),
+    )
+
+
+def test_hash_topk_capture_can_be_disabled(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        hash_topk_module,
+        "capture_routed_experts_if_allowed",
+        lambda allow_capture, *_args: captured.append(True) if allow_capture else None,
+    )
+
+    topk = HashTopK(
+        topk=2,
+        num_experts=8,
+        num_fused_shared_experts=0,
+        vocab_size=2,
+        layer_id=0,
+    )
+    topk.allow_routed_experts_capture = False
+    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+        topk(
+            hidden_states=torch.empty(1, 4),
+            router_logits=torch.ones(1, 8),
+            input_ids=torch.tensor([0], dtype=torch.int64),
+        )
+
+    assert captured == []
+
+
+def test_draft_hash_topk_capture_is_disabled():
+    topk = HashTopK(
+        topk=2,
+        num_experts=8,
+        num_fused_shared_experts=0,
+        vocab_size=2,
+        layer_id=0,
+    )
+    model = torch.nn.Sequential(topk)
+
+    disable_routed_experts_capture_for_draft(model)
+
+    assert not topk.allow_routed_experts_capture
 
 
 def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
