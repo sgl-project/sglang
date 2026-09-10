@@ -92,7 +92,6 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_gfx95_supported,
-    is_gfx942_supported,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -103,7 +102,6 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_gfx942_supported = _is_hip and is_gfx942_supported()
 _is_gfx95_supported = _is_hip and is_gfx95_supported()
 _device_sm = get_device_sm()
 
@@ -1617,8 +1615,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
-        if _is_hip and not (_is_gfx942_supported or _is_gfx95_supported):
-            return "Shared experts fusion requires gfx942 or newer GPUs."
+        if _is_hip and not _is_gfx95_supported:
+            return "Shared experts fusion on ROCm is validated on gfx950 only."
         if get_parallel().moe_ep_size > 1:
             return "Shared experts fusion is not supported together with expert parallelism yet."
         if get_moe_a2a_backend().is_deepep():
