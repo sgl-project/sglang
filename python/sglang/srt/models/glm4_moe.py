@@ -82,7 +82,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.deepseek_common.utils import enable_glm_nextn_moe_ptpc
+from sglang.srt.models.deepseek_common.utils import should_apply_glm_nextn_moe_ptpc
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
@@ -1511,30 +1511,30 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         # "model.decoder.mlp.experts", which expanded per-expert leaf excludes
         # do not match. So that module needs its own entry: bf16 as in the
         # checkpoint, or the scheme matching the on-load PTPC-FP8 cast.
-        if any(".mlp.experts." in name for name in mtp_excluded):
-            if enable_glm_nextn_moe_ptpc(quant_config):
-                mtp_layer_quant_config = quant_config.quant_config.setdefault(
-                    "layer_quant_config", {}
-                )
-                mtp_layer_quant_config["model.decoder.mlp.experts"] = {
-                    "weight": {
-                        "dtype": "fp8_e4m3",
-                        "is_dynamic": False,
-                        "qscheme": "per_channel",
-                    },
-                    # Dynamic per_channel is QuarkW8A8FP8MoE's per-token input.
-                    "input_tensors": {
-                        "dtype": "fp8_e4m3",
-                        "is_dynamic": True,
-                        "qscheme": "per_channel",
-                    },
-                }
-                logger.info(
-                    "SGLANG_GLM_NEXTN_MOE_PTPC=1: MTP fused MoE "
-                    "(model.decoder.mlp.experts) runs as PTPC-FP8"
-                )
-            else:
-                names.add("model.decoder.mlp.experts")
+        # Same gate as the weight-loader cast (Quark-excluded = bf16 in ckpt).
+        if should_apply_glm_nextn_moe_ptpc(quant_config, config.num_hidden_layers):
+            mtp_layer_quant_config = quant_config.quant_config.setdefault(
+                "layer_quant_config", {}
+            )
+            mtp_layer_quant_config["model.decoder.mlp.experts"] = {
+                "weight": {
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": False,
+                    "qscheme": "per_channel",
+                },
+                # Dynamic per_channel is QuarkW8A8FP8MoE's per-token input.
+                "input_tensors": {
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": True,
+                    "qscheme": "per_channel",
+                },
+            }
+            logger.info(
+                "SGLANG_GLM_NEXTN_MOE_PTPC=1: MTP fused MoE "
+                "(model.decoder.mlp.experts) runs as PTPC-FP8"
+            )
+        elif any(".mlp.experts." in name for name in mtp_excluded):
+            names.add("model.decoder.mlp.experts")
 
         quant_config.exclude_layers = list(names)
         return quant_config
