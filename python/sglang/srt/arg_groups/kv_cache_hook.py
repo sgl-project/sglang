@@ -170,6 +170,20 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "and cannot be used at the same time. Please use only one of them."
         )
 
+    if cfg.enable_prefill_weight_versions:
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "The argument enable-prefill-weight-versions cannot be combined with "
+                "enable-hierarchical-cache: KV restored from the host or storage tiers carries "
+                "no weight version, so the reported prompt versions would be wrong."
+            )
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "The argument enable-prefill-weight-versions is not supported in disaggregation "
+                f"mode {cfg.disaggregation_mode!r}: prefill workers do not report prompt weight "
+                "versions yet."
+            )
+
     if cfg.disaggregation_decode_enable_offload_kvcache:
         if cfg.disaggregation_mode != "decode":
             raise ValueError(

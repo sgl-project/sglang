@@ -84,6 +84,10 @@ def _make_batch_str_output() -> BatchStrOutput:
             ],
             [WeightVersionSpan(version="v2", start=0, end=2)],
         ],
+        prefill_weight_versions=[
+            [WeightVersionSpan(version="v0", start=0, end=7)],
+            None,
+        ],
     )
 
 
@@ -124,6 +128,25 @@ class TestMultiTokenizerMixin(unittest.TestCase):
         output.weight_versions = None
 
         self.assertIsNone(_handle_output_by_index(output, 0).weight_versions)
+
+    def test_batch_str_output_keeps_prefill_weight_versions_nested_per_request(self):
+        """Prefill spans split per request the same way the sampling spans do."""
+        output = _make_batch_str_output()
+
+        self.assertEqual(
+            _handle_output_by_index(output, 0).prefill_weight_versions,
+            [[WeightVersionSpan(version="v0", start=0, end=7)]],
+        )
+        self.assertEqual(
+            _handle_output_by_index(output, 1).prefill_weight_versions, [None]
+        )
+
+    def test_batch_str_output_without_prefill_weight_versions_stays_none(self):
+        """An output produced without the flag splits into None."""
+        output = _make_batch_str_output()
+        output.prefill_weight_versions = None
+
+        self.assertIsNone(_handle_output_by_index(output, 0).prefill_weight_versions)
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)

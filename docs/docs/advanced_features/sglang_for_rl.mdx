@@ -591,6 +591,7 @@ A request can outlive a version change: the RL flow retracts it with `pause_gene
 ```
 
 - Ranges are half-open `[start, end)` over output-token indices, prompt excluded. The usual case is a single span.
+- `--enable-prefill-weight-versions` adds `prefill_weight_versions`, the same span list over the prompt tokens, so KV reused from the prefix cache under older weights is visible.
 
 ## Easy To Postpone Generation
 

@@ -36,6 +36,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         tree_cache=None,
         hisparse_coordinator=None,
         req_to_token_pool=None,
+        kv_weight_version_tracker=None,
         decode_offload_manager=None,
         metrics_collector=None,
         metrics_reporter=metrics_reporter,
@@ -134,6 +135,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     auxiliary_host_output=None,
                     routed_experts_output=None,
                     indexer_topk_output=None,
+                    kv_weight_version_record=None,
                     logits_output=SimpleNamespace(
                         hidden_states=hidden_states,
                         customized_info=None,
@@ -183,6 +185,7 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
                 auxiliary_host_output=None,
                 routed_experts_output=None,
                 indexer_topk_output=None,
+                kv_weight_version_record=None,
                 logits_output=SimpleNamespace(hidden_states=hidden_states),
                 next_token_ids=None,
                 can_run_cuda_graph=False,

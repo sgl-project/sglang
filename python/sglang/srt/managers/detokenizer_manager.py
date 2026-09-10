@@ -503,6 +503,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             weight_versions=recv_obj.weight_versions,
+            prefill_weight_versions=recv_obj.prefill_weight_versions,
             token_steps=recv_obj.token_steps,
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,

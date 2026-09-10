@@ -3628,6 +3628,11 @@ class ServerArgs:
         "Enable returning indexer topk indices of layers with indexer with responses.",
         NS("exec.features"),
     ] = False
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+        NS("exec.features"),
+    ] = False
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
