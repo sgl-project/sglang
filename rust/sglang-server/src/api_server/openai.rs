@@ -17,6 +17,9 @@ mod template;
 mod template_builtins;
 mod template_legacy;
 mod template_loader;
+mod template_native;
+#[cfg(test)]
+mod template_native_tests;
 mod tools;
 
 pub(super) use template::ChatFormatter;
@@ -58,9 +61,21 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
         server_args.revision.as_deref(),
         "tokenizer_config.json",
     );
+    // `config.json` carries the architecture list, which is what selects a
+    // built-in prompt encoder for the models that ship no chat template.
+    let model_config_file = (!server_args.model_path.is_empty())
+        .then(|| {
+            tokenizer::resolve_model_file(
+                &server_args.model_path,
+                server_args.revision.as_deref(),
+                "config.json",
+            )
+        })
+        .flatten();
 
     match template::load_chat_formatter(
         config_file.as_deref(),
+        model_config_file.as_deref(),
         (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
         server_args.chat_template.as_deref(),
     ) {
