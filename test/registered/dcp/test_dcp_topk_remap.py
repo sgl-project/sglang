@@ -250,6 +250,49 @@ class TestDcpTopkRemap(CustomTestCase):
         flat_out = _remap(topk.reshape(-1, 16), dcp_size, rank)
         self.assertTrue(torch.equal(out.reshape(-1, 16), flat_out))
 
+    def test_the_float32_sort_keys_give_the_integer_permutation(self):
+        # The compaction sorts float32 keys because Ascend has no AiCore
+        # ArgSort for integer dtypes and falls back to AiCpu, which measured as
+        # the dominant term in the DCP decode penalty on A3. That is only a
+        # free substitution while the keys stay exactly representable: they are
+        # the distinct integers [0, 2K), and float32 is exact below 2**24.
+        #
+        # Pinned against an explicit integer-key reference rather than against
+        # remembered output, because the claim being made is equivalence to the
+        # dtype this used to sort -- not that some particular ordering is
+        # right, which the order and partition tests above already cover.
+        for k in (16, 2048, 8192):
+            topk = _topk_rows(6, k, max(4 * k, 64), seed=97 + k)
+            for dcp_size in DCP_SIZES:
+                for rank in range(dcp_size):
+                    got = _remap(topk, dcp_size, rank)
+
+                    owned = (topk >= 0) & (topk % dcp_size == rank)
+                    local = torch.where(
+                        owned, topk // dcp_size, torch.full_like(topk, PAD)
+                    )
+                    order = torch.arange(k, dtype=topk.dtype)
+                    int_keys = order + (~owned).to(topk.dtype) * k
+                    want = torch.gather(local, -1, torch.argsort(int_keys, dim=-1))
+
+                    self.assertTrue(
+                        torch.equal(got, want),
+                        f"float32 keys diverged from integer keys at k={k}, "
+                        f"dcp_size={dcp_size}, rank={rank}",
+                    )
+
+    def test_a_top_k_too_wide_for_exact_float32_keys_is_refused(self):
+        # The bound is stated so it fails loudly if index_topk ever grows past
+        # it, rather than degrading into a silently non-unique permutation --
+        # colliding keys would make the sort tie-break, and the whole reason
+        # the offset exists is to avoid depending on that.
+        # A stride-0 view, so this costs one element rather than 32 MiB: the
+        # precondition is checked before any elementwise work, which is the
+        # point of checking it up front.
+        topk = torch.zeros(1, dtype=torch.int32).expand(1, (1 << 23) + 1)
+        with self.assertRaises(AssertionError):
+            _remap(topk, 4, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

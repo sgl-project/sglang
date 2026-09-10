@@ -113,6 +113,15 @@ def remap_dcp_local_topk_indices(
     if dcp_size == 1:
         return topk_indices
 
+    # Checked before any work, because it is a precondition on the compaction
+    # below rather than a property of the result -- see the sort-key note.
+    k = topk_indices.shape[-1]
+    assert 2 * k <= 1 << 24, (
+        f"top-k width {k} exceeds the exactly-representable float32 sort-key "
+        "range; keys would collide and the compaction would stop being a "
+        "permutation. Sort integer keys here instead, and pay AiCpu on Ascend."
+    )
+
     owned = (topk_indices >= 0) & (topk_indices % dcp_size == parallel.attn_dcp_rank)
     local = torch.where(
         owned,
@@ -123,9 +132,25 @@ def remap_dcp_local_topk_indices(
     # Stable compaction without relying on a stable sort: offsetting a
     # non-owned entry's position by K keeps every key distinct, so the
     # permutation is unique and the ordering is exact rather than tie-broken.
-    k = topk_indices.shape[-1]
-    order = torch.arange(k, device=topk_indices.device, dtype=topk_indices.dtype)
-    keys = order + (~owned).to(topk_indices.dtype) * k
+    #
+    # The keys are float32 rather than the index dtype because Ascend has no
+    # AiCore ArgSort for int32/int64 -- it silently falls back to AiCpu and says
+    # so at warning level ("please cast dtype to float32",
+    # ArgSortKernelNpuOpApi.cpp:26). This runs once per layer per decode step,
+    # 78 times, and measured on A3 that fallback was the dominant term in the
+    # DCP decode penalty: ~9.6 ms per request per step against dcp1's own
+    # 2.5 ms, flat in dcp_size and flat in context length, which is the
+    # signature of [batch, K] work rather than anything touching the sequence.
+    # vLLM-Ascend sorts float32 keys (sfa_cp.py:1023-1045) for the same reason.
+    #
+    # Exact, not approximate. The keys are the distinct integers [0, 2K) and
+    # float32 represents every integer below 2**24 exactly, so the resulting
+    # permutation is identical to the integer sort's -- the distinctness the
+    # offset was introduced for is what makes the dtype change free. The assert
+    # states the bound rather than leaving it implicit; index_topk is three
+    # orders of magnitude below it, and the bound is asserted above.
+    order = torch.arange(k, device=topk_indices.device, dtype=torch.float32)
+    keys = order + (~owned).to(torch.float32) * k
     return torch.gather(local, -1, torch.argsort(keys, dim=-1))
 
 
