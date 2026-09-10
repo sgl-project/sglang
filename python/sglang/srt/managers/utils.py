@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -110,6 +111,7 @@ class GenerationBatchResult:
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    kv_weight_version_record: Optional[KvWeightVersionRecord] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
@@ -186,6 +188,7 @@ class GenerationBatchResult:
             sampling_mask_output,
             self.routed_experts_output,
             self.indexer_topk_output,
+            self.kv_weight_version_record,
             self.expert_distribution_metrics,
         ):
             if holder is not None:
