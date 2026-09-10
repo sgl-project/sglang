@@ -1427,6 +1427,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
+                kv_hints=obj.kv_hints,
                 extra_key=obj.extra_key,
                 cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
