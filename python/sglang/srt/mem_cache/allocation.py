@@ -299,7 +299,11 @@ def alloc_for_extend(
         reuse_kv = [r.kv.holds_kv and bool(r.dllm_incomplete_ids) for r in batch.reqs]
 
     # Create tensors for allocation
-    pin_memory = is_pin_memory_available(batch.device)
+    # NPU: torch.npu supports pinned host memory, but the generic platform
+    # mixin reports it unavailable; force it on so H2D copies can be async.
+    pin_memory = is_pin_memory_available(batch.device) or (
+        _is_npu and str(batch.device).split(":", 1)[0] == "npu"
+    )
     prefix_lens_cpu = torch.tensor(
         batch.prefix_lens, dtype=torch.int64, pin_memory=pin_memory
     )
