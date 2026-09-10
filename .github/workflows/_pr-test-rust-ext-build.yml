@@ -228,6 +228,7 @@ jobs:
           (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
           python - <<'PY'
           import importlib.util
+          import json
           import os
           import pathlib
           import runpy
@@ -238,6 +239,7 @@ jobs:
           import torch  # noqa: F401 - preload libtorch before the extension
 
           root = pathlib.Path.cwd()
+          manifest = root / "rust/sglang-radix-tree/Cargo.toml"
           suffix = sysconfig.get_config_var("EXT_SUFFIX")
           production_path = pathlib.Path(
               "python/sglang/srt/mem_cache/rust_tree_core/mem_cache" + suffix
@@ -246,11 +248,42 @@ jobs:
               "mem_cache_inspection" + suffix
           )
 
+          # Read the header name from the crate the way python/setup.py does,
+          # so renaming it stays a one-line change in Cargo.toml.
+          document = json.loads(
+              subprocess.run(
+                  [
+                      "cargo",
+                      "metadata",
+                      "--format-version",
+                      "1",
+                      "--no-deps",
+                      "--manifest-path",
+                      str(manifest),
+                  ],
+                  capture_output=True,
+                  check=True,
+                  text=True,
+              ).stdout
+          )
+          package = next(
+              p for p in document["packages"] if p["name"] == "sglang-radix-tree"
+          )
+          declared = (package["metadata"] or {}).get("sglang", {}).get(
+              "torch-compat-header"
+          )
+          compat_header = manifest.parent / (declared or "")
+          if declared is None or not compat_header.is_file():
+              raise SystemExit(
+                  f"sglang-radix-tree declares torch-compat-header={declared!r}, "
+                  f"which does not resolve under {manifest.parent}"
+              )
+
           helper = runpy.run_path(
               root / "python/sglang/srt/rust_extensions/torch_build.py"
           )
           build = helper["torch_build_configuration"](
-              compat_header=root / "rust/sglang-radix-tree/torch_compat.h",
+              compat_header=compat_header,
               python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
               torch_module=torch,
               include_absolute_rpath=False,
