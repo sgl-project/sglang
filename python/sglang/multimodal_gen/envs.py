@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -307,6 +308,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
+    ),
+    # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
+    # "auto" prefers sgl-kernel's convrot_int8_* ops where they run (CC 9.0,
+    # 10.0, 12.0, 12.1) and falls back to comfy_kitchen; "sgl_kernel" or
+    # "comfy_kitchen" forces one backend.
+    "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"

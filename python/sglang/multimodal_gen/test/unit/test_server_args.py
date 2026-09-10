@@ -611,7 +611,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.component_attention_backends,
         )
         self.assertEqual(
-            {"text_encoder": "kitchen_int8", "transformer": "fp8"},
+            {"text_encoder": "convrot_int8", "transformer": "fp8"},
             server_args.component_quantizations,
         )
         self.assertEqual(
