@@ -11,10 +11,7 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 
-/// How the SSE pump ended, reported to the `on_complete` hook. The fields
-/// beyond `transport_ok` separate outcomes that are byte-level identical to
-/// success: an in-band engine error under a committed 200, and a client that
-/// walked away mid-generation.
+/// How the SSE pump ended, reported to the `on_complete` hook.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamEnd {
     /// No upstream stream error and no pump panic.
@@ -25,15 +22,10 @@ pub struct StreamEnd {
     pub client_disconnect: bool,
 }
 
-/// Carryover cap for the in-band scanner: a single longer line resets the
-/// buffer — its detection is forfeited, but memory stays bounded.
+/// Maximum buffered length of an SSE line split across chunks.
 const INBAND_SCAN_CARRYOVER_CAP: usize = 1 << 20; // 1 MiB
 
-/// Incremental scanner for in-band SSE error envelopes — the shape sglang's
-/// `create_streaming_error_response` emits after a committed 200. Complete
-/// lines are scanned in place; only a trailing partial line is carried over.
-/// The `{"error"` prefix check is parity-safe: inside a JSON string every
-/// quote is escaped, so it cannot start a well-formed content payload.
+/// Finds in-band error envelopes emitted after an SSE response commits a 200.
 #[derive(Default)]
 struct InbandErrorScanner {
     carry: Vec<u8>,
@@ -41,55 +33,59 @@ struct InbandErrorScanner {
 }
 
 impl InbandErrorScanner {
-    fn feed(&mut self, chunk: &[u8]) {
+    /// Returns whether an error has been seen so callers can stop scanning.
+    fn feed(&mut self, mut chunk: &[u8]) -> bool {
         if self.found {
-            return;
+            return true;
         }
-        let mut rest = chunk;
-        // Finish the carried-over partial line first.
+
+        // Complete a line carried over from the previous chunk.
         if !self.carry.is_empty() {
-            match rest.iter().position(|&b| b == b'\n') {
-                Some(i) => {
-                    self.carry.extend_from_slice(&rest[..i]);
-                    if Self::line_is_inband_error(&self.carry) {
-                        self.found = true;
-                        self.carry = Vec::new();
-                        return;
-                    }
-                    self.carry.clear();
-                    rest = &rest[i + 1..];
-                }
-                None => {
-                    self.carry.extend_from_slice(rest);
-                    if self.carry.len() > INBAND_SCAN_CARRYOVER_CAP {
-                        self.carry.clear();
-                    }
-                    return;
-                }
+            let Some(newline) = chunk.iter().position(|&byte| byte == b'\n') else {
+                self.extend_carry(chunk);
+                return false;
+            };
+            self.extend_carry(&chunk[..newline]);
+            self.found = Self::line_is_inband_error(&self.carry);
+            self.carry.clear();
+            if self.found {
+                return true;
             }
+            chunk = &chunk[newline + 1..];
         }
-        // Scan complete lines in place; keep only the trailing partial.
-        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
-            if Self::line_is_inband_error(&rest[..i]) {
+
+        // Scan complete lines in place and retain the trailing partial line.
+        while let Some(newline) = chunk.iter().position(|&byte| byte == b'\n') {
+            if Self::line_is_inband_error(&chunk[..newline]) {
                 self.found = true;
-                return;
+                return true;
             }
-            rest = &rest[i + 1..];
+            chunk = &chunk[newline + 1..];
         }
-        if rest.len() <= INBAND_SCAN_CARRYOVER_CAP {
-            self.carry.extend_from_slice(rest);
+        self.extend_carry(chunk);
+        false
+    }
+
+    fn extend_carry(&mut self, bytes: &[u8]) {
+        if bytes.len()
+            <= INBAND_SCAN_CARRYOVER_CAP.saturating_sub(self.carry.len())
+        {
+            self.carry.extend_from_slice(bytes);
+        } else {
+            self.carry.clear();
         }
     }
 
     fn line_is_inband_error(line: &[u8]) -> bool {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(mut payload) = line.strip_prefix(b"data:") else {
+        let Some(payload) = line.strip_prefix(b"data:") else {
             return false;
         };
-        while let Some(p) = payload.strip_prefix(b" ") {
-            payload = p;
-        }
-        payload.starts_with(b"{\"error\"")
+        let first_non_space = payload
+            .iter()
+            .position(|&byte| byte != b' ')
+            .unwrap_or(payload.len());
+        payload[first_non_space..].starts_with(b"{\"error\"")
     }
 }
 
@@ -173,7 +169,7 @@ where
         let outcome_setter = Arc::clone(&outcome_holder);
         // The in-band scan exists solely to inform `on_complete`; skip the
         // per-chunk work entirely when nobody is listening.
-        let mut scanner = on_complete.as_ref().map(|_| InbandErrorScanner::default());
+        let mut scanner = on_complete.is_some().then(InbandErrorScanner::default);
         let pump = AssertUnwindSafe(async move {
             // Hold the guards for the task's lifetime — dropped when this
             // block exits (stream done or client disconnect).  Leading
@@ -202,19 +198,18 @@ where
                         if !bytes.is_empty() {
                             if let Some(hook) = on_inter_chunk.as_ref() {
                                 let now = std::time::Instant::now();
-                                if let Some(prev) = prev_chunk_at {
+                                if let Some(prev) = prev_chunk_at.replace(now) {
                                     hook(now.duration_since(prev).as_secs_f64());
                                 }
-                                prev_chunk_at = Some(now);
                             }
                         }
-                        if let Some(scan) = scanner.as_mut() {
-                            scan.feed(bytes);
-                            if scan.found {
-                                outcome_setter.lock().saw_inband_error = true;
-                                // Verdict is sticky; stop scanning.
-                                scanner = None;
-                            }
+                        if scanner
+                            .as_mut()
+                            .is_some_and(|scanner| scanner.feed(bytes))
+                        {
+                            outcome_setter.lock().saw_inband_error = true;
+                            // Verdict is sticky; stop scanning.
+                            scanner = None;
                         }
                     }
                     Err(_) => outcome_setter.lock().transport_ok = false,
@@ -513,78 +508,73 @@ mod tests {
 
     #[test]
     fn inband_scanner_detects_engine_error_event() {
-        // Exact shape sglang's create_streaming_error_response emits.
-        let mut s = InbandErrorScanner::default();
-        s.feed(b"data: {\"choices\": [{\"delta\": {\"content\": \"hi\"}}]}\n\n");
-        assert!(!s.found);
-        s.feed(b"data: {\"error\": {\"message\": \"queue is full\", \"code\": 503}}\n\n");
-        assert!(s.found, "must detect a well-formed in-band error event");
+        let mut scanner = InbandErrorScanner::default();
+        assert!(!scanner.feed(
+            b"data: {\"choices\": [{\"delta\": {\"content\": \"hi\"}}]}\n\n"
+        ));
+        assert!(scanner.feed(
+            b"data: {\"error\": {\"message\": \"queue is full\", \"code\": 503}}\n\n"
+        ));
     }
 
     #[test]
     fn inband_scanner_detects_error_split_across_chunks() {
-        // Network chunking can split an SSE event anywhere — including inside
-        // the `data: {"error"` prefix itself.
-        let mut s = InbandErrorScanner::default();
-        s.feed(b"data: {\"err");
-        assert!(!s.found);
-        s.feed(b"or\": {\"code\": 503}}\n\n");
-        assert!(s.found, "must detect an error event split across chunks");
+        let mut scanner = InbandErrorScanner::default();
+        assert!(!scanner.feed(b"data: {\"err"));
+        assert!(scanner.feed(b"or\": {\"code\": 503}}\n\n"));
     }
 
     #[test]
     fn inband_scanner_tolerates_no_space_and_crlf() {
-        // SSE permits `data:` with no space; proxies may normalize to CRLF.
-        let mut s = InbandErrorScanner::default();
-        s.feed(b"data:{\"error\": {\"code\": 500}}\r\n");
-        assert!(s.found, "must handle data: without space and CRLF endings");
+        let mut scanner = InbandErrorScanner::default();
+        assert!(scanner.feed(b"data:{\"error\": {\"code\": 500}}\r\n"));
     }
 
     #[test]
     fn inband_scanner_ignores_error_text_inside_content() {
-        // A model that TALKS about errors must not trip the scanner — escaped
-        // quotes mean `{"error"` cannot start a content payload.
-        let mut s = InbandErrorScanner::default();
-        s.feed(
+        let mut scanner = InbandErrorScanner::default();
+        assert!(!scanner.feed(
             b"data: {\"choices\": [{\"delta\": {\"content\": \"data: {\\\"error\\\" is how it looks\"}}]}\n\n",
-        );
-        assert!(
-            !s.found,
-            "escaped quotes in content must not false-positive"
-        );
-        s.feed(b"data: [DONE]\n\n");
-        assert!(!s.found);
+        ));
+        assert!(!scanner.feed(b"data: [DONE]\n\n"));
     }
 
     #[test]
     fn inband_scanner_bounds_carryover_on_pathological_line() {
-        // A single line longer than the cap resets the buffer (detection of
-        // that one line is forfeited by design), and scanning recovers after.
-        let mut s = InbandErrorScanner::default();
+        let mut scanner = InbandErrorScanner::default();
         let big = vec![b'x'; INBAND_SCAN_CARRYOVER_CAP + 1024];
-        s.feed(&big);
-        assert!(s.carry.len() <= INBAND_SCAN_CARRYOVER_CAP);
-        assert!(!s.found);
-        s.feed(b"\ndata: {\"error\": {\"code\": 503}}\n");
-        assert!(s.found, "scanner must recover after a pathological line");
+        assert!(!scanner.feed(&big));
+        assert!(scanner.carry.len() <= INBAND_SCAN_CARRYOVER_CAP);
+        assert!(scanner.feed(b"\ndata: {\"error\": {\"code\": 503}}\n"));
     }
 
-    /// Poll until the completion hook has fired (it runs on the spawned pump
-    /// task, after the body is fully collected).
-    async fn wait_for_stream_end(seen: &Arc<std::sync::Mutex<Option<StreamEnd>>>) -> StreamEnd {
-        for _ in 0..200 {
-            if let Some(end) = *seen.lock().unwrap() {
-                return end;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        panic!("on_complete never fired");
+    fn body_with_completion(
+        chunks: Vec<Result<Bytes, std::io::Error>>,
+    ) -> (Body, tokio::sync::oneshot::Receiver<StreamEnd>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = bytes_stream_to_body(
+            stream::iter(chunks),
+            None,
+            Some(Box::new(move |end| {
+                let _ = tx.send(end);
+            })),
+            None,
+            None,
+        );
+        (body, rx)
+    }
+
+    async fn wait_for_stream_end(
+        rx: tokio::sync::oneshot::Receiver<StreamEnd>,
+    ) -> StreamEnd {
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("on_complete timed out")
+            .expect("on_complete dropped")
     }
 
     #[tokio::test]
     async fn on_complete_reports_inband_error_with_clean_transport() {
-        let seen = Arc::new(std::sync::Mutex::new(None));
-        let seen_c = Arc::clone(&seen);
         let chunks = vec![
             Ok::<Bytes, std::io::Error>(Bytes::from_static(
                 b"data: {\"choices\": [{\"delta\": {\"content\": \"partial\"}}]}\n\n",
@@ -594,17 +584,9 @@ mod tests {
             )),
             Ok(Bytes::from_static(b"data: [DONE]\n\n")),
         ];
-        let body = bytes_stream_to_body(
-            stream::iter(chunks),
-            None,
-            Some(Box::new(move |end| {
-                *seen_c.lock().unwrap() = Some(end);
-            })),
-            None,
-            None,
-        );
+        let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await.unwrap();
-        let end = wait_for_stream_end(&seen).await;
+        let end = wait_for_stream_end(completion).await;
         assert!(end.transport_ok, "clean close: transport is fine");
         assert!(end.saw_inband_error, "in-band error must be reported");
         assert!(!end.client_disconnect);
@@ -612,25 +594,15 @@ mod tests {
 
     #[tokio::test]
     async fn on_complete_reports_clean_success() {
-        let seen = Arc::new(std::sync::Mutex::new(None));
-        let seen_c = Arc::clone(&seen);
         let chunks = vec![
             Ok::<Bytes, std::io::Error>(Bytes::from_static(
                 b"data: {\"choices\": [{\"delta\": {\"content\": \"hello\"}}]}\n\n",
             )),
             Ok(Bytes::from_static(b"data: [DONE]\n\n")),
         ];
-        let body = bytes_stream_to_body(
-            stream::iter(chunks),
-            None,
-            Some(Box::new(move |end| {
-                *seen_c.lock().unwrap() = Some(end);
-            })),
-            None,
-            None,
-        );
+        let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await.unwrap();
-        let end = wait_for_stream_end(&seen).await;
+        let end = wait_for_stream_end(completion).await;
         assert!(end.transport_ok);
         assert!(!end.saw_inband_error);
         assert!(!end.client_disconnect);
@@ -638,27 +610,15 @@ mod tests {
 
     #[tokio::test]
     async fn on_complete_reports_client_disconnect() {
-        let seen = Arc::new(std::sync::Mutex::new(None));
-        let seen_c = Arc::clone(&seen);
-        // Enough chunks to outlast the 64-slot channel, so the pump is still
-        // sending when the receiver is dropped.
         let chunks: Vec<Result<Bytes, std::io::Error>> =
             std::iter::repeat_with(|| Ok(Bytes::from_static(b"data: x\n\n")))
                 .take(1000)
                 .collect();
-        let body = bytes_stream_to_body(
-            stream::iter(chunks),
-            None,
-            Some(Box::new(move |end| {
-                *seen_c.lock().unwrap() = Some(end);
-            })),
-            None,
-            None,
-        );
+        let (body, completion) = body_with_completion(chunks);
         let mut data_stream = body.into_data_stream();
         let _ = data_stream.next().await;
         drop(data_stream);
-        let end = wait_for_stream_end(&seen).await;
+        let end = wait_for_stream_end(completion).await;
         assert!(end.transport_ok, "a walk-away client is not a worker fault");
         assert!(end.client_disconnect, "disconnect must be reported");
     }
@@ -683,13 +643,6 @@ mod tests {
             })),
         );
         let _ = body.collect().await.unwrap();
-        // The hook fires from the spawned pump task; poll briefly.
-        for _ in 0..200 {
-            if gaps.lock().unwrap().len() == 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
         let gaps = gaps.lock().unwrap();
         assert_eq!(
             gaps.len(),

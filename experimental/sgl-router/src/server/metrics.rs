@@ -87,10 +87,7 @@ const TTFT_BUCKETS: &[f64] = &[
     400.0,
 ];
 
-/// Bucket bounds (seconds) for `sgl_router_itl_seconds`. Edges are IDENTICAL
-/// to the engine's `sglang:inter_token_latency_seconds` grid
-/// (`python/sglang/srt/observability/metrics_collector.py`) — same rationale
-/// as [`TTFT_BUCKETS`]: mismatched grids skew `histogram_quantile` deltas.
+/// Bucket bounds (seconds) for `sgl_router_itl_seconds`.
 const ITL_BUCKETS: &[f64] = &[
     0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.060, 0.080,
     0.100, 0.200, 0.400, 0.600, 0.800, 1.0, 2.0, 4.0, 6.0, 8.0,
@@ -115,18 +112,16 @@ impl RequestOutcome {
     }
 }
 
-/// True outcome of a 2xx-committed SSE stream, observed at stream END — the
-/// one vantage the headers-time counters lack once the 200 is on the wire.
+/// Final outcome of a 2xx SSE stream, observed after headers are committed.
 #[derive(Debug, Clone, Copy)]
 pub enum StreamOutcome {
-    /// Stream ended cleanly with no in-band error — a real success.
+    /// Stream ended without errors.
     Ok,
-    /// The engine reported failure via an in-band `data: {"error"...}` event
-    /// under an already-committed 200.
+    /// The engine sent an in-band `data: {"error"...}` event.
     InbandError,
-    /// The byte stream itself broke (connection reset, truncated body).
+    /// The upstream byte stream failed.
     UpstreamError,
-    /// The client dropped the response body before the stream finished.
+    /// The client disconnected before the stream finished.
     ClientDisconnect,
 }
 
@@ -271,8 +266,6 @@ pub struct MetricsRegistry {
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
     itl_seconds: Mutex<HashMap<String, Histogram>>,
-    // End-of-stream outcomes for 2xx streams, from the SSE pump's completion
-    // hook — in-band errors, mid-stream drops, client disconnects.
     stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -314,7 +307,7 @@ struct EdgeResponseKey {
 
 /// Labels for `sgl_router_stream_outcome_total`. Per-worker so a single pod
 /// stuck in an accept-then-in-band-reject loop stands out.
-#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
 struct StreamOutcomeKey {
     worker_url: String,
     model_id: String,
@@ -479,35 +472,31 @@ impl MetricsRegistry {
         hist.observe(seconds);
     }
 
-    /// Observe one inter-token gap (seconds) for `sgl_router_itl_seconds`.
-    /// Strictly inter-CHUNK latency (the router does not tokenize output);
-    /// with the engine's one-event-per-token streaming the two coincide.
+    /// Record an inter-chunk latency sample in seconds.
     pub fn observe_itl(&self, model_id: &str, seconds: f64) {
-        // See `observe_request_duration` — drop non-finite before the map.
         if !seconds.is_finite() {
             return;
         }
-        let mut guard = self.itl_seconds.lock();
-        let hist = guard
+        self.itl_seconds
+            .lock()
             .entry(model_id.to_owned())
-            .or_insert_with(|| Histogram::new(ITL_BUCKETS));
-        hist.observe(seconds);
+            .or_insert_with(|| Histogram::new(ITL_BUCKETS))
+            .observe(seconds);
     }
 
-    /// Bump `sgl_router_stream_outcome_total{worker_url,model_id,outcome}`.
-    /// Recorded at SSE-pump completion, 2xx streams only.
+    /// Record the final outcome of a 2xx stream.
     pub fn record_stream_outcome(&self, worker_url: &str, model_id: &str, outcome: StreamOutcome) {
         let key = StreamOutcomeKey {
             worker_url: worker_url.to_owned(),
             model_id: model_id.to_owned(),
             outcome: outcome.as_str(),
         };
-        let mut guard = self.stream_outcome_total.lock();
-        let counter = guard
+        let counter = self
+            .stream_outcome_total
+            .lock()
             .entry(key)
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .or_default()
             .clone();
-        drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -768,7 +757,7 @@ impl MetricsRegistry {
 
         // itl histogram
         out.push_str(
-            "# HELP sgl_router_itl_seconds Inter-token latency (gap between successive upstream response chunks) for 2xx streaming requests, in seconds.\n",
+            "# HELP sgl_router_itl_seconds Gap between successive chunks of a 2xx stream, in seconds.\n",
         );
         out.push_str("# TYPE sgl_router_itl_seconds histogram\n");
         let guard = self.itl_seconds.lock();
@@ -783,7 +772,7 @@ impl MetricsRegistry {
 
         // stream_outcome_total — end-of-stream truth for 2xx streaming responses
         out.push_str(
-            "# HELP sgl_router_stream_outcome_total End-of-stream outcome of 2xx streaming responses: ok, inband_error (engine reported failure via an in-band SSE error event after committing 200), upstream_error (transport broke mid-stream), or client_disconnect.\n",
+            "# HELP sgl_router_stream_outcome_total Final outcome of a 2xx stream.\n",
         );
         out.push_str("# TYPE sgl_router_stream_outcome_total counter\n");
         let guard = self.stream_outcome_total.lock();
@@ -791,13 +780,7 @@ impl MetricsRegistry {
             .iter()
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
-        entries.sort_by(|a, b| {
-            (&a.0.worker_url, &a.0.model_id, a.0.outcome).cmp(&(
-                &b.0.worker_url,
-                &b.0.model_id,
-                b.0.outcome,
-            ))
-        });
+        entries.sort();
         for (key, value) in entries {
             out.push_str(&format!(
                 "sgl_router_stream_outcome_total{{worker_url=\"{}\",model_id=\"{}\",outcome=\"{}\"}} {}\n",
@@ -1136,6 +1119,13 @@ fn escape_label(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn assert_metric_line(output: &str, expected: &str) {
+        assert!(
+            output.lines().any(|line| line == expected),
+            "missing metric line `{expected}`; got:\n{output}"
+        );
+    }
+
     #[test]
     fn empty_registry_renders_only_help_lines() {
         let reg = MetricsRegistry::new();
@@ -1282,16 +1272,13 @@ mod tests {
         reg.observe_itl("tiny", 0.009);
         reg.observe_itl("tiny", 0.05);
         let out = reg.render();
-        assert!(
-            out.contains(r#"sgl_router_itl_seconds_count{model_id="tiny"} 2"#),
-            "expected itl count=2; got:\n{out}",
-        );
-        // 0.009 <= 0.01, so the le=0.01 bucket is 1 (cumulative).
-        assert!(
-            out.contains(r#"sgl_router_itl_seconds_bucket{model_id="tiny",le="0.01"} 1"#),
-            "expected le=0.01 bucket = 1; got:\n{out}",
-        );
-        assert!(out.contains(r#"sgl_router_itl_seconds_bucket{model_id="tiny",le="0.06"} 2"#));
+        for expected in [
+            r#"sgl_router_itl_seconds_count{model_id="tiny"} 2"#,
+            r#"sgl_router_itl_seconds_bucket{model_id="tiny",le="0.01"} 1"#,
+            r#"sgl_router_itl_seconds_bucket{model_id="tiny",le="0.06"} 2"#,
+        ] {
+            assert_metric_line(&out, expected);
+        }
     }
 
     #[test]
@@ -1323,18 +1310,14 @@ mod tests {
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
         let out = reg.render();
-        assert!(out.contains(
-            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#
-        ));
-        assert!(out.contains(
-            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="inband_error"} 1"#
-        ));
-        assert!(out.contains(
-            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#
-        ));
-        assert!(out.contains(
-            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#
-        ));
+        for expected in [
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="inband_error"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
+        ] {
+            assert_metric_line(&out, expected);
+        }
     }
 
     #[test]

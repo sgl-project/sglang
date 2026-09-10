@@ -163,15 +163,6 @@ impl Proxy {
     /// `active_requests` counter and the per-request active-load entry alive
     /// for the full streaming lifetime — without which a long-running SSE
     /// response would under-report load.
-    ///
-    /// `on_stream_end` — fires once at pump completion with the
-    /// [`sse::StreamEnd`] verdict; 2xx-only, since it classifies what
-    /// happened after a committed 200. Breaker recording is separate and
-    /// judges transport health only.
-    ///
-    /// `on_inter_chunk` — fires per non-empty chunk after the first with the
-    /// gap (seconds) since the previous; 2xx-only (an error body's pacing is
-    /// not inter-token latency). Feeds `sgl_router_itl_seconds`.
     // Each parameter is a distinct, required input to a single upstream
     // forward (target, breaker, path, headers, body, plus the
     // streaming-lifetime callbacks). Bundling them into a struct purely to
@@ -252,19 +243,12 @@ impl Proxy {
                     }
                 }))
             };
-        // Only record TTFT for successful streams — a 4xx/5xx error body
-        // streaming back is not a generated token, so drop the hook for
-        // non-2xx responses.
-        let first_byte_hook = if status.is_success() {
-            on_first_byte
+        // Only record TTFT and ITL for successful streams; error-body chunks
+        // are not generated tokens.
+        let (first_byte_hook, inter_chunk_hook) = if status.is_success() {
+            (on_first_byte, on_inter_chunk)
         } else {
-            None
-        };
-        // Same 2xx gate: an error body's chunk pacing is not a token cadence.
-        let inter_chunk_hook = if status.is_success() {
-            on_inter_chunk
-        } else {
-            None
+            (None, None)
         };
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),

@@ -22,10 +22,6 @@ fn is_infra_path(path: &str) -> bool {
 /// status_code}` on exit (incl. early-exit 400/413/503). Their difference =
 /// received-but-not-answered, invisible to post-dispatch `worker_requests_total`.
 /// `route` is the matched template (not raw URI) to bound label cardinality.
-///
-/// Also the single access-log site: one `http_request` line per request with
-/// the final status, including responses no handler sees (e.g. a 413 from the
-/// body-limit layer). For streams, `duration_ms` is time to response headers.
 async fn count_requests(State(ctx): State<Arc<AppContext>>, req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_owned();
     let path = req.uri().path().to_owned();
