@@ -284,8 +284,11 @@ class EagerRunner(BaseRunner):
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         cp_active = is_cp_active(forward_batch)
+        cp_full_sequence = getattr(
+            model_runner.model, "supports_full_sequence_cp", False
+        )
         if cp_active:
-            prepare_cp_forward(forward_batch)
+            prepare_cp_forward(forward_batch, full_sequence=cp_full_sequence)
 
         # Target verify can arrive with ``forward_metadata_ready`` set by an
         # upstream/speculative planning step.  That mark does not initialize
@@ -350,7 +353,7 @@ class EagerRunner(BaseRunner):
             device_timer_ctx(model_runner.device_timer, category),
             forward_context(get_forward_context(), forward_batch=forward_batch),
         ):
-            if cp_active and (
+            if cp_active and not cp_full_sequence and (
                 not get_parallel().enable_cp_tp_group_sharing
                 or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):

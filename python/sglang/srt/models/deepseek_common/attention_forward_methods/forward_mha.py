@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_trito
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import write_mtp_seed
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
@@ -185,6 +186,10 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        cp_mha = is_cp_active(forward_batch) and forward_batch.mha_one_shot
+        cp_kv_producer_event = None
+        cp_kv_prepared = False
+        kv_a = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -194,6 +199,29 @@ class DeepseekMHAForwardMixin:
                     dim=-1,
                 )
             )
+
+            if cp_mha:
+                assert self.rotary_emb is None and not self.use_dsa
+                kv_a = self.kv_a_layernorm(latent_cache[..., : self.kv_lora_rank])
+                prepare_mla_cp_kv = getattr(self, "prepare_mla_cp_kv", None)
+                record_producer = getattr(self, "record_mla_cp_kv_producer_event", None)
+                if prepare_mla_cp_kv is not None:
+                    if record_producer is not None:
+                        cp_kv_producer_event = record_producer(forward_batch, kv_a)
+                    if cp_kv_producer_event is None:
+                        prepare_mla_cp_kv(
+                            forward_batch,
+                            kv_a.unsqueeze(1),
+                            latent_cache[..., self.kv_lora_rank :].unsqueeze(1),
+                        )
+                    else:
+                        cp_kv_prepared = prepare_mla_cp_kv(
+                            forward_batch,
+                            kv_a.unsqueeze(1),
+                            latent_cache[..., self.kv_lora_rank :].unsqueeze(1),
+                            producer_event=cp_kv_producer_event,
+                            prepare_only=True,
+                        )
 
             # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
@@ -213,7 +241,14 @@ class DeepseekMHAForwardMixin:
                     )
             else:
                 q = self.q_a_layernorm(q)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if cp_mha:
+                    q = self.q_b_proj_forward(q)
+                    if cp_kv_prepared:
+                        self.launch_mla_cp_kv(forward_batch)
+                else:
+                    q = self.q_b_proj(q)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
 
         else:
             q = self.q_proj(hidden_states)[0].view(
@@ -222,10 +257,9 @@ class DeepseekMHAForwardMixin:
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        if kv_a is None:
+            kv_a = self.kv_a_layernorm(latent_cache[..., : self.kv_lora_rank])
         latent_cache = latent_cache.unsqueeze(1)
-
-        kv_a = self.kv_a_layernorm(kv_a)
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
@@ -251,9 +285,8 @@ class DeepseekMHAForwardMixin:
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-        if (
-            forward_batch.mha_one_shot
-            and sum(forward_batch.extend_prefix_lens_cpu) != 0
+        if forward_batch.mha_one_shot and (
+            cp_mha or sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
             if (
                 self.use_dsa
@@ -422,9 +455,13 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
-        # Only initialize the info once
-        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+        # CP one-shot reads the full request-major KV assembled in prepare
+        # and uses the ordinary FA metadata; it needs no prefix chunk plan.
+        if (
+            not is_cp_active(forward_batch)
+            and any(forward_batch.extend_prefix_lens_cpu)
+            and forward_batch.num_prefix_chunks is None
+        ):
             forward_batch.num_prefix_chunks = 0
             if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
                 get_attn_backend().init_mha_chunk_metadata(forward_batch)
@@ -600,6 +637,15 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if is_cp_active(forward_batch):
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            # attn_mqa (early launch) and attn_mha share the same layer ID.
+            # Consume the pending write once, or gather synchronously.
+            strategy.materialize_full_mla_kv(
+                forward_batch, self.attn_mha, kv_a.unsqueeze(1), k_pe
+            )
+            return
         if _is_cuda:
             # Save latent cache
             get_token_to_kv_pool().set_mla_kv_buffer(
@@ -659,9 +705,9 @@ class DeepseekMHAForwardMixin:
         """
         backend = resolve_attn_backend(forward_batch)
         kv_indices = backend.forward_metadata.page_table_1_flattened
-        assert kv_indices is not None, (
-            "page_table_1_flattened should have been generated for FP8 MHA path"
-        )
+        assert (
+            kv_indices is not None
+        ), "page_table_1_flattened should have been generated for FP8 MHA path"
 
         if _use_aiter_gfx95:
             # ROCm (gfx950) stores the FP8 MLA KV in the raw
