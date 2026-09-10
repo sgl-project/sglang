@@ -8,6 +8,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     PauseGenerationReqInput,
 )
+from sglang.test.scripted_runtime.context import queries
 from sglang.test.scripted_runtime.context.http_post import (
     _http_post_and_await_recv_msg,
     _http_post_fire_and_forget,
@@ -59,6 +60,8 @@ def continue_generation(ctx: ScriptedContext, *, torch_empty_cache: bool) -> Non
 
 
 def abort_all(ctx: ScriptedContext) -> None:
+    for epoch in ctx._request_epochs.values():
+        queries._check_epoch_post_result(ctx, epoch=epoch)
     _http_post_and_await_recv_msg(
         ctx,
         path="/abort_request",
@@ -76,6 +79,8 @@ def abort(
     epoch = handle._epoch
     if epoch is not None and ctx._request_epochs.get(handle.rid) is not epoch:
         return
+    if epoch is not None:
+        queries._check_epoch_post_result(ctx, epoch=epoch)
     repeated = epoch is not None and epoch.abort_requested
     payload = {"rid": handle.rid, "abort_all": False}
     if not await_arrival:

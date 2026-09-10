@@ -107,23 +107,20 @@ def find_req_by_rid(
     return next((r for r in _get_all_reqs(ctx) if r is req), None)
 
 
-def is_finished(
-    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
-) -> bool:
-    if epoch is None:
-        epoch = ctx._request_epochs.get(rid)
-    req = _resolve_req(ctx, rid=rid, epoch=epoch)
-    if req is not None and req.finished():
-        return True
-    if epoch is None or not epoch.post_future.done():
+def _check_epoch_post_result(ctx: ScriptedContext, *, epoch: _RequestEpoch) -> bool:
+    """Check a completed response, accepting only an intentional terminal abort."""
+    if not epoch.post_future.done():
         return False
     try:
         epoch.post_future.result()
     except aiohttp.ClientResponseError as exc:
+        if not epoch.abort_requested or exc.status != 400:
+            raise
+        req = _resolve_epoch_req(ctx, epoch=epoch)
         if (
-            not epoch.abort_requested
-            or exc.status != 400
-            or any(r is req for r in _get_all_reqs(ctx))
+            req is not None
+            and not req.finished()
+            and any(r is req for r in _get_all_reqs(ctx))
         ):
             raise
         try:
@@ -137,6 +134,16 @@ def is_finished(
         ):
             raise
     return True
+
+
+def is_finished(
+    ctx: ScriptedContext, rid: str, *, epoch: Optional[_RequestEpoch] = None
+) -> bool:
+    if epoch is None:
+        epoch = ctx._request_epochs.get(rid)
+    post_finished = epoch is not None and _check_epoch_post_result(ctx, epoch=epoch)
+    req = _resolve_req(ctx, rid=rid, epoch=epoch)
+    return post_finished or (req is not None and req.finished())
 
 
 def is_chunking(

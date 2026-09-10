@@ -161,6 +161,79 @@ class TestRequestLifecycle(CustomTestCase):
         self.assertIsNot(current._epoch, previous._epoch)
         self.assertFalse(current.finished)
 
+    def test_failed_previous_response_prevents_reuse(self):
+        """Reusing an ID must surface its previous response failure without submitting a new request."""
+        for mode in ("sync", "retry", "retry_after_wait"):
+            for kind in ("runtime", "unavailable", "duplicate"):
+                rid = f"failed-{mode}-{kind}"
+                error = {
+                    "runtime": RuntimeError("previous response failed"),
+                    "unavailable": _http_error(
+                        status=503, message="backend unavailable"
+                    ),
+                    "duplicate": _http_error(
+                        message=f"Duplicate request ID detected: {rid}"
+                    ),
+                }[kind]
+                with self.subTest(mode=mode, error=error):
+                    previous = self._register(rid=rid)
+                    self.http.replies.clear()
+                    self.http.replies.append(
+                        _HttpReply(
+                            messages=(_tokenized_request(rid=rid),),
+                            hold_response=True,
+                        )
+                    )
+                    before = len(self.http.requests)
+                    if mode != "sync":
+                        retry = self.ctx.start_req_with_retry(
+                            rid=rid, prompt_len=16, max_steps=2
+                        )
+                        self.addCleanup(retry.close)
+                        if mode == "retry_after_wait":
+                            self.assertIsNone(next(retry))
+                            self.assertEqual(len(self.http.requests), before)
+                    previous._epoch.post_future.set_exception(error)
+
+                    with self.assertRaises(type(error)) as raised:
+                        if mode == "sync":
+                            self.ctx.start_req(rid=rid, prompt_len=16)
+                        else:
+                            next(retry)
+                    self.assertIs(raised.exception, error)
+                    self.assertEqual(len(self.http.requests), before)
+                    self.assertIs(self.ctx._request_epochs[rid], previous._epoch)
+
+    def test_expected_abort_response_allows_reuse(self):
+        """An intentional abort response must not prevent a later request from reusing the ID."""
+        for use_retry in (False, True):
+            for message in ("Aborted", "Abort in waiting queue"):
+                with self.subTest(use_retry=use_retry, message=message):
+                    previous = self._register()
+                    previous._epoch.abort_requested = True
+                    previous._epoch.post_future.set_exception(
+                        _http_error(message=message)
+                    )
+                    self.http.replies.append(
+                        _HttpReply(
+                            messages=(_tokenized_request(rid="reused"),),
+                            hold_response=True,
+                        )
+                    )
+                    before = len(self.http.requests)
+                    if use_retry:
+                        retry = self.ctx.start_req_with_retry(
+                            rid="reused", prompt_len=16, max_steps=2
+                        )
+                        with self.assertRaises(StopIteration) as completed:
+                            next(retry)
+                        current = completed.exception.value
+                    else:
+                        current = self.ctx.start_req(rid="reused", prompt_len=16)
+                    self.assertEqual(len(self.http.requests), before + 1)
+                    self.assertIs(self.ctx._request_epochs["reused"], current._epoch)
+                    self.assertIsNot(current._epoch, previous._epoch)
+
     def test_reset_waits_for_http_cleanup_before_flushing(self):
         """Scheduler idleness must not let reset flush while an old HTTP handler can still affect reuse."""
         previous = self._register()
@@ -181,6 +254,131 @@ class TestRequestLifecycle(CustomTestCase):
         )
         with self.assertRaises(StopIteration):
             next(reset)
+
+    def test_reset_preserves_previous_response_failure(self):
+        """Reset must surface a failed response before posting controls or discarding request state."""
+        for error in (
+            RuntimeError("previous response failed"),
+            _http_error(status=503, message="previous backend unavailable"),
+            _http_error(),
+        ):
+            with self.subTest(error=error):
+                self.ctx._request_epochs.clear()
+                previous = self._register()
+                previous._epoch.post_future.set_exception(error)
+                self.http.replies.clear()
+                self._prepare_reset()
+                self.http.replies.append(_HttpReply(messages=(FlushCacheReqInput(),)))
+                before = len(self.http.requests)
+                reset = scheduler_hook._reset_engine_state(self.ctx)
+                self.addCleanup(reset.close)
+                with self.assertRaises(type(error)) as raised:
+                    next(reset)
+                self.assertIs(raised.exception, error)
+                self.assertEqual(len(self.http.requests), before)
+                self.assertIs(self.ctx._request_epochs["reused"], previous._epoch)
+                self.assertFalse(previous._epoch.abort_requested)
+
+    def test_reset_surfaces_response_failure_while_scheduler_is_busy(self):
+        """A response failure must interrupt scheduler drain instead of becoming a generic reset timeout."""
+        previous = self._register()
+        self._prepare_reset()
+        self.ctx.scheduler.is_fully_idle = lambda: False
+        self.http.replies.append(_HttpReply(messages=(FlushCacheReqInput(),)))
+        reset = scheduler_hook._reset_engine_state(self.ctx)
+        self.addCleanup(reset.close)
+        self.assertIsNone(next(reset))
+        error = RuntimeError("response failed during reset")
+        previous._epoch.post_future.set_exception(error)
+        with self.assertRaises(RuntimeError) as raised:
+            next(reset)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(len(self.http.requests), 1)
+        self.assertIs(self.ctx._request_epochs["reused"], previous._epoch)
+
+    def test_reset_surfaces_later_response_failure_while_another_is_pending(self):
+        """An earlier pending response must not prevent reset from detecting a later failed response."""
+        pending = self._register(rid="pending")
+        failed = self._register(rid="failed")
+        self._prepare_reset()
+        self.http.replies.append(_HttpReply(messages=(FlushCacheReqInput(),)))
+        reset = scheduler_hook._reset_engine_state(self.ctx)
+        self.addCleanup(reset.close)
+        self.assertIsNone(next(reset))
+        self.assertIsNone(next(reset))
+        error = RuntimeError("later response failed during HTTP drain")
+        failed._epoch.post_future.set_exception(error)
+
+        with self.assertRaises(RuntimeError) as raised:
+            next(reset)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(len(self.http.requests), 1)
+        self.assertFalse(pending._epoch.post_future.done())
+        self.assertIs(self.ctx._request_epochs[failed.rid], failed._epoch)
+
+    def test_controls_do_not_reclassify_an_existing_error_as_requested_abort(self):
+        """An unrequested abort-shaped failure must propagate before controls can mark it intentional."""
+        for operation in ("abort", "abort_all", "reset"):
+            for message in ("Aborted", "Abort in waiting queue"):
+                with self.subTest(operation=operation, message=message):
+                    self.ctx._request_epochs.clear()
+                    self.http.replies.clear()
+                    previous = self._register()
+                    error = _http_error(message=message)
+                    previous._epoch.post_future.set_exception(error)
+                    before = len(self.http.requests)
+                    if operation == "reset":
+                        self._prepare_reset()
+                        self.http.replies.append(
+                            _HttpReply(messages=(FlushCacheReqInput(),))
+                        )
+                        reset = scheduler_hook._reset_engine_state(self.ctx)
+                        self.addCleanup(reset.close)
+                    else:
+                        self.http.replies.append(
+                            _HttpReply(
+                                messages=(
+                                    AbortReq(
+                                        rid=previous.rid,
+                                        abort_all=operation == "abort_all",
+                                    ),
+                                )
+                            )
+                        )
+                    with self.assertRaises(aiohttp.ClientResponseError) as raised:
+                        if operation == "abort":
+                            self.ctx.abort(previous)
+                        elif operation == "abort_all":
+                            self.ctx.abort_all()
+                        else:
+                            next(reset)
+                    self.assertIs(raised.exception, error)
+                    self.assertEqual(len(self.http.requests), before)
+                    self.assertFalse(previous._epoch.abort_requested)
+                    self.assertIs(self.ctx._request_epochs["reused"], previous._epoch)
+
+    def test_expected_abort_response_allows_reset(self):
+        """Reset must accept a completed intentional abort response and still flush the cache."""
+        for message in ("Aborted", "Abort in waiting queue"):
+            with self.subTest(message=message):
+                previous = self._register()
+                previous._epoch.abort_requested = True
+                previous._epoch.post_future.set_exception(_http_error(message=message))
+                self._prepare_reset()
+                self.http.replies.append(_HttpReply(messages=(FlushCacheReqInput(),)))
+                before = len(self.http.requests)
+                reset = scheduler_hook._reset_engine_state(self.ctx)
+                self.assertIsNone(next(reset))
+                self.assertIsNone(next(reset))
+                with self.assertRaises(StopIteration):
+                    next(reset)
+                self.assertEqual(
+                    [
+                        url.rsplit("/", 1)[1]
+                        for url, _, _ in self.http.requests[before:]
+                    ],
+                    ["abort_request", "flush_cache"],
+                )
 
     def test_reset_http_cleanup_budget_does_not_flush_on_timeout(self):
         """A stuck HTTP response must fail reset without flushing or discarding the prior request."""
@@ -454,9 +652,9 @@ class TestRequestLifecycle(CustomTestCase):
             malformed,
             aiohttp.ClientConnectionError("connection reset"),
         )
-        for error in errors:
+        for index, error in enumerate(errors):
             with self.subTest(error=error):
-                handle = self._register()
+                handle = self._register(rid=f"generation-error-{index}")
                 handle._epoch.abort_requested = True
                 handle._epoch.post_future.set_exception(error)
                 with self.assertRaises(type(error)) as raised:
