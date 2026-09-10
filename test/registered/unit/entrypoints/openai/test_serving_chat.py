@@ -21,6 +21,7 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
@@ -28,6 +29,7 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     MessageProcessingResult,
     ToolChoice,
     ToolChoiceFuncName,
@@ -2549,6 +2551,153 @@ class ServingChatTestCase(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
             OpenAIServingChat(tm, TemplateManager())
+
+    # ------------- dsv4 system message position -------------
+    @staticmethod
+    def _dsv4_trailing_system_messages():
+        """#35433: the client appends a `system` reminder as the final turn."""
+        return [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Summarize the tool result."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"id":"demo"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "status=ok"},
+            {
+                "role": "system",
+                "content": "<runtime_reminder>123 tokens left</runtime_reminder>",
+            },
+        ]
+
+    @staticmethod
+    def _dsv4_mid_conversation_system_messages():
+        """A `system` turn in the middle also produces no generation boundary."""
+        return [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Hi?"},
+            {"role": "system", "content": "<reminder>answer briefly</reminder>"},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "Next?"},
+        ]
+
+    def _dsv4_non_leading_system_cases(self):
+        return {
+            "trailing_system": (self._dsv4_trailing_system_messages(), 4),
+            "trailing_system_simple": (
+                [
+                    {"role": "system", "content": "Be brief."},
+                    {"role": "user", "content": "Hi?"},
+                    {"role": "system", "content": "<reminder>brief</reminder>"},
+                ],
+                2,
+            ),
+            "mid_conversation_system": (
+                self._dsv4_mid_conversation_system_messages(),
+                2,
+            ),
+        }
+
+    def _serving_chat_for_spec(self, spec, architecture):
+        """Serving chat whose encoding spec resolves like a real server's.
+
+        Both halves matter: the resolved spec puts requests on the custom
+        encoder, and ``chat_template_name = None`` keeps them off the legacy
+        conversation-template path.
+        """
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = [architecture]
+        tm.model_config.hf_config.to_dict.return_value = (
+            {"dsv4_reasoning_effort_profile": "preview"} if spec == "dsv4" else {}
+        )
+        tm.tokenizer.chat_template = None
+        tm.chat_template_name = None
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        chat = OpenAIServingChat(tm, template_manager)
+        self.assertEqual(chat.chat_encoding_spec, spec)
+        return chat, tm
+
+    def test_dsv4_rejects_non_leading_system_before_generation(self):
+        for name, (messages, index) in self._dsv4_non_leading_system_cases().items():
+            with self.subTest(shape=name):
+                chat, tm = self._serving_chat_for_spec("dsv4", "DeepseekV4ForCausalLM")
+                request = ChatCompletionRequest(model="x", messages=messages)
+                response = get_or_create_event_loop().run_until_complete(
+                    chat.handle_request(request, self.fastapi_request)
+                )
+                error = json.loads(response.body)
+                self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+                self.assertEqual(error["type"], "BadRequestError")
+                self.assertIn("system message at the beginning", error["message"])
+                self.assertIn(f"messages[{index}]", error["message"])
+                self.assertIn("first message", error["message"])
+                tm.generate_request.assert_not_called()
+
+    def test_dsv4_rejects_trailing_system_when_streaming(self):
+        chat, tm = self._serving_chat_for_spec("dsv4", "DeepseekV4ForCausalLM")
+        request = ChatCompletionRequest(
+            model="x",
+            messages=self._dsv4_trailing_system_messages(),
+            stream=True,
+        )
+        response = get_or_create_event_loop().run_until_complete(
+            chat.handle_request(request, self.fastapi_request)
+        )
+        # A plain JSON error, not an SSE stream that already claimed HTTP 200.
+        self.assertNotIsInstance(response, StreamingResponse)
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertEqual(json.loads(response.body)["type"], "BadRequestError")
+        tm.generate_request.assert_not_called()
+
+    def test_dsv4_supported_system_shapes_reach_generation(self):
+        """Leading-system / no-system requests still reach generation."""
+        shapes = {
+            "leading_system": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Hi?"},
+            ],
+            "without_system": [{"role": "user", "content": "Hi?"}],
+            "leading_system_multi_turn": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b"},
+                {"role": "user", "content": "c"},
+            ],
+        }
+        for name, messages in shapes.items():
+            with self.subTest(shape=name):
+                chat, tm = self._serving_chat_for_spec("dsv4", "DeepseekV4ForCausalLM")
+                request = ChatCompletionRequest(model="x", messages=messages)
+                self.assertIsNone(chat._validate_request(request))
+                response = get_or_create_event_loop().run_until_complete(
+                    chat.handle_request(request, self.fastapi_request)
+                )
+                self.assertIsInstance(response, ChatCompletionResponse)
+                self.assertTrue(response.choices)
+                tm.generate_request.assert_called_once()
+
+    def test_dsv4_system_position_guard_leaves_dsv32_alone(self):
+        """dsv32 has its own encoder; the new guard must not touch it."""
+        chat, tm = self._serving_chat_for_spec("dsv32", "DeepseekV32ForCausalLM")
+        request = ChatCompletionRequest(
+            model="x", messages=self._dsv4_trailing_system_messages()
+        )
+        self.assertIsNone(chat._validate_request(request))
+        get_or_create_event_loop().run_until_complete(
+            chat.handle_request(request, self.fastapi_request)
+        )
+        tm.generate_request.assert_called_once()
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
