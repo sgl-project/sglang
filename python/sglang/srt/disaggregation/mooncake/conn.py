@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
+    validate_dsv41_c2_state_layout,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -214,6 +215,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.has_c2_state = 2 in (getattr(args, "mla_compression_ratios", None) or ())
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -1424,6 +1426,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and len(dst_indices_local) == 0
                 ):
                     continue
+                if st == StateType.C128_STATE and self.has_c2_state:
+                    try:
+                        validate_dsv41_c2_state_layout(src_item_lens, dst_item_lens)
+                    except ValueError as error:
+                        logger.error("C2 state transfer rejected: %s", error)
+                        return -1
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
                     # truncating silently misaligns rows and corrupts KV.

@@ -99,6 +99,21 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def validate_dsv41_c2_state_layout(
+    src_item_lens: List[int], dst_item_lens: List[int]
+) -> None:
+    """C2 transfer addresses both endpoints using the sender's whole-ring stride.
+
+    Check nonempty payloads before writing with an incompatible peer stride.
+    """
+    if src_item_lens != dst_item_lens:
+        raise ValueError(
+            "DeepSeek-V4.1 PD requires matching C2 state layouts on prefill and decode "
+            f"(prefill item lengths={src_item_lens}, decode item lengths={dst_item_lens}); "
+            "configure the same DSpark ring size on both endpoints."
+        )
+
+
 def get_dsv4_request_state_indices(pool, req_pool_idx: int, seq_len: int) -> np.ndarray:
     """PD transfer indices of the request-scoped state component (C128_STATE).
 
