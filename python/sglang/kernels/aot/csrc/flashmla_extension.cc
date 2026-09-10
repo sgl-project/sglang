@@ -16,10 +16,37 @@ limitations under the License.
 #include <torch/all.h>
 #include <torch/library.h>
 
-#include "api/dense_decode.h"
-#include "api/sparse_decode.h"
-#include "api/sparse_fwd.h"
 #include "sgl_kernel_ops.h"
+
+// FlashMLA exposes these two entry points only from csrc/api/*.cpp (its own pybind layer lives
+// behind FLASH_MLA_LIBTORCH_ONLY), so declare them here the way csrc/python_api.cpp does.
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+dense_attn_decode_interface(
+    at::Tensor& q,
+    const at::Tensor& kcache,
+    const int head_size_v,
+    const at::Tensor& seqlens_k,
+    const at::Tensor& block_table,
+    const float softmax_scale,
+    bool is_causal,
+    std::optional<at::Tensor>& tile_scheduler_metadata,
+    std::optional<at::Tensor>& num_splits);
+
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_interface(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor>& tile_scheduler_metadata,
+    std::optional<at::Tensor>& num_splits,
+    const std::optional<at::Tensor>& extra_kv,
+    const std::optional<at::Tensor>& extra_indices,
+    const std::optional<at::Tensor>& extra_topk_length,
+    int d_v,
+    float sm_scale,
+    const std::optional<std::string>& kv_format);
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_sparse_decode_fwd(
     const at::Tensor& q,
@@ -46,7 +73,8 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       extra_indices,
       extra_topk_length,
       static_cast<int>(d_v),
-      static_cast<float>(sm_scale));
+      static_cast<float>(sm_scale),
+      std::nullopt);
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
