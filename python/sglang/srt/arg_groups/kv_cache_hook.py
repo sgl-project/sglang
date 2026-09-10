@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
     model_config_of,
+    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
@@ -65,7 +66,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             if prefill_backend == "fa4":
                 if uses_mla:  # FA4 + MLA
                     KV4_FA4_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -86,7 +86,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             else:
                 if uses_mla:  # !FA4 + MLA
                     KV4_ATTENTION_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -189,7 +188,9 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
-    if not (0 < resolved_view(server_args).swa_full_tokens_ratio <= 1.0):
+    # `resolution_result`, not a view: a view answers `None` while nobody has
+    # claimed the field, and the value to range-check is the effective one.
+    if not (0 < resolution_result(server_args, "swa_full_tokens_ratio") <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
 
@@ -262,6 +263,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "not translate speculative verify indices to the unified "
             "pool's kernel-facing space yet."
         )
+    assert not cfg.enable_two_batch_overlap, (
+        "--enable-unified-memory does not support --enable-two-batch-overlap: "
+        "TBO's replay split hands each child a view without the pre-translate "
+        "write loc, so a captured decode replay raises. "
+        "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
+    )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
@@ -378,7 +385,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # Allow-list. Every backend below reads through the translator, so what
     # gates one is only whether its kernels can address the per-layer views:
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
-    #     snap). cutlass_mla stays rejected (never exercised).
+    #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
     #   * Without the unified pool, plain page-major stays Triton-only.
@@ -500,9 +507,9 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "radix cache indexes KV pool slots that no longer hold real data."
         )
 
-    # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
-    # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
-    # raises on writes, so the engine would boot fine but fail on the first request.
+    # Context-parallel prefill writes K/V to the pool via set_kv_buffer.
+    # NoOpMHATokenToKVPool intentionally raises on writes, so the engine would
+    # boot fine but fail on the first request.
     if resolved_view(server_args).attn_cp_size > 1:
         raise ValueError(
             "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
