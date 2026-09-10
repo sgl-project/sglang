@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
     model_config_of,
+    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
@@ -65,7 +66,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             if prefill_backend == "fa4":
                 if uses_mla:  # FA4 + MLA
                     KV4_FA4_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -86,7 +86,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             else:
                 if uses_mla:  # !FA4 + MLA
                     KV4_ATTENTION_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -189,7 +188,9 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
-    if not (0 < resolved_view(server_args).swa_full_tokens_ratio <= 1.0):
+    # `resolution_result`, not a view: a view answers `None` while nobody has
+    # claimed the field, and the value to range-check is the effective one.
+    if not (0 < resolution_result(server_args, "swa_full_tokens_ratio") <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
 
@@ -246,6 +247,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "not translate speculative verify indices to the unified "
             "pool's kernel-facing space yet."
         )
+    assert not cfg.enable_two_batch_overlap, (
+        "--enable-unified-memory does not support --enable-two-batch-overlap: "
+        "TBO's replay split hands each child a view without the pre-translate "
+        "write loc, so a captured decode replay raises. "
+        "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
+    )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
@@ -253,12 +260,8 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "full-attention slots are VIRTUAL — the host-offload path does not "
         "translate them to physical."
     )
-    assert cfg.dcp_size == 1, (
-        "--enable-unified-memory is not yet compatible with decode context "
-        "parallelism (--dcp-size > 1): the pool has no DCP-aware masked write "
-        "path (UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None), "
-        "so a DCP run would boot and then fail on the first KV write."
-    )
+    if cfg.dcp_size > 1:
+        _validate_unified_memory_dcp(server_args)
     # Only monolithic decode cuda-graph capture is wired; piecewise prefill
     # capture is not. Guard when the user opts into it.
     _cg_cfg = cfg.cuda_graph_config
@@ -278,6 +281,51 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "capture (not wired for the unified pool's loc rebind); "
             "decode capture is unaffected."
         )
+
+
+def _validate_unified_memory_dcp(server_args: Any) -> None:
+    """Gate --enable-unified-memory + --dcp-size > 1 to the audited path.
+
+    Under DCP the unified allocator hands out a WIDENED virtual id space
+    (dcp_size logical ids per stored row) and every read index reaches
+    `translate_kv_loc*` already collapsed by a DCP index kernel. Only the
+    pieces below have been converted to that two-stage contract.
+    """
+    assert use_mla_backend(server_args), (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) supports MLA models only (e.g. kimi-linear): the "
+        "MHA unified pool has no DCP-aware masked write path "
+        "(UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None)."
+    )
+    assert not model_config_of(server_args).is_hybrid_swa, (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) does not support hybrid sliding-window models: "
+        "UnifiedSWATokenToKVPoolAllocator does not widen its virtual id "
+        "space, and the full->swa mapping is not DCP-sharded."
+    )
+    cfg = resolving_view(server_args)
+    assert cfg.disaggregation_mode == "null", (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) does not support PD disaggregation: the transfer "
+        "ships whole page envelopes, which under DCP hold only this rank's "
+        "shard of each widened page. Rejected here rather than at the first KV "
+        "transfer, where translate_kv_indices_for_transfer would abort a "
+        "server that had already booted."
+    )
+    # The trtllm_mla family builds its DCP block table through the pool's v2p
+    # gather (create_mla_kv_page_table_for_dcp), so it speaks the same
+    # two-stage contract as flashinfer.
+    dcp_allowed = {"flashinfer", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+    backends = set(attention_backends_of(resolved_view(server_args)))
+    backends.discard(None)
+    assert backends <= dcp_allowed, (
+        "--enable-unified-memory with decode context parallelism "
+        f"(--dcp-size > 1) requires {sorted(dcp_allowed)} for the "
+        f"full-attention layers; got {sorted(backends)}. The other paged MLA "
+        "backends build their block table from raw (widened) req_to_token "
+        "page ids and do not translate them through the unified pool's "
+        "virtual->physical page table."
+    )
 
 
 def handle_page_major_kv_layout(server_args: Any):
@@ -321,7 +369,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # Allow-list. Every backend below reads through the translator, so what
     # gates one is only whether its kernels can address the per-layer views:
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
-    #     snap). cutlass_mla stays rejected (never exercised).
+    #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
     #   * Without the unified pool, plain page-major stays Triton-only.
@@ -443,9 +491,9 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "radix cache indexes KV pool slots that no longer hold real data."
         )
 
-    # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
-    # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
-    # raises on writes, so the engine would boot fine but fail on the first request.
+    # Context-parallel prefill writes K/V to the pool via set_kv_buffer.
+    # NoOpMHATokenToKVPool intentionally raises on writes, so the engine would
+    # boot fine but fail on the first request.
     if resolved_view(server_args).attn_cp_size > 1:
         raise ValueError(
             "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "

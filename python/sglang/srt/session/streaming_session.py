@@ -48,29 +48,31 @@ class SessionSlot:
 
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
-    swa_uuid_for_lock: Optional[str] = None
-    # components the first req skipped locking on last_node, so release dec
-    # releases only what it took (may share the node with another req).
-    skip_lock_node_ids: dict = field(default_factory=dict)
+    # Receipt of the first request's tree lock on last_node.
+    lock_receipt: DecLockRefParams = field(default_factory=DecLockRefParams)
+    # Whether the first request already released its SWA lock.
+    swa_prefix_lock_released: bool = False
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
         kv = req.detach_kv()
         if is_first:
             self.last_node = req.last_node
-            self.swa_uuid_for_lock = req.swa_uuid_for_lock
-            self.skip_lock_node_ids = req.skip_lock_node_ids
+            self.lock_receipt = req.lock_receipt
+            self.swa_prefix_lock_released = req.swa_prefix_lock_released
             # The slot takes over the request's KV record.
             self.kv = kv
         else:
             # Later turns run on the slot's record (see restore_to_req).
             assert kv is self.kv
 
+        req.swa_branching_seqlen = None
+
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.kv = self.kv
-        req.swa_uuid_for_lock = self.swa_uuid_for_lock
-        req.skip_lock_node_ids = self.skip_lock_node_ids
+        req.lock_receipt = self.lock_receipt
+        req.swa_prefix_lock_released = self.swa_prefix_lock_released
 
         # NOTE: the slot keeps sharing the record it just handed out. During
         # chunked prefill, a request may be rejected by
@@ -232,8 +234,10 @@ class StreamingSession(BasePrefixCache):
             f"{slot.kv.cache_protected_len=}"
         )
 
-        # Floor-align prefix_len to page boundary (NPU workaround).
-        if is_npu() and self.page_size > 1:
+        # NPU requires page-aligned KV reuse; a rewind below the SWA eviction
+        # cursor must also land on a page boundary -- free_kv_row_segments
+        # splits dead/alive at the cursor, and a mid-page cut frees a page twice.
+        if self.page_size > 1 and (is_npu() or req.kv.swa_evicted_seqlen > prefix_len):
             prefix_len = (prefix_len // self.page_size) * self.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
 
@@ -286,8 +290,8 @@ class StreamingSession(BasePrefixCache):
                 slot = SessionSlot(
                     kv=kv,
                     last_node=req.last_node,
-                    swa_uuid_for_lock=req.swa_uuid_for_lock,
-                    skip_lock_node_ids=req.skip_lock_node_ids,
+                    lock_receipt=req.lock_receipt,
+                    swa_prefix_lock_released=req.swa_prefix_lock_released,
                 )
                 self.slots[session_id] = slot
             else:
@@ -392,22 +396,13 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            self.inner.dec_lock_ref(
-                lock_node,
-                DecLockRefParams(
-                    swa_uuid_for_lock=slot.swa_uuid_for_lock,
-                    skip_lock_node_ids=slot.skip_lock_node_ids,
-                ),
-            )
+            # skip_swa is an SWA-cache extension kwarg; a slot can only have
+            # early-released when the inner cache supports SWA locks.
+            skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
+            self.inner.dec_lock_ref(lock_node, slot.lock_receipt, **skip)
 
         if slot.kv.holds_kv:
-            start = protected_len
-            end = slot.kv.kv_allocated_len
-            if start < end:
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    slot.kv.req_pool_idx, start:end
-                ]
-                self.token_to_kv_pool_allocator.free(kv_indices)
+            self.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
             self.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
@@ -504,7 +499,7 @@ class StreamingSession(BasePrefixCache):
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
-        self._free_kv_aligned(kv.req_pool_idx, prefix_len, kv.kv_allocated_len)
+        self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
         kv.kv_allocated_len = prefix_len
         kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
         kv.swa_evicted_seqlen = min(kv.swa_evicted_seqlen, prefix_len)
@@ -516,14 +511,18 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.kv.req_pool_idx, target, req.kv.kv_allocated_len)
+        if self.page_size > 1 and req.kv.swa_evicted_seqlen > target:
+            # Same hazard as the match-path rewind: the cursor must stay
+            # page-aligned; the partial page is re-prefilled next turn.
+            target = (target // self.page_size) * self.page_size
+        self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
-    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
-        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
+    def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
+        """Free the record's kv row over [ceil_align(target), end). Page-aligned
         because PagedTokenToKVPoolAllocator.free returns whole pages
         (free_index // page_size), so partial-page free would corrupt pages
         still holding committed tokens. The range [target, ceil_align(target))
@@ -534,9 +533,7 @@ class StreamingSession(BasePrefixCache):
         start = target
         if self.page_size > 1:
             start = ceil_align(start, self.page_size)
-        if start < end:
-            tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
-            self.token_to_kv_pool_allocator.free(tail)
+        self.free_kv_row(kv, [(start, end)])
 
     # -- Pass-through methods --
 
@@ -566,6 +563,17 @@ class StreamingSession(BasePrefixCache):
 
     def init_load_back(self, params: InitLoadBackParams):
         return self.inner.init_load_back(params)
+
+    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+        return self.inner.pop_prefetch_loaded_span(req_id)
+
+    def finish_storage_prefetch_admission(
+        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+    ) -> None:
+        self.inner.finish_storage_prefetch_admission(req_id, fulfilled_tokens, reason)
+
+    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+        self.inner.discard_storage_prefetch_accounting(req_id)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()

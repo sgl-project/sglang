@@ -14,7 +14,7 @@ import sys
 import time
 import unittest
 from array import array
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Callable
 
@@ -25,7 +25,6 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
@@ -40,8 +39,9 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
@@ -59,6 +59,7 @@ _BENCH_KV_SIZE = 500_000
 _BENCH_CHUNK_LEN = 256
 
 _DEFAULT_COMPONENTS = (ComponentType.FULL, ComponentType.MAMBA)
+_TREE_CORE_TEST_BACKEND: str | None = None
 
 
 @contextmanager
@@ -226,16 +227,22 @@ def create_bench_cache(
     # --- tree ---
     if tree_cls is None:
         tree_cls = UnifiedRadixCache
-    tree = tree_cls(
-        params=CacheInitParams(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=page_size,
-            disable=False,
-            tree_components=components if tree_cls is UnifiedRadixCache else None,
-            sliding_window_size=sliding_window_size if has_swa else None,
-        )
+    backend_override = (
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(_TREE_CORE_TEST_BACKEND)
+        if _TREE_CORE_TEST_BACKEND is not None and tree_cls is UnifiedRadixCache
+        else nullcontext()
     )
+    with backend_override:
+        tree = tree_cls(
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page_size,
+                disable=False,
+                tree_components=components if tree_cls is UnifiedRadixCache else None,
+                sliding_window_size=sliding_window_size if has_swa else None,
+            )
+        )
 
     _rid = [0]
 
@@ -416,9 +423,9 @@ def bench_api(
     (excluded from latency measurement).
     """
     items = setup_fn()
-    assert (
-        len(items) >= num_ops + warmup
-    ), f"need {num_ops + warmup} items, got {len(items)}"
+    assert len(items) >= num_ops + warmup, (
+        f"need {num_ops + warmup} items, got {len(items)}"
+    )
 
     for i in range(warmup):
         op_fn(items[i])
@@ -580,7 +587,7 @@ def bench_lock_unlock(
         lr = env.tree.inc_lock_ref(node)
         env.tree.dec_lock_ref(
             node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)),
+            lr.to_dec_params(),
         )
 
     warmup = min(20, num_pairs // 10)
@@ -625,9 +632,7 @@ def bench_cache_finished(
             if v is None:
                 env.tree.dec_lock_ref(
                     node,
-                    DecLockRefParams(
-                        swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)
-                    ),
+                    lr.to_dec_params(),
                 )
                 continue
             kv_indices = torch.cat([mr.device_indices, v])
@@ -644,8 +649,8 @@ def bench_cache_finished(
         req.last_node = node
         req.kv.cache_protected_len = matched_len
         req.kv.kv_committed_len = len(seq)
-        if hasattr(lr, "swa_uuid_for_lock"):
-            req.swa_uuid_for_lock = lr.swa_uuid_for_lock
+        if hasattr(lr, "to_dec_params"):
+            req.lock_receipt = lr.to_dec_params()
         env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 
@@ -780,6 +785,10 @@ class _BenchSuite:
             verify=True,
             page_size=cfg["page_size"],
         )
+        backend = (
+            _TREE_CORE_TEST_BACKEND or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        )
+        print(f"[{backend}] {r.report()}")
         self.assertGreater(r.num_ops, 0)
         self.assertGreater(r.ops_per_sec, 0)
 
@@ -803,7 +812,7 @@ for _cfg in _CI_BENCH_CONFIGS:
     _name = f"TestBench_{_cfg['label']}"
     globals()[_name] = type(
         _name,
-        (_BenchSuite, unittest.TestCase),
+        (_BenchSuite, CustomTestCase),
         {"bench_cfg": _cfg},
     )
     globals()[_name].__module__ = __name__

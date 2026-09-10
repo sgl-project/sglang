@@ -121,9 +121,9 @@ _AR_TUNED_TP8 = {
 }
 _AR_TUNED = {4: _AR_TUNED_TP4, 8: _AR_TUNED_TP8}
 _AR_TUNED_TOKENS = sorted(_AR_TUNED_TP4)  # same token grid for every table
-assert all(
-    set(t) == set(_AR_TUNED_TP4) for t in _AR_TUNED.values()
-), "all tuned tables must share the same token grid"
+assert all(set(t) == set(_AR_TUNED_TP4) for t in _AR_TUNED.values()), (
+    "all tuned tables must share the same token grid"
+)
 
 
 def select_ar_config(num_tokens: int, world_size: int = 4):

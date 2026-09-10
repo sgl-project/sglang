@@ -114,8 +114,7 @@ def build_sm90_mega_moe_experts_weights(experts) -> None:
     scale_group_mn, scale_group_k = 128, 128
 
     assert k1 % scale_group_k == 0 and k2 % scale_group_k == 0, (
-        f"invalid SM90 mega-moe K/group_size: k1={k1}, k2={k2}, "
-        f"group_k={scale_group_k}"
+        f"invalid SM90 mega-moe K/group_size: k1={k1}, k2={k2}, group_k={scale_group_k}"
     )
     expected_n_groups_1 = (n1 + scale_group_mn - 1) // scale_group_mn
     expected_n_groups_2 = (n2 + scale_group_mn - 1) // scale_group_mn

@@ -50,9 +50,9 @@ class MXFP4QuantizeUtil:
             new_data = (
                 right_side.clone() << 4
             )  # Put odd indices (higher addresses) in high bits
-            new_data[
-                ..., : left_side.shape[-1]
-            ] += left_side  # Put even indices in low bits
+            new_data[..., : left_side.shape[-1]] += (
+                left_side  # Put even indices in low bits
+            )
             return new_data
 
         if block_size is None:
