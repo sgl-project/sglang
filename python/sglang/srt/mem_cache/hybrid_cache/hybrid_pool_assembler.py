@@ -108,7 +108,7 @@ def _resolve_deepseek_v4_layer_mappings(
 ) -> _DeepSeekV4LayerMappings:
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full = {layer: layer for layer in range(transfer_layer_num)}
-    swa = {} if getattr(kvcache, "_unified_kv", False) else full.copy()
+    swa = full.copy() if kvcache.swa_kv_pool is not None else {}
 
     c4, c128, c4_state_global_layers = {}, {}, []
     for local_layer, item in enumerate(
@@ -638,10 +638,11 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = layer_mappings.full
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    has_paged_swa = kvcache.swa_kv_pool is not None
     mtp_swa_device_buffers = []
-    if is_unified_kv:
-        # unified_kv keeps the SWA ring inside the unified pool and never offloads it,
-        # so there is no separate SWA host pool to map.
+    if not has_paged_swa:
+        # Unified KV and encoder replay rebuild request-local SWA state;
+        # only the persistent main/indexer pages belong in the host cache.
         swa_layer_mapping = {}
     else:
         if len(kvcache.swa_kv_pool.kv_buffer) != transfer_layer_num:
@@ -690,7 +691,7 @@ def build_deepseek_v4_hicache_stack(
         ),
     ]
 
-    if not is_unified_kv:
+    if has_paged_swa:
         swa_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.SWA),
             device_buffers=[
@@ -1371,10 +1372,12 @@ class _DeepSeekV4Strategy(StackStrategy):
             DeepSeekV4TokenToKVPool,
         )
 
-        return isinstance(kvcache, DeepSeekV4TokenToKVPool) and components == {
-            ComponentType.FULL,
-            ComponentType.SWA,
-        }
+        if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
+            return False
+        expected = {ComponentType.FULL}
+        if kvcache.swa_kv_pool is not None:
+            expected.add(ComponentType.SWA)
+        return components == expected
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (

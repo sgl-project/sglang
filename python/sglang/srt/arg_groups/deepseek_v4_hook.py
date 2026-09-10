@@ -251,7 +251,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "context parallelism",
                 cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1,
             ),
-            ("HiCache", cfg.enable_hierarchical_cache),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
