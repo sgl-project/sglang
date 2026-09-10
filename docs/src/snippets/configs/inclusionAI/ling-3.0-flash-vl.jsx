@@ -68,12 +68,18 @@ sgl-eval run mmmu_pro \\
   --model {{MODEL_NAME}} \\
   --temperature 0.0 --top-p 0.95 \\
   --num-threads 64`,
+      gsm8k_pct: `pip install sgl-eval
+sgl-eval run gsm8k \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --model {{MODEL_NAME}} \\
+  --num-threads 32`,
     },
     numPromptsByConc: { 1: 8, 16: 32, 64: 128 },
   },
 
   accuracyLabels: [
     ["mmmu_pro_pct", "MMMU-Pro", "%"],
+    ["gsm8k_pct", "GSM8K", "%"],
   ],
 
   github: {
