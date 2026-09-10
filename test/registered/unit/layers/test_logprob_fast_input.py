@@ -12,10 +12,12 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     compute_row_log_normalizer,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.logprob_test_utils import coverage_cases
 from sglang.test.test_utils import CustomTestCase
@@ -27,6 +29,7 @@ VOCAB = 11
 TOPK_CYCLE = [2, 0, 3]
 # [] is a valid probe set distinct from None (opt-out).
 TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
+TEMPERATURE_CYCLE = [0.5, 1.0, 2.0]
 # start == extend_len is the zero-logprob-row shape. Order determines the cyclic
 # width-3 heterogeneous coverage cases.
 SEQ_SPEC_MENU = ((1, 1), (3, 0), (4, 1), (5, 5), (6, 2))
@@ -66,6 +69,9 @@ def _build_batch(seq_specs, dtype, vocab=VOCAB):
         token_ids_logprobs=[
             TOKEN_IDS_CYCLE[i % len(TOKEN_IDS_CYCLE)] for i in range(len(seq_specs))
         ],
+        input_logprob_temperatures=[
+            TEMPERATURE_CYCLE[i % len(TEMPERATURE_CYCLE)] for i in range(len(seq_specs))
+        ],
     )
     return (
         torch.cat(pruned_rows),
@@ -85,10 +91,29 @@ def _run(proc, batch, fast, chunk_size):
     def get_logits_fn(states, lm_head, logits_metadata, **kwargs):
         return states
 
+    temperature_values = [
+        temperature
+        for temperature, pruned_len in zip(
+            metadata.input_logprob_temperatures,
+            metadata.extend_logprob_pruned_lens_cpu,
+        )
+        for _ in range(pruned_len)
+    ]
+    input_logprob_temperatures = (
+        torch.tensor(
+            temperature_values,
+            dtype=torch.float32,
+            device=pruned_states.device,
+        )
+        if any(temperature != 1.0 for temperature in temperature_values)
+        else None
+    )
+
     return proc.forward(
         pruned_states=pruned_states,
         sample_indices=sample_indices,
         input_logprob_indices=input_logprob_indices,
+        input_logprob_temperatures=input_logprob_temperatures,
         token_to_seq_idx=t2s,
         lm_head=None,
         get_logits_fn=get_logits_fn,
@@ -182,9 +207,21 @@ class TestFastInputLogprobs(CustomTestCase):
         for combo in coverage_cases(SEQ_SPEC_MENU, max_seqs=3):
             batch = _build_batch(list(combo), torch.bfloat16)
             pruned_states, _, input_logprob_indices, _, metadata = batch
-            truth = torch.log_softmax(pruned_states.double(), dim=-1)[
-                input_logprob_indices
-            ]
+            temperatures = torch.tensor(
+                [
+                    temperature
+                    for temperature, pruned_len in zip(
+                        metadata.input_logprob_temperatures,
+                        metadata.extend_logprob_pruned_lens_cpu,
+                    )
+                    for _ in range(pruned_len)
+                ],
+                dtype=torch.float64,
+            )
+            truth = torch.log_softmax(
+                pruned_states[input_logprob_indices].double() / temperatures[:, None],
+                dim=-1,
+            )
             for chunk_size in (None, 2, 5):
                 got, _ = _run(proc, batch, True, chunk_size)
                 label = f"specs={list(combo)} chunk={chunk_size}"
@@ -227,6 +264,51 @@ class TestFastInputLogprobs(CustomTestCase):
                 logprob.cpu(), expected.expand(4), rtol=1e-5, atol=1e-5
             )
 
+    def test_temperature_scales_input_logprobs_but_not_sampling_logits(self):
+        proc = InputLogprobProcessor()
+        batch = _build_batch([(3, 0)], torch.float32)
+        batch[-1].input_logprob_temperatures = [0.5]
+        result, sampled_logits = _run(proc, batch, False, None)
+
+        pruned_states, sample_indices, input_logprob_indices, _, metadata = batch
+        expected = torch.log_softmax(pruned_states[input_logprob_indices] / 0.5, dim=-1)
+        expected_token_logprobs = expected[
+            torch.arange(expected.shape[0]),
+            metadata.extend_input_logprob_token_ids_gpu,
+        ]
+        torch.testing.assert_close(result.token_logprobs, expected_token_logprobs)
+        torch.testing.assert_close(sampled_logits, pruned_states[sample_indices])
+
+    def test_mixed_request_temperatures_align_with_pruned_rows(self):
+        metadata = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_return_logprob=True,
+            extend_seq_lens_cpu=[4, 5, 6],
+            extend_logprob_start_lens_cpu=[0, 5, 3],
+            input_logprob_temperatures=[0.5, 1.0, 2.0],
+        )
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        outputs = processor._get_pruned_states(
+            hidden_states=torch.arange(30).view(15, 2),
+            hidden_states_before_norm=None,
+            aux_hidden_states=None,
+            logits_metadata=metadata,
+        )
+        temperatures = outputs[-2]
+        torch.testing.assert_close(
+            temperatures,
+            torch.tensor([0.5, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0]),
+        )
+
+        metadata.input_logprob_temperatures = [1.0, 1.0, 1.0]
+        outputs = processor._get_pruned_states(
+            hidden_states=torch.arange(30).view(15, 2),
+            hidden_states_before_norm=None,
+            aux_hidden_states=None,
+            logits_metadata=metadata,
+        )
+        self.assertIsNone(outputs[-2])
+
     def test_fast_path_emits_fp32_logprobs(self):
         # Chosen dtype policy: the fast path returns fp32 token logprobs
         # regardless of logits dtype (the normalizer is fp32, so fp32 is the
@@ -235,6 +317,7 @@ class TestFastInputLogprobs(CustomTestCase):
         # where the CUDA kernels never execute.
         proc = InputLogprobProcessor()
         batch = _build_batch([(4, 1), (3, 0)], torch.bfloat16)
+        batch[-1].input_logprob_temperatures = [1.0, 1.0]
         got, _ = _run(proc, batch, True, None)
         self.assertEqual(got.token_logprobs.dtype, torch.float32)
         ref, _ = _run(proc, batch, False, None)
