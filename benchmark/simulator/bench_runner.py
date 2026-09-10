@@ -4,9 +4,9 @@ import asyncio
 import atexit
 import json
 import os
-from dataclasses import asdict
 from typing import Iterator
 
+import msgspec
 import numpy as np
 from sglang_simulator.compat import apply_simulator_server_args
 from sglang_simulator.dataset import BaseDataset, GenericRequest
@@ -38,7 +38,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
 
     def __init__(self, server_args: ServerArgs):
         # Disable features that are unnecessary for simulation.
-        server_args_kwargs = asdict(server_args)
+        server_args_kwargs = msgspec.structs.asdict(server_args)
         apply_simulator_server_args(server_args_kwargs)
         self.engine = SGLangSimulationEngine(**server_args_kwargs)
         self.server_args = self.engine.server_args
