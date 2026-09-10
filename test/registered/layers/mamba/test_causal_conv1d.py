@@ -15,8 +15,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    _CAUSAL_CONV1D_OP,
     PAD_SLOT_ID,
+    CausalConv1dOp,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -489,6 +492,23 @@ def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
 
     torch.testing.assert_close(out, torch.cat(expected, dim=-1), rtol=1e-2, atol=5e-2)
     torch.testing.assert_close(conv_states, conv_states_ref, rtol=1e-2, atol=5e-2)
+
+
+def test_causal_conv1d_oot_dispatch(monkeypatch):
+    from sglang.kernels import fused_op
+
+    expected = torch.empty(0)
+
+    def forward(_self, *args, **kwargs):
+        return expected
+
+    monkeypatch.setattr(fused_op, "_oot_dispatch_key", lambda: "test")
+    monkeypatch.setitem(BaseFusedOp._oot_forward_registry, "test", {})
+    BaseFusedOp.register_oot_forward(CausalConv1dOp, forward, "test")
+    monkeypatch.setattr(_CAUSAL_CONV1D_OP, "_forward_method", None)
+
+    actual = causal_conv1d_fn(expected, expected, None, expected, expected, [])
+    assert actual is expected
 
 
 if __name__ == "__main__":
