@@ -166,19 +166,27 @@ class TestLMHeadFP32(CustomTestCase):
             "matmul",
         )
 
+    # With the flag off, CUDA FP16/BF16 still uses the FP32-output GEMM.
     def test_flag_false_fp16_path(self):
+        expected_operation = "mm" if torch.cuda.is_available() else "matmul"
         self._run_case(
-            torch.float16, False, torch.float16, torch.float16, torch.float16, "matmul"
+            torch.float16,
+            False,
+            torch.float16,
+            torch.float16,
+            torch.float16,
+            expected_operation,
         )
 
     def test_flag_false_bf16_path(self):
+        expected_operation = "mm" if torch.cuda.is_available() else "matmul"
         self._run_case(
             torch.bfloat16,
             False,
             torch.bfloat16,
             torch.bfloat16,
             torch.bfloat16,
-            "matmul",
+            expected_operation,
         )
 
     def test_model_config_enables_fp32_without_server_flag(self):
