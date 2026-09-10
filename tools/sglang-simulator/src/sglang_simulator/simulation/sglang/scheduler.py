@@ -15,6 +15,7 @@ from sglang_simulator.hook import (
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.sglang.session_timeline import SessionTimeline
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,
@@ -82,6 +83,39 @@ class C_SglangPrefillAdderHook(BaseHook):
         target.add_one_req = wrapped_add_one_req
 
 
+def _session_io_structs():
+    """Import lazily; the hook layer must not pull SGLang in before installation."""
+    from sglang.srt.managers.io_struct import (
+        CloseSessionReqInput,
+        OpenSessionReqInput,
+        TokenizedGenerateReqInput,
+    )
+
+    return OpenSessionReqInput, CloseSessionReqInput, TokenizedGenerateReqInput
+
+
+def _session_id_of(req) -> str | None:
+    """Session a generate request belongs to, or None when it is unsessioned.
+
+    Radix-native sessions carry the top-level `session_id`; the older
+    session-controller path carries `session_params.id` (scheduler.py routes on
+    both). A request never sets both -- `GenerateReqInput` rejects that.
+    """
+    _, _, tokenized_generate = _session_io_structs()
+    if not isinstance(req, tokenized_generate):
+        return None
+    if req.session_id is not None:
+        return req.session_id
+    if req.session_params is None:
+        return None
+    return req.session_params.id
+
+
+def _request_finished(rid: str) -> bool:
+    req_stats = request_stats_manager.get_req_stats(rid)
+    return len(req_stats.gen_token_latencies) >= req_stats.output_length
+
+
 class ReqDispatcher:
     _instance = None
     _initialized = False
@@ -97,14 +131,17 @@ class ReqDispatcher:
 
         self.mode = mode
         # If the simulation mode is `BLOCKING`, all requests are released immediately.
-        # If the simulation mode is `OFFLINE`, only control requests, such as `flush_cache`
-        # and `server_info`, are released immediately.
+        # If the simulation mode is `OFFLINE`, only timeline-independent control
+        # requests, such as `flush_cache` and `server_info`, are released immediately.
         self.immediate_release_requests = []
         self.future_queue: list[
             tuple[float, int, Any]
         ] = []  # tuple(created time, salt, request)
         self.offline_recv_all_requests = False
         self.profile_active = False
+        self.session_timeline = SessionTimeline(
+            is_request_finished=_request_finished
+        )
 
     @staticmethod
     def simulation_created_time_s(simulation_args: dict) -> float:
@@ -122,11 +159,30 @@ class ReqDispatcher:
         self.immediate_release_requests.clear()
         self.future_queue.clear()
         self.offline_recv_all_requests = False
+        self.session_timeline.reset()
+
+    def _hold_session_requests(self, reqs: list) -> list:
+        """Take session lifecycle requests out of `reqs`, returning the rest."""
+        _, close_type, _ = _session_io_structs()
+        remaining = []
+        for req in reqs:
+            if isinstance(req, close_type):
+                self.session_timeline.hold_close(session_id=req.session_id, req=req)
+            else:
+                remaining.append(req)
+        return remaining
+
+    def _sessions_with_pending_turns(self) -> set[str]:
+        sessions = {_session_id_of(req) for _, _, req in self.future_queue}
+        sessions.discard(None)
+        return sessions
+
 
     def add(self, reqs: list):
         if self.mode == SimulationMode.BLOCKING:
             self.immediate_release_requests.extend(reqs)
         elif self.mode == SimulationMode.OFFLINE:
+            reqs = self._hold_session_requests(reqs)
             if self.offline_recv_all_requests:
                 self.immediate_release_requests.extend(reqs)
                 return
@@ -186,6 +242,15 @@ class ReqDispatcher:
         recv_reqs = []
 
         recv_reqs.extend(self.immediate_release_requests)
+        # A request admitted after the simulation started arrives now, whatever
+        # timestamp it carries. Multi-turn replay reuses one row's metadata for
+        # every round, so later turns would otherwise report the preceding turns'
+        # execution as their own queueing delay.
+        live_arrivals = (
+            {id(req) for req in self.immediate_release_requests}
+            if self.offline_recv_all_requests
+            else set()
+        )
         self.immediate_release_requests.clear()
 
         if self.mode == SimulationMode.OFFLINE and self.offline_recv_all_requests:
@@ -197,6 +262,20 @@ class ReqDispatcher:
                     break
                 recv_reqs.append(req)
                 heapq.heappop(self.future_queue)
+
+        for req in recv_reqs:
+            session_id = _session_id_of(req)
+            if session_id is not None:
+                self.session_timeline.note_dispatched(
+                    session_id=session_id, rid=req.rid
+                )
+
+        if self.mode == SimulationMode.OFFLINE:
+            recv_reqs.extend(
+                self.session_timeline.take_settled_closes(
+                    self._sessions_with_pending_turns()
+                )
+            )
 
         now = time.time()
         for req in recv_reqs:
@@ -216,6 +295,7 @@ class ReqDispatcher:
                     simulation_args = {}
                 req_stats = request_stats_manager.get_req_stats(req.rid)
                 req_stats.rid = req.rid
+                req_stats.session_id = _session_id_of(req)
                 req_stats.input_length = len(req.input_ids)
                 req_stats.output_length = req.sampling_params.max_new_tokens
 
@@ -226,9 +306,12 @@ class ReqDispatcher:
                     req_stats.last_event_time = req_stats.created_time
                     req_stats.queue_start = now
                 elif self.mode == SimulationMode.OFFLINE:
-                    req_stats.created_time = self.simulation_created_time_s(
-                        simulation_args
-                    )
+                    if id(req) in live_arrivals:
+                        req_stats.created_time = StateManager.get_global_clock()
+                    else:
+                        req_stats.created_time = self.simulation_created_time_s(
+                            simulation_args
+                        )
                     req_stats.last_event_time = req_stats.created_time
                     # Align with the real queue start timestamp if queue_start is not None. For debugging only.
                     queue_start = simulation_args.get("queue_start")
