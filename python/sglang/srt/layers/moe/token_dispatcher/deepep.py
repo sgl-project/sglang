@@ -465,7 +465,7 @@ class _DeepEPDispatcherImplBase:
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.MXFP4: {
-                "use_fp8": True,
+                "use_fp8": False,
                 "use_nvfp4": False,
             },
         }
@@ -477,10 +477,7 @@ class _DeepEPDispatcherImplBase:
         config = config_map[self.deepep_output_dtype]
         self.use_fp8 = config["use_fp8"]
         self.use_nvfp4 = config["use_nvfp4"]
-        self.use_ue8m0 = self.deepep_output_dtype in (
-            DispatcherOutputDtype.MXFP8,
-            DispatcherOutputDtype.MXFP4,
-        )
+        self.use_ue8m0 = self.deepep_output_dtype == DispatcherOutputDtype.MXFP8
         self.use_mxfp4 = self.deepep_output_dtype == DispatcherOutputDtype.MXFP4
 
         # Handle environment variables
@@ -566,7 +563,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if not _is_npu and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -820,6 +817,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         low_latency_quant_kwargs = {}
+        if not self.use_mxfp4:
+            low_latency_quant_kwargs["use_fp8"] = self.use_fp8
         if _is_npu:
             if self.use_ue8m0:
                 low_latency_quant_kwargs["use_ue8m0"] = True
@@ -833,7 +832,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=self.use_fp8,
                 **low_latency_quant_kwargs,
                 **(
                     dict(topk_weights=topk_weights)
