@@ -18,8 +18,6 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-# Prefill request capacity; larger batches use eager prefill.
-PREFILL_CUDA_GRAPH_LORA_SEGMENTS = 32
 # Match the dense kernels' token tile.
 PREFILL_CUDA_GRAPH_LORA_CHUNK_SIZE = 16
 
@@ -205,8 +203,10 @@ class TritonLoRABackend(BaseLoRABackend):
                 permutation=torch.zeros(max_tokens, dtype=torch.int32),
             )
 
-    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
-        num_slots = PREFILL_CUDA_GRAPH_LORA_SEGMENTS
+    def init_prefill_cuda_graph_batch_info(
+        self, max_num_tokens: int, max_num_requests: Optional[int] = None
+    ):
+        num_slots = max_num_tokens if max_num_requests is None else max_num_requests
         mlpb = self.max_loras_per_batch
         with torch.device(self.device):
             # bs pinned at num_slots so the captured grids cover any replay
@@ -226,6 +226,7 @@ class TritonLoRABackend(BaseLoRABackend):
             chunk_size = PREFILL_CUDA_GRAPH_LORA_CHUNK_SIZE
             # Ragged request boundaries need up to num_slots - 1 extra tiles.
             num_chunks = min(
+                max_num_tokens,
                 (max_num_tokens + chunk_size - 1) // chunk_size + num_slots - 1,
                 65535,
             )
@@ -380,11 +381,12 @@ class TritonLoRABackend(BaseLoRABackend):
             if use_prefill_cuda_graph:
                 sgemm = self.prefill_cuda_graph_sgemm_batch_info
                 chunk_size = PREFILL_CUDA_GRAPH_LORA_CHUNK_SIZE
-                num_chunks = (
-                    (max(1, forward_batch.extend_num_tokens) + chunk_size - 1)
-                    // chunk_size
-                    + PREFILL_CUDA_GRAPH_LORA_SEGMENTS
-                    - 1
+                num_tokens = max(1, forward_batch.extend_num_tokens)
+                num_chunks = min(
+                    num_tokens,
+                    (num_tokens + chunk_size - 1) // chunk_size
+                    + self.prefill_cuda_graph_max_bs
+                    - 1,
                 )
                 # Larger grids keep the request view to fit CUDA's y/z limit.
                 if num_chunks <= sgemm.seg_lens.numel():

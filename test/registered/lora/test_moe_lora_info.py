@@ -169,10 +169,12 @@ class TestDenseLoRAPrefillGraph(CustomTestCase):
     def test_replay_preserves_ragged_adapters(self):
         """Ragged replays retain adapters without a token bucket per request."""
         device, dtype = torch.device("cuda"), torch.float16
-        capacity, rank, width = 1024, 32, 64
+        capacity, num_requests, rank, width = 1024, 64, 32, 64
         ranks, scalings = [0, 16, 32], [0.0, 0.5, 1.0]
         backend = TritonLoRABackend(max_loras_per_batch=3, device=device)
-        backend.init_prefill_cuda_graph_batch_info(capacity)
+        backend.init_prefill_cuda_graph_batch_info(
+            capacity, max_num_requests=num_requests
+        )
         generator = torch.Generator().manual_seed(0)
         cpu_a, cpu_b, cpu_embedding = [
             torch.randint(-4, 5, shape, generator=generator).float() / 16
@@ -185,11 +187,11 @@ class TestDenseLoRAPrefillGraph(CustomTestCase):
         x = torch.empty((capacity, width), device=device, dtype=dtype)
         input_ids = torch.empty(capacity, device=device, dtype=torch.int64)
         output = torch.full_like(x, 0.25)
-        ragged = [1, 15, 16, 17, 31, 32, 33, 47] * 4
+        ragged = [1, 3, 7, 15, 16, 17, 23, 31] * 8
         ragged[-1] += capacity - sum(ragged)
         cases = (
             ([capacity], [0]),
-            (ragged, [i % 3 for i in range(32)]),
+            (ragged, [(i + 1) % 3 for i in range(num_requests)]),
             ([1, 17], [2, 0]),
         )
         for phase, (lengths, adapters) in enumerate(cases):
@@ -217,7 +219,7 @@ class TestDenseLoRAPrefillGraph(CustomTestCase):
             if phase == 0:
                 info = backend._sgemm_info()
                 # Allow one partial 16-token tile per request, not a bucket per slot.
-                assert info.bs * info.max_len <= capacity + 16 * 32
+                assert info.bs * info.max_len <= capacity + 16 * num_requests
                 graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 for capture in (False, True):

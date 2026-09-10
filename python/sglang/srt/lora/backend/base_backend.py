@@ -201,7 +201,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
-    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+    def init_prefill_cuda_graph_batch_info(
+        self, max_num_tokens: int, max_num_requests: Optional[int] = None
+    ):
         """Allocate static LoRA batch metadata for the prefill CUDA graph,
         sized for the largest captured token bucket. Called before capture."""
         raise NotImplementedError(

@@ -148,10 +148,12 @@ class LoRAManager:
             init_lora_two_stream_resources(self.device)
         # ===== END TO BE REFACTORED ====
 
-    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+    def init_prefill_cuda_graph_batch_info(
+        self, max_num_tokens: int, max_num_requests: Optional[int] = None
+    ):
         """Allocate static LoRA metadata and MoE scratch before prefill capture."""
         self.lora_backend.init_prefill_cuda_graph_batch_info(
-            max_num_tokens=max_num_tokens
+            max_num_tokens=max_num_tokens, max_num_requests=max_num_requests
         )
         for module in self.base_model.modules():
             if isinstance(module, FusedMoEWithLoRA):

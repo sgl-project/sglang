@@ -442,20 +442,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         if self._capture_lora:
             model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
-                max_num_tokens=self.max_num_tokens
+                max_num_tokens=self.max_num_tokens,
+                max_num_requests=(
+                    self._capture_req_slots
+                    if self._is_full_backend
+                    else min(self.max_num_tokens, self.max_bs)
+                ),
             )
-            # Clamp Full's request slots to the LoRA segment-slot count
-            # rather than fail capture.
-            lora_max_bs = model_runner.lora_manager.prefill_cuda_graph_max_bs
-            if self._capture_req_slots > lora_max_bs:
-                logger.info(
-                    "Clamping full prefill CUDA graph request slots from %d to %d "
-                    "to fit the LoRA backend's static segment slots.",
-                    self._capture_req_slots,
-                    lora_max_bs,
-                )
-                self._capture_req_slots = lora_max_bs
-
         self._full_cg_seq_lens_cpu = (
             torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
             if self._is_full_backend
