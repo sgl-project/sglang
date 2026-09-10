@@ -1435,6 +1435,12 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Fused triton indexer score reduction for the NPU low-ratio indexer:
+    # one launch for relu -> * head weights -> sum over heads -> fp32 ->
+    # visible-length mask, instead of five full-width [t, H, n] / [t, n]
+    # passes. The scoring einsum stays in torch (Cube, via aclnn); only the
+    # bandwidth-bound tail is fused. Bit-exact; opt-in.
+    SGLANG_OPT_USE_DSV41_TRITON_INDEX_SCORE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

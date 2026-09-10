@@ -15,6 +15,7 @@ from typing import Optional
 import torch
 from torch import nn
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
     DeepseekV41Compressor as DeepseekV41Compressor,
 )
@@ -75,15 +76,22 @@ def topk_from_scores(
     candidate_block_size: Optional[int] = None,
     consume: Optional[torch.Tensor] = None,
     select_candidate_blocks=None,
+    pre_masked: bool = False,
 ):
     """Masked two-level top-k over compressed-position scores.
 
     s [rows, n]; lens [rows] = visible compressed length per row; returns
     (idx [rows, k] in position order, reach [rows, k], candidate mask or None).
     Pure torch so the NPU eager path and the CANNON device leg share it.
+
+    ``pre_masked`` says the caller already applied the same ``j >= lens`` mask
+    -- what ``DeepseekV41Indexer.scores_masked`` guarantees. Re-masking would be
+    a no-op on the values but another full-width [rows, n] read-modify-write,
+    which is exactly the pass that fusion removed.
     """
-    j = torch.arange(s.shape[-1], device=s.device)
-    s = s.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
+    if not pre_masked:
+        j = torch.arange(s.shape[-1], device=s.device)
+        s = s.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
     masks = None
     if candidate_blocks:
         masks = select_candidate_blocks(
@@ -184,3 +192,36 @@ class DeepseekV41Indexer(nn.Module):
         s = torch.einsum("bhd,nd->bhn", q, k)
         s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
         return s.float()
+
+    def scores_masked(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """``scores`` with the visible-length mask the callers always apply next.
+
+        q [t, H, d], k [n, d], weights [t, H], lens [t] -> [t, n] fp32 with
+        every compressed position at or past a row's length set to -inf.
+
+        Folding the mask in is what lets the NPU path replace five full-width
+        passes with one kernel: relu, the weight multiply and the head
+        reduction each walk the whole [t, H, n] logit tensor, and .float() plus
+        masked_fill walk the [t, n] result. The scoring einsum deliberately
+        stays here in torch -- it is the only Cube-eligible part, and a triton
+        tl.dot would drop it onto the Vector unit (see
+        kernels/ops/attention/dsv4/dsv41_index_score_reduce.py).
+        """
+        s = torch.einsum("bhd,nd->bhn", q, k)
+        if envs.SGLANG_OPT_USE_DSV41_TRITON_INDEX_SCORE.get():
+            from sglang.kernels.ops.attention.dsv4.dsv41_index_score_reduce import (
+                index_score_reduce,
+                index_score_reduce_available,
+            )
+
+            if index_score_reduce_available():
+                return index_score_reduce(s, weights, lens)
+        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1).float()
+        j = torch.arange(s.shape[-1], device=s.device)
+        return s.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
