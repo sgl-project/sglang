@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use tch::Tensor;
 
 use super::*;
-use crate::components::{FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds};
 
@@ -91,7 +91,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        _params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
@@ -213,7 +213,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        _params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
@@ -293,11 +293,11 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
         assert!(!lock_host);
-        assert!(params.is_some_and(|p| p.swa_uuid_for_lock.is_some()));
+        assert!(params.swa_uuid_for_lock.is_some());
         panic!("low-priority release dispatched");
     }
 }
@@ -368,7 +368,7 @@ impl TreeComponent<Vec<i64>> for SwaComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        _params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
@@ -481,7 +481,7 @@ impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        _params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
@@ -503,7 +503,7 @@ fn locked_anchor_for_dispatch(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    tc.inc_lock_ref(tc.arena.node(n1).id)
+    tc.inc_lock_ref(tc.arena.node(n1).id, ComponentSet::EMPTY)
         .expect("live test node");
     n1
 }
@@ -516,7 +516,11 @@ fn dec_lock_ref_skip_swa_skips_the_swa_component() {
     // The skipped Swa driver is never dispatched, so its stub cannot panic.
     tc.dec_lock_ref(
         tc.arena.node(n1).id,
-        /* params = */ None,
+        /* params = */
+        &DecLockRefParams {
+            skipped_lock_components: ComponentSet::EMPTY,
+            ..Default::default()
+        },
         /* skip_swa = */ true,
     )
     .expect("live test node");
@@ -541,7 +545,7 @@ fn inc_lock_ref_reaches_every_component() {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    let _ = tc.inc_lock_ref(tc.arena.node(n1).id);
+    let _ = tc.inc_lock_ref(tc.arena.node(n1).id, ComponentSet::EMPTY);
 }
 
 #[test]
@@ -552,7 +556,11 @@ fn dec_lock_ref_without_skip_swa_reaches_every_component() {
     tc.register_component_(Arc::new(SwaComponentForTest));
     let _ = tc.dec_lock_ref(
         tc.arena.node(n1).id,
-        /* params = */ None,
+        /* params = */
+        &DecLockRefParams {
+            skipped_lock_components: ComponentSet::EMPTY,
+            ..Default::default()
+        },
         /* skip_swa = */ false,
     );
 }
@@ -630,7 +638,11 @@ fn dec_swa_lock_only_dispatches_lower_priority_releases() {
     let mut host_frees = HashMap::new();
     let _ = tc.dec_swa_lock_only(
         tc.arena.node(root).id,
-        Some(7),
+        &DecLockRefParams {
+            swa_uuid_for_lock: Some(7),
+            skipped_lock_components: ComponentSet::EMPTY,
+            ..Default::default()
+        },
         &mut device_frees,
         &mut host_frees,
     );
@@ -671,7 +683,11 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(a).id,
-        result.swa_uuid_for_lock,
+        &DecLockRefParams {
+            swa_uuid_for_lock: result.swa_uuid_for_lock,
+            skipped_lock_components: ComponentSet::EMPTY,
+            ..Default::default()
+        },
         &mut device_frees,
         &mut host_frees,
     )
@@ -3755,11 +3771,15 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
     assert_eq!(tc.full_evictable_size(), 4);
     // The orchestrator re-locks the loaded path right after commit; that lock walk
     // also re-evaluates the parent's transient D-leaf membership.
-    tc.inc_lock_ref(tc.arena.node(child).id)
+    tc.inc_lock_ref(tc.arena.node(child).id, ComponentSet::EMPTY)
         .expect("live test node");
     tc.dec_lock_ref(
         tc.arena.node(child).id,
-        /* params = */ None,
+        /* params = */
+        &DecLockRefParams {
+            skipped_lock_components: ComponentSet::EMPTY,
+            ..Default::default()
+        },
         /* skip_swa = */ false,
     )
     .expect("live test node");
@@ -5261,7 +5281,7 @@ fn stale_handle_returns_err_after_its_node_is_freed() {
     tc.evict_device_leaf(leaf, /* is_write_back = */ false)
         .expect("live test node");
     assert!(matches!(
-        tc.inc_lock_ref(leaf),
+        tc.inc_lock_ref(leaf, ComponentSet::EMPTY),
         Err(NodeAccessError { node_id }) if node_id == leaf
     ));
 }
@@ -6164,7 +6184,7 @@ fn reset_restores_a_fresh_tree() {
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    tc.inc_lock_ref(matched.best_match_node_id)
+    tc.inc_lock_ref(matched.best_match_node_id, ComponentSet::EMPTY)
         .expect("live match node");
     assert_eq!(tc.protected_size(), 3);
     // Seed aux LRU, host LRU, and host-leaf state so the reset must clear each.
@@ -6216,7 +6236,7 @@ fn size_accessors_mirror_the_full_component_state() {
     assert_eq!(tc.protected_size(), 0);
     assert_eq!(tc.component_evictable_size(FULL), 3);
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    tc.inc_lock_ref(matched.best_match_node_id)
+    tc.inc_lock_ref(matched.best_match_node_id, ComponentSet::EMPTY)
         .expect("live match node");
     assert_eq!(tc.protected_size(), 3);
     assert_eq!(tc.full_protected_size(), 3);
@@ -6306,7 +6326,7 @@ fn walk_for_kv_canary_chains_slots_across_namespaces() {
 fn walk_for_kv_canary_unlocked_only_skips_locked_nodes_but_keeps_the_chain() {
     let mut tc = core();
     let (a, _b) = matched_chain(&mut tc);
-    tc.inc_lock_ref(tc.arena.node(a).id)
+    tc.inc_lock_ref(tc.arena.node(a).id, ComponentSet::EMPTY)
         .expect("live test node");
     assert_eq!(
         sorted_canary_rows(tc.walk_for_kv_canary(true, false)),
@@ -6659,13 +6679,18 @@ fn sanity_check_passes_on_a_healthy_tree() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.inc_lock_ref(leaf).expect("live test node");
+    tc.inc_lock_ref(leaf, ComponentSet::EMPTY)
+        .expect("live test node");
     tc.sanity_check(&[(1, leaf)], &[(2, leaf)]);
     tc.dec_lock_ref(
         tc.arena
             .node(tc.arena.resolve(leaf).expect("live test node"))
             .id,
-        /* params = */ None,
+        /* params = */
+        &DecLockRefParams {
+            skipped_lock_components: ComponentSet::EMPTY,
+            ..Default::default()
+        },
         /* skip_swa = */ false,
     )
     .expect("live test node");
@@ -6774,16 +6799,28 @@ fn sanity_check_detects_an_evicted_parent_prefix() {
 }
 
 #[test]
-#[should_panic(expected = "evicted but lock_ref")]
-fn sanity_check_detects_a_locked_tombstone() {
+fn sanity_check_accepts_a_locked_tombstone() {
+    // Segment locks count evicted nodes, so a device-locked tombstone is a
+    // legal state the checker must not flag.
     let mut tc = sane_tree();
+    // write_back spares the tombstone's ancestors the backup-chain rule.
+    tc.is_write_back = true;
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.inc_lock_ref(leaf).expect("live test node");
-    let _ = tc
-        .arena
-        .take_device_value(tc.arena.resolve(leaf).expect("live test node"), FULL);
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
+    // Tombstone the leaf consistently first (host copy, ledger, leaf sets),
+    // then lock through it: the bottom segment counts the tombstone.
+    tc.arena
+        .set_host_value(leaf_idx, FULL, Tensor::from_slice(&[9i64]));
+    let taken = tc.arena.take_device_value(leaf_idx, FULL);
+    tc.dec_evictable_size(FULL, taken.size()[0] as usize);
+    tc.update_evictable_leaf_sets_(leaf_idx);
+    let parent_idx = tc.arena.node(leaf_idx).parent();
+    tc.update_evictable_leaf_sets_(parent_idx);
+    tc.inc_lock_ref(leaf, ComponentSet::EMPTY)
+        .expect("live test node");
+    assert_eq!(tc.arena.device_lock_ref(leaf_idx, FULL), 1);
     tc.sanity_check(&[], &[]);
 }
 
@@ -8049,13 +8086,16 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
             2 => {
                 // Balanced lock round trip on whatever the key matches.
                 let anchor = tc.match_prefix(&match_params(&key)).best_match_node_id;
-                let lock = tc.inc_lock_ref(anchor).expect("live match anchor");
+                let lock = tc
+                    .inc_lock_ref(anchor, ComponentSet::EMPTY)
+                    .expect("live match anchor");
                 let params = DecLockRefParams {
+                    node_id: None,
                     swa_uuid_for_lock: lock.swa_uuid_for_lock,
                     swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                    skip_lock_node_ids: lock.skip_lock_node_ids,
+                    skipped_lock_components: lock.skipped_lock_components,
                 };
-                tc.dec_lock_ref(anchor, Some(&params), /* skip_swa = */ false)
+                tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                     .expect("live match anchor");
             }
             _ => {
@@ -8063,7 +8103,9 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                 let matched = tc.match_prefix(&match_params(&key));
                 let anchor = matched.best_match_node_id;
                 let matched_len = matched.device_indices.numel() as usize;
-                let lock = tc.inc_lock_ref(anchor).expect("live match anchor");
+                let lock = tc
+                    .inc_lock_ref(anchor, ComponentSet::EMPTY)
+                    .expect("live match anchor");
                 tc.insert(&sequence_insert_params(
                     &key,
                     matched_len,
@@ -8072,11 +8114,12 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                     mamba,
                 ));
                 let params = DecLockRefParams {
+                    node_id: None,
                     swa_uuid_for_lock: lock.swa_uuid_for_lock,
                     swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                    skip_lock_node_ids: lock.skip_lock_node_ids,
+                    skipped_lock_components: lock.skipped_lock_components,
                 };
-                tc.dec_lock_ref(anchor, Some(&params), /* skip_swa = */ false)
+                tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                     .expect("live match anchor");
             }
         }
@@ -8224,10 +8267,17 @@ fn a_zero_length_match_anchors_at_the_root() {
         .best_match_node_id;
     assert_eq!(anchor, tc.root_node_handle(Some("salted")));
     // The root handle stays valid across a full namespace eviction.
-    tc.inc_lock_ref(anchor).expect("live root");
+    tc.inc_lock_ref(anchor, ComponentSet::EMPTY)
+        .expect("live root");
     drain_full_device(&mut tc);
     tc.dec_lock_ref(
-        anchor, /* params = */ None, /* skip_swa = */ false,
+        anchor,
+        /* params = */
+        &DecLockRefParams {
+            skipped_lock_components: ComponentSet::EMPTY,
+            ..Default::default()
+        },
+        /* skip_swa = */ false,
     )
     .expect("live root");
     assert!(tc.arena.resolve(anchor).is_ok());
