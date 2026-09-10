@@ -18,10 +18,10 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from lmcache.integration.sglang.unified_lmcache_mp_connector import (
-    LMCacheKVGroup,
     LMCacheLoadOperation,
     LMCacheLookupOperation,
     LMCacheStoreOperation,
+    SGLangKVComponentGroup,
     UnifiedLMCacheMPConnector,
 )
 
@@ -379,7 +379,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
         return resolved
 
-    def _resolve_dsv4_registered_groups(self, kv_pool) -> list[LMCacheKVGroup]:
+    def _resolve_dsv4_registered_groups(self, kv_pool) -> list[SGLangKVComponentGroup]:
         if tuple(self.tree_components) != (ComponentType.FULL, ComponentType.SWA):
             names = [component.name for component in self.tree_components]
             raise NotImplementedError(
@@ -389,7 +389,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         full_tensors = self._resolve_dsv4_full_page_tensors(kv_pool)
         swa_tensors = self._resolve_dsv4_swa_page_tensors(kv_pool)
         return [
-            LMCacheKVGroup(
+            SGLangKVComponentGroup(
                 name="full",
                 kv_tensors=full_tensors,
                 sliding_window_size=-1,
@@ -397,7 +397,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 slots_per_block=self.page_size,
                 tensor_rows_per_block=(1,) * len(full_tensors),
             ),
-            LMCacheKVGroup(
+            SGLangKVComponentGroup(
                 name="swa",
                 kv_tensors=swa_tensors,
                 sliding_window_size=self._aligned_swa_window_size(),
@@ -460,7 +460,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             if value is not None:
                 value[indices] = 0
 
-    def _resolve_registered_groups(self) -> list[LMCacheKVGroup]:
+    def _resolve_registered_groups(self) -> list[SGLangKVComponentGroup]:
         """Map Unified tree components to LMCache engine KV groups."""
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -470,7 +470,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if isinstance(kv_pool, DeepSeekV4TokenToKVPool):
             return self._resolve_dsv4_registered_groups(kv_pool)
 
-        groups: list[LMCacheKVGroup] = []
+        groups: list[SGLangKVComponentGroup] = []
         for component_type in self.tree_components:
             if component_type is ComponentType.FULL:
                 component_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
@@ -481,7 +481,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     tensors = (*tensors, *dsa_tensors)
                     tensor_rows_per_block += (1,) * len(dsa_tensors)
                 groups.append(
-                    LMCacheKVGroup(
+                    SGLangKVComponentGroup(
                         name=component_type.name.lower(),
                         kv_tensors=tensors,
                         sliding_window_size=-1,
@@ -500,7 +500,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     )
                 tensors = self._resolve_pool_tensors(component_pool)
                 groups.append(
-                    LMCacheKVGroup(
+                    SGLangKVComponentGroup(
                         name=component_type.name.lower(),
                         kv_tensors=tensors,
                         sliding_window_size=self._aligned_swa_window_size(),
@@ -514,7 +514,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 mamba_pool = self.req_to_token_pool.mamba_pool
                 checkpoint_grid = self._mamba_component.mamba_checkpoint_grid
                 groups.append(
-                    LMCacheKVGroup(
+                    SGLangKVComponentGroup(
                         name=component_type.name.lower(),
                         kv_tensors=tuple(
                             tensor.view(tensor.shape[0], 1, -1)
