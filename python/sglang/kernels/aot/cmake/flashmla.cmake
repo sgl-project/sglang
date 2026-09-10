@@ -42,6 +42,14 @@ if(${CUDA_VERSION} VERSION_GREATER 12.8)
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
 if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+    # B300 is sm_103; sm_100f is family-compatible so it runs there, but ptxas emits
+    # better SASS for the native arch. FlashMLA's setup.py picks sm_100a + sm_103a
+    # over sm_100f for the same reason. The cutlass patch below is what lets a TU
+    # compile at __CUDA_ARCH__ == 1030 against the pinned cutlass.
+    list(APPEND FLASHMLA_CUDA_FLAGS
+        "-gencode=arch=compute_103a,code=sm_103a"
+    )
+
     # Patch cutlass/arch/config.h: add SM103 architecture defines.
     # This patch is only needed (and only valid) with CUDA 13+.
     # The new block is inserted right before the existing "// SM101 and SM101a"
