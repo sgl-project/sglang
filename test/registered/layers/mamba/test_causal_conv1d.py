@@ -15,8 +15,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    _CAUSAL_CONV1D_OP,
     PAD_SLOT_ID,
+    CausalConv1dOp,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -594,6 +597,23 @@ def test_causal_conv1d_update_dedup_window_matches_per_token(
     assert torch.equal(state_tile, state_ref)
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (1e-2, 5e-2)
     torch.testing.assert_close(out_tile[real], out_ref[real], rtol=rtol, atol=atol)
+
+
+def test_causal_conv1d_oot_dispatch(monkeypatch):
+    from sglang.kernels import fused_op
+
+    expected = torch.empty(0)
+
+    def forward(_self, *args, **kwargs):
+        return expected
+
+    monkeypatch.setattr(fused_op, "_oot_dispatch_key", lambda: "test")
+    monkeypatch.setitem(BaseFusedOp._oot_forward_registry, "test", {})
+    BaseFusedOp.register_oot_forward(CausalConv1dOp, forward, "test")
+    monkeypatch.setattr(_CAUSAL_CONV1D_OP, "_forward_method", None)
+
+    actual = causal_conv1d_fn(expected, expected, None, expected, expected, [])
+    assert actual is expected
 
 
 if __name__ == "__main__":
