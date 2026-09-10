@@ -29,7 +29,6 @@ from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.merge_state import merge_state
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import (
@@ -76,6 +75,7 @@ except ImportError:
     )
 
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
+from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
@@ -157,8 +157,8 @@ class ForwardMetadata:
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
     planned_dcp_size: int = 1
-    dcp_local_kv_lens: Optional[torch.Tensor] = None
-    dcp_verify_token_table: Optional[torch.Tensor] = None
+    local_kv_lens: Optional[torch.Tensor] = None
+    verify_token_table: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -276,6 +276,8 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+
+        self.dcp_world_size = get_parallel().attn_dcp_size
 
         # Get v_head_dim based on model type
         if self.use_mla:
@@ -430,7 +432,6 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
-            self.dcp_world_size = get_parallel().attn_dcp_size
             _mla_low_head_repeat = (4, 8)
             _mla_low_head_zero_pad = (12,)
             # The DCP decode kernel tiles the query heads, so it serves any
@@ -1152,7 +1153,7 @@ class AiterAttnBackend(AttentionBackend):
         fm = self.forward_metadata
         q_len = fm.max_q_len
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
-        seqused_k = fm.dcp_local_kv_lens
+        seqused_k = fm.local_kv_lens
         n_rows = seqused_k.shape[0]
         bs = n_rows // q_len
 
@@ -1162,7 +1163,7 @@ class AiterAttnBackend(AttentionBackend):
             q=q.view(n_rows, num_heads, layer.qk_head_dim),
             k_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             layer=layer,
-            kv_indices=fm.dcp_verify_token_table,
+            kv_indices=fm.verify_token_table,
             kv_indptr=seqused_k,
             sm_scale=layer.scaling,
             kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
@@ -1192,7 +1193,7 @@ class AiterAttnBackend(AttentionBackend):
             qlen=q_len,
             return_lse=True,
         )
-        return merge_state(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
+        return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
 
     def mla_fp8_prefill_attn(
         self,
@@ -1350,8 +1351,8 @@ class AiterAttnBackend(AttentionBackend):
 
         # dcp metadata
         planned_dcp_size = 1
-        dcp_local_kv_lens = None
-        dcp_verify_token_table = None
+        local_kv_lens = None
+        verify_token_table = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -1373,7 +1374,7 @@ class AiterAttnBackend(AttentionBackend):
 
                     if (
                         self.use_mla
-                        and get_parallel().dcp_enabled
+                        and self.dcp_world_size > 1
                         and not forward_batch.forward_mode.is_idle()
                     ):
                         planned_dcp_size = get_parallel().attn_dcp_size
@@ -1584,8 +1585,7 @@ class AiterAttnBackend(AttentionBackend):
                 device = forward_batch.seq_lens.device
                 # Prefix and window are attended as two stages, so plan the
                 # shard over the COMMITTED length only or the window is counted twice.
-                verify_dcp = self.use_mla and get_parallel().dcp_enabled
-                if verify_dcp:
+                if self.dcp_world_size > 1:
                     kv_lens = forward_batch.seq_lens.to(torch.int32).clone()
                     kv_lens_sum = forward_batch.seq_lens_sum
                 else:
@@ -1616,7 +1616,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.req_to_token.stride(0),
                 )
 
-                if verify_dcp:
+                if self.dcp_world_size > 1:
                     planned_dcp_size = get_parallel().attn_dcp_size
                     # seq_lens_cpu is NOT usable: the DSPARK verify path pre-adds
                     # the window to it, so the shard would be draft_num too long.
@@ -1628,8 +1628,8 @@ class AiterAttnBackend(AttentionBackend):
                         bs,
                     )
                     (
-                        dcp_verify_token_table,
-                        dcp_local_kv_lens,
+                        verify_token_table,
+                        local_kv_lens,
                     ) = self._build_dcp_verify_token_table(
                         kv_indptr,
                         forward_batch.req_pool_indices,
@@ -1638,8 +1638,7 @@ class AiterAttnBackend(AttentionBackend):
                         (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
                     )
 
-                # if self.kv_cache_dtype == fp8_dtype:
-                if _use_mla_ps_kernel and not verify_dcp:
+                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
                     max_seqlen_qo = draft_num
                     (
                         work_metadata,
@@ -1685,8 +1684,8 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                     run_graph=False,
                     planned_dcp_size=planned_dcp_size,
-                    dcp_local_kv_lens=dcp_local_kv_lens,
-                    dcp_verify_token_table=dcp_verify_token_table,
+                    local_kv_lens=local_kv_lens,
+                    verify_token_table=verify_token_table,
                 )
             else:
                 bs = len(forward_batch.req_pool_indices)
@@ -2020,17 +2019,17 @@ class AiterAttnBackend(AttentionBackend):
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int32, device=self.device
         )
-        if self.use_mla and get_parallel().dcp_enabled:
+        if self.use_mla and self.dcp_world_size > 1:
             if self.num_draft_tokens:
                 # Target-verify flattens the window into single-token rows, so it
                 # needs max_bs * num_draft_tokens of them, not max_bs.
                 n_verify_rows = max_bs * self.num_draft_tokens
-                self.cuda_graph_dcp_verify_local_kv_lens = torch.zeros(
+                self.cuda_graph_verify_local_kv_lens = torch.zeros(
                     (n_verify_rows,), dtype=torch.int32, device=self.device
                 )
                 # Capture-stable token table, filled out-of-graph. One column per
                 # TOKEN, so the width is the worst-case shard ceil(ctx_len / W).
-                self.cuda_graph_dcp_verify_token_table = torch.zeros(
+                self.cuda_graph_verify_token_table = torch.zeros(
                     (n_verify_rows, self._get_dcp_graph_max_local_kv_len()),
                     dtype=torch.int32,
                     device=self.device,
@@ -2161,8 +2160,8 @@ class AiterAttnBackend(AttentionBackend):
 
         # DCP metadata which will be populated for MLA decode when dcp enabled
         planned_dcp_size = 1
-        dcp_local_kv_lens = None
-        dcp_verify_token_table = None
+        local_kv_lens = None
+        verify_token_table = None
 
         swa_page_table = None
         max_kv_len = (
@@ -2200,7 +2199,7 @@ class AiterAttnBackend(AttentionBackend):
 
                     if (
                         self.use_mla
-                        and get_parallel().dcp_enabled
+                        and self.dcp_world_size > 1
                         and not forward_mode.is_idle()
                     ):
                         planned_dcp_size = get_parallel().attn_dcp_size
@@ -2337,9 +2336,13 @@ class AiterAttnBackend(AttentionBackend):
             )
             # Prefix and window are attended as two stages, so plan the shard
             # over the COMMITTED length only or the window is counted twice.
-            verify_dcp = self.use_mla and get_parallel().dcp_enabled
-            if self.use_mla and not verify_dcp:
-                kv_lens = seq_lens + self.num_draft_tokens
+
+            if self.use_mla:
+                kv_lens = (
+                    seq_lens
+                    if self.dcp_world_size > 1
+                    else seq_lens + self.num_draft_tokens
+                )
             else:
                 kv_lens = seq_lens
             kv_indptr = self.kv_indptr[: bs + 1]
@@ -2368,7 +2371,7 @@ class AiterAttnBackend(AttentionBackend):
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
-            if verify_dcp:
+            if self.use_mla and self.dcp_world_size > 1:
                 planned_dcp_size = get_parallel().attn_dcp_size
                 # seq_lens_cpu is NOT usable (the DSPARK verify path pre-adds the
                 # window), and exact device sizing costs two syncs per replay.
@@ -2384,21 +2387,21 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 n_rows = bs * self.num_draft_tokens
                 (
-                    dcp_verify_token_table,
-                    dcp_local_kv_lens,
+                    verify_token_table,
+                    local_kv_lens,
                 ) = self._build_dcp_verify_token_table(
                     kv_indptr,
                     req_pool_indices,
                     bs,
                     self.num_draft_tokens,
                     self._get_dcp_graph_max_local_kv_len(),
-                    out=self.cuda_graph_dcp_verify_token_table[:n_rows],
-                    out_lens=self.cuda_graph_dcp_verify_local_kv_lens[:n_rows],
+                    out=self.cuda_graph_verify_token_table[:n_rows],
+                    out_lens=self.cuda_graph_verify_local_kv_lens[:n_rows],
                 )
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and not verify_dcp:
+                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -2440,8 +2443,8 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
                     planned_dcp_size=planned_dcp_size,
-                    dcp_local_kv_lens=dcp_local_kv_lens,
-                    dcp_verify_token_table=dcp_verify_token_table,
+                    local_kv_lens=local_kv_lens,
+                    verify_token_table=verify_token_table,
                 )
             else:
                 max_q_len = verify_tokens_per_req
@@ -2721,7 +2724,7 @@ class AiterAttnBackend(AttentionBackend):
                         v_scale=v_descale,
                     )
                 elif self.use_mla:
-                    if get_parallel().dcp_enabled:
+                    if self.dcp_world_size > 1:
                         # set_mla_kv_buffer owner-filters AND shards internally, so
                         # pass the RAW loc: pre-dividing applies the filter twice.
                         kv_lora_rank = v.shape[-1]
@@ -2793,7 +2796,7 @@ class AiterAttnBackend(AttentionBackend):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if forward_batch.mha_return_lse:
                     return self._forward_extend_skip_prefix(q, k, v, layer)
-                if get_parallel().dcp_enabled:
+                if self.dcp_world_size > 1:
                     # k/v are the all-gathered full-sequence tensors, so the kv
                     # side is indexed by dcp_kv_indptr rather than qo_indptr. This
                     # is MHA_ONE_SHOT (`layer` is the MHA companion), so moving
