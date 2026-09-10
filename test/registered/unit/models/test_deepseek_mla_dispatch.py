@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.layers.cp import base as cp_base
-from sglang.srt.layers.cp import utils as cp_utils
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
@@ -111,7 +110,6 @@ class TestCPMLADispatch(CustomTestCase):
         )
         with (
             mock.patch.object(abh, "_is_hip", False),
-            mock.patch.object(cp_utils, "enable_cp_v2", return_value=True),
             mock.patch.object(cp_base, "_STRATEGY", ZigzagCPStrategy(cp_size=4)),
         ):
             for prefix in (0, 32):

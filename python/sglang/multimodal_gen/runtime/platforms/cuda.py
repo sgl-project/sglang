@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import import_pynvml
+from sglang.multimodal_gen.third_party import pynvml
 
 logger = init_logger(__name__)
 
@@ -38,11 +38,15 @@ _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.atte
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
-pynvml = import_pynvml()  # type: ignore[no-untyped-call]
-
 # pytorch 2.5 uses cudnn sdpa by default, which will cause crash on some models
 # see https://github.com/huggingface/diffusers/issues/9704 for details
 torch.backends.cuda.enable_cudnn_sdp(False)
+
+
+@lru_cache(maxsize=None)
+def _device_is_integrated(device_index: int) -> bool:
+    # A static device property, asked on every planner cost evaluation.
+    return bool(torch.cuda.get_device_properties(device_index).is_integrated)
 
 
 def device_id_to_physical_device_id(device_id: int) -> int:
@@ -627,6 +631,15 @@ class CudaPlatformBase(Platform):
             free_gpu_memory = float(tensor.item())
 
         return free_gpu_memory / (1 << 30)
+
+    @classmethod
+    def device_shares_host_memory(cls) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        try:
+            return _device_is_integrated(torch.cuda.current_device())
+        except (RuntimeError, AssertionError):
+            return False
 
     @classmethod
     def _resolve_default_attn_backend(cls) -> AttentionBackendEnum:
