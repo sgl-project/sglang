@@ -54,6 +54,11 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.modelopt_fp8_input import (
+    ModelOptFp8Input,
+    ModelOptFp8LinearInput,
+    normalize_and_validate_modelopt_fp8_input,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -547,6 +552,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         # The SM12x facade selects the best qualified small-M FP8 kernel.
         cuda_capability = torch.cuda.get_device_capability() if is_cuda() else None
         self.use_sm120_fp8 = cuda_capability is not None and cuda_capability[0] == 12
+        self._static_fp8_sm89 = cuda_capability == (8, 9)
 
     def create_weights(
         self,
@@ -632,13 +638,50 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             # Marlin uses FP8 weights with unquantized activations.
             del layer.input_scale
 
+    def supports_static_fp8_input(self, layer: torch.nn.Module) -> bool:
+        """Metadata/row-scale capability, not a promise of a specific GEMM.
+
+        AUTO may select a tuned Triton GEMM for a particular token count.
+        Both it and CUTLASS retain apply_fp8_linear's channelwise scale contract.
+        """
+        return (
+            self._static_fp8_sm89
+            and self.cutlass_fp8_supported
+            and not self.use_marlin
+            and not self.use_sm120_fp8
+            and not getattr(layer, "use_flashinfer_bmm", False)
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: ModelOptFp8LinearInput,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Applies FP8 linear transformation."""
+        """Apply FP8 linear to floating-point or prequantized activations."""
+        if isinstance(x, (ModelOptFp8Input, tuple)):
+            if not self.supports_static_fp8_input(layer):
+                raise TypeError(
+                    "Pre-quantized ModelOpt input requires the SM89 channelwise FP8 path"
+                )
+            value = normalize_and_validate_modelopt_fp8_input(x, layer)
+            return apply_fp8_linear(
+                input=value.qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=value.scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                pre_quant_output_dtype=value.orig_dtype,
+                pre_quant_row_scale=value.row_scales,
+            )
+        if isinstance(x, torch.Tensor) and x.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
+            raise TypeError(
+                "A pre-quantized activation requires scalar and dtype metadata"
+            )
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

@@ -1867,6 +1867,7 @@ def apply_fp8_linear(
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
     pre_quant_output_dtype: Optional[torch.dtype] = None,
+    pre_quant_row_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Note: we pad the input because torch._scaled_mm is more performant
     # for matrices with batch dimension > 16.
@@ -1918,7 +1919,16 @@ def apply_fp8_linear(
         qinput = input_2d
         if channelwise_cutlass and not native_scalar_a_scale:
             # Unsupported CUTLASS epilogues require one A scale per row.
-            x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
+            if pre_quant_row_scale is not None:
+                assert pre_quant_row_scale.shape == (input_2d.shape[0], 1)
+                assert pre_quant_row_scale.dtype == torch.float32
+                assert pre_quant_row_scale.device == input_2d.device
+                assert pre_quant_row_scale.is_contiguous()
+                # The fused producer supplies repeats of the original scalar.
+                # Do not materialize a new row-scale tensor or change GEMM dispatch.
+                x_scale = pre_quant_row_scale
+            else:
+                x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
         else:
             x_scale = input_scale
     elif compressed_tensor_quant:

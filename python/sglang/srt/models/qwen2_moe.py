@@ -73,6 +73,7 @@ from sglang.srt.layers.moe.utils import (
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.silu_fp8_fusion import make_silu_fp8_fusion
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -185,6 +186,7 @@ class Qwen2MoeMLP(nn.Module):
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        allow_silu_fp8_quant: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -211,6 +213,9 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self._silu_fp8_fusion = make_silu_fp8_fusion(
+            self.down_proj, allowed=allow_silu_fp8_quant
+        )
         # Set externally (see qwen3_5.py) when both projections are NVFP4 and
         # the FlashInfer fused SiLU+mul+FP4-quant kernel is available. The
         # fused path replaces act_fn + the down_proj input quantization with a
@@ -255,7 +260,13 @@ class Qwen2MoeMLP(nn.Module):
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
-        x = self.act_fn(gate_up)
+        x = (
+            self._silu_fp8_fusion(gate_up)
+            if self._silu_fp8_fusion is not None
+            else None
+        )
+        if x is None:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -271,6 +282,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         is_nextn: bool = False,
         support_shared_expert_fusion: bool = False,
         enable_cuda_shared_expert_fusion: bool = False,
+        allow_silu_fp8_quant: bool = False,
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -369,6 +381,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
+                allow_silu_fp8_quant=allow_silu_fp8_quant and not is_nextn,
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if (

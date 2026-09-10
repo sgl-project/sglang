@@ -1,5 +1,6 @@
 # Adapted from qwen2.py
 import logging
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -316,6 +317,7 @@ class Qwen3DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        allow_silu_fp8_quant: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -353,6 +355,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            allow_silu_fp8_quant=allow_silu_fp8_quant,
         )
 
         norm_kwargs = (
@@ -438,13 +441,16 @@ class Qwen3Model(Qwen2Model):
         config: Qwen3Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        allow_silu_fp8_quant: bool = False,
     ) -> None:
         alt_stream = get_stream("alt") if _is_cuda else None
         super().__init__(
             config=config,
             quant_config=quant_config,
             prefix=prefix,
-            decoder_layer_type=Qwen3DecoderLayer,
+            decoder_layer_type=partial(
+                Qwen3DecoderLayer, allow_silu_fp8_quant=allow_silu_fp8_quant
+            ),
             alt_stream=alt_stream,
         )
 
@@ -480,7 +486,10 @@ class Qwen3ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen3Model(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+            allow_silu_fp8_quant=type(self) is Qwen3ForCausalLM,
         )
 
         # handle the lm head on different pp ranks
