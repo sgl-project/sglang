@@ -52,6 +52,117 @@ logger = logging.getLogger(__name__)
 _OFFLOAD_LOG_EVERY = 1000
 
 
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _engram_gate_kernel(
+    x_ptr,            # [T, HC_MULT, DIM]
+    kv_ptr,           # [T, (HC_MULT + 1) * DIM]
+    qw_ptr,           # [HC_MULT, DIM]
+    kw_ptr,           # [HC_MULT, DIM]
+    out_ptr,          # [T, HC_MULT, DIM]
+    eps,
+    clamp_value,
+    dim_inv_sqrt,
+    DIM,              # runtime value (NOT constexpr) -> dynamic loop on NPU
+    HC_MULT: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    t = pid // HC_MULT
+    hc = pid % HC_MULT
+
+    x_row = t * (HC_MULT * DIM) + hc * DIM
+    k_row = t * ((HC_MULT + 1) * DIM) + hc * DIM
+    v_row = t * ((HC_MULT + 1) * DIM) + HC_MULT * DIM
+    w_row = hc * DIM
+
+    # ---- Pass 1: accumulate three dim-reductions ----
+    sum_h2 = 0.0
+    sum_k2 = 0.0
+    sum_hwk = 0.0
+
+    for d0 in tl.range(0, DIM, BLOCK_DIM):
+        offs = d0 + tl.arange(0, BLOCK_DIM)
+        mask = offs < DIM
+        h = tl.load(x_ptr + x_row + offs, mask=mask, other=0.0).to(tl.float32)
+        k = tl.load(kv_ptr + k_row + offs, mask=mask, other=0.0).to(tl.float32)
+        qw = tl.load(qw_ptr + w_row + offs, mask=mask, other=0.0).to(tl.float32)
+        kw = tl.load(kw_ptr + w_row + offs, mask=mask, other=0.0).to(tl.float32)
+        w = qw * kw
+        sum_h2 += tl.sum(h * h)
+        sum_k2 += tl.sum(k * k)
+        sum_hwk += tl.sum(h * w * k)
+
+    # ---- Gate scalar ----
+    rstd = tl.rsqrt(sum_h2 / DIM + eps) * tl.rsqrt(sum_k2 / DIM + eps)
+    dot = sum_hwk * rstd * dim_inv_sqrt
+
+    s = tl.sqrt(tl.maximum(tl.abs(dot), clamp_value))
+    signed_s = tl.where(dot >= 0, s, -s)
+    signed_s = tl.minimum(tl.maximum(signed_s, -20.0), 20.0)
+    gate = 1.0 / (1.0 + tl.exp(-signed_s))
+
+    # ---- Pass 2: out = h + gate * value ----
+    for d0 in tl.range(0, DIM, BLOCK_DIM):
+        offs = d0 + tl.arange(0, BLOCK_DIM)
+        mask = offs < DIM
+        h = tl.load(x_ptr + x_row + offs, mask=mask, other=0.0).to(tl.float32)
+        v = tl.load(kv_ptr + v_row + offs, mask=mask, other=0.0).to(tl.float32)
+        out = h + gate * v
+        tl.store(out_ptr + x_row + offs, out.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Wrapper -- drop-in replacement for engram.engram_gate
+# ---------------------------------------------------------------------------
+def engram_gate_triton(
+    x: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    clamp_value: float,
+) -> torch.Tensor:
+    """Fused Triton implementation of engram_gate.
+
+    Args:
+        x:         [T, hc_mult, dim]   residual stream (bf16 or fp32)
+        kv:        [T, (hc_mult+1)*dim]  wkv output: keys then shared value
+        q_weight:  [hc_mult, dim]       learnable gate weights
+        k_weight:  [hc_mult, dim]       learnable gate weights
+        eps:       RMS norm epsilon
+        clamp_value: minimum |dot| before sqrt
+
+    Returns:
+        [T, hc_mult, dim]  same dtype as x
+    """
+    T, hc_mult, dim = x.shape
+
+    # Guard against empty input -- a zero-size grid produces coreDim=0 on NPU.
+    if T == 0 or hc_mult == 0:
+        return torch.empty_like(x)
+
+    out = torch.empty_like(x)
+    grid = (T * hc_mult,)
+
+    # NPU-friendly block size: 512 fits Ascend vector units without
+    # triggering coreDim issues that 1024 can cause.
+    BLOCK_DIM = min(triton.next_power_of_2(dim), 512)
+
+    _engram_gate_kernel[grid](
+        x, kv, q_weight, k_weight, out,
+        eps, clamp_value, dim ** -0.5,
+        dim,
+        HC_MULT=hc_mult,
+        BLOCK_DIM=BLOCK_DIM,
+        num_warps=8,
+        num_stages=1,
+    )
+    return out
+
 def _find_next_prime(start: int, seen_primes: set[int]) -> int:
     from sympy import isprime
 
@@ -754,6 +865,8 @@ class Engram(nn.Module):
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
         kv, _ = self.wkv(self.embed(hash_ids, forward_batch).flatten(-2))
-        return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
-        )
+        # return engram_gate(
+        #     x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+        # )
+        # from engram_gate_triton import engram_gate_triton
+        return engram_gate_triton(x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value)
