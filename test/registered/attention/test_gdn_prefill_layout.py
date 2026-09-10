@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.fla.l2norm import (
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
+    fused_qkv_split_l2norm_gdn_prefill,
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
 )
@@ -185,6 +186,71 @@ class TestGdnPrefillLayout(unittest.TestCase):
         torch.testing.assert_close(q_view, q_ref, rtol=0, atol=0)
         torch.testing.assert_close(k_view, k_ref, rtol=0, atol=0)
         torch.testing.assert_close(v_view, v_ref, rtol=0, atol=0)
+
+    def test_fused_split_l2norm_matches_split_then_l2norm(self):
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                _, (mixed_qkv, _, _, _) = self._projection_views(dtype)
+                q_ref, k_ref, v_ref = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    self.NUM_QK_HEADS,
+                    self.NUM_QK_HEADS,
+                    self.NUM_V_HEADS,
+                    self.HEAD_DIM,
+                    self.HEAD_DIM,
+                    self.HEAD_DIM,
+                )
+                q, k, v = fused_qkv_split_l2norm_gdn_prefill(
+                    mixed_qkv,
+                    self.NUM_QK_HEADS,
+                    self.NUM_V_HEADS,
+                    self.HEAD_DIM,
+                    self.HEAD_DIM,
+                )
+
+                self.assertEqual(q.dtype, dtype)
+                self.assertEqual(k.dtype, dtype)
+                torch.testing.assert_close(v, v_ref, rtol=0, atol=0)
+                # Fusing the norm changes the reduction block shape, so Q/K
+                # land within an ulp of the two-launch path rather than on it.
+                torch.testing.assert_close(
+                    q, l2norm_fwd(q_ref), rtol=2e-2, atol=2e-3
+                )
+                torch.testing.assert_close(
+                    k, l2norm_fwd(k_ref), rtol=2e-2, atol=2e-3
+                )
+                for normalized in (q, k):
+                    norms = normalized.float().pow(2).sum(-1).sqrt()
+                    torch.testing.assert_close(
+                        norms, torch.ones_like(norms), rtol=0, atol=5e-3
+                    )
+
+    def test_fused_split_l2norm_qwen35_tp2_shape_and_empty_batch(self):
+        num_qk, num_v, head = 8, 32, 128
+        qkv_dim = 2 * num_qk * head + num_v * head
+        for tokens in (0, 17):
+            with self.subTest(tokens=tokens):
+                qkvz = torch.randn(
+                    tokens,
+                    qkv_dim + num_v * head,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                mixed_qkv = qkvz[:, :qkv_dim]
+                q, k, v = fused_qkv_split_l2norm_gdn_prefill(
+                    mixed_qkv, num_qk, num_v, head, head
+                )
+                self.assertEqual(q.shape, (1, tokens, num_qk, head))
+                self.assertEqual(k.shape, (1, tokens, num_qk, head))
+                self.assertEqual(v.shape, (1, tokens, num_v, head))
+                if tokens == 0:
+                    continue
+                torch.testing.assert_close(
+                    v[0].reshape(tokens, -1),
+                    mixed_qkv[:, 2 * num_qk * head :],
+                    rtol=0,
+                    atol=0,
+                )
 
     def test_qwen35_tp2_ratio4_views_and_empty_batch(self):
         num_qk, num_v, head = 8, 32, 128
