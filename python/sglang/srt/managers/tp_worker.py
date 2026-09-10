@@ -600,6 +600,12 @@ class TpModelWorker(BaseTpWorker):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
+        if batch is not None and get_exec().features.enable_encoder_swa_bounded_replay:
+            from sglang.srt.model_executor.encoder_swa_replay import (
+                run_encoder_swa_replay,
+            )
+
+            run_encoder_swa_replay(self, batch)
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch

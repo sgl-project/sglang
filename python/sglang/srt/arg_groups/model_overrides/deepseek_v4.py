@@ -13,21 +13,37 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 
 
 @_register_for("DeepseekV4ForCausalLM")
 def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
-    """DeepSeek V4 attention/page/window/MoE-runner defaults (from
-    arg_groups/deepseek_v4_hook.py). The kv-cache dtype and NPU split-backend
-    writes, the max_running_requests fill and the validations stay in the
-    hook at its legacy slot."""
+    """Attention, page and MoE defaults; KV-cache dtype, NPU split-backend setup,
+    request limits and validation remain in deepseek_v4_hook.
+    """
     cfg = resolving_view(server_args)
-    from sglang.srt.server_args import ServerArgs
 
     model_arch = hf_config.architectures[0]
     overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
+
+    # MXFP8 serves this checkpoint's 32-wide ue8m0 blocks on SM100/SM103;
+    # explicit backend choices, including Triton, take precedence.
+    quant = getattr(hf_config, "quantization_config", None) or {}
+    if (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and cfg.device == "cuda"
+        and not get_platform().is_hip
+        and get_platform().is_sm100
+        and cfg.fp8_gemm_runner_backend == "auto"
+        and quant.get("quant_method") == "fp8"
+        and quant.get("weight_block_size") == [32, 32]
+        and quant.get("scale_fmt") == "ue8m0"
+        and is_flashinfer_available()
+    ):
+        overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
+        logger.info("Use flashinfer_cutedsl for DeepSeek-V4.1 MXFP8 dense GEMMs.")
 
     page_size = 256
     if cfg.device == "npu":
@@ -43,10 +59,6 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     logger.info(
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
     )
-
-    if cfg.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
-        overrides["swa_full_tokens_ratio"] = 0.1
-        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
     if cfg.moe_runner_backend == "auto":
         model_config = model_config_of(server_args)

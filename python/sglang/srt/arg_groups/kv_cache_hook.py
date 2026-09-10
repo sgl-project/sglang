@@ -191,6 +191,9 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # the user input before it ever takes effect.
     if not (0 < resolved_view(server_args).swa_full_tokens_ratio <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+    prefix_tails = resolved_view(server_args).swa_prefix_tails
+    if prefix_tails is not None and prefix_tails < 0:
+        raise ValueError("--swa-prefix-tails should be a non-negative integer.")
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:

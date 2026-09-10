@@ -282,6 +282,10 @@ class TinyDSV4ModelConfig:
             index_topk=DSV4_INDEX_TOPK,
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
+            # Ratio 1/2 layers are their own kv_source (one-layer fixtures).
+            kv_source_layer_ids=[
+                i for i, ratio in enumerate(compression_ratios) if ratio in (1, 2)
+            ],
         )
         self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
@@ -411,6 +415,10 @@ class MockDSV4ModelRunner:
             device=device,
             enable_memory_saver=False,
             compression_ratios=list(compression_ratios),
+            kv_source_layers=model_config.hf_config.kv_source_layer_ids,
+            # Full locs are the identity-mapped SWA locs below, so the c1/c2
+            # latent pools (slot = loc // ratio) only need to span swa_size.
+            full_size=swa_size,
         )
         # Register identity full->swa mapping over swa_size full locs.
         identity = torch.arange(swa_size, dtype=torch.int64, device=device)
@@ -1106,20 +1114,22 @@ def prepare_dsv4_runner_inputs(
     # reference needs to build that metadata itself. Stash the current batch
     # so `_pure_torch_dsv4_combined_reference` knows which one to use.
     fixture._current_batch = batch  # type: ignore[attr-defined]
-    if case.compress_ratio in (4, 128):
+    if case.compress_ratio in (1, 2, 4, 128):
         _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
 
 
 def _seed_c4_if_needed(
-    fixture: DSV4AttentionFixture, *, num_entries: int = _DSV4_EXTRA_ENTRIES
+    fixture: DSV4AttentionFixture, *, num_entries: int | None = None
 ) -> None:
     """For compress_ratio=4, seed the C4 metadata the exercised path consumes
     (the C4Indexer would normally populate it; the compact fixture skips the
     indexer): `c4_sparse_page_indices` for the dense extend path,
     `c4_sparse_raw_indices` for sparse prefill. No-op for other compress_ratios.
     """
-    if fixture.case.compress_ratio != 4:
+    if fixture.case.compress_ratio not in (1, 2, 4):
         return
+    if num_entries is None:
+        num_entries = getattr(fixture, "extra_entries", _DSV4_EXTRA_ENTRIES)
     if fixture.seed_c4_for_sparse_prefill:
         _seed_c4_sparse_prefill_indices(fixture, num_entries=num_entries)
     else:
@@ -1138,7 +1148,7 @@ def run_dsv4_fixture_eager(fixture: DSV4AttentionFixture) -> torch.Tensor:
     full_kv_locs_per_req = _populate_swa_kv_cache(
         fixture, max_context_len=max_context_len, device=runner.device
     )
-    if case.compress_ratio in (4, 128):
+    if case.compress_ratio in (1, 2, 4, 128):
         _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
@@ -1202,7 +1212,7 @@ def expected_dsv4_output_from_inputs(
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
     q_input, _ = fixture.actual_module.project(inputs["input_hidden"])
-    if case.compress_ratio in (4, 128):
+    if case.compress_ratio in (1, 2, 4, 128):
         return _pure_torch_dsv4_combined_reference(fixture, q_input).float()
     full_kv_locs_per_req = _full_kv_locs_per_req(
         case, max_context_len=max_context_len, device=runner.device
@@ -1256,10 +1266,10 @@ def _extra_metadata_indices(
     the upgraded `DSV4AttnMetadata`. Mirrors the dispatch in
     `DeepseekV4AttnBackend.forward(compress_ratio=...)`.
     """
-    if compress_ratio == 4:
+    if compress_ratio in (1, 2, 4):
         return (
-            core_metadata.c4_sparse_page_indices,
-            core_metadata.c4_sparse_topk_lengths,
+            core_metadata.sparse_page_indices(compress_ratio),
+            core_metadata.sparse_topk_lengths(compress_ratio),
         )
     if compress_ratio == 128:
         return core_metadata.c128_page_indices, core_metadata.c128_topk_lengths_clamp1
@@ -1323,7 +1333,7 @@ def _pure_torch_dsv4_combined_reference(
     swa_indices = md.swa_page_indices  # [num_q, padded_window], full-pool locs
     swa_topk_lengths = md.swa_topk_lengths  # [num_q]
 
-    if case.compress_ratio in (4, 128):
+    if case.compress_ratio in (1, 2, 4, 128):
         extra_indices, extra_topk_lengths = _extra_metadata_indices(
             md, case.compress_ratio
         )
@@ -1401,7 +1411,8 @@ def _seed_c4_sparse_indices(
     non-trivial extra contribution.
     """
     md = fixture.backend.forward_metadata.core_metadata
-    sparse_indices = md.c4_sparse_page_indices
+    ratio = fixture.case.compress_ratio
+    sparse_indices = md.sparse_page_indices(ratio)
     num_q, sparse_topk = sparse_indices.shape
     seed = torch.full(
         (num_q, sparse_topk),
@@ -1412,12 +1423,12 @@ def _seed_c4_sparse_indices(
     seed[:, :num_entries] = torch.arange(
         num_entries, dtype=sparse_indices.dtype, device=sparse_indices.device
     )
-    md.c4_sparse_page_indices = seed
-    md.c4_sparse_topk_lengths = torch.full(
-        (num_q,),
-        num_entries,
-        dtype=md.c4_sparse_topk_lengths.dtype,
-        device=md.c4_sparse_topk_lengths.device,
+    lengths = md.sparse_topk_lengths(ratio)
+    setattr(md, f"c{ratio}_sparse_page_indices", seed)
+    setattr(
+        md,
+        f"c{ratio}_sparse_topk_lengths",
+        torch.full((num_q,), num_entries, dtype=lengths.dtype, device=lengths.device),
     )
 
 
@@ -1438,15 +1449,16 @@ def _seed_c4_sparse_prefill_indices(
     asserted below.
     """
     md = fixture.backend.forward_metadata.core_metadata
-    raw_indices = md.c4_sparse_raw_indices
+    ratio = fixture.case.compress_ratio
+    raw_indices = md.sparse_raw_indices(ratio)
     assert raw_indices is not None, "requires init_flashmla_related(is_prefill=True)"
     num_q, width = raw_indices.shape
-    lens = (md.positions_casual + 1) // 4
+    lens = (md.positions_casual + 1) // ratio
     max_len = int(lens.max().item())
     pool = fixture.runner.token_to_kv_pool
-    c4_page_size = pool.get_extra_key_page_size(layer_id=0)
-    assert max_len <= min(num_entries, c4_page_size), (
-        f"case attends {max_len} c4 entries; only {min(num_entries, c4_page_size)} populated"
+    c_page_size = pool.get_extra_key_page_size(layer_id=0)
+    assert max_len <= min(num_entries, c_page_size), (
+        f"case attends {max_len} c{ratio} entries; only {min(num_entries, c_page_size)} populated"
     )
     assert (md.page_table[:, 0] == 0).all(), (
         "sparse seeding requires the raw==physical identity (first page 0)"
@@ -1457,9 +1469,10 @@ def _seed_c4_sparse_prefill_indices(
         .expand(num_q, -1)
     )
     seeded = torch.where(seq < lens.unsqueeze(1), seq, seq.new_full((), -1))
-    md.c4_sparse_raw_indices = seeded
-    md.c4_sparse_page_indices = seeded.clone()
-    md.c4_sparse_topk_lengths = lens.to(md.c4_sparse_topk_lengths.dtype)
+    lengths = md.sparse_topk_lengths(ratio)
+    setattr(md, f"c{ratio}_sparse_raw_indices", seeded)
+    setattr(md, f"c{ratio}_sparse_page_indices", seeded.clone())
+    setattr(md, f"c{ratio}_sparse_topk_lengths", lens.to(lengths.dtype))
 
 
 def run_dsv4_target_verify_attention_case(
@@ -1501,7 +1514,7 @@ def run_dsv4_target_verify_attention_case(
     testcase.assertEqual(fixture.backend.max_context_len, max_context_len)
 
     _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
-    if case.compress_ratio in (4, 128):
+    if case.compress_ratio in (1, 2, 4, 128):
         _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
 
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
@@ -1627,12 +1640,16 @@ def run_dsv4_compress_attention_case(
     dense `flash_mla_with_kvcache` extend path or `_forward_prefill_sparse`;
     the C4 seeding dispatches on the same flag.
     """
-    assert case.compress_ratio in (
-        4,
-        128,
-    ), (
-        f"DSV4 compact runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
+    assert case.compress_ratio in (1, 2, 4, 128), (
+        f"DSV4 compact runner requires compress_ratio in (1, 2, 4, 128); "
+        f"got {case.compress_ratio}"
     )
+    # The sparse-prefill seeding attends (pos + 1) // ratio entries per query, so
+    # the low ratios need more populated entries than the default 32.
+    if case.compress_ratio in (1, 2):
+        extra_entries = max(
+            extra_entries, max(case.seq_lens) // case.compress_ratio + 1
+        )
     if sparse_prefill:
         assert case.forward_mode.is_extend_without_speculative(), (
             f"sparse prefill only serves extend; got {case.forward_mode}"
@@ -1645,6 +1662,7 @@ def run_dsv4_compress_attention_case(
         compression_ratios=[case.compress_ratio],
     )
     fixture.seed_c4_for_sparse_prefill = sparse_prefill
+    fixture.extra_entries = extra_entries  # type: ignore[attr-defined]
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
 

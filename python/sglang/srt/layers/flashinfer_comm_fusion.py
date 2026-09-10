@@ -922,6 +922,15 @@ def can_use_flashinfer_allreduce(
     # Dynamo, so statically-off configs must short-circuit before reaching them
     # (same ordering rule as apply_flashinfer_allreduce_fusion).
     token_num, hidden_dim = input_.shape
+
+    # MNNVL requires float4-aligned widths and hard-fails instead of falling back
+    # (FlashInfer csrc/trtllm_mnnvl_allreduce.cu). Shape and dtype are rank-invariant.
+    if (
+        workspace_manager.backend == "mnnvl"
+        and hidden_dim % (16 // input_.element_size()) != 0
+    ):
+        return False
+
     if torch.compiler.is_compiling():
         # Don't call into the flashinfer workspace object while tracing. The
         # workspace was allocated for (max_token_num, hidden_dim, dtype) and

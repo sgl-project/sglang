@@ -7,6 +7,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_schedule,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip
@@ -524,6 +525,7 @@ class PrefillAdder:
         self.log_storage_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
+        self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
 
         if running_batch is not None:
@@ -876,6 +878,14 @@ class PrefillAdder:
             self.reprocessed_log_input_tokens += extend_input_len
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
+        if get_exec().features.enable_encoder_swa_bounded_replay and (
+            req.kv.req_pool_idx is None or req.is_retracted
+        ):
+            replay_tokens = min(prefix_len, 128)
+            self.log_replay_tokens += replay_tokens
+            self.rem_input_tokens -= replay_tokens
+            if self.rem_chunk_tokens is not None:
+                self.rem_chunk_tokens -= replay_tokens
         if req.retracted_stain:
             # Retraction attribution is intentionally omitted for now; discard
             # its lifecycle state so a later abort cannot report it as a drop.

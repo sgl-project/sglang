@@ -304,8 +304,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         self._verify_epilogue = None
+        static_epilogue_supported = (
+            self._verify_planner.mode_value == "static"
+            and self._draft_is_moe
+            and not get_parallel().enable_dp_attention
+            and self.ps.pp_size == 1
+        )
         if (
-            self._verify_planner.is_compact_mode
+            (self._verify_planner.is_compact_mode or static_epilogue_supported)
             and self._decode_graph_allowed
             and is_cuda()
         ):
@@ -321,6 +327,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     resolve_req_to_token=lambda: (
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
+                    kv_injector=self._kv_injector,
                 ),
             )
             self.model_runner.capture_tail_hooks.append(
@@ -590,9 +597,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos = torch.repeat_interleave(
                 (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
             )
+        cache_loc = batch.out_cache_loc
+        token_indices = logits_output.hidden_states_token_indices
+        if token_indices is not None:
+            cache_loc = cache_loc[token_indices]
+            positions = positions[token_indices]
+            if state_slot is not None:
+                state_slot = state_slot[token_indices]
+                final_pos = final_pos[token_indices]
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
-            cache_loc=batch.out_cache_loc,
+            cache_loc=cache_loc,
             positions=positions,
             state_slot=state_slot,
             final_pos=final_pos,
@@ -600,6 +615,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+        logits_output.hidden_states_token_indices = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -780,6 +796,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     inject_gate=fold_eligible,
                 )
             else:
+                if (
+                    self._verify_epilogue is not None
+                    and self._verify_planner.mode_value == "static"
+                ):
+                    self._verify_epilogue.begin_static_step(bs, fold_eligible)
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
                     draft_input=draft_input,
@@ -804,7 +825,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 grammar_mask.apply(logits_output.next_token_logits)
 
         epilogue = self._verify_executor.verify_epilogue
-        folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        folded_accept = (
+            fold_eligible
+            and can_run_cuda_graph
+            and (run_compact or self._verify_planner.mode_value == "static")
+        )
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
@@ -816,6 +841,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        self.model_runner.ngram_embedding_manager.update_after_verify(
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=batch.req_pool_indices,
+            commit_lens=accept.commit_lens,
         )
         if batch.return_logprob:
             compute_spec_logprobs(

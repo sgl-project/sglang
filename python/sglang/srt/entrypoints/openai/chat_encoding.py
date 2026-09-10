@@ -10,9 +10,9 @@ from __future__ import annotations
 import ast
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from sglang.srt.entrypoints.openai import encoding_dsv4
+from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv41
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,13 @@ def resolve_dsv4_reasoning_effort_profile(
     )
 
 
+def is_deepseek_v41_config(*, arch: str, model_type: str) -> bool:
+    """Check model_type before matching the DeepseekV4 architecture substring;
+    V4.1 configs can also use the V4 architecture name.
+    """
+    return model_type == "deepseek_v41" or "DeepseekV41" in arch
+
+
 def resolve_chat_encoding_spec(
     *,
     hf_config: Any,
@@ -116,6 +123,8 @@ def resolve_chat_encoding_spec(
     None means the default path (HF chat template); any non-None spec also owns
     reasoning-history rendering (:func:`spec_owns_reasoning_history`).
     """
+    if tool_call_parser == "deepseekv41":
+        return "dsv41"
     if tool_call_parser == "deepseekv4":
         return "dsv4"
     if tool_call_parser == "deepseekv32":
@@ -126,6 +135,8 @@ def resolve_chat_encoding_spec(
     architectures = hf_config.architectures
     arch = architectures[0] if architectures else ""
 
+    if is_deepseek_v41_config(arch=arch, model_type=hf_config.model_type):
+        return "dsv41"
     if "DeepseekV4" in arch:
         return "dsv4"
     if "KimiK3" in arch:
@@ -141,6 +152,55 @@ def resolve_chat_encoding_spec(
     if "DeepseekV3" in arch and not has_chat_template:
         return "dsv32"
     return None
+
+
+def resolve_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
+    """Map an API ``reasoning_effort`` onto what the V4.1 encoder accepts.
+
+    Tiers pass through; an OpenAI float in [0, 0.99] becomes a 1-100 budget;
+    an int budget (only reachable via ``chat_template_kwargs``) passes through
+    when in range. None means unsupported and the caller applies its default.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= 100 else None
+    if isinstance(value, float):
+        return min(100, max(1, round(value * 100)))
+    if value in encoding_dsv41.REASONING_EFFORT_MAPPINGS:
+        return value
+    return None
+
+
+_OPENAI_FUNCTION_FIELD_ORDER = ("name", "description", "parameters")
+
+
+def dsv41_tool_payload(tool: Any) -> Dict[str, Any]:
+    """The tool dict the V4.1 encoder renders verbatim into the prompt.
+
+    Only fields the client sent, in the OpenAI field order; pydantic would
+    otherwise add defaults (strict=false) and reorder keys by declaration.
+    """
+    payload = tool.model_dump(exclude_unset=True, exclude_none=True)
+    function = dict(payload.get("function") or {})
+    ordered = {
+        k: function.pop(k) for k in _OPENAI_FUNCTION_FIELD_ORDER if k in function
+    }
+    ordered.update(function)
+    payload["function"] = ordered
+    return payload
+
+
+def default_dsv41_reasoning_effort_from_env(raw: str) -> Union[str, int]:
+    """Parse ``SGLANG_DSV41_REASONING_EFFORT``; raises so a bad value fails at boot."""
+    value: Any = int(raw) if raw.strip().isdigit() else raw.strip()
+    effort = resolve_dsv41_reasoning_effort(value)
+    if effort is None:
+        raise ValueError(
+            f"Invalid SGLANG_DSV41_REASONING_EFFORT={raw!r}; expected one of "
+            f"{list(encoding_dsv41.REASONING_EFFORT_MAPPINGS)} or an integer in [1, 100]"
+        )
+    return effort
 
 
 def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
@@ -168,11 +228,9 @@ def encode_simple_chat(
 
     Minimal encode for offline tools: no tools, no multimodal content, no
     continue_final_message; the serving path keeps its full request-level
-    pipeline in ``serving_chat``. Like
-    ``serving_chat``, an empty system message is prepended when the
-    conversation does not start with one (for the dsv4/dsv32 encoders this
-    currently renders to zero tokens, but keeping the insertion explicit ties
-    this helper to the serving semantics rather than to that coincidence).
+    pipeline in ``serving_chat``. System-message handling matches
+    ``serving_chat``: dsv4/dsv32 get an empty one prepended, dsv41 does not
+    (it renders a system token even for empty content).
     """
     if spec == "inkling":
         from sglang.srt.parser.inkling_renderer import render_inkling_messages
@@ -184,13 +242,17 @@ def encode_simple_chat(
             add_generation_prompt=False,
         )
 
-    if spec in ("dsv4", "dsv32"):
-        if messages and messages[0]["role"] != "system":
+    if spec in ("dsv4", "dsv32", "dsv41"):
+        if spec != "dsv41" and messages and messages[0]["role"] != "system":
             messages = [{"role": "system", "content": ""}] + list(messages)
         if spec == "dsv4":
             from sglang.srt.entrypoints.openai import encoding_dsv4
 
             real_input = encoding_dsv4.encode_messages(
+                messages, thinking_mode=thinking_mode
+            )
+        elif spec == "dsv41":
+            real_input = encoding_dsv41.encode_messages(
                 messages, thinking_mode=thinking_mode
             )
         else:

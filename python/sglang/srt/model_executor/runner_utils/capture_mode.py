@@ -37,11 +37,8 @@ is_capture_mode = False
 # None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
 _capture_lora_variant: Optional[str] = None
 
-# When capturing dual DSA decode graphs (dense/sparse), tracks which variant is
-# being captured. Read by the DSA indexer's capture-time skip-logits branch to
-# force k-only ("dense") vs full indexer ("sparse").
-# None = not dual-capturing; the indexer then bakes in the full-indexer path,
-# which is correct for any kv_len.
+# Capture-time indexer variant for DSA and V4.1; None records the full path.
+# V4.1 variants can bypass scoring or candidate filtering for short histories.
 _capture_dsa_variant: Optional[str] = None
 
 
@@ -73,9 +70,15 @@ def _set_capture_lora_variant(variant: Optional[str]) -> None:
 
 
 def get_capture_dsa_variant() -> Optional[str]:
-    """Return the DSA decode variant being captured ("dense"/"sparse"), or None
-    when dual-variant capture is not active."""
+    """Return the indexer or candidate-filter variant being captured, or None."""
     return _capture_dsa_variant
+
+
+def skip_low_ratio_indexer(compress_ratio: int) -> bool:
+    """Whether this captured variant selects every position for this ratio."""
+    return _capture_dsa_variant == "candidate_all" or (
+        _capture_dsa_variant == "candidate_c2_all" and compress_ratio == 2
+    )
 
 
 def _set_capture_dsa_variant(variant: Optional[str]) -> None:

@@ -347,8 +347,12 @@ def handle_model_specific_adjustments(server_args: Any):
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v4_cp,
             validate_deepseek_v4_mega_moe_token_budget,
+            validate_deepseek_v41_features,
         )
 
+        # Ahead of the CP validation: DeepSeek-V4.1 rejects CP outright, and
+        # that message is the actionable one.
+        validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 

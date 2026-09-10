@@ -1378,6 +1378,9 @@ class Envs:
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
+    # low/high/xhigh/max or an integer budget in [1, 100].
+    SGLANG_DSV41_REASONING_EFFORT = EnvStr("high")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
@@ -1397,6 +1400,28 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
+    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
+    # rows from the GPU instead of sharding them over HBM.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
+    SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
+    # Pin and map the host table with cudaHostRegister. False leaves the plain
+    # mapping to the platform (Grace-Blackwell ATS reaches it directly).
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
+    # How the host table is laid out: "shared" is one memfd copy for the TP group
+    # with no all-reduce; "private" is one anonymous mapping per rank holding its
+    # row range, gathered with the all-reduce. "auto" picks shared when shmem THP
+    # (transparent_hugepage/shmem_enabled) is on, else private when anonymous THP
+    # is on, else shared without huge pages.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("auto")
+    # With the host table on, drop the checkpoint's page cache (posix_fadvise
+    # DONTNEED on the safetensors) before pre-faulting the table and again after
+    # loading: cached checkpoint pages fragment host memory and starve the 512 MiB
+    # huge-page faults. Costs the next restart its warm page cache.
+    SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

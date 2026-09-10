@@ -701,6 +701,50 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
+def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -> int:
+    """Worst-case SWA slots the scheduler holds live at max_running_requests.
+
+    Per request: the trailing window the eviction interval lets grow past it,
+    plus what the next decode step allocates. On top of that the prefill chunks
+    in flight, or on a PD decode rank the pre-allocated extra slots.
+    """
+    draft_tokens = get_spec().speculative_num_draft_tokens or 1
+    eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+
+    # __________[padding][eviction_interval][window]
+    # Padding to make sure eviction point is page-aligned.
+    trailing_tokens = window + eviction_interval * draft_tokens + page_size
+    if get_spec().speculative_algorithm is None:
+        decode_alloc = page_size
+    elif get_schedule().disable_overlap_schedule:
+        # spec-v1: new_tokens_required_next_decode per request.
+        decode_alloc = spec_decode_alloc_len_per_request(
+            page_size=page_size,
+            speculative_num_steps=get_spec().speculative_num_steps,
+            speculative_eagle_topk=get_spec().speculative_eagle_topk,
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+        )
+    else:
+        # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
+        # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
+        decode_alloc = 2 * get_alloc_len_per_decode()
+    per_request = trailing_tokens + decode_alloc
+
+    num_reqs = get_schedule().max_running_requests // attn_dp_size
+    if get_disagg().disaggregation_mode == "decode":
+        return (
+            per_request * num_reqs
+            + (window + page_size) * get_disagg().disaggregation_decode_extra_slots
+        )
+    else:
+        chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
+        return (
+            per_request * num_reqs
+            + chunks_in_flight * get_schedule().chunked_prefill_size
+            + page_size
+        )
+
+
 class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     """Hybrid SWA configurator with the SWA pool sized from a fixed token cap.
 
@@ -715,45 +759,11 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         super().__init__(kvc)
         assert self._full_layers_num > 0
 
-        page_size = kvc.page_size
-        window = kvc.sliding_window_size
-        draft_tokens = get_spec().speculative_num_draft_tokens or 1
-        eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-
-        """
-        __________[padding][eviction_interval][window]
-        Padding to make sure eviction point is page-aligned.
-        """
-        trailing_tokens = window + eviction_interval * draft_tokens + page_size
-        if get_spec().speculative_algorithm is None:
-            decode_alloc = page_size
-        elif get_schedule().disable_overlap_schedule:
-            # spec-v1: new_tokens_required_next_decode per request.
-            decode_alloc = spec_decode_alloc_len_per_request(
-                page_size=page_size,
-                speculative_num_steps=get_spec().speculative_num_steps,
-                speculative_eagle_topk=get_spec().speculative_eagle_topk,
-                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
-            )
-        else:
-            # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
-            # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-            decode_alloc = 2 * get_alloc_len_per_decode()
-        per_request = trailing_tokens + decode_alloc
-
-        num_reqs = get_schedule().max_running_requests // kvc.ps.attn_dp_size
-        if get_disagg().disaggregation_mode == "decode":
-            self._swa_cap = (
-                per_request * num_reqs
-                + (window + page_size) * get_disagg().disaggregation_decode_extra_slots
-            )
-        else:
-            chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
-            self._swa_cap = (
-                per_request * num_reqs
-                + chunks_in_flight * get_schedule().chunked_prefill_size
-                + page_size
-            )
+        self._swa_cap = compute_swa_request_cap(
+            page_size=kvc.page_size,
+            window=kvc.sliding_window_size,
+            attn_dp_size=kvc.ps.attn_dp_size,
+        )
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
@@ -818,6 +828,19 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         )
 
 
+# Applied when the operator left --swa-full-tokens-ratio at the CLI default and
+# the request cap is not usable; cap mode governs whenever it is.
+DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
+
+
+def _operator_swa_full_tokens_ratio() -> Optional[float]:
+    """The operator's --swa-full-tokens-ratio, or None if it is still the default."""
+    from sglang.srt.server_args import ServerArgs
+
+    ratio = get_schedule().swa_full_tokens_ratio
+    return None if ratio == ServerArgs.swa_full_tokens_ratio else ratio
+
+
 @dataclass
 class _DSV4PoolSizes:
     full_max_total_num_tokens: int
@@ -842,6 +865,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # One FlashMLA-layout latent slot, in bytes.
+        self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
         # HIP takes the FP4-accurate byte count here. The NVIDIA FP4 path
         # keeps the FP8 estimate.
         self.indexer_bytes_per_token = get_dsv4_indexer_bytes_per_token(
@@ -860,9 +886,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
-        self.swa_ratio = get_schedule().swa_full_tokens_ratio
+        self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
+        self.swa_ratio = (
+            self.operator_swa_ratio
+            if self.operator_swa_ratio is not None
+            else DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO
+        )
+        self.sliding_window_size = kvc.sliding_window_size
+        self.page_size = kvc.page_size
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
+        self.attn_dp_size = kvc.ps.attn_dp_size
         self.requested_max_running_requests_per_worker = (
             get_schedule().max_running_requests // kvc.ps.attn_dp_size
             if get_schedule().max_running_requests is not None
@@ -888,6 +922,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        # Ratio 1/2 kv_source layers keep one FlashMLA-layout latent and one packed
+        # index key per compressed position. The low-ratio indexer pools are built
+        # with force_fp4=True (deepseek_v4_memory_pool._init_low_ratio_pools), so
+        # they are fp4 whatever dtype the c4 indexer runs at.
+        low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
+            self.indexer_head_dim, use_fp4_indexer=True
+        )
+        self.low_ratio_bytes_per_full_token = sum(
+            (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[l]
+            for l in cfg.hf_config.kv_source_layer_ids
+            if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+            and cfg.compress_ratios[l] in (1, 2)
+        )
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -895,6 +942,36 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 max_speculative_num_draft_tokens() or 0
             )
 
+        from sglang.srt.runtime_context import get_exec
+
+        self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
+        self.request_window_bytes = 0
+        if self.encoder_replay:
+            slots = self.requested_max_running_requests_per_worker + 1
+            capacity = ceil_align(
+                self.sliding_window_size + self.online_c128_mtp_max_draft_tokens,
+                self.page_size,
+            )
+            layers = self.num_layers_total
+            scratch = (
+                max(
+                    get_schedule().chunked_prefill_size,
+                    slots * max(128, self.online_c128_mtp_max_draft_tokens),
+                )
+                + slots * 128
+                + self.page_size
+            )
+            self.request_window_bytes = (
+                (slots * capacity + self.page_size) * layers * (self.kv_bytes + 16)
+                + 4 * scratch * (self.kv_bytes + 16)
+                + slots * 3 * 16 * self.attn_head_dim * 8
+            )
+            self.swa_ratio = 0
+        self.swa_prefix_tails = self._resolve_swa_prefix_tails()
+        self.swa_cap_tokens = (
+            0 if self.encoder_replay else self._resolve_swa_cap_tokens()
+        )
+        self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
             # Reserve memory for the speculative draft worker by inflating
@@ -903,7 +980,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
             draft_layers = 1
             target_layers = self.num_layers_total
-            self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
+            draft_scale = (target_layers + draft_layers) / target_layers
+            self.bytes_per_full_token *= draft_scale
+            self.bytes_per_swa_token *= draft_scale
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
@@ -955,46 +1034,124 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"get_compress_state_ring_size()."
             )
 
-    def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+    def _resolve_swa_prefix_tails(self) -> int:
+        """Cached prefix tails cap mode keeps addressable in the SWA pool.
 
-        attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        c4_state_dtype_size, c128_state_dtype_size = (
-            _get_dsv4_compress_state_dtype_sizes()
+        A radix-cached prefix is reusable only while its last sliding_window
+        tokens still hold SWA slots, so SWA capacity bounds how many cached
+        prefixes stay hot. --swa-prefix-tails overrides the count.
+        """
+        prefix_tails = get_schedule().swa_prefix_tails
+        if prefix_tails is not None:
+            return prefix_tails
+        if get_memory().disable_radix_cache:
+            # Nothing is kept for reuse, so the request cap alone bounds the pool.
+            return 0
+        max_running_requests = self.requested_max_running_requests_per_worker
+        return 4 * max_running_requests if max_running_requests is not None else 0
+
+    def _resolve_swa_cap_tokens(self) -> Optional[int]:
+        """SWA slots to reserve in cap mode, or None to keep ratio sizing.
+
+        Cap mode replaces "swa_tokens = full_tokens * ratio" with a request-cap
+        budget plus radix headroom, so the SWA pool stops growing with the KV
+        budget. An explicit --swa-full-tokens-ratio opts back into ratio sizing.
+        """
+        if self.operator_swa_ratio is not None:
+            return None
+        max_running_requests = self.requested_max_running_requests_per_worker
+        if max_running_requests is None or self.sliding_window_size is None:
+            return None
+        chunked_prefill_size = get_schedule().chunked_prefill_size
+        if self.disaggregation_mode != "decode" and (
+            chunked_prefill_size is None or chunked_prefill_size <= 0
+        ):
+            return None
+
+        cap = compute_swa_request_cap(
+            page_size=self.page_size,
+            window=self.sliding_window_size,
+            attn_dp_size=self.attn_dp_size,
         )
-        c4_state_bytes = 2 * 2 * attn_head_dim * c4_state_dtype_size
+        headroom = self.swa_prefix_tails * (self.sliding_window_size + self.page_size)
+        return ceil_align(cap + headroom, self.page_size)
+
+    def _get_bytes_per_swa_token(self) -> float:
+        """Bytes one SWA slot costs across the whole stage.
+
+        The c4 compress state follows swa_tokens (c4_state_pool_size =
+        swa_tokens / swa_page_size * ring), so it is priced per SWA slot too.
+        """
+        c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
+        c4_state_bytes = 2 * 2 * self.attn_head_dim * c4_state_dtype_size
+        c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
+
+        c4_state_ratio = self.c4_ring_size / self.swa_page_size
+        return (
+            self.kv_bytes * self.num_layers_total
+            + c4_state_ratio
+            * (c4_state_bytes + c4_indexer_state_bytes)
+            * self.num_layers_ca4
+        )
+
+    def _get_bytes_per_full_token(self) -> float:
+        _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
         # Online c128 stores (max, sum, kv) per slot (3*head_dim) instead of
         # raw (kv, score) (2*head_dim). Combined with ring_size=1 this still
         # nets a large reduction (~3/256x) but the per-slot bytes go up.
         c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
         c128_state_bytes = (
-            (3 if c128_online else 2 * 1) * attn_head_dim * c128_state_dtype_size
+            (3 if c128_online else 2 * 1) * self.attn_head_dim * c128_state_dtype_size
         )
-        c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
-        c4_state_ratio = self.c4_ring_size / self.swa_page_size
         # C128 state is request-scoped and is finalized after
         # max_running_requests is known, so it should not scale with
         # full-token capacity here.
         c128_state_ratio = 0
+        # Cap mode holds swa_tokens fixed, so the SWA pool and the c4 state that
+        # follows it become bias bytes (_get_swa_fixed_bytes) instead of coeff.
+        swa_ratio = 0 if self.swa_cap_tokens is not None else self.swa_ratio
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
+            swa_ratio * self.bytes_per_swa_token
+            + self.low_ratio_bytes_per_full_token
+            + c4_frac * self.kv_bytes * self.num_layers_ca4
+            + 1 / 128 * self.kv_bytes * self.num_layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
-            + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
-            + self.swa_ratio
-            * c4_state_ratio
-            * c4_indexer_state_bytes
-            * self.num_layers_ca4
         )
+
+    def _get_swa_fixed_bytes(self) -> float:
+        """Bias bytes the SWA pool takes in cap mode; 0 when sizing by ratio."""
+        if self.encoder_replay:
+            return self.request_window_bytes
+        if self.swa_cap_tokens is None:
+            return 0
+        return self.swa_cap_tokens * self.bytes_per_swa_token
+
+    def _get_swa_tokens(self, full_token: int, page_size: int) -> int:
+        # swa_cap_tokens was page-aligned at resolve time; page_size here is the
+        # same get_schedule().page_size that self.page_size holds.
+        if self.swa_cap_tokens is None:
+            return int(full_token * self.swa_ratio) // page_size * page_size
+        return self.swa_cap_tokens
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
-        swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        swa_tokens = self._get_swa_tokens(full_token, page_size)
+        if self.swa_cap_tokens is None:
+            source = "explicit" if self.operator_swa_ratio is not None else "default"
+            logger.info(
+                f"DSV4 SWA sizing: mode=ratio ({source}), swa_tokens={swa_tokens}, "
+                f"swa_full_tokens_ratio={self.swa_ratio}"
+            )
+        else:
+            logger.info(
+                f"DSV4 SWA sizing: mode=cap, swa_tokens={swa_tokens}, "
+                f"request_cap+headroom={self.swa_cap_tokens}, "
+                f"prefix_tails={self.swa_prefix_tails}"
+            )
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
@@ -1014,18 +1171,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             return 0
 
         _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
-        attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         num_req_slots = self._get_num_req_slots(max_running_requests)
 
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
             state_rows = num_req_slots + self.c128_ring_size + 1
             state_rows *= 1 + self.online_c128_mtp_max_draft_tokens
-            state_last_dim = 3 * attn_head_dim
+            state_last_dim = 3 * self.attn_head_dim
         else:
             state_pool_size = num_req_slots * self.c128_ring_size
             state_rows = state_pool_size + self.c128_ring_size + 1
             state_rows = ceil_div(state_rows, 128) * 128
-            state_last_dim = 2 * attn_head_dim
+            state_last_dim = 2 * self.attn_head_dim
 
         return (
             state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
@@ -1092,8 +1248,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
             )
 
-        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        swa_fixed_bytes = self._get_swa_fixed_bytes()
+        fixed_bytes = c128_state_fixed_bytes + swa_fixed_bytes
+        available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
+        if full_token <= 0 and self.swa_cap_tokens is not None:
+            raise RuntimeError(
+                f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "
+                f"{swa_fixed_bytes / (1 << 30):.2f} GB) leaves no room for the full "
+                f"KV pool within the available {available_bytes / (1 << 30):.2f} GB. "
+                f"Reduce --max-running-requests, lower --swa-prefix-tails "
+                f"or SGLANG_SWA_EVICTION_INTERVAL, or increase --mem-fraction-static."
+            )
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
@@ -1101,6 +1267,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"swa_fixed={swa_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)

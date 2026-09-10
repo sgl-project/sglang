@@ -890,7 +890,7 @@ class ChatCompletionRequest(BaseModel):
         description="DeepSeek-V4 quick instruction task. When set, the last "
         "user/developer message is treated as a single-shot classification prompt "
         "and the corresponding task special token (e.g. `<｜domain｜>`) is appended "
-        "before generation. Only honored by the dsv4 chat encoder; ignored otherwise.",
+        "before generation. Only honored by the dsv4/dsv41 chat encoders; ignored otherwise.",
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.

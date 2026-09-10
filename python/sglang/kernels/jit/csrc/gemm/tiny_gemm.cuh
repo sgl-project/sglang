@@ -6,6 +6,8 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/gemm/utils.cuh>
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <array>
@@ -66,23 +68,6 @@ struct TinyGEMMParams {
   int64_t stride_x;
 };
 
-template <std::size_t N>
-SGL_DEVICE void dot_product(device::AlignedVector<bf16x2_t, N> a, device::AlignedVector<bf16x2_t, N> b, float& acc) {
-  using namespace device;
-#pragma unroll
-  for (uint32_t i = 0; i < N; ++i) {
-#if SGL_ARCH_BLACKWELL_OR_GREATER
-    acc = device::math::fma_f32_bf16(a[i].x, b[i].x, acc);
-    acc = device::math::fma_f32_bf16(a[i].y, b[i].y, acc);
-#else
-    const auto [a0, a1] = cast<fp32x2_t>(a[i]);
-    const auto [b0, b1] = cast<fp32x2_t>(b[i]);
-    acc += a0 * b0;
-    acc += a1 * b1;
-#endif
-  }
-}
-
 template <typename Trait, uint32_t M, typename Out, bool kUsePDL>
 TINY_GEMM_KERNEL void tiny_n_gemm_kernel(const TinyGEMMParams params) {
   using namespace device;
@@ -130,7 +115,7 @@ TINY_GEMM_KERNEL void tiny_n_gemm_kernel(const TinyGEMMParams params) {
       float acc = 0.0f;
 #pragma unroll
       for (uint32_t u = 0; u < kUnroll; ++u) {
-        dot_product(xv[m][u], wv[n][u], acc);
+        dot_product_vec(xv[m][u], wv[n][u], acc);
       }
       s_acc[warp_id][m * N_SPLIT + n] = warp::reduce_sum(acc);
     }
@@ -185,7 +170,7 @@ TINY_GEMM_KERNEL void tiny_k_gemm_kernel(const TinyGEMMParams params) {
 #pragma unroll
   for (uint32_t m = 0; m < M; ++m) {
     float acc = 0.0f;
-    dot_product(xv[m], wv, acc);
+    dot_product_vec(xv[m], wv, acc);
     // Broadcast store: every lane of the group holds the reduced sum.
     const auto sum = warp::reduce_sum<kNumKLanes>(acc);
     static_cast<Out*>(params.out)[m * N + n_idx] = cast<Out>(sum);

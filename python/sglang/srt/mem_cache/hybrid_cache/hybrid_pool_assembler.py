@@ -536,6 +536,88 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
     ]
 
 
+def _dsv4_low_ratio_entries(kvcache: Any, page_size: int, num_host_pages: int):
+    """Mirror each shared source once, in FULL-page units, before its first use.
+
+    Prefixes end at an even page boundary. Ratio-2 compression starts a new
+    pair there, so its request-scoped ring is rebuilt rather than cached.
+    """
+    import torch
+
+    entries = []
+    transfer_layer_num = kvcache.end_layer - kvcache.start_layer
+    for ratio, names in (
+        (
+            1,
+            (
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            ),
+        ),
+        (
+            2,
+            (
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            ),
+        ),
+    ):
+        sources = getattr(kvcache, "sources_by_ratio", {}).get(ratio, [])
+        if not sources:
+            continue
+        kv_pool = kvcache.kv_pools[ratio]
+        index_pool = kvcache.index_pools[ratio]
+        assert page_size % ratio == 0
+        slots_per_page = page_size // ratio
+        assert slots_per_page % index_pool.page_size == 0
+        index_pages_per_full_page = slots_per_page // index_pool.page_size
+        layer_mapping = {
+            source - kvcache.start_layer: index for index, source in enumerate(sources)
+        }
+        regions = [(names[0], kv_pool, kv_pool.kv_buffer)]
+        if index_pool.index_k_with_scale_buffer is not None:
+            index_regions = [(names[1], index_pool.index_k_with_scale_buffer)]
+        else:
+            index_regions = [
+                (names[1], index_pool.index_k_payload_buffer),
+                (names[2], index_pool.index_k_scale_buffer),
+            ]
+        for name, buffers in index_regions:
+            # A FULL page contains several contiguous 64-slot FP4 index pages.
+            # Drop only the extra partial padding row beyond the FULL address space.
+            rows = []
+            for buffer in buffers:
+                full_pages = buffer.shape[0] // index_pages_per_full_page
+                rows.append(
+                    buffer[: full_pages * index_pages_per_full_page]
+                    .view(torch.uint8)
+                    .reshape(full_pages, -1)
+                )
+            regions.append((name, index_pool, rows))
+        for name, device_pool, buffers in regions:
+            entries.append(
+                build_pool_entry(
+                    name=name,
+                    host_pool=DeepSeekV4PagedHostPool(
+                        pool_name=str(name),
+                        device_buffers=buffers,
+                        item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
+                        num_host_pages=num_host_pages,
+                        slot_page_size=page_size,
+                        layout=get_memory().hicache_mem_layout,
+                        allocator_type=_get_allocator_type(),
+                        page_aligned_only=True,
+                    ),
+                    device_pool=device_pool,
+                    layer_mapping=layer_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                )
+            )
+    return entries
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -745,6 +827,8 @@ def build_deepseek_v4_hicache_stack(
                 ),
             ]
         )
+
+    entries.extend(_dsv4_low_ratio_entries(kvcache, page_size, num_host_pages))
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
@@ -1338,6 +1422,12 @@ class _DeepSeekV4Strategy(StackStrategy):
                 ),
             )
             for name, src in (
+                (PoolName.DEEPSEEK_V4_C1, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C1_INDEXER, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C2, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C2_INDEXER, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE, PoolName.KV),

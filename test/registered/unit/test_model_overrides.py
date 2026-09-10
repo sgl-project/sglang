@@ -1599,17 +1599,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "attention_backend": "dsv4",
                     "moe_runner_backend": "flashinfer_mxfp4",
                     "page_size": 256,
-                    "swa_full_tokens_ratio": 0.1,
                 },
             )
         # NPU pool geometry
         self.assertEqual(
             _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128
-        )
-        # user-set window ratio survives
-        self.assertNotIn(
-            "swa_full_tokens_ratio",
-            _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
         # An explicit user choice takes precedence over the model default.
         self.assertNotIn(

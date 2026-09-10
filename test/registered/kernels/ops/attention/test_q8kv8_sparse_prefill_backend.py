@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    CompressedGather,
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
     use_dsv4_q8kv8_sparse_prefill,
@@ -166,7 +167,9 @@ def _make_backend(
     dsv4_prefill_backend: str = "auto",
 ) -> DeepseekV4AttnBackend:
     backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
-    backend.forward_metadata = SimpleNamespace(sparse_prefill_cache=None)
+    backend.forward_metadata = SimpleNamespace(
+        sparse_prefill_cache=None, late_layer_tail=None
+    )
     backend.req_to_token = req_to_token
     backend.sparse_prefill_workspace = SparsePrefillWorkspace(device)
     backend.softmax_scale = 512**-0.5
@@ -219,7 +222,12 @@ def _make_sparse_prefill_case(
         * 0.05
     ).to(torch.bfloat16)
     attn_sink = torch.zeros(local_heads, dtype=torch.float32, device=device)
-    core_attn_metadata = SimpleNamespace()
+    # position + 1 of the five query rows: seq_lens [96, 144], extend [3, 2]
+    core_attn_metadata = SimpleNamespace(
+        seq_lens_casual=torch.tensor(
+            [94, 95, 96, 143, 144], dtype=torch.int32, device=device
+        )
+    )
     return backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata
 
 
@@ -236,6 +244,10 @@ def _populate_compress_metadata(
         core_attn_metadata.c4_sparse_raw_indices = torch.zeros(
             (16, 1), dtype=torch.int32, device=device
         )
+        # The sparse prefill path selects the ratio's raw top-k through this accessor.
+        core_attn_metadata.sparse_raw_indices = lambda ratio: (
+            core_attn_metadata.c4_sparse_raw_indices if ratio == 4 else None
+        )
     elif compress_ratio == 128:
         core_attn_metadata.c128_page_indices = torch.zeros(
             (16, 1), dtype=torch.int32, device=device
@@ -248,9 +260,9 @@ def _patched_compressed_sparse_cache_paths(compress_ratio: int):
         yield
         return
 
-    old_ensure_c4 = SparsePrefillChunkCache.ensure_c4
+    old_ensure_compressed = SparsePrefillChunkCache.ensure_compressed
     old_ensure_c128 = SparsePrefillChunkCache.ensure_c128
-    old_combine_c4_layer = SparsePrefillChunkCache.combine_c4_layer
+    old_combine_compressed = SparsePrefillChunkCache.combine_compressed
 
     def _with_compressed_prefix(cache: SparsePrefillChunkCache, n_compressed: int):
         shifted_swa = torch.where(
@@ -279,26 +291,35 @@ def _patched_compressed_sparse_cache_paths(compress_ratio: int):
             self, n_compressed
         )
 
-    def fake_ensure_c4(self, page_table, extra_page_size):
-        _ = page_table, extra_page_size
+    def fake_ensure_compressed(self, compress_ratio, page_table, extra_page_size):
+        _ = page_table
         n_compressed = 8
-        self.c4_flat_token_ids = torch.arange(
-            n_compressed, dtype=torch.int64, device=self.swa_token_ids.device
+        device = self.swa_token_ids.device
+        gather = CompressedGather(
+            flat_token_ids=torch.arange(n_compressed, dtype=torch.int64, device=device),
+            page_size=extra_page_size,
+            compressed_base=torch.zeros(
+                self.num_reqs, dtype=torch.int32, device=device
+            ),
+            swa_base=torch.zeros(self.num_reqs, dtype=torch.int32, device=device),
         )
+        self.compressed[compress_ratio] = gather
+        return gather
 
-    def fake_combine_c4_layer(self, c4_sparse_raw_indices):
-        _ = c4_sparse_raw_indices
-        return _with_compressed_prefix(self, self.c4_flat_token_ids.shape[0])
+    def fake_combine_compressed(self, compress_ratio, sparse_raw_indices):
+        _ = sparse_raw_indices
+        n_compressed = self.compressed[compress_ratio].flat_token_ids.shape[0]
+        return _with_compressed_prefix(self, n_compressed)
 
     SparsePrefillChunkCache.ensure_c128 = fake_ensure_c128
-    SparsePrefillChunkCache.ensure_c4 = fake_ensure_c4
-    SparsePrefillChunkCache.combine_c4_layer = fake_combine_c4_layer
+    SparsePrefillChunkCache.ensure_compressed = fake_ensure_compressed
+    SparsePrefillChunkCache.combine_compressed = fake_combine_compressed
     try:
         yield
     finally:
-        SparsePrefillChunkCache.ensure_c4 = old_ensure_c4
+        SparsePrefillChunkCache.ensure_compressed = old_ensure_compressed
         SparsePrefillChunkCache.ensure_c128 = old_ensure_c128
-        SparsePrefillChunkCache.combine_c4_layer = old_combine_c4_layer
+        SparsePrefillChunkCache.combine_compressed = old_combine_compressed
 
 
 def _make_q8kv8_kernel_args(

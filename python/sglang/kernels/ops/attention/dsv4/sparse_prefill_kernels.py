@@ -44,6 +44,7 @@ def _combine_topk_swa_indices_kernel(
     topk_indices_ptr,
     topk_indices_stride,
     query_start_loc_ptr,
+    query_pos_ptr,
     seq_lens_ptr,
     gather_lens_ptr,
     compressed_base_ptr,
@@ -62,23 +63,19 @@ def _combine_topk_swa_indices_kernel(
     base = tl.load(query_start_loc_ptr)
     query_start = tl.load(query_start_loc_ptr + batch_idx) - base
     query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
-    query_len = query_end - query_start
     seq_len = tl.load(seq_lens_ptr + batch_idx)
     gather_len = tl.load(gather_lens_ptr + batch_idx)
     compressed_base = tl.load(compressed_base_ptr + batch_idx)
     swa_base = tl.load(swa_base_ptr + batch_idx)
-    start_pos = seq_len - query_len
     # SWA portion of the gathered buffer starts from position
     # (seq_len - gather_len), not 0. The +pos-gather_start formula maps a
     # query's window back into the workspace's SWA region.
     gather_start = seq_len - gather_len
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
-        token_idx_in_query = token_idx - query_start
-        pos = start_pos + token_idx_in_query
-        # Both the C4 indexer and the C128 metadata builder emit
-        # min((pos+1)//compress_ratio, topk_tokens) valid entries. Caller
-        # passes top_k=0 for SWA-only layers to zero this out.
+        pos = tl.load(query_pos_ptr + token_idx)
+        # Candidate filtering can leave -1 holes within the top-k span.
+        # top_k=0 disables the compressed portion for SWA-only layers.
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, top_k)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
@@ -93,7 +90,7 @@ def _combine_topk_swa_indices_kernel(
         )
         tl.store(
             combined_indices_ptr + combined_row + offset,
-            topk_vals + compressed_base,
+            tl.where(topk_vals >= 0, topk_vals + compressed_base, -1),
             mask=mask,
         )
 

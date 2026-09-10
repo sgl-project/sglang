@@ -70,33 +70,54 @@ class DeepSeekV32Detector(BaseFormatDetector):
     Reference: DeepSeek V3.2 format specification
     """
 
+    # Tag names after the DSML marker; subclasses override for newer formats.
+    dsml_token = "｜DSML｜"
+    tool_calls_block_name = "function_calls"
+    invoke_tag_name = "invoke"
+    parameter_tag_name = "parameter"
+
     def __init__(self):
         super().__init__()
-        self.bot_token = "<｜DSML｜function_calls>"
-        self.eot_token = "</｜DSML｜function_calls>"
-        self.invoke_end_token = "</｜DSML｜invoke>"
-        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
+        block = f"{self.dsml_token}{self.tool_calls_block_name}"
+        invoke = f"{self.dsml_token}{self.invoke_tag_name}"
+        parameter = f"{self.dsml_token}{self.parameter_tag_name}"
+        self.bot_token = f"<{block}>"
+        self.eot_token = f"</{block}>"
+        self.invoke_start_token = f"<{invoke}"
+        self.invoke_end_token = f"</{invoke}>"
+        self.parameter_regex = (
+            rf'<{parameter}\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</{parameter}>'
+        )
         self.partial_parameter_regex = (
-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*)$'
+            rf'<{parameter}\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*)$'
         )
-        self.function_calls_regex = (
-            r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>"
-        )
+        self.function_calls_regex = rf"<{block}>(.*?)</{block}>"
         # Long-form `<｜DSML｜invoke name="x">...</｜DSML｜invoke>` and the
         # self-closing `<｜DSML｜invoke name="x"/>` shape V4 emits for zero-arg
         # tools. The `end` group is empty when the closer hasn't streamed in.
         self.invoke_regex = (
-            r'<｜DSML｜invoke\s+name="(?P<name>[^"]+)"\s*'
+            rf'<{invoke}\s+name="(?P<name>[^"]+)"\s*'
             r"(?:(?P<self_close>/>)"
-            r"|>(?P<body>.*?)(?P<end>(?:</｜DSML｜invoke>|$)))"
+            rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
         )
-        self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
-        self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
+        # Consumed right-to-left by rstrip (a character set, not a suffix), so the
+        # invoke name is split to limit how much of a partial value gets eaten.
+        self.prefix_parameter_end_call = [
+            "</",
+            self.dsml_token,
+            self.parameter_tag_name,
+        ]
+        self.prefix_invoke_end_call = [
+            "</",
+            self.dsml_token,
+            self.invoke_tag_name[:-3],
+            self.invoke_tag_name[-3:],
+        ]
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
-        return self.bot_token in text or "<｜DSML｜invoke" in text
+        return self.bot_token in text or self.invoke_start_token in text
 
     @staticmethod
     def _unpack_invoke_match(m: "re.Match[str]") -> tuple[str, str, bool]:
@@ -379,9 +400,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'<｜DSML｜invoke name="{name}">',
-            end="</｜DSML｜invoke>",
-            trigger="<｜DSML｜invoke",
+            begin=f'{self.invoke_start_token} name="{name}">',
+            end=self.invoke_end_token,
+            trigger=self.invoke_start_token,
         )
 
     def get_structural_tag_name(self) -> str:

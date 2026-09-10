@@ -479,6 +479,7 @@ class CommitInjectCtx(msgspec.Struct):
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
+    kv_injector: Optional[TargetHiddenKvInjector] = None
 
 
 class AcceptOuts(msgspec.Struct):
@@ -530,15 +531,22 @@ class DsparkVerifyEpilogue:
         )
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
+        self._static_step_state: Optional[tuple[int, bool]] = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
-        if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
+        if (
+            runner.model_runner.is_draft_worker
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
             return
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.next_token_logits is None
             or out.hidden_states is None
         ):
+            return
+        if not runner.ragged_verify_mode:
+            self._static_epilogue(out, forward_batch)
             return
         self(
             compact_logits=out.next_token_logits,
@@ -550,6 +558,7 @@ class DsparkVerifyEpilogue:
         )
 
     def begin_step(self, verify_lens, armed: bool) -> None:
+        self._static_step_state = None
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -558,6 +567,50 @@ class DsparkVerifyEpilogue:
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
+
+    def begin_static_step(self, bs: int, armed: bool) -> None:
+        state = (bs, armed)
+        if self._static_step_state == state:
+            return
+        self.verify_lens_buf[:bs].fill_(self.stride)
+        self.verify_lens_buf[bs:].zero_()
+        self.inject_gate_buf.fill_(int(armed))
+        self._static_step_state = state
+
+    def _static_epilogue(self, out, forward_batch) -> None:
+        bs = forward_batch.batch_size
+        verify_lens = self.verify_lens_buf[:bs]
+        candidates = forward_batch.input_ids.view(bs, self.stride)
+        commit_lens = self._accept(
+            candidates=candidates,
+            logits=out.next_token_logits,
+            draft_tokens=candidates[:, 1:].contiguous(),
+            seq_lens=forward_batch.seq_lens,
+        )
+        if not self.folds_commit:
+            return
+        # Consume the same staged locations as target verify, not a second
+        # lookup through req_to_token. Padded and fallback rows never write KV.
+        gated_commit_lens = (
+            torch.minimum(commit_lens, verify_lens.to(torch.int32))
+            * self.inject_gate_buf
+        )
+        cache_loc = forward_batch.out_cache_loc
+        state_slot = None
+        if is_unified_kv_triton():
+            state_slot = (
+                forward_batch.req_pool_indices.view(-1, 1)
+                .expand(bs, self.stride)
+                .reshape(-1)
+            )
+        self.commit_ctx.kv_injector.inject_target_hidden(
+            target_hidden=out.hidden_states,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(bs, self.stride),
+            positions=forward_batch.positions,
+            commit_lens=gated_commit_lens,
+            state_slot=state_slot,
+        )
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
@@ -610,7 +663,23 @@ class DsparkVerifyEpilogue:
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
-        commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
+        candidates = torch.zeros(
+            (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
+        )
+        scatter_compact_to_strided_into(
+            compact=input_ids.view(-1, 1),
+            verify_lens=verify_lens,
+            out=candidates,
+            stride=self.stride,
+            fill_value=0,
+        )
+        commit_lens = self._accept(
+            candidates=candidates.view(bs, self.stride),
+            logits=self.strided_logits[: bs * self.stride],
+            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            seq_lens=seq_lens,
+            cutoff_verify_lens=verify_lens,
+        )
         if self.folds_commit:
             self._commit_inject(
                 commit_lens, verify_lens, seq_lens, req_pool_indices, bs
@@ -632,22 +701,15 @@ class DsparkVerifyEpilogue:
             fill_value=0.0,
         )
 
-    def _accept(self, input_ids, seq_lens, verify_lens, bs: int) -> torch.Tensor:
-        candidates = torch.zeros(
-            (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
-        )
-        scatter_compact_to_strided_into(
-            compact=input_ids.view(-1, 1),
-            verify_lens=verify_lens,
-            out=candidates,
-            stride=self.stride,
-            fill_value=0,
-        )
+    def _accept(
+        self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
+    ) -> torch.Tensor:
+        bs = candidates.shape[0]
         correct_len, bonus, cap_trim_lens = accept_greedy_triton(
-            candidates=candidates.view(bs, self.stride),
-            target_logits=self.strided_logits[: bs * self.stride],
+            candidates=candidates,
+            target_logits=logits,
             verify_num_draft_tokens=self.stride,
-            cutoff_verify_lens=verify_lens,
+            cutoff_verify_lens=cutoff_verify_lens,
         )
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
@@ -658,7 +720,7 @@ class DsparkVerifyEpilogue:
             prefix_lens=seq_lens[:bs],
         )
         out_tokens = BuildOutTokens.execute(
-            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            draft_tokens=draft_tokens,
             correct_len=correct_len,
             bonus=bonus,
             verify_num_draft_tokens=self.stride,

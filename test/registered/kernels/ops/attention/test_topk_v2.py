@@ -352,15 +352,7 @@ def test_topk_v2_ragged_window(name: str, rows, k: int, offset_shift: int) -> No
     ref_raw = _reference(windows, lengths.cpu(), k)
     _assert_topk_close(windows, ref_raw, our_raw, len(rows), lengths.cpu(), k)
 
-    # the only legal in-place write is the <=3 masked columns ahead of a window
-    # that the kernel actually reads (trivial rows read nothing)
-    changed = (scores != before).cpu()
-    for i, (start, length) in enumerate(rows):
-        allowed = torch.zeros(scores.shape[1], dtype=torch.bool)
-        if length > k:
-            allowed[start - start % 4 : start] = True
-        stray = (changed[i] & ~allowed).nonzero().flatten().tolist()
-        assert not stray, f"row {i} ({name}) wrote outside its masked head: {stray[:8]}"
+    assert torch.equal(scores, before)
 
 
 @pytest.mark.parametrize("k", [512, 2048])

@@ -111,9 +111,6 @@ def topk_transform_ragged_v2(
     Unlike :func:`topk_transform_paged_v2` this needs no page table and no plan
     (the cluster path only pays off for very few rows, and prefill has many).
 
-    IMPORTANT: ``scores`` is written in place -- the <= 3 columns ahead of each
-    row's window that the 16-byte-aligned read base pulls in are masked out.
-    They are invalid for that row and the buffer must have no other consumer.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
     if is_xpu():

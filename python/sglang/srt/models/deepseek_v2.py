@@ -196,6 +196,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
+from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
@@ -498,6 +499,12 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter(correction_bias)
         else:
             self.e_score_correction_bias = None
+        self.e_score_correction_bias_vl = None
+        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+            self.e_score_correction_bias_vl = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self.use_dsa = is_deepseek_dsa(config)
@@ -914,6 +921,9 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
+        num_token_non_padded = (
+            forward_batch.num_token_non_padded if forward_batch is not None else None
+        )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
@@ -928,12 +938,14 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
+                and not is_in_breakable_cuda_graph()
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    num_token_non_padded=num_token_non_padded,
                 )
             else:
                 return self.forward_normal(
@@ -942,6 +954,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    num_token_non_padded=num_token_non_padded,
                 )
         else:
             return self.forward_deepep(
@@ -954,6 +967,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -992,12 +1006,21 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
+            if self.gate.e_score_correction_bias_vl is not None:
+                topk_output = vision_topk(
+                    self,
+                    router_logits,
+                    input_ids_global,
+                    num_token_non_padded=num_token_non_padded,
+                )
+            else:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
@@ -1068,6 +1091,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1108,12 +1132,21 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
+            if self.gate.e_score_correction_bias_vl is not None:
+                topk_output = vision_topk(
+                    self,
+                    router_logits,
+                    input_ids_global,
+                    num_token_non_padded=num_token_non_padded,
+                )
+            else:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
         else:
             pre_quant_input = None
             shared_output = None

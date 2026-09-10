@@ -827,6 +827,19 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = 0.8
+    swa_prefix_tails: A[
+        Optional[int],
+        Arg(
+            help=(
+                "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
+                "family), how many radix-cached prefix tails it keeps room for. "
+                "Each tail is one sliding window plus one page. Default: 4 x "
+                "max_running_requests per attention-DP rank, 0 when the radix "
+                "cache is disabled."
+            ),
+        ),
+        NS("schedule"),
+    ] = None
     disable_hybrid_swa_memory: A[
         bool,
         Arg(help="Disable the hybrid SWA memory pool.", resolvable=True),
@@ -1877,6 +1890,12 @@ class ServerArgs:
     cuda_graph_max_bs_prefill: A[
         Optional[int],
         "Maximum batch size captured for the prefill cuda graph.",
+        NS("exec.graph"),
+    ] = None
+    cuda_graph_max_seq_len_prefill: A[
+        Optional[int],
+        "Longest sequence a prefill cuda graph replay admits; longer batches "
+        "run eager prefill. Folds into cuda_graph_config[prefill].max_seq_len.",
         NS("exec.graph"),
     ] = None
     cuda_graph_bs_decode: A[
@@ -3615,6 +3634,17 @@ class ServerArgs:
     enable_return_indexer_topk: A[
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
+        NS("exec.features"),
+    ] = False
+    enable_encoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
+        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA only.",
+        NS("exec.features"),
+    ] = False
+    enable_decoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
         NS("exec.features"),
     ] = False
     disable_outlines_disk_cache: A[

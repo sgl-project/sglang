@@ -82,6 +82,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    NgramEmbeddingInfo,
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
@@ -1239,6 +1240,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 is None
             ):
                 return False
+        # A backend may keep batches its captured metadata cannot describe eager.
+        backend_can_run = getattr(
+            self.model_runner.attn_backend, "can_run_prefill_cuda_graph", None
+        )
+        if backend_can_run is not None and not backend_can_run(forward_batch):
+            return False
         # Multi-req replay is supported by body-capture backends via the
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
@@ -1397,6 +1404,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 lora_ids=([None] * bs if self._capture_lora else None),
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
+            ngram_manager = self.model_runner.ngram_embedding_manager
+            if ngram_manager.enabled:
+                forward_batch.ngram_embedding_info = NgramEmbeddingInfo.create(
+                    ngram_manager.table,
+                    bs,
+                    self.device,
+                    column_starts=0,
+                    req_lens=shape_inputs["extend_seq_lens"],
+                )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
@@ -1676,6 +1692,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
         )
+        # The n-gram hasher runs outside the graph and reads this at replay.
+        static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
+        static_forward_batch.ngram_history = forward_batch.ngram_history
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (
                 static_forward_batch.next_token_logits_buffer
@@ -1749,6 +1768,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         return static_forward_batch
 
+    def _fill_input_embeds_slot(self, args, layer_kwargs, static_num_tokens: int):
+        """Refresh the captured input_embeds slot from this batch.
+
+        For text-only batches, compute embeddings from input_ids to avoid replaying
+        stale embeddings from the previous batch.
+        """
+        ie_idx = self._input_embeds_arg_idx
+        ie = layer_kwargs.get("input_embeds")
+        if ie is None and ie_idx is not None and len(args) > ie_idx:
+            ie = args[ie_idx]
+        if ie is None:
+            input_ids = layer_kwargs.get("input_ids")
+            if input_ids is None and len(args) > 0:
+                input_ids = args[0]
+            embed = getattr(self.model_runner.model, "get_input_embeddings", None)
+            assert input_ids is not None and embed is not None, (
+                "prefill CUDA graph replay needs input_embeds for the static "
+                "slot, and the model exposes no get_input_embeddings()"
+            )
+            ie = embed()(input_ids)
+        self.buffer_registry.get_slot("input_embeds").slice_for(1, static_num_tokens)[
+            : ie.shape[0]
+        ].copy_(ie)
+
     def _execute_body_capture(
         self,
         forward_batch: ForwardBatch,
@@ -1761,7 +1804,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG / Full: replay the captured body, run the LM head +
         # logits_processor eagerly.
         full_path = self._is_full_backend
-        ie_idx = self._input_embeds_arg_idx
 
         def replay_layer_forward(*args, **layer_kwargs):
             # The captured body graph reads activations from the static
@@ -1773,13 +1815,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # Copy them into the slot before replay so the graph sees the
             # current request's embeddings (mirrors main's BCG closure).
             if self.buffer_registry.has_slot("input_embeds"):
-                ie = layer_kwargs.get("input_embeds")
-                if ie is None and ie_idx is not None and len(args) > ie_idx:
-                    ie = args[ie_idx]
-                if ie is not None:
-                    self.buffer_registry.get_slot("input_embeds").slice_for(
-                        1, static_num_tokens
-                    )[: ie.shape[0]].copy_(ie)
+                self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 

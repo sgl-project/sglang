@@ -23,7 +23,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import next_power_of_2, print_warning_once
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
@@ -46,6 +46,56 @@ from sglang.srt.utils.common import get_bool_env_var
 _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
     "SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE", default="true"
 )
+
+
+def _pad_intermediate_size(layer: Module) -> None:
+    intermediate_size = layer.w13_weight.shape[1] // 2
+    padded_size = (intermediate_size + 127) // 128 * 128
+    if padded_size == intermediate_size:
+        return
+
+    # Pad after TP loading so checkpoint shard offsets retain the original width.
+    # Gate and up occupy separate halves and must each get their own zero tail.
+    for name, fill_value in (
+        ("w13_weight", 0),
+        ("w13_weight_scale_inv", 1),
+    ):
+        param = getattr(layer, name)
+        num_experts, _, width = param.shape
+        padded = torch.full(
+            (num_experts, 2 * padded_size, width),
+            fill_value,
+            dtype=param.dtype,
+            device=param.device,
+        )
+        padded[:, :intermediate_size] = param[:, :intermediate_size]
+        padded[:, padded_size : padded_size + intermediate_size] = param[
+            :, intermediate_size:
+        ]
+        param.data = padded
+
+    for name, elements_per_column, fill_value in (
+        ("w2_weight", 2, 0),
+        ("w2_weight_scale_inv", 32, 1),
+    ):
+        param = getattr(layer, name)
+        num_experts, hidden_size, width = param.shape
+        padded = torch.full(
+            (num_experts, hidden_size, padded_size // elements_per_column),
+            fill_value,
+            dtype=param.dtype,
+            device=param.device,
+        )
+        padded[:, :, :width] = param
+        param.data = padded
+
+    print_warning_once(
+        f"flashinfer_mxfp4 MoE padded the local intermediate size from "
+        f"{intermediate_size} to {padded_size} for 128-element kernel alignment "
+        "after TP weight loading. Padding adds unused channels and may waste "
+        "compute and memory. Use this TP MoE configuration with caution and "
+        "benchmark it against a TP/EP configuration that avoids padding."
+    )
 
 
 class Mxfp4FlashinferTrtllmMoEMethod:
@@ -150,6 +200,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
         if getattr(layer, "_mega_moe_weights_built", False):
             return
+
+        _pad_intermediate_size(layer)
 
         w13_w, w13_s = reorder_w1w3_to_w3w1(
             layer.w13_weight.data, layer.w13_weight_scale_inv.data

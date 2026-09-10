@@ -216,6 +216,32 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.n128k512",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.n128k512:n128k512_gemm_bf16",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="[m, 512] @ [128, 512].T for decode batches m <= 32; the DeepSeek-V4.1 low-ratio index-key projection",
+        ),
+        description="bf16 GEMM specialised for N = 128, K = 512 (sglang.kernels.jit, JIT-only).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.n32k5120",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.n32k5120:n32k5120_gemm_bf16",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="[m, 5120] @ [32, 5120].T for decode batches m <= 32; the DeepSeek-V4.1 indexer head-weight projection",
+        ),
+        description="bf16 GEMM specialised for N = 128, K = 512 (sglang.kernels.jit, JIT-only).",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.qwen3x_nvfp4",
         backend=KernelBackend.KDA,
         target=f"{_KDA_PACKAGE}.qwen3x_nvfp4_gemm:try_qwen3x_nvfp4_gemm",
@@ -282,6 +308,26 @@ def tiny_gemm_bf16(
     return impl(x, w, out, out_dtype=out_dtype, max_m=max_m)
 
 
+def n128k512_gemm_bf16(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """bf16 GEMM ``x[m, 512] @ w[128, 512].T`` for decode batches (m <= 32)."""
+    impl = get_kernel("gemm.n128k512", KernelBackend.JIT)
+    return impl(x, w, out)
+
+
+def n32k5120_gemm_bf16(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """bf16 GEMM ``x[m, 5120] @ w[32, 5120].T`` for decode batches (m <= 32)."""
+    impl = get_kernel("gemm.n32k5120", KernelBackend.JIT)
+    return impl(x, w, out)
+
+
 def try_qwen3x_nvfp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -302,6 +348,8 @@ __all__ = [
     "bmm_fp8",
     "dsv3_fused_a_gemm",
     "fp8_scaled_mm",
+    "n128k512_gemm_bf16",
+    "n32k5120_gemm_bf16",
     "tiny_gemm_bf16",
     "try_qwen3x_nvfp4_gemm",
 ]

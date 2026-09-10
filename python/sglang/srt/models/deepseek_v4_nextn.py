@@ -41,7 +41,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
+from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
+    wo_a_fp8_gemm_enabled,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -232,6 +236,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.tp_size = get_parallel().tp_size
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
+        self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:

@@ -1,4 +1,4 @@
-"""Unit tests for LongCat ngram token table updates."""
+"""Unit tests for ngram token tables and Engram predecessor history."""
 
 import unittest
 from types import SimpleNamespace

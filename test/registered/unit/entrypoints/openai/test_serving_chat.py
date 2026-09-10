@@ -52,7 +52,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
-_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
+_ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
 
 
 def _spec_result(index):
