@@ -17,7 +17,7 @@ import json
 import os
 import random
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence
 
 from sglang.srt.utils import kill_process_tree
@@ -31,11 +31,16 @@ from sglang.test.test_utils import (
 # depending on a corpus it cannot download.
 AGENTIC_TRACE_PATH_ENV = "SGLANG_AGENTIC_TRACE_PATH"
 
-# Rough BPE tokens-per-word for the code-and-prose mix below. Only used to
-# turn the token budgets in `AgenticTraceSpec` into word counts; the replay
-# itself never depends on hitting the budget exactly (`AgenticTraceDataset`
-# treats each conversation's `prompt_tokens` as informational).
-_TOKENS_PER_WORD = 1.3
+# Tokens produced per filler fragment emitted by `_lorem_words`, used to turn
+# the token budgets in `AgenticTraceSpec` into fragment counts. Measured at
+# 5.34 (gpt2) and 5.30 (bert-base-uncased) over the fragments below; dotted
+# identifiers and `key=value` pairs split densely, which is the point. Pass a
+# tokenizer to `write_agentic_coding_trace` to calibrate this exactly instead.
+_TOKENS_PER_PART = 5.3
+
+# Fragments to encode when calibrating against a real tokenizer. Large enough
+# that the ratio settles, small enough to encode in well under a second.
+_CALIBRATION_PARTS = 2000
 
 _MODULES = (
     "scheduler",
@@ -66,7 +71,7 @@ _SYMBOLS = (
 _TOOL_NAMES = ("read_file", "grep", "edit_file", "run_tests", "bash", "list_dir")
 
 
-def _lorem_words(rng: random.Random, num_words: int) -> str:
+def _lorem_words(rng: random.Random, num_parts: int) -> str:
     """Deterministic filler that tokenizes like source code and tracebacks.
 
     Realistic token shapes matter here: the replay measures prefill cost, and a
@@ -74,7 +79,7 @@ def _lorem_words(rng: random.Random, num_words: int) -> str:
     word than a real agent transcript.
     """
     parts = []
-    while len(parts) < num_words:
+    while len(parts) < num_parts:
         parts.extend(
             (
                 f"{rng.choice(_MODULES)}.{rng.choice(_SYMBOLS)}",
@@ -101,11 +106,23 @@ def _lorem_words(rng: random.Random, num_words: int) -> str:
                 ),
             )
         )
-    return " ".join(parts[:num_words])
+    return " ".join(parts[:num_parts])
 
 
-def _block(rng: random.Random, num_tokens: int) -> str:
-    return _lorem_words(rng, max(1, int(num_tokens / _TOKENS_PER_WORD)))
+def calibrate_tokens_per_part(tokenizer) -> float:
+    """Measure how many tokens one filler fragment costs under ``tokenizer``.
+
+    The filler is statistically homogeneous, so one sample is enough to scale
+    the whole corpus; encoding every block to hit its budget exactly would cost
+    far more than the accuracy is worth.
+    """
+    sample = _lorem_words(random.Random(0), _CALIBRATION_PARTS)
+    num_tokens = len(tokenizer.encode(sample, add_special_tokens=False))
+    return num_tokens / _CALIBRATION_PARTS
+
+
+def _block(rng: random.Random, num_tokens: int, tokens_per_part: float) -> str:
+    return _lorem_words(rng, max(1, int(num_tokens / tokens_per_part)))
 
 
 @dataclass(frozen=True)
@@ -132,7 +149,7 @@ class AgenticTraceSpec:
         return self.system_prompt_tokens + self.repo_context_tokens + self.turn_tokens
 
 
-def _system_prompt(spec: AgenticTraceSpec) -> str:
+def _system_prompt(spec: AgenticTraceSpec, tokens_per_part: float) -> str:
     rng = random.Random(0)
     tools = ", ".join(_TOOL_NAMES)
     head = (
@@ -141,13 +158,14 @@ def _system_prompt(spec: AgenticTraceSpec) -> str:
         "before editing, keep patches minimal, and run the tests you touch. "
         "Reference implementation notes follow.\n"
     )
-    return head + _block(rng, spec.system_prompt_tokens)
+    return head + _block(rng, spec.system_prompt_tokens, tokens_per_part)
 
 
 def write_agentic_coding_trace(
     path: str,
     spec: AgenticTraceSpec = AgenticTraceSpec(),
     seed: int = 42,
+    tokenizer=None,
 ) -> str:
     """Write a synthetic agentic-coding trace in ``agentic-trace`` JSON form.
 
@@ -156,17 +174,27 @@ def write_agentic_coding_trace(
     long shared scaffold, a long per-session context, and short tool-output
     deltas. Absolute throughput is therefore not comparable to a run over a
     real corpus, but the run-to-run comparison a nightly regression check needs
-    holds, because the corpus is a deterministic function of ``spec`` and
-    ``seed``.
+    holds, because the corpus is a deterministic function of its inputs.
+
+    Passing ``tokenizer`` makes the token budgets in ``spec`` land on the model
+    actually under test; without one they fall back to a measured constant that
+    is accurate to a few percent for BPE and WordPiece vocabularies. Sizes have
+    to be roughly right either way, since they decide how much context each
+    session carries and therefore what the run costs.
 
     Returns the path written.
     """
-    system_prompt = _system_prompt(spec)
+    tokens_per_part = _TOKENS_PER_PART
+    if tokenizer is not None:
+        tokens_per_part = calibrate_tokens_per_part(tokenizer)
+        print(f"Calibrated agentic filler at {tokens_per_part:.2f} tokens/fragment")
+
+    system_prompt = _system_prompt(spec, tokens_per_part)
     conversations = []
 
     for conv_index in range(spec.num_conversations):
         rng = random.Random(seed + conv_index)
-        repo_context = _block(rng, spec.repo_context_tokens)
+        repo_context = _block(rng, spec.repo_context_tokens, tokens_per_part)
         turns = [
             {
                 "messages": [
@@ -177,7 +205,7 @@ def write_agentic_coding_trace(
                             f"Task {conv_index}: a regression landed in "
                             f"{rng.choice(_MODULES)}. Repository context "
                             f"follows.\n{repo_context}\n"
-                            f"{_block(rng, spec.turn_tokens)}"
+                            f"{_block(rng, spec.turn_tokens, tokens_per_part)}"
                         ),
                     },
                 ],
@@ -194,7 +222,7 @@ def write_agentic_coding_trace(
                             "role": "user",
                             "content": (
                                 f"Output of {tool} (call {turn_index}):\n"
-                                f"{_block(rng, spec.turn_tokens)}"
+                                f"{_block(rng, spec.turn_tokens, tokens_per_part)}"
                             ),
                         }
                     ],
@@ -212,6 +240,7 @@ def write_agentic_coding_trace(
                 "metadata": {
                     "source": "sglang-synthetic-agentic-coding",
                     "seed": seed,
+                    "tokens_per_part": tokens_per_part,
                     **{k: getattr(spec, k) for k in spec.__dataclass_fields__},
                 },
                 "conversations": conversations,
@@ -221,10 +250,43 @@ def write_agentic_coding_trace(
     return path
 
 
+def _resolve_local_tokenizer(model_path: str) -> str:
+    """Prefer an on-disk snapshot so the client skips the HF Hub API.
+
+    ``AutoTokenizer.from_pretrained`` on a repo id can stall for minutes in CI;
+    ``run_bench_serving`` resolves the same way.
+    """
+    try:
+        from sglang.srt.utils import find_local_repo_dir
+
+        local_dir = find_local_repo_dir(model_path, revision=None)
+        if local_dir and os.path.isdir(local_dir):
+            return local_dir
+    except Exception as e:
+        print(f"Could not resolve a local snapshot for {model_path}: {e}")
+    return model_path
+
+
+def _load_tokenizer_for_calibration(model_path: str):
+    """Load the model's tokenizer, or return None if it cannot be loaded.
+
+    Only used to size the synthetic corpus, so a failure here should downgrade
+    to the fallback ratio rather than take down the benchmark.
+    """
+    try:
+        from sglang.benchmark.utils import get_tokenizer
+
+        return get_tokenizer(_resolve_local_tokenizer(model_path))
+    except Exception as e:
+        print(f"Falling back to the default filler ratio; no tokenizer for {e}")
+        return None
+
+
 def resolve_agentic_trace(
     result_dir: str,
     spec: AgenticTraceSpec = AgenticTraceSpec(),
     seed: int = 42,
+    tokenizer=None,
 ) -> str:
     """Return a trace path, preferring a real corpus over the synthetic one."""
     override = os.environ.get(AGENTIC_TRACE_PATH_ENV)
@@ -237,7 +299,7 @@ def resolve_agentic_trace(
         return override
 
     path = os.path.join(result_dir, "agentic_coding_trace.json")
-    write_agentic_coding_trace(path, spec=spec, seed=seed)
+    write_agentic_coding_trace(path, spec=spec, seed=seed, tokenizer=tokenizer)
     print(
         f"Synthesized agentic trace at {path} "
         f"({spec.num_conversations} conversations x "
@@ -259,6 +321,7 @@ class AgenticBenchPoint:
 
     concurrency: int
     conversations: int
+    total_turns: int
     completed_turns: int
     duration_s: float
     output_throughput: float
@@ -273,12 +336,36 @@ class AgenticBenchPoint:
     host_cached_tokens: Optional[int] = None
     raw: Dict = field(default_factory=dict, repr=False)
 
+    @property
+    def failed_turns(self) -> int:
+        return self.total_turns - self.completed_turns
+
+
+# Per-turn arrays that `--output-details` adds. Only the errors list is read;
+# the rest would carry megabytes of generated text through the sweep.
+_DETAIL_KEYS = (
+    "input_lens",
+    "output_lens",
+    "ttfts",
+    "itls",
+    "generated_texts",
+    "errors",
+    "cached_tokens",
+    "cached_tokens_details",
+)
+
 
 def _parse_bench_record(record: Dict, concurrency: int, conversations: int):
     cache_report = record.get("cache_report") or {}
+    # One entry per replayed turn, which is the only corpus-agnostic way to
+    # learn how many turns the run actually attempted: a real trace has a
+    # different turn count in every conversation.
+    errors = record.get("errors") or []
+    summary = {k: v for k, v in record.items() if k not in _DETAIL_KEYS}
     return AgenticBenchPoint(
         concurrency=concurrency,
         conversations=conversations,
+        total_turns=len(errors),
         completed_turns=record.get("completed", 0),
         duration_s=record.get("duration", 0.0),
         output_throughput=record.get("output_throughput", 0.0),
@@ -291,8 +378,61 @@ def _parse_bench_record(record: Dict, concurrency: int, conversations: int):
         accept_length=record.get("accept_length"),
         cache_hit_rate_pct=cache_report.get("cache_hit_rate_pct"),
         host_cached_tokens=cache_report.get("host_cached_tokens"),
-        raw=record,
+        raw=summary,
     )
+
+
+def build_agentic_bench_command(
+    base_url: str,
+    model_path: str,
+    tokenizer: str,
+    trace_path: str,
+    conversations: int,
+    concurrency: int,
+    output_file: str,
+    max_turns: Optional[int] = None,
+    output_len: Optional[int] = None,
+    extra_bench_args: Optional[List[str]] = None,
+) -> List[str]:
+    """Build one ``sglang.benchmark.serving`` invocation for the sweep."""
+    command = [
+        "python3",
+        "-m",
+        "sglang.benchmark.serving",
+        # Multi-turn replay is only wired up for the chat backends.
+        "--backend",
+        "sglang-oai-chat",
+        "--base-url",
+        base_url,
+        "--model",
+        model_path,
+        "--tokenizer",
+        tokenizer,
+        "--dataset-name",
+        "agentic-trace",
+        "--dataset-path",
+        trace_path,
+        # For this dataset one "prompt" is one conversation.
+        "--num-prompts",
+        str(conversations),
+        "--max-concurrency",
+        str(concurrency),
+        "--warmup-requests",
+        "1",
+        "--cache-report",
+        # Carries the per-turn errors list, which is how the caller tells a
+        # clean run from one that reported throughput for turns that 5xx'd.
+        "--output-details",
+        "--output-file",
+        output_file,
+    ]
+    if max_turns is not None:
+        command += ["--agentic-max-turns", str(max_turns)]
+    if output_len is not None:
+        command += ["--sharegpt-output-len", str(output_len)]
+    if extra_bench_args:
+        command += list(extra_bench_args)
+    return command
 
 
 def run_agentic_concurrency_sweep(
@@ -304,7 +444,7 @@ def run_agentic_concurrency_sweep(
     conversations_per_slot: int = 2,
     max_turns: Optional[int] = None,
     output_len: Optional[int] = None,
-    timeout: int = 3600,
+    timeout_per_point: int = 1800,
     extra_bench_args: Optional[List[str]] = None,
 ) -> List[AgenticBenchPoint]:
     """Replay the trace once per concurrency level against a running server.
@@ -319,6 +459,7 @@ def run_agentic_concurrency_sweep(
     """
     os.makedirs(result_dir, exist_ok=True)
     points: List[AgenticBenchPoint] = []
+    tokenizer = _resolve_local_tokenizer(model_path)
 
     for concurrency in concurrencies:
         conversations = concurrency * conversations_per_slot
@@ -326,42 +467,21 @@ def run_agentic_concurrency_sweep(
         if os.path.exists(output_file):
             os.remove(output_file)
 
-        command = [
-            "python3",
-            "-m",
-            "sglang.benchmark.serving",
-            "--backend",
-            "sglang-oai-chat",
-            "--base-url",
-            base_url,
-            "--model",
-            model_path,
-            "--tokenizer",
-            model_path,
-            "--dataset-name",
-            "agentic-trace",
-            "--dataset-path",
-            trace_path,
-            "--num-prompts",
-            str(conversations),
-            "--max-concurrency",
-            str(concurrency),
-            "--warmup-requests",
-            "1",
-            "--cache-report",
-            "--output-file",
-            output_file,
-            "--trust-remote-code",
-        ]
-        if max_turns is not None:
-            command += ["--agentic-max-turns", str(max_turns)]
-        if output_len is not None:
-            command += ["--sharegpt-output-len", str(output_len)]
-        if extra_bench_args:
-            command += list(extra_bench_args)
+        command = build_agentic_bench_command(
+            base_url=base_url,
+            model_path=model_path,
+            tokenizer=tokenizer,
+            trace_path=trace_path,
+            conversations=conversations,
+            concurrency=concurrency,
+            output_file=output_file,
+            max_turns=max_turns,
+            output_len=output_len,
+            extra_bench_args=extra_bench_args,
+        )
 
         print(f"Running agentic replay at concurrency {concurrency}: {command}")
-        result = subprocess.run(command, text=True, timeout=timeout)
+        result = subprocess.run(command, text=True, timeout=timeout_per_point)
         if result.returncode != 0:
             raise RuntimeError(
                 f"Agentic replay failed at concurrency {concurrency} "
@@ -379,9 +499,9 @@ def run_agentic_concurrency_sweep(
             raise RuntimeError(f"{output_file} contains no benchmark records")
 
         point = _parse_bench_record(records[-1], concurrency, conversations)
-        if point.completed_turns == 0:
+        if point.total_turns == 0:
             raise RuntimeError(
-                f"Agentic replay at concurrency {concurrency} completed no turns"
+                f"Agentic replay at concurrency {concurrency} replayed no turns"
             )
         points.append(point)
 
@@ -399,11 +519,23 @@ def run_agentic_benchmark(
     max_turns: Optional[int] = None,
     output_len: Optional[int] = None,
     server_launch_timeout: int = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    bench_timeout: int = 3600,
+    bench_timeout_per_point: int = 1800,
     env: Optional[dict] = None,
 ) -> List[AgenticBenchPoint]:
     """Launch a server, run the concurrency sweep against it, then tear it down."""
-    trace_path = resolve_agentic_trace(result_dir, spec=trace_spec)
+    # The largest point needs this many distinct conversations; the loader
+    # silently returns fewer rows than asked for if the corpus is smaller, so
+    # grow the synthesized one rather than measure a shorter workload than the
+    # sweep describes. A caller-supplied corpus is taken as-is.
+    needed = max(concurrencies) * conversations_per_slot
+    if trace_spec.num_conversations < needed:
+        trace_spec = replace(trace_spec, num_conversations=needed)
+
+    trace_path = resolve_agentic_trace(
+        result_dir,
+        spec=trace_spec,
+        tokenizer=_load_tokenizer_for_calibration(model_path),
+    )
 
     process = popen_launch_server(
         model=model_path,
@@ -422,7 +554,7 @@ def run_agentic_benchmark(
             conversations_per_slot=conversations_per_slot,
             max_turns=max_turns,
             output_len=output_len,
-            timeout=bench_timeout,
+            timeout_per_point=bench_timeout_per_point,
         )
     finally:
         kill_process_tree(process.pid)
@@ -434,13 +566,13 @@ def generate_agentic_markdown_report(
     """Render a sweep as a markdown table for the GitHub step summary."""
     summary = f"### {header}\n"
     summary += (
-        "| concurrency | conversations | turns | duration (s) | "
+        "| concurrency | conversations | turns (ok/total) | duration (s) | "
         "output throughput (tok/s) | mean TTFT (ms) | p99 TTFT (ms) | "
         "mean ITL (ms) | p99 ITL (ms) | mean E2E (ms) | cache hit (%) | "
         "accept len |\n"
     )
     summary += (
-        "| ----------- | ------------- | ----- | ------------ | "
+        "| ----------- | ------------- | ---------------- | ------------ | "
         "------------------------- | -------------- | ------------- | "
         "------------- | ------------ | ------------- | ------------- | "
         "---------- |\n"
@@ -452,7 +584,8 @@ def generate_agentic_markdown_report(
         )
         accept = f"{p.accept_length:.2f}" if p.accept_length else "n/a"
         summary += (
-            f"| {p.concurrency} | {p.conversations} | {p.completed_turns} | "
+            f"| {p.concurrency} | {p.conversations} | "
+            f"{p.completed_turns}/{p.total_turns} | "
             f"{p.duration_s:.1f} | {p.output_throughput:.2f} | "
             f"{p.mean_ttft_ms:.2f} | {p.p99_ttft_ms:.2f} | "
             f"{p.mean_itl_ms:.2f} | {p.p99_itl_ms:.2f} | "
