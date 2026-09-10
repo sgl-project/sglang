@@ -66,11 +66,6 @@ pub struct GenerateBody {
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
-    /// Override the server-wide streaming frame format for this response.
-    /// `None` preserves the configured default; one value applies to the whole
-    /// response, including every item in a batch.
-    #[serde(default)]
-    pub incremental_streaming_output: Option<bool>,
     /// One params object (broadcast) or a list of them (per item); see
     /// [`SamplingParamsInput`].
     pub sampling_params: Option<SamplingParamsInput>,

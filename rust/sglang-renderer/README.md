@@ -4,11 +4,16 @@ The renderer runs as a separate service. It owns text preprocessing, token decod
 and OpenAI chat/completion responses. The native Rust server accepts token IDs;
 the renderer submits them through the engine's `/generate` endpoint.
 
+The renderer targets the existing `/generate` contract on SGLang main and must
+work with an unmodified Rust server. It accepts both cumulative and incremental
+streaming responses, using the engine's configured format. Additional generate
+request fields or server behavior changes are deferred to separate PRs.
+
 ## Build and run
 
 From the repository root, build the standalone executable separately from the
 Python package. The Python environment must already have the native Rust server
-extension built for this checkout.
+extension built from SGLang main or this checkout.
 
 ```sh
 cargo build --manifest-path rust/Cargo.toml -p sglang-renderer --release --features http --locked
@@ -22,10 +27,10 @@ SGLANG_RUST_SERVER=1 python -m sglang.launch_server \
   --host 127.0.0.1 --port 30001 --skip-server-warmup
 ```
 
-Python's automatic server warmup sends text to `/generate`, which the native
-engine now rejects. Skip that warmup and warm the service through the renderer's
-OpenAI endpoints. Keep scheduler tokenizer initialization enabled for stop and
-minimum-token handling. The engine's `/health_generate` uses a token-ID probe.
+The command skips Python's text-based warmup so it also works with token-ID-only
+engine builds. Warm the service through the renderer's OpenAI endpoints. Keep
+scheduler tokenizer initialization enabled for stop and minimum-token handling.
+The engine's `/health_generate` uses a token-ID probe.
 
 Start the renderer in another terminal. Match the engine's model revision,
 tokenizer, context limit, and sampling defaults. Set tool and reasoning parsers

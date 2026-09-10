@@ -612,6 +612,101 @@ mod suite {
     }
 
     #[tokio::test]
+    async fn cumulative_engine_frames_preserve_completion_text_logprobs_and_usage() {
+        async fn cumulative_generate(
+            Json(body): Json<serde_json::Value>,
+        ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+            assert!(body.get("incremental_streaming_output").is_none());
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["return_logprob"], true);
+            assert_eq!(body["return_text_in_logprobs"], false);
+            let frames = (1..=2).map(|count| {
+                Ok(Event::default().data(serde_json::json!({
+                    "output_ids": vec![104; count],
+                    "meta_info": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": count,
+                        "output_token_logprobs": vec![serde_json::json!([-0.5, 104, null]); count],
+                        "output_top_logprobs": vec![serde_json::json!([[-0.5, 104, null]]); count],
+                        "finish_reason": if count == 2 {
+                            serde_json::json!({"type": "length", "length": 2})
+                        } else { serde_json::Value::Null }
+                    }
+                }).to_string()))
+            });
+            Sse::new(futures::stream::iter(
+                frames.chain([Ok(Event::default().data("[DONE]"))]),
+            ))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let engine = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().route("/generate", post(cumulative_generate)),
+            )
+            .into_future(),
+        );
+        let renderer = Arc::new(RendererService::with_tokenizer(
+            renderer_config(),
+            Arc::new(WordTokenizer),
+            2,
+            2,
+        ));
+        let tokenizer = tiny_tokenizer();
+        let expected_text = String::from(tokenizer.decode(&[104, 104], true).unwrap());
+        let client = HttpGenerateClient::new(format!("http://{address}"), tokenizer).unwrap();
+        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+
+        for stream in [false, true] {
+            let response = post_request(
+                app.clone(),
+                "/v1/completions",
+                &serde_json::json!({
+                    "model": "model", "prompt": "hello", "max_tokens": 2,
+                    "logprobs": 1, "stream": stream,
+                    "stream_options": {"include_usage": true}
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let frames: Vec<serde_json::Value> = if stream {
+                let body = std::str::from_utf8(&bytes).unwrap();
+                assert!(body.ends_with("data: [DONE]\n\n"));
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect()
+            } else {
+                vec![serde_json::from_slice(&bytes).unwrap()]
+            };
+            let choices: Vec<_> = frames
+                .iter()
+                .flat_map(|frame| frame["choices"].as_array().unwrap())
+                .collect();
+            let text: String = choices
+                .iter()
+                .map(|choice| choice["text"].as_str().unwrap())
+                .collect();
+            let logprobs: Vec<_> = choices
+                .iter()
+                .flat_map(|choice| choice["logprobs"]["token_logprobs"].as_array().unwrap())
+                .collect();
+            assert_eq!(text, expected_text);
+            assert_eq!(
+                logprobs,
+                [&serde_json::json!(-0.5), &serde_json::json!(-0.5)]
+            );
+            assert_eq!(choices.last().unwrap()["finish_reason"], "length");
+            assert_eq!(frames.last().unwrap()["usage"]["completion_tokens"], 2);
+        }
+        engine.abort();
+    }
+
+    #[tokio::test]
     async fn inference_and_render_share_request_preparation() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -679,7 +774,6 @@ mod suite {
         rendered["stream"] = serde_json::Value::Bool(true);
         rendered["return_text_in_logprobs"] = serde_json::Value::Bool(false);
         rendered["sampling_params"]["stop"] = serde_json::json!([]);
-        rendered["incremental_streaming_output"] = serde_json::Value::Bool(true);
         assert_eq!(engine_request, rendered);
 
         let batch = serde_json::json!({

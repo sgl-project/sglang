@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_stream::stream;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{
     GenerateRequest, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
@@ -22,15 +22,6 @@ pub struct HttpGenerateClient {
     health_url: reqwest::Url,
     health_timeout: Duration,
     tokenizer: dynamo_tokenizers::Tokenizer,
-}
-
-/// Renderer-to-engine framing options stay private to this HTTP transport and
-/// do not become part of the model server's `/generate` contract.
-#[derive(Serialize)]
-struct EngineGenerateBody<'a> {
-    #[serde(flatten)]
-    request: &'a GenerateRequest,
-    incremental_streaming_output: bool,
 }
 
 impl HttpGenerateClient {
@@ -114,10 +105,7 @@ impl HttpGenerateClient {
         let response = self
             .client
             .post(self.generate_url.clone())
-            .json(&EngineGenerateBody {
-                request: &request,
-                incremental_streaming_output: true,
-            })
+            .json(&request)
             .send()
             .await
             .map_err(|error| unavailable(format!("engine request failed: {error}")))?;
@@ -656,15 +644,8 @@ fn group_logprobs(
     top_values: WireTopLogprobs,
     kind: &str,
 ) -> Result<Vec<PositionLogprobs>, ResponseError> {
-    if !top_values.is_empty() && top_values.len() != values.len() {
-        return Err(internal(format!(
-            "engine returned {} {kind} top-logprob positions for {} selected-token positions",
-            top_values.len(),
-            values.len()
-        )));
-    }
-
-    if top_values.is_empty() {
+    // P/D can send a single null position when top logprobs are disabled.
+    if top_values.iter().all(Option::is_none) {
         return Ok(values
             .into_iter()
             .map(|token| PositionLogprobs {
@@ -672,6 +653,14 @@ fn group_logprobs(
                 top: Vec::new(),
             })
             .collect());
+    }
+
+    if top_values.len() != values.len() {
+        return Err(internal(format!(
+            "engine returned {} {kind} top-logprob positions for {} selected-token positions",
+            top_values.len(),
+            values.len()
+        )));
     }
 
     Ok(values
@@ -946,6 +935,34 @@ mod tests {
     }
 
     #[test]
+    fn engine_frame_preserves_selected_logprobs_with_absent_top_positions() {
+        let output = parse_engine_frame(
+            r#"{
+                "output_ids":[12095,13],
+                "meta_info":{
+                    "prompt_tokens":5,
+                    "completion_tokens":2,
+                    "output_token_logprobs":[
+                        [-0.42652416229248047,12095,null],
+                        [-0.7053262591362,13,null]
+                    ],
+                    "output_top_logprobs":[null]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(output.token_ids, [12095, 13]);
+        assert_eq!(
+            output.extras.unwrap().output_logprobs,
+            [
+                position(12095, -0.42652416, &[]),
+                position(13, -0.70532626, &[])
+            ]
+        );
+    }
+
+    #[test]
     fn engine_frame_rejects_misaligned_logprob_positions() {
         let error = parse_engine_frame(
             r#"{
@@ -1085,11 +1102,13 @@ mod tests {
         ]))
     }
 
-    async fn incremental_generate() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    async fn streaming_generate(
+        State(cumulative): State<bool>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
         let frame = |completion_tokens, finish_reason: serde_json::Value| {
             Event::default().data(
                 serde_json::json!({
-                    "output_ids": [104],
+                    "output_ids": if cumulative { vec![104; completion_tokens] } else { vec![104] },
                     "meta_info": {
                         "prompt_tokens": 1,
                         "completion_tokens": completion_tokens,
@@ -1201,49 +1220,53 @@ mod tests {
         assert_eq!(request["rid"], "client-request");
         assert_eq!(request["input_ids"], serde_json::json!([65]));
         assert_eq!(request["stream"], true);
-        assert_eq!(request["incremental_streaming_output"], true);
+        assert!(request.get("incremental_streaming_output").is_none());
         assert_eq!(request["return_text_in_logprobs"], false);
         server.abort();
     }
 
     #[tokio::test]
-    async fn incremental_engine_frames_are_forwarded_once() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(
-            axum::serve(
-                listener,
-                Router::new().route("/generate", post(incremental_generate)),
-            )
-            .into_future(),
-        );
+    async fn engine_frames_are_forwarded_once() {
+        for cumulative in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/generate", post(streaming_generate))
+                        .with_state(cumulative),
+                )
+                .into_future(),
+            );
 
-        let client =
-            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
-        let mut events = client
-            .generate(
-                TokenIdsRequest {
-                    rid: "incremental".into(),
-                    input_ids: vec![65],
-                    options: GenerationOptions::default(),
-                    metadata: Default::default(),
-                }
-                .into(),
-            )
-            .await
-            .unwrap();
+            let client =
+                HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
+            let mut events = client
+                .generate(
+                    TokenIdsRequest {
+                        rid: "incremental".into(),
+                        input_ids: vec![65],
+                        options: GenerationOptions::default(),
+                        metadata: Default::default(),
+                    }
+                    .into(),
+                )
+                .await
+                .unwrap();
 
-        let first = events.next().await.unwrap().unwrap();
-        assert!(first.finish_reason.is_none());
-        assert_eq!(first.token_ids, [104]);
-        assert_eq!(first.completion_tokens, 1);
+            let first = events.next().await.unwrap().unwrap();
+            assert!(first.finish_reason.is_none());
+            assert_eq!(first.token_ids, [104]);
+            assert_eq!(first.completion_tokens, 1);
 
-        let second = events.next().await.unwrap().unwrap();
-        assert!(second.finish_reason.is_some());
-        assert_eq!(second.token_ids, [104]);
-        assert_eq!(second.completion_tokens, 1);
-        assert!(events.next().await.is_none());
-        server.abort();
+            let second = events.next().await.unwrap().unwrap();
+            assert!(second.finish_reason.is_some());
+            assert_eq!(second.token_ids, [104]);
+            assert_eq!(second.completion_tokens, 1);
+            assert!(events.next().await.is_none());
+            server.abort();
+        }
     }
 
     struct DropNotice(Option<tokio::sync::oneshot::Sender<()>>);
