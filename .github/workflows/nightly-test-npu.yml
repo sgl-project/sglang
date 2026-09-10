@@ -360,7 +360,8 @@ jobs:
 
   nightly-acc-16-npu-a3-cann910:
     name: nightly-acc-16-npu-a3-cann910
-    if: ${{ false }}
+    # Enabled: run only the cann910 w8a8 8p GPQA accuracy case (the only
+    # test registered to this suite).
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -385,28 +386,29 @@ jobs:
       matrix:
         test_config:
           # glm5_1 performance tests
-          - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-          # deepseek_v4_flash performance tests
-          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
-          #   prefill_size: 1
-          #   decode_size: 1
+          # Disable test case temporarily due to feature refactor in PR #38293.
+          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
+          #   prefill_size: 2
+          #   decode_size: 2
           #   router_size: 1
-          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
+          #   test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
           #   test_type: 'perf'
           #   prefill_decode_deployment: 'separation'
+          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash performance tests
+          - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
