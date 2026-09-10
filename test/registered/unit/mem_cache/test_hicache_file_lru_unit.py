@@ -181,6 +181,28 @@ class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
         self.assertEqual(b._evictor._total_bytes, 0)
 
 
+class TestLongFileNames(HiCacheFileLRUTestBase):
+    """A write must not fail because its temp name outgrows NAME_MAX."""
+
+    def test_set_near_name_max(self):
+        # A local snapshot path as the model name plus the longest DeepSeek-V4
+        # sidecar pool name puts the final ".bin" name at ~200 chars; the temp
+        # file must stay writable regardless of how long the final name is.
+        model = "/" + "/".join(["snapshots-" + "a" * 20] * 5)
+        b = self.make_backend(is_mla=True, model=model, subdir="long")
+        key = "f" * 64 + ".deepseek_v4_c1_indexer_scale"
+        final_name = f"{b._get_suffixed_key(key)}.bin"
+        self.assertGreater(len(final_name), 200)
+        self.assertLessEqual(len(final_name), 255)
+        self.assertTrue(b.set(key, _t(64, fill=7)))
+        self.assertTrue(b.exists(key))
+        out = b.get(key, _t(64))
+        self.assertIsNotNone(out)
+        self.assertTrue(torch.equal(out, _t(64, fill=7)))
+        leftovers = [f for f in os.listdir(b.file_path) if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+
 class TestCapBasedEviction(HiCacheFileLRUTestBase):
     def test_basic_lru_evicts_oldest(self):
         b = self.make_backend(max_size="300", eviction_ratio=1.0)
