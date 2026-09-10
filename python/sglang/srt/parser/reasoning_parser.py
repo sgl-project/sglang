@@ -1076,9 +1076,8 @@ class GraniteThinkingDetector(BaseReasoningFormatDetector):
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         ret = self._detect_and_parse_impl(text)
         think_end_present = self.think_end_token in text
-        # HF plugin swaps when the parsed content is absent: that covers text
-        # ending exactly at </think>, but not newline-only content, which the
-        # plugin strips itself and keeps as empty content.
+        # HF plugin swaps when parsed content is absent (text ends at </think>);
+        # newline-only content the plugin strips itself, without swapping.
         content_absent = think_end_present and not ret.normal_text
         if think_end_present and ret.normal_text:
             ret.normal_text = ret.normal_text.lstrip("\n")

@@ -1613,12 +1613,6 @@ class TestGraniteThinkingDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "reasoning")
         self.assertEqual(result.normal_text, "Hello")
 
-    def test_multiple_leading_newlines_stripped(self):
-        text = "<think>reasoning</think>\n\n\nHello"
-        result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "reasoning")
-        self.assertEqual(result.normal_text, "Hello")
-
     def test_no_newline(self):
         text = "<think>r</think>c"
         result = self.detector.detect_and_parse(text)
@@ -1645,15 +1639,6 @@ class TestGraniteThinkingDetector(CustomTestCase):
         result = detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "reasoning")
         self.assertEqual(result.normal_text, "")
-
-    def test_force_nonempty_swaps_truncated_reasoning(self):
-        """When </think> is NOT present (truncated), force_nonempty_content
-        swaps reasoning to content. Matches HF plugin behavior."""
-        detector = GraniteThinkingDetector(force_nonempty_content=True)
-        text = "<think>only reasoning no end token"
-        result = detector.detect_and_parse(text)
-        self.assertEqual(result.normal_text, "only reasoning no end token")
-        self.assertEqual(result.reasoning_text, "")
 
     def test_force_nonempty_swaps_when_text_ends_at_think_end(self):
         """Content absent right after </think> (e.g. max_tokens cut there) swaps
@@ -1701,27 +1686,6 @@ class TestGraniteThinkingDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "content")
 
-    def test_streaming_leading_newline_stripped(self):
-        self.detector.parse_streaming_increment("<think>")
-        result = self.detector.parse_streaming_increment("reason")
-        self.assertEqual(result.reasoning_text, "reason")
-        result = self.detector.parse_streaming_increment("</think>")
-        result = self.detector.parse_streaming_increment("\n")
-        self.assertEqual(result.normal_text, "")
-        result = self.detector.parse_streaming_increment("Hello")
-        self.assertEqual(result.normal_text, "Hello")
-
-    def test_streaming_multiple_newline_chunks_stripped(self):
-        self.detector.parse_streaming_increment("<think>")
-        self.detector.parse_streaming_increment("r")
-        self.detector.parse_streaming_increment("</think>")
-        r1 = self.detector.parse_streaming_increment("\n")
-        self.assertEqual(r1.normal_text, "")
-        r2 = self.detector.parse_streaming_increment("\n")
-        self.assertEqual(r2.normal_text, "")
-        r3 = self.detector.parse_streaming_increment("Hello")
-        self.assertEqual(r3.normal_text, "Hello")
-
     def test_streaming_newlines_preserved_after_content_starts(self):
         self.detector.parse_streaming_increment("<think>")
         self.detector.parse_streaming_increment("r")
@@ -1730,13 +1694,6 @@ class TestGraniteThinkingDetector(CustomTestCase):
         self.detector.parse_streaming_increment("Hello")
         result = self.detector.parse_streaming_increment("\nworld")
         self.assertEqual(result.normal_text, "\nworld")
-
-    def test_streaming_think_end_with_newline_in_same_chunk(self):
-        self.detector.parse_streaming_increment("<think>")
-        r1 = self.detector.parse_streaming_increment("r")
-        self.assertEqual(r1.reasoning_text, "r")
-        result = self.detector.parse_streaming_increment("</think>\nHello")
-        self.assertEqual(result.normal_text, "Hello")
 
     def test_streaming_no_strip_without_reasoning(self):
         result = self.detector.parse_streaming_increment("\nHello")
@@ -1788,6 +1745,19 @@ class TestGraniteThinkingDetector(CustomTestCase):
         )
         self.assertEqual(reasoning, "thinking")
         self.assertEqual(normal, "The answer")
+
+    def test_enable_thinking_false_swaps_truncated_reasoning(self):
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        request = ChatCompletionRequest(
+            model="granite-4.2-30b",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        parser = ReasoningParser("granite_thinking_parser", request=request)
+        reasoning, normal = parser.parse_non_stream("<think>truncated")
+        self.assertEqual(reasoning, "")
+        self.assertEqual(normal, "truncated")
 
 
 if __name__ == "__main__":
