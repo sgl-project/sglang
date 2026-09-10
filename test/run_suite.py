@@ -156,6 +156,13 @@ NIGHTLY_SUITES = {
         "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
+        # MI455x (gfx1250) bring-up, gated on the accuracy the MI455x cookbook
+        # measured on real hardware. One suite per model so each can become its
+        # own runner job.
+        "nightly-amd-1-gpu-mi45x-cookbook-gpt-oss",
+        "nightly-amd-1-gpu-mi45x-cookbook-dsr1",
+        "nightly-amd-2-gpu-mi45x-cookbook-dsv4-flash",
+        "nightly-amd-1-gpu-mi45x-cookbook-qwen35",
     ],
     HWBackend.MUSA: [
         "nightly-musa-1-gpu",
