@@ -74,6 +74,38 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 5. `SGLANG_MLX_FUSE_SWIGLU=1` - Enables the use of fused Swish-Gated Linear Unit kernel (disabled by default)
 6. `SGLANG_MLX_CLEAR_CACHE_STEPS=256` - Sets the number of decode steps before clearing the MLX cache (256 by default)
 
+### Sampling penalties
+
+Enable MLX-native sampling with `--mlx-enable-sampling`, then pass sampling
+penalties in the request:
+
+```bash
+SGLANG_USE_MLX=1 python -m sglang.launch_server \
+  --model-path <MODEL_ID_OR_PATH> \
+  --mlx-enable-sampling \
+  --disable-cuda-graph
+
+curl http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Write a short paragraph about apples.",
+    "sampling_params": {
+      "temperature": 0.7,
+      "max_new_tokens": 64,
+      "frequency_penalty": 1.0,
+      "presence_penalty": 0.5,
+      "repetition_penalty": 1.1
+    }
+  }'
+```
+
+Frequency and presence penalties are applied additively from the current
+request's generated-token counts, followed by repetition-penalty scaling for
+tokens already generated. Only generated output tokens are counted, so prompt
+and cached-prefix tokens are excluded. Penalty state remains lazy across
+overlap-scheduled decode steps, and this feature does not require a custom Metal
+kernel.
+
 ## Quantization
 
 The MLX backend supports two quantization paths on Apple Silicon:
