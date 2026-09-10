@@ -27,6 +27,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4A16LinearMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -338,6 +339,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         config = config.get_mtp_config()
         self.config = config
         self.quant_config = quant_config
+        self._owns_lm_head = False
         # Required for parent's load_weights
         self.pp_group = get_pp_group()
 
@@ -385,13 +387,56 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        weights = (
-            (name.removeprefix("language_model."), weight) for name, weight in weights
+        has_mtp_layers = False
+        has_target_layers = False
+        head_weights = set()
+
+        def normalized_weights():
+            nonlocal has_mtp_layers, has_target_layers
+            for name, weight in weights:
+                name = name.removeprefix("language_model.")
+                has_mtp_layers |= name.startswith("mtp.layers.")
+                has_target_layers |= name.startswith(
+                    ("backbone.layers.", "model.layers.")
+                )
+                if name.startswith("lm_head."):
+                    head_weights.add(name)
+                yield name, weight
+
+        # Inspect names while streaming: buffering a full target checkpoint here
+        # would double its host-memory footprint during embedded MTP loading.
+        super().load_weights(normalized_weights(), is_mtp=True)
+        self._owns_lm_head = bool(
+            has_mtp_layers and not has_target_layers and head_weights
         )
-        super().load_weights(weights, is_mtp=True)
+        if self._owns_lm_head:
+            expected = {
+                name
+                for name, _ in self.named_parameters()
+                if name.startswith("lm_head.")
+            }
+            if "lm_head.input_scale" in expected and isinstance(
+                self.lm_head.quant_method, ModelOptNvFp4A16LinearMethod
+            ):
+                # NVFP4A16 accepts this loader placeholder but never uses it.
+                expected.remove("lm_head.input_scale")
+            missing = (expected | {"lm_head.weight"}) - head_weights
+            if missing:
+                raise ValueError(
+                    f"Incomplete standalone MTP lm_head: missing {sorted(missing)}"
+                )
+
+    def set_embed_and_head(self, embed, head):
+        if not self._owns_lm_head:
+            return super().set_embed_and_head(embed, head)
+        # Standalone MTP checkpoints can supply a differently quantized head.
+        # Share only the input embeddings; retain the entire loaded head module.
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     def set_lm_head_from_target(self, target_lm_head: nn.Module) -> None:
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings or self._owns_lm_head:
             return
         self.lm_head = target_lm_head
 
