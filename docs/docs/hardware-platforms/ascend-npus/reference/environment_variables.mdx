@@ -133,6 +133,16 @@ This document provides a list of commonly used environment variables and aims to
       <td></td>
     </tr>
     <tr>
+      <td><code>ASCEND_MF_TRANSFER_PROTOCOL</code></td>
+      <td>Transfer protocol used by MemFabric during PD disaggregation.<br/> One of <code>sdma</code> (default), <code>device_rdma</code> (required on A2), <br/>or <code>host_rdma</code>. An unsupported value falls back to <code>sdma</code> <br/>with a warning.</td>
+      <td><code>sdma</code></td>
+    </tr>
+    <tr>
+      <td><code>ASCEND_MF_NIC</code></td>
+      <td>The NIC endpoint (<code>IP:PORT</code>) used by the transfer engine. Only effective<br/> with <code>ASCEND_MF_TRANSFER_PROTOCOL=host_rdma</code>; each NPU rank listens<br/> on <code>PORT + npu_id * 100</code> so that ranks do not conflict.</td>
+      <td></td>
+    </tr>
+    <tr>
       <td><code>ASCEND_LAUNCH_BLOCKING</code></td>
       <td>Controls whether synchronous mode is enabled during operator execution. <a href="https://www.hiascend.com/document/detail/zh/Pytorch/710/comref/Envvariables/Envir_006.html">Detail</a></td>
       <td><code>0</code></td>
