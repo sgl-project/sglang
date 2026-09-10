@@ -1271,6 +1271,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "return_sampling_mask only supports DisallowedTokensLogitsProcessor "
                     "among custom logit processors."
                 )
+            if obj.return_logprob and get_exec().dllm.dllm_algorithm is not None:
+                # `process_batch_result_dllm` has no input-logprob stage,
+                # so the streamer would answer with empty arrays.
+                raise ValueError(
+                    "return_logprob is not supported with diffusion LLM "
+                    "inference (--dllm-algorithm): dLLM denoises a masked block "
+                    "per step and does not produce per-token logprobs."
+                )
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

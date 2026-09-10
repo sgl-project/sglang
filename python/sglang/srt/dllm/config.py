@@ -5,12 +5,30 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
 
+def _require_positive_int(name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"dLLM {name} must be a positive integer, got {value!r}")
+
+
+def _validate_multi_block_prefill_backend(
+    *, block_size: int, prefill_block_size: int, prefill_attention_backend: str
+) -> None:
+    if prefill_block_size > block_size and prefill_attention_backend != "flashinfer":
+        raise ValueError(
+            "dLLM multi-block prefill currently requires the FlashInfer "
+            "prefill attention backend: "
+            f"{prefill_block_size=}, {block_size=}, "
+            f"{prefill_attention_backend=}"
+        )
+
+
 class DllmConfig:
     def __init__(
         self,
         algorithm: str,
         algorithm_config: dict[str, Any],
         block_size: int,
+        prefill_block_size: int,
         mask_id: int,
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
@@ -18,6 +36,7 @@ class DllmConfig:
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
+        self.prefill_block_size = prefill_block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
@@ -64,15 +83,38 @@ class DllmConfig:
                     "`pip install pyyaml`"
                 )
             with open(cfg.dllm_algorithm_config, "r") as f:
-                algorithm_config = yaml.safe_load(f)
+                algorithm_config = yaml.safe_load(f) or {}
 
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
+
+        _require_positive_int("block_size", block_size)
+
+        # Preserve the previous fixed-block behavior unless the user explicitly
+        # opts into larger prefill chunks.
+        prefill_block_size = algorithm_config.get("prefill_block_size", block_size)
+        if cfg.dllm_prefill_block_size is not None:
+            prefill_block_size = cfg.dllm_prefill_block_size
+        _require_positive_int("prefill_block_size", prefill_block_size)
+        if prefill_block_size < block_size or prefill_block_size % block_size != 0:
+            raise ValueError(
+                "dllm prefill_block_size must be a positive multiple of block_size "
+                f"and no smaller than it: {prefill_block_size=}, {block_size=}"
+            )
+        # Each dLLM step needs one complete block; reject smaller budgets
+        # to avoid unschedulable requests and scheduler livelock.
+        max_prefill_tokens = cfg.max_prefill_tokens
+        if max_prefill_tokens is not None and max_prefill_tokens < block_size:
+            raise ValueError(
+                "max_prefill_tokens must be at least the dLLM block_size: "
+                f"{max_prefill_tokens=}, {block_size=}"
+            )
 
         return DllmConfig(
             algorithm=cfg.dllm_algorithm,
             algorithm_config=algorithm_config,
             block_size=block_size,
+            prefill_block_size=prefill_block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
             first_done_first_out_mode=cfg.dllm_fdfo,

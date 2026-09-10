@@ -218,6 +218,10 @@ def check_server_args(server_args: Any):
     # Check two batch overlap backend requirement.
     check_two_batch_overlap(server_args)
 
+    check_dllm_speculative_decoding(server_args)
+
+    check_dllm_deterministic_inference(server_args)
+
     # Check communications compression
     if cfg.enable_quant_communications and cfg.tp_size == 1:
         raise ValueError("Communications quantization is only used with tp_size != 1")
@@ -438,12 +442,50 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def check_dllm_speculative_decoding(server_args: Any):
+    """dLLM runs its own denoising loop, so a draft/verify path has no meaning.
+
+    It also keeps `max_running_requests` still after memory sizing: the
+    speculative handlers fill it with 48 at a later slot, which would push
+    prefill totals past the dLLM graph buckets already sized and reserved for.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.dllm_algorithm is not None and cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--speculative-algorithm is not supported with diffusion LLM "
+            "inference (--dllm-algorithm): dLLM decodes a masked block per "
+            "step rather than verifying draft tokens."
+        )
+
+
+def check_dllm_deterministic_inference(server_args: Any):
+    """dLLM aligns prefill truncation to the denoising block, not the split tile.
+
+    `add_one_req` asserts `truncation_align_size is None` for dLLM, so without
+    this check the deterministic alignment would be silently ignored rather
+    than refused.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.dllm_algorithm is not None and cfg.enable_deterministic_inference:
+        raise ValueError(
+            "--enable-deterministic-inference is not supported with diffusion "
+            "LLM inference (--dllm-algorithm): dLLM aligns prefill truncation "
+            "to the denoising block size, which cannot also honour the "
+            "deterministic split-tile alignment."
+        )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
     # the other ubatch's compute), which requires DP attention. Enabling it
     # there needs no extra opt-in env flag.
     cfg = resolving_view(server_args)
+    if cfg.enable_two_batch_overlap and cfg.dllm_algorithm is not None:
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported with diffusion LLM "
+            "inference (--dllm-algorithm)."
+        )
 
     if (
         cfg.enable_two_batch_overlap

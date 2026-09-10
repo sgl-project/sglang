@@ -32,8 +32,10 @@ class SchedulerDllmMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
-        if self.enable_priority_preemption:
-            running_batch.batch_is_full = False
+        # `batch_is_full` is a per-round signal here: dLLM requests never enter
+        # `running_batch`, and a stale value would block re-admitting the
+        # request whose KV a retraction just freed.
+        running_batch.batch_is_full = False
 
         # Early exit if batch is full or no requests available
         if self._should_skip_prefill(running_batch=running_batch):
@@ -42,19 +44,46 @@ class SchedulerDllmMixin:
         running_bs = len(running_batch.reqs)
         self.policy.calc_priority(self.waiting_queue)
 
-        # Create prefill adder with resource constraints
-        adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
-
-        # Initialize DLLM manager and transfer requests
-        self.dllm_manager.init_next_round()
+        # Admit new requests before preparing every managed request for this
+        # round, so phase selection sees cache-matched incoming requests too.
         self._fetch_waiting_reqs()
+        self.dllm_manager.init_next_round(self.tree_cache)
 
-        # Process batches
-        forward_mode = self._process_dllm_batches(adder, running_batch=running_batch)
+        # Attempt one homogeneous phase at a time, prefill first. Each attempt
+        # builds its own adder so the per-round DLLM budget stays phase-aware,
+        # and a phase that cannot allocate falls through to the next one instead
+        # of ending the round.
+        adder = None
+        forward_mode = None
+        for is_prefill in self._dllm_phase_order():
+            # A failed probe must not leave `batch_is_full` set for the phase
+            # attempted after it.
+            running_batch.batch_is_full = False
+            candidate = self._create_dllm_prefill_adder(
+                running_bs, running_batch=running_batch, is_prefill=is_prefill
+            )
+            # Pure prefill intentionally uses normal EXTEND mode: it does not
+            # contain masks and must not enter the fixed-block DLLM CUDA graph
+            # path. Decode keeps DLLM_EXTEND and its fixed block invariant.
+            candidate_mode = self._process_dllm_batches(
+                candidate, running_batch=running_batch, is_prefill=is_prefill
+            )
+            if candidate.can_run_list:
+                adder, forward_mode = candidate, candidate_mode
+                break
+
+            # Empty today: dLLM batches never enter `running_batch`, so
+            # `preempt_to_schedule` finds nothing to take. Drained anyway --
+            # only the winning adder reaches `_update_state_for_batch`, so a
+            # probe that did preempt would strand its victims.
+            for preempted_req in candidate.preempt_list:
+                self._add_request_to_queue(preempted_req)
+
+        if adder is None:
+            self._retract_or_abort_dllm_req(running_batch)
+            return None
 
         can_run_list = adder.can_run_list
-        if not can_run_list:
-            return None
 
         # Record metrics and update state
         set_time_batch(can_run_list, "set_forward_entry_time")
@@ -66,6 +95,90 @@ class SchedulerDllmMixin:
         )
         return new_batch
 
+    def _dllm_phase_order(self: Scheduler) -> List[bool]:
+        """Phases to attempt this round, as `is_prefill` flags.
+
+        Prefill keeps priority, but decode is a real fallback rather than an
+        existence check: only an actual `PrefillAdder` pass can tell a blocked
+        phase from a runnable one, because an FDFO decode reuses retained KV and
+        can run with zero fresh KV budget.
+
+        Re-querying the manager inside `_process_dllm_batches` is safe: the only
+        writer of `dllm_phase` during an attempt is `process_dllm_incoming_reqs`,
+        which promotes a request to STAGING_* solely when it entered
+        `can_run_list` -- and that ends the loop.
+        """
+        order = []
+        if self.dllm_manager.get_prefill_requests():
+            order.append(True)
+        if self.dllm_manager.get_decode_requests():
+            order.append(False)
+        return order
+
+    def _retract_or_abort_dllm_req(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> None:
+        """Break a no-progress round by giving KV back, not by killing a request.
+
+        Mirrors the non-dLLM policy in `ScheduleBatch.retract_decode`: retract
+        first, and abort only a request that already gave everything back and
+        still cannot be admitted with the pool to itself.
+        """
+        if not running_batch.is_empty():
+            # Never fires today (see the probe loop in `get_new_batch_dllm`).
+            # Anything decoding alongside frees KV on its own, so this round is
+            # not terminal evidence of anything.
+            return
+
+        # Every non-empty phase was attempted and admitted nothing, so every
+        # staging request was rejected by `add_dllm_staging_req` (it either
+        # appends to `can_run_list` or returns NO_TOKEN without side effects).
+        # Retract the first one in manager order to keep the victim
+        # deterministic and independent of phase priority.
+        victim = next(
+            (
+                req
+                for req in self.dllm_manager.waiting_queue
+                if req.dllm_phase
+                in (DllmReqPhase.STAGING_PREFILL, DllmReqPhase.STAGING_DECODE)
+            ),
+            None,
+        )
+        if victim is not None:
+            self._retract_dllm_req(victim)
+            return
+
+        # Nothing is admitted, so no dLLM KV is left to reclaim. A lone request
+        # that was already retracted and still cannot be admitted with the pool
+        # to itself can never run; abort it instead of spinning forever. Any
+        # other shape may just be waiting on policy rather than on memory.
+        managed = self.dllm_manager.waiting_queue
+        if len(managed) == 1 and managed[0].is_retracted:
+            logger.error(
+                "Aborting dLLM request %s: it cannot be admitted even after "
+                "retraction released all dLLM KV",
+                managed[0].rid,
+            )
+            self._abort_dllm_req_exact(managed[0])
+
+    def _retract_dllm_req(self: Scheduler, req: Req) -> None:
+        """Release a staging request's KV and re-queue it for admission.
+
+        The request keeps its place in `dllm_manager.waiting_queue` and its
+        decoded `output_ids`; only the KV, and the unresolved FDFO block that KV
+        backed, are given up. Unlike `_abort_dllm_req_exact` this is invisible to
+        the client.
+        """
+        logger.info(
+            "Retracting dLLM request %s: no managed phase can allocate an "
+            "aligned extend",
+            req.rid,
+        )
+        self._cleanup_dllm_req(req, is_abort=False)
+        req.reset_for_retract()
+        req.reset_dllm_for_retract()
+        req.time_stats.set_retract_time()
+
     def process_batch_result_dllm(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -73,6 +186,17 @@ class SchedulerDllmMixin:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+
+        # Pure prefill only commits prompt KV. It produces neither a denoising
+        # state nor generated tokens, including when FDFO is enabled.
+        if batch.is_dllm_prefill:
+            self.metrics_reporter.report_prefill_stats(
+                batch=batch,
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=result.can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+            return
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
         assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
@@ -188,7 +312,7 @@ class SchedulerDllmMixin:
         return False
 
     def _create_dllm_prefill_adder(
-        self: Scheduler, running_bs: int, running_batch: ScheduleBatch
+        self: Scheduler, running_bs: int, running_batch: ScheduleBatch, is_prefill: bool
     ) -> PrefillAdder:
         """Create a prefill adder configured for DLLM scheduling."""
         return PrefillAdder(
@@ -203,17 +327,18 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
+            dllm_is_prefill=is_prefill,
         )
 
     def _process_dllm_batches(
-        self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
+        self: Scheduler,
+        adder: PrefillAdder,
+        running_batch: ScheduleBatch,
+        is_prefill: bool,
     ) -> ForwardMode:
         """Process prefill or decode batches for DLLM."""
-        forward_mode = ForwardMode.DLLM_EXTEND
-
-        # Try prefill batch first
-        prefill_reqs = self.dllm_manager.get_prefill_requests()
-        if prefill_reqs:
+        if is_prefill:
+            prefill_reqs = self.dllm_manager.get_prefill_requests()
             self._process_batch_by_phase(
                 adder,
                 prefill_reqs,
@@ -221,8 +346,8 @@ class SchedulerDllmMixin:
                 DllmReqPhase.INCOMING_PREFILL,
                 running_batch=running_batch,
             )
+            return ForwardMode.EXTEND
         else:
-            # Fall back to decode batch
             decode_reqs = self.dllm_manager.get_decode_requests()
             self._process_batch_by_phase(
                 adder,
@@ -232,7 +357,7 @@ class SchedulerDllmMixin:
                 running_batch=running_batch,
             )
 
-        return forward_mode
+            return ForwardMode.DLLM_EXTEND
 
     def _process_batch_by_phase(
         self,
@@ -285,6 +410,7 @@ class SchedulerDllmMixin:
             self.enable_overlap,
             self.spec_algorithm,
             dllm_config=self.dllm_config,
+            is_dllm_prefill=forward_mode == ForwardMode.EXTEND,
         )
         new_batch.prepare_for_extend()
         new_batch.forward_mode = forward_mode
@@ -322,13 +448,24 @@ class SchedulerDllmMixin:
                 ):
                     break
 
-            # Prepare and add request
-            req.init_next_round_input(self.tree_cache)
+            # The request was cache-matched and phase-classified before this
+            # homogeneous batch was selected.
+            # truncation_align_size is None by construction: add_one_req asserts
+            # it, and check_dllm_deterministic_inference rejects the only setter.
             res = adder.add_one_req(
                 req,
                 has_chunked_req=True,
-                truncation_align_size=self.truncation_align_size,
+                truncation_align_size=None,
             )
+
+            # Incoming is an admission state. Once this request owns a slot in
+            # the outgoing batch, subsequent rounds must treat it as staging
+            # rather than preparing its input a second time.
+            if req in adder.can_run_list:
+                if req.dllm_phase == DllmReqPhase.INCOMING_PREFILL:
+                    req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+                elif req.dllm_phase == DllmReqPhase.INCOMING_DECODE:
+                    req.dllm_phase = DllmReqPhase.STAGING_DECODE
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -340,13 +477,61 @@ class SchedulerDllmMixin:
     def process_dllm_staging_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
-        """Process staging DLLM requests with resource allocation."""
-        for req in reqs:
-            res = adder.add_dllm_staging_req(req)
-            if res == AddReqResult.NO_TOKEN:
-                return res
+        """Process staging DLLM requests with resource allocation.
 
-        return AddReqResult.CONTINUE
+        Scans the whole phase rather than stopping at the first rejection: a
+        later request may reuse retained FDFO KV even when this one cannot
+        allocate a fresh block. Deciding what to do about a phase that admitted
+        nothing belongs to `get_new_batch_dllm`, which is the only caller that
+        can see every phase.
+        """
+        result = AddReqResult.CONTINUE
+        for req in reqs:
+            if adder.add_dllm_staging_req(req) == AddReqResult.NO_TOKEN:
+                result = AddReqResult.NO_TOKEN
+
+        return result
+
+    def _cleanup_dllm_req(self: Scheduler, req: Req, *, is_abort: bool) -> None:
+        if is_abort:
+            # Cancels the in-flight prefetch and staged host hold keyed by
+            # this rid. A retracted request keeps its rid and re-enters
+            # admission, so it would only pay for that work twice;
+            # `ScheduleBatch.retract_decode` does not touch it either.
+            self._release_aborted_request(req.rid)
+
+        # `Req.kv` is always a ReqKvInfo, so every field below is present.
+        kv = req.kv
+        if kv.holds_kv or kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            return
+
+        # Only a STAGING_* request owns anything here: it was stashed by
+        # cache_unfinished_req, which locked `last_node` before the req slot was
+        # freed. An INCOMING_* one only ran match_prefix, which takes no ref, so
+        # releasing would drop a ref it never took and unprotect a live prefix.
+        if req.dllm_phase not in (
+            DllmReqPhase.STAGING_PREFILL,
+            DllmReqPhase.STAGING_DECODE,
+        ):
+            return
+
+        uncached = req.prefix_indices[kv.cache_protected_len :]
+        if len(uncached):
+            self.token_to_kv_pool_allocator.free(uncached)
+        if req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
+            req.last_node = None
+        kv.mark_kv_released()
+
+    def _abort_dllm_req_exact(self: Scheduler, req: Req) -> None:
+        # Same abort payload as every other abort path: `_make_abort_req`
+        # attaches the weight-version spans the tokenizer manager accounts for.
+        from sglang.srt.managers.scheduler import _make_abort_req
+
+        self._cleanup_dllm_req(req, is_abort=True)
+        self.dllm_manager.pop_aborted_reqs(False, req.rid, exact=True)
+        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
 
 
 class DllmManager:
@@ -416,7 +601,9 @@ class DllmManager:
         self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
-    def pop_aborted_reqs(self, abort_all: bool, rid: str) -> List[Req]:
+    def pop_aborted_reqs(
+        self, abort_all: bool, rid: str, *, exact: bool = False
+    ) -> List[Req]:
         aborted_reqs: List[Req] = []
         seen: Set[int] = set()
 
@@ -424,7 +611,8 @@ class DllmManager:
             queue = getattr(self, queue_name)
             kept_queue = []
             for req in queue:
-                if abort_all or req.rid.startswith(rid):
+                matches_rid = req.rid == rid if exact else req.rid.startswith(rid)
+                if abort_all or matches_rid:
                     req_id = id(req)
                     if req_id not in seen:
                         aborted_reqs.append(req)
@@ -435,8 +623,25 @@ class DllmManager:
 
         return aborted_reqs
 
-    def init_next_round(self) -> None:
-        """Initialize staging requests for next round and clear staging queue."""
+    def init_next_round(self, tree_cache=None) -> None:
+        """Prepare staging and incoming requests for the next scheduling round."""
         for req in self.staging_queue:
             req.init_next_round_input()
         self.staging_queue = []
+
+        for req in self.waiting_queue:
+            if req.dllm_phase not in (
+                DllmReqPhase.INCOMING_PREFILL,
+                DllmReqPhase.INCOMING_DECODE,
+            ):
+                continue
+
+            req.init_next_round_input(tree_cache)
+            # determine_dllm_phase() reports the semantic execution phase as
+            # STAGING_*. Preserve admission lifecycle until this request is
+            # actually added to the outgoing batch.
+            req.dllm_phase = (
+                DllmReqPhase.INCOMING_PREFILL
+                if req.is_dllm_prefill()
+                else DllmReqPhase.INCOMING_DECODE
+            )

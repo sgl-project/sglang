@@ -1707,22 +1707,50 @@ def _dllm_page_size(view: Any) -> dict:
         return {}
     from sglang.srt.dllm.config import DllmConfig
 
-    config = DllmConfig.from_server_args(view)
-    if not view.disable_radix_cache and view.page_size % config.block_size != 0:
-        logger.warning(
-            f"Setting page size to {config.block_size} for diffusion LLM inference"
+    block_size = DllmConfig.from_server_args(view).block_size
+
+    if not view.disable_radix_cache and view.page_size % block_size != 0:
+        # The radix cache matches prefixes a page at a time, so a page size that
+        # does not divide the block size cannot express a dLLM block boundary.
+        logger.warning(f"Setting page size to {block_size} for diffusion LLM inference")
+        return {"page_size": block_size}
+
+    page_size = min(view.page_size, block_size)
+
+    # The invariant `memory_hook.dllm_prefill_graph_alignment` reads the block
+    # size on. Memory sizing captures every multiple of the block size, while
+    # `_get_dllm_extend_len` only emits multiples of lcm(page_size, block_size),
+    # so a page size that does not divide the block strands all but one in
+    # lcm/block_size of those graphs -- as few as one in 31 reachable for a
+    # 32-token block -- without giving the scheduler one extra shape it can
+    # emit. Only the radix-off path gets here (the branch above coerces
+    # otherwise), where the page size is the layout the caller asked for, so say
+    # so rather than change it silently. With no graph to capture there is
+    # nothing to strand, hence the phase check.
+    alignment = math.lcm(page_size, block_size)
+    if alignment != block_size and (
+        view.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+    ):
+        raise ValueError(
+            f"dLLM needs a page size that divides the block size: "
+            f"page_size={view.page_size} against block_size={block_size} "
+            f"lets the scheduler emit only multiples of {alignment}, while the "
+            f"prefill graph captures every multiple of {block_size} -- so one "
+            f"captured graph in {alignment // block_size} is ever replayable. "
+            f"Pick a divisor of {block_size}, drop --disable-radix-cache and the "
+            "page size is coerced instead, or turn the prefill CUDA graph off."
         )
-        return {"page_size": config.block_size}
-    if view.page_size > config.block_size:
-        # Legacy scheduler-init fallback, folded into the pass: the page
-        # size must not exceed the dllm block size.
-        logger.warning(
-            "WARNING: "
-            f"The page size {view.page_size} should not be larger than dllm block size {config.block_size}."
-            f"Page size now falls back to {config.block_size}"
-        )
-        return {"page_size": config.block_size}
-    return {}
+
+    if page_size == view.page_size:
+        return {}
+    # Legacy scheduler-init fallback, folded into the pass: the page
+    # size must not exceed the dllm block size.
+    logger.warning(
+        "WARNING: "
+        f"The page size {view.page_size} should not be larger than dllm block size {block_size}."
+        f"Page size now falls back to {block_size}"
+    )
+    return {"page_size": page_size}
 
 
 def validate_declarations(

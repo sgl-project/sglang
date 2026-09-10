@@ -6,8 +6,11 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.dllm.mixin.scheduler import DllmManager
+from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
+from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context
@@ -58,12 +61,35 @@ class _FakeTreeCache:
         return True
 
 
+class _SchedulerHarness:
+    process_dllm_staging_reqs = SchedulerDllmMixin.process_dllm_staging_reqs
+    _cleanup_dllm_req = SchedulerDllmMixin._cleanup_dllm_req
+    _abort_dllm_req_exact = SchedulerDllmMixin._abort_dllm_req_exact
+    _retract_dllm_req = SchedulerDllmMixin._retract_dllm_req
+    _retract_or_abort_dllm_req = SchedulerDllmMixin._retract_or_abort_dllm_req
+    # The real teardown, plus the three flags it reads: a stub or an attribute
+    # default would let this double drift from what the scheduler runs.
+    _release_aborted_request = Scheduler._release_aborted_request
+    enable_hierarchical_cache = False
+    enable_hicache_storage = False
+    enable_unified_cache_external_linker = False
+
+
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
+        # Admitted at some point, which is what stashes a request as locked.
+        dllm_phase=DllmReqPhase.STAGING_DECODE,
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
+        last_node=None,
+        # `_make_abort_req` reads these to build the weight-version spans that
+        # every abort output carries.
+        output_ids=array("q"),
+        weight_version_events=[],
+        # The real record, so the scheduler reads the same fields and defaults
+        # it does in production.
         kv=ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
@@ -219,6 +245,242 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         )
         self.assertEqual(manager.waiting_queue, [keep])
         self.assertEqual(manager.staging_queue, [])
+
+    def test_staging_no_token_retracts_instead_of_aborting(self):
+        manager = DllmManager(SimpleNamespace(max_running_requests=4))
+        victim = _make_req("job_1", [1], self.block_size)
+        keep = _make_req("job_10", [2], self.block_size)
+        for req in (victim, keep):
+            req.dllm_phase = DllmReqPhase.STAGING_DECODE
+            req.is_retracted = False
+            req.origin_input_ids = [1]
+            req.output_ids = [7, 8]
+            req.dllm_config = SimpleNamespace(block_size=self.block_size)
+            req.dllm_algo_state = object()
+            req.dllm_block_offset = self.block_size
+            req.reset_for_retract = lambda r=req: setattr(r, "is_retracted", True)
+            req.time_stats = SimpleNamespace(set_retract_time=lambda: None)
+            req.reset_dllm_for_retract = lambda r=req: (
+                ReqDllmMixin.reset_dllm_for_retract(r)
+            )
+        manager.waiting_queue = [victim, keep]
+        manager.staging_queue = []
+
+        outputs = []
+        freed = []
+        scheduler = _SchedulerHarness()
+        scheduler.dllm_manager = manager
+        # A victim with no req_pool_idx still holds uncached prefix slots, which
+        # _cleanup_dllm_req releases straight through the allocator.
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            free=lambda indices: freed.append(indices)
+        )
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(
+                send_output=lambda msg, req: outputs.append((msg, req))
+            )
+        )
+        adder = SimpleNamespace(
+            can_run_list=[],
+            running_batch=SimpleNamespace(is_empty=lambda: True),
+            add_dllm_staging_req=lambda req: AddReqResult.NO_TOKEN,
+        )
+
+        result = scheduler.process_dllm_staging_reqs(adder, [victim, keep])
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+        scheduler._retract_or_abort_dllm_req(
+            SimpleNamespace(is_empty=lambda: True),
+        )
+
+        # Retraction reclaims KV without telling the client, and both requests
+        # stay managed so the freed pages can serve them next round.
+        self.assertEqual(outputs, [])
+        self.assertEqual(manager.waiting_queue, [victim, keep])
+        self.assertIsNone(victim.kv.req_pool_idx)
+        self.assertEqual(victim.kv.kv_allocated_len, 0)
+        # Exactly the victim's uncached prefix slots go back to the allocator.
+        self.assertEqual([t.tolist() for t in freed], [[1]])
+        self.assertEqual(victim.dllm_phase, DllmReqPhase.INCOMING_DECODE)
+        self.assertEqual(len(victim.dllm_incomplete_ids), 0)
+        self.assertEqual(victim.output_ids, [7, 8])
+        # Only the first blocker in manager order is given up.
+        self.assertEqual(keep.dllm_phase, DllmReqPhase.STAGING_DECODE)
+
+    def test_exact_abort_cleans_stashed_fdfo_before_pop_and_response(self):
+        events = []
+        manager = DllmManager(SimpleNamespace(max_running_requests=4))
+        req = _make_req("job_1", [10, 11, 12, 13], self.block_size)
+        keep = _make_req("job_10", [20], self.block_size)
+        req.kv.cache_protected_len = 2
+        req.kv.kv_allocated_len = 4
+        req.last_node = object()
+        manager.waiting_queue = [req, keep]
+        manager.staging_queue = [req]
+
+        original_pop = manager.pop_aborted_reqs
+
+        def tracked_pop(abort_all, rid, *, exact=False):
+            events.append("pop")
+            return original_pop(abort_all, rid, exact=exact)
+
+        manager.pop_aborted_reqs = tracked_pop
+
+        freed = []
+
+        def free(indices):
+            events.append("free_kv")
+            freed.append(indices.clone())
+
+        unlocked = []
+
+        def dec_lock_ref(node):
+            events.append("unlock")
+            unlocked.append(node)
+
+        outputs = []
+
+        def send_output(msg, output_req):
+            events.append("send")
+            outputs.append((msg, output_req))
+
+        scheduler = _SchedulerHarness()
+        scheduler.dllm_manager = manager
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=free)
+        scheduler.tree_cache = SimpleNamespace(dec_lock_ref=dec_lock_ref)
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=send_output)
+        )
+
+        last_node = req.last_node
+        scheduler._abort_dllm_req_exact(req)
+
+        self.assertEqual(events, ["free_kv", "unlock", "pop", "send"])
+        self.assertEqual(len(freed), 1)
+        self.assertEqual(freed[0].tolist(), [12, 13])
+        self.assertEqual(unlocked, [last_node])
+        self.assertIsNone(req.last_node)
+        self.assertIsNone(req.kv.req_pool_idx)
+        self.assertEqual(req.kv.kv_allocated_len, 0)
+        self.assertEqual(manager.waiting_queue, [keep])
+        self.assertEqual(manager.staging_queue, [])
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0][0].rid, "job_1")
+        self.assertIs(outputs[0][1], req)
+        # Built through `_make_abort_req` like every other abort path, so the
+        # tokenizer manager sees the same payload it does elsewhere.
+        self.assertIsNotNone(outputs[0][0].weight_versions)
+
+    def test_abort_of_never_admitted_req_keeps_shared_prefix_locked(self):
+        """An INCOMING request only ran match_prefix, which does not lock.
+
+        Releasing its `last_node` would drop a ref it never took, and that node
+        is shared with whichever live request actually put the prefix there.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+        from sglang.srt.mem_cache.radix_cache import (
+            CacheInitParams,
+            InsertParams,
+            RadixCache,
+            RadixKey,
+        )
+
+        freed = []
+        allocator = SimpleNamespace(
+            device="cpu",
+            page_size=1,
+            available_size=lambda: 1 << 30,
+            free=lambda indices: freed.append(indices.tolist()),
+        )
+        pool = ReqToTokenPool(
+            size=8, max_context_len=64, device="cpu", enable_memory_saver=False
+        )
+        cache = RadixCache(
+            CacheInitParams(
+                req_to_token_pool=pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=False,
+            )
+        )
+
+        prefix = [1, 2, 3, 4]
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prefix)),
+                value=torch.arange(len(prefix), dtype=torch.int64),
+            )
+        )
+
+        # A live request holding the prefix, as cache_unfinished_req would.
+        live = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        cache.inc_lock_ref(live.last_device_node)
+        self.assertEqual(cache.protected_size(), len(prefix))
+
+        # The victim: matched the same node this round, never admitted, so
+        # init_next_round_input left cache_protected_len == len(prefix_indices).
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        victim = _make_req("never-admitted", prefix, self.block_size)
+        victim.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+        victim.prefix_indices = match.device_indices
+        victim.last_node = match.last_device_node
+        victim.kv = ReqKvInfo(cache_protected_len=len(match.device_indices))
+        self.assertIs(victim.last_node, live.last_device_node)
+
+        scheduler = _SchedulerHarness()
+        scheduler.tree_cache = cache
+        scheduler.token_to_kv_pool_allocator = allocator
+
+        scheduler._cleanup_dllm_req(victim, is_abort=True)
+
+        # The live request's prefix stays protected, and nothing is handed back.
+        self.assertEqual(live.last_device_node.lock_ref, 1)
+        self.assertEqual(cache.protected_size(), len(prefix))
+        self.assertEqual(cache.evictable_size(), 0)
+        self.assertEqual(freed, [])
+
+    def test_retract_keeps_the_rid_keyed_cache_state_that_abort_drops(self):
+        """A retracted request keeps its rid and re-enters admission, so only
+        the abort path may drop the cache state keyed by that rid."""
+        released = []
+        manager = DllmManager(SimpleNamespace(max_running_requests=4))
+        retracted = _make_req("job_1", [1], self.block_size)
+        aborted = _make_req("job_2", [2], self.block_size)
+        for req in (retracted, aborted):
+            req.origin_input_ids = [1]
+            req.output_ids = [7]
+            req.dllm_config = SimpleNamespace(block_size=self.block_size)
+            req.reset_for_retract = lambda: None
+            req.reset_dllm_for_retract = lambda: None
+            req.time_stats = SimpleNamespace(set_retract_time=lambda: None)
+            # A STAGING request stashed by cache_unfinished_req: the req slot is
+            # gone but kv_allocated_len still records the old length until the
+            # teardown calls mark_kv_released(). Non-zero so that call is pinned.
+            req.kv.kv_allocated_len = self.block_size
+        manager.waiting_queue = [retracted, aborted]
+
+        scheduler = _SchedulerHarness()
+        # Without one of these flags `_release_aborted_request` is a no-op.
+        scheduler.enable_hierarchical_cache = True
+        scheduler.dllm_manager = manager
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            free=lambda indices: None
+        )
+        scheduler.tree_cache = SimpleNamespace(
+            release_aborted_request=released.append,
+            dec_lock_ref=lambda node: None,
+        )
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=lambda msg, req: None)
+        )
+
+        scheduler._retract_dllm_req(retracted)
+        self.assertEqual(released, [])
+        # Retraction still gives the KV back, just not the cache state.
+        self.assertEqual(retracted.kv.kv_allocated_len, 0)
+
+        scheduler._abort_dllm_req_exact(aborted)
+        self.assertEqual(released, ["job_2"])
 
 
 if __name__ == "__main__":
