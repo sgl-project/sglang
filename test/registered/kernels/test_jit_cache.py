@@ -14,7 +14,7 @@ import sys
 import msgspec
 import pytest
 
-from sglang.kernels.jit.utils.compile import cache, ninja
+from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -50,6 +50,26 @@ def _spec(**overrides) -> BuildSpec:
     )
     base.update(overrides)
     return BuildSpec(**base)
+
+
+def test_nvcc_uses_the_fingerprinted_host_compiler(monkeypatch):
+    host_compiler = "/opt/compiler $tool/g++"
+    quoted_compiler = "'/opt/compiler $$tool/g++'"
+    monkeypatch.setattr(toolchain, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(toolchain, "host_compiler_path", lambda: host_compiler)
+
+    build_file = ninja.generate(
+        _spec(
+            cpp_wrappers=(),
+            cuda_wrappers=(("run", "Kernel::run"),),
+        )
+    )
+
+    assert f"cxx = {quoted_compiler}" in build_file
+    assert f"-ccbin={quoted_compiler}" in build_file
+    assert "command = $nvcc -MD -MF" in build_file
+    assert "$cudaflags -c" in build_file
+    assert "build cuda_0.o: compile_cuda cuda.cu" in build_file
 
 
 def _build_key(**overrides) -> str:
