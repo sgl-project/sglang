@@ -453,6 +453,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+          SGLANG_INKLING_FA4_USE_PIP: "1"
         run: |
           python3 test/run_suite.py \
             --hw cuda \
