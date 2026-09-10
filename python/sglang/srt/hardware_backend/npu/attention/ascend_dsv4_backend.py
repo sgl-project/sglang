@@ -1182,15 +1182,33 @@ class DeepseekV4AscendAttnBackend(
                 live_seq_lens_cpu = torch.zeros_like(raw_seq_lens_cpu)
                 final_seq_lens_cpu = live_seq_lens_cpu
             elif self._is_dspark_algorithm:
-                live_seq_lens_cpu = torch.as_tensor(
-                    forward_batch.spec_info.live_seq_lens_cpu,
-                    dtype=raw_seq_lens_cpu.dtype,
-                    device=raw_seq_lens_cpu.device,
-                ).flatten()[:raw_bs]
-                live_seq_lens_cpu = F.pad(
-                    live_seq_lens_cpu,
-                    (0, bs - live_seq_lens_cpu.numel()),
+                # >>>>>>>>>>>>>>>>>>>>>>>>>>>> l00993641 revised >>>>>>>>>>>>>>>>>>>>>>>>>>>>
+                explicit_live_cpu = getattr(
+                    getattr(forward_batch, "spec_info", None),
+                    "live_seq_lens_cpu",
+                    None,
                 )
+                if explicit_live_cpu is None:
+                    # DSpark draft-block forward uses TARGET_VERIFY mode but its
+                    # reusable spec_info does not carry live_seq_lens_cpu.
+                    # Recover the committed/live prefix from the expanded KV lengths.
+                    live_seq_lens_cpu = torch.clamp(
+                        raw_seq_lens_cpu - int(tokens_per_bs),
+                        min=0,
+                    )
+
+                # >>>>>>>>>>>>>>>>>>>>>>>>>>>> l00993641 revised >>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+                else:
+                    live_seq_lens_cpu = torch.as_tensor(
+                        forward_batch.spec_info.live_seq_lens_cpu,
+                        dtype=raw_seq_lens_cpu.dtype,
+                        device=raw_seq_lens_cpu.device,
+                    ).flatten()[:raw_bs]
+                    live_seq_lens_cpu = F.pad(
+                        live_seq_lens_cpu,
+                        (0, bs - live_seq_lens_cpu.numel()),
+                    )
                 if ragged_layout is not None:
                     # Query rows beyond raw_bs are graph-tier ghosts. Keep their
                     # Q indptr geometry intact, but do not allocate/write target
