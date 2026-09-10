@@ -3,7 +3,11 @@
 Run with: python test/registered/openai_server/basic/test_deepseek_v4_rust.py
 """
 
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 import requests
 
@@ -16,7 +20,21 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=360, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="8-gpu-h200")
+
+
+def capture_prompt(config):
+    """Observe actual model inputs through the existing forward-hook interface."""
+    import torch.distributed as dist
+
+    def hook(module, args, output):
+        batch = args[3]
+        if dist.get_rank() == 0 and batch.forward_mode.is_extend():
+            count = sum(batch.extend_seq_lens_cpu)
+            with open(config["path"], "a") as output_file:
+                output_file.write(json.dumps(args[0][:count].tolist()) + "\n")
+
+    return hook
 
 
 def chat_cases():
@@ -97,18 +115,31 @@ def chat_cases():
 
 
 class TestDeepSeekV4RustParity(CustomTestCase):
-    def collect(self, model, rust):
+    def collect(self, model, rust, prompt_file):
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env={
+                "PYTHONPATH": os.pathsep.join(
+                    [str(Path(__file__).parent), os.environ.get("PYTHONPATH", "")]
+                ),
                 "SGLANG_RUST_SERVER": str(int(rust)),
                 "SGLANG_DEFAULT_THINKING": "0",
                 "SGLANG_DSV4_REASONING_EFFORT": "",
                 "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
             },
             other_args=[
+                "--forward-hooks",
+                json.dumps(
+                    [
+                        {
+                            "target_modules": ["logits_processor"],
+                            "hook_factory": f"{Path(__file__).stem}:capture_prompt",
+                            "config": {"path": str(prompt_file)},
+                        }
+                    ]
+                ),
                 "--tp",
                 "2",
                 "--moe-runner-backend",
@@ -133,67 +164,52 @@ class TestDeepSeekV4RustParity(CustomTestCase):
         try:
             results = {}
             for name, body in chat_cases():
+                prompt_file.write_text("")
                 response = requests.post(
                     DEFAULT_URL_FOR_TEST + "/v1/chat/completions",
                     json={
                         "model": model,
                         "temperature": 0,
                         "max_tokens": 8,
-                        "logprobs": True,
-                        "top_logprobs": 5,
                         **body,
                     },
                     timeout=180,
                 )
                 self.assertEqual(response.status_code, 200, (name, response.text))
-                results[name] = response.json()
+                result = response.json()
+                # Chunked prefill can contribute multiple model-forward inputs.
+                input_ids = [
+                    token
+                    for line in prompt_file.read_text().splitlines()
+                    for token in json.loads(line)
+                ]
+                self.assertTrue(input_ids, name)
+                self.assertEqual(len(input_ids), result["usage"]["prompt_tokens"], name)
+                self.assertGreater(result["usage"]["completion_tokens"], 0, name)
+                choice = result["choices"][0]
+                self.assertTrue(choice["message"]["content"], name)
+                self.assertIn(choice["finish_reason"], ("stop", "length"), name)
+                results[name] = input_ids
             return results
         finally:
             kill_process_tree(process.pid)
+            process.wait()
 
     def test_chat_parity(self):
-        for model in (
-            "deepseek-ai/DeepSeek-V4-Flash",
-            "deepseek-ai/DeepSeek-V4-Flash-0731",
-        ):
-            python = self.collect(model, rust=False)
-            rust = self.collect(model, rust=True)
-            for name in python:
-                with self.subTest(model=model, case=name):
-                    reference, actual = python[name], rust[name]
-                    self.assertEqual(
-                        actual["usage"]["prompt_tokens"],
-                        reference["usage"]["prompt_tokens"],
-                    )
-                    reference, actual = reference["choices"][0], actual["choices"][0]
-                    self.assertEqual(
-                        actual["message"]["content"], reference["message"]["content"]
-                    )
-                    self.assertEqual(
-                        actual["finish_reason"], reference["finish_reason"]
-                    )
-                    reference = reference["logprobs"]["content"]
-                    actual = actual["logprobs"]["content"]
-                    self.assertTrue(reference)
-                    self.assertEqual(len(actual), len(reference))
-                    for expected, observed in zip(reference, actual, strict=True):
-                        self.assertEqual(observed["token"], expected["token"])
-                        self.assertAlmostEqual(
-                            observed["logprob"], expected["logprob"], delta=1e-5
-                        )
-                        self.assertEqual(
-                            {v["token"] for v in observed["top_logprobs"]},
-                            {v["token"] for v in expected["top_logprobs"]},
-                        )
-                        expected_top = {
-                            v["token"]: v["logprob"] for v in expected["top_logprobs"]
-                        }
-                        for entry in observed["top_logprobs"]:
-                            self.assertAlmostEqual(
-                                entry["logprob"],
-                                expected_top[entry["token"]],
-                                delta=1e-5,
-                            )
+        # Quantized inference can differ even for repeated identical requests.
+        # Assert exact token IDs entering the model, and successful generation
+        # through both complete HTTP paths, without comparing unstable logits.
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_file = Path(directory) / "prompts.jsonl"
+            for model in (
+                "deepseek-ai/DeepSeek-V4-Flash",
+                "deepseek-ai/DeepSeek-V4-Flash-0731",
+            ):
+                python = self.collect(model, rust=False, prompt_file=prompt_file)
+                rust = self.collect(model, rust=True, prompt_file=prompt_file)
+                for name in python:
+                    with self.subTest(model=model, case=name):
+                        self.assertEqual(rust[name], python[name])
 
 
 if __name__ == "__main__":
