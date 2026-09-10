@@ -348,6 +348,176 @@ def test_moe_wna16_marlin_gemm(
     torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
 
 
+ASYMMETRIC_REFERENCE_CASES = [
+    pytest.param(
+        torch.float16,
+        32,
+        8,
+        id="asymmetric_group32_fp16_small_batch",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        32,
+        8,
+        id="asymmetric_group32_bf16_small_batch",
+    ),
+    pytest.param(
+        torch.float16,
+        32,
+        32,
+        id="asymmetric_group32_fp16_large_batch",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        32,
+        32,
+        id="asymmetric_group32_bf16_large_batch",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        64,
+        32,
+        id="asymmetric_group64_boundary",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        128,
+        8,
+        id="asymmetric_group128_existing_branch",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        -1,
+        8,
+        id="asymmetric_channelwise_existing_branch",
+    ),
+]
+
+
+@pytest.mark.parametrize("dtype,group_size,block_size_m", ASYMMETRIC_REFERENCE_CASES)
+def test_moe_wna16_marlin_asymmetric_matches_reference(dtype, group_size, block_size_m):
+    """Compare asymmetric Marlin MoE paths with a dequantized reference."""
+    torch.manual_seed(0)
+
+    m, n, k, e, topk = 4, 128, 256, 1, 1
+    quant_type = scalar_types.uint4
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w_ref, qweight, scales, zeros, g_idx, sort_indices = _setup_moe_weights(
+        e, n, k, quant_type, group_size, False, dtype
+    )
+    assert zeros is not None
+    assert torch.unique(zeros).numel() > 1
+
+    topk_ids = torch.zeros((m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.ones((m, topk), device="cuda", dtype=torch.float32)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, e
+    )
+
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    max_workspace_size = (max(n, k) // 64) * (sorted_token_ids.size(0) // block_size_m)
+    workspace = torch.zeros(
+        min(max_workspace_size, sms * 4), dtype=torch.int, device="cuda"
+    )
+    use_atomic_add = (
+        dtype == torch.half or torch.cuda.get_device_capability("cuda")[0] >= 9
+    )
+
+    output = _run_single_gemm(
+        moe_wna16_marlin_gemm,
+        a,
+        torch.empty((m * topk, n), dtype=dtype, device="cuda"),
+        qweight,
+        scales,
+        zeros,
+        g_idx,
+        sort_indices,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        quant_type,
+        block_size_m,
+        topk,
+        m,
+        n,
+        k,
+        False,
+        True,
+        use_atomic_add,
+    )
+    output_ref = a @ w_ref[0].T
+
+    torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.01)
+
+
+def test_fused_marlin_moe_asymmetric_group32_matches_reference():
+    """Exercise group-size-32 zero points through both fused MoE GEMMs."""
+    torch.manual_seed(0)
+
+    m, n, k, e, topk = 8, 128, 256, 4, 2
+    dtype = torch.bfloat16
+    group_size = 32
+    quant_type = scalar_types.uint4
+
+    hidden_states = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w_ref1, qweight1, scales1, zeros1, g_idx1, sort_indices1 = _setup_moe_weights(
+        e, n, k, quant_type, group_size, False, dtype
+    )
+    w_ref2, qweight2, scales2, zeros2, g_idx2, sort_indices2 = _setup_moe_weights(
+        e, k, n, quant_type, group_size, False, dtype
+    )
+    assert zeros1 is not None and zeros2 is not None
+    assert torch.unique(zeros1).numel() > 1
+    assert torch.unique(zeros2).numel() > 1
+
+    router_logits = torch.randn((m, e), device="cuda", dtype=dtype)
+    score_softmax = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    topk_weights, topk_ids = torch.topk(score_softmax, topk)
+
+    output = fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=qweight1,
+        w2=qweight2,
+        w1_scale=scales1,
+        w2_scale=scales2,
+        gating_output=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        g_idx1=g_idx1,
+        g_idx2=g_idx2,
+        sort_indices1=sort_indices1,
+        sort_indices2=sort_indices2,
+        w1_zeros=zeros1,
+        w2_zeros=zeros2,
+        num_bits=4,
+        is_k_full=True,
+        routed_scaling_factor=1.0,
+        activation="relu2",
+        is_gated=False,
+    )
+
+    output_ref = torch.zeros_like(hidden_states, dtype=torch.float32)
+    for expert_id in range(e):
+        token_indices, route_indices = torch.where(topk_ids == expert_id)
+        intermediate = hidden_states[token_indices] @ w_ref1[expert_id].T
+        intermediate = torch.square(torch.relu(intermediate))
+        routed = intermediate @ w_ref2[expert_id].T
+        output_ref.index_add_(
+            0,
+            token_indices,
+            routed.float() * topk_weights[token_indices, route_indices, None],
+        )
+
+    torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, output_ref.to(dtype), rtol=0.04, atol=0.04)
+
+
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",
