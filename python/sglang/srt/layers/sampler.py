@@ -96,9 +96,9 @@ class _SamplingMaskCapture(NamedTuple):
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_tp_group().device_group
+        self.tp_sync_group = get_tp_group()
         if is_dp_attention_enabled():
-            self.tp_sync_group = get_parallel().attn_tp_group.device_group
+            self.tp_sync_group = get_parallel().attn_tp_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -648,6 +648,12 @@ class Sampler(nn.Module):
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+            if self.tp_sync_group.world_size == 1:
+                return
+            device_group = self.tp_sync_group.device_group
+            if device_group is None:
+                return
+
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
@@ -658,7 +664,7 @@ class Sampler(nn.Module):
             torch.distributed.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
+                group=device_group,
             )
 
     def compute_logprobs_only(
