@@ -101,7 +101,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
     # No kernel-facing-id wiring anywhere: must stay rejected until they get one.
-    UNWIRED_BACKENDS = ("cutlass_mla", "aiter")
+    UNWIRED_BACKENDS = ("aiter",)
 
     def test_triton_allowed_on_every_arm(self):
         """Triton reads both view families, so it is the one backend neither
