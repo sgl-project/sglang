@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple
+from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -61,6 +61,12 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
     window wide."""
     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
     return ring_size - window_size + 2 if ring_size > window_size else 0
+
+
+def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
+    # A verify batch writes its draft tokens ahead of the committed position.
+    spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
+    return sliding_window + spec_extra
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -179,6 +185,63 @@ class DeepSeekV4SingleKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Use get_key_buffer instead.")
+
+
+class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
+    """Uniform 512-dim FP8 (e4m3) variant of the DSv4 single-KV pool.
+
+    Each token is 448 NoPE + 64 RoPE contiguous e4m3 values without in-cache
+    scales or per-page padding. The backend supplies the dequant scale.
+    """
+
+    def get_bytes_per_token(self) -> int:
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    def create_buffer(self, *, num_pages: int):
+        bytes_per_token = self.get_bytes_per_token()
+        assert bytes_per_token == 512, (
+            "DSV4 uniform-FP8 KV layout: qk_nope_head_dim (448) + "
+            "qk_rope_head_dim (64), all e4m3 = 512 bytes/token"
+        )
+        self.kv_cache_total_dim = bytes_per_token
+        self.bytes_per_page_padded = self.page_size * bytes_per_token
+
+        return torch.zeros(
+            num_pages,
+            self.page_size * bytes_per_token,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        return self.kv_buffer[layer_id]
+
+    def set_key_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+    ):
+        raise NotImplementedError(
+            "The packed NopeFp8RopeBf16Pack store does not apply to the "
+            "uniform-FP8 pool; use set_key_buffer_fused."
+        )
+
+    def set_key_buffer_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        """Store normed/roped rows as e4m3 with the backend's fixed unit scale.
+
+        uint8 views work around index_put not supporting FP8 dtypes.
+        """
+
+        assert cache_k.dim() == 2 and cache_k.shape[1] == self.kv_cache_total_dim
+        self.kv_buffer[layer_id].view(torch.uint8).view(-1, self.kv_cache_total_dim)[
+            loc.long()
+        ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
@@ -566,6 +629,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        # Resolve the unified-kv gate before any sizing so the two cannot drift.
+        self._unified_kv = is_unified_kv_triton()
+        # Uniform 512-dim e4m3 layout for the trtllm attention backend
+        self.uniform_fp8 = (
+            not self._unified_kv
+        ) and get_exec().kernel.dsv4_attn_backend == "trtllm"
+        c4_ring_size = self.get_ring_size(4)
+        if self._unified_kv:
+            # Unified C4 state is request-addressed: one ring per req slot,
+            # so the caller-supplied, SWA-scaled size does not apply here.
+            c4_state_pool_size = self.num_req_slots * c4_ring_size
+        # Non-unified (fp8) keeps the caller-supplied, SWA-addressed size.
         self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
@@ -621,20 +700,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        self._unified_kv = is_unified_kv_triton()
-
         if self._unified_kv:
             self.swa_kv_pool = None
             self.c4_kv_pool = None
             self.c128_kv_pool = None
-            spec_extra = (
-                (get_spec().speculative_num_draft_tokens - 1)
-                if get_spec().speculative_algorithm is not None
-                else 0
+            swa_ring_size = get_swa_ring_size(
+                self.sliding_window, get_spec().speculative_algorithm is not None
             )
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
                 stage_ratios=stage_ratios,
@@ -646,14 +717,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
-                swa_ring_size=self.sliding_window + spec_extra,
+                swa_ring_size=swa_ring_size,
             )
 
             self.unified_swa_window = self.sliding_window
-            self.unified_swa_ring_size = self.sliding_window + spec_extra
+            self.unified_swa_ring_size = swa_ring_size
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
+            self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
+            kv_pool_cls: type = DeepSeekV4SingleKVPool
+            if self.uniform_fp8:
+                assert dtype == torch.float8_e4m3fn, (
+                    "--dsv4-attn-backend trtllm requires "
+                    f"kv_cache_dtype=fp8_e4m3, got {dtype}"
+                )
+                kv_pool_cls = DeepSeekV4UniformFP8KVPool
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
                 page_size=swa_page_size,
@@ -662,10 +741,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
+                cls=kv_pool_cls,
             )
 
-            c4_kv_pool_type = DeepSeekV4SingleKVPool
+            c4_kv_pool_type = kv_pool_cls
             if enable_hisparse:
+                assert not self.uniform_fp8, (
+                    "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
+                )
                 c4_kv_pool_type = HiSparseC4DevicePool
             self.c4_kv_pool = self._make_kv_pool(
                 size=c4_size,
@@ -686,6 +769,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=page_size,
+                cls=kv_pool_cls,
             )
 
         indexer_size = self.c4_logical_size
@@ -1052,6 +1136,32 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
 
+    def clear_c4_req_states(self, req_pool_indices: Sequence[int]) -> None:
+        if not self._unified_kv or not req_pool_indices:
+            return
+
+        pools = [
+            pool
+            for pool in self.compress_state_pools + self.indexer_compress_state_pools
+            if pool is not None and pool.ratio == 4
+        ]
+        if not pools:
+            return
+
+        ring_size = self.get_ring_size(4)
+        device = pools[0].kv_score_buffer.kv_score.device
+        req_indices = torch.as_tensor(req_pool_indices, dtype=torch.long, device=device)
+        state_locs = (
+            req_indices[:, None] * ring_size
+            + torch.arange(ring_size, dtype=torch.long, device=device)
+        ).flatten()
+
+        for pool in pools:
+            state = pool.kv_score_buffer.kv_score
+            half = state.shape[-1] // 2
+            state[state_locs, :half] = 0
+            state[state_locs, half:] = float("-inf")
+
     def clear_c128_req_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped C128 state for one req slot."""
         for pool in self.compress_state_pools:
@@ -1078,7 +1188,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         accept_lens: torch.Tensor,
         num_draft_tokens: int,
     ) -> None:
-        """Clear offline C128 ring slots written for rejected speculative tokens."""
+        """Clear offline C128 ring slots written for rejected speculative tokens.
+        C4 needs no counterpart: its draft states are overwritten in position order
+        before any read; a C128 compression boundary can read a stale draft slot."""
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
@@ -1247,6 +1359,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if self.uniform_fp8:
+            # Uniform-FP8 (trtllm-gen) layout: norm + RoPE with the existing
+            # Triton kernel (in-place on kv; safe -- kv is not read again),
+            # then a plain e4m3 cast + scatter in the pool setter (per-tensor
+            # scale 1.0). Fusing the store is deferred to the perf phase.
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                fused_norm_rope_inplace_triton,
+            )
+
+            fused_norm_rope_inplace_triton(
+                kv,
+                kv_weight,
+                eps,
+                freqs_cis,
+                positions=positions,
+            )
+            self.swa_kv_pool.set_key_buffer_fused(
+                self._swa_local_layer_id(layer_id), swa_loc, kv
+            )
+            return
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
