@@ -308,6 +308,7 @@ def adjust_config_with_unaligned_cpu_tp(
         [model_config.hf_config, "vision_config", "qwen3_vl", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5_moe", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5", "num_heads"],
+        [model_config.hf_config, "vision_config", "qwen4_exp", "num_heads"],
         [model_config.hf_config, "vision_config", "mllama", "attention_heads"],
         [
             model_config.hf_config,

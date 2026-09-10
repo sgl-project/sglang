@@ -24,8 +24,7 @@ from sglang.srt.layers.cp.padding import (
 )
 from sglang.srt.layers.cp.utils import (
     cp_split_before_forward,
-    enable_cp_v2,
-    is_cp_v2_active,
+    is_cp_active,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -88,7 +87,7 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertFalse(is_interleave())
         self.assertEqual(get_cp_strategy_kind(), ContextParallelStrategyKind.ZIGZAG)
 
-    def test_get_cp_strategy_is_initialized_under_cp_v2(self):
+    def test_get_cp_strategy_is_initialized_under_cp(self):
         init_cp_strategy(
             enable_prefill_cp=True,
             cp_size=4,
@@ -122,16 +121,6 @@ class TestCPStrategyUnit(CustomTestCase):
         ):
             self.assertFalse(is_dsa_enable_prefill_cp())
 
-    @patch("sglang.srt.utils.is_npu", return_value=False)
-    @patch("sglang.srt.utils.is_hip", return_value=True)
-    def test_hip_keeps_strategy_cp_disabled(self, _mock_is_hip, _mock_is_npu):
-        self.assertFalse(enable_cp_v2())
-
-    @patch("sglang.srt.utils.is_npu", return_value=True)
-    @patch("sglang.srt.utils.is_hip", return_value=False)
-    def test_npu_keeps_strategy_cp_disabled(self, _mock_is_hip, _mock_is_npu):
-        self.assertFalse(enable_cp_v2())
-
 
 class TestPrefillCPBCGReplay(CustomTestCase):
     def tearDown(self):
@@ -147,7 +136,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [2048, 2304]
         runner.max_num_tokens = 2304
-        runner.enable_cp_v2_bcg_capture = True
+        runner.enable_cp_bcg_capture = True
         return runner
 
     def _make_forward_batch(self):
@@ -305,7 +294,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             attn_cp_metadata=metadata,
         )
 
-    def test_enable_cp_v2_and_is_cp_v2_active(self):
+    def test_is_cp_active(self):
         active_batch = SimpleNamespace(
             input_ids=torch.arange(8),
             forward_mode=_ExtendMode(),
@@ -318,9 +307,8 @@ class TestCPZigzagStrategy(CustomTestCase):
         )
 
         with patch.dict("os.environ", {"SGLANG_ENABLE_CP_V2": "0"}):
-            self.assertTrue(enable_cp_v2())
-            self.assertTrue(is_cp_v2_active(active_batch))
-            self.assertFalse(is_cp_v2_active(inactive_batch))
+            self.assertTrue(is_cp_active(active_batch))
+            self.assertFalse(is_cp_active(inactive_batch))
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
@@ -832,7 +820,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
     def _rank_tensors(self, x, *, cp_size, seq_lens, extend_seq_lens):
         per_rank = []
         metas = []
-        with self._patch_legacy_round_robin_mode():
+        with self._patch_legacy_interleave_mode():
             for rank in range(cp_size):
                 metadata = self._metadata_for_rank(
                     rank,
@@ -848,9 +836,9 @@ class TestCPInterleaveStrategy(CustomTestCase):
         return metas, per_rank
 
     @contextmanager
-    def _patch_legacy_round_robin_mode(self):
+    def _patch_legacy_interleave_mode(self):
         with patch(
-            "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
+            "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_interleave",
             return_value=True,
         ):
             yield
@@ -875,7 +863,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
                 return_value=torch.no_grad(),
             ),
             patch(
-                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_interleave",
                 return_value=True,
             ),
         )
@@ -960,7 +948,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
                     attn_cp_rank=rank,
                     attn_cp_size=cp_size,
                 ),
-                self._patch_legacy_round_robin_mode(),
+                self._patch_legacy_interleave_mode(),
             ):
                 local_x = strategy.shard_hidden_states(x, fb)
                 local_positions = strategy.shard_position_ids(positions, fb)
