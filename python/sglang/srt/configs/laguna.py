@@ -114,6 +114,7 @@ class LagunaConfig(PretrainedConfig):
         moe_routed_scaling_factor: float = 1.0,
         moe_router_logit_softcapping: float = 0.0,
         moe_apply_router_weight_on_input: bool = False,
+        moe_router_score_func: str = "sigmoid",
         # Per-layer-type rope dict; nested under "full_attention" / "sliding_attention".
         rope_parameters: Optional[Dict[str, Any]] = None,
         partial_rotary_factor: Optional[float] = None,
@@ -155,6 +156,8 @@ class LagunaConfig(PretrainedConfig):
         self.moe_routed_scaling_factor = moe_routed_scaling_factor
         self.moe_router_logit_softcapping = moe_router_logit_softcapping
         self.moe_apply_router_weight_on_input = moe_apply_router_weight_on_input
+        # Router scoring nonlinearity: "sigmoid" (default) or "sqrtsoftplus".
+        self.moe_router_score_func = moe_router_score_func
 
         # Synthesise per-layer schedules when the caller omits them so the model
         # file can index by layer_id without per-call guards.

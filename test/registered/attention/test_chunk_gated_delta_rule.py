@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=11, stage="stage-b", runner_config="1-gpu-large-amd")
 register_xpu_ci(est_time=900, suite="stage-b-test-1-gpu-xpu")
 
@@ -293,6 +293,53 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             pool_size=32,
             sequential_indices=True,
         )
+
+    # ------------------------------------------------------------------
+    # Padded rows (idle DP ranks under breakable CUDA graph prefill)
+    # ------------------------------------------------------------------
+
+    def test_padded_state_index_is_skipped(self):
+        """Rows carrying state index -1 must be skipped, not addressed.
+
+        Without the guard the sentinel reaches pointer arithmetic and
+        addresses before the state pool.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        B, T_per_seq, H, K, V, pool_size = 4, 64, 4, 128, 128, 8
+        T = B * T_per_seq
+        torch.manual_seed(0)
+
+        pool_init = (
+            torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device) * 0.1
+        )
+        cu_seqlens = torch.zeros(B + 1, dtype=torch.long, device=device)
+        cu_seqlens[1:] = (
+            torch.arange(1, B + 1, dtype=torch.long, device=device) * T_per_seq
+        )
+        q = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        k = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T, H, dtype=dtype, device=device)
+        )
+        beta = torch.sigmoid(torch.randn(1, T, H, dtype=dtype, device=device))
+
+        # "all padded" is the idle-DP-rank case that faulted.
+        for label, indices in (("mixed", [0, -1, 2, -1]), ("all_padded", [-1] * B)):
+            with self.subTest(label):
+                cache_indices = torch.tensor(indices, dtype=torch.int32, device=device)
+                o, pool = self._run_chunk(
+                    pool_init, cache_indices, q, k, v, g, beta, cu_seqlens
+                )
+                # Forces a sync: an out-of-bounds access surfaces here.
+                self.assertTrue(torch.isfinite(o.float()).all())
+
+                untouched = [s for s in range(pool_size) if s not in indices]
+                self.assertTrue(
+                    torch.equal(pool[untouched], pool_init[untouched]),
+                    f"{label}: padded rows wrote into the state pool",
+                )
 
 
 if __name__ == "__main__":

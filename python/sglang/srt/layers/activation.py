@@ -33,7 +33,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, publish_role
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -130,7 +130,10 @@ logger = logging.getLogger(__name__)
 class SiluAndMul(BaseFusedOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_exec().deterministic.rl_on_policy_target is not None:
+        if (
+            publish_role() is not None
+            and get_exec().deterministic.rl_on_policy_target is not None
+        ):
             self._forward_method = self.forward_native
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
@@ -478,8 +481,7 @@ def get_act_fn(
     if quant_config is not None and act_fn_name in quant_config.get_scaled_act_names():
         if intermediate_size is None:
             raise ValueError(
-                "intermediate_size must be specified for scaled "
-                "activation functions."
+                "intermediate_size must be specified for scaled activation functions."
             )
         return ScaledActivation(
             act_fn, intermediate_size, input_is_parallel, params_dtype
@@ -492,7 +494,6 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         hasattr(config, "sbert_ce_default_activation_function")
         and config.sbert_ce_default_activation_function is not None
     ):
-
         function_name = config.sbert_ce_default_activation_function
         assert function_name.startswith("torch.nn.modules."), (
             "Loading of activation functions is restricted to "

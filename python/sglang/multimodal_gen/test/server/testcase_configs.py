@@ -46,6 +46,9 @@ class ToleranceConfig:
     non_denoise_stage: float
     denoise_step: float
     denoise_agg: float
+    load_peak_vram: float = 0.01
+    runtime_peak_vram: float = 0.02
+    host_anon: float = 0.02
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -86,6 +89,19 @@ class ToleranceConfig:
             denoise_agg=float(
                 os.getenv("SGLANG_DENOISE_AGG_TOLERANCE", tol_data["denoise_agg"])
             ),
+            load_peak_vram=float(
+                os.getenv(
+                    "SGLANG_LOAD_PEAK_VRAM_TOLERANCE",
+                    tol_data.get("load_peak_vram", 0.01),
+                )
+            ),
+            runtime_peak_vram=float(
+                os.getenv(
+                    "SGLANG_RUNTIME_PEAK_VRAM_TOLERANCE",
+                    tol_data.get("runtime_peak_vram", 0.02),
+                )
+            ),
+            host_anon=float(tol_data.get("host_anon", 0.02)),
         )
 
 
@@ -99,6 +115,46 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    load_peak_vram_mb: float | None = None
+    runtime_peak_vram_mb: float | None = None
+    # Peak of the warmup calibration probe (the default workload's full shape
+    # under the load-safe placement); None skips the check until a baseline exists.
+    warmup_peak_vram_mb: float | None = None
+    # Allocated peaks; when present they are the enforced VRAM figure and the
+    # reserved peaks above are reported only (reserved tracks pool history).
+    load_peak_allocated_mb: float | None = None
+    runtime_peak_allocated_mb: float | None = None
+    # Anonymous-host budget caps; None skips the check (older baselines).
+    load_peak_host_anon_mb: float | None = None
+    runtime_peak_host_anon_mb: float | None = None
+    # Per-case override for the wall-clock tolerances (e2e, denoise and stage
+    # timings) when a case's runtime is dominated by shared-runner host I/O
+    # rather than by the code under test. Memory guards keep the profile
+    # tolerance -- they are what such a case actually protects.
+    timing_tolerance: float | None = None
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
+        def optional_float(name: str) -> float | None:
+            value = cfg.get(name)
+            return float(value) if value is not None else None
+
+        return cls(
+            stages_ms=cfg["stages_ms"],
+            denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+            expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+            expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+            expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+            estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            load_peak_vram_mb=optional_float("load_peak_vram_mb"),
+            runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
+            warmup_peak_vram_mb=optional_float("warmup_peak_vram_mb"),
+            load_peak_allocated_mb=optional_float("load_peak_allocated_mb"),
+            runtime_peak_allocated_mb=optional_float("runtime_peak_allocated_mb"),
+            load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
+            runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
+            timing_tolerance=optional_float("timing_tolerance"),
+        )
 
 
 @dataclass
@@ -122,16 +178,10 @@ class BaselineConfig:
             data.get("tolerances", {}), profile_name
         )
 
-        scenarios = {}
-        for name, cfg in data["scenarios"].items():
-            scenarios[name] = ScenarioConfig(
-                stages_ms=cfg["stages_ms"],
-                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
-                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
-                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
-                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
-            )
+        scenarios = {
+            name: ScenarioConfig.from_dict(cfg)
+            for name, cfg in data["scenarios"].items()
+        }
 
         return cls(
             scenarios=scenarios,
@@ -147,18 +197,12 @@ class BaselineConfig:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
 
-        scenarios_new = {}
-        for name, cfg in data["scenarios"].items():
-            scenarios_new[name] = ScenarioConfig(
-                stages_ms=cfg["stages_ms"],
-                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
-                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
-                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
-                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
-            )
-
-        self.scenarios.update(scenarios_new)
+        self.scenarios.update(
+            {
+                name: ScenarioConfig.from_dict(cfg)
+                for name, cfg in data["scenarios"].items()
+            }
+        )
         return self
 
 
@@ -248,6 +292,7 @@ class DiffusionSamplingParams:
 
     # output format
     output_format: str | None = None  # "png", "jpeg", "mp4", etc.
+    expect_audio_output: bool = False
 
     num_outputs_per_prompt: int = 1
 
@@ -273,6 +318,8 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
+    # Validate every repetition against the same baseline and GT.
+    perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
@@ -283,6 +330,8 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
 
     def __post_init__(self) -> None:
+        if self.perf_repeat_requests < 1:
+            raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
@@ -408,6 +457,13 @@ class PerformanceSummary:
     step_metrics: list[float]
     sampled_steps: dict[int, float]
     all_denoise_steps: dict[int, float]
+    load_peak_vram_mb: float = 0.0
+    runtime_peak_vram_mb: float = 0.0
+    warmup_peak_vram_mb: float = 0.0
+    load_peak_allocated_mb: float = 0.0
+    runtime_peak_allocated_mb: float = 0.0
+    load_peak_host_anon_mb: float = 0.0
+    runtime_peak_host_anon_mb: float = 0.0
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
@@ -437,6 +493,32 @@ class PerformanceSummary:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
 
+        load_peak_vram_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        runtime_peak_vram_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        warmup_peak_vram_mb = float(
+            record.memory_snapshots.get("warmup_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        load_peak_allocated_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_allocated_mb", 0.0)
+        )
+        runtime_peak_allocated_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get(
+                "peak_allocated_mb", 0.0
+            )
+        )
+        load_peak_host_anon_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_host_anon_mb", 0.0)
+        )
+        runtime_peak_host_anon_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get(
+                "peak_host_anon_mb", 0.0
+            )
+        )
+
         return PerformanceSummary(
             e2e_ms=e2e_ms,
             avg_denoise_ms=avg_denoise,
@@ -445,6 +527,13 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
+            load_peak_vram_mb=load_peak_vram_mb,
+            runtime_peak_vram_mb=runtime_peak_vram_mb,
+            warmup_peak_vram_mb=warmup_peak_vram_mb,
+            load_peak_allocated_mb=load_peak_allocated_mb,
+            runtime_peak_allocated_mb=runtime_peak_allocated_mb,
+            load_peak_host_anon_mb=load_peak_host_anon_mb,
+            runtime_peak_host_anon_mb=runtime_peak_host_anon_mb,
         )
 
 
@@ -795,6 +884,7 @@ PERF_BASELINE_FILE_BY_PLATFORM = {
     "h100": "h100.json",
     "b200": "b200.json",
     "5090": "5090.json",
+    "xpu_b60": "xpu_b60.json",
 }
 PERF_BASELINE_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -806,6 +896,8 @@ PERF_BASELINE_PLATFORM_ALIASES = {
     "sm120": "5090",
     "rtx5090": "5090",
     "5090": "5090",
+    "xpu": "xpu_b60",
+    "bmg": "xpu_b60",
 }
 
 
@@ -825,6 +917,8 @@ def get_perf_baseline_platform() -> str:
     override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
     if override:
         return _normalize_perf_baseline_platform(override)
+    if current_platform.is_xpu():
+        return "xpu_b60"
     if current_platform.is_sm120():
         return "5090"
     if current_platform.is_blackwell():
@@ -839,6 +933,14 @@ def get_perf_baseline_path(platform: str | None = None) -> Path:
         else get_perf_baseline_platform()
     )
     return PERF_BASELINE_DIR / PERF_BASELINE_FILE_BY_PLATFORM[baseline_platform]
+
+
+def get_perf_baseline_update_path() -> Path:
+    if current_platform.is_npu():
+        return Path(__file__).parent / "ascend" / "perf_baselines_npu.json"
+    if current_platform.is_musa():
+        return Path(__file__).parent / "musa" / "perf_baselines_musa.json"
+    return get_perf_baseline_path()
 
 
 def _make_modelopt_ci_case(

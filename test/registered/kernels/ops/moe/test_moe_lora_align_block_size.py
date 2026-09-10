@@ -9,9 +9,10 @@ import torch
 # IMPORT PREBUILT KERNEL
 # ---------------------------------------------------------
 from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
 def round_up(x, base):
@@ -158,9 +159,9 @@ def test_moe_lora_align_block_size(
 
                 # Check that all tokens in this block truly belong to 'lora_idx'
                 actual_owners = token_ownership[original_token_indices]
-                assert torch.all(
-                    actual_owners == lora_idx
-                ), f"Kernel put tokens from LoRA {actual_owners} into block for LoRA {lora_idx}"
+                assert torch.all(actual_owners == lora_idx), (
+                    f"Kernel put tokens from LoRA {actual_owners} into block for LoRA {lora_idx}"
+                )
 
 
 if __name__ == "__main__":

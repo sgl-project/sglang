@@ -279,5 +279,9 @@
     "default_mean_abs_diff_threshold_image": 8.0,
     "default_ssim_threshold_video": 0.92,
     "default_psnr_threshold_video": 24.0,
-    "default_mean_abs_diff_threshold_video": 10.0
+    "default_mean_abs_diff_threshold_video": 10.0,
+    "default_audio_spectral_similarity_threshold": 0.95,
+    "default_audio_waveform_correlation_threshold": 0.90,
+    "default_audio_rms_db_diff_threshold": 2.0,
+    "default_audio_duration_diff_threshold": 0.1
 }

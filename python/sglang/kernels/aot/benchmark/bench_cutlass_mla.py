@@ -114,10 +114,8 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
 
     q_size = qn.numel() * qn.element_size() + qr.numel() * qr.element_size()
 
-    gbps = (
-        lambda ms: (
-            q_size + q_size * dv / d + kv_cache.numel() * kv_cache.element_size()
-        )
+    gbps = lambda ms: (
+        (q_size + q_size * dv / d + kv_cache.numel() * kv_cache.element_size())
         * 1e-9
         / (ms * 1e-3)
     )
