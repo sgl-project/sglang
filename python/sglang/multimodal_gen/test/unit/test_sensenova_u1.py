@@ -107,9 +107,11 @@ def _install_sensenova_cache_dit_stub(
 
     module.enable_cache_on_transformer = enable_cache_on_transformer
     module.disable_cache_on_transformer = disable_cache_on_transformer
-    module.refresh_context_on_transformer = lambda transformer, steps: calls[
-        "refresh"
-    ].append((transformer, steps))
+
+    def refresh_context_on_transformer(transformer, steps, *, config=None):
+        calls["refresh"].append((transformer, steps, config))
+
+    module.refresh_context_on_transformer = refresh_context_on_transformer
     monkeypatch.setitem(sys.modules, module.__name__, module)
     return calls
 
@@ -742,7 +744,9 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["seed"] == 123
 
 
-def test_sensenova_u1_cache_dit_mounts_refreshes_and_unmounts(monkeypatch):
+def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
+    monkeypatch,
+):
     calls = _install_sensenova_cache_dit_stub(monkeypatch)
     transformer = SimpleNamespace(layers=object())
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
@@ -752,7 +756,13 @@ def test_sensenova_u1_cache_dit_mounts_refreshes_and_unmounts(monkeypatch):
         guidance_scale=4.0,
         sampling_params=SimpleNamespace(
             enable_cache_dit=True,
-            cache_dit_params={"residual_diff_threshold": 0.1},
+            cache_dit_params={
+                "Fn_compute_blocks": 3,
+                "Bn_compute_blocks": 1,
+                "max_warmup_steps": 2,
+                "residual_diff_threshold": 0.1,
+                "max_continuous_cached_steps": 4,
+            },
         ),
     )
 
@@ -762,15 +772,27 @@ def test_sensenova_u1_cache_dit_mounts_refreshes_and_unmounts(monkeypatch):
     assert transformer._sensenova_cache_dit_native_layers is transformer.layers
     config = calls["enable"][0][1]
     assert config.kwargs["num_inference_steps"] == 8
+    assert config.kwargs["Fn_compute_blocks"] == 3
+    assert config.kwargs["Bn_compute_blocks"] == 1
+    assert config.kwargs["max_warmup_steps"] == 2
     assert config.kwargs["residual_diff_threshold"] == 0.1
+    assert config.kwargs["max_continuous_cached_steps"] == 4
     assert calls["enable"][0][2]["has_separate_cfg"] is True
 
+    # A sequential n>1 request enters the generation stage once per output.
+    # The second output refreshes the context instead of remounting Cache-DiT.
     stage._maybe_enable_cache_dit(batch, SimpleNamespace())
-    assert calls["refresh"] == [(transformer, 8)]
+    assert len(calls["refresh"]) == 1
+    refreshed_transformer, refreshed_steps, refreshed_config = calls["refresh"][0]
+    assert refreshed_transformer is transformer
+    assert refreshed_steps == 8
+    assert refreshed_config is config
+    assert refreshed_config.kwargs == config.kwargs
 
     batch.sampling_params.enable_cache_dit = False
     stage._maybe_enable_cache_dit(batch, SimpleNamespace())
     assert calls["disable"] == [transformer]
+    assert stage._cache_dit_active_config is None
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
 
 

@@ -12,7 +12,8 @@ class _FakeDBCacheConfig:
         self.kwargs = kwargs
 
     def reset(self, **kwargs):
-        return kwargs
+        self.kwargs.update(kwargs)
+        return self.kwargs
 
 
 class _FakeForwardPattern:
@@ -208,6 +209,65 @@ class TestCacheDitRefreshContext(unittest.TestCase):
                 "steps_computation_policy": "fast",
             },
         )
+
+    def test_refresh_context_preserves_mounted_db_cache_config(self):
+        module = _import_module_with_stub()
+        config = module.CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=4,
+            Bn_compute_blocks=2,
+            max_warmup_steps=3,
+            residual_diff_threshold=0.1,
+            max_continuous_cached_steps=5,
+            num_inference_steps=8,
+        )
+
+        module.refresh_context_on_transformer(
+            transformer="transformer",
+            num_inference_steps=8,
+            config=config,
+        )
+
+        self.assertEqual(
+            module.cache_dit.refresh_calls[0]["cache_config"].kwargs,
+            {
+                "Fn_compute_blocks": 4,
+                "Bn_compute_blocks": 2,
+                "max_warmup_steps": 3,
+                "residual_diff_threshold": 0.1,
+                "max_continuous_cached_steps": 5,
+                "num_inference_steps": 8,
+                "steps_computation_mask": None,
+                "steps_computation_policy": "dynamic",
+            },
+        )
+
+    def test_refresh_context_config_allows_scm_preset_override(self):
+        module = _import_module_with_stub()
+        config = module.CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=4,
+            steps_computation_mask=[0, 1],
+            steps_computation_policy="dynamic",
+            num_inference_steps=2,
+        )
+
+        module.refresh_context_on_transformer(
+            transformer="transformer",
+            num_inference_steps=3,
+            scm_preset="fast",
+            config=config,
+        )
+
+        self.assertEqual(
+            module.cache_dit.steps_mask_calls,
+            [{"mask_policy": "fast", "total_steps": 3}],
+        )
+        refreshed = module.cache_dit.refresh_calls[0]["cache_config"].kwargs
+        self.assertEqual(refreshed["Fn_compute_blocks"], 4)
+        self.assertEqual(refreshed["num_inference_steps"], 3)
+        self.assertEqual(refreshed["steps_computation_mask"], [1, 1, 1])
+        self.assertEqual(refreshed["steps_computation_policy"], "fast")
 
     def test_dual_refresh_without_scm_preset_skips_steps_mask(self):
         module = _import_module_with_stub()

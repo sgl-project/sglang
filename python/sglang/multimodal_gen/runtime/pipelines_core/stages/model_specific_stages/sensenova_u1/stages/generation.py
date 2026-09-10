@@ -74,6 +74,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
         self.tokenizer = tokenizer
         self._cache_dit_enabled = False
         self._cache_dit_active_key: tuple | None = None
+        self._cache_dit_active_config = None
         self._cache_dit_cleanup_required = False
 
     def _cache_dit_requested(self, batch: Req) -> bool:
@@ -110,6 +111,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 del transformer._sensenova_cache_dit_native_layers
             self._cache_dit_enabled = False
             self._cache_dit_active_key = None
+            self._cache_dit_active_config = None
             # If rollback itself failed, do not let a later ordinary request
             # take the early-return path and execute a potentially wrapped
             # transformer without its native-layers escape hatch.
@@ -180,11 +182,40 @@ class SenseNovaU1GenerationStage(PipelineStage):
 
         transformer = self._cache_dit_transformer
         steps = int(batch.num_inference_steps)
-        if self._cache_dit_enabled:
-            refresh_context_on_transformer(transformer, steps)
-            return
         if not requested:
             return
+
+        if self._cache_dit_enabled:
+            if self._cache_dit_active_config is None:
+                raise RuntimeError(
+                    "SenseNova-U1 Cache-DiT is enabled without an active config."
+                )
+            refresh_context_on_transformer(
+                transformer,
+                steps,
+                config=self._cache_dit_active_config,
+            )
+            return
+
+        config = CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=overrides.get(
+                "Fn_compute_blocks", envs.SGLANG_CACHE_DIT_FN
+            ),
+            Bn_compute_blocks=overrides.get(
+                "Bn_compute_blocks", envs.SGLANG_CACHE_DIT_BN
+            ),
+            max_warmup_steps=overrides.get(
+                "max_warmup_steps", envs.SGLANG_CACHE_DIT_WARMUP
+            ),
+            residual_diff_threshold=overrides.get(
+                "residual_diff_threshold", envs.SGLANG_CACHE_DIT_RDT
+            ),
+            max_continuous_cached_steps=overrides.get(
+                "max_continuous_cached_steps", envs.SGLANG_CACHE_DIT_MC
+            ),
+            num_inference_steps=steps,
+        )
 
         # Cache-DiT's forward wrapper replaces ``transformer.layers`` only
         # dynamically. Preserve the genuine ModuleList so both Qwen3 backbones
@@ -195,25 +226,6 @@ class SenseNovaU1GenerationStage(PipelineStage):
             transformer, "_sensenova_cache_dit_native_layers", transformer.layers
         )
         try:
-            config = CacheDitConfig(
-                enabled=True,
-                Fn_compute_blocks=overrides.get(
-                    "Fn_compute_blocks", envs.SGLANG_CACHE_DIT_FN
-                ),
-                Bn_compute_blocks=overrides.get(
-                    "Bn_compute_blocks", envs.SGLANG_CACHE_DIT_BN
-                ),
-                max_warmup_steps=overrides.get(
-                    "max_warmup_steps", envs.SGLANG_CACHE_DIT_WARMUP
-                ),
-                residual_diff_threshold=overrides.get(
-                    "residual_diff_threshold", envs.SGLANG_CACHE_DIT_RDT
-                ),
-                max_continuous_cached_steps=overrides.get(
-                    "max_continuous_cached_steps", envs.SGLANG_CACHE_DIT_MC
-                ),
-                num_inference_steps=steps,
-            )
             enable_cache_on_transformer(
                 transformer,
                 config,
@@ -236,6 +248,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             raise
         self._cache_dit_enabled = True
         self._cache_dit_active_key = desired_key
+        self._cache_dit_active_config = config
         self._cache_dit_cleanup_required = False
 
     @property
