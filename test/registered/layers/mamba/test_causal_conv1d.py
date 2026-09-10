@@ -20,6 +20,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import empty_gpu_cache
 
@@ -432,6 +433,272 @@ def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
 
     torch.testing.assert_close(out, torch.cat(expected, dim=-1), rtol=1e-2, atol=5e-2)
     torch.testing.assert_close(conv_states, conv_states_ref, rtol=1e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("activation", [None, "silu"])
+@pytest.mark.parametrize("width", [1, 4])
+def test_causal_conv1d_native_varlen(activation, width):
+    device = get_device()
+    torch.manual_seed(0)
+    dim = 32
+    seq_lens = [2, 5, 1, 3]
+    query_start_loc = torch.tensor(
+        [0, 2, 7, 8, 11, 11], dtype=torch.int32, device=device
+    )
+    x = torch.randn(dim, sum(seq_lens), dtype=torch.float32, device=device)
+    weight = torch.randn(dim, width, dtype=torch.float32, device=device)
+    bias = torch.randn(dim, dtype=torch.float32, device=device)
+    cache_indices = torch.tensor([3, 1, 4, PAD_SLOT_ID], device=device)
+    has_initial_state = torch.tensor([True, False, True, False], device=device)
+    conv_states = torch.randn(6, dim, width - 1, dtype=torch.float16, device=device)
+    conv_states_ref = conv_states.clone()
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        seq_lens,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        validate_data=True,
+        backend=KernelBackend.TORCH,
+    )
+
+    expected = []
+    start = 0
+    for batch_idx, seq_len in enumerate(seq_lens[:-1]):
+        state_idx = int(cache_indices[batch_idx].item())
+        initial_state = (
+            conv_states_ref[state_idx].to(x.dtype).unsqueeze(0)
+            if has_initial_state[batch_idx]
+            else None
+        )
+        out_ref, _ = causal_conv1d_ref(
+            x[:, start : start + seq_len].unsqueeze(0),
+            weight,
+            bias,
+            initial_states=initial_state,
+            return_final_states=True,
+            final_states_out=conv_states_ref[state_idx].unsqueeze(0),
+            activation=activation,
+        )
+        expected.append(out_ref.squeeze(0))
+        start += seq_len
+
+    torch.testing.assert_close(out[:, :start], torch.cat(expected, dim=-1))
+    torch.testing.assert_close(conv_states, conv_states_ref)
+
+
+def test_causal_conv1d_native_without_state_cache():
+    device = get_device()
+    x = torch.randn(4, 3, device=device)
+    weight = torch.randn(4, 3, device=device)
+    bias = torch.randn(4, device=device)
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        None,
+        torch.tensor([0, 3], device=device),
+        [3],
+        activation=None,
+        backend=KernelBackend.TORCH,
+    )
+    expected, _ = causal_conv1d_ref(x.unsqueeze(0), weight, bias, activation=None)
+    torch.testing.assert_close(out, expected.squeeze(0))
+
+
+@pytest.mark.parametrize("backend", [KernelBackend.TORCH, KernelBackend.TRITON])
+def test_causal_conv1d_rejects_unsupported_activation(backend):
+    device = get_device()
+    with pytest.raises(NotImplementedError, match="activation must be"):
+        causal_conv1d_fn(
+            torch.randn(4, 2, device=device),
+            torch.randn(4, 2, device=device),
+            None,
+            None,
+            torch.tensor([0, 2], device=device),
+            [2],
+            activation="relu",
+            backend=backend,
+        )
+
+
+def test_causal_conv1d_triton_without_state_cache():
+    device = get_device()
+    x = torch.randn(4, 3, device=device)
+    weight = torch.randn(4, 3, device=device)
+    bias = torch.randn(4, device=device)
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        None,
+        torch.tensor([0, 3], device=device),
+        [3],
+        activation=None,
+        backend=KernelBackend.TRITON,
+    )
+    expected, _ = causal_conv1d_ref(x.unsqueeze(0), weight, bias, activation=None)
+    torch.testing.assert_close(out, expected.squeeze(0))
+
+
+def test_causal_conv1d_native_preserves_higher_precision_state():
+    device = get_device()
+    x = torch.tensor([[4.0]], dtype=torch.float16, device=device)
+    weight = torch.ones(1, 4, dtype=torch.float32, device=device)
+    conv_states = torch.tensor(
+        [[[1.0001, 2.0002, 3.0003]]], dtype=torch.float32, device=device
+    )
+
+    causal_conv1d_fn(
+        x,
+        weight,
+        None,
+        conv_states,
+        torch.tensor([0, 1], device=device),
+        [1],
+        has_initial_state=torch.tensor([True], device=device),
+        activation=None,
+        backend=KernelBackend.TORCH,
+    )
+
+    torch.testing.assert_close(
+        conv_states,
+        torch.tensor([[[2.0002, 3.0003, 4.0]]], device=device),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("backend", [KernelBackend.TORCH, KernelBackend.TRITON])
+@pytest.mark.parametrize("validate_data", [False, True])
+def test_causal_conv1d_validates_initial_state_cache(validate_data, backend):
+    device = get_device()
+    with pytest.raises(ValueError, match="requires conv_states"):
+        causal_conv1d_fn(
+            torch.randn(4, 2, device=device),
+            torch.randn(4, 2, device=device),
+            None,
+            None,
+            torch.tensor([0, 2], device=device),
+            [2],
+            has_initial_state=torch.tensor([True], device=device),
+            validate_data=validate_data,
+            backend=backend,
+        )
+
+
+@pytest.mark.parametrize("validate_data", [False, True])
+def test_causal_conv1d_native_validates_implicit_state_indices(validate_data):
+    device = get_device()
+    with pytest.raises(ValueError, match="smaller than the implicit batch"):
+        causal_conv1d_fn(
+            torch.randn(4, 2, device=device),
+            torch.randn(4, 2, device=device),
+            None,
+            torch.zeros(1, 4, 1, device=device),
+            torch.tensor([0, 1, 2], device=device),
+            [1, 1],
+            validate_data=validate_data,
+            backend=KernelBackend.TORCH,
+        )
+
+
+@pytest.mark.parametrize("validate_data", [False, True])
+@pytest.mark.parametrize("bad_index", [-2, 1])
+def test_causal_conv1d_native_validates_explicit_state_indices(
+    validate_data, bad_index
+):
+    device = get_device()
+    with pytest.raises(ValueError, match="out-of-range state index"):
+        causal_conv1d_fn(
+            torch.randn(4, 2, device=device),
+            torch.randn(4, 2, device=device),
+            None,
+            torch.zeros(1, 4, 1, device=device),
+            torch.tensor([0, 2], device=device),
+            [2],
+            cache_indices=torch.tensor([bad_index], device=device),
+            validate_data=validate_data,
+            backend=KernelBackend.TORCH,
+        )
+
+
+@pytest.mark.parametrize("validate_data", [False, True])
+def test_causal_conv1d_native_rejects_short_query_start_loc(validate_data):
+    device = get_device()
+    with pytest.raises(ValueError, match="query_start_loc"):
+        causal_conv1d_fn(
+            torch.randn(4, 2, device=device),
+            torch.randn(4, 2, device=device),
+            None,
+            torch.zeros(1, 4, 1, device=device),
+            torch.tensor([0], device=device),
+            [2],
+            validate_data=validate_data,
+            backend=KernelBackend.TORCH,
+        )
+
+
+def test_causal_conv1d_native_validates_query_span():
+    with pytest.raises(ValueError, match="within the input tokens"):
+        causal_conv1d_fn(
+            torch.randn(4, 3),
+            torch.randn(4, 2),
+            None,
+            None,
+            torch.tensor([1, 3]),
+            [2],
+            validate_data=True,
+            backend=KernelBackend.TORCH,
+        )
+
+
+def test_causal_conv1d_native_allows_trailing_padding():
+    x = torch.randn(4, 3)
+    weight = torch.randn(4, 2)
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        None,
+        None,
+        torch.tensor([0, 2]),
+        [2],
+        activation=None,
+        validate_data=True,
+        backend=KernelBackend.TORCH,
+    )
+    expected, _ = causal_conv1d_ref(x[:, :2].unsqueeze(0), weight, activation=None)
+    torch.testing.assert_close(out[:, :2], expected.squeeze(0))
+
+
+def test_causal_conv1d_native_ignores_zero_length_state_index():
+    x = torch.randn(4, 2)
+    weight = torch.randn(4, 2)
+    conv_states = torch.zeros(1, 4, 1)
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        None,
+        conv_states,
+        torch.tensor([0, 2, 2]),
+        [2, 0],
+        cache_indices=torch.tensor([0, 99]),
+        activation=None,
+        validate_data=True,
+        backend=KernelBackend.TORCH,
+    )
+    expected, final_state = causal_conv1d_ref(
+        x.unsqueeze(0), weight, return_final_states=True, activation=None
+    )
+    torch.testing.assert_close(out, expected.squeeze(0))
+    torch.testing.assert_close(conv_states[0], final_state.squeeze(0))
 
 
 if __name__ == "__main__":

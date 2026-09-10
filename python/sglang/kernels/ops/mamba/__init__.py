@@ -17,6 +17,11 @@ if TYPE_CHECKING:
     import torch
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_CUDA_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
+_CAUSAL_CONV1D_FORMAT = FormatSignature(
+    in_place=True,
+    description="variable-length causal Conv1D with optional state-cache updates",
+)
 
 # JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,
 # never by the ROCm / MUSA / Metal extensions. Non-CUDA resolves nothing here --
@@ -46,6 +51,24 @@ register_kernel(
         description="Causal conv1d update (sglang.kernels.jit).",
     )
 )
+for _backend, _method, _capabilities in (
+    (KernelBackend.TORCH, "forward_native", frozenset()),
+    (KernelBackend.TRITON, "forward_triton", _CUDA_HIP),
+):
+    register_kernel(
+        KernelSpec(
+            op="mamba.causal_conv1d_fn",
+            backend=_backend,
+            target=(
+                "sglang.kernels.ops.mamba.causal_conv1d_triton:"
+                f"_CAUSAL_CONV1D_OP.{_method}"
+            ),
+            capabilities=_capabilities,
+            format_signature=_CAUSAL_CONV1D_FORMAT,
+            description=f"Variable-length causal Conv1D ({_backend.value}).",
+        )
+    )
+del _backend, _method, _capabilities
 
 
 def causal_conv1d_fwd(
@@ -103,7 +126,6 @@ __all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
 for _mod, _fn in [
     ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),
     ("triton_ops.mamba_ssm", "selective_state_update"),
-    ("causal_conv1d_triton", "causal_conv1d_fn"),
     ("mamba_state_scatter_triton", "fused_mamba_state_scatter_with_mask"),
 ]:
     register_kernel(
