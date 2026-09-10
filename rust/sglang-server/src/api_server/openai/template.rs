@@ -6,7 +6,6 @@
 //! `Conversation.get_prompt()` so there is exactly one implementation of the
 //! per-style formatting logic (no Jinja translation to drift).
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dynamo_protocols::types::CreateChatCompletionRequest;
@@ -25,12 +24,12 @@ use super::template_loader::infer_legacy_template_from_model_path;
 pub(super) use super::template_loader::load_chat_formatter;
 
 /// A chat prompt formatter: either the model's HuggingFace Jinja template or a
-/// legacy SGLang conversation template.
+/// legacy SGLang conversation template, or a Dynamo native formatter.
 #[derive(Clone)]
 pub enum ChatFormatter {
     HuggingFace(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
-    DeepSeekV4(BTreeMap<String, String>),
+    Native(PromptFormatter),
 }
 
 impl ChatFormatter {
@@ -50,8 +49,8 @@ impl ChatFormatter {
                     })
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request),
-            ChatFormatter::DeepSeekV4(prompts) => {
-                super::template_dsv4::render(request, prompts, thinking)
+            ChatFormatter::Native(formatter) => {
+                super::template_native::render(formatter, request, thinking)
             }
         }
     }
@@ -62,7 +61,7 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) | ChatFormatter::DeepSeekV4(_) => None,
+            ChatFormatter::HuggingFace(_) | ChatFormatter::Native(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }

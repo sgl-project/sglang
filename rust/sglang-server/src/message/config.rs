@@ -329,8 +329,8 @@ pub enum DisaggregationMode {
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
-    /// Present only for DeepSeek V4; resolved by Python's canonical encoder/profile selection.
-    pub dsv4_effort_prompts: Option<BTreeMap<String, String>>,
+    /// Authoritative HF model type, used to select a native chat formatter.
+    pub model_type: Option<String>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
@@ -353,20 +353,20 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, dsv4_effort_prompts))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
         default_sampling_params: DefaultSamplingParams,
-        dsv4_effort_prompts: Option<BTreeMap<String, String>>,
+        model_type: Option<String>,
     ) -> Self {
         Self {
             context_len,
             vocab_size,
             is_multimodal,
             default_sampling_params,
-            dsv4_effort_prompts,
+            model_type,
         }
     }
 }
@@ -376,7 +376,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             context_len: 2048,
-            dsv4_effort_prompts: None,
+            model_type: None,
             vocab_size: 1000,
             is_multimodal: false,
             default_sampling_params: DefaultSamplingParams::default(),
