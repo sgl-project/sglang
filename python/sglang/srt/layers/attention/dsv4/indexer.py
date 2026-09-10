@@ -1128,16 +1128,13 @@ class C4Indexer(nn.Module):
         )
 
 
-def select_candidate_blocks(
+def select_candidate_block_indices(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,
     topk_blocks: int,
     block_size: int,
-) -> torch.Tensor:
-    """Level one of the two-level top-k: a bool mask over positions keeping the
-    topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
-    in logits, so an all -inf block means not reachable yet; the block holding the
-    query's newest position is always kept."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return selected block indices and their reachability, including the newest block."""
     width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
@@ -1149,7 +1146,22 @@ def select_candidate_blocks(
     )
 
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
+    return top.indices, top.values > -torch.inf
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Return a position mask covering selected reachable blocks and the newest block."""
+    indices, valid = select_candidate_block_indices(
+        logits, compress_lens, topk_blocks, block_size
     )
+    width = logits.size(-1)
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
+    ).scatter_(-1, indices, valid)
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
