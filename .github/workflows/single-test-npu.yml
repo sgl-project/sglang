@@ -1,0 +1,100 @@
+name: Single Test (NPU)
+# test round 1: <测试用例描述>
+
+on:
+  pull_request:
+    branches:
+      - testcases
+      - testcases-260813
+    paths:
+      - ".github/workflows/single-test-npu.yml"
+
+concurrency:
+  group: single-test-npu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  single-node-poc:
+    name: single-node-poc
+    runs-on: linux-amd64-a5-2
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-20260828
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check npu info
+        run: |
+          npu-smi info
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          HF_ENDPOINT: https://hf-mirror.com
+          SGLANG_IS_IN_CI: true
+        shell: bash
+        run: |
+          sglang_source_path=$(pwd)
+          echo "Source code path: ${sglang_source_path}"
+          ln -sf ${sglang_source_path} /root/sglang
+
+          # Test cases - 使用时替换为实际的测试用例路径
+          test_cases=(
+            "test/registered/npu/llm_models/test_npu_qwen3_0_6b.py"
+          )
+
+          for test_case in "${test_cases[@]}"; do
+            if [ ! -f "${sglang_source_path}/${test_case}" ]; then
+              echo "The testcase does not exit: ${sglang_source_path}/${test_case}"
+              exit 1
+            fi
+          done
+
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+          echo "scaling_governor performance num: \
+            $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | grep performance | wc -l)"
+          echo "swappiness: $(cat /proc/sys/vm/swappiness)"
+          echo "numa_balancing: $(cat /proc/sys/kernel/numa_balancing)"
+          echo "sched_migration_cost_ns: $(cat /proc/sys/kernel/sched_migration_cost_ns)"
+
+          export SGLANG_TEST_MAX_RETRY=0
+          export SGLANG_SET_CPU_AFFINITY=1
+          echo "SGLANG_SET_CPU_AFFINITY: $SGLANG_SET_CPU_AFFINITY"
+
+          echo "Use sglang from image"
+          sglang_pkg_path=/sgl-workspace/sglang/python
+          ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
+          mkdir -p ${ascend_test_util_path}
+          mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
+          cp -r ${sglang_source_path}/python/sglang/test/ascend ${ascend_test_util_path}
+
+          # Set environment of cann
+          source /usr/local/Ascend/cann/set_env.sh || true
+          source /usr/local/Ascend/nnal/atb/set_env.sh || true
+
+          current_date=$(date +%Y%m%d)
+          log_path="/root/.cache/tests/logs/log/${current_date}/${HOSTNAME}"
+          rm -rf ${log_path}
+          mkdir -p ${log_path}
+          echo "Log path: ${log_path}"
+
+          for test_case in "${test_cases[@]}"; do
+            tc_name=$(basename ${test_case} .py)
+            echo "Running test case ${test_case}"
+            python -u ${sglang_source_path}/${test_case}
+            echo "Finished test case ${test_case}"
+          done
+
+          plog_path="/root/ascend/log/debug/plog"
+          if [ -d "$plog_path" ];then
+            echo "Plog files found. Begin to backup them."
+            target_plog_path="/root/.cache/tests/logs/plog/${HOSTNAME}"
+            echo "Save path: ${target_plog_path}"
+            rm -rf ${target_plog_path}
+            mkdir -p ${target_plog_path}
+            cp ${plog_path}/* ${target_plog_path}
+          fi
