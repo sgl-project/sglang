@@ -303,6 +303,78 @@ class TestDecideRequestAuth(CustomTestCase):
         )
         self.assertTrue(decision.allowed)
 
+    # ==================== Non-ASCII tokens ====================
+
+    def test_non_ascii_token_is_rejected_not_raised(self):
+        """A non-ASCII bearer token must deny, not raise.
+
+        ``secrets.compare_digest`` refuses ``str`` operands with non-ASCII
+        characters ("comparing strings with non-ASCII characters is not
+        supported"), so any client sending such a token turned the 401 into an
+        unhandled ``TypeError`` — a 500 out of the middleware, which has no
+        exception handling around the auth decision.
+        """
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/chat/completions",
+            authorization_header="Bearer \u5bc6\u94a5",
+            api_key="my-api-key",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.error_status_code, 401)
+
+    def test_non_ascii_api_key_is_usable(self):
+        """A server started with a non-ASCII --api-key must still authenticate.
+
+        Every request failed with the same ``TypeError`` regardless of the
+        token sent, so such a key could not be used at all.
+        """
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/chat/completions",
+            authorization_header="Bearer \u5bc6\u94a5",
+            api_key="\u5bc6\u94a5",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_non_ascii_api_key_wrong_token_denied(self):
+        """The non-ASCII path must still distinguish a wrong token."""
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/chat/completions",
+            authorization_header="Bearer \u5bc6\u94a5x",
+            api_key="\u5bc6\u94a5",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertFalse(decision.allowed)
+
+    def test_non_ascii_admin_key_force_level(self):
+        """ADMIN_FORCE must behave the same way for a non-ASCII admin key."""
+        allowed = decide_request_auth(
+            method="POST",
+            path="/admin/endpoint",
+            authorization_header="Bearer \u7ba1\u7406\u5bc6\u94a5",
+            api_key=None,
+            admin_api_key="\u7ba1\u7406\u5bc6\u94a5",
+            auth_level=AuthLevel.ADMIN_FORCE,
+        )
+        self.assertTrue(allowed.allowed)
+
+        denied = decide_request_auth(
+            method="POST",
+            path="/admin/endpoint",
+            authorization_header="Bearer \u5176\u4ed6\u5bc6\u94a5",
+            api_key=None,
+            admin_api_key="\u7ba1\u7406\u5bc6\u94a5",
+            auth_level=AuthLevel.ADMIN_FORCE,
+        )
+        self.assertFalse(denied.allowed)
+
 
 if __name__ == "__main__":
     unittest.main()
