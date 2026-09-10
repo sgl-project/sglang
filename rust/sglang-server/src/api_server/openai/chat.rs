@@ -190,6 +190,13 @@ async fn chat_completions(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(n);
 
+    let reasoning_splitters = if stream && reasoning_parser.is_some() {
+        (0..n)
+            .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), &prompt))
+            .collect()
+    } else {
+        vec![]
+    };
     let mut prompt = Some(prompt);
     for index in 0..n {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
@@ -232,7 +239,7 @@ async fn chat_completions(
             want_logprobs,
             include_usage,
             parser,
-            reasoning_parser,
+            reasoning_splitters,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -528,7 +535,7 @@ pub(super) fn chat_event_stream(
     want_logprobs: bool,
     include_usage: bool,
     parser: Option<String>,
-    reasoning_parser: Option<String>,
+    mut reasoning_splitters: Vec<ReasoningStreamSplitter>,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -542,16 +549,6 @@ pub(super) fn chat_event_stream(
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u64;
-        // One stateful reasoning splitter per choice (Python keeps a
-        // `reasoning_parser_dict` per index).
-        let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
-            if reasoning_parser.is_some() {
-                (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
-                    .collect()
-            } else {
-                vec![]
-            };
         let reasoning_enabled = !reasoning_splitters.is_empty();
 
         for (index, rid, rx) in submitted {
@@ -863,6 +860,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 #[cfg(test)]
 mod tests {
+    use super::super::reasoning::ReasoningStreamSplitter;
     use super::super::test_utils::{chat_submitted, chunk, senders};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
@@ -1132,7 +1130,7 @@ mod tests {
             false,
             true,
             None,
-            Some("deepseek-r1".into()),
+            vec![ReasoningStreamSplitter::new(Some("deepseek-r1"), "")],
             None,
             None,
             false,
@@ -1178,7 +1176,7 @@ mod tests {
             false,
             true,
             None,
-            None,
+            vec![],
             None,
             None,
             false,
