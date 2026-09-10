@@ -13,6 +13,8 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import save_file
 
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
+
 partial_json_parser = types.ModuleType("partial_json_parser")
 partial_json_parser_core = types.ModuleType("partial_json_parser.core")
 partial_json_parser_exceptions = types.ModuleType("partial_json_parser.core.exceptions")
@@ -704,7 +706,11 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ["/cache/minimax_h3_fl2va.safetensors"], "ref2va"
             )
 
-    def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self):
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+        "_load_comfy_kitchen"
+    )
+    def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self, _load):
         marker = json.dumps(
             {
                 "format": "int8_tensorwise",
@@ -712,23 +718,80 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 "convrot_groupsize": 256,
             }
         ).encode()
-        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
-            save_file(
-                {
-                    "adaln_t_table": torch.zeros((1025, 8)),
-                    "blocks.0.mlp.fc1.weight": torch.ones((2, 256), dtype=torch.int8),
-                    "blocks.0.mlp.fc1.weight_scale": torch.ones((2, 1)),
-                    "blocks.0.mlp.fc1.comfy_quant": torch.tensor(
+        mapping = get_param_names_mapping(MiniMaxH3DiTArchConfig().param_names_mapping)
+        for prefix in ("", "model.diffusion_model."):
+            with (
+                self.subTest(prefix=prefix),
+                tempfile.NamedTemporaryFile(suffix=".safetensors") as f,
+            ):
+                weights = {
+                    prefix + "adaln_t_table": torch.zeros((1025, 8)),
+                    prefix + "blocks.0.mlp.fc1.weight": torch.ones(
+                        (2, 256), dtype=torch.int8
+                    ),
+                    prefix + "blocks.0.mlp.fc1.weight_scale": torch.ones((2, 1)),
+                    prefix + "blocks.0.mlp.fc1.comfy_quant": torch.tensor(
                         list(marker), dtype=torch.uint8
                     ),
-                },
-                f.name,
-            )
+                }
+                save_file(weights, f.name)
+                curve_shape, comfy_quant = inspect_minimax_h3_safetensors([f.name])
+                config = resolve_minimax_h3_checkpoint_quantization(comfy_quant)
+                layer = ReplicatedLinear(
+                    256,
+                    2,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    quant_config=config,
+                    prefix="blocks.0.mlp.fc1",
+                )
+                target_names = {
+                    "blocks.0.mlp.fc1." + name for name in layer.state_dict()
+                } | {"adaln_t_table"}
+                native_mapping = get_param_names_mapping(
+                    MiniMaxH3DiTArchConfig().param_names_mapping,
+                    valid_target_names=target_names,
+                )
+                mapped, _ = hf_to_custom_state_dict(
+                    weights, native_mapping, valid_target_names=target_names
+                )
 
-            curve_shape, comfy_quant = inspect_minimax_h3_safetensors([f.name])
+                self.assertEqual(curve_shape, (1025, 8))
+                self.assertIn("adaln_t_table", mapped)
+                self.assertEqual(set(config.layer_markers), {"blocks.0.mlp.fc1"})
+                self.assertEqual(mapped["blocks.0.mlp.fc1.weight"].dtype, torch.int8)
+                self.assertIn("blocks.0.mlp.fc1.weight_scale", mapped)
+                layer.load_state_dict(
+                    {
+                        name.removeprefix("blocks.0.mlp.fc1."): tensor
+                        for name, tensor in mapped.items()
+                        if name in target_names and name != "adaln_t_table"
+                    },
+                    strict=True,
+                )
+                fp8_mapped, _ = hf_to_custom_state_dict(weights, mapping)
+                self.assertIn("blocks.0.mlp.fc1.weight_scale_inv", fp8_mapped)
+                both_scales = target_names | {"blocks.0.mlp.fc1.weight_scale_inv"}
+                final_mapping = get_param_names_mapping(
+                    MiniMaxH3DiTArchConfig().param_names_mapping, both_scales
+                )
+                self.assertEqual(
+                    final_mapping(prefix + "blocks.0.mlp.fc1.weight_scale")[0],
+                    "blocks.0.mlp.fc1.weight_scale_inv",
+                )
 
-        self.assertEqual(curve_shape, (1025, 8))
-        self.assertEqual(comfy_quant["blocks.0.mlp.fc1"]["format"], "int8_tensorwise")
+    def test_mapping_fallback_preserves_merge_and_explicit_drop(self):
+        mapping = get_param_names_mapping(
+            {
+                r"^wrapper\.(.*)$": r"\1",
+                r"^q\.(.*)$": (r"qkv.\1", 0, 3),
+                r"^qkv\.weight_scale$": "qkv.weight_scale_inv",
+                r"^ignored$": "",
+            },
+            {"qkv.weight_scale", "ignored"},
+        )
+        self.assertEqual(mapping("wrapper.q.weight_scale"), ("qkv.weight_scale", 0, 3))
+        self.assertEqual(mapping("wrapper.ignored"), ("", None, None))
 
     def test_inspect_minimax_h3_fp8_detects_static_activation_scale(self):
         marker = torch.tensor(list(b'{"format":"float8_e4m3fn"}'), dtype=torch.uint8)
