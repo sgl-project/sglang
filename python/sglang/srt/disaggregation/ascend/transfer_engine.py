@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PROTOCOL = "sdma"
 
+# Port spacing between NPU ranks under host_rdma. One hcom instance binds
+# several adjacent ports, so ranks are spaced widely to avoid EADDRINUSE.
+_HOST_RDMA_PORT_STRIDE = 100
+
 
 class AscendTransferEngine(MooncakeTransferEngine):
     def __init__(
@@ -75,9 +79,28 @@ class AscendTransferEngine(MooncakeTransferEngine):
             )
 
         trans_op_type = self._resolve_trans_op_type(transfer_protocol)
+
+        # With host_rdma, each NPU rank must listen on a distinct port. One hcom
+        # instance binds several adjacent ports, so ranks are spaced by a wide
+        # stride; a stride of 1 caused EADDRINUSE under stress tests.
+        nic = os.getenv("ASCEND_MF_NIC")
+        if transfer_protocol == "host_rdma" and nic:
+            nic_host, nic_port = nic.rsplit(":", 1)
+            nic = f"{nic_host}:{int(nic_port) + self.npu_id * _HOST_RDMA_PORT_STRIDE}"
+            logger.info(
+                "HOST_RDMA endpoint: npu_id=%s, nic=%s",
+                self.npu_id,
+                nic,
+            )
+
         """Initialize the ascend transfer instance."""
         ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            self.store_url,
+            self.session_id,
+            self.role,
+            self.npu_id,
+            trans_op_type,
+            nic=nic,
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
