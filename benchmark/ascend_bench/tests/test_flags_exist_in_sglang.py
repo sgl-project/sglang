@@ -7,8 +7,8 @@ flags are literal ``add_argument`` strings in ``sglang/benchmark/serving.py``.
 Skipped when this directory is relocated outside a sglang checkout.
 """
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
 import yaml
