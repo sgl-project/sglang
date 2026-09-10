@@ -1407,22 +1407,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
 
-    @staticmethod
-    def _kv_dequant_scales(layer) -> Tuple[float, float]:
-        """Per-tensor K/V scales for an FP8 pool (1.0 when the checkpoint ships none)."""
-
-        def scalar(name_float, name):
-            value = getattr(layer, name_float, None)
-            if value is None:
-                value = getattr(layer, name, None)
-            if value is None:
-                return 1.0
-            if isinstance(value, torch.Tensor):
-                return float(value.item()) if value.numel() == 1 else 1.0
-            return float(value)
-
-        return scalar("k_scale_float", "k_scale"), scalar("v_scale_float", "v_scale")
-
     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
         key = (batch, pages_per_row, device)
         cached = self._trtllm_sparse_tables.get(key)
@@ -1472,7 +1456,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
         # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
         # paged kernel always runs the bf16 q + bf16 KV path.
-        k_scale, v_scale = self._kv_dequant_scales(layer)
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
@@ -1497,8 +1480,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
             zero_fill_cols=stride,
-            k_scale=k_scale,
-            v_scale=v_scale,
         )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
@@ -1605,7 +1586,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             if metadata.is_cuda_graph
             else batch * topk
         )
-        k_scale, v_scale = self._kv_dequant_scales(layer)
         packed_k, packed_v = self._get_fa2_scratch(
             scratch_capacity,
             k_buffer.shape[1],
@@ -1629,8 +1609,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
-            k_scale=k_scale,
-            v_scale=v_scale,
         )
         output = flash_attn_varlen_func(
             q=q,

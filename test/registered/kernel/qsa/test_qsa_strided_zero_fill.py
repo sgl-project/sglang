@@ -10,10 +10,13 @@ multiply masked probabilities into stale NaN/Inf bytes. Also checks the compact
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
-    qwen_sparse_valid_counts_triton,
 )
 
 
@@ -47,7 +50,6 @@ def test_strided_gather_zero_fills_tail(dtype):
         indices[b, :n] = torch.arange(n, device=device, dtype=torch.int32)
     cu_strided = torch.arange(batch + 1, device=device, dtype=torch.int32) * stride
     # the scratch is always in the compute dtype (bf16); an FP8 pool is dequantized on the way in
-    k_scale, v_scale = (1.0, 1.0) if dtype == torch.bfloat16 else (0.5, 2.0)
     packed_k = torch.full(
         (batch * stride, heads, dim), float("nan"), device=device, dtype=torch.bfloat16
     )
@@ -66,8 +68,6 @@ def test_strided_gather_zero_fills_tail(dtype):
         batch,
         topk,
         zero_fill_cols=stride,
-        k_scale=k_scale,
-        v_scale=v_scale,
     )
     pk, pv = (
         packed_k.float().view(batch, stride, heads, dim),
@@ -77,12 +77,8 @@ def test_strided_gather_zero_fills_tail(dtype):
     for b in range(batch):
         n = min(int(seq_lens[b]), topk)
         slots = req_to_token[b, :n].long()
-        torch.testing.assert_close(
-            pk[b, :n], (k_pool[slots].float() * k_scale).to(torch.bfloat16).float()
-        )
-        torch.testing.assert_close(
-            pv[b, :n], (v_pool[slots].float() * v_scale).to(torch.bfloat16).float()
-        )
+        torch.testing.assert_close(pk[b, :n], k_pool[slots].to(torch.bfloat16).float())
+        torch.testing.assert_close(pv[b, :n], v_pool[slots].to(torch.bfloat16).float())
         assert (pk[b, n:] == 0).all() and (pv[b, n:] == 0).all()
 
 
@@ -139,8 +135,8 @@ def test_strided_gather_addresses_pool_beyond_int32_elements():
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if torch.cuda.get_device_properties(0).total_memory < 8 * 1024**3:
-        pytest.skip("needs ~4.5 GB of device memory")
+    if torch.cuda.get_device_properties(0).total_memory < 6 * 1024**3:
+        pytest.skip("needs ~2.5 GB of device memory")
     torch.manual_seed(0)
     device = torch.device("cuda")
     heads, dim = 2, 256

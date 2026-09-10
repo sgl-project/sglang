@@ -382,8 +382,6 @@ def _compact_kv(
     req_stride: tl.constexpr,
     idx_stride: tl.constexpr,
     pad_cols,
-    k_scale,
-    v_scale,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ZERO_FILL: tl.constexpr,
@@ -420,13 +418,21 @@ def _compact_kv(
         store_mask = (cols < pad_cols)[:, None] & (dims[None, :] < dim)
     else:
         store_mask = load_mask
-    # Dequantize while gathering: the scratch is allocated in the query dtype, so
-    # FP8 pools are read as fp8 and stored as bf16 (times the per-tensor scale).
+    # Dequantize while gathering: the scratch is allocated in the query dtype, so an
+    # FP8 pool is read as fp8 and stored as bf16. The QSA backend writes the pool
+    # without per-tensor k/v scales (see set_kv_buffer calls in
+    # qwen_sparse_attn_backend.py), so no scale is applied here either.
     out_dtype = out_k.dtype.element_ty
-    k_vals = tl.load(k + src, mask=load_mask, other=0.0).to(tl.float32) * k_scale
-    v_vals = tl.load(v + src, mask=load_mask, other=0.0).to(tl.float32) * v_scale
-    tl.store(out_k + dst, k_vals.to(out_dtype), mask=store_mask)
-    tl.store(out_v + dst, v_vals.to(out_dtype), mask=store_mask)
+    tl.store(
+        out_k + dst,
+        tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
+        mask=store_mask,
+    )
+    tl.store(
+        out_v + dst,
+        tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
+        mask=store_mask,
+    )
 
 
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
@@ -455,8 +461,6 @@ def qwen_sparse_kv_extraction_compact_triton(
     batch,
     topk,
     zero_fill_cols: int = 0,
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
 ):
     """Gather the selected K/V rows into ``out_k``/``out_v``.
 
@@ -468,7 +472,11 @@ def qwen_sparse_kv_extraction_compact_triton(
     the varlen fallback, whose rows are packed back-to-back.
 
     ``out_k``/``out_v`` may use a wider dtype than the pool (bf16 scratch for an FP8
-    pool); rows are dequantized with ``k_scale``/``v_scale`` while gathering.
+    pool); rows are converted while gathering.
+
+    Both layouts assume the valid entries of each ``indices`` row are contiguous at
+    the front (``expand_qsa_block_indices`` sorts them that way): ``valid_count`` is a
+    count, not a mask, so a ``-1`` in the middle of a row would shift the packing.
     """
     _, heads, dim = k.shape
     block_topk = 16
@@ -490,8 +498,6 @@ def qwen_sparse_kv_extraction_compact_triton(
         req_to_token.stride(0),
         indices.stride(0),
         num_cols,
-        float(k_scale),
-        float(v_scale),
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
