@@ -60,23 +60,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         self.assertEqual(args[1:], (64, 1))
         jit_metadata.assert_not_called()
 
-    def test_sm120_fp8_torch_fallback_keeps_metadata_none(self):
-        with (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_TOPK_V2.override(False),
-        ):
-            metadata = PagedIndexerMetadata(
-                page_size=256,
-                compressed_page_size=64,
-                page_table=torch.zeros((1, 1), dtype=torch.int32),
-                compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
-                use_topk_v2=False,
-            )
-
-        self.assertIsNone(metadata.deep_gemm_metadata)
-
-    def test_topk_v2_ineligible_backend_skips_plan(self):
+    def test_torch_fallback_skips_deep_gemm_and_ineligible_topk_plan(self):
         with (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
@@ -91,6 +75,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 use_topk_v2=False,
             )
 
+        self.assertIsNone(metadata.deep_gemm_metadata)
         plan_topk_v2.assert_not_called()
         self.assertEqual(metadata.topk_metadata.numel(), 0)
 

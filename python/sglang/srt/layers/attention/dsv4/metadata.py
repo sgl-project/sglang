@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import Any, List, Optional
 
 import torch
 
@@ -10,10 +10,6 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
 
 _IS_SM120 = is_sm120_supported()
-
-if TYPE_CHECKING:
-    pass
-
 
 """
 Some comments on the common terms used in DeepSeekV4Backend:

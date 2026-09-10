@@ -630,7 +630,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.num_req_slots = (
             num_req_slots if num_req_slots is not None else max_num_reqs + 1
         )
-        self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -697,9 +696,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.sliding_window = sliding_window
 
         self.swa_size = swa_size
-        self.swa_window_size = swa_page_size
         self.swa_page_size = swa_page_size
-        self.scale_pad = 1
 
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -1203,20 +1200,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_swa_raw_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
-
-    def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
-        self.wait_layer_transfer(layer_id)
-        return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
-
-    def set_swa_key_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
-    ) -> None:
-        self.swa_kv_pool.set_key_buffer(
-            self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
-        )
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
         _, _, compress_kv_pool = self.layer_mapping[layer_id]
