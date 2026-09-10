@@ -436,15 +436,7 @@ class ModelRunner:
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
-        # its worker names, and treats None as the coarse whole-forward fence.
-        self.shared_read_done_event: Optional[torch.cuda.Event] = None
-        # Events the publishers record into the mailbox above. Depth 2: the
-        # barrier drains the mailbox once per step, so at most one record can
-        # still be awaited when a slot comes around again.
-        self.shared_read_done_events = ReusableEventRing(
-            torch.get_device_module(self.device).Event, depth=2
-        )
+        self.init_shared_read_done_mailbox()
 
         # CPU offload
         set_offloader(create_offloader(dp_rank=self.ps.dp_rank))
@@ -558,6 +550,17 @@ class ModelRunner:
         if state is not None:
             state.scale_phase = "serving_expanded"
         self._rearm_eplb_after_elastic_scale()
+
+    def init_shared_read_done_mailbox(self):
+        # The scheduler's WAR barrier reads the mailbox off the runner its worker
+        # names, and treats None as the coarse whole-forward fence. Publishers
+        # draw the events they record into it from the ring beside it; depth 2,
+        # because the barrier drains the mailbox once per step, so at most one
+        # record can still be awaited when a slot comes around again.
+        self.shared_read_done_event: Optional[torch.cuda.Event] = None
+        self.shared_read_done_events = ReusableEventRing(
+            torch.get_device_module(self.device).Event, depth=2
+        )
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()

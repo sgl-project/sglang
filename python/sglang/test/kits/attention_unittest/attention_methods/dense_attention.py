@@ -320,6 +320,9 @@ class MockModelRunner(ModelRunner):
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
+        # ModelRunner.__init__ is bypassed here, so wire the WAR read-done
+        # mailbox the graph runners publish through.
+        self.init_shared_read_done_mailbox()
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.kv_cache_dtype_str = "auto"
