@@ -178,6 +178,11 @@ class GenerationBatchResult:
             self.routed_experts_output,
             self.indexer_topk_output,
             self.expert_distribution_metrics,
+            (
+                self.logits_output.next_token_sampling_mask_output
+                if self.logits_output is not None
+                else None
+            ),
         ):
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)

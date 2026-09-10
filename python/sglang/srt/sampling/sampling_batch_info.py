@@ -76,6 +76,7 @@ class SamplingBatchInfo:
 
     # Per-request flag for returning sparse sampling support metadata.
     return_sampling_masks: Optional[List[bool]] = None
+    sampling_mask_max_top_k: int = 1
 
     # Device
     device: str = "cuda"
@@ -145,6 +146,10 @@ class SamplingBatchInfo:
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
+        sampling_mask_max_top_k = max(
+            (int(r.sampling_params.top_k) for r in reqs if r.return_sampling_mask),
+            default=1,
+        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -210,6 +215,7 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
+            sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -439,6 +445,10 @@ class SamplingBatchInfo:
             self.return_sampling_masks = (
                 self.return_sampling_masks or [False] * self_len
             ) + (other.return_sampling_masks or [False] * other_len)
+            self.sampling_mask_max_top_k = max(
+                self.sampling_mask_max_top_k,
+                other.sampling_mask_max_top_k,
+            )
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

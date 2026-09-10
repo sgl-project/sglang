@@ -198,8 +198,13 @@ class LogitsProcessorOutput:
     next_token_token_ids_logprobs_idx: Optional[List] = None
     # Sparse top-k/top-p/min-p support ids and selected-token logprob after
     # truncation/renormalization. Only populated when requested.
-    next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    next_token_sampling_mask_idx: Optional[
+        List[Optional[Union[List[int], List[List[int]]]]]
+    ] = None
+    next_token_sampling_logprobs: Optional[
+        List[Optional[Union[float, List[float]]]]
+    ] = None
+    next_token_sampling_mask_output: Optional[Any] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
