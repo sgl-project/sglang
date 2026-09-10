@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, Dict, Generator, List, Literal, Optional
 
 from sglang.test.scripted_runtime.context import (
     engine,
@@ -16,11 +17,11 @@ from sglang.test.scripted_runtime.context.lock_ref_exhauster import (
     ScriptedLockRefExhauster,
 )
 from sglang.test.scripted_runtime.context.req_starter import ScriptedContextReqStarter
+from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle, _RequestEpoch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
-    from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
@@ -45,10 +46,34 @@ class ScriptedContext:
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._http_poster = http_poster
 
-        self._seen_rids: set[str] = set()
+        self._request_epochs: Dict[str, _RequestEpoch] = {}
         self._kv_exhauster = ScriptedKvPoolExhauster(self.scheduler)
         self._lock_ref_exhauster = ScriptedLockRefExhauster(self.scheduler)
         self._req_starter = ScriptedContextReqStarter(self)
+
+    def _register_request(self, *, rid: str, post_future: Future) -> ScriptedReqHandle:
+        previous = self._request_epochs.get(rid)
+        if previous is not None:
+            queries._resolve_epoch_req(self, epoch=previous)
+            previous.closed = True
+        excluded_reqs = tuple(r for r in queries._get_all_reqs(self) if r.rid == rid)
+        if previous is not None and previous.req is not None:
+            excluded_reqs += (previous.req,)
+        epoch = _RequestEpoch(
+            rid=rid,
+            post_future=post_future,
+            batch_start=len(self._scheduler_hook._batch_log),
+            excluded_reqs=excluded_reqs,
+        )
+        self._request_epochs[rid] = epoch
+        return ScriptedReqHandle(rid=rid, context=self, _epoch=epoch)
+
+    def _reset_request_tracking(self) -> None:
+        for epoch in self._request_epochs.values():
+            queries._resolve_epoch_req(self, epoch=epoch)
+            epoch.closed = True
+        self._request_epochs.clear()
+        self._scheduler_hook._batch_log.clear()
 
     def start_req(
         self,
@@ -67,6 +92,7 @@ class ScriptedContext:
         temperature: Optional[float] = None,
         lora_path: Optional[str] = None,
     ) -> ScriptedReqHandle:
+        """Submit immediately; use start_req_with_retry to wait for an earlier rid."""
         return self._req_starter.start_req(
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
@@ -83,6 +109,17 @@ class ScriptedContext:
             lora_path=lora_path,
         )
 
+    def start_req_with_retry(
+        self, *, rid: str, max_steps: int = 400, **kwargs
+    ) -> Generator[None, None, ScriptedReqHandle]:
+        """Drain the previous HTTP response, then retry duplicate rejection by yielding.
+
+        max_steps bounds the combined response wait and duplicate retries.
+        """
+        return self._req_starter.start_req_with_retry(
+            rid=rid, max_steps=max_steps, **kwargs
+        )
+
     def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:
         return lifecycle.pause_generation(self, mode=mode)
 
@@ -93,7 +130,7 @@ class ScriptedContext:
         return lifecycle.abort_all(self)
 
     def abort(self, handle: ScriptedReqHandle, *, await_arrival: bool = True) -> None:
-        return lifecycle.abort(self, rid=handle.rid, await_arrival=await_arrival)
+        return lifecycle.abort(self, handle=handle, await_arrival=await_arrival)
 
     def flush_cache(self) -> None:
         return lifecycle.flush_cache(self)
