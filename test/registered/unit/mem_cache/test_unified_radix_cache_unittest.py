@@ -6301,7 +6301,8 @@ class UnifiedRadixCacheSuite:
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
                 req=req,
-                mem_quota=-1_000_000,
+                # Pinning the resident ancestors leaves too little for the tail.
+                mem_quota=len(tokens) - 1,
             )
         )
 
@@ -8137,6 +8138,7 @@ class _InsertWalkSuite(CustomTestCase):
 
     _rid = 0
     _make_req = UnifiedRadixCacheSuite._make_req
+    _apply_match_to_req = UnifiedRadixCacheSuite._apply_match_to_req
     _alloc = UnifiedRadixCacheSuite._alloc
     _insert = UnifiedRadixCacheSuite._insert
     _init_hicache = UnifiedRadixCacheSuite._init_hicache
