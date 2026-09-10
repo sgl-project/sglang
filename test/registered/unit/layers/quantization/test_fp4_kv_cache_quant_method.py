@@ -125,6 +125,8 @@ class TestCPUFP8KVCacheMethod(CustomTestCase):
             cache_v,
             k_scale=0.5,
             v_scale=0.25,
+            native_k_scale_buffer=None,
+            native_v_scale_buffer=None,
         )
 
         torch.testing.assert_close(

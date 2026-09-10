@@ -55,7 +55,7 @@ class TestQwen35NVFP4KVNativePrefillSM100(GSM8KMixin, DefaultServerBase):
     gsm8k_num_examples = GSM8K_NUM_QUESTIONS
     gsm8k_num_threads = 128
     gsm8k_num_shots = GSM8K_NUM_SHOTS
-    other_args = COMMON_ARGS + ["--prefill-kv-cache-dtype", "nvfp4"]
+    other_args = COMMON_ARGS + ["--prefill-kv-cache-dequant-dtype", "none"]
 
 
 @unittest.skipUnless(HAS_FOUR_SM100_GPUS, "requires 4 SM100 GPUs with CUDA 12.8+")
@@ -67,7 +67,7 @@ class TestQwen35NVFP4KVDQPrefillSM100(GSM8KMixin, DefaultServerBase):
     gsm8k_num_examples = GSM8K_NUM_QUESTIONS
     gsm8k_num_threads = 128
     gsm8k_num_shots = GSM8K_NUM_SHOTS
-    other_args = COMMON_ARGS + ["--prefill-kv-cache-dtype", "fp8_e4m3"]
+    other_args = COMMON_ARGS + ["--prefill-kv-cache-dequant-dtype", "fp8_e4m3"]
 
 
 @unittest.skipUnless(HAS_FOUR_SM100_GPUS, "requires 4 SM100 GPUs with CUDA 12.8+")
@@ -80,7 +80,7 @@ class TestQwen35NVFP4KVNativePrefillMTPSM100(GSM8KMixin, DefaultServerBase):
     gsm8k_num_threads = 128
     gsm8k_num_shots = GSM8K_NUM_SHOTS
     gsm8k_accept_length_thres = 1.2
-    other_args = COMMON_ARGS + ["--prefill-kv-cache-dtype", "nvfp4"] + MTP_ARGS
+    other_args = COMMON_ARGS + ["--prefill-kv-cache-dequant-dtype", "none"] + MTP_ARGS
 
 
 @unittest.skipUnless(HAS_FOUR_SM100_GPUS, "requires 4 SM100 GPUs with CUDA 12.8+")
@@ -93,7 +93,9 @@ class TestQwen35NVFP4KVDQPrefillMTPSM100(GSM8KMixin, DefaultServerBase):
     gsm8k_num_threads = 128
     gsm8k_num_shots = GSM8K_NUM_SHOTS
     gsm8k_accept_length_thres = 1.2
-    other_args = COMMON_ARGS + ["--prefill-kv-cache-dtype", "fp8_e4m3"] + MTP_ARGS
+    other_args = (
+        COMMON_ARGS + ["--prefill-kv-cache-dequant-dtype", "fp8_e4m3"] + MTP_ARGS
+    )
 
 
 if __name__ == "__main__":

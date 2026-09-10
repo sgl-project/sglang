@@ -2758,28 +2758,6 @@ class MHATokenToKVPool(KVCache):
             )
         return self.dq_k_buffer, self.dq_v_buffer
 
-    def get_native_kv_buffer(
-        self, layer_id: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return packed NHD data and TRT-LLM-native HND block scales."""
-        local_layer_id = layer_id - self.start_layer
-        if self.native_k_scale_buffer is None or self.native_v_scale_buffer is None:
-            raise RuntimeError(
-                "Native FP4 KV cache requested from a pool without native scales."
-            )
-        k_scale = self.native_k_scale_buffer[local_layer_id]
-        v_scale = self.native_v_scale_buffer[local_layer_id]
-        scale_view_dtype = self.quant_method.scale_buffer_view_dtype()
-        if scale_view_dtype is not None:
-            k_scale = k_scale.view(scale_view_dtype)
-            v_scale = v_scale.view(scale_view_dtype)
-        return (
-            self.k_buffer[local_layer_id],
-            self.v_buffer[local_layer_id],
-            k_scale,
-            v_scale,
-        )
-
     def get_flashinfer_dequant_workspace_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4126,13 +4104,6 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_raw_kv_buffer(layer_id)
-
-    def get_native_kv_buffer(
-        self, layer_id: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        self._wait_for_layer(layer_id)
-        layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_native_kv_buffer(layer_id)
 
     def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.full_kv_pool.get_dequant_workspace()

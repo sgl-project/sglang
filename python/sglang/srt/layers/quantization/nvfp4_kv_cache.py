@@ -66,7 +66,7 @@ def _store_nvfp4_kv_kernel(
     v_scale_linear_dst,
     k_scale_native_dst,
     v_scale_native_dst,
-    num_tokens: tl.constexpr,
+    loc_stride: tl.constexpr,
     num_heads: tl.constexpr,
     packed_dim: tl.constexpr,
     scale_dim: tl.constexpr,
@@ -78,7 +78,7 @@ def _store_nvfp4_kv_kernel(
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
-    slot = tl.load(loc + token_idx).to(tl.int64)
+    slot = tl.load(loc + token_idx * loc_stride).to(tl.int64)
 
     packed_offsets = tl.arange(0, BLOCK_PACKED)
     packed_mask = packed_offsets < packed_dim
@@ -195,7 +195,7 @@ def store_nvfp4_kv_cache(
         linear_v,
         native_k,
         native_v,
-        num_tokens=num_tokens,
+        loc_stride=loc.stride(0),
         num_heads=num_heads,
         packed_dim=packed_dim,
         scale_dim=scale_dim,

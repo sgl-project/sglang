@@ -419,6 +419,8 @@ class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
         cache_v,
         k_scale=None,
         v_scale=None,
+        native_k_scale_buffer=None,
+        native_v_scale_buffer=None,
     ) -> None:
         k_scale = 1.0 if k_scale is None else k_scale
         v_scale = 1.0 if v_scale is None else v_scale

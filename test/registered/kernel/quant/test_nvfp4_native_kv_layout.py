@@ -11,7 +11,11 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=30,
+    stage="base-b-kernel-unit",
+    runner_config="4-gpu-b200",
+)
 
 pytestmark = pytest.mark.skipif(
     not is_sm100_supported(), reason="TRT-LLM native NVFP4 layout requires SM100"
@@ -41,9 +45,12 @@ def test_nvfp4_native_layout_matches_flashinfer_reference():
         total_tokens, heads, head_dim, layer_num=1, device="cuda"
     )
 
-    # A non-monotonic scatter exercises page boundaries and every token mod-4
-    # position used by TRT-LLM's V-scale interleave.
-    loc = torch.randperm(total_tokens, device="cuda")
+    # Match multi-step EAGLE's per-step view while exercising page boundaries
+    # and every token mod-4 position used by TRT-LLM's V-scale interleave.
+    loc_storage = torch.empty((total_tokens, 3), dtype=torch.int64, device="cuda")
+    loc_storage[:, 0] = torch.randperm(total_tokens, device="cuda")
+    loc = loc_storage[:, 0]
+    assert loc.stride() == (3,)
     method.quantize_and_store(
         buffers["k_buffer"][0],
         buffers["v_buffer"][0],

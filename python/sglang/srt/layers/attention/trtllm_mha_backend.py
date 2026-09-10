@@ -42,7 +42,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -87,6 +88,46 @@ def _native_fp4_decode_output_capacity(
     """Maximum FP8 output rows for eager/graph decode and target verify."""
     request_capacity = max(max_running_requests, max_cuda_graph_bs or 0)
     return request_capacity * max(1, max_draft_tokens or 1)
+
+
+def _native_fp4_prefill_output_capacity(
+    max_context_len: int,
+    max_prefill_tokens: int,
+    chunked_prefill_limit: int,
+) -> int:
+    """Maximum FP8 output rows for one admitted prefill batch."""
+    if chunked_prefill_limit > 0:
+        return chunked_prefill_limit
+    return max(max_context_len, max_prefill_tokens)
+
+
+def _trtllm_native_nvfp4_kv_buffer(token_to_kv_pool, layer_id: int):
+    """Return the pool-owned buffers in TRT-LLM GenMHA's native layout."""
+    pool = token_to_kv_pool
+    if isinstance(pool, HybridLinearKVPool):
+        pool._wait_for_layer(layer_id)
+        layer_id = pool._transfer_full_attention_id(layer_id)
+        pool = pool.full_kv_pool
+    elif pool.layer_transfer_counter is not None:
+        pool.layer_transfer_counter.wait_until(layer_id - pool.start_layer)
+
+    local_layer_id = layer_id - pool.start_layer
+    if pool.native_k_scale_buffer is None or pool.native_v_scale_buffer is None:
+        raise RuntimeError(
+            "TRT-LLM native FP4 KV cache requested from a pool without native scales."
+        )
+    k_scale = pool.native_k_scale_buffer[local_layer_id]
+    v_scale = pool.native_v_scale_buffer[local_layer_id]
+    scale_view_dtype = pool.quant_method.scale_buffer_view_dtype()
+    if scale_view_dtype is not None:
+        k_scale = k_scale.view(scale_view_dtype)
+        v_scale = v_scale.view(scale_view_dtype)
+    return (
+        pool.k_buffer[local_layer_id],
+        pool.v_buffer[local_layer_id],
+        k_scale,
+        v_scale,
+    )
 
 
 @dataclass
@@ -220,9 +261,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             prefill_limit = 0
             if self.prefill_uses_native_fp4 and not skip_prefill:
                 # Includes PP dynamic-chunk growth and piecewise capture bounds.
-                prefill_limit = max_prefill_buffer_tokens()
-                if prefill_limit is None or prefill_limit <= 0:
-                    prefill_limit = self.max_context_len
+                prefill_limit = _native_fp4_prefill_output_capacity(
+                    self.max_context_len,
+                    get_schedule().max_prefill_tokens or 0,
+                    max_prefill_buffer_tokens(),
+                )
             decode_limit = 0
             if self.decode_uses_native_fp4:
                 # TARGET_VERIFY submits one query row per draft token. Use the
@@ -1367,8 +1410,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 layer.layer_id
             )
         else:
-            k_fp4, v_fp4, k_scale, v_scale = self.token_to_kv_pool.get_native_kv_buffer(
-                layer.layer_id
+            k_fp4, v_fp4, k_scale, v_scale = _trtllm_native_nvfp4_kv_buffer(
+                self.token_to_kv_pool, layer.layer_id
             )
         kv_cache = self._reshape_paged_kv_cache(
             k_fp4, v_fp4, layer, layer.head_dim // 2

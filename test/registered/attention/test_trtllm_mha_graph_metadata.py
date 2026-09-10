@@ -49,6 +49,25 @@ def test_native_nvfp4_output_capacity_includes_verify_width(
     )
 
 
+@pytest.mark.parametrize(
+    "max_context_len,max_prefill_tokens,chunked_prefill_limit,expected",
+    [
+        (4096, 8192, 0, 8192),
+        (8192, 4096, 0, 8192),
+        (8192, 16384, 2048, 2048),
+    ],
+)
+def test_native_nvfp4_output_capacity_includes_unchunked_batch(
+    max_context_len, max_prefill_tokens, chunked_prefill_limit, expected
+):
+    assert (
+        trtllm_mha_backend._native_fp4_prefill_output_capacity(
+            max_context_len, max_prefill_tokens, chunked_prefill_limit
+        )
+        == expected
+    )
+
+
 def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 
