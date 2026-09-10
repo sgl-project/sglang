@@ -149,6 +149,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self._model_update_group = {}
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()

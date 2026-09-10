@@ -1177,6 +1177,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_update_weights_from_distributed.py",
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py",
         "../single_test_file/test_encoder_fold_srt_2_gpu.py",
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
