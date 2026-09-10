@@ -592,8 +592,12 @@ Output throughput: 1611.623 token/s
 
 **Run Benchmark**
 ```shell Command
-python3 benchmark/mmlu/bench_sglang.py --port 30000
+sgl-eval run mmlu \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-threads 64 --max-tokens 2048
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 **Test Results:**
 ```text Output

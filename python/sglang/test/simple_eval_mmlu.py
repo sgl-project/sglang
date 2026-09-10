@@ -6,23 +6,6 @@ Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song,
 https://arxiv.org/abs/2009.03300
 """
 
-import random
-import re
-from typing import Optional
-
-import pandas
-
-from sglang.test import simple_eval_common as common
-from sglang.test.simple_eval_common import (
-    ANSWER_PATTERN_MULTICHOICE,
-    HTML_JINJA,
-    Eval,
-    EvalResult,
-    SamplerBase,
-    SingleEvalResult,
-    format_multichoice_question,
-)
-
 subject2category = {
     "abstract_algebra": "stem",
     "anatomy": "other",
@@ -82,44 +65,3 @@ subject2category = {
     "virology": "other",
     "world_religions": "humanities",
 }
-
-
-class MMLUEval(Eval):
-    def __init__(self, filename: str, num_examples: Optional[int], num_threads: int):
-        if "://" in filename:
-            df = pandas.read_csv(filename, storage_options={"timeout": 30})
-        else:
-            df = pandas.read_csv(filename)
-        examples = [row.to_dict() for _, row in df.iterrows()]
-        if num_examples:
-            examples = random.Random(0).sample(examples, num_examples)
-        self.examples = examples
-        self.num_threads = num_threads
-
-    def __call__(self, sampler: SamplerBase) -> EvalResult:
-        def fn(row: dict):
-            prompt_messages = [
-                sampler._pack_message(
-                    content=format_multichoice_question(row), role="user"
-                )
-            ]
-            response_text = sampler(prompt_messages)
-            response_text = response_text or ""
-            match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
-            extracted_answer = match.group(1) if match else None
-            score = 1.0 if extracted_answer == row["Answer"] else 0.0
-            html = common.jinja_env.from_string(HTML_JINJA).render(
-                prompt_messages=prompt_messages,
-                next_message=dict(content=response_text, role="assistant"),
-                score=score,
-                correct_answer=row["Answer"],
-                extracted_answer=extracted_answer,
-            )
-            convo = prompt_messages + [dict(content=response_text, role="assistant")]
-            category = subject2category.get(row["Subject"], "other")
-            return SingleEvalResult(
-                html=html, score=score, metrics={category: score}, convo=convo
-            )
-
-        results = common.map_with_progress(fn, self.examples, self.num_threads)
-        return common.aggregate_results(results)

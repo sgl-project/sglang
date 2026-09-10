@@ -461,11 +461,13 @@ TODO — replace with real GSM8K accuracy after benchmark run on Hy3-preview (BF
 
 #### 5.1.2 MMLU
 
-- Benchmark Method: 5-shot, all 57 subjects
+- Benchmark Method: zero-shot Chat API evaluation via sgl-eval, all 57 subjects
 - Benchmark Command:
 
 ```bash Command
-python3 benchmark/mmlu/bench_sglang.py --nsub 60 --parallel 64
+sgl-eval run mmlu \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-threads 64 --max-tokens 2048
 ```
 
 - Test Results:

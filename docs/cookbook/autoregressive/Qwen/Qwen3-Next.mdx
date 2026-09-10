@@ -753,10 +753,12 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 8000
 - **Benchmark Command:**
 
 ```shell Command
-cd sglang
-bash benchmark/mmlu/download_data.sh
-python3 benchmark/mmlu/bench_sglang.py --nsub 10
+sgl-eval run mmlu \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-threads 64 --max-tokens 2048
 ```
+
+The command evaluates all 57 subjects. Historical results below use the removed 10-subject harness and are not measurements of the sgl-eval command above.
 
 - **Results**:
 
