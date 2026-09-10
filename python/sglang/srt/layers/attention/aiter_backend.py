@@ -164,7 +164,6 @@ class ForwardMetadata:
     swa_page_table: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
-    planned_dcp_size: int = 1
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
 
@@ -371,8 +370,6 @@ class AiterAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        # Read-index translation door; the DCP decode planner collapses the
-        # widened per-rank shard through it.
         self.kv_index_translator = model_runner.kv_index_translator
 
         # sliding window attention
@@ -442,8 +439,6 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_mla:
             _mla_low_head_repeat = (4, 8)
             _mla_low_head_zero_pad = (12,)
-            # The DCP decode kernel tiles the query heads, so it serves any
-            # local head count; the check below is for the non-DCP path only.
             _valid_heads = (
                 self.num_head in _mla_low_head_repeat
                 or self.num_head in _mla_low_head_zero_pad
@@ -481,8 +476,6 @@ class AiterAttnBackend(AttentionBackend):
                 self.head_pad_mode = "none"
                 self.head_repeat_factor = 1
 
-            # Under DCP, Q is all-gathered, so this operates on the gathered
-            # head count num_head * dcp_world_size. No-op otherwise.
             _gathered_num_head = self.num_head * self.dcp_world_size
             self.mla_kernel_num_head_padded = (
                 16 if _gathered_num_head < 16 else _gathered_num_head
@@ -588,8 +581,6 @@ class AiterAttnBackend(AttentionBackend):
         return "fp8_e4m3"
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
-        # Under DCP this is the gathered head count (num_head * dcp_world_size);
-        # equals num_head_padded when DCP is off.
         nhead = self.mla_kernel_num_head_padded
         dtype = self.kv_cache_dtype
 
@@ -673,7 +664,6 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         dtype = self.kv_cache_dtype
 
-        # For dcp, kv_indptr here is already localized to this rank's shard
         meta = get_mla_metadata_v1(
             qo_indptr,
             kv_indptr,
@@ -1147,8 +1137,6 @@ class AiterAttnBackend(AttentionBackend):
             min_kv_seq_len=1,
             return_lse=True,
         )
-        # Natural-log lse throughout: is_mla_dcp_lse_base_on_e() reports
-        # base-e for aiter, so the cross-rank merge picks the exp/log pair.
         return out, lse.view(bs, num_heads)
 
     def _forward_verify_dcp(self, q, k_window, layer, k_descale):
@@ -1165,8 +1153,6 @@ class AiterAttnBackend(AttentionBackend):
         n_rows = seqused_k.shape[0]
         bs = n_rows // q_len
 
-        # The committed prefix: a plain decode over this rank's shard, one row
-        # per query token.
         out_a, lse_a = mla_gluon_decode(
             q=q.view(n_rows, num_heads, layer.qk_head_dim),
             k_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1363,7 +1349,6 @@ class AiterAttnBackend(AttentionBackend):
         max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         # dcp metadata
-        planned_dcp_size = 1
         local_kv_lens = None
         verify_token_table = None
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -1390,7 +1375,6 @@ class AiterAttnBackend(AttentionBackend):
                         and self.dcp_world_size > 1
                         and not forward_batch.forward_mode.is_idle()
                     ):
-                        planned_dcp_size = get_parallel().attn_dcp_size
                         kv_lens = forward_batch.seq_lens[:bs].to(torch.int32).clone()
                         self._plan_dcp_decode_metadata(
                             kv_indptr,
@@ -1457,7 +1441,7 @@ class AiterAttnBackend(AttentionBackend):
 
                 # DCP decode runs the aiter MLA kernel (builds its own block-table
                 # metadata in forward_decode), so skip the persist metadata.
-                if _use_mla_ps_kernel and planned_dcp_size == 1:
+                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
                     (
                         work_metadata,
                         work_indptr,
@@ -1502,7 +1486,6 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
                 swa_page_table=swa_page_table,
                 swa_out_cache_loc=swa_out_cache_loc,
-                planned_dcp_size=planned_dcp_size,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -1598,8 +1581,6 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
                 device = forward_batch.seq_lens.device
-                # Prefix and window are attended as two stages, so plan the
-                # shard over the COMMITTED length only or the window is counted twice.
                 if self.dcp_world_size > 1:
                     kv_lens = forward_batch.seq_lens.to(torch.int32).clone()
                     kv_lens_sum = forward_batch.seq_lens_sum
@@ -1634,9 +1615,6 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if self.dcp_world_size > 1:
-                    planned_dcp_size = get_parallel().attn_dcp_size
-                    # seq_lens_cpu is NOT usable: the DSPARK verify path pre-adds
-                    # the window to it, so the shard would be draft_num too long.
                     self._plan_dcp_decode_metadata(
                         kv_indptr,
                         kv_indices,
@@ -1700,7 +1678,6 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
                     run_graph=False,
-                    planned_dcp_size=planned_dcp_size,
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
                 )
@@ -2041,7 +2018,7 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_mla and self.dcp_world_size > 1:
             if self.num_draft_tokens:
                 # Target-verify flattens the window into single-token rows, so it
-                # needs max_bs * num_draft_tokens of them, not max_bs.
+                # needs max_bs * num_draft_tokens.
                 n_verify_rows = max_bs * self.num_draft_tokens
                 self.cuda_graph_verify_local_kv_lens = torch.zeros(
                     (n_verify_rows,), dtype=torch.int32, device=self.device
@@ -2178,7 +2155,6 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = None
 
         # DCP metadata which will be populated for MLA decode when dcp enabled
-        planned_dcp_size = 1
         local_kv_lens = None
         verify_token_table = None
 
@@ -2221,7 +2197,6 @@ class AiterAttnBackend(AttentionBackend):
                         and self.dcp_world_size > 1
                         and not forward_mode.is_idle()
                     ):
-                        planned_dcp_size = get_parallel().attn_dcp_size
                         kv_lens = seq_lens[:bs].to(torch.int32).clone()
                         self._plan_dcp_decode_metadata(
                             kv_indptr,
@@ -2291,7 +2266,7 @@ class AiterAttnBackend(AttentionBackend):
 
                 # DCP decode builds its own block-table metadata in
                 # forward_decode, so the persist metadata is unused here.
-                if _use_mla_ps_kernel and planned_dcp_size == 1:
+                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -2333,7 +2308,6 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
-                planned_dcp_size=planned_dcp_size,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 
@@ -2353,9 +2327,6 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # Prefix and window are attended as two stages, so plan the shard
-            # over the COMMITTED length only or the window is counted twice.
-
             if self.use_mla:
                 kv_lens = (
                     seq_lens
@@ -2393,9 +2364,6 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
             if self.use_mla and self.dcp_world_size > 1:
-                planned_dcp_size = get_parallel().attn_dcp_size
-                # seq_lens_cpu is NOT usable (the DSPARK verify path pre-adds the
-                # window), and exact device sizing costs two syncs per replay.
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
@@ -2463,7 +2431,6 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
-                    planned_dcp_size=planned_dcp_size,
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
                 )
@@ -2748,8 +2715,6 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     if self.dcp_world_size > 1:
-                        # set_mla_kv_buffer owner-filters AND shards internally, so
-                        # pass the RAW loc: pre-dividing applies the filter twice.
                         kv_lora_rank = v.shape[-1]
                         self.token_to_kv_pool.set_mla_kv_buffer(
                             layer,
@@ -2800,10 +2765,10 @@ class AiterAttnBackend(AttentionBackend):
 
             if (
                 forward_batch.forward_mode.is_target_verify()
-                and self.forward_metadata.planned_dcp_size > 1
+                and self.dcp_world_size > 1
             ):
-                # Two-stage DCP verify, dispatched before the dims below: the
-                # model layer hands us the window's k/v, not a full-sequence k.
+                # two-stage dcp verify, dispatched before the dims below: the
+                # model provides the per rank kvcache slices.
                 return self._forward_verify_dcp(q, k, layer, k_descale)
 
             qk_nope_head_dim = k.shape[-1] - qk_rope_head_dim
@@ -2820,11 +2785,6 @@ class AiterAttnBackend(AttentionBackend):
                 if forward_batch.mha_return_lse:
                     return self._forward_extend_skip_prefix(q, k, v, layer)
                 if self.dcp_world_size > 1:
-                    # k/v are the all-gathered full-sequence tensors, so the kv
-                    # side is indexed by dcp_kv_indptr rather than qo_indptr. This
-                    # is MHA_ONE_SHOT (`layer` is the MHA companion), so moving
-                    # DCP prefill onto mla_gluon needs an MLA AttnForwardMethod
-                    # first, not just a swapped call.
                     if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     return flash_attn_varlen_func(
@@ -3616,9 +3576,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
         if self.use_mla:
-            if self.forward_metadata.planned_dcp_size > 1:
-                # Returns (out, natural-log lse) in its own shape for the cross-rank
-                # merge, so it bypasses the reshape below.
+            if self.dcp_world_size > 1 and not forward_batch.forward_mode.is_idle():
                 k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 return self._forward_decode_dcp(q, k_buffer, layer, k_descale)
 
