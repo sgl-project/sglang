@@ -12,6 +12,7 @@ from sglang.srt.managers.cache_controller import PrefetchAck
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PPPrefetchDecision,
     PPPrefetchPoolSpec,
     PPPrefetchState,
     PPPrefetchTicket,
@@ -125,6 +126,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 c.pp_prefetch_command_queue.put.assert_not_called()
                 self.assertFalse(c.release_pp_prefetch("hit"))
                 self.assertIsNone(c.get_prefetch_submission("hit"))
+                self.assertEqual(c.pp_prefetch_decisions, {})
 
     def test_pre_relay_records_skipped_prefetch_before_normal_enqueue(self):
         from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -180,7 +182,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
             Scheduler.handle_generate_request(scheduler, recv_req)
         scheduler._prefetch_kvcache.assert_called_once_with(req)
         scheduler._add_request_to_queue.assert_called_once_with(req)
-        self.assertFalse(c.pp_prefetch_decisions["skip"])
+        self.assertIs(c.pp_prefetch_decisions["skip"], PPPrefetchDecision.SKIPPED)
         self.assertFalse(recv_req.pp_prefetch_ticketed)
         c._storage_hit_query.assert_not_called()
         c.pp_prefetch_command_queue.put.assert_not_called()
@@ -508,6 +510,49 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertEqual(c.pp_prefetch_decisions, {})
         self.assertEqual(c.prefetch_tokens_occupied, 0)
 
+    def test_release_before_local_ticket_registration_waits_for_final_ack(self):
+        c = self.controller
+        c.pp_rank = 1
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = c
+        cache.bind_prefetch_ticket("hit")
+        self.assertTrue(c.release_pp_prefetch("hit"))
+        # Repeated cleanup must retain cancellation until the ticket arrives.
+        self.assertTrue(c.release_pp_prefetch("hit"))
+        self.assertIs(c.pp_prefetch_decisions["hit"], PPPrefetchDecision.CANCELLED)
+
+        ticket = make_ticket(
+            pool_specs=(
+                PPPrefetchPoolSpec(PoolName.SWA, 4, keys=["h1"]),
+                PPPrefetchPoolSpec(
+                    PoolName.DRAFT_SWA, 0, indices_from_pool=PoolName.SWA
+                ),
+            ),
+        )
+        commands = iter([ticket, None])
+
+        def broadcast(objects, **kwargs):
+            objects[0] = next(commands)
+
+        with patch.object(torch.distributed, "broadcast_object_list", broadcast):
+            c.pp_prefetch_command_thread_func()
+        operation = c.prefetch_buffer.get_nowait()
+        self.assertTrue(c.pp_prefetch_states["hit"].release_requested)
+        self.assertEqual(c.pp_prefetch_decisions, {})
+        c.mem_pool_host.free.assert_not_called()
+        self.sync_acks(PrefetchAck("hit", operation, completed_tokens=4))
+        c.mem_pool_host.free.assert_not_called()
+        self.sync_acks(PrefetchAck("hit", operation, completed_req=True))
+        self.assertEqual(
+            [args.kwargs["pool"] for args in c.mem_pool_host.free.call_args_list],
+            [PoolName.KV, PoolName.SWA],
+        )
+        self.assertEqual(c.prefetch_tokens_occupied, 0)
+        self.assertEqual(c.pp_prefetch_states, {})
+        self.assertEqual(c.pp_prefetch_decisions, {})
+        self.assertFalse(c.release_pp_prefetch("unknown"))
+        self.assertEqual(c.pp_prefetch_decisions, {})
+
     def test_take_ready_transfers_ownership_exactly_once(self):
         c = self.controller
         operation = self.submit().operation
@@ -635,7 +680,10 @@ class TestPPTicketAdmission(unittest.TestCase):
         cache = self.cache
         cache.cache_controller.is_pp_prefetch_ready.return_value = True
         self.assertFalse(cache.check_prefetch_progress("hit"))
-        self.assertTrue(cache.cache_controller.pp_prefetch_decisions["hit"])
+        self.assertIs(
+            cache.cache_controller.pp_prefetch_decisions["hit"],
+            PPPrefetchDecision.TICKETED,
+        )
         self.assertEqual(cache._all_reduce.call_args.args[0].item(), 0)
         cache.cache_controller.is_pp_prefetch_ready.assert_not_called()
         cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
@@ -645,7 +693,10 @@ class TestPPTicketAdmission(unittest.TestCase):
         cache.pp_rank = 0
         cache.cache_controller.is_pp_prefetch_ready.return_value = False
         self.assertFalse(cache.check_prefetch_progress("hit"))
-        self.assertTrue(cache.cache_controller.pp_prefetch_decisions["hit"])
+        self.assertIs(
+            cache.cache_controller.pp_prefetch_decisions["hit"],
+            PPPrefetchDecision.TICKETED,
+        )
         cache.cache_controller.is_pp_prefetch_ready.assert_called_once_with("hit")
         cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
 
@@ -697,9 +748,25 @@ class TestPPTicketAdmission(unittest.TestCase):
 
     def test_miss_admission_keeps_decision_without_collective(self):
         cache = self.cache
-        cache.cache_controller.pp_prefetch_decisions["miss"] = False
+        cache.bind_prefetch_ticket("miss", False)
         self.assertTrue(cache.check_prefetch_progress("miss"))
-        self.assertIs(cache.cache_controller.pp_prefetch_decisions["miss"], False)
+        self.assertIs(
+            cache.cache_controller.pp_prefetch_decisions["miss"],
+            PPPrefetchDecision.SKIPPED,
+        )
+        cache._all_reduce.assert_not_called()
+        cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
+
+    def test_cancelled_decision_does_not_enter_ticket_admission(self):
+        cache = self.cache
+        cache.cache_controller.pp_prefetch_decisions["hit"] = (
+            PPPrefetchDecision.CANCELLED
+        )
+        self.assertTrue(cache.check_prefetch_progress("hit"))
+        self.assertIs(
+            cache.cache_controller.pp_prefetch_decisions["hit"],
+            PPPrefetchDecision.CANCELLED,
+        )
         cache._all_reduce.assert_not_called()
         cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
 

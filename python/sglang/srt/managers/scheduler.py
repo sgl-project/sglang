@@ -3153,9 +3153,11 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
+            self._release_aborted_request(req.rid)
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
+                self._release_aborted_request(req.rid)
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)

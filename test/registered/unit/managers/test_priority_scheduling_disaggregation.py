@@ -39,6 +39,9 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = False
         scheduler.abort_on_priority_when_disabled = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_hicache_storage = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.waiting_queue = []
         scheduler._prefetch_kvcache = MagicMock()
         scheduler._abort_on_queued_limit = MagicMock(return_value=False)
@@ -95,6 +98,61 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
+
+    def test_priority_rejection_releases_early_prefetch(self):
+        for mode in DisaggregationMode:
+            with self.subTest(mode=mode):
+                scheduler = self._new_scheduler(mode)
+                scheduler.enable_priority_scheduling = False
+                scheduler.abort_on_priority_when_disabled = True
+                scheduler.enable_hicache_storage = True
+                scheduler.tree_cache = MagicMock(spec=["release_aborted_request"])
+                req = self._new_req(priority=10)
+
+                with patch(
+                    "sglang.srt.managers.scheduler.get_serving",
+                    return_value=SimpleNamespace(weight_version="v0"),
+                ):
+                    scheduler._add_request_to_queue(req)
+
+                scheduler.tree_cache.release_aborted_request.assert_called_once_with(
+                    req.rid
+                )
+                scheduler._prefetch_kvcache.assert_not_called()
+                self.assertEqual(scheduler.waiting_queue, [])
+                scheduler.disagg_prefill_bootstrap_queue.add.assert_not_called()
+                scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
+
+    def test_full_queue_releases_only_the_rejected_request(self):
+        for priority in (0, 2):
+            with self.subTest(incoming_priority=priority):
+                scheduler = self._new_scheduler(DisaggregationMode.NULL)
+                del scheduler._abort_on_queued_limit  # Exercise the real queue check.
+                scheduler.max_queued_requests = 1
+                scheduler.enable_hicache_storage = True
+                scheduler.tree_cache = MagicMock(spec=["release_aborted_request"])
+                scheduler.beam_coordinator = MagicMock()
+                queued = self._new_req(priority=1)
+                queued.rid = "queued"
+                scheduler.waiting_queue = [queued]
+                incoming = self._new_req(priority=priority)
+
+                with patch(
+                    "sglang.srt.managers.scheduler.get_serving",
+                    return_value=SimpleNamespace(weight_version="v0"),
+                ):
+                    scheduler._add_request_to_queue(incoming)
+
+                rejected = incoming if priority == 0 else queued
+                scheduler.tree_cache.release_aborted_request.assert_called_once_with(
+                    rejected.rid
+                )
+                if priority == 0:
+                    self.assertEqual(scheduler.waiting_queue, [queued])
+                    scheduler._prefetch_kvcache.assert_not_called()
+                else:
+                    self.assertEqual(scheduler.waiting_queue, [incoming])
+                    scheduler._prefetch_kvcache.assert_called_once_with(incoming)
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):

@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PPPrefetchDecision,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -1917,7 +1918,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
         # PP0 also records misses/skips; only hits travel with the request relay.
         with self.cache_controller.pp_prefetch_state_lock:
-            self.cache_controller.pp_prefetch_decisions[req_id] = decision
+            self.cache_controller.pp_prefetch_decisions[req_id] = (
+                PPPrefetchDecision.TICKETED if decision else PPPrefetchDecision.SKIPPED
+            )
 
     def _check_pp_prefetch_progress(self, req_id: str) -> bool:
         ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(req_id)
@@ -1975,7 +1978,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_prefetch_progress(self, req_id: str) -> bool:
         if (
             self.cache_controller is not None
-            and self.cache_controller.pp_prefetch_decisions.get(req_id, False)
+            and self.cache_controller.pp_prefetch_decisions.get(req_id)
+            is PPPrefetchDecision.TICKETED
         ):
             return self._check_pp_prefetch_progress(req_id)
 

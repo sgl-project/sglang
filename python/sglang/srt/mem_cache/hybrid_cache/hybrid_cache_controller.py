@@ -7,6 +7,7 @@ import threading
 import time
 from array import array
 from dataclasses import dataclass, field, replace
+from enum import Enum, auto
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
@@ -80,6 +81,12 @@ class PPPrefetchTicket:
     is_bigram: bool
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
     storage_hit_count: int = 0
+
+
+class PPPrefetchDecision(Enum):
+    SKIPPED = auto()  # Initial storage miss or skipped prefetch.
+    TICKETED = auto()  # Ticket issued, awaiting consumption.
+    CANCELLED = auto()  # Cancelled before local ticket registration.
 
 
 @dataclass
@@ -172,7 +179,7 @@ class HybridCacheController(BaseHiCacheController):
         self.pp_prefetch_command_queue: Queue[Optional[PPPrefetchTicket]] = Queue()
         self.pp_prefetch_state_lock = threading.Lock()
         self.pp_prefetch_states: dict[str, PPPrefetchState] = {}
-        self.pp_prefetch_decisions: dict[str, bool] = {}
+        self.pp_prefetch_decisions: dict[str, PPPrefetchDecision] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -692,7 +699,7 @@ class HybridCacheController(BaseHiCacheController):
             if rid not in self.pp_prefetch_decisions:
                 return None
             decision = self.pp_prefetch_decisions[rid]
-        return PrefetchSubmission(decision=decision)
+        return PrefetchSubmission(decision=decision is PPPrefetchDecision.TICKETED)
 
     def submit_prefetch(
         self,
@@ -727,7 +734,9 @@ class HybridCacheController(BaseHiCacheController):
         )
         decision = operation is not None
         with self.pp_prefetch_state_lock:
-            self.pp_prefetch_decisions[rid] = decision
+            self.pp_prefetch_decisions[rid] = (
+                PPPrefetchDecision.TICKETED if decision else PPPrefetchDecision.SKIPPED
+            )
         return PrefetchSubmission(operation=operation, decision=decision)
 
     def submit_pp_prefetch(
@@ -896,9 +905,13 @@ class HybridCacheController(BaseHiCacheController):
     def release_pp_prefetch(self, rid: str) -> bool:
         """Retire a ticket; free only buffers not handed to buffer mode."""
         with self.pp_prefetch_state_lock:
-            self.pp_prefetch_decisions.pop(rid, None)
+            decision = self.pp_prefetch_decisions.pop(rid, None)
             state = self.pp_prefetch_states.get(rid)
             if state is None:
+                if decision not in (None, PPPrefetchDecision.SKIPPED):
+                    # Request rejection may precede local ticket registration.
+                    self.pp_prefetch_decisions[rid] = PPPrefetchDecision.CANCELLED
+                    return True
                 return False
             if state.consumed:
                 self.pp_prefetch_states.pop(rid)
@@ -940,6 +953,10 @@ class HybridCacheController(BaseHiCacheController):
                     operation.is_pp_broadcast = True
                     state = PPPrefetchState(ticket=ticket, operation=operation)
                     self.pp_prefetch_states[ticket.rid] = state
+                decision = self.pp_prefetch_decisions.get(ticket.rid)
+                if decision is PPPrefetchDecision.CANCELLED:
+                    state.release_requested = True
+                    self.pp_prefetch_decisions.pop(ticket.rid)
                 operation = state.operation
 
             operation.hash_value = self.get_hash_str(
