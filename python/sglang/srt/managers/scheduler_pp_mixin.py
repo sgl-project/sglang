@@ -179,18 +179,15 @@ class SchedulerPPMixin:
         ====================================================================
         Stage P
         recv ith req from previous stage
-        recv ith bootstrap req from previous stage
+        pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
         recv ith transferred req from previous stage
         recv ith proxy from previous stage
         run ith batch
-        recv prev (i+1) % mb_size th consensus bootstrapped req from previous stage
-        local consensus on bootstrapped req
         recv prev (i+1) % mb_size th release req from previous stage
         local consensus on release req
         recv prev (i+1) % mb_size th outputs
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
-        send ith bootstrap req to next stage
         send ith transferred req to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage (can be stashed and delayed to send later)
@@ -198,23 +195,17 @@ class SchedulerPPMixin:
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
         ====================================================================
 
-        There are two additional elements compared to the regular schedule:
-
-        Bootstrap Requests + Release Requests:
-        - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
+        Release Requests still use the two-pass PP consensus. Bootstrap uses
+        PPConsensusStore instead of the legacy two-round RID sync.
 
         """
         self.init_pp_loop_state()
 
         # PD additional state initialization
-        bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
-        consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
-        send_bootstrapped_work = []
         send_transfer_work = []
-        send_consensus_bootstrapped_work = []
         send_release_work = []
 
         while True:
@@ -227,7 +218,6 @@ class SchedulerPPMixin:
 
                 next_pp_outputs = None
                 next_release_rids = None
-                next_consensus_bootstrapped_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -236,9 +226,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
-                bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
+                self.process_bootstrapped_queue()
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
@@ -285,28 +273,12 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
-                        bootstrapped_rids,
-                    )
-                )
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
 
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
@@ -325,9 +297,6 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -343,7 +312,6 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
-                consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
 
@@ -568,67 +536,9 @@ class SchedulerPPMixin:
             defaultdict(deque)
         )
 
-    def process_bootstrapped_queue(
-        self: Scheduler, bootstrapped_rids: Optional[List[str]]
-    ):
-        # finished consensus bootstrapped reqs and prepare the waiting queue
-        if bootstrapped_rids is not None:
-            (
-                good_consensus_bootstrapped_rids,
-                bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
-            good_reqs, failed_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                    return_failed_reqs=True,
-                    pp_good_rids=good_consensus_bootstrapped_rids,
-                    pp_bad_rids=bad_consensus_bootstrapped_rids,
-                )
-            )
-            self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
-        return None
-
-    def _pp_pd_get_bootstrapped_ids(self: Scheduler):
-        # communicate pre-consensus bootstrapp reqs
-        if self.pp_group.is_first_rank:
-            # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
-        else:
-            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
-            )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
-            )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
-            )
-        # Route locally-aborted reqs through the bad-union consensus so every PP
-        # rank flushes them in the same consensus round, regardless of when the
-        # AbortReq reaches each rank and regardless of whether
-        # disagg_kv_sender.abort() drives the poll to Failed (it is optional).
-        aborted_rids = {
-            req.rid
-            for req in self.disagg_prefill_bootstrap_queue.queue
-            if isinstance(req.finished_reason, FINISH_ABORT)
-        }
-        good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
-            good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
-        )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+    def process_bootstrapped_queue(self: Scheduler):
+        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        self.waiting_queue.extend(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success

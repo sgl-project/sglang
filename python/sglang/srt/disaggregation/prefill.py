@@ -51,8 +51,9 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    _all_reduce_polls,
     poll_and_all_reduce_attn_cp_tp_group,
-    poll_and_all_reduce_pp,
+    pp_sync_polls,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -177,6 +178,7 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        self.pp_poll_sync_work_list: List = []
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -422,16 +424,8 @@ class PrefillBootstrapQueue:
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
     ) -> List[Req] | tuple[List[Req], List[Req]]:
-        """
-        pop the reqs which has finished bootstrapping
-
-        return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        pp_good_rids: RIDs that PP consensus determined as WaitingForInput.
-        pp_bad_rids: RIDs that PP consensus determined as Failed.
-        """
+        """Pop the reqs which have finished bootstrapping."""
 
         bootstrapped_reqs = []
         failed_reqs = []
@@ -444,22 +438,28 @@ class PrefillBootstrapQueue:
                 return [], []
 
         if self.pp_size > 1:
-            polls = poll_and_all_reduce_pp(
-                (req.rid for req in self.queue),
-                KVPoll.WaitingForInput,
-                pp_good_rids,
-                pp_bad_rids,
+            if self.pp_rank == 0:
+                polls = [
+                    int(req.disagg_kv_sender.poll_pp_consensus()) for req in self.queue
+                ]
+                if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
+                    import random
+
+                    polls = [
+                        int(KVPoll.Failed)
+                        if random.random() < failure_prob
+                        else poll
+                        for poll in polls
+                    ]
+            else:
+                polls = None
+            polls = pp_sync_polls(
+                polls,
+                self.scheduler.pp_group,
+                self.pp_rank,
+                self.pp_size,
+                self.pp_poll_sync_work_list,
             )
-            uncovered = [i for i, poll in enumerate(polls) if poll is None]
-            if uncovered:
-                local_polls = poll_and_all_reduce_attn_cp_tp_group(
-                    [self.queue[i].disagg_kv_sender for i in uncovered],
-                    self.scheduler.attn_cp_cpu_group,
-                    self.scheduler.attn_tp_cpu_group,
-                )
-                for i, local_poll in zip(uncovered, local_polls):
-                    if local_poll == KVPoll.Failed:
-                        polls[i] = KVPoll.Failed
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
@@ -467,10 +467,11 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if poll is None:
-                continue
+        if self.pp_size > 1:
+            polls = _all_reduce_polls(polls, self.scheduler.attn_tp_cpu_group)
+            polls = _all_reduce_polls(polls, self.scheduler.attn_cp_cpu_group)
 
+        for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)

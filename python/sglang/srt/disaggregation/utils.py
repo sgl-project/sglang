@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -47,6 +48,44 @@ if is_npu():
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+def pp_sync_polls(
+    polls: Optional[List[int]],
+    pp_group,
+    pp_rank: int,
+    pp_size: int,
+    sync_work_list: List,
+) -> List[int]:
+    """Synchronize poll states from PP0 through the PP pipeline.
+
+    PP0 provides the data. Each later PP rank receives it from the previous
+    rank and asynchronously forwards it to the next rank.
+    """
+    if pp_size <= 1:
+        assert polls is not None
+        return polls
+
+    for p2p_work in sync_work_list:
+        p2p_work.work.wait()
+    sync_work_list.clear()
+
+    data = polls
+    if pp_rank > 0:
+        data = pp_group.recv_object(
+            src=pp_rank - 1,
+            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+        )
+    if pp_rank + 1 < pp_size:
+        sync_work_list.extend(
+            pp_group.send_object(
+                data,
+                dst=pp_rank + 1,
+                async_send=True,
+                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            )
+        )
+    return data
 
 
 def poll_and_all_reduce_pp(

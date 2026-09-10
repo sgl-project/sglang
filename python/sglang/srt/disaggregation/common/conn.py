@@ -9,6 +9,8 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
+
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -216,7 +218,7 @@ class CommonKVManager(BaseKVManager):
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
-        self.request_status: Dict[int, KVPoll] = {}
+        self.request_status: Union[Dict[int, KVPoll], PPConsensusStore] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -361,6 +363,12 @@ class CommonKVManager(BaseKVManager):
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
+
+    def check_status_pp_consensus(self, bootstrap_room: int) -> KVPoll:
+        statuses = self.request_status.get_all_ranks(bootstrap_room)
+        if any(status is None for status in statuses):
+            return KVPoll.Bootstrapping
+        return min(statuses)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         if bootstrap_room not in self.request_status:
