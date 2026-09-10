@@ -267,16 +267,17 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
             "ulysses_degree": server_args.ulysses_degree,
             "ring_degree": server_args.ring_degree,
         }
+        # The sparse mask spans the whole camera-major sequence, so sequence and
+        # tensor sharding are not supported. CFG parallel is fine: each rank runs
+        # one complete branch with its own mask cache and only the weighted
+        # velocities are all-reduced.
         for name, degree in parallel_degrees.items():
             if int(degree or 1) > 1:
                 raise ValueError(
-                    f"Cosmos3 multiview v1 is single-GPU; {name} must be 1."
+                    "Cosmos3 multiview does not support sequence or tensor "
+                    f"parallelism; {name} must be 1 (use --enable-cfg-parallel on "
+                    "2 GPUs instead)."
                 )
-        if server_args.enable_cfg_parallel:
-            raise ValueError(
-                "Cosmos3 multiview v1 uses single-GPU sequential CFG; "
-                "--enable-cfg-parallel is not supported."
-            )
 
     def supports_action_endpoint(self) -> bool:
         return False

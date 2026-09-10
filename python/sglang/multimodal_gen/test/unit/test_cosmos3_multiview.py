@@ -941,16 +941,16 @@ class TestDeploymentConfig(unittest.TestCase):
                 setattr(server_args, name, 2)
                 with self.assertRaises(ValueError):
                     config.validate_server_args(server_args)
-        with self.assertRaises(ValueError):
-            config.validate_server_args(
-                SimpleNamespace(
-                    tp_size=1,
-                    sp_degree=1,
-                    ulysses_degree=1,
-                    ring_degree=1,
-                    enable_cfg_parallel=True,
-                )
+        # CFG parallel only splits the two branches across ranks; it is allowed.
+        config.validate_server_args(
+            SimpleNamespace(
+                tp_size=1,
+                sp_degree=1,
+                ulysses_degree=1,
+                ring_degree=1,
+                enable_cfg_parallel=True,
             )
+        )
 
 
 def _views(cameras, *, vision=False):

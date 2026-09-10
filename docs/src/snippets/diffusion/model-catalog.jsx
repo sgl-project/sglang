@@ -242,7 +242,7 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "Cosmos3 Multiview-AV",
       modelIds: ["nvidia/Cosmos3-Nano-Transfer-Auto"],
-      note: "11-camera WSM-to-RGB transfer in one pass with block-sparse cross-camera attention (single GPU); local checkpoints are also detected by the Cosmos3MultiviewPipeline class name.",
+      note: "11-camera WSM-to-RGB transfer in one pass with block-sparse cross-camera attention (single GPU or 2-GPU CFG parallel; no SP/TP); local checkpoints are also detected by the Cosmos3MultiviewPipeline class name.",
     },
     {
       name: "LingBotWorld",
