@@ -59,15 +59,15 @@ from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
 from sglang.srt.layers.cp.bcg import (
-    enable_cp_v2_bcg_capture as should_enable_cp_v2_bcg_capture,
+    enable_cp_bcg_capture as should_enable_cp_bcg_capture,
 )
 from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
 from sglang.srt.layers.cp.utils import (
-    is_cp_v2_active,
-    is_mla_prefill_cp_enabled,
+    is_cp_active,
+    is_mla_cp_enabled,
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -127,6 +127,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_memory,
     get_parallel,
     get_schedule,
@@ -381,9 +382,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or self.prefill_backend_name == Backend.FULL
             ),
             require_gathered_buffer=require_gathered_buffer(),
-            enable_prefill_cp=(
-                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
-            ),
+            enable_prefill_cp=(is_dsa_enable_prefill_cp() or is_mla_cp_enabled()),
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             source=self.buffers,
         )
@@ -416,7 +415,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._is_full_backend = False
         # Same ordering requirement: capture_prepare reads this.
         self._capture_lora = False
-        self.enable_cp_v2_bcg_capture = False
+        self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
@@ -514,10 +513,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 }
 
         server_args = model_runner.server_args
-        self.enable_cp_v2_bcg_capture = isinstance(
+        self.enable_cp_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_v2_bcg_capture(server_args)
-        if self.enable_cp_v2_bcg_capture:
+        ) and should_enable_cp_bcg_capture(server_args)
+        if self.enable_cp_bcg_capture:
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
@@ -847,9 +846,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
-        # MegaMoE is exempt (prefill_graph_tolerates_sum_len): its idle ranks
-        # still execute MegaMoE with 0 tokens, so per-rank SUM_LEN buckets stay
-        # collective-safe and need no eager fallback.
+        # MegaMoE graphs without a captured DP gather tolerate per-rank buckets
+        # and an eager idle rank; graphs with one fall through to the check.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
@@ -1238,7 +1236,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             return False
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
@@ -1420,13 +1418,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        with freeze_gc(get_exec().graph.enable_cudagraph_gc):
-            with graph_capture(
-                stream=get_or_create_global_graph_capture_stream()
-            ) as graph_capture_context:
-                self.stream = graph_capture_context.stream
-                with self.backend.capture_session(self.stream):
-                    self._capture_one_stream()
+        dp_flags = get_flags().dp
+        dp_flags.capturing_prefill_graph = True
+        try:
+            with freeze_gc(get_exec().graph.enable_cudagraph_gc):
+                with graph_capture(
+                    stream=get_or_create_global_graph_capture_stream()
+                ) as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with self.backend.capture_session(self.stream):
+                        self._capture_one_stream()
+        finally:
+            dp_flags.capturing_prefill_graph = False
+        if dp_flags.prefill_graph_has_dp_gather:
+            logger.info(
+                "Prefill CUDA graph captured a DP gather/scatter; "
+                "DP ranks will replay a shared MAX_LEN bucket."
+            )
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1460,7 +1468,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        if self.enable_cp_v2_bcg_capture:
+        if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
                 self,
@@ -1507,7 +1515,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # Main's monolithic BCG runner never invokes
         # on_after_cuda_graph_warmup between warmup iterations — the BCG
-        # contract is to keep warmup state untouched and let
+        # contract is to keep warmup metadata untouched and let
         # init_forward_metadata_in_graph (recorded inside the captured
         # forward) do any raw->full upgrade. cg-refactor's runner_backend
         # abstraction exposes a post_warmup_hook for backends that need
@@ -1517,6 +1525,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # corrupt warmup iter 2's metadata read.
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
+            req_pool = self.model_runner.req_to_token_pool
+            mamba_pool = getattr(req_pool, "mamba_pool", None)
+            if mamba_pool is not None and not prefix_num_chunks:
+                capture_state_indices = req_pool.translate_mamba_indices(
+                    req_pool.get_mamba_indices(forward_batch.req_pool_indices)
+                ).unique()
+
+                def post_warmup_hook():
+                    mamba_pool.clear_slots(capture_state_indices)
+
+                post_warmup_hook()
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         self.backend.capture_one(
@@ -1542,7 +1561,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
@@ -1756,7 +1775,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         metadata_forward_batch = forward_batch
-        if self.enable_cp_v2_bcg_capture:
+        if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
                 self,
@@ -1926,7 +1945,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner, shared_read_ends, self.device_module
             )
 
-            if self.enable_cp_v2_bcg_capture:
+            if self.enable_cp_bcg_capture:
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,
