@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 _NVFP4_PREFILL_BACKEND = {
     "fp8_e4m3": "flashinfer",
-    "none": "trtllm_mha",
+    "nvfp4": "trtllm_mha",
 }
 _NVFP4_PREFILL_DEQUANT_DTYPE = {
     backend: dtype for dtype, backend in _NVFP4_PREFILL_BACKEND.items()
@@ -55,9 +55,9 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
                     "NVFP4 prefill supports an FP8 E4M3 workspace or native "
                     f"NVFP4, but backend {explicit_backend!r} provides neither."
                 )
-            requested_dtype = "none" if get_platform().is_sm100 else "fp8_e4m3"
+            requested_dtype = "nvfp4" if get_platform().is_sm100 else "fp8_e4m3"
 
-    if requested_dtype == "none" and not get_platform().is_sm100:
+    if requested_dtype == "nvfp4" and not get_platform().is_sm100:
         raise ValueError(
             "Native NVFP4 prefill currently requires SM100; use "
             "--prefill-kv-cache-dequant-dtype=fp8_e4m3 on this platform."
@@ -91,11 +91,10 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
     if cfg.prefill_kv_cache_dequant_dtype == "auto":
         updates["prefill_kv_cache_dequant_dtype"] = requested_dtype
     declare_resolution(server_args, "_handle_nvfp4_prefill_kv_dequant_dtype", **updates)
-    prefill_input_dtype = "nvfp4" if requested_dtype == "none" else requested_dtype
     logger.info(
         "NVFP4 prefill dequant dtype: %s; prefill input: %s; decode input: nvfp4.",
         requested_dtype,
-        prefill_input_dtype,
+        requested_dtype,
     )
 
 

@@ -716,7 +716,7 @@ class TestKV4Compatibility(unittest.TestCase):
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_prefill_kv_dequant_dtype_selects_native_backends_on_sm100(self):
-        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="none")
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="nvfp4")
         handle_nvfp4_prefill_kv_dequant_dtype(args)
         self.assertEqual(
             resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
@@ -741,7 +741,7 @@ class TestKV4Compatibility(unittest.TestCase):
         args = self._make_unrouted_nvfp4_args()
         handle_nvfp4_prefill_kv_dequant_dtype(args)
         self.assertEqual(
-            resolution_result(args, "prefill_kv_cache_dequant_dtype"), "none"
+            resolution_result(args, "prefill_kv_cache_dequant_dtype"), "nvfp4"
         )
         self.assertEqual(
             resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
@@ -771,14 +771,14 @@ class TestKV4Compatibility(unittest.TestCase):
 
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_prefill_kv_dequant_dtype_rejects_native_prefill_off_sm100(self):
-        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="none")
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="nvfp4")
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             handle_nvfp4_prefill_kv_dequant_dtype(args)
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_prefill_kv_dequant_dtype_rejects_conflicting_prefill_backend(self):
         args = self._make_unrouted_nvfp4_args(
-            prefill_kv_cache_dequant_dtype="none",
+            prefill_kv_cache_dequant_dtype="nvfp4",
             prefill_attention_backend="flashinfer",
         )
         with self.assertRaisesRegex(ValueError, "Remove the backend option"):
@@ -798,7 +798,7 @@ class TestKV4Compatibility(unittest.TestCase):
         args = ServerArgs(
             model_path="dummy",
             kv_cache_dtype="fp8_e4m3",
-            prefill_kv_cache_dequant_dtype="none",
+            prefill_kv_cache_dequant_dtype="nvfp4",
         )
         with self.assertRaisesRegex(ValueError, "applies only"):
             handle_nvfp4_prefill_kv_dequant_dtype(args)
