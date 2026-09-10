@@ -6,10 +6,11 @@
 //! `Conversation.get_prompt()` so there is exactly one implementation of the
 //! per-style formatting logic (no Jinja translation to drift).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use dynamo_protocols::types::CreateChatCompletionRequest;
-use dynamo_renderer::PromptFormatter;
+use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
+use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, TextInput};
 use thiserror::Error;
 
 use crate::message::types::OneOrMany;
@@ -23,13 +24,16 @@ pub(super) use super::template_legacy::LegacySpec;
 use super::template_loader::infer_legacy_template_from_model_path;
 pub(super) use super::template_loader::load_chat_formatter;
 
-/// A chat prompt formatter: either the model's HuggingFace Jinja template or a
-/// legacy SGLang conversation template, or a Dynamo native formatter.
+/// Extra variables for the chat template (`chat_template_kwargs`).
+pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
+
+/// A chat prompt formatter: a Dynamo renderer (the model's Jinja template or a
+/// built-in encoder for models that ship none) or a legacy SGLang conversation
+/// template.
 #[derive(Clone)]
 pub enum ChatFormatter {
-    HuggingFace(PromptFormatter),
+    Dynamo(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
-    Native(PromptFormatter),
 }
 
 impl ChatFormatter {
@@ -37,33 +41,70 @@ impl ChatFormatter {
     pub(super) fn render(
         &self,
         request: &CreateChatCompletionRequest,
-        thinking: Option<bool>,
+        kwargs: Option<&ChatTemplateKwargs>,
     ) -> Result<String, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace(formatter) => {
-                let PromptFormatter::OAI(formatter) = formatter;
-                formatter
-                    .render(request)
-                    .map_err(|error| TemplateError::Renderer {
-                        message: error.to_string(),
-                    })
-            }
+            ChatFormatter::Dynamo(PromptFormatter::OAI(formatter)) => formatter
+                .render(&TemplateRequest { request, kwargs })
+                .map_err(|error| TemplateError::Renderer {
+                    message: error.to_string(),
+                }),
             ChatFormatter::Legacy(formatter) => formatter.render(request),
-            ChatFormatter::Native(formatter) => {
-                super::template_native::render(formatter, request, thinking)
-            }
         }
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
     /// (`str | list[str] | None`). Legacy/builtin templates define them (e.g.
-    /// chatml's `<|im_end|>`); the HuggingFace renderer carries none, matching
+    /// chatml's `<|im_end|>`); the Dynamo renderer carries none, matching
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) | ChatFormatter::Native(_) => None,
+            ChatFormatter::Dynamo(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
+    }
+}
+
+/// The wire request plus its `chat_template_kwargs`, which the protocol type
+/// does not carry.
+struct TemplateRequest<'a> {
+    request: &'a CreateChatCompletionRequest,
+    kwargs: Option<&'a ChatTemplateKwargs>,
+}
+
+impl OAIChatLikeRequest for TemplateRequest<'_> {
+    fn model(&self) -> String {
+        self.request.model()
+    }
+    fn messages(&self) -> minijinja::Value {
+        self.request.messages()
+    }
+    fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
+        self.request.typed_messages()
+    }
+    fn tools(&self) -> Option<minijinja::Value> {
+        self.request.tools()
+    }
+    fn tool_choice(&self) -> Option<minijinja::Value> {
+        self.request.tool_choice()
+    }
+    fn response_format(&self) -> Option<minijinja::Value> {
+        self.request.response_format()
+    }
+    fn reasoning_effort(&self) -> Option<minijinja::Value> {
+        self.request.reasoning_effort()
+    }
+    fn should_add_generation_prompt(&self) -> bool {
+        self.request.should_add_generation_prompt()
+    }
+    fn chat_template_args(&self) -> Option<&ChatTemplateKwargs> {
+        self.kwargs
+    }
+    fn extract_text(&self) -> Option<TextInput> {
+        self.request.extract_text()
+    }
+    fn mm_processor_kwargs(&self) -> Option<&serde_json::Value> {
+        self.request.mm_processor_kwargs()
     }
 }
 
@@ -139,6 +180,8 @@ pub(super) enum TemplateError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use dynamo_protocols::types::{
         ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
         ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
@@ -425,6 +468,7 @@ mod tests {
         let formatter = load_chat_formatter(
             Some(base.to_str().unwrap()),
             None,
+            None,
             Some(base.to_str().unwrap()),
         )
         .unwrap();
@@ -460,6 +504,7 @@ mod tests {
 
         let formatter = load_chat_formatter(
             Some(base.to_str().unwrap()),
+            None,
             None,
             Some(legacy.to_str().unwrap()),
         )
@@ -562,7 +607,7 @@ mod tests {
     /// A built-in `--chat-template` name resolves without any tokenizer config.
     #[test]
     fn builtin_argument_works_without_tokenizer_config() {
-        let formatter = load_chat_formatter(None, None, Some("chatml")).unwrap();
+        let formatter = load_chat_formatter(None, None, None, Some("chatml")).unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
             panic!("expected a legacy formatter");
         };
@@ -590,6 +635,7 @@ mod tests {
             Some(base.to_str().unwrap()),
             Some("models/vicuna-7b-v1.5"),
             None,
+            None,
         )
         .unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
@@ -597,7 +643,7 @@ mod tests {
         };
         assert_eq!(formatter.spec.name, "vicuna_v1.1");
         // No config at all + path matcher.
-        let formatter = load_chat_formatter(None, Some("deepseek-vl2-7b"), None).unwrap();
+        let formatter = load_chat_formatter(None, Some("deepseek-vl2-7b"), None, None).unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
             panic!("expected a legacy formatter");
         };
@@ -614,7 +660,8 @@ mod tests {
             r#"{"model_type":"phi4mm","architectures":["Phi4MMForCausalLM"]}"#,
         )
         .unwrap();
-        let formatter = load_chat_formatter(None, Some(model_dir.to_str().unwrap()), None).unwrap();
+        let formatter =
+            load_chat_formatter(None, Some(model_dir.to_str().unwrap()), None, None).unwrap();
         let ChatFormatter::Legacy(formatter) = &formatter else {
             panic!("expected a legacy formatter");
         };
@@ -658,8 +705,107 @@ mod tests {
     fn minicpm_4_6_skips_legacy_inference() {
         assert!(infer_legacy_template_from_model_path("minicpm-v-4.6").is_none());
         assert!(matches!(
-            load_chat_formatter(None, Some("minicpm-v-4.6"), None),
+            load_chat_formatter(None, Some("minicpm-v-4.6"), None, None),
             Err(TemplateError::MissingConfig)
         ));
+    }
+
+    fn temp_config(contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sglang-template-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("tokenizer_config.json");
+        std::fs::write(&config, contents).unwrap();
+        config
+    }
+
+    #[test]
+    fn chat_template_kwargs_reach_the_template() {
+        let config = temp_config(r#"{"chat_template": "thinking={{ thinking }}"}"#);
+        let formatter =
+            load_chat_formatter(Some(config.to_str().unwrap()), None, None, None).unwrap();
+        let kwargs = HashMap::from([("thinking".into(), serde_json::json!(true))]);
+        assert_eq!(formatter.render(&request(), None).unwrap(), "thinking=");
+        assert_eq!(
+            formatter.render(&request(), Some(&kwargs)).unwrap(),
+            "thinking=True"
+        );
+    }
+
+    #[test]
+    fn missing_template_falls_back_to_native_formatter() {
+        let config = temp_config("{}");
+        let config = config.to_str().unwrap();
+        let load = |config, model_type, arg| {
+            load_chat_formatter(config, Some("/models/x"), model_type, arg)
+        };
+
+        let formatter = load(Some(config), Some("deepseek_v4"), None).unwrap();
+        assert!(matches!(formatter, ChatFormatter::Dynamo(_)));
+        let kwargs = HashMap::from([("thinking".into(), serde_json::json!(false))]);
+        assert_eq!(
+            formatter.render(&request(), Some(&kwargs)).unwrap(),
+            "<｜begin▁of▁sentence｜>Be concise.<｜User｜>Hello<｜Assistant｜></think>"
+        );
+        assert!(matches!(
+            load(None, Some("deepseek_v4"), None),
+            Ok(ChatFormatter::Dynamo(_))
+        ));
+
+        // A template, `--chat-template`, or an unknown architecture wins.
+        let templated = temp_config(r#"{"chat_template": "Hi"}"#);
+        let formatter = load(Some(templated.to_str().unwrap()), Some("deepseek_v4"), None).unwrap();
+        assert_eq!(formatter.render(&request(), None).unwrap(), "Hi");
+        assert!(matches!(
+            load(Some(config), Some("deepseek_v4"), Some("chatml")),
+            Ok(ChatFormatter::Legacy(_))
+        ));
+        assert!(matches!(
+            load(Some(config), Some("llama"), None),
+            Err(TemplateError::Missing)
+        ));
+        assert!(matches!(
+            load(None, None, None),
+            Err(TemplateError::MissingConfig)
+        ));
+    }
+
+    /// Fixture written by `test/registered/rust/test_chat_render_parity.py`
+    /// from Python's real serving path.
+    #[test]
+    #[ignore = "run test/registered/rust/test_chat_render_parity.py"]
+    fn python_rust_render_parity() {
+        use crate::tokenizer_manager::tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("SGLANG_CHAT_PARITY_FIXTURE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let path = fixture["tokenizer_path"].as_str().unwrap();
+        let config = std::path::Path::new(path).join("tokenizer_config.json");
+        let formatter = load_chat_formatter(
+            config.to_str(),
+            Some(path),
+            fixture["model_type"].as_str(),
+            None,
+        )
+        .unwrap();
+        let tokenizer =
+            DynamoTokenizer::new(load_tokenizer(Some(path), None, false).unwrap().unwrap());
+
+        let mut mismatches = Vec::new();
+        for case in fixture["cases"].as_array().unwrap() {
+            let request = serde_json::from_value(case["request"].clone()).unwrap();
+            let kwargs =
+                serde_json::from_value(case["request"]["chat_template_kwargs"].clone()).ok();
+            let prompt = formatter.render(&request, kwargs.as_ref()).unwrap();
+            let input_ids = serde_json::json!(tokenizer.encode(&prompt).unwrap());
+            if prompt != case["prompt"] || input_ids != case["input_ids"] {
+                mismatches.push(format!(
+                    "{}:\n  python: {}\n  rust:   {prompt:?}",
+                    case["name"], case["prompt"]
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 }

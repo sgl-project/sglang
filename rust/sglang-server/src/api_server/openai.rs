@@ -17,10 +17,9 @@ mod template;
 mod template_builtins;
 mod template_legacy;
 mod template_loader;
-mod template_native;
 mod tools;
 
-pub(super) use template::ChatFormatter;
+pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
@@ -63,6 +62,7 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     match template::load_chat_formatter(
         config_file.as_deref(),
         (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
+        server_args.model_config.model_type.as_deref(),
         server_args.chat_template.as_deref(),
     ) {
         Ok(formatter) => {
@@ -73,22 +73,6 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
             Some(formatter)
         }
         Err(error) => {
-            if server_args.chat_template.is_none()
-                && matches!(
-                    error,
-                    template::TemplateError::Missing | template::TemplateError::MissingConfig
-                )
-                && let Some(formatter) = dynamo_renderer::native_formatter_for(
-                    &server_args
-                        .model_config
-                        .model_type
-                        .as_ref()
-                        .map(|s| s.to_lowercase()),
-                    &server_args.model_path.to_lowercase(),
-                )
-            {
-                return Some(ChatFormatter::Native(formatter));
-            }
             tracing::warn!(%error, "OpenAI chat completions disabled");
             None
         }
