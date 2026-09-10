@@ -480,9 +480,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
                 ctx.params.tree_components,
                 (fake_components.ComponentType.FULL,),
             )
-            self.assertIs(
-                result, fake_module.LMCacheUnifiedRadixCache.return_value
-            )
+            self.assertIs(result, fake_module.LMCacheUnifiedRadixCache.return_value)
 
     def test_lmcache_rejects_hicache(self):
         ctx = _make_ctx(
