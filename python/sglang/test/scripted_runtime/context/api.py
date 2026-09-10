@@ -54,6 +54,7 @@ class ScriptedContext:
     def _register_request(self, *, rid: str, post_future: Future) -> ScriptedReqHandle:
         previous = self._request_epochs.get(rid)
         if previous is not None:
+            queries._check_epoch_post_result(self, epoch=previous)
             queries._resolve_epoch_req(self, epoch=previous)
             previous.closed = True
         excluded_reqs = tuple(r for r in queries._get_all_reqs(self) if r.rid == rid)
@@ -69,6 +70,8 @@ class ScriptedContext:
         return ScriptedReqHandle(rid=rid, context=self, _epoch=epoch)
 
     def _reset_request_tracking(self) -> None:
+        for epoch in self._request_epochs.values():
+            queries._check_epoch_post_result(self, epoch=epoch)
         for epoch in self._request_epochs.values():
             queries._resolve_epoch_req(self, epoch=epoch)
             epoch.closed = True

@@ -6,8 +6,9 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 
 import aiohttp
+import orjson
 
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, Req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -154,6 +155,86 @@ class TestRequestEpochs(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "stream failed"):
             _ = handle.status
 
+    def test_completed_request_surfaces_late_response_failure(self):
+        """A scheduler finish must not hide a response failure that arrives afterward."""
+        errors = (
+            RuntimeError("late stream failure"),
+            aiohttp.ClientResponseError(
+                request_info=SimpleNamespace(real_url="http://localhost/generate"),
+                history=(),
+                status=503,
+                message="backend unavailable after finish",
+            ),
+        )
+        for index, error in enumerate(errors):
+            handle = self._register(rid=f"late-error-{index}")
+            req = self._req(rid=handle.rid)
+            self._record(reqs=[req])
+            req.finished_reason = FINISH_LENGTH(length=4)
+            self.assertTrue(handle.finished)
+            handle._epoch.post_future.set_exception(error)
+
+            for name, query in (
+                ("handle.finished", lambda: handle.finished),
+                ("handle.status", lambda: handle.status),
+                ("context.is_finished", lambda: self.ctx.is_finished(handle.rid)),
+            ):
+                with self.subTest(error=error, query=name):
+                    with self.assertRaises(type(error)) as raised:
+                        query()
+                    self.assertIs(raised.exception, error)
+
+    def test_expected_abort_response_is_terminal_in_last_batch(self):
+        """A requested abort remains terminal while its finished Req is still in the last batch."""
+        for message in ("Aborted", "Abort in waiting queue"):
+            with self.subTest(message=message):
+                handle = self._register()
+                req = self._req()
+                self._record(reqs=[req])
+                req.finished_reason = FINISH_ABORT()
+                handle._epoch.abort_requested = True
+                handle._epoch.post_future.set_exception(
+                    aiohttp.ClientResponseError(
+                        request_info=None,
+                        history=(),
+                        status=400,
+                        message=orjson.dumps({"error": {"message": message}}).decode(),
+                    )
+                )
+
+                self.assertIs(handle.req, req)
+                self.assertTrue(handle.finished)
+                self.assertEqual(handle.status, "finished")
+                self.assertTrue(self.ctx.is_finished(handle.rid))
+
+    def test_abort_response_requires_exact_message_and_terminal_request(self):
+        """An abort marker must not suppress unrelated failures or errors for a still-live request."""
+        for index, (finished, requested, message) in enumerate(
+            (
+                (False, True, "Aborted"),
+                (True, True, "Aborted because of invalid sampling parameters"),
+                (True, False, "Abort in waiting queue"),
+            )
+        ):
+            with self.subTest(finished=finished, requested=requested, message=message):
+                handle = self._register(rid=f"abort-error-{index}")
+                req = self._req(rid=handle.rid)
+                self._record(reqs=[req])
+                if finished:
+                    req.finished_reason = FINISH_LENGTH(length=4)
+                handle._epoch.abort_requested = requested
+                error = aiohttp.ClientResponseError(
+                    request_info=SimpleNamespace(real_url="http://localhost/generate"),
+                    history=(),
+                    status=400,
+                    message=orjson.dumps({"error": {"message": message}}).decode(),
+                )
+                handle._epoch.post_future.set_exception(error)
+
+                with self.assertRaises(aiohttp.ClientResponseError) as raised:
+                    _ = handle.finished
+                self.assertIs(raised.exception, error)
+
     def test_abort_response_before_first_forward_is_terminal(self):
         """An expected abort response completes an unobserved request, but other errors propagate."""
         for status in (400, 503):
@@ -192,6 +273,22 @@ class TestRequestEpochs(CustomTestCase):
         self.assertEqual(self.ctx.chunked_parks(second.rid), 0)
         self.assertIsNone(second.req)
         self.assertTrue(first.finished)
+
+    def test_tracking_reset_is_atomic_when_a_later_response_failed(self):
+        """A failed response must leave every request epoch intact when tracking reset is rejected."""
+        first = self._register(rid="first")
+        first._epoch.post_future.set_result(None)
+        later = self._register(rid="later")
+        error = RuntimeError("later response failed")
+        later._epoch.post_future.set_exception(error)
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.ctx._reset_request_tracking()
+        self.assertIs(raised.exception, error)
+        self.assertIs(self.ctx._request_epochs[first.rid], first._epoch)
+        self.assertIs(self.ctx._request_epochs[later.rid], later._epoch)
+        self.assertFalse(first._epoch.closed)
+        self.assertFalse(later._epoch.closed)
 
     def test_observed_waiting_abort_can_complete_after_removal(self):
         """An observed waiting request can be removed by abort without setting its finish reason."""
