@@ -1973,7 +1973,10 @@ class BaseMultimodalProcessor(ABC):
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.
+        from sglang.srt.managers.mm_utils import AUXILIARY_TRANSPORT_FEATURE_NAMES
+
         updates = []
+        metadata_updates = []
         try:
             for item in mm_items:
                 fields = (
@@ -1986,6 +1989,21 @@ class BaseMultimodalProcessor(ABC):
                     wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
                     setattr(item, field, wrapped)
                     updates.append((item, field, tensor, wrapped))
+                original_data = item.model_specific_data
+                for key in AUXILIARY_TRANSPORT_FEATURE_NAMES:
+                    tensor = original_data.get(key)
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    if item.model_specific_data is original_data:
+                        item.model_specific_data = dict(original_data)
+                        metadata_updates.append((item, original_data))
+                    wrapped = (
+                        tensor.cpu()
+                        if tensor.numel() == 0
+                        else self._wrap_tensor_for_cuda_ipc(tensor)
+                    )
+                    item.model_specific_data[key] = wrapped
+                    updates.append((item.model_specific_data, key, tensor, wrapped))
         except BaseException as error:
             rollback_errors = []
             for item, field, tensor, wrapped in reversed(updates):
@@ -1995,7 +2013,12 @@ class BaseMultimodalProcessor(ABC):
                 except BaseException as rollback_error:
                     rollback_errors.append(rollback_error)
                 finally:
-                    setattr(item, field, tensor)
+                    if isinstance(item, dict):
+                        item[field] = tensor
+                    else:
+                        setattr(item, field, tensor)
+            for item, original_data in reversed(metadata_updates):
+                item.model_specific_data = original_data
             if rollback_errors:
                 error.add_note(
                     f"{len(rollback_errors)} CUDA IPC rollback operation(s) also failed"

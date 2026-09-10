@@ -94,7 +94,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import discard_shm_features, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -1591,8 +1591,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
-            self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
+            self._mark_state_dispatched(tokenized_obj.rid)
             dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
             if dispatch_ready is not None:
                 dispatch_ready.set()
@@ -1600,6 +1600,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
             if not dispatched:
+                discard_shm_features(tokenized_obj)
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
 
     def _mark_state_dispatched(self, rid: str):
@@ -1630,7 +1631,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
-            for tokenized_obj in tokenized_objs:
+            for index, tokenized_obj in enumerate(tokenized_objs):
+                tokenized_obj = wrap_shm_features(tokenized_obj)
+                tokenized_objs[index] = tokenized_obj
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
@@ -1639,14 +1642,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
             self._dispatch_to_scheduler(batch_req)
+            dispatched = True
             for tokenized_obj in tokenized_objs:
                 self._mark_state_dispatched(tokenized_obj.rid)
-            dispatched = True
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
         finally:
             if not dispatched:
+                for tokenized_obj in tokenized_objs:
+                    discard_shm_features(tokenized_obj)
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
 
     def _coalesce_streaming_chunks(
