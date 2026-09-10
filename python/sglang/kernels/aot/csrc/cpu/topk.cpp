@@ -159,16 +159,25 @@ inline void sigmoid(float* __restrict__ out, const scalar_t* __restrict__ input)
   const fVec one = fVec(1.f);
 
   constexpr int kVecSize = bVec::size();
-  for (int d = 0; d < SIZE; d += kVecSize) {
-    bVec x_bvec = bVec::loadu(input + d);
+  if constexpr (SIZE < kVecSize) {
+    bVec x_bvec = bVec::loadu(input, SIZE);
     fVec x_fvec0, x_fvec1;
     std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
     x_fvec0 = one / (one + x_fvec0.neg().exp_u20());
-    x_fvec1 = one / (one + x_fvec1.neg().exp_u20());
+    x_fvec0.store(out, SIZE);
+  } else {
+    for (int d = 0; d < SIZE; d += kVecSize) {
+      bVec x_bvec = bVec::loadu(input + d);
+      fVec x_fvec0, x_fvec1;
+      std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
-    x_fvec0.store(out + d);
-    x_fvec1.store(out + d + fVec::size());
+      x_fvec0 = one / (one + x_fvec0.neg().exp_u20());
+      x_fvec1 = one / (one + x_fvec1.neg().exp_u20());
+
+      x_fvec0.store(out + d);
+      x_fvec1.store(out + d + fVec::size());
+    }
   }
 }
 
@@ -177,10 +186,16 @@ inline void sigmoid(float* __restrict__ out, const float* __restrict__ input) {
   using fVec = at::vec::Vectorized<float>;
   const fVec one = fVec(1.f);
   constexpr int kVecSize = fVec::size();
-  for (int d = 0; d < SIZE; d += kVecSize) {
-    fVec in_fvec = fVec::loadu(input + d);
+  if constexpr (SIZE < kVecSize) {
+    fVec in_fvec = fVec::loadu(input, SIZE);
     in_fvec = one / (one + in_fvec.neg().exp_u20());
-    in_fvec.store(out + d);
+    in_fvec.store(out, SIZE);
+  } else {
+    for (int d = 0; d < SIZE; d += kVecSize) {
+      fVec in_fvec = fVec::loadu(input + d);
+      in_fvec = one / (one + in_fvec.neg().exp_u20());
+      in_fvec.store(out + d);
+    }
   }
 }
 
