@@ -74,10 +74,7 @@ from sglang.srt.configs import (
     XllmConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
-from sglang.srt.configs.deepseek_v41 import (
-    DEEPSEEK_V41_CONFIG_CLASSES,
-    normalize_deepseek_v4_fields,
-)
+from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
@@ -183,9 +180,6 @@ try:
         engram_head_dim = 0
         engram_pad_token_id = 2
         engram_compressed_vocab_size = 0
-
-        def __init__(self, **kwargs):
-            super().__init__(**normalize_deepseek_v4_fields(kwargs))
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
