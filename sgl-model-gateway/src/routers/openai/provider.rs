@@ -180,6 +180,19 @@ impl Provider for GeminiProvider {
     }
 }
 
+/// Evolink (`https://direct.evolink.ai/v1`) is an OpenAI-compatible
+/// aggregation platform. Requests are forwarded unchanged apart from
+/// stripping SGLang-private fields (the default `Provider` behavior), so the
+/// upstream receives a clean OpenAI payload. It exists as a first-class
+/// provider so it can be selected explicitly via `provider: evolink`.
+pub struct EvolinkProvider;
+
+impl Provider for EvolinkProvider {
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Evolink
+    }
+}
+
 pub struct ProviderRegistry {
     providers: HashMap<ProviderType, Arc<dyn Provider>>,
     default_provider: Arc<dyn Provider>,
@@ -210,6 +223,10 @@ impl ProviderRegistry {
         providers.insert(
             ProviderType::Anthropic,
             Arc::new(AnthropicProvider) as Arc<dyn Provider>,
+        );
+        providers.insert(
+            ProviderType::Evolink,
+            Arc::new(EvolinkProvider) as Arc<dyn Provider>,
         );
 
         Self {
@@ -248,5 +265,50 @@ impl ProviderRegistry {
 
     pub fn default_provider_arc(&self) -> Arc<dyn Provider> {
         Arc::clone(&self.default_provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evolink_provider_reports_evolink_type() {
+        assert_eq!(EvolinkProvider.provider_type(), ProviderType::Evolink);
+    }
+
+    #[test]
+    fn registry_resolves_evolink_provider() {
+        let registry = ProviderRegistry::new();
+        let provider = registry.get_arc(&ProviderType::Evolink);
+        assert_eq!(provider.provider_type(), ProviderType::Evolink);
+    }
+
+    #[test]
+    fn provider_type_evolink_is_first_class_not_custom() {
+        // `"evolink"` must resolve to the dedicated `Evolink` variant rather
+        // than falling through to the untagged `Custom(String)` catch-all.
+        let pt: ProviderType = serde_json::from_value(Value::String("evolink".into())).unwrap();
+        assert_eq!(pt, ProviderType::Evolink);
+        assert_eq!(pt.as_str(), "evolink");
+    }
+
+    #[test]
+    fn evolink_strips_sglang_private_fields() {
+        // Default transform must drop SGLang-only fields so the upstream
+        // OpenAI-compatible endpoint receives a clean payload.
+        let mut payload = serde_json::json!({
+            "model": "gpt-5.2",
+            "messages": [],
+            "top_k": 5,
+            "request_id": "abc",
+        });
+        EvolinkProvider
+            .transform_request(&mut payload, Endpoint::Chat)
+            .unwrap();
+        let obj = payload.as_object().unwrap();
+        assert!(obj.contains_key("model"));
+        assert!(!obj.contains_key("top_k"));
+        assert!(!obj.contains_key("request_id"));
     }
 }
