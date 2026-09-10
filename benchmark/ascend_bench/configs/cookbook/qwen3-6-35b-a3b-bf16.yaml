@@ -1,0 +1,58 @@
+# Cookbook spec 2: small-activated MoE BF16 (Ascend NPU, single A3 node).
+# Qwen3.6-35B-A3B (~67GB, BF16) — adjust model.path to your local weights
+# (e.g. ModelScope download or a shared read-only assets mount).
+# 2 x 2 server-axis values x 3 concurrency values x 3 repeats = 36 cells.
+name: qwen3-6-35b-a3b-bf16
+
+model:
+  path: /workspace/shared_assets/models/Qwen/Qwen3.6-35B-A3B
+  dtype: bfloat16
+  trust_remote_code: true
+
+server:
+  args:
+    --device: npu
+    --attention-backend: ascend
+    --tp-size: 2
+    --port: 30000
+    --mem-fraction-static: 0.85
+    --max-total-tokens: 32768
+  env:
+    # Ascend-documented tuning knobs (see docs ascend-npus parameter_tuning)
+    HCCL_BUFFSIZE: "1200"
+  axes:
+    # Ascend NPU graph capture: keep <= 10 batch sizes (507000 crash guard;
+    # also enforced by config validation)
+    --cuda-graph-bs:
+      - [1, 2, 4, 8]
+      - [1, 2, 4, 8, 16, 32]
+    --chunked-prefill-size: [4096, 8192]
+
+workload:
+  dataset_name: random
+  args:
+    --random-input-len: 1024
+    --random-output-len: 1024
+    --random-range-ratio: 1.0
+  axes:
+    --max-concurrency: [8, 32, 64]
+  num_prompts_mult: 8
+
+sla:
+  thresholds:
+    p99_ttft_ms: 3000
+    p99_tpot_ms: 100
+  cv_max: 0.15
+
+run:
+  repeats: 3
+  seed: 42
+  warmup_requests: 8
+  health_timeout_s: 2400    # MoE load takes longer
+  bench_timeout_s: 3600
+  hbm_budget_mb: 500
+  hbm_timeout_s: 240
+  gsm8k:
+    num_questions: 200
+    num_shots: 5
+    accuracy_floor: 0.30

@@ -1,0 +1,49 @@
+# Cookbook spec 1: dense BF16 (Ascend NPU, single A3 node, PD co-located).
+# Qwen3-8B has an official Ascend best-practices deployment page.
+# 2 server-axis values x 4 concurrency values x 3 repeats = 24 cells.
+name: qwen3-8b-bf16
+
+model:
+  path: Qwen/Qwen3-8B
+  dtype: bfloat16
+  trust_remote_code: true
+
+server:
+  args:
+    --device: npu
+    --attention-backend: ascend
+    --tp-size: 2            # A3: tp-size = 2 x card count (2 dies)
+    --port: 30000
+  env: {}
+  axes:
+    --mem-fraction-static: [0.80, 0.85]
+
+workload:
+  dataset_name: random      # no dataset download needed on the bench host
+  args:
+    --random-input-len: 1024
+    --random-output-len: 1024
+    --random-range-ratio: 1.0
+  axes:
+    --max-concurrency: [1, 8, 32, 64]
+  num_prompts_mult: 8       # num_prompts = 8 x concurrency
+
+sla:
+  thresholds:               # all keys are upper bounds; see methodology doc
+    p99_ttft_ms: 2000
+    p99_tpot_ms: 100
+  cv_max: 0.15              # std/mean above this -> cell marked unrankable
+
+run:
+  repeats: 3
+  seed: 42
+  warmup_requests: 8
+  health_timeout_s: 1800
+  bench_timeout_s: 3600
+  hbm_budget_mb: 500
+  hbm_timeout_s: 240
+  # python: /usr/local/python3.12.13/bin/python3   # set on hosts with several interpreters
+  gsm8k:
+    num_questions: 200
+    num_shots: 5
+    accuracy_floor: 0.30    # below this, perf data is flagged untrustworthy
