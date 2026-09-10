@@ -13,7 +13,6 @@ import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
-from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1639,7 +1638,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 # layer_communicator.prepare_attn_and_capture_last_layer_outputs
                 # hook (which qwen4-exp layers deliberately drop).
                 aux_hidden_states.append(
-                    self._prepare_aux_hidden_state(hidden_states, residual)
+                    self._prepare_aux_hidden_state(layer, hidden_states, residual)
                 )
             if i + 1 < self.end_layer:
                 next_ple = getattr(self.layers[i + 1], "ple", None)
@@ -1669,17 +1668,33 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         return hidden_states
 
     def _prepare_aux_hidden_state(
-        self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         aux_hidden_state = hidden_states
         if residual is not None:
             aux_hidden_state = aux_hidden_state + residual
-        # Between qwen4-exp layers the residual stream stays in the
-        # hyper-connection layout (hc_count * hidden_size wide); contract it
-        # back to hidden_size for the drafter, like glm5_next does for mhc.
-        if aux_hidden_state.shape[-1] == self.hc_count * self.hidden_size:
-            aux_hidden_state = hc_contract(aux_hidden_state, self.hc_count)
-        return aux_hidden_state
+        if aux_hidden_state.shape[-1] == self.hidden_size:
+            # Only the first capture edge (the embedding output feeding layer
+            # 0) is plain hidden_size wide; set_dflash_layers_to_capture
+            # shifts capture targets by +1, so this edge is unreachable in
+            # practice. Mirror _prepare_qwen4_exp_attn: tile into the
+            # hyper-connection layout before the learned mix. Mixing also
+            # avoids appending the live embedding tensor, which the parent's
+            # capture hook would have to clone (communicator.py).
+            aux_hidden_state = torch.cat(
+                [aux_hidden_state for _ in range(self.hc_count)], dim=-1
+            )
+        # Between layers the residual stream stays in the hyper-connection
+        # layout (hc_count * hidden_size) wide. Contract it back to
+        # hidden_size with the same learned gate layer i applies to its own
+        # attention input (attn_hyper_connection.mix), not a uniform
+        # hc_contract average: reviewer hardware checks showed hc_contract
+        # matches the reference hidden states at cos 0.000, while the
+        # learned mix reaches 0.23-0.89.
+        return layer.attn_hyper_connection.mix(aux_hidden_state)[0]
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
