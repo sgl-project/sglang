@@ -185,7 +185,7 @@ jobs:
             local cname=ci_sglang_${{ matrix.name }}_s${sid}
             docker rm -f "$cname" >/dev/null 2>&1 || true
             docker run -dt \
-              --cpuset-cpus="$cpus" --cpuset-mems="$mems" --memory=240g \
+              --cpuset-cpus="$cpus" --cpuset-mems="$mems" --memory=220g \
               -v ${{ github.workspace }}:/sglang-checkout/ --shm-size=32g \
               -v $HOME/.cache/huggingface:/root/.cache/huggingface \
               -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
