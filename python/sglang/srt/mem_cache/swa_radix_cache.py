@@ -501,9 +501,7 @@ class SWARadixCache(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
+            req.last_node, req.lock_receipt, skip_swa=req.swa_prefix_lock_released
         )
         req.swa_prefix_lock_released = False
 
@@ -563,13 +561,10 @@ class SWARadixCache(BasePrefixCache):
         req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
+            req.last_node, req.lock_receipt, skip_swa=req.swa_prefix_lock_released
         )
         req.swa_prefix_lock_released = False
-        result = self.inc_lock_ref(new_last_node)
-        swa_uuid_for_lock = result.swa_uuid_for_lock
+        lock_receipt = self.inc_lock_ref(new_last_node).to_dec_params()
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if len(new_indices) < len(kv_indices):
@@ -579,7 +574,7 @@ class SWARadixCache(BasePrefixCache):
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
-        req.swa_uuid_for_lock = swa_uuid_for_lock
+        req.lock_receipt = lock_receipt
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -806,13 +801,14 @@ class SWARadixCache(BasePrefixCache):
     def dec_swa_lock_only(
         self,
         node: TreeNode,
-        swa_uuid_for_lock: Optional[int] = None,
-        skip_lock_node_ids: Optional[dict] = None,  # unused, signature parity only
+        params: DecLockRefParams,
     ):
         """
         Decrement only the swa_lock_ref (and swa_protected_size_) along the chain
-        [node, swa_uuid_for_lock], inclusive. The full_lock_ref is left untouched
-        so the caller's full-cache protection is preserved.
+        [node, receipt boundary uuid], inclusive. The full_lock_ref is left
+        untouched so the caller's full-cache protection is preserved. Of the
+        receipt this cache consumes only ``swa_uuid_for_lock``; it has no
+        lower-priority components to drop.
 
         Used to early-release the SWA portion of a request's tree lock once the
         request's decode position has advanced past the sliding window, so the
@@ -826,13 +822,14 @@ class SWARadixCache(BasePrefixCache):
         as `swa_tombstone=True`. The full kv stays alive until the full-side
         lock drops; future prefix-matches stop before this tombstoned leaf.
 
-        Caller must ensure this is invoked at most once per (node, swa_uuid_for_lock)
+        Caller must ensure this is invoked at most once per (node, boundary uuid)
         pair (track via e.g. `Req.swa_prefix_lock_released`). When the request
         finally releases its full lock via `dec_lock_ref`, pass `skip_swa=True`
         to avoid touching SWA state again.
         """
         if self.disable:
             return
+        swa_uuid_for_lock = params.swa_uuid_for_lock
 
         while node != self.root_node:
             assert not node.swa_tombstone, (

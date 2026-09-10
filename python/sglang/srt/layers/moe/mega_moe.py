@@ -224,8 +224,8 @@ def _run_mega_routed(
     assert num_tokens <= num_max_tokens_per_rank, (
         f"mega MoE: num_tokens={num_tokens} exceeds cap "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-        f"{num_max_tokens_per_rank}; raise the env var or shrink "
-        f"cuda_graph_max_bs / chunked_prefill_size accordingly"
+        f"{num_max_tokens_per_rank}; raise the env var or lower "
+        f"--cuda-graph-max-bs-decode / --chunked-prefill-size accordingly"
     )
 
     buf = _get_mega_moe_symm_buffer(
