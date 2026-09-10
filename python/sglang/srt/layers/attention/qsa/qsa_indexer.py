@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
     qsa_fast_topk,
+    zero_padded_group_locs,
 )
 from sglang.srt.layers.attention.qsa.metadata import (
     build_group_ring_slots,
@@ -326,11 +327,7 @@ class QSAIndexer(MultiPlatformOp):
                 # targeting reserved compressed slot 0; real writes never target
                 # it. Clamp those padded gathers to row 0 so a short extend
                 # (one MTP token) cannot index out of bounds.
-                group_locs = torch.where(
-                    (compressed_locs != 0)[:, None],
-                    group_locs,
-                    torch.zeros_like(group_locs),
-                )
+                group_locs = zero_padded_group_locs(group_locs, compressed_locs)
             source_keys = token_k
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
