@@ -417,12 +417,12 @@ def _forward_with_allreduce_fusion_quant_per_token(
         tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token,
     )
 
-    result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
+    fused_result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
         x, residual, weight, norm_module.variance_epsilon
     )
-    if result is None or len(result) != 4:
+    if fused_result is None or len(fused_result) != 4:
         return None
-    fp8_out, residual_out, scale_out, bf16_out = result
+    fp8_out, residual_out, scale_out, bf16_out = fused_result
     bf16_out._fp8_qinput = (fp8_out, scale_out)
     return bf16_out, residual_out
 
