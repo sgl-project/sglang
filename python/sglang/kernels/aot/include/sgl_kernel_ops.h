@@ -142,6 +142,17 @@ void musa_fused_add_rms_norm(
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
+#ifndef USE_ROCM
+void fused_swiglu_quant_fp8(
+    const at::Tensor& input,
+    at::Tensor& output_q,
+    at::Tensor& output_s,
+    const at::Tensor& residual,
+    const at::Tensor& expert_offsets,
+    int64_t num_experts,
+    double swiglu_limit,
+    bool has_swiglu_limit);
+#endif
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
@@ -256,6 +267,15 @@ void sgl_per_token_group_quant_8bit_v2(
     bool fuse_silu_and_mul,
     const std::optional<torch::Tensor>& masked_m);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+#ifndef USE_ROCM
+void fused_per_token_quant_fp8(
+    const at::Tensor& input,
+    at::Tensor& output_q,
+    at::Tensor& output_s,
+    const at::Tensor& residual,
+    const at::Tensor& expert_offsets,
+    int64_t num_experts);
+#endif
 
 torch::Tensor gptq_gemm(
     torch::Tensor a,
@@ -333,6 +353,17 @@ void prepare_moe_input(
     const int64_t n,
     const int64_t k);
 
+void compact_cutlass_w4a8_moe_mm_data(
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& problem_sizes1,
+    const torch::Tensor& problem_sizes2,
+    torch::Tensor& compact_expert_offsets,
+    torch::Tensor& compact_problem_sizes1,
+    torch::Tensor& compact_problem_sizes2,
+    torch::Tensor& compact_expert_ids,
+    const int64_t num_experts,
+    const int64_t max_groups);
+
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
 
 void apply_shuffle_mul_sum(
@@ -402,6 +433,17 @@ void get_cutlass_w4a8_moe_mm_data(
     const int64_t n,
     const int64_t k);
 
+void get_cutlass_w4a8_moe_mm_data_with_permutation(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
+
 void cutlass_w4a8_moe_mm(
     torch::Tensor& d_tensors,
     torch::Tensor const& a_tensors,
@@ -416,6 +458,83 @@ void cutlass_w4a8_moe_mm(
     torch::Tensor const& s_strides,
     int64_t chunk_size,
     int64_t topk);
+
+void cutlass_mxfp4a8_moe_mm(
+    torch::Tensor& d_tensors,
+    torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides,
+    int64_t chunk_size,
+    int64_t topk,
+    std::optional<torch::Tensor> act_block_scales,
+    std::optional<torch::Tensor> as_strides,
+    int64_t act_scale_group,
+    std::optional<torch::Tensor> expert_ids);
+
+void cutlass_mxfp4a8_fused_moe_mm(
+    torch::Tensor& d_tensors,
+    torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides,
+    int64_t topk,
+    int64_t swg_config,
+    std::optional<torch::Tensor> expert_ids);
+
+void cutlass_mxfp4a8_fused_moe_core(
+    torch::Tensor& c1,
+    torch::Tensor& c2,
+    torch::Tensor const& input,
+    torch::Tensor const& topk_ids,
+    torch::Tensor& a_map,
+    torch::Tensor& c_map,
+    torch::Tensor& gateup_input_bf16,
+    torch::Tensor& gateup_input,
+    torch::Tensor& a1_scale,
+    torch::Tensor& intermediate_q,
+    torch::Tensor& a2_scale,
+    torch::Tensor const& w1,
+    torch::Tensor const& w1_scale,
+    torch::Tensor const& w1_residual,
+    torch::Tensor const& w2,
+    torch::Tensor const& w2_scale,
+    torch::Tensor const& w2_residual,
+    torch::Tensor& expert_offsets,
+    torch::Tensor const& gemm_expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor const& a_strides1,
+    torch::Tensor const& b_strides1,
+    torch::Tensor const& c_strides1,
+    torch::Tensor const& s_strides1,
+    torch::Tensor const& a_strides2,
+    torch::Tensor const& b_strides2,
+    torch::Tensor const& c_strides2,
+    torch::Tensor const& s_strides2,
+    int64_t topk,
+    int64_t gemm1_config,
+    int64_t gemm2_config,
+    int64_t num_experts,
+    int64_t intermediate_size,
+    int64_t hidden_size,
+    double swiglu_limit,
+    bool has_swiglu_limit,
+    bool prepare_inputs,
+    std::optional<torch::Tensor> expert_ids);
+
 /*
  * From csrc/speculative
  */

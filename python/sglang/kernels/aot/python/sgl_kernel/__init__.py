@@ -29,8 +29,11 @@ else:
         merge_state_v2,
     )
     from sgl_kernel.cutlass_moe import (
+        compact_cutlass_w4a8_moe_mm_data,
+        cutlass_mxfp4a8_moe_mm,
         cutlass_w4a8_moe_mm,
         get_cutlass_w4a8_moe_mm_data,
+        get_cutlass_w4a8_moe_mm_data_with_permutation,
     )
     from sgl_kernel.elementwise import (
         concat_mla_absorb_q,
@@ -156,6 +159,7 @@ else:
         "causal_conv1d_update",
         "concat_mla_absorb_q",
         "concat_mla_k",
+        "compact_cutlass_w4a8_moe_mm_data",
         "copy_to_gpu_no_ce",
         "cutlass_mla_decode",
         "cutlass_mla_get_workspace_size",
@@ -177,6 +181,7 @@ else:
         "gelu_tanh_and_mul",
         "gemma_fused_add_rmsnorm",
         "gemma_rmsnorm",
+        "get_cutlass_w4a8_moe_mm_data_with_permutation",
         "gptq_gemm",
         "gptq_shuffle",
         "int8_scaled_mm",
