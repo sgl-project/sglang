@@ -289,6 +289,12 @@ class ModelSlimConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if self._is_moe_layer_skipped(prefix):
+                logger.info_once(
+                    f"ModelSlim experts are unquantized (FLOAT) for layer {prefix}; "
+                    "using the unquantized MoE method."
+                )
+                return None
             moe_schemes = self.get_moe_scheme(layer, prefix)
             if moe_schemes is None:
                 raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
@@ -433,6 +439,33 @@ class ModelSlimConfig(QuantizationConfig):
         logger.info_once(f"Using {type(w2_scheme).__name__} for W2")
 
         return w13_scheme, w2_scheme
+
+    def _is_moe_layer_skipped(self, prefix: str) -> bool:
+        """Return whether all expert projections are explicitly unquantized."""
+        expert_name = prefix.split(".")[-1]
+        naming_conventions = [
+            ("gate_proj", "up_proj", "down_proj"),
+            ("w1", "w3", "w2"),
+        ]
+
+        for projection_names in naming_conventions:
+            projection_prefixes = [
+                f"{prefix}.0.{projection_name}"
+                for projection_name in projection_names
+            ]
+            if all(
+                projection_prefix + ".weight" in self.quant_description
+                for projection_prefix in projection_prefixes
+            ):
+                fused_mapping = {
+                    expert_name: [
+                        f"{expert_name}.0.{projection_name}"
+                        for projection_name in projection_names
+                    ]
+                }
+                return self.is_layer_skipped(prefix, fused_mapping)
+
+        return False
 
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
