@@ -4012,3 +4012,15 @@ def _fuse_deepseek_v4_wqkv_a_pair(
             )
         return q
     return torch.cat([q, kv], dim=0)
+
+
+# ---------------------------------------------------------------------------
+# DSV4_FP4_PROJ: optional fp8 -> mxfp4 swap for the attention projection GEMMs,
+# selected per forward mode. Inert unless SGLANG_DSV4_FP4_PROJ=1. Installed at
+# import time because it patches Fp8Config.get_quant_method, which has to be in
+# place before DeepseekV4ForCausalLM builds its linear layers.
+# ---------------------------------------------------------------------------
+from sglang.srt.layers.quantization import dsv4_fp4_proj as _dsv4_fp4_proj  # noqa: E402
+
+_dsv4_fp4_proj.install()
+_dsv4_fp4_proj.install_model_hook(DeepseekV4ForCausalLM)
