@@ -29,7 +29,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
-from sglang.multimodal_gen.utils import best_output_size
 
 logger = init_logger(__name__)
 
@@ -38,6 +37,31 @@ V = StageValidators
 
 
 # TODO: since this might change sampling params after logging, should be do this beforehand?
+
+
+def _best_output_size(w, h, dw, dh, expected_area):
+    # float output size
+    ratio = w / h
+    ow = (expected_area * ratio) ** 0.5
+    oh = expected_area / ow
+
+    # process width first
+    ow1 = int(ow // dw * dw)
+    oh1 = int(expected_area / ow1 // dh * dh)
+    assert ow1 % dw == 0 and oh1 % dh == 0 and ow1 * oh1 <= expected_area
+    ratio1 = ow1 / oh1
+
+    # process height first
+    oh2 = int(oh // dh * dh)
+    ow2 = int(expected_area / oh2 // dw * dw)
+    assert oh2 % dh == 0 and ow2 % dw == 0 and ow2 * oh2 <= expected_area
+    ratio2 = ow2 / oh2
+
+    # compare ratios
+    if max(ratio / ratio1, ratio1 / ratio) < max(ratio / ratio2, ratio2 / ratio):
+        return ow1, oh1
+    else:
+        return ow2, oh2
 
 
 class InputValidationStage(PipelineStage):
@@ -230,7 +254,7 @@ class InputValidationStage(PipelineStage):
             )
             dh, dw = patch_size[1] * vae_stride, patch_size[2] * vae_stride
             max_area = 704 * 1280
-            ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+            ow, oh = _best_output_size(iw, ih, dw, dh, max_area)
 
             scale = max(ow / iw, oh / ih)
             img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)

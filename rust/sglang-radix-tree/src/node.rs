@@ -283,6 +283,12 @@ impl<K: ChildKeyType> Node<K> {
         self.set_lock_ref_(slot, src_node.lock_ref_(slot));
     }
 
+    /// Copy the component's host lock refcount from `src_node`.
+    pub fn copy_host_lock_ref(&mut self, component_type: ComponentType, src_node: &Node<K>) {
+        let slot = ValueSlotIdx::host(component_type);
+        self.set_lock_ref_(slot, src_node.lock_ref_(slot));
+    }
+
     /// Split the component's device value between a new parent and the child.
     pub fn redistribute_child_device_value(
         parent_node: &mut Node<K>,
