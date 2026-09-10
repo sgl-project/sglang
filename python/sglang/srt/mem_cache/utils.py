@@ -120,13 +120,21 @@ def get_hash_str(
     return get_native_hash(token_ids, prior_digest, page_size)
 
 
-def extra_key_hash_seed(extra_key: Optional[str]) -> Optional[str]:
-    """Return the Rust-compatible storage seed; None keeps token-only keys."""
-    if extra_key is None:
+def storage_namespace_seed(
+    extra_key: Optional[str], cache_salt: Optional[str]
+) -> Optional[str]:
+    """Seed storage chains; preserve unnamespaced keys and Rust byte parity."""
+    if extra_key is None and cache_salt is None:
         return None
-    return hashlib.sha256(
-        b"sglang-extra-key-v1\0" + extra_key.encode("utf-8")
-    ).hexdigest()
+    digest = hashlib.sha256(b"sglang-cache-namespace-v1")
+    # Presence and UTF-8 byte length distinguish absent, empty and joined parts.
+    for part in (extra_key, cache_salt):
+        if part is None:
+            digest.update(b"\x00")
+            continue
+        encoded = part.encode("utf-8")
+        digest.update(b"\x01" + len(encoded).to_bytes(8, "little") + encoded)
+    return digest.hexdigest()
 
 
 def get_storage_hash_str(
@@ -134,9 +142,11 @@ def get_storage_hash_str(
     prior_hash: Optional[str] = None,
     page_size: Optional[int] = None,
 ) -> str | List[str]:
-    """Hash storage pages; seed only new chains with extra_key."""
+    """Seed new storage chains with the request namespace."""
     if prior_hash is None:
-        prior_hash = extra_key_hash_seed(getattr(key, "extra_key", None))
+        prior_hash = storage_namespace_seed(
+            getattr(key, "extra_key", None), getattr(key, "cache_salt", None)
+        )
     return get_hash_str(key, prior_hash, page_size=page_size)
 
 
@@ -164,9 +174,9 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
 
 
 def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
-    """Compute and memoize namespace-aware external KV-event hashes."""
-    cache_salt = node.key.cache_salt
-    if cache_salt is None:
+    """Hash tokens with the legacy salt seed; omit extra_key."""
+    namespace = (node.key.extra_key, node.key.cache_salt)
+    if namespace == (None, None):
         return compute_node_hash_values(node, page_size)
 
     if node.event_hash_value is not None:
@@ -174,31 +184,22 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
 
     missing_nodes = []
     current = node
-    while (
-        current is not None
-        and current.key is not None
-        and len(current.key) > 0
-        and current.event_hash_value is None
-    ):
-        if current.key.cache_salt != cache_salt:
-            raise ValueError("Radix path contains mismatched cache_salt values")
+    while current is not None and current.key is not None and len(current.key) > 0:
+        if (current.key.extra_key, current.key.cache_salt) != namespace:
+            raise ValueError("Radix path contains mismatched cache namespaces")
+        if current.event_hash_value is not None:
+            break
         missing_nodes.append(current)
         current = current.parent
 
-    if (
-        current is not None
-        and current.key is not None
-        and len(current.key) > 0
-        and current.key.cache_salt != cache_salt
-    ):
-        raise ValueError("Radix path contains mismatched cache_salt values")
-
     if current is not None and current.event_hash_value:
         parent_hash = current.event_hash_value[-1]
-    else:
+    elif node.key.cache_salt is not None:
         parent_hash = hashlib.sha256(
-            b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")
+            b"sglang-cache-salt-v1\0" + node.key.cache_salt.encode("utf-8")
         ).hexdigest()
+    else:
+        parent_hash = None
 
     for missing_node in reversed(missing_nodes):
         hash_values = get_hash_str(missing_node.key, parent_hash, page_size=page_size)

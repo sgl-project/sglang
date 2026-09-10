@@ -20,7 +20,6 @@ from sglang.srt.mem_cache.evict_policy import (
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
-    extra_key_hash_seed,
     get_eviction_strategy,
     get_hash_str,
     hash_str_to_int64,
@@ -275,41 +274,48 @@ class TestGetHashStr(unittest.TestCase):
 
 
 class TestStorageHashNamespace(unittest.TestCase):
-    def test_extra_key_seed_matches_rust(self):
-        # Must match extra_key_hash_seed in rust/sglang-radix-tree/src/node.rs.
-        self.assertEqual(
-            extra_key_hash_seed("lora-a"),
-            "15cfd7eca1d0db419fdeed65060b86f42cae66878af294d4675a36a42f7ed22d",
-        )
-
     def test_node_hashes_isolate_namespaces_and_continue_the_chain(self):
         root = SimpleNamespace(parent=None, key=_HashKey(array("q")), hash_value=None)
         tokens = array("q", range(1, 129))
 
-        def child(extra_key):
+        def child(extra_key=None, cache_salt=None):
             return SimpleNamespace(
                 parent=root,
-                key=_HashKey(tokens, extra_key=extra_key),
+                key=_HashKey(tokens, extra_key=extra_key, cache_salt=cache_salt),
                 hash_value=None,
             )
 
-        plain = compute_node_hash_values(child(None), page_size=64)
-        lora = compute_node_hash_values(child("lora-a"), page_size=64)
-        other = compute_node_hash_values(child("lora-b"), page_size=64)
+        plain = compute_node_hash_values(child(), page_size=64)
+        self.assertEqual(plain, get_hash_str(tokens, None, page_size=64))
+        # Also guard ambiguous concatenations: ("a", "bc") vs ("ab", "c").
+        namespaced = [
+            compute_node_hash_values(child(*namespace), page_size=64)
+            for namespace in [
+                ("lora-a", None),
+                ("lora-b", None),
+                (None, "tenant-a"),
+                ("lora-a", "tenant-a"),
+                ("a", "bc"),
+                ("ab", "c"),
+            ]
+        ]
         for i in range(len(plain)):
-            self.assertEqual(len({plain[i], lora[i], other[i]}), 3)
+            page_hashes = {plain[i], *(hashes[i] for hashes in namespaced)}
+            self.assertEqual(len(page_hashes), 1 + len(namespaced))
 
         # Continue the parent chain without re-seeding.
-        parent = child("lora-a")
-        parent.hash_value = lora
+        parent = child("lora-a", "tenant-a")
+        parent.hash_value = namespaced[3]
         grand = SimpleNamespace(
             parent=parent,
-            key=_HashKey(array("q", range(200, 264)), extra_key="lora-a"),
+            key=_HashKey(
+                array("q", range(200, 264)), extra_key="lora-a", cache_salt="tenant-a"
+            ),
             hash_value=None,
         )
         self.assertEqual(
             compute_node_hash_values(grand, page_size=64),
-            get_hash_str(array("q", range(200, 264)), lora[-1], page_size=64),
+            get_hash_str(array("q", range(200, 264)), namespaced[3][-1], page_size=64),
         )
 
 
@@ -378,10 +384,6 @@ class TestComputeNodeHashValues(unittest.TestCase):
         self.assertEqual(
             compute_node_event_hash_values(self._make_node(key), page_size=8),
             _legacy_page_hashes(key, page_size=8, prior_hash=seed),
-        )
-        self.assertEqual(
-            compute_node_hash_values(self._make_node(key), page_size=8),
-            _legacy_page_hashes(key, page_size=8),
         )
 
         other = _HashKey(array("q", range(1, 17)), cache_salt="tenant-b")

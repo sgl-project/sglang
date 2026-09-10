@@ -1946,22 +1946,23 @@ fn iter_yields_all_members() {
     assert_eq!(members, vec![NodeIdx_(10), NodeIdx_(30)]);
 }
 
-// Pin storage hashes shared with Python.
+// Pin Python/Rust storage hashes across a parent-child boundary.
 #[test]
 fn storage_hashes_match_python() -> Result<(), TreeCoreRuntimeError> {
+    let namespace = KeyNamespaceRef::new(Some("adapter-a"), Some("tenant-a"));
     let mut arena: NodeArena<Vec<i64>> = NodeArena::new(vec![FULL], 2);
     let root = arena.root();
-    let parent = arena.alloc_child(root, vec![1, 2], 0, Some("lora-a"))?;
+    let parent = arena.alloc_child_in_namespace(root, vec![1, 2], 0, namespace)?;
     let hashes = arena.compute_node_hash_values(parent, 2);
     assert_eq!(
         hashes,
-        vec!["90c897f275cb3d14264966133c8d9e1053265aed8aacbe6b7e8543b0df8e9040"]
+        vec!["91b8b854063250a84c6f75b3d294bc5d72047c3a15c52b09038a5831f69ecd1a"]
     );
     arena.node_mut(parent).hash_value = Some(hashes);
-    let child = arena.alloc_child(parent, vec![3, 4], 0, None)?;
+    let child = arena.alloc_child_in_namespace(parent, vec![3, 4], 0, namespace)?;
     assert_eq!(
         arena.compute_node_hash_values(child, 2),
-        vec!["4542fadd7007b94d68a46e922eddfd9dbffa4a8332e16e8fb63db8740344b347"]
+        vec!["c1ab67afa32b9fdd2ac8429d44d56f207a99c03a30b7a9bb131a32db35354c90"]
     );
     Ok(())
 }

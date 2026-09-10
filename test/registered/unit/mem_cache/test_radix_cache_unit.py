@@ -749,6 +749,32 @@ class TestRadixCache(unittest.TestCase):
         ]
         self.assertNotEqual(unsalted_hashes, stored[0].block_hashes)
 
+    def test_extra_key_does_not_move_published_block_hashes(self):
+        """Adding extra_key preserves event hashes and split-parent links."""
+        for cache_salt in (None, "tenant-a"):
+            published = []
+            for extra_key in (None, "lora-a"):
+                cache = RadixCache.create_simulated(
+                    page_size=2, enable_kv_cache_events=True
+                )
+                namespace = dict(extra_key=extra_key, cache_salt=cache_salt)
+                for tokens in ([1, 2, 3, 4, 5, 6], [1, 2, 7, 8]):
+                    cache.insert(
+                        InsertParams(
+                            key=RadixKey(array("q", tokens), **namespace),
+                            value=torch.tensor(tokens, dtype=torch.int64),
+                        )
+                    )
+                published.append(
+                    [
+                        (event.parent_block_hash, tuple(event.block_hashes))
+                        for event in cache.take_events()
+                        if isinstance(event, BlockStored)
+                    ]
+                )
+            self.assertEqual(published[0], published[1])
+            self.assertIsNotNone(published[1][-1][0])
+
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
         original = RadixKey(array("q", [1, 2, 3, 4]), cache_salt="tenant-a")

@@ -91,6 +91,7 @@ class DecodeHiCachePreallocMixin:
                     last_hash,
                     prefix_keys,
                     extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
                 )
 
         return DecodePrefixMatch(

@@ -950,15 +950,6 @@ pub(crate) fn hash_page<K: ChildKeyType>(
     hasher.finalize().into()
 }
 
-/// Storage seed; must match Python's `mem_cache.utils.extra_key_hash_seed`.
-pub fn extra_key_hash_seed(extra_key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"sglang-extra-key-v1\0");
-    hasher.update(extra_key.as_bytes());
-    let digest: HashDigest = hasher.finalize().into();
-    digest_to_hex(&digest)
-}
-
 /// Lowercase-hex encoding of a digest.
 fn digest_to_hex(digest: &HashDigest) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1146,7 +1137,7 @@ impl<K: ChildKeyType> NodeArena<K> {
             .filter_map(|(idx, slot)| slot.as_ref().map(|_| NodeIdx_(idx)))
     }
 
-    /// Chain page hashes from the parent, or seed a new chain with extra_key.
+    /// Chain page hashes from the parent, or seed a new chain with the namespace.
     pub fn compute_node_hash_values(&self, node_id: NodeIdx_, page_size: usize) -> Vec<String> {
         let node = self.node(node_id);
         let parent_hash = node.parent.and_then(|parent_id| {
@@ -1157,10 +1148,26 @@ impl<K: ChildKeyType> NodeArena<K> {
                 None
             }
         });
-        let prior: Option<String> = match parent_hash {
-            Some(hash) => Some(hash.to_owned()),
-            None => node.namespace.extra_key().map(extra_key_hash_seed),
-        };
+        let prior = parent_hash.map(str::to_owned).or_else(|| {
+            let namespace = node.namespace.as_ref();
+            if namespace == KeyNamespaceRef::default() {
+                return None;
+            }
+            // Match Python's storage_namespace_seed byte for byte.
+            let mut hasher = Sha256::new();
+            hasher.update(b"sglang-cache-namespace-v1");
+            for part in [namespace.extra_key, namespace.cache_salt] {
+                match part {
+                    None => hasher.update([0u8]),
+                    Some(part) => {
+                        hasher.update([1u8]);
+                        hasher.update((part.len() as u64).to_le_bytes());
+                        hasher.update(part.as_bytes());
+                    }
+                }
+            }
+            Some(digest_to_hex(&hasher.finalize().into()))
+        });
         crate::node::get_hash_str::<K>(node.key.as_ref(), prior.as_deref(), page_size)
     }
 

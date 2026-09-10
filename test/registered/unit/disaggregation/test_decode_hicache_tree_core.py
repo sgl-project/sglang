@@ -41,7 +41,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             rid="req-0",
             origin_input_ids=[0, 1, 2, 3, 4, 5, 6, 7],
             extra_key="model",
-            cache_salt=None,
+            cache_salt="tenant-a",
         )
         result = SimpleNamespace(
             device_indices=torch.tensor([10, 11]),
@@ -56,7 +56,12 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
 
         self.assertEqual(prefix_match.l3_storage_hit_length, 2)
         tree_cache.query_storage_hit_length.assert_called_once_with(
-            22, [4, 5, 6, 7], "h2", ["h0", "h1"], extra_key="model"
+            22,
+            [4, 5, 6, 7],
+            "h2",
+            ["h0", "h1"],
+            extra_key="model",
+            cache_salt="tenant-a",
         )
 
         DecodeHiCachePreallocMixin._start_hicache_prefetch(harness, req, prefix_match)
@@ -69,7 +74,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             "h2",
             ["h0", "h1"],
             extra_key="model",
-            cache_salt=None,
+            cache_salt="tenant-a",
         )
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):

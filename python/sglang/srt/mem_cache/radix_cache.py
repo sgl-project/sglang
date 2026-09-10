@@ -71,10 +71,9 @@ class RadixKey:
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
-        # Extra key for caller-defined cache classification.
+        # Namespaces the tree and storage; omitted from KV events.
         self.extra_key = extra_key
-        # Salt namespaces the radix tree and KV events separately from extra_key.
-        # Storage hashes use tokens and extra_key only.
+        # Namespaces the tree, storage and KV events.
         self.cache_salt = cache_salt or None
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram

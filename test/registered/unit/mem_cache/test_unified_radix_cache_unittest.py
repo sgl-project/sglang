@@ -3866,10 +3866,18 @@ class UnifiedRadixCacheSuite:
             storage_dir, seq, extra_key=extra_key, cache_salt=cache_salt
         )
 
-        # A root anchor has no namespace of its own. The fetched span must use
-        # the request namespace supplied to prefetch_from_storage.
+        # A root anchor has no namespace; probe and prefetch must use the request's.
         cons, _, _ = build_fixture(self.cfg)
         self._init_buffer_hicache(cons, storage_dir)
+        self.assertEqual(
+            cons.query_storage_hit_length(
+                cons.root_node_handle(),
+                array("q", seq),
+                extra_key=extra_key,
+                cache_salt=cache_salt,
+            ),
+            len(seq),
+        )
         root_req = "salted-root-prefetch"
         cons.prefetch_from_storage(
             root_req,

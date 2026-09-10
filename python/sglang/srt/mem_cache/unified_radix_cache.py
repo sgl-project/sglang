@@ -1740,6 +1740,7 @@ class UnifiedRadixCache(BasePrefixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
         extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> int:
         """Probe L3 with the request namespace."""
         if (
@@ -1749,7 +1750,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return 0
 
-        _, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,

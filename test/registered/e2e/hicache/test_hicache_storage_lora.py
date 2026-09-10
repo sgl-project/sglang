@@ -1,4 +1,4 @@
-"""HiCache storage must isolate LoRA and base pages across cache flushes."""
+"""Storage round trips preserve LoRA and salt isolation."""
 
 import json
 import os
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
 
 LORA_NAME = "sql"
 LORA_PATH = "philschmid/code-llama-3-1-8b-text-to-sql-lora"
@@ -79,7 +79,11 @@ class TestHiCacheStorageLoRAIsolation(CustomTestCase):
         shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     def send_request(
-        self, prompt: str, lora_path: Optional[str], max_tokens: int = 32
+        self,
+        prompt: str,
+        lora_path: Optional[str],
+        max_tokens: int = 32,
+        cache_salt: Optional[str] = None,
     ) -> Dict:
         payload = {
             "text": prompt,
@@ -91,6 +95,8 @@ class TestHiCacheStorageLoRAIsolation(CustomTestCase):
         }
         if lora_path is not None:
             payload["lora_path"] = lora_path
+        if cache_salt is not None:
+            payload["cache_salt"] = cache_salt
         response = requests.post(f"{self.base_url}/generate", json=payload, timeout=120)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
@@ -129,28 +135,21 @@ class TestHiCacheStorageLoRAIsolation(CustomTestCase):
         self.assertEqual(lora_first["text"], lora_again["text"])
         self.flush_device_cache()
 
-        # The same prompt without the adapter must not find the adapter's pages.
-        base_first = self.send_request(prompt, lora_path=None)
-        self.assertLess(
-            self.cached_tokens(base_first),
-            PAGE_SIZE,
-            "a request without the adapter hit pages written under the adapter",
-        )
-        self.flush_device_cache()
+        # Base and salted pages must miss existing namespaces, then round-trip.
+        for cache_salt in (None, "tenant-a"):
+            with self.subTest(cache_salt=cache_salt):
+                first = self.send_request(prompt, lora_path=None, cache_salt=cache_salt)
+                self.assertLess(self.cached_tokens(first), PAGE_SIZE)
+                self.flush_device_cache()
 
-        # Base pages round-trip too, and the adapter still does not see them.
-        base_again = self.send_request(prompt, lora_path=None)
-        self.assertGreater(self.cached_tokens(base_again), hit_floor)
-        self.assertEqual(base_first["text"], base_again["text"])
-        self.flush_device_cache()
+                again = self.send_request(prompt, lora_path=None, cache_salt=cache_salt)
+                self.assertGreater(self.cached_tokens(again), hit_floor)
+                self.assertEqual(first["text"], again["text"])
+                self.flush_device_cache()
 
         lora_third = self.send_request(prompt, lora_path=LORA_NAME)
         self.assertGreater(self.cached_tokens(lora_third), hit_floor)
-        self.assertEqual(
-            lora_first["text"],
-            lora_third["text"],
-            "adapter output changed once base pages for the same prompt existed",
-        )
+        self.assertEqual(lora_first["text"], lora_third["text"])
 
 
 if __name__ == "__main__":
