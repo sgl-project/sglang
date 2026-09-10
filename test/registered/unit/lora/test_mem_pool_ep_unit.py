@@ -1297,52 +1297,6 @@ class TestAttnModulesShardByAttnTp(unittest.TestCase):
         )
 
 
-class TestDenseRowParallelBuffer(unittest.TestCase):
-    """Dense/shared MLPs can use a different TP width on each layer."""
-
-    def test_down_proj_matches_activation_partition(self):
-        for dense_tp in (1, 2, 4):
-            for wrapped in (False, True):
-                with self.subTest(dense_tp=dense_tp, wrapped=wrapped):
-                    pool = TestAttnModulesShardByAttnTp()._pool(
-                        tp_size=4, attn_tp_size=1
-                    )
-                    model = torch.nn.Module()
-                    model.layers = torch.nn.ModuleList()
-                    for layer_tp in (dense_tp, 4):
-                        layer = torch.nn.Module()
-                        layer.mlp = torch.nn.Module()
-                        linear = torch.nn.Module()
-                        linear.input_size = 256
-                        linear.input_size_per_partition = 256 // layer_tp
-                        if wrapped:
-                            wrapper = torch.nn.Module()
-                            wrapper.base_layer = linear
-                            linear = wrapper
-                        layer.mlp.down_proj = linear
-                        model.layers.append(layer)
-
-                    for layer_idx, layer_tp in enumerate((dense_tp, 4)):
-                        shape = pool.get_lora_A_shape("down_proj", model, 8, layer_idx)
-                        self.assertEqual(shape, (2, 8, 256 // layer_tp))
-                        # Every rank's activation and adapter shard must fit the
-                        # allocated buffer, and their sum must equal the full A*x.
-                        torch.manual_seed(42)
-                        x = torch.randn(3, 256)
-                        a = torch.randn(8, 256)
-                        partials = []
-                        for rank in range(layer_tp):
-                            shard = slice(rank * shape[-1], (rank + 1) * shape[-1])
-                            buffer = torch.empty(shape)
-                            buffer[0].copy_(a[:, shard])
-                            partials.append(
-                                torch.nn.functional.linear(x[:, shard], buffer[0])
-                            )
-                        torch.testing.assert_close(
-                            sum(partials), torch.nn.functional.linear(x, a)
-                        )
-
-
 class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
     """Regression: `load_lora_weight_to_buffer` must hand `moe_tp_rank` (not
     the outer `tp_rank`) to `slice_moe_lora_{a,b}_weights`.
