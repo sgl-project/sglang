@@ -67,6 +67,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
         req_to_token_pool=None,
+        kv_weight_version_tracker=None,
         decode_offload_manager=None,
         metrics_collector=None,
         metrics_reporter=metrics_reporter,
