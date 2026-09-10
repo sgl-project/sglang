@@ -29,7 +29,7 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
-from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +173,15 @@ REASONING_MODE_RULES = (
         value=ReasoningToggleConfig(special_case="mistral"),
         predicate=lambda ctx: (
             ctx.has_text("reasoning_effort") and ctx.has_text("[THINK]")
+        ),
+    ),
+    DetectionRule(
+        name="hunyuan_reasoning_effort",
+        value=ReasoningToggleConfig(special_case="hunyuan_effort"),
+        predicate=lambda ctx: (
+            ctx.has_text("reasoning_effort")
+            and ctx.has_text("reasoning_mode_token")
+            and ctx.has_text("no_think")
         ),
     ),
     DetectionRule(
@@ -364,8 +373,16 @@ def _is_hunyuan(ctx):
     sep = ctx.has_text("<tool_sep>") or ctx.has_vocab_pattern(
         r"^<tool_sep(?::[^>]+)?>$"
     )
-    return (tc and sep) or (
-        ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking")
+    return (
+        (tc and sep)
+        or (
+            tc
+            and ctx.reasoning_config
+            == ReasoningToggleConfig(special_case="hunyuan_effort")
+            and ctx.has_vocab_pattern(r"^<arg_key(?::[^>]+)?>$")
+            and ctx.has_vocab_pattern(r"^<arg_value(?::[^>]+)?>$")
+        )
+        or (ctx.has_text("reasoning_effort") and ctx.has_text("interleaved_thinking"))
     )
 
 
@@ -812,4 +829,4 @@ def resolve_auto_parsers(server_args) -> None:
                 detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
 
     if detected:
-        declare_late_resolution(server_args, "template-detection", **detected)
+        declare_resolution(server_args, "template-detection", **detected)
