@@ -522,6 +522,21 @@ crate-type = ["cdylib"]
                     msg=version,
                 )
 
+            # cc-rs only honours the shell quoting on a spaced header path
+            # when it parses *FLAGS as shell words.
+            fake_torch.__version__ = "2.14.0+cu130"
+            spaced_header = root / "compat dir" / "compat.h"
+            spaced_header.parent.mkdir()
+            spaced_header.write_text("// compatibility\n", encoding="utf-8")
+            spaced_build = torch_build_configuration(
+                compat_header=spaced_header,
+                python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+                torch_module=fake_torch,
+                base_environment={},
+            )
+            self.assertEqual(spaced_build.environment["CC_SHELL_ESCAPED_FLAGS"], "1")
+            self.assertIn(f"'{spaced_header}'", spaced_build.environment["CXXFLAGS"])
+
             fake_torch.__version__ = "2.15.0"
             with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.14"):
                 torch_build_configuration(

@@ -94,6 +94,10 @@ def torch_build_configuration(
     # CXX_STANDARD 20 from Torch 2.12 on, and 2.14 headers reject C++17
     # outright. cc-rs pushes all of CXXFLAGS after a build script's own flags,
     # so this overrides it. Only 2.11 still ships a C++17 libtorch.
+    # cc-rs splits *FLAGS on plain whitespace unless told to parse them as
+    # shell words, which is what makes the quoting below hold a header path
+    # containing a space together.
+    environment["CC_SHELL_ESCAPED_FLAGS"] = "1"
     cxxflags = [environment.get("CXXFLAGS", "")]
     if major_minor >= (2, 12):
         cxxflags.append("-std=c++20")

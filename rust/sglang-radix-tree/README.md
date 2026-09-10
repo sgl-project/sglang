@@ -14,7 +14,7 @@ SGLang wheels bundle the production extension. A source checkout falls back to
 the shared fingerprinted Rust-extension cache; it never writes a shared object
 into the Python package. LibTorch and the Python headers come from the running
 interpreter's PyTorch install. PyTorch 2.11 through 2.14 are accepted explicitly,
-and `torch_2_13_compat.h` covers two alignment APIs removed in PyTorch 2.13 plus
+and `torch_compat.h` covers two alignment APIs removed in PyTorch 2.13 plus
 the `cholesky` and `qr` aliases removed in 2.14. Torch 2.12 and later declare
 C++20, so the builds below pass `-std=c++20` over torch-sys's own `-std=c++17`.
 
@@ -25,13 +25,13 @@ C++20, so the builds below pass `-std=c++20` over torch-sys's own `-std=c++17`.
 cd rust/sglang-radix-tree
 LIBTORCH_USE_PYTORCH=1 \
   LIBTORCH_BYPASS_VERSION_CHECK=1 \
-  CXXFLAGS="-std=c++20 -include $PWD/torch_2_13_compat.h" \
+  CXXFLAGS="-std=c++20 -include $PWD/torch_compat.h" \
   cargo build --release --locked --features python-extension
 
 # Native tests do not enable pyo3's extension-module feature:
 TORCH_ROOT=$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')
 LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 \
-  CXXFLAGS="-std=c++20 -include $PWD/torch_2_13_compat.h" \
+  CXXFLAGS="-std=c++20 -include $PWD/torch_compat.h" \
   LD_LIBRARY_PATH="$TORCH_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   cargo test --locked
 ```
