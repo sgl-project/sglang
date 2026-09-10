@@ -129,3 +129,62 @@ def test_compact_gather_unchanged():
     torch.testing.assert_close(packed_k[300:350], k_pool[req_to_token[1, :50].long()])
     # compact layout leaves the region past the packed rows untouched (still NaN)
     assert torch.isnan(packed_k[350:]).all()
+
+
+def test_strided_gather_addresses_pool_beyond_int32_elements():
+    """Slots past 2^31 / (heads * dim) must be addressed with 64-bit offsets.
+
+    An FP8 KV pool on one GB300 holds ~7.6M tokens for Qwen3.8-Flash-Next (2 kv heads x 256),
+    so slot indices above 4,194,304 occur in production; int32 element offsets wrap there.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_properties(0).total_memory < 8 * 1024**3:
+        pytest.skip("needs ~4.5 GB of device memory")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    heads, dim = 2, 256
+    threshold = (1 << 31) // (heads * dim)  # 4,194,304
+    pool_rows = threshold + 4096
+    k_pool = torch.zeros(
+        pool_rows, heads, dim, device=device, dtype=torch.float8_e4m3fn
+    )
+    v_pool = torch.zeros(
+        pool_rows, heads, dim, device=device, dtype=torch.float8_e4m3fn
+    )
+    hi = torch.arange(threshold + 64, threshold + 64 + 300, device=device)
+    k_pool[hi] = torch.randn(300, heads, dim, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    v_pool[hi] = torch.randn(300, heads, dim, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    batch, topk, page = 1, 2051, 64
+    stride = ((topk + page - 1) // page) * page
+    seq_lens = torch.tensor([300], device=device, dtype=torch.int32)
+    req_to_token = torch.zeros(batch, 512, device=device, dtype=torch.int32)
+    req_to_token[0, :300] = hi.to(torch.int32)
+    indices = torch.full((batch, topk), -1, device=device, dtype=torch.int32)
+    indices[0, :300] = torch.arange(300, device=device, dtype=torch.int32)
+    cu_strided = torch.arange(batch + 1, device=device, dtype=torch.int32) * stride
+    packed_k = torch.full(
+        (batch * stride, heads, dim), float("nan"), device=device, dtype=torch.bfloat16
+    )
+    packed_v = packed_k.clone()
+    qwen_sparse_kv_extraction_compact_triton(
+        k_pool,
+        v_pool,
+        req_to_token,
+        torch.zeros(1, device=device, dtype=torch.int32),
+        indices,
+        seq_lens,
+        cu_strided,
+        packed_k,
+        packed_v,
+        batch,
+        topk,
+        zero_fill_cols=stride,
+    )
+    torch.testing.assert_close(packed_k[:300], k_pool[hi].to(torch.bfloat16))
+    torch.testing.assert_close(packed_v[:300], v_pool[hi].to(torch.bfloat16))
+    assert (packed_k[300:] == 0).all() and (packed_v[300:] == 0).all()

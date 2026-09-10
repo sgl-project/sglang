@@ -402,8 +402,15 @@ def _compact_kv(
         mask=valid,
         other=0,
     )
-    src = slots[:, None] * heads * dim + head * dim + dims[None, :]
-    dst = (pack_start + cols)[:, None] * heads * dim + head * dim + dims[None, :]
+    # 64-bit element offsets: slot * heads * dim exceeds int32 once the pool holds
+    # more than 2^31 / (heads * dim) tokens (~4.2M for 2 x 256), which an FP8 pool
+    # on one GPU does reach.
+    src = slots.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
+    dst = (
+        (pack_start + cols).to(tl.int64)[:, None] * heads * dim
+        + head * dim
+        + dims[None, :]
+    )
     load_mask = valid[:, None] & (dims[None, :] < dim)
     if ZERO_FILL:
         # Strided (page-aligned) packing: the paged decode kernel reads whole pages,
