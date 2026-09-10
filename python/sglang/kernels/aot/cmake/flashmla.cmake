@@ -1,9 +1,9 @@
 # flash_mla
-# sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
+# DeepSeek v4.1 kernels merged into the SGLang fork (sgl-project/FlashMLA@3e18517).
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/c1dee569a494b184811a08171a690ece21420262.tar.gz
-    URL_HASH SHA256=77d3f1714b5903dc8f7a99fbc3a5d9a2b886e449f994b6c4b1d2feeacb467b1e
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3e18517fb055a6c9608eef5a1f1347fb1a047bbd.tar.gz
+    URL_HASH SHA256=ab2af4657683a1bbaa707a2781a5e2c2792eba574ff36905f1832598e67fea79
 )
 FetchContent_Populate(repo-flashmla)
 
@@ -42,23 +42,8 @@ if(${CUDA_VERSION} VERSION_GREATER 12.8)
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
 if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
-    # Patch FlashMLA sources for SM103a support.
-    # These patches are only needed (and only valid) with CUDA 13+.
-
-    # Patch utils.h: widen IS_SM100 to cover the full SM100 family.
-    # Newer FlashMLA versions use csrc/utils.h.
-    set(FLASHMLA_UTILS_FILE "${repo-flashmla_SOURCE_DIR}/csrc/utils.h")
-    file(READ "${FLASHMLA_UTILS_FILE}" FLASHMLA_UTILS_CONTENT)
-    string(REPLACE
-        "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
-#define IS_SM100 1"
-        "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
-#define IS_SM100 1"
-        FLASHMLA_UTILS_CONTENT "${FLASHMLA_UTILS_CONTENT}")
-    file(WRITE "${FLASHMLA_UTILS_FILE}" "${FLASHMLA_UTILS_CONTENT}")
-    message(STATUS "Patched utils.h for SM103a support")
-
     # Patch cutlass/arch/config.h: add SM103 architecture defines.
+    # This patch is only needed (and only valid) with CUDA 13+.
     # The new block is inserted right before the existing "// SM101 and SM101a"
     # anchor in the upstream header.
     set(CUTLASS_CONFIG_FILE "${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include/cutlass/arch/config.h")
@@ -99,26 +84,33 @@ set(FlashMLA_SOURCES
     # Compatibility shim for sgl-kernel torch.ops API.
     ${repo-flashmla_SOURCE_DIR}/csrc/python_api.cpp
 
+    # Attention entry points (the pybind registrations in these files are
+    # compiled out by FLASH_MLA_LIBTORCH_ONLY).
+    ${repo-flashmla_SOURCE_DIR}/csrc/api/dense_decode.cpp
+    ${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_decode.cpp
+    ${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_prefill.cpp
+
     # Decode metadata/combine kernels.
-    ${repo-flashmla_SOURCE_DIR}/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/smxx/decode/combine/combine.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/smxx/decode/combine/combine.cu
 
     # sm90 dense decode.
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/dense/instantiations/fp16.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/dense/instantiations/bf16.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/dense/instantiations/fp16.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/dense/instantiations/bf16.cu
 
     # sm90 sparse decode.
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h128.cu
 
     # sm90 sparse prefill.
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu
 
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
@@ -128,20 +120,33 @@ set(FlashMLA_SOURCES
 if(FLASHMLA_ENABLE_SM100)
     list(APPEND FlashMLA_SOURCES
         # sm100 dense prefill/bwd.
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
 
         # sm100 sparse prefill.
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k576.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu
 
         # sm100 sparse decode.
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32.cu
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/model1.cu
-        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64_no_split.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64_no_split.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64_no_split.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64_no_split.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_splitkv.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu
     )
 endif()
 
@@ -167,7 +172,6 @@ endif()
 target_include_directories(flashmla_ops PRIVATE
     ${repo-flashmla_SOURCE_DIR}/csrc
     ${repo-flashmla_SOURCE_DIR}/csrc/kerutils/include
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/tools/util/include
@@ -178,4 +182,6 @@ target_link_libraries(flashmla_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 
 install(TARGETS flashmla_ops LIBRARY DESTINATION "sgl_kernel")
 
-target_compile_definitions(flashmla_ops PRIVATE)
+# FlashMLA's csrc/api/*.cpp register their ops through pybind by default; sgl-kernel
+# links them as plain libtorch C++ and registers the ops itself in flashmla_extension.cc.
+target_compile_definitions(flashmla_ops PRIVATE FLASH_MLA_LIBTORCH_ONLY)
