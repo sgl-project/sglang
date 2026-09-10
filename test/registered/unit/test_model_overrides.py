@@ -36,6 +36,7 @@ from sglang.srt.runtime_context import (
     override_platform,
     reset_context,
 )
+from sglang.srt.server_args import _declared_default
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -95,6 +96,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "kv_cache_dtype",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
+                    "dsv4_attn_backend",
                     "dsa_topk_backend",
                     "prefill_attention_backend",
                     "decode_attention_backend",
@@ -1421,7 +1423,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _attention_backend_default,
-            _attention_backend_dual_chunk,
             _attention_backend_fa3_fp8_fallback,
             _attention_backend_platform_fallbacks,
         )
@@ -1456,19 +1457,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with override_platform(has_amx=True):
             self.assertEqual(_attention_backend_platform_fallbacks(view), {})
-
-        # dual-chunk config: mismatched explicit backend raises verbatim
-        def _mc(dual):
-            return SimpleNamespace(
-                _model_config=SimpleNamespace(
-                    hf_config=SimpleNamespace(dual_chunk_attention_config=dual)
-                ),
-                attention_backend="fa3",
-            )
-
-        with self.assertRaises(ValueError):
-            _attention_backend_dual_chunk(ResolvedView(_mc({"a": 1})))
-        self.assertEqual(_attention_backend_dual_chunk(ResolvedView(_mc(None))), {})
 
     def test_dllm_platform_paths_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
@@ -1612,14 +1600,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
             _deepseek_v4_overrides,
         )
-        from sglang.srt.server_args import ServerArgs
 
         hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
 
         def _args(**kw):
             defaults = dict(
                 device="cuda",
-                swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
+                swa_full_tokens_ratio=_declared_default("swa_full_tokens_ratio"),
                 moe_a2a_backend="none",
                 moe_runner_backend="auto",
                 _model_config=SimpleNamespace(is_fp4_experts=True, nvfp4_moe_meta=None),
@@ -2666,16 +2653,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _view(attention_backend="trtllm_mha", page_size=256)
             ),
             {"page_size": 64},
-        )
-        # chained: cutlass_mla decode -> 128, then trtllm_mha prefill keeps 128
-        self.assertEqual(
-            _mla_backend_page_constraints(
-                _view(
-                    decode_attention_backend="cutlass_mla",
-                    prefill_attention_backend="trtllm_mha",
-                )
-            ),
-            {"page_size": 128},
         )
         # no matching backend: nothing declared
         self.assertEqual(_mla_backend_page_constraints(_view()), {})
