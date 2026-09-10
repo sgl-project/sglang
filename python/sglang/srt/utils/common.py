@@ -4262,7 +4262,11 @@ def get_physical_cpus_by_numa():
     for node, core_to_cpu in physical_by_node.items():
         cpus = sorted(core_to_cpu.values())
         allowed_cpus = set(cpus).intersection(cpus_allowed_list)
-        node_to_cpus[node] = allowed_cpus
+        # A cpuset-restricted process (e.g. one socket-pinned CI container) sees
+        # NUMA nodes it has no allowed CPUs on; skip them so per-node memory math
+        # divides by the count of usable nodes, not all physical nodes.
+        if allowed_cpus:
+            node_to_cpus[node] = allowed_cpus
 
     return node_to_cpus
 
