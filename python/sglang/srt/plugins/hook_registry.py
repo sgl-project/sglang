@@ -79,6 +79,7 @@ class HookRegistry:
         list
     )
     _patched: set[str] = set()
+    _applied_hooks: dict[str, tuple[tuple[HookType, Callable], ...]] = {}
 
     @classmethod
     def register(
@@ -143,6 +144,20 @@ class HookRegistry:
         )
 
     @classmethod
+    def is_hook_applied(
+        cls, target: str, callback: Callable, hook_type: HookType = HookType.AFTER
+    ) -> bool:
+        """Whether the registry successfully applied this callback and hook type.
+
+        This reports installation, not whether a call reaches the callback:
+        an outer hook or later patch can still bypass it.
+        """
+        return target in cls._patched and any(
+            applied_type == hook_type and applied_callback is callback
+            for applied_type, applied_callback in cls._applied_hooks.get(target, ())
+        )
+
+    @classmethod
     def apply_hooks(cls):
         """
         Apply all registered hooks to their target functions/classes.
@@ -162,6 +177,9 @@ class HookRegistry:
             try:
                 cls._apply_target(target, hooks)
                 cls._patched.add(target)
+                cls._applied_hooks[target] = tuple(
+                    (hook_type, callback) for hook_type, callback, _source in hooks
+                )
             except Exception:
                 logger.exception("Failed to apply hooks to %s", target)
 
@@ -315,6 +333,7 @@ class HookRegistry:
         """Reset all hooks and patches. Primarily for testing."""
         cls._hooks.clear()
         cls._patched.clear()
+        cls._applied_hooks.clear()
 
 
 def _propagate_patch(original: object, wrapped: object, source_module: object) -> int:
