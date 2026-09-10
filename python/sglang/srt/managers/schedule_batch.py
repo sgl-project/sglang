@@ -1895,6 +1895,7 @@ class Req(ReqDllmMixin):
                     write_pos=write_pos,
                     cache_base=pool.replayssm_cache_base,
                     is_flush=pool.replayssm_is_flush,
+                    # The cursor includes accepted tokens; tracking is disabled.
                     accept_lens=torch.zeros_like(replay_indices, dtype=torch.int32),
                     null_block_id=-1,
                 )
