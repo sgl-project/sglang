@@ -20,8 +20,22 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 #  expected_reasoning, expected_content)
 # All cases produce identical results in both streaming and non-streaming.
 PARITY_CASES = [
-    ("leading_nl", "<think>reasoning</think>\nHello", True, False, "reasoning", "Hello"),
-    ("multi_nl", "<think>reasoning</think>\n\n\nHello", True, False, "reasoning", "Hello"),
+    (
+        "leading_nl",
+        "<think>reasoning</think>\nHello",
+        True,
+        False,
+        "reasoning",
+        "Hello",
+    ),
+    (
+        "multi_nl",
+        "<think>reasoning</think>\n\n\nHello",
+        True,
+        False,
+        "reasoning",
+        "Hello",
+    ),
     ("simple_no_nl", "<think>r</think>c", True, False, "r", "c"),
     ("reasoning_only", "<think>reasoning</think>", True, False, "reasoning", ""),
     ("ws_only_content", "<think>reasoning</think>\n\n", True, False, "reasoning", ""),

@@ -315,9 +315,11 @@ def _is_k2_v3(ctx):
 
 
 def _is_granite_thinking_parser(ctx):
+    # Nemotron-3 templates share the same <parameter= tool-call block, so it
+    # cannot discriminate; defer_loading is Granite's deferred tool loading.
     return (
         ctx.has_text("truncate_history_thinking")
-        and ctx.has_text("<parameter=")
+        and ctx.has_text("defer_loading")
         and ctx.reasoning_config is not None
         and ctx.reasoning_config.toggle_param == "enable_thinking"
         and ctx.reasoning_config.default_enabled is True

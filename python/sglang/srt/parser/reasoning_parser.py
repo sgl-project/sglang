@@ -1076,23 +1076,32 @@ class GraniteThinkingDetector(BaseReasoningFormatDetector):
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         ret = self._detect_and_parse_impl(text)
         think_end_present = self.think_end_token in text
+        # HF plugin swaps when the parsed content is absent: that covers text
+        # ending exactly at </think>, but not newline-only content, which the
+        # plugin strips itself and keeps as empty content.
+        content_absent = think_end_present and not ret.normal_text
         if think_end_present and ret.normal_text:
             ret.normal_text = ret.normal_text.lstrip("\n")
-        # Match HF plugin: only swap reasoning→content when </think> was NOT
-        # found (content truly absent). When </think> IS present but content
-        # is empty after lstrip, do not swap.
         if (
             self._force_nonempty_content
             and not ret.normal_text
-            and not think_end_present
+            and (content_absent or not think_end_present)
         ):
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        if self._in_reasoning:
-            self._reasoning_seen = True
+        was_in_reasoning = self._in_reasoning
         ret = super().parse_streaming_increment(new_text)
+        # Sampling only the pre-call state misses a whole think block arriving
+        # in one chunk; post-call evidence keeps stripping chunk-independent.
+        if (
+            was_in_reasoning
+            or self._in_reasoning
+            or self.stripped_think_start
+            or ret.reasoning_text
+        ):
+            self._reasoning_seen = True
         if self._reasoning_seen and not self._content_started and ret.normal_text:
             ret.normal_text = ret.normal_text.lstrip("\n")
             if ret.normal_text:
