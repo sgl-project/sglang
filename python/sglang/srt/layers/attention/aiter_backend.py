@@ -11,7 +11,6 @@ end to end attention solution with aiter kernels
 """
 
 import logging
-import math
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -163,9 +162,6 @@ class ForwardMetadata:
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
-
-
-_LOG2E = math.log2(math.e)
 
 
 _DCP_VERIFY_TABLE_COLS_PER_BLOCK = 128
@@ -1126,7 +1122,7 @@ class AiterAttnBackend(AttentionBackend):
         return (self.max_context_len + w - 1) // w
 
     def _forward_decode_dcp(self, q, k_buffer, layer, k_descale):
-        """Attend this rank's KV shard for decode -> (out, base-2 lse)."""
+        """Attend this rank's KV shard for decode -> (out, natural-log lse)."""
         fm = self.forward_metadata
         bs = fm.kv_indptr.shape[0] - 1
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
@@ -1142,13 +1138,13 @@ class AiterAttnBackend(AttentionBackend):
             min_kv_seq_len=1,
             return_lse=True,
         )
-        # mla_gluon returns a natural-log lse; the cross-rank merge
-        # (cp_lse_ag_out_rs_mla) takes base-2.
-        return out, lse.view(bs, num_heads) * _LOG2E
+        # Natural-log lse throughout: is_mla_dcp_lse_base_on_e() reports
+        # base-e for aiter, so the cross-rank merge picks the exp/log pair.
+        return out, lse.view(bs, num_heads)
 
     def _forward_verify_dcp(self, q, k_window, layer, k_descale):
         """Attend the committed prefix and the verify window separately, then
-        merge -> (out, base-2 lse).
+        merge -> (out, natural-log lse).
 
         Splitting at the window boundary avoids the one thing the decode kernel
         cannot do under DCP: mask on the GLOBAL position g(j) = j * W + r.
@@ -1180,7 +1176,7 @@ class AiterAttnBackend(AttentionBackend):
         # identical on every rank, so only one rank attends it; the others
         # return their prefix partial for the cross-rank merge.
         if get_parallel().attn_dcp_rank != 0:
-            return out_a, lse_a * _LOG2E
+            return out_a, lse_a
 
         # The window latent is request-major and contiguous, so it IS the pool:
         # row i of request b lives at b * q_len + i. mla_gluon's MTP mask at
@@ -1196,8 +1192,7 @@ class AiterAttnBackend(AttentionBackend):
             qlen=q_len,
             return_lse=True,
         )
-        out, lse = merge_state(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
-        return out, lse * _LOG2E
+        return merge_state(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
 
     def mla_fp8_prefill_attn(
         self,
@@ -3596,7 +3591,7 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_mla:
             if self.forward_metadata.planned_dcp_size > 1:
-                # Returns (out, base-2 lse) in its own shape for the cross-rank
+                # Returns (out, natural-log lse) in its own shape for the cross-rank
                 # merge, so it bypasses the reshape below.
                 k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 return self._forward_decode_dcp(q, k_buffer, layer, k_descale)
