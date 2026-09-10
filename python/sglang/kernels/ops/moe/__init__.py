@@ -70,6 +70,32 @@ register_kernel(
         description="MoE top-k softmax (sglang.kernels.jit).",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="moe.moe_sum",
+        backend=KernelBackend.AOT,
+        target="sgl_kernel:moe_sum",
+        capabilities=_HIP,
+        format_signature=FormatSignature(
+            in_place=True,
+            description="sum of top-k expert outputs per token",
+        ),
+        description="MoE top-k expert-output sum (sgl_kernel ROCm wheel).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.moe_sum",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.moe_sum:moe_sum",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True,
+            description="sum of top-k expert outputs per token",
+        ),
+        description="MoE top-k expert-output sum (sglang.kernels.jit).",
+    )
+)
 
 
 def moe_align_block_size(
@@ -128,7 +154,16 @@ def topk_softmax(
     )
 
 
-__all__ = ["moe_align_block_size", "topk_softmax"]
+def moe_sum(input: torch.Tensor, output: torch.Tensor) -> None:
+    """Sum the top-k expert outputs of every token.
+
+    ``output[num_tokens, hidden] = input[num_tokens, topk, hidden].sum(dim=1)``,
+    written in place into the preallocated ``output``.
+    """
+    return get_kernel("moe.moe_sum")(input, output)
+
+
+__all__ = ["moe_align_block_size", "moe_sum", "topk_softmax"]
 
 
 # Fused MoE-LoRA Triton kernels migrated into this group (from lora/triton_ops);
