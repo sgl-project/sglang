@@ -114,6 +114,8 @@ Overriding them is the most common cause of a disappointing measurement: it leav
 
 Enable the reasoning parser — `--reasoning-parser auto` resolves to `deepseek-v41` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer. The parser puts the thinking block in `reasoning_content` and the answer in `content`; without it both arrive concatenated in `content`.
 
+The parser can only split a thinking block the model actually produced, and **thinking is off by default** (`SGLANG_DEFAULT_THINKING=false`). Sending `reasoning_effort` turns it on: any value other than `none` also switches `chat_template_kwargs.thinking` on for you. A request that carries neither comes back with an empty `reasoning_content` however the parser is configured.
+
 <Accordion title="Reasoning Example (Python)">
 
 ```python Example
@@ -123,6 +125,7 @@ client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 resp = client.chat.completions.create(
     model="deepseek-ai/DeepSeek-V4.1-Flash",
     messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    reasoning_effort="high",
 )
 msg = resp.choices[0].message
 print("Reasoning:", getattr(msg, "reasoning_content", None))
@@ -131,7 +134,7 @@ print("Answer:", msg.content)
 
 </Accordion>
 
-Reasoning effort is part of the request contract for this model: send `reasoning_effort` on the request, either as a tier or as an integer budget. Tiers with no V4.1 counterpart (`none`, `minimal`, `medium`) log a warning and fall back to the server-side default rather than erroring; that default is `high`, and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
+On the request, `reasoning_effort` accepts the tiers `low`, `high`, `xhigh` and `max`, or a float in `[0.0, 0.99]` that maps onto the model's 1–100 budget. An integer budget is reachable only through `chat_template_kwargs.reasoning_effort`, and that route does not switch thinking on by itself — pair it with `chat_template_kwargs.thinking`. `none` turns thinking off. The remaining OpenAI tiers, which have no V4.1 counterpart (`minimal`, `medium`), log a warning and fall back to the server-side default rather than erroring; that default is `high`, and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
 
 ### 3.2 Tool Calling
 
@@ -160,6 +163,7 @@ resp = client.chat.completions.create(
     model="deepseek-ai/DeepSeek-V4.1-Flash",
     messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
     tools=tools,
+    reasoning_effort="high",
 )
 choice = resp.choices[0]
 print("finish_reason:", choice.finish_reason)
