@@ -420,10 +420,19 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        if (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and (
+                self._budget_planner is None
+                or self._budget_planner.forced_budget_frac is None
+            )
+        ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips.
+            # the per-step schedule and its host<->device round-trips. A profiler
+            # budget pin must still reach the dynamic layout path even when the
+            # bootstrap SPS table is uninitialized.
             key = (int(req_pool_indices.shape[0]), global_num_reqs)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
