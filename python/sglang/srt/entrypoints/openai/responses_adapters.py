@@ -19,10 +19,6 @@ import json
 import zlib
 from typing import Any, Dict, Optional, Set, Tuple
 
-# ---------------------------------------------------------------------------
-# custom tools
-# ---------------------------------------------------------------------------
-
 CUSTOM_TOOL_INPUT_KEY = "input"
 
 _SIMPLE_ESCAPES = {
@@ -38,7 +34,6 @@ _SIMPLE_ESCAPES = {
 
 
 def custom_tool_parameters() -> Dict[str, Any]:
-    """JSON schema of the single-string wrapper shown to the model."""
     return {
         "type": "object",
         "properties": {
@@ -78,7 +73,6 @@ def custom_tool_names(tools: Any) -> Set[str]:
 
 
 def encode_custom_tool_input(payload: str) -> str:
-    """Wrap a payload back into shim arguments, for replayed history."""
     return json.dumps({CUSTOM_TOOL_INPUT_KEY: payload}, ensure_ascii=False)
 
 
@@ -116,7 +110,6 @@ def _payload_start(buffer: str) -> Optional[int]:
 
 
 def _unicode_escape(buffer: str, i: int) -> Optional[Tuple[str, int]]:
-    """Decode ``\\uXXXX``, plus its low surrogate, at ``buffer[i]``."""
     if i + 6 > len(buffer):
         return None
     try:
@@ -174,10 +167,6 @@ def decode_custom_tool_input_prefix(buffer: str) -> str:
     return "".join(out)
 
 
-# ---------------------------------------------------------------------------
-# developer messages
-# ---------------------------------------------------------------------------
-
 DEVELOPER_BLOCK_LABEL = "Developer instructions:"
 
 
@@ -201,10 +190,6 @@ def label_developer_content(content: Any) -> Any:
     return content
 
 
-# ---------------------------------------------------------------------------
-# reasoning.encrypted_content
-# ---------------------------------------------------------------------------
-
 _REASONING_STATE_PREFIX = "sglang-reasoning-v1."
 
 
@@ -221,7 +206,6 @@ def encode_reasoning_state(text: str) -> str:
 
 
 def decode_reasoning_state(blob: Any) -> Optional[str]:
-    """Inverse of :func:`encode_reasoning_state`; None when the blob is foreign."""
     if not isinstance(blob, str) or not blob.startswith(_REASONING_STATE_PREFIX):
         return None
     try:

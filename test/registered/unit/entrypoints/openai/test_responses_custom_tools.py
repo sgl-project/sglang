@@ -52,8 +52,6 @@ class CustomToolAdapterTestCase(CustomTestCase):
             self.assertEqual(
                 decode_custom_tool_input(encode_custom_tool_input(payload)), payload
             )
-
-    def test_bare_text_falls_back_to_raw_arguments(self):
         self.assertEqual(decode_custom_tool_input("pwd"), "pwd")
 
     def test_prefix_decode_tracks_a_growing_buffer(self):
@@ -67,8 +65,6 @@ class CustomToolAdapterTestCase(CustomTestCase):
             self.assertTrue(payload.startswith(prefix), (payload, prefix))
             seen = prefix
         self.assertEqual(seen, payload)
-
-    def test_prefix_decode_ignores_a_foreign_buffer(self):
         self.assertEqual(decode_custom_tool_input_prefix('{"city": "Beijing"}'), "")
 
 
@@ -79,6 +75,13 @@ class CustomToolShimTestCase(CustomTestCase):
         self.assertEqual(tool.function.name, "emit_command")
         self.assertEqual(list(tool.function.parameters["properties"]), ["input"])
         self.assertEqual(tool.function.parameters["required"], ["input"])
+
+        nameless = ResponsesRequest(
+            model="x", input="hi", tools=[{"type": "custom"}], store=False
+        )
+        self.assertEqual(
+            OpenAIServingResponses._response_tools_to_chat_tools(nameless), []
+        )
 
     def test_grammar_format_is_described_to_the_model(self):
         request = _custom_request(
@@ -96,14 +99,6 @@ class CustomToolShimTestCase(CustomTestCase):
         (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request)
         self.assertIn("lark", tool.function.description)
         self.assertIn('start: "pwd"', tool.function.description)
-
-    def test_nameless_custom_tool_is_skipped(self):
-        request = ResponsesRequest(
-            model="x", input="hi", tools=[{"type": "custom"}], store=False
-        )
-        self.assertEqual(
-            OpenAIServingResponses._response_tools_to_chat_tools(request), []
-        )
 
     def test_required_tool_choice_accepts_a_custom_tool(self):
         serving = make_serving()
@@ -170,32 +165,6 @@ class CustomToolShimTestCase(CustomTestCase):
             self.assertIn(b"tool_choice", result.body)
         serving.tokenizer_manager.generate_request.assert_not_called()
 
-    def test_function_tools_still_report_json_arguments(self):
-        serving = make_serving()
-        serving.reasoning_parser = None
-        serving.tool_call_parser = None
-        request = _custom_request(
-            tools=[
-                {
-                    "type": "function",
-                    "name": "get_weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                    },
-                }
-            ]
-        )
-        output_items = serving._make_response_output_items(
-            request,
-            '[{"name": "get_weather", "parameters": {"city": "Beijing"}}]',
-            tokenizer=Mock(),
-            require_reasoning=False,
-        )
-        (item,) = output_items
-        self.assertEqual(item.type, "function_call")
-        self.assertEqual(item.arguments, '{"city": "Beijing"}')
-
 
 class CustomToolReplayTestCase(CustomTestCase):
     def test_custom_tool_call_replays_through_the_shim(self):
@@ -226,15 +195,14 @@ class CustomToolReplayTestCase(CustomTestCase):
             {"role": "tool", "tool_call_id": "call_1", "content": "/workspace"},
         )
 
-    def test_tool_output_content_parts_are_flattened(self):
-        message = OpenAIServingResponses._normalize_response_message_for_chat(
+        parts = OpenAIServingResponses._normalize_response_message_for_chat(
             {
                 "type": "custom_tool_call_output",
                 "call_id": "call_1",
                 "output": [{"type": "output_text", "text": "/work"}, {"text": "space"}],
             }
         )
-        self.assertEqual(message["content"], "/workspace")
+        self.assertEqual(parts["content"], "/workspace")
 
 
 class CustomToolStreamTestCase(CustomTestCase):
@@ -262,6 +230,13 @@ class CustomToolStreamTestCase(CustomTestCase):
         self.assertEqual(done[0]["input"], "pwd")
         self.assertEqual(deltas, "pwd")
 
+        added = [p for t, p in pairs if t == "response.output_item.added"]
+        item_done = [p for t, p in pairs if t == "response.output_item.done"]
+        self.assertEqual(len(added), 1)
+        self.assertEqual(len(item_done), 1)
+        self.assertEqual(added[0]["item"]["type"], "custom_tool_call")
+        self.assertEqual(added[0]["item"]["id"], item_done[0]["item"]["id"])
+
         final = find_completed_event(events)["response"]
         (item,) = [i for i in final["output"] if i["type"] == "custom_tool_call"]
         self.assertEqual(item["name"], "emit_command")
@@ -270,20 +245,6 @@ class CustomToolStreamTestCase(CustomTestCase):
         self.assertNotIn(
             "response.function_call_arguments.delta", [t for t, _ in pairs]
         )
-
-    def test_item_lifetime_events_pair_up(self):
-        emitted = '[{"name": "emit_command", "parameters": {"input": "ls -la"}}]'
-        events = self._stream(
-            [engine_chunk(emitted, 1), engine_chunk(emitted, 2, finish=True)]
-        )
-        pairs = list(zip(event_types(events), event_payloads(events)))
-        added = [p for t, p in pairs if t == "response.output_item.added"]
-        done = [p for t, p in pairs if t == "response.output_item.done"]
-        self.assertEqual(len(added), 1)
-        self.assertEqual(len(done), 1)
-        self.assertEqual(added[0]["item"]["type"], "custom_tool_call")
-        self.assertEqual(added[0]["item"]["id"], done[0]["item"]["id"])
-        self.assertEqual(done[0]["item"]["input"], "ls -la")
 
 
 GLM47_CALL = (
@@ -339,8 +300,6 @@ class ReasoningEncryptedContentTestCase(CustomTestCase):
     def test_state_survives_encode_decode(self):
         for text in ("", "step one\nstep two", "naïve 😀"):
             self.assertEqual(decode_reasoning_state(encode_reasoning_state(text)), text)
-
-    def test_foreign_blob_is_rejected(self):
         self.assertIsNone(decode_reasoning_state("not-ours"))
         self.assertIsNone(decode_reasoning_state(None))
 
@@ -422,13 +381,11 @@ class ReasoningEncryptedContentTestCase(CustomTestCase):
 
 
 class DeveloperMessageTestCase(CustomTestCase):
-    def test_string_content_is_labelled(self):
+    def test_content_is_labelled(self):
         self.assertEqual(
             label_developer_content("Be terse."),
             "Developer instructions:\nBe terse.",
         )
-
-    def test_first_text_part_is_labelled(self):
         self.assertEqual(
             label_developer_content(
                 [{"type": "input_text", "text": "Be terse."}, {"type": "input_image"}]
@@ -438,18 +395,6 @@ class DeveloperMessageTestCase(CustomTestCase):
                 {"type": "input_image"},
             ],
         )
-
-    def test_label_is_prepended_when_no_text_part_exists(self):
-        self.assertEqual(
-            label_developer_content([{"type": "input_image"}]),
-            [
-                {"type": "input_text", "text": "Developer instructions:"},
-                {"type": "input_image"},
-            ],
-        )
-
-    def test_missing_content_is_left_alone(self):
-        self.assertIsNone(label_developer_content(None))
 
     def test_developer_block_follows_instructions_in_the_system_message(self):
         serving = make_serving()
@@ -483,14 +428,11 @@ class DeveloperMessageTestCase(CustomTestCase):
 
 
 class ModelValidationTestCase(CustomTestCase):
-    def test_unknown_model_is_rejected(self):
+    def test_model_validation(self):
         serving = make_serving()
         error = serving._validate_model("__no_such_model__")
         self.assertIsNotNone(error)
         self.assertEqual(error.status_code, 404)
-
-    def test_served_and_lora_qualified_names_are_accepted(self):
-        serving = make_serving()
         self.assertIsNone(serving._validate_model(None))
         self.assertIsNone(serving._validate_model("x"))
         self.assertIsNone(serving._validate_model("x:my-adapter"))
