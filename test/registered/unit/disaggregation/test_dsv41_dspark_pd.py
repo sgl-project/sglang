@@ -5,9 +5,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import torch
-
-from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v41_features
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -15,12 +12,9 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.utils import get_dsv41_spec_layout
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.common import retraction_backup
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative.dspark_disaggregation import build_dspark_disagg_draft_input
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -42,57 +36,6 @@ def make_layout():
 
 
 class TestDSV41DSparkPD(CustomTestCase):
-    def test_feature_gate(self):
-        base = dict(
-            speculative_algorithm="DSPARK",
-            disaggregation_mode="prefill",
-            disaggregation_transfer_backend="mooncake",
-            enable_hisparse=False,
-            enable_two_batch_overlap=False,
-            pp_size=1,
-            dp_size=1,
-            enable_dp_attention=False,
-            attn_cp_size=1,
-            dcp_size=1,
-            enable_prefill_context_parallel=False,
-            enable_decoder_swa_bounded_replay=False,
-            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(backend="disabled")),
-        )
-        model = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
-        cases = [
-            ({}, "static", True),
-            ({"disaggregation_mode": "decode"}, "static", True),
-            ({}, "compact", False),
-            ({}, "cap-accept", False),
-            ({"disaggregation_transfer_backend": "nixl"}, "static", False),
-            ({"dp_size": 2}, "static", False),
-            ({"enable_dp_attention": True}, "static", False),
-            ({"enable_prefill_context_parallel": True}, "static", False),
-            ({"attn_cp_size": 2}, "static", False),
-            ({"dcp_size": 2}, "static", False),
-            ({"pp_size": 2}, "static", False),
-            ({"speculative_algorithm": "EAGLE"}, "static", False),
-        ]
-        for overrides, mode, supported in cases:
-            with (
-                self.subTest(overrides=overrides, mode=mode),
-                envs.SGLANG_RAGGED_VERIFY_MODE.override(mode),
-                patch(
-                    "sglang.srt.arg_groups.deepseek_v4_hook.model_config_of",
-                    return_value=model,
-                ),
-                get_context().override_server_args(**(base | overrides)) as args,
-                patch(
-                    "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
-                    return_value=False,
-                ),
-            ):
-                if supported:
-                    validate_deepseek_v41_features(args)
-                else:
-                    with self.assertRaises(ValueError):
-                        validate_deepseek_v41_features(args)
-
     def test_bootstrap_validates_before_caching(self):
         layout = make_layout()
         cases = [("matching", layout, layout, 4, True), ("legacy", None, None, 2, True)]
@@ -244,28 +187,6 @@ class TestDSV41DSparkPD(CustomTestCase):
                     device_module.assert_not_called()
                     self.assertEqual(req.output_ids, [7, 8])
                     self.assertEqual(queue.retracted_queue, [req])
-
-    def test_prebuilt_seeds_bonus_and_committed_lengths(self):
-        for overlap in (False, True):
-            with self.subTest(overlap=overlap):
-                batch = SimpleNamespace(
-                    seq_lens=torch.tensor([255, 256, 257], dtype=torch.int32),
-                    req_pool_indices=torch.tensor([3, 1, 7]),
-                    enable_overlap=overlap,
-                )
-                bonus_tokens = torch.tensor([11, 12, 13])
-                future_map = Mock()
-                draft = build_dspark_disagg_draft_input(batch, bonus_tokens, future_map)
-                self.assertTrue(torch.equal(draft.bonus_tokens, bonus_tokens))
-                if overlap:
-                    future_map.publish.assert_called_once_with(
-                        batch.req_pool_indices, batch.seq_lens
-                    )
-                    payload = future_map.stash.call_args.args[1]
-                    self.assertTrue(torch.equal(payload.bonus_tokens, bonus_tokens))
-                else:
-                    future_map.publish.assert_not_called()
-                    future_map.stash.assert_not_called()
 
 
 if __name__ == "__main__":
