@@ -2316,6 +2316,7 @@ jobs:
     needs:
       # 1-GPU Unit Tests (MI30x + MI35x)
       - nightly-test-1-gpu-unit
+      - nightly-test-1-gpu-kernel
       - nightly-test-1-gpu-mi35x
       # 2-GPU and 4-GPU Tests (MI30x + MI35x)
       - nightly-accuracy-2-gpu

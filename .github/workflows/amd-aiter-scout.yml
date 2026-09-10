@@ -83,25 +83,37 @@ jobs:
           echo "- **Filter:** \`${FILTER}\`" >> $GITHUB_STEP_SUMMARY
 
   call-nightly-amd:
+    name: Nightly AMD (${{ matrix.rocm_version }})
     if: needs.resolve-aiter.outputs.run_nightly_amd == 'true'
     needs: resolve-aiter
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        rocm_version: [rocm10, rocm724]
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
     with:
       ref: amd/aiter-ci
-      rocm_version: rocm10
+      rocm_version: ${{ matrix.rocm_version }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd:
+    name: PR Test AMD (${{ matrix.rocm_version }})
     if: needs.resolve-aiter.outputs.run_pr_test_amd == 'true'
     needs: resolve-aiter
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        rocm_version: [rocm10, rocm724]
     uses: ./.github/workflows/pr-test-amd.yml
     secrets: inherit
     with:
       ref: amd/aiter-ci
-      rocm_version: rocm10
+      rocm_version: ${{ matrix.rocm_version }}
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -124,8 +136,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Workflow | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Nightly AMD ROCm 10 | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| PR Test AMD ROCm 10 Gate | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nightly AMD ROCm10 + ROCm7.2.4 | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm10 + ROCm7.2.4 Gate | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
 
       - name: Check if any job failed
         run: |
