@@ -90,6 +90,11 @@ def expand_cells(cfg: BenchConfig) -> list[Cell]:
                 "num_prompts": num_prompts,
             }
             cell_hash = _canonical_hash(payload)
+            raw_tp = server_args.get("--tp-size")
+            try:
+                tp_size = int(raw_tp) if raw_tp is not None else None
+            except (TypeError, ValueError):
+                tp_size = None
             for ri in range(cfg.run.repeats):
                 cells.append(
                     Cell(
@@ -102,7 +107,7 @@ def expand_cells(cfg: BenchConfig) -> list[Cell]:
                         dataset_name=cfg.workload.dataset_name,
                         concurrency=concurrency,
                         num_prompts=num_prompts,
-                        tp_size=server_args.get("--tp-size"),
+                        tp_size=tp_size,
                         repeat=ri,
                         meta={"server_combo": si, "workload_combo": wi},
                     )

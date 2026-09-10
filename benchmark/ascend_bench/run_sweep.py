@@ -22,7 +22,7 @@ from asc_bench.config import ConfigError, load_config
 from asc_bench.expand import expand_cells
 from asc_bench.npu import hbm_used_mb
 from asc_bench.provenance import capture
-from asc_bench.report import render_report
+from asc_bench.report import load_provenance_header, render_report
 from asc_bench.runner import Manifest, Runner
 from asc_bench.sla import aggregate_by_hash, evaluate
 
@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg.sla,
             accuracy_floor=cfg.run.gsm8k.accuracy_floor if cfg.run.gsm8k else None,
         )
-        provenance = _provenance_from_header(manifest_path)
+        provenance = load_provenance_header(manifest_path)
         render_report(
             run_dir, cfg.name, run_id, rows, records, provenance, cfg.sla.thresholds
         )
@@ -132,22 +132,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"report: {run_dir / 'report.md'}")
     runner.manifest.close()
     return exit_code
-
-
-def _provenance_from_header(manifest_path: Path) -> dict:
-    if not manifest_path.exists():
-        return {}
-    import json
-
-    with open(manifest_path, encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if record.get("type") == "run_header":
-                return record.get("provenance", {})
-    return {}
 
 
 if __name__ == "__main__":

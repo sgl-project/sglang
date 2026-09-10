@@ -37,7 +37,7 @@ def _server_argv_text(row: Row) -> str:
     return " ".join(argv_from_args(cell.server_args))
 
 
-def _bench_argv_text(row: Row, cfg_name: str) -> str:
+def _bench_argv_text(row: Row) -> str:
     cell = row.cell
     if cell is None:
         return ""
@@ -173,8 +173,8 @@ def render_report(
         lines.append("python -m sglang.launch_server --model-path <model> \\")
         lines.append(f"  {_server_argv_text(top)}")
         lines.append("")
-        lines.append(f"# benchmark ({_bench_argv_text(top, config_name)})")
-        lines.append(_bench_argv_text(top, config_name))
+        lines.append(f"# benchmark ({_bench_argv_text(top)})")
+        lines.append(_bench_argv_text(top))
         lines.append("```")
         lines.append("")
 
