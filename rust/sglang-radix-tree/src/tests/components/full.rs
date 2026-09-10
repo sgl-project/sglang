@@ -325,7 +325,7 @@ fn host_drive_evicts_leaves_lowest_priority_first_until_the_budget() {
     let (a, b, c) = host_walk_setup(&mut tc);
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
-        tc.drive_host_eviction(FULL, /* num_tokens = */ 2, false),
+        tc.drive_host_eviction(FULL, /* num_tokens = */ 2),
         &mut tr,
         &mut df,
         &mut hf,
@@ -373,7 +373,7 @@ fn host_drive_stops_when_a_leaf_overshoots_the_budget() {
     tc.evictable_host_leaves.add(small);
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
-        tc.drive_host_eviction(FULL, /* num_tokens = */ 2, false),
+        tc.drive_host_eviction(FULL, /* num_tokens = */ 2),
         &mut tr,
         &mut df,
         &mut hf,
@@ -407,7 +407,7 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
 
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
-        tc.drive_host_eviction(FULL, /* num_tokens = */ 2, false),
+        tc.drive_host_eviction(FULL, /* num_tokens = */ 2),
         &mut tr,
         &mut df,
         &mut hf,
@@ -434,7 +434,7 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
 
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
-        tc.drive_host_eviction(FULL, /* num_tokens = */ 2, false),
+        tc.drive_host_eviction(FULL, /* num_tokens = */ 2),
         &mut tr,
         &mut df,
         &mut hf,
@@ -449,7 +449,7 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
     tc.finish_write_through(vec![handle], handle)
         .expect("live test node");
     accumulate_step(
-        tc.drive_host_eviction(FULL, /* num_tokens = */ 2, false),
+        tc.drive_host_eviction(FULL, /* num_tokens = */ 2),
         &mut tr,
         &mut df,
         &mut hf,
@@ -479,7 +479,7 @@ fn host_drive_is_a_noop_without_host_leaves() {
     });
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
-        tc.drive_host_eviction(FULL, /* num_tokens = */ 5, false),
+        tc.drive_host_eviction(FULL, /* num_tokens = */ 5),
         &mut tr,
         &mut df,
         &mut hf,
@@ -532,7 +532,7 @@ fn host_drive_readmits_the_freed_leafs_parent() {
     // p only becomes an H-leaf once both children are gone; the readmission
     // after c2 lets one drive drain the whole chain.
     accumulate_step(
-        tc.drive_host_eviction(FULL, /* num_tokens = */ 100, false),
+        tc.drive_host_eviction(FULL, /* num_tokens = */ 100),
         &mut tr,
         &mut df,
         &mut hf,
@@ -578,7 +578,7 @@ fn host_drive_skips_a_stale_heap_entry_for_an_already_freed_leaf() {
     tc.evictable_host_leaves.add(c);
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
-        tc.drive_host_eviction(FULL, /* num_tokens = */ 100, false),
+        tc.drive_host_eviction(FULL, /* num_tokens = */ 100),
         &mut tr,
         &mut df,
         &mut hf,
