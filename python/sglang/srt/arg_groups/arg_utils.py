@@ -39,7 +39,6 @@ annotation is equivalent to ``Arg(help=that_string)``.
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import functools
 import types
@@ -54,26 +53,14 @@ from typing import (
     get_type_hints,
 )
 
+import msgspec
+import msgspec.structs
+
 A = Annotated
 
 
-class _NoFallback:
-    """Sentinel for ``Arg.fallback``: this field declares none.
-
-    ``None`` cannot serve, because ``None`` is what a field *holds* when the
-    operator did not type it -- the state a fallback answers for.
-    """
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return "<no fallback>"
-
-
-NO_FALLBACK = _NoFallback()
-
-
-@dataclasses.dataclass(frozen=True)
-class Arg:
-    """CLI argument metadata attached to a dataclass field via ``Annotated``."""
+class Arg(msgspec.Struct, frozen=True):
+    """CLI argument metadata attached to a field via ``Annotated``."""
 
     help: str = ""
     choices: list | None = None
@@ -96,15 +83,16 @@ class Arg:
     # What the field means when nobody said anything -- the bottom of the read
     # chain: override, decision, input, then this. Not the dataclass default,
     # which stays `None` because that is how the record spells "not typed".
+    # `None` here means the field declares no fallback, which is the same
+    # answer the read chain gives without one.
     #
     # Only a value fixed for the life of the configuration belongs here. One
     # that depends on the machine, on another field, or on anything impure is a
     # decision, and decisions stay in a hook where their order is visible.
-    fallback: Any = NO_FALLBACK
+    fallback: Any = None
 
 
-@dataclasses.dataclass(frozen=True)
-class Derived:
+class Derived(msgspec.Struct, frozen=True):
     """Metadata for a field the configuration implies, not one anyone types.
 
     The other half of a namespace. An ``Arg`` field is the operator's input and
@@ -131,8 +119,7 @@ class Derived:
     fn: str = ""
 
 
-@dataclasses.dataclass(frozen=True)
-class NS:
+class NS(msgspec.Struct, frozen=True):
     """Namespace-path marker for a ServerArgs field, attached alongside the
     field's metadata in ``Annotated``:
 
@@ -164,7 +151,7 @@ def namespace_of(cls) -> dict:
     the per-field ``NS`` marker. A field with neither is absent from the map
     (the coverage lint flags them). Non-dataclass types yield an empty map.
     """
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return {}
     # An assembled record: the collector recorded who declared each field,
     # because there are no base classes left to ask.
@@ -177,10 +164,10 @@ def namespace_of(cls) -> dict:
             continue
         for name in getattr(base, "__annotations__", {}):
             out.setdefault(name, path)
-    if len(out) == len(dataclasses.fields(cls)):
+    if len(out) == len(record_fields(cls)):
         return out
     hints = get_type_hints(cls, include_extras=True)
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         if field.name in out:
             continue
         tp = hints.get(field.name, field.type)
@@ -195,9 +182,9 @@ def namespace_of(cls) -> dict:
 @functools.cache
 def field_names(cls) -> frozenset:
     """Names of ``cls`` dataclass fields — what a declaration may name."""
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return frozenset()
-    return frozenset(field.name for field in dataclasses.fields(cls))
+    return frozenset(field.name for field in record_fields(cls))
 
 
 @functools.cache
@@ -207,11 +194,11 @@ def resolvable_fields(cls) -> frozenset:
 
     Non-dataclass types (e.g. mock config objects in tests) have no Arg
     metadata and yield an empty whitelist."""
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return frozenset()
     hints = get_type_hints(cls, include_extras=True)
     names = set()
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
         if arg is not None and arg.resolvable:
             names.add(field.name)
@@ -226,13 +213,26 @@ def fallbacks_of(cls) -> dict:
     beside the help text of the field it belongs to rather than in whatever
     hook used to fill it in.
     """
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return {}
     hints = get_type_hints(cls, include_extras=True)
     out = {}
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
-        if arg is not None and arg.fallback is not NO_FALLBACK:
+        if arg is not None and arg.fallback is not None:
+            # Two things `with_fallback` relies on and cannot check itself,
+            # asserted where a new declaration passes through. This function is
+            # cached, so a mutable fallback would hand one shared object to
+            # every reader; and a field whose dataclass default is not `None`
+            # can never reach the fallback, which makes the declaration dead.
+            assert not isinstance(arg.fallback, (list, dict, set)), (
+                f"{cls.__name__}.{field.name}: a mutable fallback would be "
+                "shared by every reader -- use a scalar"
+            )
+            assert field.default is None, (
+                f"{cls.__name__}.{field.name}: declares a fallback but defaults "
+                f"to {field.default!r}, so the fallback is unreachable"
+            )
             out[field.name] = arg.fallback
     return out
 
@@ -246,17 +246,32 @@ def with_fallback(cls, name: str, value: Any) -> Any:
     on `if cfg.swa_full_tokens_ratio is None`, and a fallback answering there
     would make that branch dead. `test_declared_fallbacks.py` pins both halves.
 
-    A container fallback is copied, for the reason a dataclass spells this
-    `default_factory`.
+    A mutable fallback would need copying per read, for the reason a dataclass
+    spells this `default_factory`. Every declared one is a scalar.
     """
     if value is not None:
         return value
-    fallback = fallbacks_of(cls).get(name, NO_FALLBACK)
-    if fallback is NO_FALLBACK:
-        return value
-    if isinstance(fallback, (list, dict, set)):
-        return copy.deepcopy(fallback)
-    return fallback
+    return fallbacks_of(cls).get(name, value)
+
+
+def record_fields(cls):
+    """The declared fields of a record, Struct or dataclass.
+
+    `ServerArgs` and the namespace classes are `msgspec.Struct`; the config-bag
+    tests build ad-hoc dataclasses spanning namespaces, and the helpers here are
+    driven with both. Anything else yields nothing.
+    """
+    if isinstance(cls, type) and issubclass(cls, msgspec.Struct):
+        return msgspec.structs.fields(cls)
+    if dataclasses.is_dataclass(cls):
+        return dataclasses.fields(cls)
+    return ()
+
+
+def is_record(cls) -> bool:
+    """Whether ``cls`` declares fields the way a record does."""
+    target = cls if isinstance(cls, type) else type(cls)
+    return issubclass(target, msgspec.Struct) or dataclasses.is_dataclass(cls)
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +334,16 @@ def _infer_type_func(tp):
 
 
 def _field_default(field):
-    """Return the default value for a dataclass field, or _MISSING."""
-    if field.default is not _MISSING:
+    """Return the default value for a field, or `_MISSING`.
+
+    The two record shapes spell "no default" differently -- a Struct field says
+    `msgspec.NODEFAULT`, a dataclass field `dataclasses.MISSING` -- so both are
+    normalized here and every caller below tests against `_MISSING` alone.
+    """
+    absent = (_MISSING, msgspec.NODEFAULT)
+    if field.default not in absent:
         return field.default
-    if field.default_factory is not _MISSING:
+    if field.default_factory not in absent:
         return field.default_factory()
     return _MISSING
 
@@ -352,7 +373,7 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: list[str] | None = None)
     """
     hints = get_type_hints(cls, include_extras=True)
 
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         if fields is not None and field.name not in fields:
             continue
 

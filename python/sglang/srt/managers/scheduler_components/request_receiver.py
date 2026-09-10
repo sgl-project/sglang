@@ -79,9 +79,6 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
-    # Emits AbortReqs for SGLANG_REQ_WAITING_TIMEOUT / _RUNNING_TIMEOUT;
-    # runs on the rank that owns the waiting queue.
-    poll_timeout_aborts: Callable[[], List[AbortReq]]
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -90,9 +87,13 @@ class SchedulerRequestReceiver:
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
-        self,
+        self, local_reqs: Optional[List[AbortReq]] = None
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks.
+
+        local_reqs are aborts the caller decided on this rank; they ride the
+        same broadcast as the pulled requests.
+        """
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
@@ -105,16 +106,6 @@ class SchedulerRequestReceiver:
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
-
-        # Decided once and broadcast, so every rank sharing this waiting queue
-        # drops the same requests in the same iteration.
-        local_reqs = []
-        if (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        ):
-            local_reqs = self.poll_timeout_aborts()
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
