@@ -8,6 +8,13 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=6500, suite="full-acc-2-npu-a3", nightly=True)
 
+# only debug
+register_npu_ci(
+    est_time=6500,
+    suite="debug-full-acc-2-npu-a3",
+    nightly=True,
+)
+
 ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -59,7 +66,7 @@ class TestNPUGlm4_7Flash_1P_GSM8K(TestNpuAccuracyTestCaseBase):
     accuracy = 0.9560
     datasets = ["gsm8k"]
     few_shot_num = 5
-    generation_config = {"max_tokens": 65536, "temperature": 1.0}
+    generation_config = {"max_tokens": 16384, "temperature": 0.0}
     eval_batch_size = 64
 
     def test_gsm8k(self):

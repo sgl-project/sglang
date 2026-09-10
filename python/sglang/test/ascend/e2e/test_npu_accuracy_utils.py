@@ -527,6 +527,9 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     accuracy = 0.1
+    # If set (e.g. 0.8), fail the test immediately when the first-round
+    # accuracy falls below threshold * first_run_fail_ratio, without retrying.
+    first_run_fail_ratio = None
 
     @classmethod
     def setUpClass(cls):
@@ -602,6 +605,18 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
                 ):
                     best_metrics = metrics
                 threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if (
+                    attempt == 0
+                    and self.first_run_fail_ratio is not None
+                    and float(best_metrics.get("accuracy", 0))
+                    < threshold * self.first_run_fail_ratio
+                ):
+                    raise AssertionError(
+                        f"First-run accuracy {best_metrics.get('accuracy')} is below "
+                        f"{threshold * self.first_run_fail_ratio:.4f} "
+                        f"({self.first_run_fail_ratio} of threshold {threshold:.4f}), "
+                        "skip retrying and mark the test as failed."
+                    )
                 if float(best_metrics.get("accuracy", 0)) >= threshold:
                     break
                 if attempt < max_retries - 1:
