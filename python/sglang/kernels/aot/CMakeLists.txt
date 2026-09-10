@@ -44,6 +44,12 @@ endif()
 
 # Torch
 find_package(Torch REQUIRED)
+# torch >= 2.14 headers require C++20.
+if (Torch_VERSION VERSION_GREATER_EQUAL "2.14" AND SGL_KERNEL_CXX_STANDARD LESS 20)
+    message(STATUS "Torch ${Torch_VERSION} requires C++20; raising SGL_KERNEL_CXX_STANDARD from ${SGL_KERNEL_CXX_STANDARD}")
+    set(SGL_KERNEL_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
+endif()
 clear_cuda_arches(CMAKE_FLAG)
 
 # Third Party repos

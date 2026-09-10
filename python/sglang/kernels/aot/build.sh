@@ -41,6 +41,12 @@ fi
 
 PY_TAG="cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}"
 
+# CUDA 13.4 has no stable torch; pass the nightly pinned in docker/Dockerfile.
+if [ "${CUDA_VERSION}" = "13.4" ] && [ -z "${TORCH_NIGHTLY_VERSION:-}" ]; then
+  echo "CUDA 13.4 requires TORCH_NIGHTLY_VERSION (see docker/Dockerfile)" >&2
+  exit 1
+fi
+
 # Output directory for wheels
 DIST_DIR="dist"
 mkdir -p "${DIST_DIR}"
@@ -64,6 +70,7 @@ echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
 echo "PYTORCH_INDEX_BASE: ${PYTORCH_INDEX_BASE:-https://download.pytorch.org/whl}"
 echo "PIP_DEFAULT_INDEX:  ${PIP_DEFAULT_INDEX:-https://pypi.python.org/simple}"
 echo "YUM_MIRROR:         ${YUM_MIRROR:-(upstream)}"
+echo "TORCH_NIGHTLY_VERSION: ${TORCH_NIGHTLY_VERSION:-(n/a, CUDA 13.4 only)}"
 echo "----------------------------------------"
 
 # Optional build-args (empty string disables)
@@ -77,6 +84,7 @@ BUILD_ARGS=()
 [ -n "${PYTORCH_INDEX_BASE:-}" ]   && BUILD_ARGS+=(--build-arg PYTORCH_INDEX_BASE="${PYTORCH_INDEX_BASE}")
 [ -n "${PIP_DEFAULT_INDEX:-}" ]    && BUILD_ARGS+=(--build-arg PIP_DEFAULT_INDEX="${PIP_DEFAULT_INDEX}")
 [ -n "${YUM_MIRROR:-}" ]           && BUILD_ARGS+=(--build-arg YUM_MIRROR="${YUM_MIRROR}")
+[ -n "${TORCH_NIGHTLY_VERSION:-}" ] && BUILD_ARGS+=(--build-arg TORCH_NIGHTLY_VERSION="${TORCH_NIGHTLY_VERSION}")
 
 # ---- Step 1: Build deps image (layer cached, fast on repeat) ----
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"

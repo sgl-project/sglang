@@ -16,6 +16,7 @@ on:
           - "all"
           - "cu129"
           - "cu130"
+          - "cu134"
       packaging-ref:
         description: "DeepEP ref containing the shared sgl_deep_ep overlay"
         type: string
@@ -167,14 +168,104 @@ jobs:
           path: DeepEP-source/dist-pypi/*.whl
           if-no-files-found: error
 
+  # cu134 overrides TORCH_VERSION with the nightly pinned in docker/Dockerfile.
+  # Index-only like cu129; cp312 only.
+  build-cu134-matrix:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (inputs.target == 'all' || inputs.target == 'cu134')
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+            source-branch: sgl-deepep
+          - arch: aarch64
+            runner: arm-kernel-build-node
+            source-branch: sgl-deepep
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clean workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+
+      - name: Checkout DeepEP implementation
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ matrix.source-branch }}
+          path: DeepEP-source
+          submodules: recursive
+
+      - name: Checkout DeepEP packaging overlay
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ inputs['packaging-ref'] || 'sgl-deepep-packaging' }}
+          path: DeepEP-packaging
+          sparse-checkout: sgl_deep_ep
+
+      - name: Set wheel version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          printf '%s' "${RELEASE_VERSION}" > DeepEP-packaging/sgl_deep_ep/VERSION
+
+      # Workaround until sgl-deepep-packaging's build_sgl_deep_ep.sh learns CUDA 13.4.
+      - name: Patch DeepEP packaging for CUDA 13.4
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("DeepEP-packaging/sgl_deep_ep/build_sgl_deep_ep.sh")
+          s = p.read_text()
+          if "13.4|13.4.*" not in s:
+              old = '    *)\n        echo "Unsupported CUDA version: ${CUDA_VERSION}; expected 12.9 or 13.0"'
+              new = ('    13.4|13.4.*)\n        CUDA_MAJOR=13\n        CUDA_TAG=cu134\n        ;;\n'
+                     '    *)\n        echo "Unsupported CUDA version: ${CUDA_VERSION}; expected 12.9, 13.0 or 13.4"')
+              assert old in s, "DeepEP packaging CUDA case changed shape; update this patch"
+              p.write_text(s.replace(old, new))
+              print("patched build_sgl_deep_ep.sh for CUDA 13.4")
+          PY
+
+      - name: Resolve the torch nightly pinned in docker/Dockerfile
+        id: torch
+        run: echo "version=$(sed -n 's/^ARG TORCH_NIGHTLY_VERSION=//p' docker/Dockerfile)" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel
+        env:
+          TORCH_VERSION: ${{ steps.torch.outputs.version }}
+        run: |
+          chmod +x scripts/build_sgl_deepep.sh DeepEP-packaging/sgl_deep_ep/build_sgl_deep_ep.sh
+          scripts/build_sgl_deepep.sh \
+            "${{ matrix.python-version }}" \
+            "13.4" \
+            "${{ github.workspace }}/DeepEP-source" \
+            "${{ github.workspace }}/DeepEP-packaging/sgl_deep_ep" \
+            "${{ matrix.arch }}"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepep-wheel-cu134-py${{ matrix.python-version }}-${{ matrix.arch }}
+          path: DeepEP-source/dist/*.whl
+          if-no-files-found: error
+
   release-whl:
-    needs: [build-cu129-matrix, build-cu130-matrix]
+    needs: [build-cu129-matrix, build-cu130-matrix, build-cu134-matrix]
     if: |
       always() &&
       github.repository == 'sgl-project/sglang' &&
       (
         (inputs.target == 'cu129' && needs.build-cu129-matrix.result == 'success') ||
         (inputs.target == 'cu130' && needs.build-cu130-matrix.result == 'success') ||
+        (inputs.target == 'cu134' && needs.build-cu134-matrix.result == 'success') ||
         (
           inputs.target == 'all' &&
           needs.build-cu129-matrix.result == 'success' &&
@@ -216,6 +307,9 @@ jobs:
           fi
           if [[ "${{ inputs.target }}" == "all" || "${{ inputs.target }}" == "cu130" ]]; then
             python3 scripts/update_deepep_whl_index.py --cuda 130
+          fi
+          if [[ "${{ inputs.target }}" == "cu134" || ( "${{ inputs.target }}" == "all" && "${{ needs.build-cu134-matrix.result }}" == "success" ) ]]; then
+            python3 scripts/update_deepep_whl_index.py --cuda 134
           fi
 
       - name: Push wheel indexes
