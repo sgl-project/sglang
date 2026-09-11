@@ -1670,6 +1670,14 @@ class Envs:
     # (the branch-measured crossover). Raise it to keep long prefills on the
     # fused CUTLASS kernel.
     SGLANG_FLASHKDA_MAX_SEQ_LEN = EnvInt(2048)
+    # Triton chunk_kda prefill: split every sequence into this many 64-token
+    # aligned segments for the recurrent-state pass and fold the segment states
+    # (one launch computes each segment's zero-init final state and its
+    # state-transform matrix, a tiny scan chains them, a second launch re-runs
+    # the segments from their true incoming states). The state kernel is
+    # parallel only over (sequence, head): at 12 heads per rank it fills 48 of
+    # 148 SMs and walks 512 chunks serially at 32K. 1 = off (unsegmented).
+    SGLANG_KDA_STATE_SEGMENTS = EnvInt(1)
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);

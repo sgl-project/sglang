@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -272,6 +273,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             lower_bound=lower_bound,
             beta_is_raw=beta_is_raw,
             output_intermediate_states=return_intermediate_states,
+            state_segments=envs.SGLANG_KDA_STATE_SEGMENTS.get(),
             track_state=kwargs.get("track_state"),
             track_chunk_idx=kwargs.get("track_chunk_idx"),
             chunk_indices=kwargs.get("chunk_indices"),
