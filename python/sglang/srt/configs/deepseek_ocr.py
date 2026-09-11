@@ -24,12 +24,7 @@ DeepseekOCRImage = Union[Image.Image, torch.Tensor]
 
 BASE_SIZE = 1024
 IMAGE_SIZE = 640  # DeepSeek-OCR local crop; OCR-2 uses OCR2_IMAGE_SIZE
-# DeepSeek-OCR-2's local crop. Crop pixels and the per-tile visual token budget
-# are coupled: the processor counts `ceil((image_size // patch_size) /
-# downsample_ratio) ** 2` tokens per tile and the decoder picks its tuned query
-# table from that count (144 for 768px, 256 for the 1024px global view), falling
-# back to an interpolated table otherwise.
-OCR2_IMAGE_SIZE = 768  # (768 // 16 // 4) ** 2 == 144 tokens
+OCR2_IMAGE_SIZE = 768
 CROP_MODE = True
 MIN_CROPS = 2
 MAX_CROPS = 6  # max:9; If your GPU memory is small, it is recommended to set it to 6.
