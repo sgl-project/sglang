@@ -1137,8 +1137,6 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
-    # Prefill: True uses DeepEP's expanded layout (skips ep_scatter); False uses
-    # the non-expand ep_scatter/ep_gather path.
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(True)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only

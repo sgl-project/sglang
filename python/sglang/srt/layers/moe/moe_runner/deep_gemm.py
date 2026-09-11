@@ -1761,8 +1761,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
             all_tokens,
             deepep_v2_expert_alignment,
         )
-        # Expanded DeepEP recv scales are not in the contiguous-GEMM TMA layout;
-        # _run_contiguous_gemm aligns them (hidden_states_scale_tma_aligned stays False).
         return DeepGemmRunnerInput(
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
@@ -1846,10 +1844,8 @@ def post_permute_deep_gemm_to_deepep_v2(
         if topk_weights is not None and not running_state.get(
             "deepep_v2_weight_prefused", False
         ):
-            # Weight the expanded rows before combine (skipped when already folded
-            # into down_input's scale). DeepEP 2.0.0 combine ignores topk_weights in
-            # expand mode; 2.1.0+ (#674) accepts a 1-D weight there, so a follow-up
-            # can gate on version and pass recv_topk_weights straight to combine.
+            # combine ignores topk_weights in expand mode, so weight the expanded
+            # rows here unless already folded into the down-proj input scale.
             from sglang.kernels.ops.moe.ep_moe_kernels import scale_expanded_rows_
 
             scale_expanded_rows_(hidden_states, topk_weights)
