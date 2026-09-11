@@ -1138,9 +1138,7 @@ class OpenAIServingChat(OpenAIServingBase):
         custom_labels = self.extract_custom_labels(raw_request)
 
         # Extract routed_dp_rank from header (has higher priority than body)
-        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
-            raw_request, request.routed_dp_rank
-        )
+        generation_routing = self._extract_generation_routing(request, raw_request)
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
@@ -1161,11 +1159,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
             lora_path=lora_path,
-            bootstrap_host=request.bootstrap_host,
-            bootstrap_port=request.bootstrap_port,
-            bootstrap_room=request.bootstrap_room,
-            routed_dp_rank=effective_routed_dp_rank,
-            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+            **generation_routing,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
