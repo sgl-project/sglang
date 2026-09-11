@@ -449,8 +449,8 @@ export const Qwen35Deployment = () => {
     // All AMD MI GPUs use the AITER unified-attention backend (pair with
     // SGLANG_USE_AITER=1 and SGLANG_USE_AITER_UNIFIED_ATTN=1; see cookbook prose),
     // which requires --page-size 16. Multi-GPU runs enable AITER allreduce fusion,
-    // except the MXFP4 MI355X recipe, which uses ROCm INT8 quantized quick
-    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT8) instead.
+    // except the MXFP4 MI355X recipe, which uses ROCm INT4 quantized quick
+    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT4) instead.
     if (amdGpu) {
       const amdFp4 = quantization === 'fp4' && hardware === 'mi355x';
       let amdEnv = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\nAITER_FLYDSL_FORCE=1 \\\n";
@@ -458,7 +458,7 @@ export const Qwen35Deployment = () => {
         amdEnv += "SGLANG_MAMBA_SSM_DTYPE=bfloat16 \\\n";
       }
       if (amdFp4) {
-        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \\\n";
+        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \\\n";
       }
       cmd = amdEnv + cmd;
       cmd += " \\\n  --attention-backend aiter";
@@ -485,7 +485,7 @@ export const Qwen35Deployment = () => {
     // FP4-specific backend settings
     if (quantization === 'fp4') {
       if (hardware === 'mi355x') {
-        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT8 quantized
+        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT4 quantized
         // ROCm quick all-reduce env are emitted by the AMD backend block above
         // (this recipe uses quick all-reduce instead of AITER allreduce fusion).
         // Add the FP4-specific flags here.
@@ -500,8 +500,8 @@ export const Qwen35Deployment = () => {
           cmd += ' \\\n  --enable-hierarchical-cache';
           cmd += ' \\\n  --hicache-ratio 1.5';
           cmd += ' \\\n  --hicache-write-policy write_through';
-          cmd += ' \\\n  --hicache-io-backend direct';
-          cmd += ' \\\n  --hicache-mem-layout page_first_direct';
+          cmd += ' \\\n  --hicache-io-backend kernel';
+          cmd += ' \\\n  --hicache-mem-layout page_first';
         }
       } else {
         // NVIDIA NVFP4 on Blackwell (B200 / B300).
