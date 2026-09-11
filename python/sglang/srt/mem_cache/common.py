@@ -107,6 +107,34 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def _coalesce_touching_segments(
+    segments: list[tuple[torch.Tensor, int]],
+) -> list[tuple[torch.Tensor, int]]:
+    """Merge ascending ``(kv_indices, start_pos)`` segments of one kv row that
+    touch end-to-start into single segments; drop empty ones.
+
+    ``UnifiedRadixCache.cache_finished_req`` frees a request truncated mid
+    prefill (an abort) as two ranges, ``[page_aligned_len, effective_len)``
+    and ``[effective_len, full_len)``, which touch at ``effective_len``.
+    Handed to the allocator separately, the second one starts mid-page and
+    ``_page_disjoint`` asserts on the shared boundary page. Slices of the
+    same row that touch are exactly the slice they were cut from, so merging
+    them keeps "one call frees a shared page once" without an assert.
+    """
+    merged: list[tuple[torch.Tensor, int]] = []
+    for kv_indices, start_pos in segments:
+        num_indices = kv_indices.numel()
+        if num_indices == 0:
+            continue
+        if merged:
+            prev_indices, prev_start = merged[-1]
+            if prev_start + prev_indices.numel() == start_pos:
+                merged[-1] = (torch.cat((prev_indices, kv_indices)), prev_start)
+                continue
+        merged.append((kv_indices, start_pos))
+    return merged
+
+
 def free_kv_row_segments(
     allocator: BaseTokenToKVPoolAllocator,
     segments: list[tuple[torch.Tensor, int]],
@@ -114,10 +142,11 @@ def free_kv_row_segments(
     swa_evicted_seqlen: int,
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row, split at the SWA eviction floor."""
+    request's kv row, split at the SWA eviction floor. Touching segments are
+    coalesced first so a boundary that is not page-aligned is freed once."""
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
-    for kv_indices, start_pos in segments:
+    for kv_indices, start_pos in _coalesce_touching_segments(segments):
         num_indices = kv_indices.numel()
         if num_indices == 0:
             continue
