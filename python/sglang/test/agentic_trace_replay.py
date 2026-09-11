@@ -128,7 +128,12 @@ def _request_input(
     api_url: str,
     model: str,
     output_len: Optional[int] = None,
+    cache_report: bool = True,
 ) -> RequestFuncInput:
+    # The chat endpoint only reports its prefix-cache hits when the request asks
+    # for them, which is the same opt-in ``bench_serving`` sends; without it
+    # every turn comes back with zero cached tokens.
+    extra_request_body = {"return_cached_tokens_details": True} if cache_report else {}
     return RequestFuncInput(
         prompt=list(history),
         api_url=api_url,
@@ -137,7 +142,7 @@ def _request_input(
         model=model,
         lora_name="",
         image_data=None,
-        extra_request_body={},
+        extra_request_body=extra_request_body,
     )
 
 
@@ -189,6 +194,7 @@ async def _replay_conversation(
     model: str,
     semaphore: Optional[asyncio.Semaphore],
     progress: _Progress,
+    cache_report: bool = True,
 ) -> List[RequestFuncOutput]:
     """Replay one trajectory: each turn waits for the previous reply.
 
@@ -203,7 +209,7 @@ async def _replay_conversation(
         for turn in conversation:
             history.extend(turn.messages)
             output = await async_request_openai_chat_completions(
-                _request_input(turn, history, api_url, model)
+                _request_input(turn, history, api_url, model, cache_report=cache_report)
             )
             outputs.append(output)
             progress.turn_done()
@@ -224,6 +230,7 @@ async def _replay_all(
     model: str,
     max_concurrency: Optional[int],
     progress_interval: float,
+    cache_report: bool = True,
 ) -> List[RequestFuncOutput]:
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
     progress = _Progress(
@@ -233,7 +240,9 @@ async def _replay_all(
     )
     per_conversation = await asyncio.gather(
         *(
-            _replay_conversation(conversation, api_url, model, semaphore, progress)
+            _replay_conversation(
+                conversation, api_url, model, semaphore, progress, cache_report
+            )
             for conversation in conversations
         )
     )
@@ -357,7 +366,14 @@ def run_agentic_replay(
 
     start = time.perf_counter()
     outputs = asyncio.run(
-        _replay_all(conversations, api_url, model, max_concurrency, progress_interval)
+        _replay_all(
+            conversations,
+            api_url,
+            model,
+            max_concurrency,
+            progress_interval,
+            cache_report,
+        )
     )
     duration = time.perf_counter() - start
 

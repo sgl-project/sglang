@@ -333,15 +333,14 @@ class _ChatHandler(BaseHTTPRequestHandler):
             {"choices": [{"index": 0, "delta": {"content": "w1 "}}]}
             for _ in range(num_tokens)
         ]
-        chunks.append(
-            {
-                "choices": [],
-                "usage": {"completion_tokens": num_tokens},
-                "sglext": {
-                    "cached_tokens_details": {"device": self.cached_tokens_per_turn}
-                },
+        final = {"choices": [], "usage": {"completion_tokens": num_tokens}}
+        # The real endpoint reports its cache details only when the request asks
+        # for them, so a replay that forgets to ask must see zeros here too.
+        if body.get("return_cached_tokens_details"):
+            final["sglext"] = {
+                "cached_tokens_details": {"device": self.cached_tokens_per_turn}
             }
-        )
+        chunks.append(final)
         self._stream(chunks)
 
     def log_message(self, fmt, *args):
@@ -445,7 +444,7 @@ class TestAgenticReplayDriver(CustomTestCase):
         with self._replay(max_concurrency=2, flush_cache=True) as (
             result,
             stats,
-            _,
+            bodies,
             output_file,
         ):
             # The prompt side is summed per turn, so a trajectory's growing
@@ -460,6 +459,10 @@ class TestAgenticReplayDriver(CustomTestCase):
             self.assertEqual(
                 cache["total_cached_tokens"],
                 stats.num_turns * _ChatHandler.cached_tokens_per_turn,
+            )
+            self.assertTrue(
+                all(b["return_cached_tokens_details"] for b in bodies),
+                "every round must opt into the server's cache-detail reporting",
             )
             self.assertEqual(cache["total_prompt_tokens"], result["total_input_tokens"])
             self.assertEqual(
