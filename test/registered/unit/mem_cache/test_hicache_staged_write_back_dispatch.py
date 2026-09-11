@@ -833,7 +833,19 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             )
 
     def test_dsa_indexer_backup_then_load_roundtrip_uses_staged(self):
-        layer_num = 2
+        for producer_layers, draft_layer_num in (
+            ([0, 1, 2, 3], 0),
+            ([0, 2], 0),
+            ([0, 2], 2),
+            ([], 2),
+        ):
+            with self.subTest(
+                producer_layers=producer_layers, draft_layer_num=draft_layer_num
+            ):
+                self._run_dsa_indexer_staged_roundtrip(producer_layers, draft_layer_num)
+
+    def _run_dsa_indexer_staged_roundtrip(self, producer_layers, draft_layer_num):
+        layer_num = 4
         page_size = 2
         host_indices = torch.tensor([0, 1, 4, 5], dtype=torch.int64)
         device_indices = torch.tensor([2, 3, 6, 7], dtype=torch.int64)
@@ -847,7 +859,15 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ).reshape(5, 1, indexer_page_stride_size)
             for layer_id in range(layer_num)
         ]
-        expected = [buffer[device_page_indices].clone() for buffer in device_layers]
+        draft_layers = [
+            torch.full(
+                (5, 1, indexer_page_stride_size), 200 + layer_id, dtype=torch.uint8
+            )
+            for layer_id in range(draft_layer_num)
+        ]
+        packed_layers = [device_layers[layer_id] for layer_id in producer_layers]
+        packed_layers.extend(draft_layers)
+        expected = [buffer[device_page_indices].clone() for buffer in packed_layers]
         device_pool = _device_pool_stub(
             layer_num=layer_num,
             index_k_with_scale_buffer=device_layers,
@@ -855,16 +875,19 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
         host.device_pool = device_pool
+        host.device_layer_ids = producer_layers
+        host.target_layer_num = len(producer_layers)
         host.host_layer_by_device = {
-            layer_id: layer_id for layer_id in range(layer_num)
+            layer_id: host_layer_id
+            for host_layer_id, layer_id in enumerate(producer_layers)
         }
         host.layout = "page_first"
         host.page_size = page_size
-        host.layer_num = layer_num
+        host.layer_num = len(packed_layers)
         host.indexer_page_stride_size = indexer_page_stride_size
         host.indexer_layout_dim = host.layer_num * host.indexer_page_stride_size
         host.index_k_device_ptrs = torch.tensor(
-            [buffer.data_ptr() for buffer in device_layers], dtype=torch.uint64
+            [buffer.data_ptr() for buffer in packed_layers], dtype=torch.uint64
         )
         host.index_k_with_scale_buffer = torch.zeros(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
@@ -874,7 +897,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         host.can_use_jit = False
         host.can_use_write_back_jit = True
-        src_registry = {_ptr_key_from_layers(device_layers): device_layers}
+        src_registry = {_ptr_key_from_layers(packed_layers): packed_layers}
 
         staged_patch, fallback_patch, load_patch = self._patched_transfers(
             src_registry, module=DSA_POOL_HOST_MODULE
@@ -886,7 +909,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 device_indices=device_indices,
                 io_backend="kernel",
             )
-            for buffer in device_layers:
+            for buffer in [*device_layers, *draft_layers]:
                 buffer.zero_()
             for layer_id in range(layer_num):
                 host.load_to_device_per_layer(
@@ -896,20 +919,34 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                     layer_id=layer_id,
                     io_backend="kernel",
                 )
+            for draft_layer_id, buffer in enumerate(draft_layers):
+                host.load_to_device_per_layer(
+                    device_pool=_device_pool_stub(
+                        layer_num=1, index_k_with_scale_buffer=[buffer]
+                    ),
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    layer_id=layer_num + draft_layer_id,
+                    io_backend="kernel",
+                    is_draft=True,
+                )
 
         self.assertEqual(staged.call_count, 1)
         self.assertEqual(fallback.call_count, 0)
-        self.assertEqual(load.call_count, layer_num)
-        for layer_id, buffer in enumerate(device_layers):
+        self.assertEqual(load.call_count, len(packed_layers))
+        for host_layer_id, buffer in enumerate(packed_layers):
             self.assertTrue(
-                torch.equal(buffer[device_page_indices], expected[layer_id])
+                torch.equal(buffer[device_page_indices], expected[host_layer_id])
             )
             self.assertTrue(
                 torch.equal(
-                    host.index_k_with_scale_buffer[host_page_indices, layer_id],
-                    expected[layer_id],
+                    host.index_k_with_scale_buffer[host_page_indices, host_layer_id],
+                    expected[host_layer_id],
                 )
             )
+        for layer_id, buffer in enumerate(device_layers):
+            if layer_id not in producer_layers:
+                self.assertEqual(torch.count_nonzero(buffer).item(), 0)
 
     def test_logical_host_pool_preserves_page_first_group_layout(self):
         logical_host_pool = LogicalHostPool(8, 2, layout="page_first")

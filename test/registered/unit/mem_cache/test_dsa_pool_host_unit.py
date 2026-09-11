@@ -70,6 +70,11 @@ class TestDSAProducerHostSidecar(unittest.TestCase):
         pool._owned_local_layer_range = lambda: (6, 10)
         self.assertEqual(_get_rank_local_dsa_indexer_layers(pool), [6])
 
+        pool.layer_shard_enabled = False
+        self.assertEqual(
+            _get_rank_local_dsa_indexer_layers(pool), pool.hicache_indexer_layers
+        )
+
     def test_compacts_target_layers_and_preserves_packed_drafts(self):
         target_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(4)]
         draft_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(2)]
@@ -156,29 +161,40 @@ class TestDSAProducerHostSidecar(unittest.TestCase):
                 return_value=memory_config,
             ),
         ):
-            group, _ = build_anchor_sidecar_stack(
-                params=params,
-                kv_pool=target_pool,
-                sidecar_pool_name=PoolName.INDEXER,
-                full_layer_mapping={i: i for i in range(4)},
-                sidecar_layer_mapping={0: 0, 2: 2},
-                load_cache_event=mock.sentinel.load_cache_event,
-                storage_backend=None,
-                use_mla=True,
-                sidecar_host_pool_factory=lambda _: sidecar_host,
-            )
+            for sidecar_mapping, expected_layers in (
+                ({0: 0, 2: 2}, [0, None, 2, None, 4]),
+                ({}, [None, None, None, None, 4]),
+                (None, [0, 1, 2, 3, 4]),
+            ):
+                with self.subTest(sidecar_mapping=sidecar_mapping):
+                    group, _ = build_anchor_sidecar_stack(
+                        params=params,
+                        kv_pool=target_pool,
+                        sidecar_pool_name=PoolName.INDEXER,
+                        full_layer_mapping={i: i for i in range(4)},
+                        sidecar_layer_mapping=sidecar_mapping,
+                        load_cache_event=mock.sentinel.load_cache_event,
+                        storage_backend=None,
+                        use_mla=True,
+                        sidecar_host_pool_factory=lambda _: sidecar_host,
+                    )
 
-        anchor_mapper = group.get_entry(PoolName.KV).layer_mapper
-        indexer_mapper = group.get_entry(PoolName.INDEXER).layer_mapper
-        self.assertEqual([anchor_mapper(i) for i in range(5)], [0, 1, 2, 3, 4])
-        self.assertEqual([indexer_mapper(i) for i in range(5)], [0, None, 2, None, 4])
-        self.assertEqual(
-            group.get_entry(PoolName.KV).packed_draft_device_pools, (draft_pool,)
-        )
-        self.assertEqual(
-            group.get_entry(PoolName.INDEXER).packed_draft_device_pools,
-            (draft_pool,),
-        )
+                    anchor_mapper = group.get_entry(PoolName.KV).layer_mapper
+                    indexer_mapper = group.get_entry(PoolName.INDEXER).layer_mapper
+                    self.assertEqual(
+                        [anchor_mapper(i) for i in range(5)], [0, 1, 2, 3, 4]
+                    )
+                    self.assertEqual(
+                        [indexer_mapper(i) for i in range(5)], expected_layers
+                    )
+                    self.assertEqual(
+                        group.get_entry(PoolName.KV).packed_draft_device_pools,
+                        (draft_pool,),
+                    )
+                    self.assertEqual(
+                        group.get_entry(PoolName.INDEXER).packed_draft_device_pools,
+                        (draft_pool,),
+                    )
 
     def test_page_first_stack_omits_empty_indexer_sidecar(self):
         target_pool = SimpleNamespace(layer_num=3, kv_cache_dim=576)
