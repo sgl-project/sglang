@@ -20,8 +20,6 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4 import (
-    topk_transform_paged,
-    topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
@@ -68,7 +66,11 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
+    CandidateRole,
+    apply_decode_candidates,
+    mask_topk_scores,
     select_candidate_blocks,
+    write_paged_indexer_topk,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
@@ -248,103 +250,8 @@ def _fp4_paged_mqa_logits(
     )
 
 
-def two_level_decode_logits(
-    logits: torch.Tensor,
-    seq_lens: torch.Tensor,
-    *,
-    is_candidate_source: bool,
-    uses_candidates: bool,
-    topk_blocks: int,
-    block_size: int,
-    published: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Apply candidate-block filtering and return logits plus an optional published mask.
-
-    Mask columns past each sequence length to -inf before selection: the paged
-    logits kernel leaves that tail uninitialized, and an all -inf block means
-    unreachable. This path is graph-captured and must not synchronize with the host.
-    Work scales with allocated page-table capacity, not live sequence length.
-    """
-    if not (is_candidate_source or uses_candidates):
-        return logits, None
-
-    from sglang.srt.model_executor.runner_utils.capture_mode import (
-        get_capture_dsa_variant,
-    )
-
-    if get_capture_dsa_variant() in (
-        "candidate_all",
-        "candidate_c2_all",
-        "candidate_unfiltered",
-    ):
-        # All requests fit the candidate budget; paged top-k masks their tails.
-        return logits, None
-
-    if (
-        logits.is_cuda
-        and torch.version.cuda is not None
-        and logits.ndim == 2
-        and logits.stride(1) == 1
-        and seq_lens.device == logits.device
-        and seq_lens.dtype in (torch.int32, torch.int64)
-        and seq_lens.is_contiguous()
-        and seq_lens.shape in ((logits.shape[0],), (logits.shape[0], 1))
-        and logits.numel() > 0
-        and 0 < block_size <= 1024
-    ):
-        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-            candidate_block_logits,
-        )
-
-        if not is_candidate_source:
-            assert (
-                torch.is_tensor(published)
-                and published.shape[0] == logits.shape[0]
-                and published.shape[1] >= logits.shape[1]
-            ), "candidate mask missing for decode"
-        return candidate_block_logits(
-            logits,
-            seq_lens,
-            topk_blocks=topk_blocks,
-            block_size=block_size,
-            published=None if is_candidate_source else published,
-        )
-
-    lens_col = seq_lens if seq_lens.dim() > 1 else seq_lens.unsqueeze(-1)
-    reachable = torch.arange(logits.shape[-1], device=logits.device) < lens_col
-    logits = logits.float().masked_fill(~reachable, -torch.inf)
-
-    if is_candidate_source:
-        # The source scores over every reachable position itself and only publishes,
-        # which is what the reference does.
-        return logits, select_candidate_blocks(
-            logits, lens_col, topk_blocks=topk_blocks, block_size=block_size
-        )
-
-    assert torch.is_tensor(published) and published.shape[0] == logits.shape[0], (
-        "candidate mask missing for decode"
-    )
-    return logits.masked_fill(~published[:, : logits.shape[-1]], -torch.inf), None
-
-
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
 _TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
-
-
-def _mask_topk_scores(
-    scores: torch.Tensor,
-    indices: torch.Tensor,
-    offsets: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Keep masked indexer scores out of attention even when top-k underfills."""
-    columns = indices.to(torch.int64)
-    if offsets is not None:
-        columns = columns - offsets[:, None]
-    selected_scores = scores.gather(1, columns.clamp(0, scores.shape[1] - 1))
-    valid = (
-        (columns >= 0) & (columns < scores.shape[1]) & (selected_scores > -torch.inf)
-    )
-    return indices.masked_fill(~valid, -1)
 
 
 @functools.cache
@@ -1130,7 +1037,8 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         # Per-request candidate masks the candidate_source layer publishes for the
         # index_source layers after it (torch indexer scratch).
-        self.candidate_masks: Optional[List[torch.Tensor]] = None
+        self.candidate_masks_by_request: Optional[List[torch.Tensor]] = None
+        self.candidate_mask: Optional[torch.Tensor] = None
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -1682,7 +1590,7 @@ class DeepseekV4AttnBackend(
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (
             self.forward_metadata,
-            self.candidate_masks,
+            self.candidate_masks_by_request,
             forward_batch.attn_cp_metadata,
             get_local_dp_buffer_len(),
         )
@@ -1692,10 +1600,10 @@ class DeepseekV4AttnBackend(
             if tail.cp_metadata is not None
             else tail.extend_seq_lens_cpu
         )
-        if isinstance(self.candidate_masks, list) and self.candidate_masks:
-            self.candidate_masks = [
+        if self.candidate_masks_by_request:
+            self.candidate_masks_by_request = [
                 mask[mask.shape[0] - t :]
-                for mask, t in zip(self.candidate_masks, tail_lens_cpu)
+                for mask, t in zip(self.candidate_masks_by_request, tail_lens_cpu)
             ]
         # The last index-source layer before the switch published its top-k into
         # the full metadata's buffers; the consumer layers after the switch read
@@ -1734,7 +1642,7 @@ class DeepseekV4AttnBackend(
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
         (
             self.forward_metadata,
-            self.candidate_masks,
+            self.candidate_masks_by_request,
             forward_batch.attn_cp_metadata,
             local_dp_buffer_len,
         ) = saved
@@ -2040,8 +1948,8 @@ class DeepseekV4AttnBackend(
         return buf[:n]
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        from sglang.srt.model_executor.runner_utils.capture_mode import (
-            skip_low_ratio_indexer,
+        from sglang.srt.layers.attention.dsv4.indexer_capture import (
+            get_indexer_capture_options,
         )
 
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
@@ -2061,7 +1969,7 @@ class DeepseekV4AttnBackend(
         if isinstance(metadata, DSV4Metadata):
             core = metadata.core_metadata
             for ratio in core.low_ratios:
-                if skip_low_ratio_indexer(ratio):
+                if get_indexer_capture_options(ratio).select_all:
                     # Share the full-position indices across layers of this ratio.
                     fill_all_compressed_indices(
                         core.page_table,
@@ -3149,8 +3057,9 @@ class DeepseekV4AttnBackend(
         empty_mask = torch.zeros(0, 0, dtype=torch.bool, device=device)
         num_tokens = pos.shape[0]
         if not slot_chunks or num_tokens == 0:
-            if indexer.is_candidate_source:
-                self.candidate_masks = [empty_mask for _ in lc_per_req]
+            if indexer.candidate_role is CandidateRole.PUBLISH:
+                self.candidate_masks_by_request = [empty_mask for _ in lc_per_req]
+                self.candidate_mask = None
             return
         k_slots = torch.cat(slot_chunks)
         k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
@@ -3176,7 +3085,7 @@ class DeepseekV4AttnBackend(
             # the fused top-k reads score rows through 16-byte vectors
             ceil_align(max(lc_per_req), 4),
         )
-        if indexer.is_candidate_source or indexer.uses_candidates:
+        if indexer.candidate_role is not CandidateRole.NONE:
             self._publish_or_consume_candidates(
                 indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
             )
@@ -3185,8 +3094,8 @@ class DeepseekV4AttnBackend(
         topk_transform_ragged_v2(
             logits, compress_lens, out_offsets=ks, out_indices=selected
         )
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            selected = _mask_topk_scores(logits, selected, ks)
+        if indexer.candidate_role is CandidateRole.CONSUME:
+            selected = mask_topk_scores(logits, selected, ks)
         # ascending positions, padding last: the layout the consumers expect
         unselected = torch.iinfo(torch.int32).max
         selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
@@ -3203,7 +3112,7 @@ class DeepseekV4AttnBackend(
         self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
     ) -> None:
         """Level one of the two-level top-k: publish block masks, or sink non-candidates."""
-        publish = [] if indexer.is_candidate_source else None
+        publish = [] if indexer.candidate_role is CandidateRole.PUBLISH else None
         j = torch.arange(logits.shape[1], device=logits.device)
         tok_start = 0
         for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
@@ -3215,7 +3124,7 @@ class DeepseekV4AttnBackend(
                 continue
             scores = logits[rows, :lc]
             if publish is None:
-                scores.masked_fill_(~self.candidate_masks[b], -torch.inf)
+                scores.masked_fill_(~self.candidate_masks_by_request[b], -torch.inf)
                 continue
             lens = compress_lens[rows, None]
             # the block selection tells unreachable positions apart by -inf
@@ -3233,7 +3142,8 @@ class DeepseekV4AttnBackend(
             ]
             publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
         if publish is not None:
-            self.candidate_masks = publish
+            self.candidate_masks_by_request = publish
+            self.candidate_mask = None
 
     def _low_ratio_index_topk_prefill_graph(self, layer, pos, q, w) -> None:
         """q/w come from live rows; metadata fixes the graph's context width."""
@@ -3253,7 +3163,7 @@ class DeepseekV4AttnBackend(
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
         assert indexer.n_local_heads == indexer.n_heads
         width = metadata.max_c4_seq_len
-        if indexer.uses_candidates or indexer.is_candidate_source:
+        if indexer.candidate_role is not CandidateRole.NONE:
             # Every reachable block is a candidate inside the window, so the
             # two-level selection collapses to the plain top-k below.
             assert (
@@ -3300,11 +3210,12 @@ class DeepseekV4AttnBackend(
                 raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(torch.int32)
 
     def _low_ratio_index_topk_decode(self, layer, x, q_lora, pos) -> None:
-        from sglang.srt.model_executor.runner_utils.capture_mode import (
-            skip_low_ratio_indexer,
+        from sglang.srt.layers.attention.dsv4.indexer_capture import (
+            get_indexer_capture_options,
         )
 
-        if skip_low_ratio_indexer(layer.compress_ratio):
+        capture_options = get_indexer_capture_options(layer.compress_ratio)
+        if capture_options.select_all:
             # The compressor still writes index K for later, longer contexts.
             return
 
@@ -3373,48 +3284,35 @@ class DeepseekV4AttnBackend(
             metadata.max_c4_seq_len,
         )
 
-        logits, published = two_level_decode_logits(
+        logits, published = apply_decode_candidates(
             logits,
             metadata.c4_seq_lens,
-            is_candidate_source=indexer.is_candidate_source,
-            uses_candidates=indexer.uses_candidates,
+            candidate_role=(
+                CandidateRole.NONE
+                if capture_options.bypass_candidates
+                else indexer.candidate_role
+            ),
             topk_blocks=indexer.candidate_topk_blocks,
             block_size=indexer.candidate_block_size,
-            published=self.candidate_masks,
+            published=self.candidate_mask,
         )
         if published is not None:
-            self.candidate_masks = published
+            self.candidate_mask = published
+            self.candidate_masks_by_request = None
 
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
-        filter_candidates = indexer.uses_candidates and not indexer.is_candidate_source
-        selected = torch.empty_like(page_indices) if filter_candidates else raw_indices
-        if metadata.use_topk_v2 and raw_indices is None:
-            topk_transform_paged_v2(
-                logits,
-                metadata.c4_seq_lens,
-                None if filter_candidates else metadata.page_table,
-                selected if filter_candidates else page_indices,
-                page_size,
-                metadata.topk_metadata,
-            )
-        else:
-            topk_transform_paged(
-                logits,
-                metadata.c4_seq_lens,
-                metadata.page_table,
-                page_indices,
-                page_size,
-                selected,
-            )
-        if filter_candidates:
-            selected = _mask_topk_scores(logits, selected)
-            columns = selected.clamp_min(0).to(torch.int64)
-            slots = metadata.page_table.gather(1, columns // page_size) * page_size
-            slots = slots + columns % page_size
-            page_indices.copy_(torch.where(selected >= 0, slots, -1))
-            if raw_indices is not None:
-                raw_indices.copy_(selected)
+        write_paged_indexer_topk(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            raw_indices,
+            page_size=page_size,
+            use_topk_v2=metadata.use_topk_v2,
+            topk_metadata=metadata.topk_metadata,
+            mask_topk=indexer.candidate_role is CandidateRole.CONSUME,
+        )
 
     def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
         """Hopper decode indexer: one token per request, every request scored at
@@ -3462,24 +3360,25 @@ class DeepseekV4AttnBackend(
         s = fp4_index_logits_decode(
             q, weights, slots, lens, table, table.shape[1] // 68
         )
-        if indexer.is_candidate_source:
-            self.candidate_masks = select_candidate_blocks(
+        if indexer.candidate_role is CandidateRole.PUBLISH:
+            self.candidate_mask = select_candidate_blocks(
                 s,
                 lens[:, None],
                 topk_blocks=indexer.candidate_topk_blocks,
                 block_size=indexer.candidate_block_size,
             )
-        elif indexer.uses_candidates:
+            self.candidate_masks_by_request = None
+        elif indexer.candidate_role is CandidateRole.CONSUME:
             # Published this step by the candidate-source layer's decode pass above.
-            consume = self.candidate_masks
+            consume = self.candidate_mask
             assert torch.is_tensor(consume) and consume.shape[0] == bs, (
                 "candidate mask missing for decode"
             )
             s = s.masked_fill(~consume[:, :lmax], -torch.inf)
         k = min(indexer.index_topk, lmax)
         idx = s.topk(k, dim=-1, sorted=False).indices
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            idx = _mask_topk_scores(s, idx)
+        if indexer.candidate_role is CandidateRole.CONSUME:
+            idx = mask_topk_scores(s, idx)
             idx = idx.masked_fill(idx < 0, lmax)
         idx = idx.sort(dim=-1).values
         reach = idx < lens[:, None]
@@ -3505,8 +3404,12 @@ class DeepseekV4AttnBackend(
         # A compressed position is visible once the query has passed its last token.
         compress_lens = (pos + 1) // ratio
         topk = indexer.index_topk
-        publish = [] if indexer.is_candidate_source else None
-        consume = self.candidate_masks if indexer.uses_candidates else None
+        publish = [] if indexer.candidate_role is CandidateRole.PUBLISH else None
+        consume = (
+            self.candidate_masks_by_request
+            if indexer.candidate_role is CandidateRole.CONSUME
+            else None
+        )
         for b, r in enumerate(torch.unique_consecutive(req).tolist()):
             tok = (req == r).nonzero().squeeze(1)
             lens = compress_lens[tok]
@@ -3549,7 +3452,7 @@ class DeepseekV4AttnBackend(
                     s = s.masked_fill(~consume[b][rows], -torch.inf)
                 idx = s.topk(k, dim=-1, sorted=False).indices
                 if consume is not None and masks is None:
-                    idx = _mask_topk_scores(s, idx)
+                    idx = mask_topk_scores(s, idx)
                     idx = idx.masked_fill(idx < 0, lc)
                 idx = idx.sort(dim=-1).values
                 reach = idx < lens_c[:, None]
@@ -3561,7 +3464,8 @@ class DeepseekV4AttnBackend(
             if masks is not None:
                 publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
         if publish is not None:
-            self.candidate_masks = publish
+            self.candidate_masks_by_request = publish
+            self.candidate_mask = None
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.

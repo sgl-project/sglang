@@ -14,6 +14,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 from sglang.kernels.ops.attention.dsv4.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.layers.attention.dsv4.indexer import CandidateRole
 from sglang.srt.layers.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
@@ -205,8 +206,9 @@ class DeepseekV41Indexer(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
         self.owns_k = layer_id in config.kv_source_layer_ids
-        self.is_candidate_source = layer_id == config.candidate_source_layer_id
-        self.uses_candidates = 0 <= config.candidate_source_layer_id < layer_id
+        self.candidate_role = CandidateRole.for_layer(
+            layer_id, config.candidate_source_layer_id
+        )
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.softmax_scale = self.index_head_dim**-0.5
