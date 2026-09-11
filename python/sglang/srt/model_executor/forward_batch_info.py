@@ -1187,10 +1187,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if ragged_layout is None:
             seq_positions = seq_positions.view(batch_size, -1)
             next_input_positions = (
-                (seq_positions + mrope_delta_tensor)
-                .flatten()
-                .unsqueeze(0)
-                .repeat(3, 1)
+                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
             )
         else:
             # Ragged target verify packs real request rows first and pads the

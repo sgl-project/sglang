@@ -225,6 +225,22 @@ def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     return spec_info.ragged_verify_layout
 
 
+def ragged_verify_dense_scatter_indices(
+    *, query_start_loc: torch.Tensor, seq_len: int, draft_token_num: int
+) -> torch.Tensor:
+    """Map packed tokens to dense ``[request, step]`` slots.
+
+    Uncovered graph-tail tokens map to one value-irrelevant ghost slot.
+    """
+    batch_size = query_start_loc.shape[0] - 1
+    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
+    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+    return (
+        token_slots * draft_token_num
+        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
+    ).clamp_(max=batch_size * draft_token_num)
+
+
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor
