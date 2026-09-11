@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from time import perf_counter
@@ -459,6 +460,57 @@ _DIRECT_CHUNK = 64 << 20
 MAPPED_DIRECT_READ_MIN_BYTES = 8 * 1024**3
 
 
+def _pin_in_place(tensor: torch.Tensor) -> bool:
+    """Page-lock an allocated CPU tensor in place, at exactly its size.
+
+    torch's pinned pool rounds each block up to a power of two (a 1.20 GiB
+    layer store costs 2 GiB), which the pin budget never charged for.
+    """
+    if not torch.cuda.is_available():
+        return False
+    storage = tensor.untyped_storage()
+    nbytes = storage.nbytes()
+    if nbytes == 0:
+        return False
+    try:
+        cudart = torch.cuda.cudart()
+        if int(cudart.cudaHostRegister(storage.data_ptr(), nbytes, 0)) != 0:
+            return False
+    except Exception:
+        return False
+    weakref.finalize(storage, _unpin_in_place, storage.data_ptr())
+    return True
+
+
+def _unpin_in_place(data_ptr: int) -> None:
+    try:
+        torch.cuda.cudart().cudaHostUnregister(data_ptr)
+    except Exception:
+        pass
+
+
+# Below this, torch's own pinned pool: its power-of-two rounding costs little on
+# small blocks, and two small blocks can share a page, which cudaHostRegister
+# refuses to lock twice.
+_REGISTER_MIN_BYTES = 64 << 20
+
+
+def _pinned_empty(*size: int, dtype: torch.dtype, stride=None) -> torch.Tensor:
+    """A pinned CPU tensor of exactly this size; torch's pinned pool as fallback."""
+    shape = size[0] if stride is not None else size
+    if math.prod(shape) * dtype.itemsize >= _REGISTER_MIN_BYTES:
+        if stride is None:
+            tensor = torch.empty(*size, dtype=dtype)
+        else:
+            tensor = torch.empty_strided(size=shape, stride=stride, dtype=dtype)
+        if _pin_in_place(tensor):
+            return tensor
+        del tensor
+    if stride is None:
+        return torch.empty(*size, dtype=dtype, pin_memory=True)
+    return torch.empty_strided(size=shape, stride=stride, dtype=dtype, pin_memory=True)
+
+
 class _DirectReader:
     """Read a mapped tensor's bytes from its checkpoint file with O_DIRECT.
 
@@ -710,7 +762,11 @@ class MappedLayerCourier:
             []
             if direct_copy
             else [
-                torch.empty(slot_bytes, dtype=torch.uint8, pin_memory=pin_slots)
+                (
+                    _pinned_empty(slot_bytes, dtype=torch.uint8)
+                    if pin_slots
+                    else torch.empty(slot_bytes, dtype=torch.uint8)
+                )
                 for _ in range(self._NUM_SLOTS)
             ]
         )
@@ -1359,12 +1415,18 @@ class LayerwiseOffloadManager:
 
                     # Preserve non-contiguous layouts such as the transposed FP8
                     # weight views expected by CUTLASS kernels.
-                    cpu_tensor = torch.empty_strided(
-                        size=local_weight.shape,
-                        stride=local_weight.stride(),
-                        dtype=dtype,
-                        pin_memory=pin_this_layer,
-                    )
+                    if pin_this_layer:
+                        cpu_tensor = _pinned_empty(
+                            local_weight.shape,
+                            dtype=dtype,
+                            stride=local_weight.stride(),
+                        )
+                    else:
+                        cpu_tensor = torch.empty_strided(
+                            size=local_weight.shape,
+                            stride=local_weight.stride(),
+                            dtype=dtype,
+                        )
                     cpu_tensor.copy_(local_weight)
                     self._strided_cpu_weights[layer_idx][name] = cpu_tensor
                     self._weight_metadata[layer_idx][name] = {
@@ -1394,9 +1456,10 @@ class LayerwiseOffloadManager:
                 total_numel = current_offset
 
                 # create concatenated CPU buffer (in pinned memory)
-                cpu_buffer = torch.empty(
-                    total_numel, dtype=dtype, pin_memory=pin_this_layer
-                )
+                if pin_this_layer:
+                    cpu_buffer = _pinned_empty(total_numel, dtype=dtype)
+                else:
+                    cpu_buffer = torch.empty(total_numel, dtype=dtype)
 
                 # offload weights to the buffer
                 for name, weight, local_weight in contiguous_weights:

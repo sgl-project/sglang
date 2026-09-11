@@ -1,3 +1,4 @@
+import gc
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -2347,3 +2348,40 @@ def test_offloaded_weight_bytes_counts_mapped_and_strided_entries():
     )
     total = LayerwiseOffloadManager.offloaded_weight_bytes(manager)
     assert total == 8 * 2 + 6 * 2 + 4 * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_large_pinned_stores_are_registered_in_place_at_exact_size(monkeypatch):
+    pooled = []
+    empty = torch.empty
+
+    def record_pool_use(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pooled.append(kwargs)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_pool_use)
+    nbytes = layerwise_offload_mod._REGISTER_MIN_BYTES + 4096
+    tensor = layerwise_offload_mod._pinned_empty(nbytes, dtype=torch.uint8)
+    # locked where it was allocated: pinned, no pool block, no rounding
+    assert tensor.is_pinned()
+    assert tensor.untyped_storage().nbytes() == nbytes
+    assert pooled == []
+    del tensor
+    gc.collect()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_small_pinned_stores_keep_using_the_pool(monkeypatch):
+    pooled = []
+    empty = torch.empty
+
+    def record_pool_use(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pooled.append(kwargs)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_pool_use)
+    tensor = layerwise_offload_mod._pinned_empty(1024, dtype=torch.float32)
+    assert tensor.is_pinned()
+    assert len(pooled) == 1
