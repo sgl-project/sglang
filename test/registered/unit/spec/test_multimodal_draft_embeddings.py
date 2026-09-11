@@ -8,9 +8,6 @@ import torch
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative.eagle_worker_v2 import (
-    _shift_mm_input_embeds_for_draft_prefill,
-)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -26,7 +23,7 @@ class _MutatingLanguageModel:
         return input_embeds
 
 
-def test_eagle_mm_embeddings_survive_in_place_target_updates():
+def _run_mutating_prefill(input_embeds):
     source_embeds = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     expected_embeds = source_embeds.clone()
     forward_batch = SimpleNamespace(
@@ -35,7 +32,7 @@ def test_eagle_mm_embeddings_survive_in_place_target_updates():
         mm_inputs=[SimpleNamespace()],
         extend_prefix_lens_cpu=[0],
         extend_seq_lens_cpu=[4],
-        input_embeds=None,
+        input_embeds=input_embeds,
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
     )
 
@@ -52,22 +49,28 @@ def test_eagle_mm_embeddings_survive_in_place_target_updates():
             language_model=_MutatingLanguageModel(),
         )
 
+    return source_embeds, expected_embeds, forward_batch, hidden_states
+
+
+def test_eagle_mm_embeddings_survive_in_place_target_updates():
+    source_embeds, expected_embeds, forward_batch, hidden_states = (
+        _run_mutating_prefill(input_embeds=None)
+    )
+
     torch.testing.assert_close(hidden_states, expected_embeds + 100)
     torch.testing.assert_close(forward_batch.mm_input_embeds, expected_embeds)
     assert forward_batch.mm_input_embeds.data_ptr() != hidden_states.data_ptr()
 
 
-def test_shift_mm_embeddings_stays_within_request_boundaries():
-    mm_input_embeds = torch.tensor([[0], [1], [2], [10], [11], [20]])
-
-    shifted_embeds = _shift_mm_input_embeds_for_draft_prefill(
-        mm_input_embeds, extend_lens=[3, 2, 1]
+def test_eagle_mm_embeddings_reuse_source_when_static_buffer_exists():
+    static_embeds = torch.zeros(4, 2)
+    source_embeds, expected_embeds, forward_batch, hidden_states = (
+        _run_mutating_prefill(input_embeds=static_embeds)
     )
 
-    torch.testing.assert_close(
-        shifted_embeds, torch.tensor([[1], [2], [2], [11], [11], [20]])
-    )
-    assert shifted_embeds.data_ptr() != mm_input_embeds.data_ptr()
+    torch.testing.assert_close(hidden_states, expected_embeds + 100)
+    assert forward_batch.mm_input_embeds is source_embeds
+    torch.testing.assert_close(forward_batch.mm_input_embeds, expected_embeds)
 
 
 if __name__ == "__main__":
