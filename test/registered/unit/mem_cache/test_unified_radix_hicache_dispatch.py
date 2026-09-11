@@ -48,8 +48,30 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         )
 
         kvcache = _mock_kvcache(DeepSeekV4TokenToKVPool)
+        kvcache.swa_kv_pool = MagicMock()
         strategy = _select_strategy(kvcache, {FULL, SWA})
         self.assertIsInstance(strategy, _DeepSeekV4Strategy)
+
+    def test_deepseek_v41_encoder_replay_full_only(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        kvcache = _mock_kvcache(DeepSeekV4TokenToKVPool)
+        kvcache.swa_kv_pool = None
+        self.assertIsInstance(_select_strategy(kvcache, {FULL}), _DeepSeekV4Strategy)
+
+    def test_deepseek_v4_unified_kv_full_swa(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        kvcache = _mock_kvcache(DeepSeekV4TokenToKVPool)
+        kvcache._unified_kv = True
+        kvcache.swa_kv_pool = None
+        self.assertIsInstance(
+            _select_strategy(kvcache, {FULL, SWA}), _DeepSeekV4Strategy
+        )
 
     def test_mamba(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -141,6 +163,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
 
         for cls in (SWAKVPool, DeepSeekV4TokenToKVPool):
             kvcache = _mock_kvcache(cls)
+            kvcache.swa_kv_pool = MagicMock()
             with self.assertRaises(AssertionError) as cm:
                 _select_strategy(kvcache, {FULL})
             self.assertIn("No matching HiCache strategy", str(cm.exception))
