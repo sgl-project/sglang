@@ -479,6 +479,9 @@ class _DirectReader:
         self._fds.clear()
 
 
+_LSB = bytes(b & 1 for b in range(256))
+
+
 def _resident_fraction(data_ptr: int, nbytes: int, *, samples: int = 8) -> float:
     """Share of a mapping's pages the page cache holds, sampled in 4 MiB windows.
 
@@ -490,7 +493,8 @@ def _resident_fraction(data_ptr: int, nbytes: int, *, samples: int = 8) -> float
     window = 4 << 20
     start = data_ptr & ~(page - 1)
     total = data_ptr + nbytes - start
-    step = max(total // samples, window)
+    # mincore wants a page-aligned address: step in whole pages
+    step = max(total // samples, window) & ~(page - 1)
     resident = checked = 0
     offset = 0
     while offset < total:
@@ -499,7 +503,7 @@ def _resident_fraction(data_ptr: int, nbytes: int, *, samples: int = 8) -> float
         vec = (ctypes.c_ubyte * pages)()
         if _libc.mincore(ctypes.c_void_p(start + offset), ctypes.c_size_t(length), vec):
             return -1.0
-        resident += sum(byte & 1 for byte in bytes(vec))
+        resident += bytes(vec).translate(_LSB).count(1)
         checked += pages
         offset += step
     return resident / checked if checked else -1.0
@@ -803,13 +807,14 @@ class MappedLayerCourier:
                     located = (
                         self._reader.locate(cpu_tensor) if self.direct_read else None
                     )
-                    if (
-                        located is not None
-                        and not self._direct_read_always
-                        and _resident_fraction(cpu_tensor.data_ptr(), nbytes) >= 0.5
-                    ):
-                        located = None
-                        stats["cached_layers"] += 1
+                    if located is not None and not self._direct_read_always:
+                        # a layer the cache holds -- or one we cannot ask about --
+                        # keeps the memcpy path; only pages known to be cold go
+                        # to the drive
+                        fraction = _resident_fraction(cpu_tensor.data_ptr(), nbytes)
+                        if fraction < 0 or fraction >= 0.5:
+                            located = None
+                            stats["cached_layers"] += 1
                     if located is not None:
                         path, file_offset, _ = located
                         aligned_start, span = _aligned_span(file_offset, nbytes)
