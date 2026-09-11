@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_serving
+from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -162,7 +162,7 @@ def _create_unified_radix_cache(
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     tree_components = [ComponentType.FULL]
-    if ctx.is_hybrid_swa and not get_exec().features.enable_encoder_swa_bounded_replay:
+    if ctx.is_hybrid_swa:
         tree_components.append(ComponentType.SWA)
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)

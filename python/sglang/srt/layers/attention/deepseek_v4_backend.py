@@ -624,12 +624,12 @@ class DSV4AttnMetadata:
                 "c2_sparse_topk_lengths",
                 "c2_sparse_page_indices",
                 "c2_sparse_raw_indices",
+                "request_window_layout",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
-                "request_window_layout",
                 "c0_flashmla_metadata",
                 "c1_flashmla_metadata",
                 "c2_flashmla_metadata",
@@ -1873,6 +1873,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
+            num_groups=bs,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -2008,6 +2009,7 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=False,
             is_prefill=True,
+            num_groups=batch_size,
         )
         if swa_out_cache_loc is not None:
             # Captures store_cache's cached path instead of a per-layer
