@@ -176,6 +176,29 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
                 )
 
     @staticmethod
+    def _quantize_weight_online(
+        weight: torch.Tensor, weight_prefix: str, quant_dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize BF16/FP16 experts [E, N, K] to a packed MX payload.
+
+        The returned e8m0 block scale is already pair-split as [E, N, K//64, 2];
+        an offline checkpoint instead stores it flat as [E, N, K//32].
+        """
+        if weight.dtype not in (torch.float16, torch.bfloat16):
+            logger.warning(
+                "%s_weight dtype %s is not float16/bfloat16; casting to bfloat16 "
+                "before MX quantization.",
+                weight_prefix,
+                weight.dtype,
+            )
+            weight = weight.to(torch.bfloat16)
+        if not weight.is_npu:
+            weight = weight.to(f"npu:{torch.npu.current_device()}")
+        return torch.ops.npu.npu_dynamic_mx_quant(
+            weight, dst_type=quant_dtype, round_mode="round"
+        )
+
+    @staticmethod
     def _get_bias_args(
         quant_info: "AscendQuantInfo", weight_prefix: str
     ) -> Dict[str, Any]:
@@ -189,7 +212,12 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 #  NPUW4A8MXFP4MoEMethod
 # ---------------------------------------------------------------------------
 class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
-    """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
+    """W4A8 MoE with packed MXFP4 weights and MXFP8 activations.
+
+    Serves the offline ModelSlim ``W4A8_MXFP`` checkpoints and the online
+    ``--quantization mxfp_w4a8`` entry point; ``process_weights_after_loading``
+    tells them apart by expert-weight dtype.
+    """
 
     def __init__(self):
         super().__init__(quant_config=None)
@@ -208,6 +236,19 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
 
         weight = getattr(layer, f"{weight_prefix}_weight")
+        if weight.data.dtype in (torch.float16, torch.bfloat16):
+            # Online entry: UnquantizedFusedMoEMethod created BF16 experts and no
+            # scale parameter, so make both here and share the re-layout below.
+            packed, block_scale = self._quantize_weight_online(
+                weight.data, weight_prefix, fp4_dtype
+            )
+            weight = Parameter(packed, requires_grad=False)
+            layer.register_parameter(f"{weight_prefix}_weight", weight)
+            layer.register_parameter(
+                f"{weight_prefix}_weight_scale",
+                Parameter(block_scale, requires_grad=False),
+            )
+
         weight.data = npu_format_cast(
             weight.data,
             customize_dtype=torch.float8_e4m3fn,
@@ -215,13 +256,12 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         ).transpose(-1, -2)
 
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        scale = weight_scale.data.reshape(
-            weight_scale.shape[0],
-            weight_scale.shape[1],
-            weight_scale.shape[2] // 2,
-            2,
-        ).transpose(1, 2)
-        weight_scale.data = scale
+        scale = weight_scale.data
+        if scale.dim() == 3:
+            scale = scale.reshape(
+                scale.shape[0], scale.shape[1], scale.shape[2] // 2, 2
+            )
+        weight_scale.data = scale.transpose(1, 2)
 
         # The refactored NPU dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
@@ -274,7 +314,12 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
 #  NPUW4A4MXFP4MoEMethod
 # ---------------------------------------------------------------------------
 class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
-    """ModelSlim W4A4 MXFP4 MoE with single-level FP4 weights and activations."""
+    """W4A4 MXFP4 MoE with single-level FP4 weights and activations.
+
+    Serves the offline ModelSlim ``W4A4_MXFP4`` checkpoints and the online
+    ``--quantization mxfp4`` entry point; ``process_weights_after_loading``
+    tells them apart by expert-weight dtype.
+    """
 
     def __init__(self):
         super().__init__(quant_config=None)
@@ -286,6 +331,10 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
             quant_dtype=fp4_dtype,
             use_mx_quant=True,
         )
+        # Held next to self.matmul rather than picked by weight_prefix in
+        # __init__ (the MXFP8 shape) so one instance still serves both groups
+        # and the ModelSlim scheme keeps its no-argument constructor.
+        self.fused_gmm1 = GroupedMatmulSwigluQuant()
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -293,21 +342,81 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight = getattr(layer, f"{weight_prefix}_weight")
+        if weight.data.dtype in (torch.float16, torch.bfloat16):
+            # Online entry: UnquantizedFusedMoEMethod created BF16 experts and no
+            # scale parameter, so make both here and share the re-layout below.
+            packed, block_scale = self._quantize_weight_online(
+                weight.data,
+                weight_prefix,
+                self.hidden_states_quantizer.quant_dtype,
+            )
+            weight = Parameter(packed, requires_grad=False)
+            layer.register_parameter(f"{weight_prefix}_weight", weight)
+            layer.register_parameter(
+                f"{weight_prefix}_weight_scale",
+                Parameter(block_scale, requires_grad=False),
+            )
+
         weight.data = npu_format_cast(weight.data).transpose(-1, -2)
 
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        scale = weight_scale.data.reshape(
-            weight_scale.shape[0],
-            weight_scale.shape[1],
-            weight_scale.shape[2] // 2,
-            2,
-        ).transpose(1, 2)
-        weight_scale.data = scale
+        scale = weight_scale.data
+        if scale.dim() == 3:
+            scale = scale.reshape(
+                scale.shape[0], scale.shape[1], scale.shape[2] // 2, 2
+            )
+        weight_scale.data = scale.transpose(1, 2)
 
         # The refactored NPU dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize immediately before each GMM.
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gate/up projection, swiglu and fp4 requantization in one kernel.
+
+        Returns the fp4 activations and their e8m0 block scale, i.e. what the w2
+        gmm takes directly, so the runner skips its activation step. The
+        unfused route through apply() spends two extra kernels and two bf16
+        round trips through HBM ([T, 2*inter] and [T, inter]) to reach the same
+        gmm2 input.
+
+        ``pertoken_scale`` is None whenever the dispatcher handed over BF16,
+        which for W4A4 is always: there is no fp4 routing quant, so the
+        activation quant happens here.
+        """
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
+        e8m0_dtype = _require_e8m0_dtype()
+        fp4_dtype = self.hidden_states_quantizer.quant_dtype
+        return self.fused_gmm1.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens,
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            quant_mode=2,
+            dequant_dtype=torch.float32,
+            # Unlike e4m3, fp4 IS in the op's QUANT_DTYPES, so the x/weight
+            # dtypes must be named explicitly instead of left implicit.
+            quant_dtype=fp4_dtype,
+            x_dtype=fp4_dtype,
+            weight_dtype=fp4_dtype,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
+        )
 
     def apply(
         self,
@@ -324,7 +433,10 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
 
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-        elif pertoken_scale is not None:
+        elif pertoken_scale.dim() == 2:
+            # A flat [T, K/32] scale still needs pairing; apply_fused_gmm1_swiglu
+            # already returns the paired form, which the MXFP8 w2 gmm likewise
+            # forwards untouched.
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 32, 2
             )
