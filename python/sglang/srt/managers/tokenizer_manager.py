@@ -3495,9 +3495,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        # Check every rid for collisions before inserting any. This method is
+        # called outside the caller's try/except, so raising partway through the
+        # insertion loop would leak the already-inserted states: they have no
+        # waiter and no scheduler request, so nothing ever removes them, and they
+        # permanently poison those rids for later retries.
+        seen = set()
+        for rid, _, _ in items:
+            if rid in self.rid_to_state or rid in seen:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            seen.add(rid)
+
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state

@@ -1219,6 +1219,44 @@ class TestEmbeddingReqInputRidNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.rid, ["a", "b"])
 
+    def test_expanded_rids_are_not_prefixes_of_each_other(self):
+        """The scheduler aborts by prefix match, so no sub-rid may prefix another.
+
+        With an unpadded index ``base_1`` prefixes ``base_10``, so aborting one
+        item of a >=11 item score call would silently abort its siblings.
+        """
+        req = EmbeddingReqInput(text=["x"] * 12, rid="base")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid[0], "base_00")
+        self.assertEqual(req.rid[11], "base_11")
+        for a in req.rid:
+            for b in req.rid:
+                if a is not b:
+                    self.assertFalse(b.startswith(a), f"{a!r} prefixes {b!r}")
+
+    def test_expanded_rids_unpadded_for_small_batches(self):
+        req = EmbeddingReqInput(text=["Hello", "World", "!"], rid="my-rid")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid, ["my-rid_0", "my-rid_1", "my-rid_2"])
+
+    def test_reserved_rid_prefix_rejected(self):
+        for bad in ("HEALTH_CHECK", "HEALTH_CHECK-1", "draft:abc"):
+            with self.subTest(rid=bad):
+                req = EmbeddingReqInput(text=["a", "b"], rid=bad)
+                with self.assertRaisesRegex(ValueError, "reserved prefix"):
+                    req.normalize_batch_and_arguments()
+
+    def test_empty_rid_rejected(self):
+        req = EmbeddingReqInput(text=["a", "b"], rid="")
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            req.normalize_batch_and_arguments()
+
+    def test_generate_req_input_expansion_is_also_padded(self):
+        req = GenerateReqInput(text=["x"] * 12, rid="base")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid[0], "base_00")
+        self.assertEqual(req.rid[11], "base_11")
+
 
 if __name__ == "__main__":
     unittest.main()

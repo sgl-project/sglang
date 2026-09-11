@@ -51,6 +51,7 @@ import zmq.asyncio
 from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -78,6 +79,29 @@ else:
     Image = Any
 
 logger = logging.getLogger(__name__)
+
+# Reserved rid prefixes that change scheduler control flow rather than just
+# labelling a request, so a caller-supplied rid must never start with them.
+_RESERVED_RID_PREFIXES = (HEALTH_CHECK_RID_PREFIX, "draft:")
+
+
+def expand_base_rid(rid: str, num: int) -> List[str]:
+    """Expand one caller-supplied base rid into ``num`` per-item rids.
+
+    The index is zero-padded to a fixed width because the scheduler matches rids
+    by *prefix* when aborting (``req.rid.startswith(recv_req.rid)``). With an
+    unpadded index ``<base>_1`` is a prefix of ``<base>_10``, so aborting a single
+    item of a batch of 11 or more would silently abort its siblings too.
+    """
+    if not isinstance(rid, str) or not rid:
+        raise ValueError("The rid should be a non-empty string.")
+    for reserved in _RESERVED_RID_PREFIXES:
+        if rid.startswith(reserved):
+            raise ValueError(
+                f"The rid must not start with the reserved prefix {reserved!r}."
+            )
+    width = len(str(num - 1)) if num > 1 else 1
+    return [f"{rid}_{i:0{width}d}" for i in range(num)]
 
 
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
@@ -700,8 +724,7 @@ class GenerateReqInput:
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
-            self.rid = new_rids
+            self.rid = expand_base_rid(self.rid, num)
         elif isinstance(self.rid, list):
             # Note: the length of rid shall be the same as the batch_size,
             # as the rid would be expanded for parallel sampling in tokenizer_manager
@@ -1226,7 +1249,7 @@ class EmbeddingReqInput:
                 # GenerateReqInput._normalize_rid, so a caller can pass one rid
                 # for a whole batch (e.g. score_request threading a shared
                 # correlation id across the items it fans out into).
-                self.rid = [f"{self.rid}_{i}" for i in range(self.batch_size)]
+                self.rid = expand_base_rid(self.rid, self.batch_size)
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
 
