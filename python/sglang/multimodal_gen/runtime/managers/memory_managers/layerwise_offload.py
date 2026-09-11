@@ -1847,6 +1847,9 @@ class LayerwiseOffloadManager:
             return self._mapped_courier
         if envs.SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER:
             return None
+        if getattr(self, "_courier_retired", False):
+            # a courier that failed stays retired: its layers keep the synchronous copy
+            return None
         if self.copy_stream is None or self._synchronous_mps:
             return None
         if not self._mapped_bytes:
@@ -1893,6 +1896,7 @@ class LayerwiseOffloadManager:
                 exc,
             )
             self._mapped_courier = None
+            self._courier_retired = True
             self._mapped_bytes = self._mapped_bytes  # unchanged; direct path
         return self._mapped_courier
 
@@ -1912,6 +1916,7 @@ class LayerwiseOffloadManager:
                 exc,
             )
             self._mapped_courier = None
+            self._courier_retired = True
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
