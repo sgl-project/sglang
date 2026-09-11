@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentData,
     ComponentType,
     EvictLayer,
+    LinkerTransferPhase,
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
@@ -140,6 +141,14 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # Logical-page KV sharding: rotation base of the chain this node's Full
+        # KV pages belong to — the owner rank of position-page P along the chain
+        # is (rotation_base + P) % shard_size. A host-side mirror of the
+        # loc-derived owners (the Full value is a device tensor; reading it
+        # would put a D2H sync on the alloc path): set at insert from the
+        # inserting request's host base, copied on split, read through
+        # req.last_node at alloc time. None when sharding is off.
+        self.rotation_base: Optional[int] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -513,6 +522,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         return self.node_by_id(node_id) is self.root_node
+
+    supports_rotation_base = True
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the node's chain rotation base, or None
+        when sharding is off (and on the root, which starts no chain)."""
+        return self.node_by_id(node_id).rotation_base
 
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
@@ -954,7 +970,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if self.enable_external_cache_linker:
             return (
-                not node.external_cache_stored
+                self._needs_external_linker_offload(node)
                 and node.hit_count >= self.write_through_threshold
             )
 
@@ -963,6 +979,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and not node.backuped
             and node.hit_count >= self.write_through_threshold
         )
+
+    @staticmethod
+    def _needs_external_linker_offload(node: UnifiedTreeNode) -> bool:
+        """Whether neither a confirmed nor an in-flight external copy exists."""
+        return not node.external_cache_stored and node.write_through_pending_id is None
 
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the insert, running to its first barrier or completion."""
@@ -993,6 +1014,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 ),
             )
 
+        if params.rotation_base is not None:
+            conflict = self._rotation_conflict(key, params.rotation_base)
+            if conflict is not None:
+                total_prefix_length, node = conflict
+                return InsertStepResult(
+                    actions=[],
+                    result=InsertResult(
+                        prefix_len=total_prefix_length,
+                        last_device_node=node.id,
+                        rotation_tail_declined=True,
+                        adopted_ranges={} if params.track_adopted_ranges else None,
+                    ),
+                )
+
         self._ongoing_insert_walk_state = _InsertWalkState(
             phase=_InsertPhase.WALK,
             node=self.root_node,
@@ -1006,6 +1041,52 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             ),
         )
         return self._advance_insert()
+
+    def _rotation_conflict(
+        self, key: RadixKey, rotation_base: int
+    ) -> Optional[tuple[int, UnifiedTreeNode]]:
+        """Logical-page KV sharding: refuse an insert that would splice two
+        rotation runs into one cached path.
+
+        Read-only mirror of ``_insert_walk_step``'s matching. Returns
+        ``(matched_len, deepest_matched_node)`` when the chain this key lands on
+        was allocated under a different rotation base than the inserting
+        request's pages, else None.
+
+        Grafting across a base discontinuity would create a cached path whose
+        page owners are not one cyclic run — the padded-allgather / ``k // N``
+        translation contract — so later readers would crash on a negative pad or
+        silently read the wrong rank's scratch rows. Such a discontinuity means
+        two requests sharing a prefix were planned in pipelined batches before
+        either's insert landed, or the match was capped below the cached prefix.
+
+        Unlike the flat radix tree, the unified insert transfers page ownership
+        at three points, not just the tail graft: the tail leaf
+        (``_add_new_node``), an evicted node restored from the request's fresh
+        pages (``_unevict_node_on_insert``), and a component re-pointing a
+        matched node's Full value at the request's pages
+        (``update_component_on_insert_overlap``). All three are downstream of
+        this same predicate, so it is evaluated once, up front, and declines the
+        whole insert — which also keeps the walk's duplicate frees from running,
+        as the declined request stays on its own pages.
+        """
+        node = self.root_node
+        total_prefix_length = 0
+        while len(key) > 0:
+            child_key = key.child_key(self.page_size)
+            if child_key not in node.children:
+                break
+            child = node.children[child_key]
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            node = child
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            if prefix_len < len(child.key):
+                # The walk would split here; the fragment inherits this base.
+                break
+        if node is self.root_node or node.rotation_base == rotation_base:
+            return None
+        return total_prefix_length, node
 
     def resume_insert(self) -> InsertStepResult:
         """Continue the suspended insert after its step actions were executed."""
@@ -1143,7 +1224,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.total_prefix_length + len(state.key),
             )
             state.target_node = self._add_new_node(
-                state.node, state.key, state.value, priority=state.priority
+                state.node,
+                state.key,
+                state.value,
+                priority=state.priority,
+                rotation_base=state.params.rotation_base,
             )
             state.is_new_leaf = True
         else:
@@ -1218,6 +1303,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
+        # The rotation base is constant along a chain (position-page P keeps
+        # owner (b + P) % N on both sides of the split).
+        new_node.rotation_base = child.rotation_base
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -1266,10 +1354,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         value: torch.Tensor,
         priority: int = 0,
+        rotation_base: Optional[int] = None,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
         new_node.key = key
+        # Chain-constant under sharding: the pre-flight decline in
+        # begin_insert() guarantees this tail continues the matched prefix's
+        # rotation, so stamping the inserting request's base keeps every node
+        # on a root path carrying the same base.
+        new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -2140,7 +2234,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             while (
                 ancestor is not None
                 and ancestor is not self.root_node
-                and not (ancestor.backuped or ancestor.external_cache_stored)
+                and not ancestor.backuped
+                and not ancestor.external_cache_stored
+                and (
+                    not self.enable_external_cache_linker
+                    or ancestor.write_through_pending_id is None
+                )
             ):
                 chain.append(ancestor)
                 ancestor = ancestor.parent
@@ -2278,6 +2377,69 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             depth += 1
             node = node.parent
         return depth
+
+    def build_external_linker_offload_transfers(
+        self, node_id: NodeId
+    ) -> Optional[list[PoolTransfer]]:
+        """Build transfers for a node with no stored or pending external copy."""
+        node = self.node_by_id(node_id)
+        if not self._needs_external_linker_offload(node):
+            return None
+
+        transfers = []
+        for component in self.components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.OFFLOAD, node, None
+            )
+            if transfer is not None:
+                transfers.append(transfer)
+        return transfers
+
+    def mark_external_cache_stored_path(
+        self, from_node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        """Mark an externally restored path, excluding its existing anchor."""
+        until_node = self.node_by_id(until_node_id)
+        node = self.node_by_id(from_node_id)
+        path = []
+        while node is not until_node:
+            if node.parent is None:
+                raise RuntimeError(
+                    f"node {until_node_id} is not an ancestor of node {from_node_id}"
+                )
+            path.append(node)
+            node = node.parent
+
+        for node in path:
+            node.external_cache_stored = True
+
+    def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
+        """Publish an accepted external offload as pending."""
+        node = self.node_by_id(node_id)
+        if not self._needs_external_linker_offload(node):
+            raise AssertionError(
+                f"invalid external offload state for node {node_id}: "
+                f"stored={node.external_cache_stored}, "
+                f"pending={node.write_through_pending_id}"
+            )
+        node.write_through_pending_id = node_id
+
+    def finish_external_linker_offload(
+        self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
+    ) -> None:
+        """Finalize external-store state for an offload and its split fragments."""
+        nodes = [self.node_by_id(node_id) for node_id in node_ids]
+        for node_id, node in zip(node_ids, nodes):
+            if node.write_through_pending_id != ack_id:
+                raise AssertionError(
+                    f"invalid external offload state for node {node_id}: "
+                    f"expected pending={ack_id}; got "
+                    f"stored={node.external_cache_stored}, "
+                    f"pending={node.write_through_pending_id}"
+                )
+        for node in nodes:
+            node.write_through_pending_id = None
+            node.external_cache_stored |= success
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the

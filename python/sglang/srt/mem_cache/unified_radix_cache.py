@@ -13,6 +13,9 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    page_interleave_shard_size,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -199,6 +202,22 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+
+        if (
+            page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
+            and not self.tree_core.supports_rotation_base
+        ):
+            # A core that does not model rotation_base would never decline a
+            # cross-base graft, and the resulting cached path's page owners are
+            # not one cyclic run: later readers take a negative allgather pad or
+            # silently read another rank's scratch rows. Fail at construction
+            # rather than corrupt reads at serve time.
+            raise ValueError(
+                "logical-page KV sharding requires a tree core that tracks "
+                "rotation bases; "
+                f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
+                "does not."
+            )
 
         # Session ref tracking (--enable-session-radix-cache).
         self.session_refs = UnifiedSessionRefTracker(
@@ -939,6 +958,7 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params = InsertParams(
                 prev_prefix_len=req.kv.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                rotation_base=req.kv_rotation_base,
             )
 
             # components prepare insert data + return effective cache_len
@@ -975,8 +995,17 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail (+ deferred truncation tail)
-            ranges = [(page_aligned_len, len(kv_indices))]
+            # Free unaligned tail (+ deferred truncation tail). A rotation
+            # decline inserted nothing, so the whole span past the protected
+            # prefix stayed request-owned and is released here instead.
+            free_from = (
+                # min(): the protected prefix can already run past a truncated
+                # cache_len, and free_kv_row takes ascending ranges only.
+                min(req.kv.cache_protected_len, len(kv_indices))
+                if result.rotation_tail_declined
+                else page_aligned_len
+            )
+            ranges = [(free_from, len(kv_indices))]
             if tail_free_start is not None:
                 ranges.append((tail_free_start, len(kv_indices_full)))
             self.free_kv_row(req.kv, ranges)
@@ -1026,6 +1055,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1071,6 +1101,23 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.key = radix_key
         insert_params.value = values
         result = self.insert(insert_params)
+
+        if result.rotation_tail_declined:
+            # Rotation-base discontinuity with the matched chain (pipelined
+            # batches raced this request's insert against another chain over
+            # the same prefix). Adopting the canonical locs would leave this
+            # request's row mixing two rotation runs, which the cyclic-owner
+            # gather contract forbids -- keep the request entirely on its own
+            # pages: no dedup free, no rebind, no protection change. The insert
+            # declined before its walk, so nothing was freed underneath us. The
+            # final cache_finished_req releases everything past the protected
+            # prefix.
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=False, insert_params=insert_params
+                )
+            return
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
@@ -1594,7 +1641,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # entirely empty spec (e.g. foreign-pin rejection) must never report
         # success, even at load_back_threshold <= 0.
         if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
+            mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
@@ -1732,6 +1779,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
+
+    def rotation_base_of(self, node_id: Optional[NodeId]) -> Optional[int]:
+        if node_id is None:
+            return None
+        return self.tree_core.rotation_base_of(node_id)
 
     def query_storage_hit_length(
         self,
