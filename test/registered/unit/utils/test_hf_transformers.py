@@ -30,6 +30,7 @@ from sglang.srt.utils.hf_transformers.common import (
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -39,7 +40,7 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 # ---------------------------------------------------------------------------
 
 
-class TestGetProcessor(unittest.TestCase):
+class TestGetProcessor(CustomTestCase):
     def test_does_not_forward_backend_to_auto_processor(self):
         config = SimpleNamespace(model_type="test_vlm", auto_map={})
         loaded_processor = MagicMock()
@@ -144,7 +145,7 @@ class TestGetProcessor(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestImageProcessorKwargsPatch(unittest.TestCase):
+class TestImageProcessorKwargsPatch(CustomTestCase):
     def test_filters_unsupported_kwargs_and_caches_signature(self):
         class StrictImageProcessor(BaseImageProcessor):
             model_input_names = ["pixel_values"]
@@ -171,7 +172,7 @@ class TestImageProcessorKwargsPatch(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestNormalizeRopeScalingCompat(unittest.TestCase):
+class TestNormalizeRopeScalingCompat(CustomTestCase):
     def test_adds_type_from_rope_type(self):
         cfg = PretrainedConfig()
         cfg.rope_scaling = {"rope_type": "llama3", "factor": 8.0}
@@ -224,7 +225,7 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetRopeConfig(unittest.TestCase):
+class TestGetRopeConfig(CustomTestCase):
     def test_v5_rope_parameters(self):
         cfg = PretrainedConfig()
         cfg.rope_parameters = {"rope_theta": 10000.0, "rope_type": "default"}
@@ -254,7 +255,7 @@ class TestGetRopeConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPatchTextConfig(unittest.TestCase):
+class TestPatchTextConfig(CustomTestCase):
     def test_propagates_parent_to_text(self):
         parent = PretrainedConfig()
         parent.pad_token_id = 0
@@ -295,7 +296,7 @@ class TestPatchTextConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetContextLength(unittest.TestCase):
+class TestGetContextLength(CustomTestCase):
     def test_max_position_embeddings(self):
         cfg = PretrainedConfig()
         cfg.max_position_embeddings = 4096
@@ -338,7 +339,7 @@ class TestGetContextLength(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestCheckGgufFile(unittest.TestCase):
+class TestCheckGgufFile(CustomTestCase):
     def test_gguf_suffix(self):
         with tempfile.NamedTemporaryFile(suffix=".gguf") as f:
             self.assertTrue(check_gguf_file(f.name))
@@ -363,7 +364,7 @@ class TestCheckGgufFile(unittest.TestCase):
             self.assertFalse(check_gguf_file(d))
 
 
-class TestResolveHfGgufReference(unittest.TestCase):
+class TestResolveHfGgufReference(CustomTestCase):
     @patch("huggingface_hub.hf_hub_download", return_value="/cache/model-Q4_K.gguf")
     @patch("huggingface_hub.HfApi")
     def test_resolves_quant_type(self, api_cls, download):
@@ -405,7 +406,7 @@ class TestResolveHfGgufReference(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDeepseekOcrDetection(unittest.TestCase):
+class TestDeepseekOcrDetection(CustomTestCase):
     def test_ocr_model_detected(self):
         cfg = PretrainedConfig()
         cfg.auto_map = {"AutoModel": "modeling_deepseekocr.DeepseekOCRForCausalLM"}
@@ -439,7 +440,7 @@ class TestDeepseekOcrDetection(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestOverrideVHeadDimIfZero(unittest.TestCase):
+class TestOverrideVHeadDimIfZero(CustomTestCase):
     def test_patches_zero_v_head_dim(self):
         text_cfg = SimpleNamespace(v_head_dim=0)
         cfg = PretrainedConfig()
@@ -477,7 +478,7 @@ class TestOverrideVHeadDimIfZero(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetHfTextConfig(unittest.TestCase):
+class TestGetHfTextConfig(CustomTestCase):
     def test_returns_config_for_pure_text_model(self):
         cfg = PretrainedConfig()
         cfg.architectures = ["LlamaForCausalLM"]
@@ -561,7 +562,7 @@ class TestGetHfTextConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestAttachAdditionalStopTokenIds(unittest.TestCase):
+class TestAttachAdditionalStopTokenIds(CustomTestCase):
     """Bug regression: the Inkling bundle ships eos metadata unset while its
     turn-final marker <|content_model_end_sampling|> sits in added_tokens; the
     old detector only recognized <|eom_id|>, so generation ran to max length
@@ -597,7 +598,7 @@ class TestAttachAdditionalStopTokenIds(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestFixSpecialTokensPattern(unittest.TestCase):
+class TestFixSpecialTokensPattern(CustomTestCase):
     def test_fixes_cls_sep_with_missing_tokens(self):
         tok = SimpleNamespace(
             special_tokens_pattern="cls_sep",
@@ -636,7 +637,7 @@ class TestFixSpecialTokensPattern(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestModuleReExports(unittest.TestCase):
+class TestModuleReExports(CustomTestCase):
     def test_all_public_symbols_importable(self):
         import sglang.srt.utils.hf_transformers as pkg
 
@@ -662,7 +663,7 @@ class TestModuleReExports(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPatchRemovedSymbols(unittest.TestCase):
+class TestPatchRemovedSymbols(CustomTestCase):
     def test_llama_flash_attention2_exists(self):
         from transformers.models.llama import modeling_llama
 
@@ -677,7 +678,7 @@ class TestPatchRemovedSymbols(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestRopeParametersValidationPatch(unittest.TestCase):
+class TestRopeParametersValidationPatch(CustomTestCase):
     """A config without `max_position_embeddings` must still get its
     `default_rope_type` resolved, and must still not raise."""
 
@@ -709,7 +710,7 @@ class TestRopeParametersValidationPatch(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestIsTorchFxAvailableCompat(unittest.TestCase):
+class TestIsTorchFxAvailableCompat(CustomTestCase):
     def test_is_torch_fx_available_exists(self):
         import transformers.utils.import_utils as _iu
 
@@ -727,7 +728,7 @@ class TestIsTorchFxAvailableCompat(unittest.TestCase):
 _KNOWN_NAME_MISMATCHES = {"inkling_mm_model"}
 
 
-class TestAutoConfigRegistration(unittest.TestCase):
+class TestAutoConfigRegistration(CustomTestCase):
     """`AutoConfig` must keep resolving to a class the Auto* mappings can key on.
 
     `_LazyAutoMapping` looks its entries up by config class `__name__`, so a
@@ -778,7 +779,7 @@ class TestAutoConfigRegistration(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPixtralVisionRope(unittest.TestCase):
+class TestPixtralVisionRope(CustomTestCase):
     """The Pixtral tower takes its rope table from transformers, so a change to
     the axial recomposition would rotate every patch by the wrong angle with
     the shapes and the import both still intact."""
