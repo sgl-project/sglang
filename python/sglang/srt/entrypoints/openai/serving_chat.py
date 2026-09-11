@@ -1043,6 +1043,22 @@ class OpenAIServingChat(OpenAIServingBase):
             f"received unsupported content type '{media_type}'."
         )
 
+    def _engine_prompt(
+        self, processed_messages: MessageProcessingResult, is_multimodal: bool
+    ) -> tuple[str, Any]:
+        """Standard VLMs render a text prompt (with placeholder strings) for
+        the MM processor to tokenize. Token-first encoders instead produce
+        pre-rendered input_ids with single placeholder ids and leave the text
+        empty; pass those through rather than re-tokenizing an empty prompt.
+        """
+        if is_multimodal and not chat_encoding.spec_renders_prompt_ids(
+            self.chat_encoding_spec
+        ):
+            return "text", processed_messages.prompt
+        if isinstance(processed_messages.prompt_ids, str):
+            return "text", processed_messages.prompt_ids
+        return "input_ids", processed_messages.prompt_ids
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -1112,27 +1128,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle single vs multiple requests
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal and self.chat_encoding_spec == "kimi_k3":
-            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal:
-            # Standard VLMs render a text prompt (with placeholder strings) for the MM
-            # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
-            # input_ids with single placeholders; pass those through so the MM processor
-            # expands them rather than re-tokenizing an empty prompt. Gated on the Inkling
-            # encoding spec so every other model keeps the standard text path.
-            if (
-                self.chat_encoding_spec == "inkling"
-                and isinstance(processed_messages.prompt_ids, list)
-                and processed_messages.prompt_ids
-            ):
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-            else:
-                prompt_kwargs = {"text": processed_messages.prompt}
         else:
-            if isinstance(processed_messages.prompt_ids, str):
-                prompt_kwargs = {"text": processed_messages.prompt_ids}
-            else:
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+            prompt_key, prompt_value = self._engine_prompt(
+                processed_messages, is_multimodal
+            )
+            prompt_kwargs = {prompt_key: prompt_value}
 
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
