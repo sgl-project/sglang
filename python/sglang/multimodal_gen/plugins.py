@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from enum import Enum
@@ -34,40 +35,43 @@ class _OnceState(Enum):
 class _Once:
     """A process-local initialization gate.
 
-    Activation runs during single-threaded process startup, so this is
-    deliberately unsynchronized. It exists for idempotency, for the re-entrant
-    call a plugin callback can make, and to keep a failure terminal.
+    The lock spans the action, so RUNNING means the caller is the thread already
+    inside: a callback that hands activation to another thread and joins it
+    deadlocks rather than racing. A failure is terminal.
     """
 
     def __init__(self, name: str) -> None:
         self.name = name
         self.state = _OnceState.NOT_STARTED
         self.error: BaseException | None = None
+        self._lock = threading.RLock()
 
     def run(self, action: Callable[[], None]) -> bool:
         """Run *action* once; return False only for a re-entrant call."""
-        if self.state is _OnceState.COMPLETE:
-            return True
-        if self.state is _OnceState.FAILED:
-            raise RuntimeError(
-                f"{self.name} previously failed: {self.error}"
-            ) from self.error
-        if self.state is _OnceState.RUNNING:
-            return False
+        with self._lock:
+            if self.state is _OnceState.COMPLETE:
+                return True
+            if self.state is _OnceState.FAILED:
+                raise RuntimeError(
+                    f"{self.name} previously failed: {self.error}"
+                ) from self.error
+            if self.state is _OnceState.RUNNING:
+                return False
 
-        self.state = _OnceState.RUNNING
-        try:
-            action()
-        except BaseException as exc:
-            self.error = exc
-            self.state = _OnceState.FAILED
-            raise
-        self.state = _OnceState.COMPLETE
-        return True
+            self.state = _OnceState.RUNNING
+            try:
+                action()
+            except BaseException as exc:
+                self.error = exc
+                self.state = _OnceState.FAILED
+                raise
+            self.state = _OnceState.COMPLETE
+            return True
 
     def reset(self) -> None:
-        self.state = _OnceState.NOT_STARTED
-        self.error = None
+        with self._lock:
+            self.state = _OnceState.NOT_STARTED
+            self.error = None
 
 
 _plugin_registration = _Once("Diffusion plugin registration")
@@ -219,7 +223,8 @@ def load_plugins() -> None:
     seemingly harmless plugin-discovery call capable of importing the entire
     worker runtime.
 
-    Re-entrant calls from a plugin callback return immediately. A failed load is
+    Re-entrant calls from a plugin callback return immediately; a caller on
+    another thread waits for the in-flight registration. A failed load is
     terminal for the process because arbitrary callback side effects cannot be
     rolled back safely.
     """

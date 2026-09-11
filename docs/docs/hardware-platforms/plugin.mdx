@@ -205,11 +205,36 @@ platform activation module necessarily loads before its own `init_backend()`;
 activation modules must therefore remain import-safe. Prefer platform methods
 and registries for required behavior.
 
-Diffusion activation runs during single-threaded process startup, so each phase
-is a plain process-local gate: a re-entrant call from a plugin callback returns
-and lets the outer call finish the phase. A fatal failure is cached and
-re-raised on later calls, because plugin callbacks can have arbitrary side
-effects and retrying them in the same process would be unsafe.
+Each activation phase runs once per process behind a lock: a re-entrant call
+from a plugin callback returns and lets the outer call finish, another thread
+waits for it, and a failure is terminal. A callback must not hand activation to
+a second thread and join it — that deadlocks.
+
+#### Offline scripts and the spawn boundary
+
+`spawn` re-executes the launching script's module scope in every child *before*
+it unpickles the target's arguments, so an offline script's own imports run
+ahead of that child's platform initialization and `ServerArgsPayload` cannot
+help. The supported script layout is:
+
+```python
+from sglang.multimodal_gen import DiffGenerator  # a proxy: imports nothing yet
+
+if __name__ == "__main__":
+    generator = DiffGenerator.from_pretrained(model_path="...")
+```
+
+`DiffGenerator` on the `sglang.multimodal_gen` facade is a lazy proxy, so
+binding it at module scope costs no diffusion import and the child still reaches
+`initialize_current_platform()` with a clean module table. Module scope also
+stays open to `envs`, `plugins` and `runtime.platforms`, which the contract
+already keeps import-safe — a plugin must import the last of those to subclass
+`Platform`. Everything else, including `SamplingParams` and `PipelineConfig`
+from the same facade, belongs inside the `if __name__ == "__main__":` guard or
+inside the function that uses it. A child
+that finds runtime modules already imported names them in a warning: hook
+application can still patch those modules, but classes and registrations
+created while importing them are already past reach.
 
 ---
 

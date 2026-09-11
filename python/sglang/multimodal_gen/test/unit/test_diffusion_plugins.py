@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +13,43 @@ from sglang.srt.plugins.hook_registry import (
     HookType,
 )
 
+_THREAD_TIMEOUT_S = 10
+
+
+class _Caller(threading.Thread):
+    """Runs one activation call on its own thread, keeping what it raised."""
+
+    def __init__(self, call):
+        super().__init__(daemon=True)
+        self._call = call
+        self.error = None
+
+    def run(self):
+        try:
+            self._call()
+        except BaseException as exc:
+            self.error = exc
+
+
+class _GateProbe:
+    """A gate lock that reports when a thread genuinely has to wait on it.
+
+    The non-blocking attempt fails only for a non-owner, so the arrival is
+    observable instead of guessed at with a sleep that can silently miss.
+    """
+
+    def __init__(self, lock):
+        self._lock = lock
+        self.blocked = threading.Event()
+
+    def __enter__(self):
+        if not self._lock.acquire(blocking=False):
+            self.blocked.set()
+            self._lock.acquire()
+
+    def __exit__(self, *exc_info):
+        self._lock.release()
+
 
 def _entry_point(name, distribution):
     entry_point = MagicMock(name=f"entry_point_{name}")
@@ -21,8 +60,74 @@ def _entry_point(name, distribution):
     return entry_point
 
 
-class TestDiffusionPluginBarrier(unittest.TestCase):
+class _ThreadedTestCase(unittest.TestCase):
     def setUp(self):
+        super().setUp()
+        self._callers = []
+        # A failed assertion can leave a caller unjoined; it must not run on
+        # into the next test.
+        self.addCleanup(self._join_started_callers)
+
+    def _join_started_callers(self):
+        for caller in self._callers:
+            caller.join(_THREAD_TIMEOUT_S)
+
+    def _finish(self):
+        for caller in self._callers:
+            caller.join(_THREAD_TIMEOUT_S)
+            self.assertFalse(caller.is_alive(), "activation thread never finished")
+
+    def _start_caller(self, call):
+        caller = _Caller(call)
+        self._callers.append(caller)
+        caller.start()
+        return caller
+
+    def _start_second_caller(self, call, probe):
+        """Start *call* elsewhere and wait until it is provably blocked at the gate."""
+        caller = self._start_caller(call)
+        self.assertTrue(
+            probe.blocked.wait(_THREAD_TIMEOUT_S),
+            "second thread never reached the gate",
+        )
+        return caller
+
+
+class TestOnceGate(_ThreadedTestCase):
+    """Gate semantics on a fresh instance, clear of the module-global phases."""
+
+    def test_a_waiting_thread_inherits_the_failure(self):
+        """A failure must reach a caller that arrived while the phase ran."""
+        once = plugins._Once("test gate")
+        probe = _GateProbe(once._lock)
+        once._lock = probe
+        inside = threading.Event()
+        release = threading.Event()
+
+        def boom():
+            inside.set()
+            self.assertTrue(
+                release.wait(_THREAD_TIMEOUT_S), "release was never signalled"
+            )
+            raise RuntimeError("vendor plugin exploded")
+
+        first = self._start_caller(lambda: once.run(boom))
+        try:
+            self.assertTrue(inside.wait(_THREAD_TIMEOUT_S))
+            second = self._start_second_caller(lambda: once.run(lambda: None), probe)
+        finally:
+            release.set()
+            self._finish()
+
+        self.assertIsInstance(first.error, RuntimeError)
+        self.assertIn("exploded", str(first.error))
+        self.assertIsInstance(second.error, RuntimeError)
+        self.assertIn("previously failed", str(second.error))
+
+
+class TestDiffusionPluginBarrier(_ThreadedTestCase):
+    def setUp(self):
+        super().setUp()
         state = (
             plugins._plugin_registration.state,
             plugins._plugin_registration.error,
@@ -32,6 +137,10 @@ class TestDiffusionPluginBarrier(unittest.TestCase):
         )
         self.addCleanup(self._restore_lifecycle, state)
         plugins._reset_lifecycle_for_tests()
+        self._callers = []
+        # A failed assertion can leave a caller unjoined; it must not run on
+        # into the next test.
+        self.addCleanup(self._join_started_callers)
 
     @staticmethod
     def _restore_lifecycle(state):
@@ -118,8 +227,63 @@ class TestDiffusionPluginBarrier(unittest.TestCase):
 
         apply_hooks.assert_called_once_with()
 
+    def _probe_registration_gate(self):
+        probe = _GateProbe(plugins._plugin_registration._lock)
+        patcher = patch.object(plugins._plugin_registration, "_lock", probe)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return probe
+
+    def test_a_second_thread_does_not_skip_hook_application(self):
+        """A caller that arrives during registration must not return before the
+        registry is applied."""
+        inside = threading.Event()
+        release = threading.Event()
+        applied_on_return = []
+        probe = self._probe_registration_gate()
+
+        def slow_register():
+            inside.set()
+            self.assertTrue(
+                release.wait(_THREAD_TIMEOUT_S), "release was never signalled"
+            )
+
+        with (
+            patch.object(plugins, "_register_plugins_once", slow_register),
+            patch.object(plugins.HookRegistry, "apply_hooks") as apply_hooks,
+        ):
+
+            def apply_and_report():
+                plugins.apply_plugin_hooks()
+                applied_on_return.append(apply_hooks.call_count)
+
+            first = self._start_caller(plugins.load_plugins)
+            try:
+                self.assertTrue(inside.wait(_THREAD_TIMEOUT_S))
+                second = self._start_second_caller(apply_and_report, probe)
+            finally:
+                release.set()
+                self._finish()
+
+            apply_hooks.assert_called_once_with()
+
+        self.assertIsNone(first.error)
+        self.assertIsNone(second.error)
+        self.assertEqual(
+            applied_on_return,
+            [1],
+            "second thread returned before the registry was applied",
+        )
+
 
 class TestDiffusionPlugins(unittest.TestCase):
+    def setUp(self):
+        # _discover() reads this live, so an allowlist set in the environment
+        # would filter the mocked entry points out from under these tests.
+        patcher = patch.dict(os.environ, {"SGLANG_PLUGINS": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_load_executes_callbacks_without_resolving_hook_targets(self):
         register = MagicMock()
 
@@ -150,6 +314,8 @@ class TestDiffusionPlugins(unittest.TestCase):
                     "healthy": (healthy, "b"),
                 },
             ),
+            # Unpatched, this runs real platform detection.
+            patch.object(plugins, "get_selected_platform_dist", return_value=None),
         ):
             plugins._register_plugins_once()
 

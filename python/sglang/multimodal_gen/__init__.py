@@ -3,24 +3,22 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from sglang.utils import LazyImport
+
 if TYPE_CHECKING:
     from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
     from sglang.multimodal_gen.configs.sample import SamplingParams
-    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-        DiffGenerator,
-    )
 
 __all__ = ["DiffGenerator", "PipelineConfig", "SamplingParams"]
 
+DiffGenerator = LazyImport(
+    "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator",
+    "DiffGenerator",
+)
+
 
 def __getattr__(name: str) -> Any:
-    if name == "DiffGenerator":
-        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-            DiffGenerator,
-        )
-
-        value = DiffGenerator
-    elif name == "PipelineConfig":
+    if name == "PipelineConfig":
         from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
 
         value = PipelineConfig
