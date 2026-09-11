@@ -115,10 +115,9 @@ export const config = {
             // state pool still is not enough: its head costs ~3.2GB more at
             // runtime, and at fp32 the default split leaves the pool short of
             // its slots. Measured on v0.5.19 - the published pins alone, and
-            // the KV cap alone, both fail to boot here. Balanced ratio,
-            // r = S * token_equiv / L with D = 0 (replayssm moves the draft's
-            // intermediate states onto a fixed ring), S = 5 / 4 and
-            // token_equiv = 4923 for an fp32 state slot against an fp8 KV token.
+            // the KV cap alone, both fail to boot here. The pins below are the
+            // measured pair; pinning the ratio here overrides the calculator's
+            // live value for this selection.
             ...(sel.hw === "rtx5090" &&
                 sel.quant === "nvfp4-bf16-head" &&
                 sel.ssmDtype === "float32"
@@ -147,17 +146,6 @@ export const config = {
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
             "--speculative-draft-attention-backend flashinfer",
-            // Measured on the 5090 on v0.5.19: bf16 serves at 0.88,
-            // below the 0.90 this recipe carried when it was measured on an
-            // older build, because a draft model plus the automatic prefill
-            // CUDA-graph capture no longer fit there. fp32 is greyed out by the
-            // SSM dtype row. EAGLE and no-speculation are unaffected: replayssm
-            // keeps EAGLE's state pool tiny and no-spec loads no draft weights.
-            // Measured on the 5090 at the commit the Install accordion pins:
-            // bf16 serves at 0.88, and on the FP4-head export fp32 serves at
-            // 0.89 on the balanced ratio (pool 25,911 / K=6 low-latency,
-            // 29,490 / K=5 high-throughput). fp32 on the BF16-head export is
-            // greyed out by the SSM dtype row.
             // On the 32GB 5090 this row owns the pools outright. Two things
             // fail if it does not: the KV pool sizes itself for concurrency
             // --max-running-requests 1 forbids (127,332 tokens against the
@@ -167,13 +155,11 @@ export const config = {
             // --mem-fraction-static, so boot dies with
             // `max_mamba_cache_size=0 ... max_num_reqs=0`.
             //
-            // Ratios are the calculator's balanced values,
-            // r = S * token_equiv / L, with S = 5 (extra_buffer) or 4
-            // (extra_buffer_lazy), token_equiv = 2398 (bf16 state slot vs fp8
-            // KV token) or 4923 (fp32), and L = 8192 + 1024. The mem-fraction
-            // and prefill-chunk values below are measured on v0.5.19; the two
-            // FP4-head exports share one set of pins, the dense-lm_head export
-            // needs its own because its head costs ~3.2GB more at runtime.
+            // Every value below is measured on v0.5.19 at ISL 8192 / OSL 1024,
+            // concurrency 1. Pinning the ratio here overrides the calculator's
+            // live value for these selections. The two FP4-head exports share
+            // one set of pins; the dense-lm_head export needs its own because
+            // its head costs ~3.2GB more at runtime.
             ...(sel.hw === "rtx5090"
               ? [
                   "--max-total-tokens 16384",
@@ -386,7 +372,9 @@ export const config = {
   ],
 
   dockerImages: {
-    // Every recipe on this page is measured on this release. It is multi-arch
+    // One release for the whole page. Every SM12x recipe (RTX PRO 6000,
+    // RTX 5090, DGX Spark) is measured on it; the H200 and GB300 recipes were
+    // validated on earlier builds and carry over unchanged. Multi-arch
     // (linux/amd64 + linux/arm64), so it pulls natively on DGX Spark's GB10.
     // This tag and v0.5.19-cu130 are the same image (same digest); the sweep
     // ran the -cu130 name.
@@ -753,8 +741,7 @@ export const config = {
     {
       // NVIDIA's ModelOpt export: same body, same FP4 lm_head, same 21.9GB of
       // weights as the RadixArk FP4-head checkpoint, so the 32GB fit and every
-      // mem-fraction pin the overlay rows apply carry over unchanged. Those
-      // pins were measured on the RadixArk export, not this one, hence the badge.
+      // mem-fraction pin the overlay rows apply carry over unchanged.
       match: { hw: "rtx5090", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
       // Measured on v0.5.19 against this export: all 15 offered overlay
       // combinations serve and score 93.93-94.92% on the full 1319-question
@@ -962,8 +949,6 @@ export const config = {
       ],
     },
     {
-      // NVIDIA's ModelOpt export of the same W4A4 body and FP4 lm_head as the
-      // RadixArk FP4-head checkpoint above, on that cell's recipe.
       match: { hw: "gb300", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
       verified: true,
       // DFLASH2 has not been exercised on this platform; every other overlay

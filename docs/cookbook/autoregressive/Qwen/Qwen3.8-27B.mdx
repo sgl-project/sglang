@@ -19,7 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 pip install --upgrade pip
 pip install uv
 
-pip install "sglang[all]==0.5.19"
+uv pip install --prerelease=allow "sglang[all]==0.5.19"
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -203,10 +203,11 @@ recipes pin `--max-running-requests 1`, but nothing caps the pools to match, so
 the KV pool sizes itself for 127,332 tokens against the 9,216 one
 8192-in/1024-out request needs, and the engine's default split then leaves the
 GDN state pool far short of the slots it needs once the draft model's weights
-are counted against `--mem-fraction-static`. The DSPARK row (and DFLASH2 on the
-dense-lm_head export) therefore pins `--max-total-tokens` and the calculator's
-balanced `--mamba-full-memory-ratio`. The no-speculation and MTP rows need
-none of that and run at the pins shown.
+are counted against `--mem-fraction-static`. The DSPARK row therefore pins
+`--max-total-tokens` and a measured `--mamba-full-memory-ratio`, as do DFLASH2
+and MTP on the dense-lm_head export at float32 state. Those pins override the
+calculator's live value for the selections that carry them. The no-speculation
+row needs none of it and runs at the pins shown.
 
 The two RadixArk checkpoints declare `kv_cache_quant_algo: FP8`, so SGLang's
 default `--kv-cache-dtype auto` already puts their KV pool in `fp8_e4m3`. The
@@ -299,15 +300,16 @@ row back to Auto.
   serving tiers and two GDN state dtypes, full 1319-question GSM8K on each,
   93.18-95.15%. The RTX PRO 6000 and DGX Spark recipes need no changes. On the
   32GB RTX 5090 the panel applies the measured pins automatically: DFlash2 at
-  `--mem-fraction-static 0.91` with `--chunked-prefill-size 1024` — the only
-  cell on this page needing a smaller prefill chunk, because at 0.91 the pools
-  fit but a 2048-token chunk's activations do not — DSpark at 0.88 (bfloat16)
-  and 0.91 (float32) with its pools pinned, EAGLE at 0.93 (bfloat16) and 0.94
-  (float32), and no-speculation at 0.90.
+  `--mem-fraction-static 0.91` with `--chunked-prefill-size 1024` — at 0.91 the
+  pools fit but a 2048-token chunk's activations do not — DSpark at 0.88
+  (bfloat16), 0.91 (float32) and 0.92 on the dense-lm_head export, all three
+  with their pools pinned and the last two also cutting the prefill chunk to
+  1024 and 512, EAGLE at 0.93 (bfloat16) and 0.94 (float32), and
+  no-speculation at 0.90.
   Whether float32 is available with a draft model depends on the `lm_head`: on
   the BF16-head export it is greyed out for both DSpark and DFlash2, since the
   dense head's ~3.2 GB leave no fp32 state pool that also clears prefill graph
-  capture. The FP4-head export frees that headroom back — DSpark serves at 0.89
+  capture. The FP4-head export frees that headroom back — DSpark serves at 0.91
   and DFlash2 High-Throughput at 0.895 with `--mamba-full-memory-ratio 10`
   overriding the balanced value — and only DFlash2 Low-Latency stays out of
   reach, where five fp32 slots and a full request's KV never coexist. bfloat16
