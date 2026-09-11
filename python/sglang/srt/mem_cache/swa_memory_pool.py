@@ -42,6 +42,7 @@ class SWAKVPool(BaseSWAKVPool):
         swa_kv_pool_class: Optional[type] = None,
         full_kv_pool_kwargs: Optional[dict] = None,
         swa_kv_pool_kwargs: Optional[dict] = None,
+        identity_swa_locations: bool = False,
         **kwargs,
     ):
         self.size = size
@@ -56,6 +57,7 @@ class SWAKVPool(BaseSWAKVPool):
         self.start_layer = 0
         self.page_size = page_size
         self.layer_transfer_counter = None
+        self.identity_swa_locations = identity_swa_locations
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -214,9 +216,8 @@ class SWAKVPool(BaseSWAKVPool):
         # asking a pool for "the" v_head_dim wants the full-attention geometry.
         # `start_layer`, not 0, so pipeline parallelism (start_layer > 0) works,
         # and because layer 0 need not be a full-attention layer.
-        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
-            -1
-        ]
+        pool = self.full_kv_pool if self.full_layer_nums else self.swa_kv_pool
+        return pool.get_value_buffer(pool.start_layer).shape[-1]
 
     def get_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
@@ -235,7 +236,9 @@ class SWAKVPool(BaseSWAKVPool):
             return self.full_kv_pool.get_kv_scale_buffer(layer_id_pool)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
-        assert self.full_to_swa_index_mapping is not None
+        if self.full_to_swa_index_mapping is None:
+            assert self.identity_swa_locations
+            return kv_indices
         # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.
         return self.full_to_swa_index_mapping[kv_indices]
 
@@ -255,9 +258,13 @@ class SWAKVPool(BaseSWAKVPool):
         pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
         if is_swa_layer:
             # swa_loc is the full->SWA translation, computed once per forward by
-            # the attention backend; set_kv_buffer never translates internally.
-            assert swa_loc is not None
-            loc = swa_loc
+            # the attention backend. With hybrid allocation disabled, both pools
+            # share the same logical locations and no mapping is registered.
+            loc = (
+                swa_loc
+                if swa_loc is not None
+                else self.translate_loc_from_full_to_swa(loc)
+            )
         if isinstance(pool, MLATokenToKVPool):
             pool.set_kv_buffer(
                 None,

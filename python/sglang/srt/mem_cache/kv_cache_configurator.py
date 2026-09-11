@@ -1234,10 +1234,19 @@ class KVCacheConfigurator:
         elif (
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa or self.is_hybrid_swa_compress:
+                full_max_total_num_tokens = sizes.full_max_total_num_tokens
+                swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
+                if not self.is_hybrid_swa:
+                    # --disable-hybrid-swa-memory keeps one shared logical token
+                    # space, but compressed SWA models can still have different
+                    # full/SWA KV geometries. Back both geometries with the same
+                    # token capacity and use identity locations between them.
+                    full_max_total_num_tokens = sizes.max_total_num_tokens
+                    swa_max_total_num_tokens = sizes.max_total_num_tokens
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
-                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
-                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    full_max_total_num_tokens=full_max_total_num_tokens,
+                    swa_max_total_num_tokens=swa_max_total_num_tokens,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
                 token_to_kv_pool = self._build_ascend_minimax_sparse_kv_pool(
@@ -1478,6 +1487,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=self.model_config.full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
+            identity_swa_locations=not self.is_hybrid_swa,
             **kwargs,
         )
         return token_to_kv_pool
@@ -1576,6 +1586,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,

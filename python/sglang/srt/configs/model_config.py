@@ -963,6 +963,15 @@ class ModelConfig:
             "InklingForConditionalGenerationMTP",
             "Gemma4UnifiedForConditionalGeneration",
         ]
+        if self.is_hybrid_swa_compress and not self.is_hybrid_swa:
+            # Disabling hybrid SWA memory changes allocation policy, but layers
+            # with different KV geometries still need full/SWA pool routing.
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures,
+                    self.hf_text_config,
+                )
+            )
 
     @cached_property
     def linear_attn_registry_result(self) -> Any:
