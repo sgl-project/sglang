@@ -626,6 +626,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 with self.assertRaisesRegex(ValueError, message):
                     self._construct(*qwen4, **kwargs)
 
+    def test_qwen4_ple_file_requires_offload(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        with override_platform(is_cuda=True):
+            sa = self._construct(
+                *qwen4,
+                ple_offload_embedding=True,
+                ple_offload_backend="file",
+                ple_offload_dir="/tmp/ple",
+            )
+            self.assertEqual(self._resolved(sa, "ple_offload_backend"), "file")
+            self.assertEqual(self._resolved(sa, "ple_offload_dir"), "/tmp/ple")
+            with self.assertRaisesRegex(ValueError, "requires --ple-offload-embedding"):
+                self._construct(
+                    *qwen4, ple_offload_embedding=False, ple_offload_backend="file"
+                )
+
     def test_qwen4_ple_offload_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
         with override_platform(is_cuda=True):
