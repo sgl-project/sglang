@@ -1,0 +1,289 @@
+---
+title: "Nebius Serverless AI"
+description: "Deploy a single-GPU SGLang server on Nebius Serverless AI Endpoints and send authenticated OpenAI-compatible requests."
+---
+
+Run the SGLang OpenAI-compatible server on a [Nebius Serverless AI Endpoint](https://docs.nebius.com/serverless/overview). This guide uses one NVIDIA L40S GPU and a small public model, `Qwen/Qwen3-0.6B`.
+
+The Endpoint keeps running until you stop or delete it. This example uses a regular GPU instance and does not configure autoscaling or automatic scale-to-zero. Nebius bills its underlying Compute resources; mounted storage is billed separately. See [pricing and quotas](https://docs.nebius.com/serverless/pricing-quotas).
+
+<Note>
+This example has not yet been validated on a live Nebius Endpoint. Its image, model revision, and CLI options have been checked against their published interfaces; GPU compatibility, cold starts, streaming through ingress, and cleanup still require end-to-end validation.
+</Note>
+
+{/* TODO: Complete live validation of this exact configuration before removing the note above. */}
+
+## Prerequisites
+
+- A Nebius project with permission to create, inspect, stop, start, and delete Endpoints, and to inspect their underlying Compute VMs and disks.
+- Sufficient GPU, VM, and disk quotas in `eu-north1`. Check availability of `gpu-l40s-a` with the `1gpu-8vcpu-32gb` preset in your project.
+- A subnet with outbound access to Docker Hub and Hugging Face. Restrict direct access to the container from the subnet to trusted clients.
+- The [Nebius CLI](https://docs.nebius.com/cli/install), authenticated for that project. The CLI options below were checked with version `0.12.265`.
+- Bash, `curl`, `jq`, and `openssl` on your local machine. The Python example also requires Python 3.10 or newer.
+
+The image runs Linux/amd64 with CUDA 13. Check its NVIDIA driver requirements against the selected platform when changing the image or GPU. This model does not require a Hugging Face token. For a gated model, accept its license and supply `HF_TOKEN` using Nebius [secret environment variables](https://docs.nebius.com/serverless/endpoints/manage); do not put the secret in the command arguments or image.
+
+## Create the Endpoint
+
+Run the following commands in Bash. Set the project and subnet IDs explicitly, and use the same CLI profile throughout the guide.
+
+```bash
+export PROJECT_ID="<project-id>"
+export SUBNET_ID="<subnet-id>"
+export ENDPOINT_NAME="sglang-qwen-$(openssl rand -hex 6)"
+export ENDPOINT_TOKEN="$(openssl rand -hex 32)"
+export MODEL_ID="Qwen/Qwen3-0.6B"
+export MODEL_REVISION="c1899de289a04d12100db370d81485cdf75e47ca"
+# lmsysorg/sglang:v0.5.19, Linux/amd64 image digest.
+export SGLANG_IMAGE="lmsysorg/sglang@sha256:37bbbd3444732a464bbc68dee4fb0164e0ce9e18e2f027f3fc967f1152d3c262"
+
+umask 077
+export RUN_DIR="$(mktemp -d)"
+printf '%s\n' "$PROJECT_ID" "$ENDPOINT_NAME" > "$RUN_DIR/submission.txt"
+
+nebius ai endpoint create \
+    --parent-id "$PROJECT_ID" \
+    --subnet-id "$SUBNET_ID" \
+    --name "$ENDPOINT_NAME" \
+    --image "$SGLANG_IMAGE" \
+    --container-command "python3 -m sglang.launch_server" \
+    --args "--model-path $MODEL_ID --revision $MODEL_REVISION --served-model-name $MODEL_ID --host 0.0.0.0 --port 30000 --tp 1 --context-length 4096 --mem-fraction-static 0.8 --max-running-requests 4" \
+    --platform gpu-l40s-a \
+    --preset 1gpu-8vcpu-32gb \
+    --container-port 30000/http \
+    --auth token --token "$ENDPOINT_TOKEN" \
+    --disk-size 250Gi --shm-size 16Gi \
+    --public=false --preemptible=false \
+    --retries 1
+```
+
+Save the ID from the created Endpoint. If you need to locate it, run `nebius ai endpoint list --parent-id "$PROJECT_ID"` and inspect the matching resources. Copy the correct ID rather than assuming that a name is unique:
+
+```bash
+export ENDPOINT_ID="<endpoint-id>"
+printf '%s\n' "$ENDPOINT_ID" > "$RUN_DIR/endpoint-id.txt"
+```
+
+If creation times out or your terminal disconnects, inspect the resources in that project before submitting again. Compare the recorded name and requested configuration against every matching Endpoint. A local error does not prove that creation failed or that cloud resources were cancelled. `--retries 1` disables automatic CLI retries; the guide does not automatically repeat mutations.
+
+Keep the Endpoint token private and save it securely if you will return to the Endpoint later. It is separate from your CLI credentials. Token authentication uses one HTTP port. This example relies on authentication at the managed HTTPS URL and does not configure a second SGLang API key. Trusted callers with this token can reach the server's exposed routes; it is not an authorization scheme for untrusted tenants.
+
+A public VM IP is not required for the managed HTTPS URL. `--public=false` does not make that managed URL private.
+
+### Model storage
+
+The image and model revision are pinned for reproducibility. SGLang downloads the model and tokenizer into the container disk on startup. Allow space for the image, unpacked layers, model weights, and temporary caches. The pinned image is approximately 15 GB compressed.
+
+Treat the container disk as disposable: starting again may require new image and model downloads. To retain model files separately, Nebius supports bucket and shared-filesystem [volume mounts](https://docs.nebius.com/serverless/endpoints/manage). A bucket mount is not a general-purpose local filesystem; keep writable caches and temporary files local, and validate your loading strategy before relying on it. Mounted volumes have their own retention and billing lifecycle.
+
+## Wait for the model
+
+Inspect the Endpoint and its recent logs:
+
+```bash
+nebius ai endpoint get "$ENDPOINT_ID"
+nebius ai endpoint logs "$ENDPOINT_ID" --tail 100 --timestamps
+```
+
+`RUNNING` alone is not a model-readiness test. The function below waits up to 30 minutes for the provider state, one managed HTTPS URL, a successful health response, and the expected model ID. Each individual request also has a timeout. The last in-flight request can extend the loop deadline by its request timeout.
+
+```bash
+wait_for_model() {
+    local deadline=$((SECONDS + 1800))
+    local state url health_code models_code
+    while (( SECONDS < deadline )); do
+        if ! nebius ai endpoint get "$ENDPOINT_ID" --format json \
+            --retries 1 --timeout 20s --auth-timeout 20s \
+            > "$RUN_DIR/status.json"; then
+            echo "Could not read Endpoint status; inspect it before continuing." >&2
+            return 1
+        fi
+        state="$(jq -er '.status.state' "$RUN_DIR/status.json")" || return 1
+        case "$state" in
+            ERROR|STOPPING|STOPPED|DELETING)
+                jq '.status | {state, state_details}' "$RUN_DIR/status.json" >&2
+                return 1
+                ;;
+            RUNNING)
+                url="$(jq -er '
+                    [.status.public_endpoints[]? | select(startswith("https://"))]
+                    | if length == 1 then .[0] else empty end
+                ' "$RUN_DIR/status.json")" || url=""
+                if [[ -n "$url" ]]; then
+                    export ENDPOINT_URL="${url%/}"
+                    health_code="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+                        "$ENDPOINT_URL/health" -H "Authorization: Bearer $ENDPOINT_TOKEN" \
+                        --output /dev/null --write-out '%{http_code}')" || health_code=000
+                    case "$health_code" in
+                        401|403) echo "Check your Endpoint token." >&2; return 1 ;;
+                    esac
+                    if [[ "$health_code" == 200 ]]; then
+                        models_code="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+                            "$ENDPOINT_URL/v1/models" -H "Authorization: Bearer $ENDPOINT_TOKEN" \
+                            --output "$RUN_DIR/models.json" --write-out '%{http_code}')" || models_code=000
+                        case "$models_code" in
+                            401|403) echo "Check your Endpoint token." >&2; return 1 ;;
+                        esac
+                        if [[ "$models_code" == 200 ]] && jq -e --arg model "$MODEL_ID" \
+                            'any(.data[]?; .id == $model)' "$RUN_DIR/models.json" > /dev/null; then
+                            return 0
+                        fi
+                    fi
+                fi
+                ;;
+            PROVISIONING|STARTING|IMAGE_PULLING|STATE_UNSPECIFIED) ;;
+            *) echo "Unexpected Endpoint state: $state" >&2; return 1 ;;
+        esac
+        sleep 5
+    done
+    echo "Model readiness deadline exceeded; inspect logs and clean up the Endpoint." >&2
+    return 1
+}
+
+wait_for_model
+```
+
+Continue only if the function succeeds. The following chat request is the final generation check: SGLang's `/health` route does not necessarily generate a token. Keep diagnostic files in `RUN_DIR` private; Endpoint responses can contain configuration and secrets.
+
+During startup, the URL may be absent or ingress may return 404, 502, or 503. The loop stops on 401/403 so you can resolve authentication. A timeout stops local polling, not billing or the remote workload. Use [troubleshooting](#troubleshooting), then stop or delete any Endpoint you do not need.
+
+## Send a chat request
+
+Create a bounded request and call the OpenAI-compatible route:
+
+```bash
+cat > "$RUN_DIR/chat.json" <<'JSON'
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+  "temperature": 0,
+  "max_tokens": 128,
+  "chat_template_kwargs": {"enable_thinking": false}
+}
+JSON
+
+curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 120 \
+    "$ENDPOINT_URL/v1/chat/completions" \
+    -H "Authorization: Bearer $ENDPOINT_TOKEN" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$RUN_DIR/chat.json"
+```
+
+Expect a chat-completion response with an assistant message. The Qwen-specific `enable_thinking` option disables reasoning for this short example; it is not a universal model option. See [OpenAI-compatible chat completions](/docs/basic_usage/openai_api_completions).
+
+### Stream the response
+
+Set `stream` and use `curl -N` to display events as they arrive:
+
+```bash
+jq '. + {stream: true}' "$RUN_DIR/chat.json" > "$RUN_DIR/stream.json"
+
+curl -N --fail-with-body --silent --show-error --connect-timeout 5 --max-time 120 \
+    "$ENDPOINT_URL/v1/chat/completions" \
+    -H "Authorization: Bearer $ENDPOINT_TOKEN" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$RUN_DIR/stream.json"
+```
+
+A complete SSE stream ends with `data: [DONE]`. Do not pipe it through `jq`, which would prevent you from observing the stream directly. To check incremental delivery, use a longer prompt and generation budget, and confirm content arrives before completion. Receiving one final response with several chunks is not enough to establish incremental delivery through ingress. Do not automatically replay a partially received stream.
+
+### Use the OpenAI Python client
+
+Install the client in a local virtual environment:
+
+```bash
+python3 -m venv "$RUN_DIR/client-venv"
+"$RUN_DIR/client-venv/bin/python" -m pip install openai==3.12.0
+```
+
+Save the following as `request.py` and run it with `"$RUN_DIR/client-venv/bin/python" request.py` in the same shell:
+
+```python
+import os
+
+from openai import OpenAI
+
+with OpenAI(
+    base_url=os.environ["ENDPOINT_URL"].rstrip("/") + "/v1",
+    api_key=os.environ["ENDPOINT_TOKEN"],
+    timeout=120.0,
+    max_retries=0,
+) as client:
+    with client.chat.completions.create(
+        model="Qwen/Qwen3-0.6B",
+        messages=[{"role": "user", "content": "Explain GPU inference in three sentences."}],
+        max_tokens=256,
+        temperature=0,
+        stream=True,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    ) as stream:
+        for chunk in stream:
+            if chunk.choices:
+                print(chunk.choices[0].delta.content or "", end="", flush=True)
+    print()
+```
+
+The base URL includes `/v1`; the API key is your Endpoint token. The client timeout bounds individual network waits, not the complete lifetime of a long stream. The curl example has an overall request deadline.
+
+The server configuration limits running requests to four. This is an SGLang scheduling setting, not an ingress rate limit or autoscaling target. Start with at most four concurrent client requests and bounded generation lengths. It does not bound the waiting queue or guarantee throughput; adjust [server arguments](/docs/advanced_features/server_arguments) only after testing your workload.
+
+## Check authentication
+
+Check an inference-related route, not only `/health`: SGLang's native health routes are exempt from its own API-key checks.
+
+```bash
+curl --silent --show-error --connect-timeout 5 --max-time 10 \
+    --output /dev/null --write-out '%{http_code}\n' \
+    "$ENDPOINT_URL/v1/models"
+
+curl --silent --show-error --connect-timeout 5 --max-time 10 \
+    --output /dev/null --write-out '%{http_code}\n' \
+    "$ENDPOINT_URL/v1/models" -H 'Authorization: Bearer incorrect-token'
+```
+
+Both calls should return 401 or 403. Also check that chat requests with missing or incorrect tokens are rejected. Stop the Endpoint and investigate if unauthenticated inference succeeds unexpectedly.
+
+## Stop, start, and delete
+
+Stop the Endpoint when you do not need it:
+
+```bash
+nebius ai endpoint stop "$ENDPOINT_ID" --retries 1
+nebius ai endpoint get "$ENDPOINT_ID"
+```
+
+Wait for `STOPPED` before starting it again. Stopped compute is not charged, but separately mounted volumes remain billable. To start the same Endpoint:
+
+```bash
+nebius ai endpoint start "$ENDPOINT_ID" --retries 1
+wait_for_model
+```
+
+Starting again can require fresh capacity and image/model downloads. The readiness function rediscovers the HTTPS URL. Repeat chat, streaming, and authentication checks after it succeeds; do not assume in-flight requests or local caches survive a restart.
+
+Before deletion, record the Endpoint's underlying VM IDs from its status or the console, and record each VM's boot-disk ID from Compute. Delete the Endpoint when finished:
+
+```bash
+nebius ai endpoint delete "$ENDPOINT_ID" --retries 1
+nebius ai endpoint get "$ENDPOINT_ID"
+```
+
+Confirm that the lookup returns `NotFound`, then check that the recorded VMs and boot disks have also been deleted in Compute. A timeout, permission error, stopped VM, or unsuccessful lookup is not deletion evidence. If cleanup is not confirmed, keep the resource IDs and investigate through Nebius support. Do not delete unrelated resources by matching their names.
+
+Nebius documents automatic VM and boot-disk deletion with the Endpoint. Mounted volumes have separate lifecycles; retain or delete them deliberately. Review every Endpoint created during failed attempts, and remove private diagnostic files from `RUN_DIR` after reconciliation. See [Endpoint management](https://docs.nebius.com/serverless/endpoints/manage).
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| `ERROR` or readiness deadline exceeded | Read `status.state_details` and recent logs. Endpoint errors use `ERROR`, not the Job-only `FAILED` state. |
+| `NotEnoughResources` | Check regional platform/preset availability. Inspect or delete the existing resource before a deliberate new attempt. |
+| Image pull fails with no container logs | Verify the digest and registry access. Large images can make cold starts slow; investigate an in-region registry mirror if external pulls fail. |
+| Model download or tokenizer load fails | Check the model revision, egress, disk space, and any model-access token/license requirements. |
+| CUDA or shared-memory errors | Verify the image's driver/GPU requirements and `/dev/shm` size. |
+| GPU out of memory | Reduce context length, concurrency, or static memory fraction; use an appropriate model/GPU pair. |
+| `RUNNING` but HTTP requests fail | Verify the host binding, container port, exact managed HTTPS URL, and model loading. |
+| 401/403 with your token | Check that you are using the Endpoint token for the correct resource, rather than CLI credentials. |
+| Stream ends without DONE, or all content arrives at once | Check client buffering, request deadlines, server logs, and ingress behavior with a longer bounded generation. |
+
+See Nebius [lifecycle and statuses](https://docs.nebius.com/serverless/lifecycle), [failure debugging](https://docs.nebius.com/serverless/jobs/failure), and the [Serverless AI cookbook](https://github.com/nebius/serverless-ai-cookbook) for further operational guidance. A debugging wrapper that sleeps after failure keeps compute alive; use it only with an explicit cleanup plan.

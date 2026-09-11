@@ -1051,7 +1051,8 @@
                   "docs/references/multi_node_deployment/deploy_on_k8s",
                   "docs/references/multi_node_deployment/lws_pd/lws_pd_deploy",
                   "docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd",
-                  "docs/basic_usage/aws_sagemaker"
+                  "docs/basic_usage/aws_sagemaker",
+                  "docs/basic_usage/nebius_serverless"
                 ]
               },
               "docs/references/custom_chat_template",
