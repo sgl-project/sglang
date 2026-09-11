@@ -1,5 +1,7 @@
+import ctypes
 import logging
 import os
+import uuid
 from typing import Optional
 
 from sglang.srt.environ import envs
@@ -11,6 +13,13 @@ from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
 
 logger = logging.getLogger(__name__)
 
+# 0 when the platform has no O_DIRECT (macOS); patched in tests.
+_O_DIRECT = getattr(os, "O_DIRECT", 0)
+# 0 before Linux 3.11 and on non-Linux; patched in tests.
+_O_TMPFILE = getattr(os, "O_TMPFILE", 0)
+
+# Consumed by SGLang, never forwarded to a plugin. "active" is deliberately absent:
+# it selects the plugin, so listing it would make promotion flag every valid config.
 _SGLANG_NIXL_CONFIG_KEYS = {
     "use_direct_io",
     "l3_cleaner_enabled",
@@ -233,6 +242,89 @@ class NixlFileManager:
                 f"Initialized file manager with base directories: {self.base_dirs}. Direct I/O: {use_direct_io}"
             )
 
+    def direct_io_error(self, addr: int, size: int) -> Optional[str]:
+        """Return why an O_DIRECT write sourced from ``addr`` cannot be used, or
+        None if it succeeds on every base directory. ``addr`` must be
+        OS-page-aligned and ``size`` a multiple of the page size.
+
+        Every base directory is probed: they are separate mounts, so O_DIRECT can
+        be usable on one and rejected on the next.
+        """
+        if not self.base_dirs:
+            return None
+        if not _O_DIRECT:
+            return "O_DIRECT is not available on this platform"
+        for base in self.base_dirs:
+            error = self._direct_io_dir_error(base, addr, size)
+            if error is not None:
+                return error
+        return None
+
+    def _open_probe_file(self, base: str) -> "tuple[int, Optional[str]]":
+        """Open a scratch file for the probe, returning its fd and the path to
+        unlink (None when the file has no directory entry to begin with).
+
+        An O_TMPFILE probe is unlinked by construction, so a SIGKILL between open
+        and unlink cannot leave a file behind: the L3 cleaner only walks bucket
+        directories, so a stray file in a base directory is never reclaimed.
+        """
+        if _O_TMPFILE:
+            try:
+                fd = os.open(base, os.O_WRONLY | _O_TMPFILE | _O_DIRECT, 0o644)
+                return fd, None
+            except OSError:
+                # Not every filesystem implements O_TMPFILE; a named file still
+                # answers the question this probe asks.
+                pass
+        path = os.path.join(
+            base, f".direct_io_probe.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        )
+        return (
+            os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_DIRECT, 0o644),
+            path,
+        )
+
+    def _direct_io_dir_error(self, base: str, addr: int, size: int) -> Optional[str]:
+        fd = None
+        path = None
+        try:
+            try:
+                fd, path = self._open_probe_file(base)
+            except OSError as e:
+                return (
+                    f"opening a scratch file under {base} with O_DIRECT failed: "
+                    f"{e.strerror} (errno {e.errno})"
+                )
+            try:
+                written = os.pwrite(fd, (ctypes.c_char * size).from_address(addr), 0)
+            except OSError as e:
+                return (
+                    f"a page-aligned {size}-byte O_DIRECT write under {base} failed: "
+                    f"{e.strerror} (errno {e.errno})"
+                )
+            if written != size:
+                return (
+                    f"a page-aligned {size}-byte O_DIRECT write under {base} moved "
+                    f"only {written} bytes"
+                )
+            return None
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    def disable_direct_io(self, reason: str) -> None:
+        logger.warning(
+            "NixlFileManager: disabling O_DIRECT and falling back to buffered "
+            "tier-3 I/O: %s",
+            reason,
+        )
+        self.use_direct_io = False
+
     def clear(self) -> None:
         """Clear all files below every configured base directory."""
         if not self.base_dirs:
@@ -287,8 +379,8 @@ class NixlFileManager:
         """
         flags = os.O_RDWR | os.O_CREAT if create else os.O_RDWR
         if self.use_direct_io:
-            if hasattr(os, "O_DIRECT"):
-                flags |= os.O_DIRECT
+            if _O_DIRECT:
+                flags |= _O_DIRECT
             else:
                 logger.warning(
                     "use_direct_io is True, but O_DIRECT is not available on "
