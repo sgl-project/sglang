@@ -155,9 +155,9 @@ fn match_prefix_is_consistent_with_concurrent_clear() {
         // consistent.
         if m.matched_blocks == chain.len() {
             assert!(
-                m.workers.contains(&w),
+                m.workers().contains(&w),
                 "full match must include worker; got {:?}",
-                m.workers,
+                m.workers(),
             );
         }
     }

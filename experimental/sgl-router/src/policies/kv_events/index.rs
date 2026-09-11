@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 use super::block_size_oracle::BlockSizeOracle;
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
-use super::tree::{HashTree, KvWorkerId};
+use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::KvCacheEvent;
 use crate::policies::engine_load::EngineLoadTable;
 
@@ -482,12 +482,25 @@ async fn pump_loop(
                     }
                 }
                 for event in &batch.events {
+                    // The `medium` tag decides which tier a store lands on and
+                    // which tier a removal clears, so a device eviction leaves
+                    // a worker that still holds the block on host as an owner
+                    // — see the tree's "Storage tiers" docs.
                     match event {
                         KvCacheEvent::BlockStored(b) => {
-                            tree.insert(&worker, b.parent_block_hash, &b.block_hashes);
+                            tree.insert_tiered(
+                                &worker,
+                                b.parent_block_hash,
+                                &b.block_hashes,
+                                Tiers::for_store(b.medium.as_deref()),
+                            );
                         }
                         KvCacheEvent::BlockRemoved(b) => {
-                            tree.remove(&worker, &b.block_hashes);
+                            tree.remove_tiered(
+                                &worker,
+                                &b.block_hashes,
+                                Tiers::for_remove(b.medium.as_deref()),
+                            );
                         }
                         KvCacheEvent::AllBlocksCleared => {
                             tree.clear_worker(&worker);
@@ -593,7 +606,54 @@ mod tests {
 
         let m = tree.match_prefix(None, &[10, 20, 30]);
         assert_eq!(m.matched_blocks, 3);
-        assert!(m.workers.contains(&id), "tree must hold the worker");
+        assert!(m.workers().contains(&id), "tree must hold the worker");
+    }
+
+    /// The pump must carry each event's `medium` into the tree. The engine's
+    /// write-back sequence for a backed-up block is a host-tagged store
+    /// followed by a device-tagged removal; applied tier-blind, the removal
+    /// erased the worker and every repeat of that prefix routed cold for the
+    /// whole host retention horizon.
+    #[tokio::test]
+    async fn pump_keeps_host_backed_block_owned_across_device_eviction() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, tx, pump) = (h.tree, h.tx, h.pump);
+
+        let stored = |medium: Option<&str>| {
+            KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![10, 20],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: medium.map(str::to_owned),
+            })
+        };
+        let removed = |medium: Option<&str>| {
+            KvCacheEvent::BlockRemoved(BlockRemoved {
+                block_hashes: vec![20],
+                medium: medium.map(str::to_owned),
+            })
+        };
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: batch(vec![
+                stored(Some("GPU")),
+                stored(Some("CPU_PINNED")),
+                removed(Some("GPU")),
+            ]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        let m = tree.match_prefix(None, &[10, 20]);
+        assert_eq!(m.matched_blocks, 2, "host copy keeps the block routable");
+        assert!(m.workers().contains(&id));
+        assert!(!m.device_workers().contains(&id), "device copy is gone");
     }
 
     /// A `WorkerEvent::Load` lands in the engine-load table (gauge, no
