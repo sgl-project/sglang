@@ -158,8 +158,8 @@ export const Nemotron3UltraDeployment = () => {
       name: 'mambabackend',
       title: 'Mamba Backend',
       items: [
-        { id: 'triton',     label: 'Triton',     subtitle: 'Default', default: true  },
-        { id: 'flashinfer', label: 'FlashInfer', subtitle: 'Faster',  default: false }
+        { id: 'triton',     label: 'Triton',     subtitle: 'SGLang default',       default: false },
+        { id: 'flashinfer', label: 'FlashInfer', subtitle: 'MTP decode throughput', default: true  }
       ],
       commandRule: (value) => value === 'flashinfer' ? '--mamba-backend flashinfer' : null
     },
