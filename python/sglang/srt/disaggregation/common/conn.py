@@ -201,10 +201,15 @@ class CommonKVManager(BaseKVManager):
             self.is_hybrid_mla_backend
             and disaggregation_mode == DisaggregationMode.DECODE
         )
+        # DSV4.1 CP materializes global token order before cache writes. Split the
+        # replicated page set across CP senders; request-scoped state remains
+        # canonical on CP rank 0 via _should_skip_cp_replicated_state_transfer.
+        dsv41_dspark_pd = self.dsv41_spec_layout is not None
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
+            or dsv41_dspark_pd
         )
 
         # bind zmq socket
@@ -678,9 +683,15 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-            if info.attn_tp_size != self.attn_tp_size:
+            if self.attn_cp_size != 1:
+                raise RuntimeError("DeepSeek-V4.1 DSpark PD requires Decode CP=1")
+            prefill_attention_width = info.attn_tp_size * info.attn_cp_size
+            if prefill_attention_width != self.attn_tp_size:
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
+                    "DeepSeek-V4.1 DSpark PD requires the Prefill attention "
+                    "parallel width to match Decode attention TP: "
+                    f"prefill={info.attn_tp_size}x{info.attn_cp_size}, "
+                    f"decode={self.attn_tp_size}"
                 )
 
         if self.dcp_size > 1:
