@@ -245,6 +245,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
+        runner._capture_chunked_prefix = False
         runner.buffer_registry = _FakeBatchRegistry()
         runner.model_runner = SimpleNamespace(attn_tp_sequence_sharded=lambda _: False)
         runner.enable_cp_bcg_capture = False

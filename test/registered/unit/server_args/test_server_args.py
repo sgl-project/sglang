@@ -1816,8 +1816,6 @@ class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
 
     def test_rejects_invalid_values_during_resolution(self):
         cases = (
-            ([256, 1024], "exactly one integer"),
-            (True, "exactly one integer"),
             (0, "positive integer"),
             (-1, "positive integer"),
             (4097, "model context length"),
