@@ -9,7 +9,7 @@ in ``sys.modules`` and the real ``linear_method_npu.py`` source is loaded
 directly by path with importlib. The CI marker ``register_npu_ci`` is still
 emitted (as a no-op) so the AST-based CI register picks this suite up.
 
-Scope: the CPU-runnable subset 鈥?module-level dtype helpers, the base class
+Scope: the CPU-runnable subset —module-level dtype helpers, the base class
 ``_NPULinearMethodBase``, and the four linear methods whose
 ``process_weights_after_loading`` does not call ``.to("npu")`` /
 ``weight.is_npu`` (those code paths require real NPU hardware and are skipped
@@ -65,7 +65,7 @@ for _pkg in (
     _ensure_pkg(_pkg)
 
 # register_npu_ci: load the REAL marker from sglang's ci_register.py (by path,
-# so sglang/__init__.py 鈥?which needs triton 鈥?does not run) and register it in
+# so sglang/__init__.py —which needs triton —does not run) and register it in
 # sys.modules so the literal `from sglang.test.ci.ci_register import ...` used
 # by the attention-test files resolves to the real no-op marker. CI
 # registration is AST-based; the call is a runtime no-op.
@@ -104,7 +104,7 @@ _base_mod.LinearMethodBase = LinearMethodBase
 _base_mod.QuantizationConfig = type("QuantizationConfig", (), {})
 _install_stub("sglang.srt.layers.quantization.base_config", _base_mod)
 
-# RowParallelLinear (lazy-imported in W8A8Int8.apply) 鈥?plain marker class so
+# RowParallelLinear (lazy-imported in W8A8Int8.apply) —plain marker class so
 # isinstance(layer, RowParallelLinear) is False for the test layer.
 _linear_mod = ModuleType("sglang.srt.layers.linear")
 
@@ -116,7 +116,7 @@ class RowParallelLinear:
 _linear_mod.RowParallelLinear = RowParallelLinear
 _install_stub("sglang.srt.layers.linear", _linear_mod)
 
-# ModelWeightParameter (lazy-imported in create_weights) 鈥?callable returning a
+# ModelWeightParameter (lazy-imported in create_weights) —callable returning a
 # Parameter so register_parameter works.
 _param_mod = ModuleType("sglang.srt.layers.parameter")
 
@@ -139,7 +139,7 @@ class NPUACLFormat:
 
 
 def npu_format_cast(t, *args, **kwargs):
-    return t  # passthrough 鈥?keeps the real tensor so downstream ops work
+    return t  # passthrough —keeps the real tensor so downstream ops work
 
 
 _npu_utils.NPUACLFormat = NPUACLFormat
@@ -163,7 +163,7 @@ _envs.SGLANG_NPU_W4A4_NEW_PACKING = _EnvFlag(False)
 _environ_mod.envs = _envs
 _install_stub("sglang.srt.environ", _environ_mod)
 
-# is_npu (lazy-imported in _get_float4_e2m1fn_x2_dtype) 鈥?always False on CPU.
+# is_npu (lazy-imported in _get_float4_e2m1fn_x2_dtype) —always False on CPU.
 _utils_mod = ModuleType("sglang.srt.utils")
 
 
@@ -302,7 +302,7 @@ class TestDtypeHelpers(unittest.TestCase):
 
 
 # =============================================================================
-# _NPULinearMethodBase 鈥?__init__
+# _NPULinearMethodBase —__init__
 # =============================================================================
 class TestLinearMethodBaseInit(unittest.TestCase):
     def test_stores_quant_config(self):
@@ -319,7 +319,7 @@ class TestLinearMethodBaseInit(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW8A8Int8DynamicLinearMethod 鈥?process_weights_after_loading
+# NPUW8A8Int8DynamicLinearMethod —process_weights_after_loading
 # =============================================================================
 class TestW8A8DynamicProcess(unittest.TestCase):
     """process: transpose weight, flatten scale/offset (npu_format_cast passthrough)."""
@@ -370,7 +370,7 @@ class TestW8A8DynamicProcess(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW8A8Int8DynamicLinearMethod 鈥?apply (mocked npu ops)
+# NPUW8A8Int8DynamicLinearMethod —apply (mocked npu ops)
 # =============================================================================
 class TestW8A8DynamicApply(unittest.TestCase):
     def setUp(self):
@@ -433,7 +433,7 @@ class TestW8A8DynamicApply(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW8A8Int8LinearMethod 鈥?apply (mocked; process uses .to("npu") so skipped)
+# NPUW8A8Int8LinearMethod —apply (mocked; process uses .to("npu") so skipped)
 # =============================================================================
 class TestW8A8Int8Apply(unittest.TestCase):
     def setUp(self):
@@ -525,7 +525,7 @@ class TestW8A8Int8Apply(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW8A8Int8LinearMethod 鈥?process_weights_after_loading
+# NPUW8A8Int8LinearMethod —process_weights_after_loading
 # (.to("npu") patched to passthrough so it runs on CPU)
 # =============================================================================
 class TestW8A8Int8Process(unittest.TestCase):
@@ -610,7 +610,7 @@ class TestW8A8Int8Process(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP8LinearMethod 鈥?create_weights
+# NPUMXFP8LinearMethod —create_weights
 # =============================================================================
 class TestMXFP8CreateWeights(unittest.TestCase):
     def setUp(self):
@@ -650,7 +650,7 @@ class TestMXFP8CreateWeights(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP8LinearMethod 鈥?process_weights_after_loading (offline path)
+# NPUMXFP8LinearMethod —process_weights_after_loading (offline path)
 # =============================================================================
 class TestMXFP8ProcessOffline(unittest.TestCase):
     """Offline path: weight is already float8_e4m3fn -> pure-torch re-layout."""
@@ -706,7 +706,7 @@ class TestMXFP8ProcessOffline(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP8LinearMethod 鈥?apply (mocked npu ops)
+# NPUMXFP8LinearMethod —apply (mocked npu ops)
 # =============================================================================
 class TestMXFP8Apply(unittest.TestCase):
     def setUp(self):
@@ -804,7 +804,7 @@ class TestMXFP8Apply(unittest.TestCase):
 
 
 # =============================================================================
-# NPU_W4A4DynamicLinearMethod 鈥?process_weights_after_loading (both env paths)
+# NPU_W4A4DynamicLinearMethod —process_weights_after_loading (both env paths)
 # =============================================================================
 class TestW4A4Process(unittest.TestCase):
     def setUp(self):
@@ -860,7 +860,7 @@ class TestW4A4Process(unittest.TestCase):
 
 
 # =============================================================================
-# NPU_W4A4DynamicLinearMethod 鈥?apply (mocked npu ops)
+# NPU_W4A4DynamicLinearMethod —apply (mocked npu ops)
 # =============================================================================
 class TestW4A4Apply(unittest.TestCase):
     def setUp(self):
@@ -912,7 +912,7 @@ class TestW4A4Apply(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP4W4A8OfflineLinearMethod 鈥?process (no is_npu, pure torch + format_cast)
+# NPUMXFP4W4A8OfflineLinearMethod —process (no is_npu, pure torch + format_cast)
 # =============================================================================
 class TestMXFP4W4A8OfflineProcess(unittest.TestCase):
     """Offline W4A8 process: packed-FP4 uint8 weight -> (passthrough) format_cast
@@ -944,7 +944,7 @@ class TestMXFP4W4A8OfflineProcess(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP4W4A8OfflineLinearMethod 鈥?apply (mocked npu ops)
+# NPUMXFP4W4A8OfflineLinearMethod —apply (mocked npu ops)
 # =============================================================================
 class TestMXFP4W4A8OfflineApply(unittest.TestCase):
     def setUp(self):
@@ -985,7 +985,7 @@ class TestMXFP4W4A8OfflineApply(unittest.TestCase):
         self.kernel.apply(self.layer, torch.randn(2, self.in_))
         kw = _MATMUL_MOCK.call_args.kwargs
         self.assertEqual(kw["group_sizes"], [0, 0, MXFP4_BLOCK_SIZE])
-        # x2_dtype = float4_e2m1fn_x2 (None on CPU) 鈥?just verify it's passed
+        # x2_dtype = float4_e2m1fn_x2 (None on CPU) —just verify it's passed
         self.assertIn("x2_dtype", kw)
 
     def test_bias_bfloat16_converted_to_float32(self):
@@ -1019,7 +1019,7 @@ class TestMXFP4W4A8OfflineApply(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP4W4A8LinearMethod (online) 鈥?create_weights + process + apply
+# NPUMXFP4W4A8LinearMethod (online) —create_weights + process + apply
 # =============================================================================
 class TestMXFP4W4A8OnlineCreateWeights(unittest.TestCase):
     def setUp(self):
@@ -1109,7 +1109,7 @@ class TestMXFP4W4A8OnlineProcess(_IsNpuPatchedTestCase):
         self.kernel.process_weights_after_loading(self.layer)
         kw = _MX_QUANT_MOCK.call_args.kwargs
         self.assertEqual(kw["round_mode"], "round")
-        # dst_type = float4_e2m1fn_x2 (None on CPU) 鈥?verify the kwarg is passed
+        # dst_type = float4_e2m1fn_x2 (None on CPU) —verify the kwarg is passed
         self.assertIn("dst_type", kw)
 
 
@@ -1186,7 +1186,7 @@ class TestMXFP4W4A8OnlineApply(unittest.TestCase):
 
 
 # =============================================================================
-# NPUSingleLevelMXFP4LinearMethod (online W4A4) 鈥?create + process + apply
+# NPUSingleLevelMXFP4LinearMethod (online W4A4) —create + process + apply
 # =============================================================================
 class TestSingleLevelMXFP4OnlineProcess(_IsNpuPatchedTestCase):
     def setUp(self):
@@ -1268,7 +1268,7 @@ class TestSingleLevelMXFP4OnlineApply(unittest.TestCase):
 
 
 # =============================================================================
-# NPUSingleLevelMXFP4OfflineLinearMethod 鈥?process (inherits apply from online)
+# NPUSingleLevelMXFP4OfflineLinearMethod —process (inherits apply from online)
 # =============================================================================
 class TestSingleLevelMXFP4OfflineProcess(_IsNpuPatchedTestCase):
     def setUp(self):
@@ -1297,7 +1297,7 @@ class TestSingleLevelMXFP4OfflineProcess(_IsNpuPatchedTestCase):
 
 
 # =============================================================================
-# NPUDualLevelMXFP4LinearMethod (online dual-level W4A4) 鈥?process + apply
+# NPUDualLevelMXFP4LinearMethod (online dual-level W4A4) —process + apply
 # =============================================================================
 class TestDualLevelMXFP4Process(_IsNpuPatchedTestCase):
     def setUp(self):

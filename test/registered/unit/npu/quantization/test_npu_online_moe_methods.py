@@ -177,7 +177,7 @@ def _backend(kind):
 
 
 # =============================================================================
-# NPUMXFP8OnlineMoEMethod 鈥?__init__
+# NPUMXFP8OnlineMoEMethod —__init__
 # =============================================================================
 class TestInit(unittest.TestCase):
     def test_stores_quant_config(self):
@@ -194,7 +194,7 @@ class TestInit(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP8OnlineMoEMethod 鈥?create_moe_runner (backend validation + kernel attach)
+# NPUMXFP8OnlineMoEMethod —create_moe_runner (backend validation + kernel attach)
 # =============================================================================
 class TestCreateMoeRunner(unittest.TestCase):
     def setUp(self):

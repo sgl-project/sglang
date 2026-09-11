@@ -2,7 +2,7 @@
 Unit tests for sglang.srt.hardware_backend.npu.quantization.moe_methods.
 
 The module reaches NPU only through ``torch.ops.npu.*`` ops, ``npu_format_cast``,
-and the ``is_npu``/``torch_npu`` dtype helpers 鈥?all called at runtime, not import
+and the ``is_npu``/``torch_npu`` dtype helpers —all called at runtime, not import
 time. To keep these unit tests runnable on any machine, the heavy sglang
 infrastructure (FusedMoEMethodBase / npu utils / envs / moe matmul+quant stubs /
 linear_method_npu dtype helpers / is_npu) is stubbed in ``sys.modules`` and the
@@ -10,7 +10,7 @@ real ``moe_methods.py`` source is loaded directly by path with importlib. The CI
 marker ``register_npu_ci`` is loaded from the real ``ci_register.py`` (by path,
 so sglang/__init__.py does not run).
 
-Scope: the CPU-runnable subset 鈥?``_require_e8m0_dtype``, the ``_NPUMoEMethodBase``
+Scope: the CPU-runnable subset —``_require_e8m0_dtype``, the ``_NPUMoEMethodBase``
 helpers, every MoE method ``__init__``, the pure-torch packing helpers
 (``_pack_int4``/``_pack_to_int32``/``_unpack_from_int32``/``_update_bias``), and
 the ``process_weights_after_loading`` paths that don't call ``.npu()``/
@@ -69,7 +69,7 @@ for _pkg in (
     _ensure_pkg(_pkg)
 
 # register_npu_ci: load the REAL marker from sglang's ci_register.py (by path,
-# so sglang/__init__.py 鈥?which needs triton 鈥?does not run) and register it in
+# so sglang/__init__.py —which needs triton —does not run) and register it in
 # sys.modules so the literal import used by the attention-test files resolves.
 _ci_src = os.path.normpath(
     os.path.join(
@@ -243,7 +243,7 @@ def _reset_e8m0():
 
 
 # =============================================================================
-# _require_e8m0_dtype 鈥?raises on CPU (no float8_e8m0fnu without torch_npu)
+# _require_e8m0_dtype —raises on CPU (no float8_e8m0fnu without torch_npu)
 # =============================================================================
 class TestRequireE8m0Dtype(unittest.TestCase):
     def setUp(self):
@@ -261,7 +261,7 @@ class TestRequireE8m0Dtype(unittest.TestCase):
 
 
 # =============================================================================
-# _NPUMoEMethodBase 鈥?__init__ + static helpers
+# _NPUMoEMethodBase —__init__ + static helpers
 # =============================================================================
 class TestMoEMethodBaseInit(unittest.TestCase):
     def test_stores_quant_config(self):
@@ -369,7 +369,7 @@ class TestMoEMethodInits(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW4A4Int4MoEMethod 鈥?pure-torch packing helpers
+# NPUW4A4Int4MoEMethod —pure-torch packing helpers
 # =============================================================================
 class TestW4A4Int4PackHelpers(unittest.TestCase):
     def setUp(self):
@@ -409,7 +409,7 @@ class TestW4A4Int4PackHelpers(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW4A8Int8MoEMethod 鈥?_pack_to_int32 (assert + view) + _update_bias
+# NPUW4A8Int8MoEMethod —_pack_to_int32 (assert + view) + _update_bias
 # =============================================================================
 class TestW4A8Int8PackHelpers(unittest.TestCase):
     def setUp(self):
@@ -447,7 +447,7 @@ class TestW4A8Int8PackHelpers(unittest.TestCase):
 
 
 # =============================================================================
-# NPUWNA16Int4MoEMethod 鈥?_unpack_from_int32 + _pack_to_int32
+# NPUWNA16Int4MoEMethod —_unpack_from_int32 + _pack_to_int32
 # =============================================================================
 class TestWNA16Int4UnpackPack(unittest.TestCase):
     def setUp(self):
@@ -516,7 +516,7 @@ class TestWNA16Int4UnpackPack(unittest.TestCase):
 
 
 # =============================================================================
-# NPUUnquantMoEMethod 鈥?process_weights_after_loading (format_cast passthrough)
+# NPUUnquantMoEMethod —process_weights_after_loading (format_cast passthrough)
 # =============================================================================
 class TestUnquantMoEProcess(unittest.TestCase):
     def setUp(self):
@@ -554,7 +554,7 @@ class TestUnquantMoEProcess(unittest.TestCase):
 
 
 # =============================================================================
-# NPUWNA16Int4MoEMethod 鈥?process_weights_after_loading (unpack+repack)
+# NPUWNA16Int4MoEMethod —process_weights_after_loading (unpack+repack)
 # =============================================================================
 class TestWNA16Int4MoEProcess(unittest.TestCase):
     def setUp(self):
@@ -601,7 +601,7 @@ class TestWNA16Int4MoEProcess(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW4A8MXFP4MoEMethod 鈥?process_weights_after_loading (patch _get_float4)
+# NPUW4A8MXFP4MoEMethod —process_weights_after_loading (patch _get_float4)
 # =============================================================================
 class TestW4A8MXFP4MoEProcess(unittest.TestCase):
     """Offline-style W4A8 MXFP process: format_cast(passthrough)+transpose,
@@ -648,7 +648,7 @@ class TestW4A8MXFP4MoEProcess(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP8MoEMethod 鈥?process_weights_after_loading (offline fp8 path)
+# NPUMXFP8MoEMethod —process_weights_after_loading (offline fp8 path)
 # =============================================================================
 class TestMXFP8MoEProcessOffline(unittest.TestCase):
     """Offline path: weight is already float8_e4m3fn -> pure-torch re-layout
@@ -687,7 +687,7 @@ class TestMXFP8MoEProcessOffline(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW8A8Int8MoEMethod 鈥?maybe_process_fuseep_weights (non-fuseep path)
+# NPUW8A8Int8MoEMethod —maybe_process_fuseep_weights (non-fuseep path)
 # =============================================================================
 class TestW8A8Int8FuseepGuard(unittest.TestCase):
     def test_returns_false_when_not_fuseep(self):
@@ -713,7 +713,7 @@ class TestW8A8Int8FuseepGuard(unittest.TestCase):
 
 
 # =============================================================================
-# apply wiring (methods that don't call _require_e8m0_dtype) 鈥?mocked matmul
+# apply wiring (methods that don't call _require_e8m0_dtype) —mocked matmul
 # =============================================================================
 class TestWNA16Int4ApplyWiring(unittest.TestCase):
     def setUp(self):
@@ -798,7 +798,7 @@ class TestUnquantApplyWiring(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW4A8MXFP4MoEMethod 鈥?apply (distinct: per_token_scale list, weight_dtype=fp4,
+# NPUW4A8MXFP4MoEMethod —apply (distinct: per_token_scale list, weight_dtype=fp4,
 # x_dtype=fp8, scale/scale_dtype=None, antiquant_scale, per_token_scale_dtype=e8m0)
 # Needs _get_float4 + _require_e8m0 patched (both raise on CPU).
 # =============================================================================
@@ -893,7 +893,7 @@ class TestW4A8MXFP4MoEApply(unittest.TestCase):
 
 
 # =============================================================================
-# NPUMXFP8MoEMethod 鈥?apply (w2 path; distinct: scale_dtype=e8m0,
+# NPUMXFP8MoEMethod —apply (w2 path; distinct: scale_dtype=e8m0,
 # x_dtype=None, weight_dtype=None). Needs _require_e8m0 patched.
 # =============================================================================
 class TestMXFP8MoEApplyW2(unittest.TestCase):
@@ -981,8 +981,8 @@ class TestMXFP8MoEApplyW2(unittest.TestCase):
 
 
 # =============================================================================
-# NPUW4A8Int8MoEMethod 鈥?apply (representative: W4A4Int4/W8A8Int8/W4A8Int8 share
-# this exact apply body 鈥?scale + per_token_scale + bias_args + transposed=True).
+# NPUW4A8Int8MoEMethod —apply (representative: W4A4Int4/W8A8Int8/W4A8Int8 share
+# this exact apply body —scale + per_token_scale + bias_args + transposed=True).
 # =============================================================================
 class TestW4A8Int8MoEApply(unittest.TestCase):
     def setUp(self):

@@ -72,7 +72,7 @@ for _pkg in (
     _ensure_pkg(_pkg)
 
 # register_npu_ci: load the REAL marker from sglang's ci_register.py (by path,
-# so sglang/__init__.py 鈥?which needs triton 鈥?does not run) and register it in
+# so sglang/__init__.py —which needs triton —does not run) and register it in
 # sys.modules so the literal `from sglang.test.ci.ci_register import ...` used
 # by the attention-test files resolves to the real no-op marker. CI
 # registration is AST-based; the call is a runtime no-op.
@@ -190,7 +190,7 @@ def _make_moe_layer(
 
 
 # =============================================================================
-# AWQAscendLinearKernel 鈥?__init__
+# AWQAscendLinearKernel —__init__
 # =============================================================================
 class TestLinearKernelInit(unittest.TestCase):
     def test_stores_quant_config(self):
@@ -204,7 +204,7 @@ class TestLinearKernelInit(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendLinearKernel 鈥?process_weights_after_loading (NPU fast path)
+# AWQAscendLinearKernel —process_weights_after_loading (NPU fast path)
 # =============================================================================
 class TestLinearProcessNpuFastPath(unittest.TestCase):
     """group_size is a multiple of 32 and < K -> NPU fast path."""
@@ -273,7 +273,7 @@ class TestLinearProcessNpuFastPath(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendLinearKernel 鈥?process_weights_after_loading (fallback path)
+# AWQAscendLinearKernel —process_weights_after_loading (fallback path)
 # =============================================================================
 class TestLinearProcessFallback(unittest.TestCase):
     """group_size not a multiple of 32 -> dequantize + FP16 linear fallback."""
@@ -325,7 +325,7 @@ class TestLinearProcessFallback(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendLinearKernel 鈥?process_weights_after_loading (per-tensor)
+# AWQAscendLinearKernel —process_weights_after_loading (per-tensor)
 # =============================================================================
 class TestLinearProcessPerTensorFallback(unittest.TestCase):
     """num_groups=1 -> group_size==K -> falls back (group_size < K is False)."""
@@ -344,7 +344,7 @@ class TestLinearProcessPerTensorFallback(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendLinearKernel 鈥?process_weights_after_loading (errors)
+# AWQAscendLinearKernel —process_weights_after_loading (errors)
 # =============================================================================
 class TestLinearProcessErrors(unittest.TestCase):
     def test_k_not_divisible_by_groups_raises(self):
@@ -359,7 +359,7 @@ class TestLinearProcessErrors(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendLinearKernel 鈥?apply (NPU matmul path)
+# AWQAscendLinearKernel —apply (NPU matmul path)
 # =============================================================================
 class TestLinearApplyNpuMatmul(unittest.TestCase):
     def setUp(self):
@@ -464,7 +464,7 @@ class TestLinearApplyNpuMatmul(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendLinearKernel 鈥?apply (fallback linear path)
+# AWQAscendLinearKernel —apply (fallback linear path)
 # =============================================================================
 class TestLinearApplyFallback(unittest.TestCase):
     def setUp(self):
@@ -495,7 +495,7 @@ class TestLinearApplyFallback(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendMoEKernel 鈥?__init__
+# AWQAscendMoEKernel —__init__
 # =============================================================================
 class TestMoeKernelInit(unittest.TestCase):
     def test_stores_quant_config(self):
@@ -521,7 +521,7 @@ class TestMoeKernelInit(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendMoEKernel 鈥?_register_or_replace_parameter (static)
+# AWQAscendMoEKernel —_register_or_replace_parameter (static)
 # =============================================================================
 class TestMoeRegisterOrReplaceParameter(unittest.TestCase):
     def test_registers_new_parameter(self):
@@ -549,7 +549,7 @@ class TestMoeRegisterOrReplaceParameter(unittest.TestCase):
 
 
 # =============================================================================
-# AWQAscendMoEKernel 鈥?process_weights_after_loading
+# AWQAscendMoEKernel —process_weights_after_loading
 # =============================================================================
 class TestMoeProcessWeights(unittest.TestCase):
     def setUp(self):

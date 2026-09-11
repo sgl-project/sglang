@@ -52,7 +52,7 @@ for _pkg in ("sglang", "sglang.test", "sglang.test.ci"):
     _ensure_pkg(_pkg)
 
 # register_npu_ci: load the REAL marker from sglang's ci_register.py (by path,
-# so sglang/__init__.py 鈥?which needs triton 鈥?does not run) and register it in
+# so sglang/__init__.py —which needs triton —does not run) and register it in
 # sys.modules so the literal `from sglang.test.ci.ci_register import ...` used
 # by the attention-test files resolves to the real no-op marker. CI
 # registration is AST-based; the call is a runtime no-op.
@@ -82,7 +82,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 # linear_method_npu test) don't clobber each other's ops. Each op is a cached
 # child mock of the same object; npu_convert_weight_to_int4pack is a real
 # passthrough lambda (returns the int32 tensor so downstream .reshape/Parameter
-# work 鈥?the real packing is the NPU op's job and is not replicated here).
+# work —the real packing is the NPU op's job and is not replicated here).
 # ---------------------------------------------------------------------------
 if "_test_npu_ops_stub" not in sys.modules:
     sys.modules["_test_npu_ops_stub"] = MagicMock()
@@ -158,7 +158,7 @@ def _make_moe_layer(
 
 
 # =============================================================================
-# unpack_from_int32 鈥?pure function (no NPU), fully tested with real values
+# unpack_from_int32 —pure function (no NPU), fully tested with real values
 # =============================================================================
 class TestUnpackFromInt32(unittest.TestCase):
     def test_4bit_dim1_values(self):
@@ -238,7 +238,7 @@ class TestUnpackFromInt32(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQLinearAscendKernel 鈥?__init__
+# GPTQLinearAscendKernel —__init__
 # =============================================================================
 class TestLinearKernelInit(unittest.TestCase):
     def test_stores_quant_config(self):
@@ -256,7 +256,7 @@ class TestLinearKernelInit(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQLinearAscendKernel 鈥?process_weights_after_loading (4-bit, v2)
+# GPTQLinearAscendKernel —process_weights_after_loading (4-bit, v2)
 # =============================================================================
 class TestLinearProcess4BitV2(unittest.TestCase):
     """v2 format -> qzeros NOT incremented by 1."""
@@ -299,7 +299,7 @@ class TestLinearProcess4BitV2(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQLinearAscendKernel 鈥?process_weights_after_loading (4-bit, non-v2)
+# GPTQLinearAscendKernel —process_weights_after_loading (4-bit, non-v2)
 # =============================================================================
 class TestLinearProcess4BitNonV2(unittest.TestCase):
     """non-v2 format -> qzeros += 1 after unpacking."""
@@ -326,7 +326,7 @@ class TestLinearProcess4BitNonV2(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQLinearAscendKernel 鈥?process_weights_after_loading (8-bit)
+# GPTQLinearAscendKernel —process_weights_after_loading (8-bit)
 # =============================================================================
 class TestLinearProcess8Bit(unittest.TestCase):
     """8-bit -> no npu_convert_weight_to_int4pack, qweight stored as int8."""
@@ -374,7 +374,7 @@ class TestLinearProcess8Bit(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQLinearAscendKernel 鈥?apply (4-bit, mocked matmul)
+# GPTQLinearAscendKernel —apply (4-bit, mocked matmul)
 # =============================================================================
 class TestLinearApply4Bit(unittest.TestCase):
     def setUp(self):
@@ -467,7 +467,7 @@ class TestLinearApply4Bit(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQLinearAscendKernel 鈥?apply (8-bit)
+# GPTQLinearAscendKernel —apply (8-bit)
 # =============================================================================
 class TestLinearApply8Bit(unittest.TestCase):
     def setUp(self):
@@ -512,7 +512,7 @@ class TestLinearApply8Bit(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQMoEAscendKernel 鈥?__init__
+# GPTQMoEAscendKernel —__init__
 # =============================================================================
 class TestMoeKernelInit(unittest.TestCase):
     def test_stores_quant_config(self):
@@ -530,7 +530,7 @@ class TestMoeKernelInit(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQMoEAscendKernel 鈥?process_weights_after_loading (4-bit, v2, no neg scale)
+# GPTQMoEAscendKernel —process_weights_after_loading (4-bit, v2, no neg scale)
 # =============================================================================
 class TestMoeProcess4BitV2(unittest.TestCase):
     def setUp(self):
@@ -607,7 +607,7 @@ class TestMoeProcess4BitV2(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQMoEAscendKernel 鈥?process_weights_after_loading (4-bit, non-v2)
+# GPTQMoEAscendKernel —process_weights_after_loading (4-bit, non-v2)
 # =============================================================================
 class TestMoeProcess4BitNonV2(unittest.TestCase):
     def setUp(self):
@@ -654,7 +654,7 @@ class TestMoeProcess4BitNonV2(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQMoEAscendKernel 鈥?process_weights_after_loading (negative-scale correction)
+# GPTQMoEAscendKernel —process_weights_after_loading (negative-scale correction)
 # =============================================================================
 class TestMoeProcessNegScale(unittest.TestCase):
     """All-negative scales -> weights negated+clamped to 7, scales -> abs."""
@@ -726,7 +726,7 @@ class TestMoeProcessNegScale(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQMoEAscendKernel 鈥?process_weights_after_loading (skip neg-scale, incompatible)
+# GPTQMoEAscendKernel —process_weights_after_loading (skip neg-scale, incompatible)
 # =============================================================================
 class TestMoeProcessSkipNegScale(unittest.TestCase):
     """Incompatible scales (G*gs != K) -> skip correction, pack directly.
@@ -766,7 +766,7 @@ class TestMoeProcessSkipNegScale(unittest.TestCase):
 
 
 # =============================================================================
-# GPTQMoEAscendKernel 鈥?process_weights_after_loading (8-bit)
+# GPTQMoEAscendKernel —process_weights_after_loading (8-bit)
 # =============================================================================
 class TestMoeProcess8Bit(unittest.TestCase):
     def setUp(self):
