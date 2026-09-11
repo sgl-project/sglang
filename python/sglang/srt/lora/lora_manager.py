@@ -105,6 +105,7 @@ class LoRAManager:
         )
         self.lora_use_virtual_experts: bool = get_lora().lora_use_virtual_experts
         self.lora_strict_loading: bool = get_lora().lora_strict_loading
+        self.lora_no_cpu_backup: bool = get_lora().lora_no_cpu_backup
         self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
 
         # LoRA backend for running sgemm kernels
@@ -896,6 +897,7 @@ class LoRAManager:
             self.load_config,
             self.lora_backend,
             base_model=self.base_model,
+            keep_weights_on_device=self.lora_no_cpu_backup,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
 
@@ -1012,6 +1014,20 @@ class LoRAManager:
         self.loras[uid] = new_lora
 
         if (
+            self.lora_no_cpu_backup
+            and tensors
+            and getattr(self, "memory_pool", None) is not None
+        ):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            self.memory_pool.install_streamed_adapter(
+                uid,
+                new_lora,
+                self.lora_modules,
+                self.embed_tokens_module,
+                self.lm_head_module,
+            )
+        elif (
             is_update
             and getattr(self, "memory_pool", None) is not None
             and uid in self.memory_pool.uid_to_buffer_id
@@ -1082,6 +1098,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            lora_no_cpu_backup=self.lora_no_cpu_backup,
         )
 
         # Initializing memory pool with base model
