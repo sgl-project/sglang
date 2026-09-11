@@ -18,6 +18,9 @@ from sglang.benchmark.tracelab import (
     run_trace,
     send_generate,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_canonical_replay_preserves_generated_context_and_corpus(tmp_path):
