@@ -35,6 +35,10 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
@@ -1212,6 +1216,26 @@ class TestTriFactorySizing(unittest.TestCase):
             + 4 * pool.spec("mamba").entry_bytes()
         )
         self.assertEqual(pool.total_bytes, want)
+
+    def test_full_side_carries_the_fused_draft_region(self):
+        """The boot solve prices the fused entry whenever a placement resolves,
+        so a factory that dropped the kwarg would allocate UNFUSED under that
+        price and under-budget the private draft pool."""
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
+        bundle = init_unified_mamba_swa_pools(
+            **self._factory_kwargs(fused_draft=placement)
+        )
+        pool = bundle.unified_memory_pool
+        self.assertIs(pool.fused_draft, placement)
+        self.assertIs(pool.spec("full").draft_region, region)
+        self.assertIs(pool.require_draft_host_spec("full"), pool.spec("full"))
+        for other in ("swa", "mamba"):
+            self.assertIsNone(pool.spec(other).draft_region, other)
 
     def test_bs1_floor_fails_loud_before_construction(self):
         """A budget far below one worst-case request must raise BEFORE any
