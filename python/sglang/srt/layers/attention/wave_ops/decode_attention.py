@@ -6,6 +6,7 @@ It supports page size = 1.
 import functools
 import logging
 
+import torch
 from wave_lang.kernel.lang.global_symbols import *
 from wave_lang.kernel.wave.compile import WaveCompileOptions, wave_compile
 from wave_lang.kernel.wave.constraints import GenericDot, MMAOperand, MMAType
@@ -21,6 +22,36 @@ logger = logging.getLogger(__name__)
 import os
 
 dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
+
+
+@functools.lru_cache(maxsize=None)
+def _is_rocm10_gfx942(device_index: int) -> bool:
+    """Return whether a device needs the ROCm 10 Wave decode workaround."""
+    hip_version = torch.version.hip
+    if hip_version is None:
+        return False
+
+    try:
+        hip_major_minor = tuple(int(part) for part in hip_version.split(".")[:2])
+    except ValueError:
+        return False
+
+    arch = torch.cuda.get_device_properties(device_index).gcnArchName.split(":", 1)[0]
+    # torch 2.11's ROCm 10 build reports HIP 7.15.
+    return arch == "gfx942" and hip_major_minor >= (7, 15)
+
+
+def _needs_triton_fallback(q, k_buffer, v_buffer) -> bool:
+    # Wave's paged decode kernel returns NaNs for this shape on gfx942 with
+    # ROCm 10. Keep Wave enabled for every other shape and architecture.
+    shape = (q.shape[1], k_buffer.shape[1], q.shape[2], v_buffer.shape[2])
+    if shape != (128, 1, 576, 512):
+        return False
+
+    device_index = q.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _is_rocm10_gfx942(device_index)
 
 
 @functools.lru_cache(maxsize=4096)
@@ -119,6 +150,34 @@ def decode_attention_wave(
     num_seqs, num_query_heads, head_size = q.shape
     _, num_kv_heads, _ = k_buffer.shape
     _, _, head_size_kv = v_buffer.shape
+
+    if _needs_triton_fallback(q, k_buffer, v_buffer):
+        # The Wave and Triton intermediates contain the same number of values,
+        # but use different dimension orders. Reuse their storage so the
+        # fallback does not add an allocation to the decode path.
+        from sglang.kernels.ops.attention.decode_attention import (
+            decode_attention_fwd_grouped as triton_decode_attention_fwd_grouped,
+        )
+
+        triton_decode_attention_fwd_grouped(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            b_req_idx,
+            req_to_token,
+            attn_logits.reshape(
+                num_seqs, num_query_heads, max_kv_splits, head_size_kv
+            ),
+            attn_logits_max.reshape(num_seqs, num_query_heads, max_kv_splits),
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            1.0,
+            logit_cap,
+        )
+        return
+
     block_size = 32
     shape = paged_decode_attention_shape(
         num_query_heads,
