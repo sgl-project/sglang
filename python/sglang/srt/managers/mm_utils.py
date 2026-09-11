@@ -61,6 +61,67 @@ from sglang.utils import logger
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
+
+def _open_ipc_view(ipc_extra: Dict[str, Any]):
+    """Reconstruct the zero-copy view described by ``ipc_extra``.
+
+    Opens (or reuses) the IPC storage and applies the view's offset/shape/stride.
+    Reusable-handle caching is delegated to ``cuda_ipc_transport_utils`` so this shares
+    one cache lifecycle with the rest of the CUDA-IPC path. On a stale cached mapping the
+    open fails; invalidate that entry and retry once.
+    """
+    import torch
+
+    from sglang.srt.multimodal.transport.cuda_ipc import (
+        _normalize_pool_cache_key,
+        _open_pooled_storage_uncached,
+        _pool_handle_cache_get_or_open,
+        _pool_handle_cache_invalidate,
+    )
+
+    handle = ipc_extra["handle"]
+    use_cache = ipc_extra.get("cacheable", False)
+    device_index = ipc_extra["device_index"]
+    target_device = torch.device(f"cuda:{device_index}")
+    cache_key = _normalize_pool_cache_key(handle, device_index) if use_cache else None
+
+    def _build():
+        # cudaIpcOpenMemHandle must run under target_device's context (as in the original
+        # __setstate__ and VLM path), else it can fail or map on the wrong device.
+        with torch.cuda.device(target_device):
+            if cache_key is not None:
+                storage = _pool_handle_cache_get_or_open(cache_key, handle)
+            else:
+                storage = _open_pooled_storage_uncached(handle)
+            return torch.empty(0, dtype=ipc_extra["dtype"], device=target_device).set_(
+                storage,
+                storage_offset=ipc_extra["storage_offset"],
+                size=ipc_extra["shape"],
+                stride=ipc_extra["stride"],
+            )
+
+    try:
+        return _build()
+    except RuntimeError:
+        # Torch surfaces CUDA/IPC failures (e.g. a stale mapping) as RuntimeError; other
+        # exception types are programming errors and should propagate on the first try.
+        if cache_key is None:
+            raise
+        _pool_handle_cache_invalidate(cache_key)
+        return _build()
+
+
+def _rebuild_transport_proxy_from_ipc(state: Dict[str, Any]) -> "TransportProxyTensor":
+    """Pickle reconstructor for the cuda_ipc path: rebuild a zero-copy view of the
+    IPC-mapped storage from ``ipc_extra`` (no tensor bytes were transmitted)."""
+    base = _open_ipc_view(state["ipc_extra"])
+    obj = TransportProxyTensor(base, transport_mode="cuda_ipc")
+    obj._metadata = state["metadata"]
+    # Carry the handle forward so re-pickling stays IPC-only.
+    obj._shared_ipc_handle = state["ipc_extra"]["handle"]
+    return obj
+
+
 _is_default_tensor_transport = None
 
 
@@ -126,6 +187,7 @@ class TransportProxyTensor(torch.Tensor):
         name: Optional[str] = None,
         fields: Optional[Dict[str, Any]] = None,
         transport_mode: TensorTransportMode = "default",
+        ipc_handle: Optional[Any] = None,
         *args,
         **kwargs,
     ):
@@ -142,8 +204,25 @@ class TransportProxyTensor(torch.Tensor):
             "fields": fields if fields is not None else {},
             "transport_mode": transport_mode,
         }
+        # Optional IPC handle of the buffer backing ``data``; if set, __getstate__ reuses
+        # it instead of deriving one.
+        instance._shared_ipc_handle = ipc_handle
 
         return instance
+
+    def __reduce_ex__(self, protocol):
+        """Pickle via CUDA IPC handle only (no storage) on the cuda_ipc path.
+
+        torch.Tensor's default reduction serializes the storage by value, so a view into a
+        large shared buffer would pickle the whole buffer (D2H + wire + H2D) every request.
+        Instead emit only the handle + offset/shape and rebuild a zero-copy view on the
+        other side. Anything not IPC-transportable falls back to by-value reduction."""
+        transport_mode = self._metadata.get("transport_mode", "default")
+        if transport_mode == "cuda_ipc" and self.is_cuda:
+            state = self.__getstate__()
+            if state.get("ipc_extra") is not None:
+                return (_rebuild_transport_proxy_from_ipc, (state,))
+        return super().__reduce_ex__(protocol)
 
     def __getstate__(self):
         """
@@ -159,8 +238,19 @@ class TransportProxyTensor(torch.Tensor):
 
         if transport_mode == "cuda_ipc" and self.is_cuda:
             try:
-                storage = self.untyped_storage()
-                handle = storage._share_cuda_()
+                # Reuse a caller-supplied buffer handle if present: skips per-request
+                # cudaIpcGetMemHandle and works from importer processes (imported memory
+                # can't be re-exported). Offset/shape/stride still come from the tensor.
+                # Reused-handle contract: the backing region must be (1) fully written and
+                # the producer stream synchronized before transport (the reused handle's
+                # export-time IPC event doesn't cover later writes), and (2) kept allocated
+                # and immutable until the consumer finishes reading (overlapping requests
+                # use distinct regions, reclaimed only after consumption).
+                shared_handle = getattr(self, "_shared_ipc_handle", None)
+                if shared_handle is not None:
+                    handle = shared_handle
+                else:
+                    handle = self.untyped_storage()._share_cuda_()
 
                 state["ipc_extra"] = {
                     "handle": handle,
@@ -169,10 +259,12 @@ class TransportProxyTensor(torch.Tensor):
                     "stride": self.stride(),
                     "device_index": self.device.index,
                     "storage_offset": self.storage_offset(),
+                    # Whether this handle is reusable and should be cached on open.
+                    "cacheable": shared_handle is not None,
                 }
                 state["tensor_data"] = None
             except Exception:
-                # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
+                # Failed to get/reuse CUDA IPC handle (possibly tp). Falling back to default transport.
                 state["metadata"]["transport_mode"] = "default"
                 state["tensor_data"] = self.as_subclass(torch.Tensor)
         else:
@@ -190,24 +282,8 @@ class TransportProxyTensor(torch.Tensor):
         transport_mode = self._metadata.get("transport_mode", "default")
 
         if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
-            ipc_extra = state["ipc_extra"]
-            handle, shape, dtype, stride, source_device_index, s_offset = (
-                ipc_extra["handle"],
-                ipc_extra["shape"],
-                ipc_extra["dtype"],
-                ipc_extra["stride"],
-                ipc_extra["device_index"],
-                ipc_extra["storage_offset"],
-            )
-
             try:
-                target_device = torch.device(f"cuda:{source_device_index}")
-                with torch.cuda.device(target_device):
-                    storage = torch.UntypedStorage._new_shared_cuda(*handle)
-                    reconstructed_tensor = torch.empty(
-                        0, dtype=dtype, device=target_device
-                    ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
-                    self.set_(reconstructed_tensor)
+                self.set_(_open_ipc_view(state["ipc_extra"]))
             except Exception as e:
                 print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
                 raise e
