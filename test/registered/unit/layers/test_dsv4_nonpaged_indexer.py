@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     C4IndexerBackendMixin,
@@ -45,8 +46,9 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         ):
             metadata = PagedIndexerMetadata(
                 page_size=256,
+                compressed_page_size=64,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
-                c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
                 use_topk_v2=False,
                 force_deep_gemm_metadata=True,
             )
@@ -59,22 +61,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         self.assertEqual(args[1:], (64, 1))
         jit_metadata.assert_not_called()
 
-    def test_sm120_fp8_torch_fallback_keeps_metadata_none(self):
-        with (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_TOPK_V2.override(False),
-        ):
-            metadata = PagedIndexerMetadata(
-                page_size=256,
-                page_table=torch.zeros((1, 1), dtype=torch.int32),
-                c4_seq_lens=torch.tensor([65], dtype=torch.int32),
-                use_topk_v2=False,
-            )
-
-        self.assertIsNone(metadata.deep_gemm_metadata)
-
-    def test_topk_v2_ineligible_backend_skips_plan(self):
+    def test_torch_fallback_skips_deep_gemm_and_ineligible_topk_plan(self):
         with (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
@@ -83,13 +70,53 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         ):
             metadata = PagedIndexerMetadata(
                 page_size=256,
+                compressed_page_size=64,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
-                c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
                 use_topk_v2=False,
             )
 
+        self.assertIsNone(metadata.deep_gemm_metadata)
         plan_topk_v2.assert_not_called()
         self.assertEqual(metadata.topk_metadata.numel(), 0)
+
+    def test_physical_page_size_controls_metadata_and_replay(self):
+        planner = MagicMock(return_value=torch.zeros((1, 2), dtype=torch.int32))
+        deep_gemm = SimpleNamespace(
+            get_num_sms=MagicMock(return_value=1),
+            get_paged_mqa_logits_metadata=planner,
+        )
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            metadata = [
+                PagedIndexerMetadata(
+                    page_size=256,
+                    compressed_page_size=page_size,
+                    page_table=torch.zeros((1, 3), dtype=torch.int32),
+                    compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
+                    use_topk_v2=False,
+                    force_deep_gemm_metadata=True,
+                )
+                for page_size in (64, 32, 32)
+            ]
+
+        self.assertEqual(
+            [call.args[1] for call in planner.call_args_list], [64, 32, 32]
+        )
+        self.assertEqual([m.max_compressed_seq_len for m in metadata], [192, 96, 96])
+        self.assertEqual([m.max_seq_len for m in metadata], [768, 768, 768])
+        with self.assertRaisesRegex(AssertionError, "compressed_page_size"):
+            metadata[0].copy_(metadata[1])
+
+        destination, source = metadata[1:]
+        source.page_table.fill_(7)
+        source.compressed_seq_lens.fill_(17)
+        page_table_ptr = destination.page_table.data_ptr()
+        destination.copy_(source)
+        self.assertEqual(destination.page_table.data_ptr(), page_table_ptr)
+        torch.testing.assert_close(destination.page_table, source.page_table)
+        torch.testing.assert_close(
+            destination.compressed_seq_lens, source.compressed_seq_lens
+        )
 
 
 class TestDSV4FlashInferTopK(CustomTestCase):
@@ -183,6 +210,78 @@ class TestDSV4FlashInferTopK(CustomTestCase):
                 )
 
 
+class TestDSV4TopKDispatch(CustomTestCase):
+    def test_v2_raw_output_uses_sparse_prefill_buffer_with_capture(self):
+        page_table = torch.zeros((1, 1), dtype=torch.int32)
+        c4_seq_lens = torch.ones(1, dtype=torch.int32)
+        page_indices = torch.full((1, 512), -1, dtype=torch.int32)
+        raw_indices = torch.full_like(page_indices, -1)
+        topk_metadata = torch.zeros((2, 2), dtype=torch.int32)
+
+        indexer_metadata = object.__new__(PagedIndexerMetadata)
+        indexer_metadata.page_size = 256
+        indexer_metadata.page_table = page_table
+        indexer_metadata.c4_seq_lens = c4_seq_lens
+        indexer_metadata.topk_metadata = topk_metadata
+
+        logits = torch.empty((1, 65), dtype=torch.float32)
+        backend = C4IndexerBackendMixin()
+        backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_mapping={0: SimpleNamespace(compress_layer_id=7)}
+        )
+        backend.forward_metadata = SimpleNamespace(
+            indexer_metadata=indexer_metadata,
+            core_metadata=SimpleNamespace(
+                positions=torch.arange(1, dtype=torch.int64),
+                page_table=page_table,
+                c4_sparse_page_indices=page_indices,
+                c4_sparse_raw_indices=raw_indices,
+            ),
+        )
+        backend.hisparse_coordinator = None
+        backend._forward_prepare_normal = MagicMock(
+            return_value=(
+                torch.empty((1, 1, 128)),
+                torch.empty((1, 1, 1)),
+            )
+        )
+        backend._get_nonpaged_indexer_plan = MagicMock(return_value=object())
+        backend._forward_nonpaged_indexer = MagicMock(return_value=logits)
+
+        indexer_capturer = MagicMock()
+        with (
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            patch(
+                f"{_INDEXER}.get_global_indexer_capturer",
+                return_value=indexer_capturer,
+            ),
+            patch(f"{_INDEXER}.topk_transform_paged") as topk_v1,
+            patch(f"{_INDEXER}.topk_transform_paged_v2") as topk_v2,
+        ):
+            backend.forward_c4_indexer(
+                x=torch.empty((1, 1)),
+                q_lora=torch.empty((1, 1)),
+                c4_indexer=SimpleNamespace(use_fp4_indexer=False, layer_id=0),
+                forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+            )
+
+        topk_v2.assert_called_once()
+        args = topk_v2.call_args.args
+        self.assertIs(args[0], logits)
+        torch.testing.assert_close(args[1], c4_seq_lens)
+        torch.testing.assert_close(args[2], page_table)
+        torch.testing.assert_close(args[3], page_indices)
+        self.assertEqual(args[4], 64)
+        self.assertIs(args[5], topk_metadata)
+        self.assertEqual(args[6].data_ptr(), raw_indices.data_ptr())
+        topk_v1.assert_not_called()
+        indexer_capturer.capture.assert_called_once_with(7, raw_indices)
+
+
 class TestDSV4NonPagedIndexer(CustomTestCase):
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)
@@ -253,7 +352,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
         )
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
         page_table = torch.tensor([[3, 1]], dtype=torch.int32).repeat(query_rows, 1)
         c4_seq_lens = torch.tensor([62, 63, 64, 65], dtype=torch.int32)
 
@@ -301,7 +400,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
         )
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
         page_table = torch.zeros((query_rows, 1), dtype=torch.int32)
         c4_seq_lens = torch.tensor(
             [124_997, 124_998, 124_999, 125_000], dtype=torch.int32
@@ -339,7 +438,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=can_use_nonpaged_indexer)
         backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
         c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=512)
-        metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
+        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
 
         def build_plan(query_rows):
             batch = SimpleNamespace(

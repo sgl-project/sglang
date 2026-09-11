@@ -126,6 +126,10 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
     GPUWorkerPostTrainingMixin,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
+from sglang.multimodal_gen.runtime.realtime.video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
+)
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     fixed_loading_residency_components,
@@ -139,17 +143,13 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.process import kill_itself_when_parent_died
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
-    build_raw_rgb_frame_batches,
-)
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     DiffStage,
     init_diffusion_tracing,
     trace_slice,
 )
-from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
@@ -510,6 +510,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
+                pin_budget=get_global_component_residency_manager(
+                    self.pipeline, self.server_args
+                ).host_pin_budget,
                 component_names=(
                     None
                     if self.server_args.component_residency is not None
@@ -1507,13 +1510,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         merge batched output
         """
-        if parts.output_file_paths:
-            merged.output_file_paths = parts.output_file_paths
         if any(metrics is not None for metrics in parts.metrics_list):
             merged.metrics_list = parts.metrics_list
             merged.metrics = next(
                 metrics for metrics in parts.metrics_list if metrics is not None
             )
+        if merged.error is not None:
+            return
+        if parts.output_file_paths:
+            merged.output_file_paths = parts.output_file_paths
         if parts.tensor_outputs:
             merged.output = torch.cat(parts.tensor_outputs, dim=0)
         elif parts.list_outputs:
