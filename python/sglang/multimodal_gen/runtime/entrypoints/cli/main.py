@@ -6,7 +6,7 @@
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.generate import GenerateSubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.serve import ServeSubcommand
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 def generate_cmd_init() -> list[CLISubcommand]:
