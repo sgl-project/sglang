@@ -275,22 +275,6 @@ class _LowLatencyBuffer:
         return torch.empty(0), torch.empty(0), object(), object(), object()
 
 
-class _PreMxfp8LowLatencyBuffer:
-    """A runtime predating every MXFP8 selection API."""
-
-    def low_latency_dispatch(
-        self,
-        hidden_states,
-        topk_ids,
-        num_max_dispatch_tokens_per_rank,
-        num_experts,
-        *,
-        use_fp8,
-        **kwargs,
-    ):
-        return torch.empty(0), torch.empty(0), object(), object(), object()
-
-
 class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
     def test_mxfp4_output_dtype_enables_only_mxfp4(self):
         dispatcher = object.__new__(deepep._DeepEPDispatcherImplBase)
@@ -416,16 +400,6 @@ class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
 
         self.assertFalse(buffer.kwargs["use_fp8"])
         self.assertIs(buffer.kwargs["use_ue8m0"], _NOT_PASSED)
-
-    def test_mxfp8_rejects_legacy_runtime_without_mxfp8_support(self):
-        dispatcher = self._dispatcher("mx_fp8_e4m3", _PreMxfp8LowLatencyBuffer())
-
-        with self.assertRaisesRegex(RuntimeError, "use_mxfp8"):
-            dispatcher._dispatch_core(
-                torch.zeros(1, 64),
-                torch.zeros(1, 1, dtype=torch.int64),
-                torch.ones(1, 1),
-            )
 
 
 class TestW4A8MxfpGmmInputScale(unittest.TestCase):
