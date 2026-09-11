@@ -5,12 +5,13 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     attention_backends_of,
-    declare_direct_writes,
     declare_resolution,
     model_config_of,
+    record_foreign_defaults,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -157,7 +158,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
         # TODO: move the per-algorithm validation below into spec module hooks.
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
-            declare_direct_writes(
+            record_foreign_defaults(
                 server_args,
                 "handle_speculative_decoding.custom_validate",
                 algo.validate_server_args,
@@ -175,21 +176,34 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             _init_adaptive_speculative_params(server_args)
 
     if algo is not None:
-        # A registered algorithm's callback lives outside this tree and sets
-        # fields on the record, so the writes are captured around the call.
-        declare_direct_writes(
-            server_args,
-            "handle_speculative_decoding.custom_algo",
-            algo.handle_server_args,
-        )
+        # Imported here and not above: the name is only bound inside the
+        # `speculative_algorithm is not None` branch, and this runs either way.
+        from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+        if isinstance(algo, CustomSpecAlgo):
+            # A registered algorithm's callback lives outside this tree and
+            # assigns fields, so it gets the stand-in and its writes are
+            # declared.
+            record_foreign_defaults(
+                server_args,
+                "handle_speculative_decoding.custom_algo",
+                algo.handle_server_args,
+            )
+        else:
+            # The in-tree dispatcher, which declares. It needs the record
+            # itself: handed the stand-in, its `declare_resolution` calls would
+            # stash on that instead.
+            algo.handle_server_args(server_args)
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (cfg.device.startswith("cuda") or cfg.device == "npu"):
+    if not (
+        cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "xpu"
+    ):
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA and NPU devices."
+            "DFLASH speculative decoding only supports CUDA, NPU and XPU devices."
         )
 
     if resolved_view(server_args).enable_dp_attention:
@@ -711,16 +725,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     cfg = resolving_view(server_args)
 
-    supported_draft_backends = (
-        "flashinfer",
-        "fa3",
-        "fa4",
-        "triton",
-        "trtllm_mha",
-        "ascend",
+    supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
+    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+    fallback_backend = (
+        "triton" if (get_platform().is_xpu or get_platform().is_hip) else "flashinfer"
     )
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
@@ -862,6 +871,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        "HYV4ForCausalLM",
+        # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
+        "Qwen4ExpForConditionalGeneration",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(
@@ -967,7 +979,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
-    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
+    # it; flashmla / trtllm_mla can't express the per-branch tree, so reject.
     _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
     view = resolved_view(server_args)
     if (

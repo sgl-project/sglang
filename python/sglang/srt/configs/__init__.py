@@ -16,7 +16,9 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
+from sglang.srt.configs.hy_v4 import HYV4Config
 from sglang.srt.configs.inkling import (
     InklingAudioConfig,
     InklingMMConfig,
@@ -51,9 +53,11 @@ from sglang.srt.configs.muse_glimmer import (
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
 )
+from sglang.srt.configs.nanbeige import NanbeigeConfig
 from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
+    NemotronH_Omni_Reasoning_V3_Config,
 )
 from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
@@ -65,6 +69,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.configs.spark2_5 import Spark2_5Config
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
@@ -100,11 +105,15 @@ __all__ = [
     "Olmo3Config",
     "MuseGlimmerConfig",
     "MuseGlimmerAssistantConfig",
+    "Glm5NextConfig",
+    "Glm5NextTextConfig",
     "KimiLinearConfig",
     "KimiK3Config",
     "KimiK25Config",
     "LagunaConfig",
     "Qwen3NextConfig",
+    "Qwen4ExpConfig",
+    "Qwen4ExpTextConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
     "Qwen3_5TextConfig",
@@ -118,6 +127,7 @@ __all__ = [
     "Dots3Config",
     "FalconH1Config",
     "GraniteMoeHybridConfig",
+    "HYV4Config",
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",
@@ -128,6 +138,8 @@ __all__ = [
     "NemotronHPuzzleConfig",
     "NemotronH_Nano_VL_V2_Config",
     "NemotronH_Nano_Omni_Reasoning_V3_Config",
+    "NemotronH_Omni_Reasoning_V3_Config",
+    "NanbeigeConfig",
     "JetNemotronConfig",
     "JetVLMConfig",
     "MiniCPMHybridConfig",

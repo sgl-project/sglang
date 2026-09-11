@@ -41,7 +41,11 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
+from sglang.srt.configs.model_config import (
+    REQUANTIZATION_METHODS,
+    ModelConfig,
+    is_qwen3_5_mtp_draft,
+)
 from sglang.srt.distributed import get_world_group
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -61,6 +65,7 @@ from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
     is_cpu,
+    is_hip,
     log_info_on_rank0,
     print_warning_once,
 )
@@ -259,6 +264,37 @@ def _resolve_explicit_draft_quant_config(
     return quant_config
 
 
+def _quark_draft_online_quant_config(
+    model_config: ModelConfig, hf_quant_config: dict
+) -> Optional[QuantizationConfig]:
+    """Explicit ``--speculative-draft-model-quantization quark_mxfp4`` on a Quark
+    checkpoint whose MTP/NextN draft experts were exported in bf16 (listed under
+    ``exclude``): quantize the draft's routed experts online to MXFP4 instead of
+    running them through the bf16 MoE path. Only the draft model is affected; the
+    target model keeps its serialized Quark scheme."""
+    if not (
+        model_config.is_draft_model
+        and model_config.is_draft_quantization_explicit
+        and model_config.quantization == "quark_mxfp4"
+        and hf_quant_config.get("quant_method") == "quark"
+        # ROCm + Qwen3.5 MTP draft only (validated combination); anything else is
+        # left exactly as before.
+        and is_hip()
+        and is_qwen3_5_mtp_draft(model_config.hf_config)
+    ):
+        return None
+    excluded = hf_quant_config.get("exclude") or []
+    if not any(str(name).startswith("mtp.layers.0.mlp.experts") for name in excluded):
+        return None
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    logger.info(
+        "Draft MTP experts are unquantized in the Quark checkpoint; "
+        "quantizing them online to MXFP4 (quark_mxfp4) for the draft model."
+    )
+    return QuarkConfig(online_scheme="quark_mxfp4", hf_config=model_config.hf_config)
+
+
 def _modelopt_quant_section(config: dict) -> dict:
     """Return ModelOpt quant settings from nested or flat ``hf_quant_config.json``.
 
@@ -313,7 +349,11 @@ def get_quant_config(
             # This is only used by quantization methods that support requantization (e.g. from nvfp4/fp8 to mxfp4).
             if model_config.quantization in REQUANTIZATION_METHODS:
                 hf_quant_config["requantization_method"] = model_config.quantization
-
+            draft_online = _quark_draft_online_quant_config(
+                model_config, hf_quant_config
+            )
+            if draft_online is not None:
+                return draft_online
             return _resolve_explicit_draft_quant_config(
                 model_config, quant_cls.from_config(hf_quant_config)
             )
@@ -1021,7 +1061,7 @@ def _prefetch_all_checkpoints(
     succeeded_event = threading.Event()
     errors: List[Tuple[str, Exception]] = []
 
-    logger.info(
+    logger.debug(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
         "(background, %d local ranks sharing the work, %d threads per rank)...",
         local_rank,
@@ -1042,7 +1082,7 @@ def _prefetch_all_checkpoints(
             if total_for_rank > 0 and next_log_pct <= 100:
                 pct = 100 * completed / total_for_rank
                 while pct >= next_log_pct and next_log_pct <= 100:
-                    logger.info(
+                    logger.debug(
                         "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
                         local_rank,
                         next_log_pct,
@@ -1093,7 +1133,7 @@ def _prefetch_all_checkpoints(
         start = time.perf_counter()
         _prefetch_all()
         succeeded_event.set()
-        logger.info(
+        logger.debug(
             "Rank %d: prefetching checkpoint files into page cache finished in %.2fs",
             local_rank,
             time.perf_counter() - start,
@@ -1571,11 +1611,18 @@ def row_parallel_weight_loader(
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
+def sharded_weight_loader(
+    shard_axis: int,
+    tp_rank_getter=None,
+) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_parallel().attn_tp_rank
+        tp_rank = (
+            tp_rank_getter()
+            if tp_rank_getter is not None
+            else get_parallel().attn_tp_rank
+        )
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
