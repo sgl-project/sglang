@@ -24,6 +24,10 @@ def handle_dllm_inference(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None:
         return
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    get_algorithm_cls(cfg.dllm_algorithm).configure_server_args(server_args)
+
     # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
     # resolution moved to the pipeline: arg_groups/overrides.py
     # _dllm_attention_backend, invoked below at its legacy slot).
