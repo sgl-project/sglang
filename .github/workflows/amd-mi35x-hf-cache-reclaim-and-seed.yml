@@ -9,7 +9,8 @@ name: AMD MI35x HF cache reclaim and seed
 # What it reclaims and what it seeds are set by RECLAIM_DIRS and SEED_MODEL
 # below, so reusing this means editing them and dispatching from the branch
 # carrying that edit. RECLAIM_DIRS empty is an audit: the job reports the cache
-# and uploads a listing, and deletes nothing.
+# and uploads a listing, and deletes nothing. Run it that way first -- the
+# allowlist should come from what is on the volume, not from memory of it.
 #
 # It runs on pull_request as well as dispatch because a workflow file that is
 # not yet on the default branch cannot be dispatched at all, and the cache is
@@ -69,13 +70,36 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
+      # Run 34548293873 audited the volume: 15 TB, 775 MB free, 50 checkpoints.
+      # amd/GLM-5.2-MXFP4 sits there half-downloaded at 212 GiB of 408 GiB, so
+      # 196 GiB has to be fetched and the partial is worth keeping -- HF resumes
+      # against the blobs already present.
+      #
+      # The two entries below are what that audit plus the reachability join in
+      # #36114 found dead on the MI35x cache, and they are dead for reasons that
+      # do not depend on the join being complete:
+      #
+      #   amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 (216 GiB) appears nowhere in
+      #     the tree -- no test, no doc, no config, and nothing in git history.
+      #   deepseek-ai/DeepSeek-V4-Flash-0731 (156 GiB) is named only by
+      #     test_deepseek_v4_flash_fp4_b200.py and its megamoe variant, both
+      #     register_cuda_ci on 4-gpu-b200, so no AMD job can want it.
+      #
+      # 372 GiB against 196 GiB needed. The margin is deliberate: the fleet eats
+      # into anything released while the download runs.
+      #
+      # Not on the list, though the join reports them unreferenced:
+      # amd/Qwen3.5-397B-A17B-MXFP4, because the MI35x Qwen3.5 nightly does load
+      # that checkpoint and only reads as unreferenced because it names a local
+      # /data path rather than the repo id; and zai-org/GLM-5.3-Flash, which has
+      # no test but is new enough that someone is plausibly mid-bring-up on it.
       - name: Reclaim and seed
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
-            -e RECLAIM_DIRS="" \
-            -e SEED_MODEL="" \
-            -e SEED_MIN_GIB="0" \
+            -e RECLAIM_DIRS="models--amd--Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 models--deepseek-ai--DeepSeek-V4-Flash-0731" \
+            -e SEED_MODEL="amd/GLM-5.2-MXFP4" \
+            -e SEED_MIN_GIB="408" \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             bash scripts/ci/amd/reclaim_and_seed_hf_cache.sh || EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
