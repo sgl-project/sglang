@@ -1,5 +1,4 @@
 from transformers import PretrainedConfig
-from transformers.configuration_utils import layer_type_validation
 
 from sglang.utils import logger
 
@@ -319,7 +318,7 @@ class Qwen3OmniMoeTalkerCodePredictorConfig(PretrainedConfig):
                 )
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types, self.num_hidden_layers)
+        self.validate_layer_type()
         self.num_code_groups = num_code_groups
 
 

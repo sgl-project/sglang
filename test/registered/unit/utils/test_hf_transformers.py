@@ -671,36 +671,37 @@ class TestPatchRemovedSymbols(unittest.TestCase):
             "LlamaFlashAttention2 should be patched onto modeling_llama",
         )
 
-    def test_is_flash_attn_greater_or_equal_2_10_callable(self):
-        import transformers.utils as _u
-
-        self.assertTrue(
-            hasattr(_u, "is_flash_attn_greater_or_equal_2_10"),
-            "is_flash_attn_greater_or_equal_2_10 should be patched onto transformers.utils",
-        )
-        self.assertIsInstance(_u.is_flash_attn_greater_or_equal_2_10(), bool)
-
 
 # ---------------------------------------------------------------------------
 # compat: _patch_rope_parameters_validation
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# compat: _ensure_clean_up_tokenization_compat
-# ---------------------------------------------------------------------------
+class TestRopeParametersValidationPatch(unittest.TestCase):
+    """A config without `max_position_embeddings` must still get its
+    `default_rope_type` resolved, and must still not raise."""
 
+    def test_default_rope_type_survives_a_missing_max_position_embeddings(self):
+        class _AxialConfig(PretrainedConfig):
+            default_rope_type = "axial"
 
-class TestCleanUpTokenizationCompat(unittest.TestCase):
-    def test_clean_up_tokenization_exists(self):
-        from transformers import PreTrainedTokenizerBase
+        config = _AxialConfig(rope_theta=10000.0)
+        self.assertFalse(hasattr(config, "max_position_embeddings"))
+        config.standardize_rope_params()
 
-        self.assertTrue(hasattr(PreTrainedTokenizerBase, "clean_up_tokenization"))
+        self.assertEqual(config.rope_parameters["rope_type"], "axial")
 
-    def test_clean_up_tokenization_callable(self):
-        from transformers import PreTrainedTokenizerBase
+    def test_scaling_rope_type_without_max_position_embeddings_does_not_raise(self):
+        """The original guard's purpose: no `AttributeError` out of __post_init__."""
 
-        self.assertTrue(callable(PreTrainedTokenizerBase.clean_up_tokenization))
+        class _ScalingConfig(PretrainedConfig):
+            pass
+
+        config = _ScalingConfig(
+            rope_parameters={"rope_type": "yarn", "rope_theta": 10000.0}
+        )
+        self.assertFalse(hasattr(config, "max_position_embeddings"))
+        config.standardize_rope_params()  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -717,32 +718,113 @@ class TestIsTorchFxAvailableCompat(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# compat: _patch_nemotron_h_pattern
+# AutoConfig registration
 # ---------------------------------------------------------------------------
 
 
-class TestPatchNemotronHPattern(unittest.TestCase):
-    def test_pattern_to_list_skips_mlp_dash(self):
-        try:
-            from transformers.models.nemotron_h.configuration_nemotron_h import (
-                NemotronHConfig,
-            )
+# `inkling_mm_model` predates the invariant: `sglang.srt.configs.inkling` writes
+# `InklingMMConfig` straight into `_extra_content`, over a native `InklingConfig`.
+_KNOWN_NAME_MISMATCHES = {"inkling_mm_model"}
 
-            result = NemotronHConfig._pattern_to_list("M-*-")
-            self.assertEqual(result, ["mamba", "attention"])
-        except ImportError:
-            self.skipTest("NemotronHConfig not available in this transformers version")
 
-    def test_pattern_to_list_standard_chars(self):
-        try:
-            from transformers.models.nemotron_h.configuration_nemotron_h import (
-                NemotronHConfig,
-            )
+class TestAutoConfigRegistration(unittest.TestCase):
+    """`AutoConfig` must keep resolving to a class the Auto* mappings can key on.
 
-            result = NemotronHConfig._pattern_to_list("ME*")
-            self.assertEqual(result, ["mamba", "moe", "attention"])
-        except ImportError:
-            self.skipTest("NemotronHConfig not available in this transformers version")
+    `_LazyAutoMapping` looks its entries up by config class `__name__`, so a
+    SGLang class that shadows a native one under a different name silently
+    disappears from PROCESSOR_MAPPING / TOKENIZER_MAPPING / MODEL_MAPPING.
+    """
+
+    def test_shadowing_entries_keep_the_native_class_name(self):
+        from transformers.models.auto.configuration_auto import (
+            CONFIG_MAPPING,
+            CONFIG_MAPPING_NAMES,
+        )
+
+        import sglang.srt.configs  # noqa: F401  (populates the registrations)
+
+        # `_extra_content` is exactly the set of classes SGLang registered, so
+        # this covers `_CONFIG_REGISTRY` and the standalone registrations alike.
+        for model_type, cls in CONFIG_MAPPING._extra_content.items():
+            native_name = CONFIG_MAPPING_NAMES.get(model_type)
+            if native_name is None or model_type in _KNOWN_NAME_MISMATCHES:
+                continue
+            with self.subTest(model_type=model_type):
+                self.assertEqual(
+                    cls.__name__,
+                    native_name,
+                    f"{cls.__name__} shadows the native {native_name} for "
+                    f"'{model_type}'; the Auto* mappings key on __name__ and "
+                    f"would stop resolving this model type",
+                )
+
+    def test_autoconfig_only_registrations_win_over_native(self):
+        """zaya / cosmos3-edge have no `_CONFIG_REGISTRY` re-parse to fall back on."""
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        from sglang.srt.configs.cosmos3 import Cosmos3EdgeConfig
+        from sglang.srt.configs.zaya import ZayaConfig
+
+        for model_type, expected in (
+            ("zaya", ZayaConfig),
+            ("cosmos3_edge", Cosmos3EdgeConfig),
+        ):
+            with self.subTest(model_type=model_type):
+                self.assertIs(CONFIG_MAPPING[model_type], expected)
+
+
+# ---------------------------------------------------------------------------
+# Pixtral vision rope
+# ---------------------------------------------------------------------------
+
+
+class TestPixtralVisionRope(unittest.TestCase):
+    """The Pixtral tower takes its rope table from transformers, so a change to
+    the axial recomposition would rotate every patch by the wrong angle with
+    the shapes and the import both still intact."""
+
+    def test_rope_table_matches_the_axial_closed_form(self):
+        import torch
+        from transformers import PixtralVisionConfig
+        from transformers.models.pixtral.modeling_pixtral import (
+            PixtralVisionRotaryEmbedding,
+        )
+
+        from sglang.srt.models.pixtral import position_meshgrid
+
+        config = PixtralVisionConfig(
+            hidden_size=64, num_attention_heads=4, image_size=32, patch_size=8
+        )
+        dim = config.head_dim
+        max_side = config.image_size // config.patch_size
+        base = config.rope_parameters["rope_theta"]
+
+        # Separate H and W frequency ladders over the full grid, indexed by the
+        # flattened patch offset, then duplicated for rotate_half.
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        freqs_h = torch.outer(torch.arange(max_side), freqs[::2]).float()
+        freqs_w = torch.outer(torch.arange(max_side), freqs[1::2]).float()
+        table = torch.cat(
+            [
+                freqs_h[:, None, :].repeat(1, max_side, 1),
+                freqs_w[None, :, :].repeat(max_side, 1, 1),
+            ],
+            dim=-1,
+        ).reshape(-1, dim // 2)
+        table = torch.cat((table, table), dim=-1)
+
+        # Two images of different aspect ratios, as the tower batches them.
+        grids = [torch.empty(1, 3, 4), torch.empty(1, 2, 2)]
+        position_ids = position_meshgrid(grids)
+        flat = position_ids[:, 0] * max_side + position_ids[:, 1]
+        expected = table[flat]
+
+        cos, sin = PixtralVisionRotaryEmbedding(config)(
+            torch.zeros(position_ids.shape[0], config.hidden_size), position_ids
+        )
+
+        torch.testing.assert_close(cos, expected.cos(), rtol=0, atol=1e-6)
+        torch.testing.assert_close(sin, expected.sin(), rtol=0, atol=1e-6)
 
 
 if __name__ == "__main__":

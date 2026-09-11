@@ -61,10 +61,8 @@ def apply_all():
     _patch_removed_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
-    _patch_nemotron_h_pattern()
 
     # v5 general patches
-    _ensure_clean_up_tokenization_compat()
     _ensure_is_torch_fx_available_compat()
 
     # CI-only: neutralize HF API calls inside tokenizer from_pretrained
@@ -161,21 +159,22 @@ def _patch_rope_parameters_validation():
     For ``PretrainedConfig``, ``standardize_rope_params()`` accesses
     ``self.max_position_embeddings`` during ``__post_init__`` before extra
     kwargs are set as attributes, causing ``AttributeError``.
-
-    Fix: guard ``standardize_rope_params`` against missing
-    ``max_position_embeddings``.
     """
     from transformers import PretrainedConfig
 
-    # standardize_rope_params accesses self.max_position_embeddings before
-    # __post_init__ sets extra kwargs — skip when the attribute is absent.
     if hasattr(PretrainedConfig, "standardize_rope_params"):
         _orig_standardize = PretrainedConfig.standardize_rope_params
 
         def _safe_standardize(self):
-            if not hasattr(self, "max_position_embeddings"):
-                return
-            return _orig_standardize(self)
+            # Only the llama3/yarn/longrope branches read the attribute, so the
+            # call must still run: it also resolves `default_rope_type`, which
+            # Pixtral's vision config needs to reach "axial".
+            try:
+                return _orig_standardize(self)
+            except AttributeError as e:
+                if "max_position_embeddings" not in str(e):
+                    raise
+                return None
 
         PretrainedConfig.standardize_rope_params = _safe_standardize
 
@@ -203,20 +202,14 @@ def _patch_flash_attn_availability():
 
 
 def _patch_removed_symbols():
-    """Re-export symbols removed in transformers v5.4.0.
+    """Re-export ``LlamaFlashAttention2``, removed in transformers v5.4.0.
 
-    Remote model code (e.g. DeepSeek-OCR) still imports these.
+    Remote model code (e.g. DeepSeek-OCR) still imports it.
     ``check_imports`` in ``dynamic_module_utils.py`` validates imports at
-    config-load time, so these must exist before any ``from_pretrained``.
-
-    Removed symbols:
-    - ``LlamaFlashAttention2`` -- replaced by unified ``LlamaAttention``
-    - ``is_flash_attn_greater_or_equal_2_10`` -- replaced by
-      ``is_flash_attn_greater_or_equal("2.10.0")``
+    config-load time, so it must exist before any ``from_pretrained``.
 
     TODO(upstream): DeepSeek-OCR / deepseek_vl_v2 remote code needs update.
     """
-    # LlamaFlashAttention2
     try:
         import logging
 
@@ -246,23 +239,6 @@ def _patch_removed_symbols():
         logger.warning(
             "Could not import transformers.models.llama.modeling_llama; "
             "LlamaFlashAttention2 compat patch not applied."
-        )
-
-    # is_flash_attn_greater_or_equal_2_10
-    try:
-        import transformers.utils as _u
-
-        if not hasattr(_u, "is_flash_attn_greater_or_equal_2_10"):
-            if hasattr(_u, "is_flash_attn_greater_or_equal"):
-                _u.is_flash_attn_greater_or_equal_2_10 = lambda: (
-                    _u.is_flash_attn_greater_or_equal("2.10.0")
-                )
-            else:
-                _u.is_flash_attn_greater_or_equal_2_10 = lambda: False
-    except ImportError:
-        logger.warning(
-            "Could not import transformers.utils; "
-            "is_flash_attn_greater_or_equal_2_10 compat patch not applied."
         )
 
 
@@ -360,76 +336,9 @@ def _patch_image_process_cuda_tensor():
         )
 
 
-def _patch_nemotron_h_pattern():
-    """Fix ``_pattern_to_list()`` crashing on ``-`` in hybrid_override_pattern.
-
-    Nemotron-H models (e.g. NVIDIA-Nemotron-Nano-9B-v2) use patterns like
-    ``M-M-M-MM-M-*-...`` where ``-`` denotes an MLP layer.  The upstream
-    ``_pattern_to_list`` tries to map every character and crashes with
-    ``KeyError: '-'``.  We skip ``-`` (and any other unmapped chars)
-    since ``layers_block_type`` only tracks mamba/moe/attention layers.
-    SGLang reads MLP positions from ``hybrid_override_pattern`` directly.
-
-    TODO(upstream): report to HF transformers.
-    """
-    try:
-        from transformers.models.nemotron_h.configuration_nemotron_h import (
-            NemotronHConfig,
-        )
-
-        @staticmethod
-        def _pattern_to_list(pattern: str) -> list:
-            pattern_mapping = {
-                "M": "mamba",
-                "E": "moe",
-                "*": "attention",
-            }
-            return [
-                pattern_mapping[char] for char in pattern if char in pattern_mapping
-            ]
-
-        NemotronHConfig._pattern_to_list = _pattern_to_list
-    except ImportError:
-        logger.debug(
-            "_patch_nemotron_h_pattern: NemotronHConfig not importable, patch skipped"
-        )
-
-
 # ---------------------------------------------------------------------------
 # v5 general patches
 # ---------------------------------------------------------------------------
-
-
-def _ensure_clean_up_tokenization_compat() -> None:
-    """Re-add ``clean_up_tokenization`` removed in transformers v5.
-
-    Remote-code tokenizers (e.g. InternLM2Tokenizer) call
-    ``self.clean_up_tokenization()`` which was a static method on
-    ``PreTrainedTokenizerBase`` in v4 but removed in v5. Patch it back
-    so existing HuggingFace Hub tokenizer code keeps working.
-    """
-    from transformers import PreTrainedTokenizerBase
-
-    if hasattr(PreTrainedTokenizerBase, "clean_up_tokenization"):
-        return
-
-    @staticmethod
-    def clean_up_tokenization(out_string: str) -> str:
-        out_string = (
-            out_string.replace(" .", ".")
-            .replace(" ?", "?")
-            .replace(" !", "!")
-            .replace(" ,", ",")
-            .replace(" ' ", "'")
-            .replace(" n't", "n't")
-            .replace(" 'm", "'m")
-            .replace(" 's", "'s")
-            .replace(" 've", "'ve")
-            .replace(" 're", "'re")
-        )
-        return out_string
-
-    PreTrainedTokenizerBase.clean_up_tokenization = clean_up_tokenization
 
 
 def _ensure_is_torch_fx_available_compat() -> None:
