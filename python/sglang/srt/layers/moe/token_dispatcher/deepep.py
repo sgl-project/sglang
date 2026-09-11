@@ -611,6 +611,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # `handle` as a member variable works.
 
         _deepep_precompile_tp_barrier()
+        npu_quantization_opts = (
+            {
+                "use_fp8": self.use_fp8,
+                "use_mxfp4": self.use_mxfp4,
+                "use_mxfp8": self.use_mxfp8,
+            }
+            if _is_npu
+            else {}
+        )
         (
             recv_x,
             recv_topk_ids,
@@ -631,9 +640,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
-            use_fp8=self.use_fp8,
-            use_mxfp4=self.use_mxfp4,
-            use_mxfp8=self.use_mxfp8,
+            **npu_quantization_opts,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
@@ -790,6 +797,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        npu_mxfp_quantization_opts = (
+            {
+                "use_mxfp4": self.use_mxfp4,
+                "use_mxfp8": self.use_mxfp8,
+            }
+            if _is_npu
+            else {}
+        )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -797,8 +812,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=self.use_fp8,
-                use_mxfp4=self.use_mxfp4,
-                use_mxfp8=self.use_mxfp8,
+                **npu_mxfp_quantization_opts,
                 **(
                     dict(topk_weights=topk_weights)
                     if _is_npu and not _use_zbal
