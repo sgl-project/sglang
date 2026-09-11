@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.pool.base import KVCache
 
 
 class MambaFullCacheDonor(Protocol):
