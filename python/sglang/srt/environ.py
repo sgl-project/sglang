@@ -284,6 +284,14 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
+    # Hold --dcp-comm-backend ag_rs on NPU instead of promoting it to a2a.
+    # `ag_rs` is the field's own default, so the resolution pipeline cannot tell
+    # an explicitly passed one from an unset one and the NPU default pass
+    # promotes both. That makes ag_rs -- kept precisely as a correctness
+    # reference for localizing a merge bug -- unreachable from the CLI at the
+    # moment it is needed. This is the escape hatch; it changes nothing unless
+    # the backend also resolves to ag_rs.
+    SGLANG_DCP_KEEP_AG_RS = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

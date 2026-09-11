@@ -12,7 +12,9 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -546,6 +548,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_buf_size: Optional[int] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
     ):
@@ -605,6 +608,44 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
 
+        # How many token rows the index-K buffer spans, independent of how many
+        # the latent KV spans. The CUDA pool has had this seam since it was
+        # written -- `DSATokenToKVPool` takes `index_buf_size` and hands it to
+        # `IndexKeyCache` (memory_pool.py:4444, :4496) -- and `hisparse` already
+        # passes something other than `size` through it
+        # (hisparse_memory_pool.py:58). This pool derived both counts from
+        # `self.size`, which is only correct while the two are equal.
+        #
+        # They stop being equal under decode context parallelism. The latent KV
+        # is sharded, so each rank keeps `size` rows and translates writes into
+        # them; the LightningIndexer is replicated and has to address every
+        # global position, so its buffer spans the full virtual range,
+        # `size * dcp_size`, and is written at a raw, unfiltered `loc`. That is
+        # the same division of labour the CUDA DSA pool already has.
+        #
+        # Nothing passes a widened value yet: at dcp_size 1 the two are equal
+        # and this is a pure refactor. The seam lands first, on its own, so that
+        # the write-path translation it enables is a separate diff to bisect.
+        #
+        # One consumer this diverges from: the HiCache host mirror allocates
+        # index-K from the same `base_dims` as k/v (pool_host/mla.py, layout
+        # "page_first_kv_split"), sized from this pool's *sharded* `size` times
+        # hicache_ratio. A DCP-widened index buffer outgrows it whenever
+        # hicache_ratio < dcp_size. HiCache + DCP is permitted for MLA
+        # (hybrid_pool_assembler.py:153), so that combination is reachable and
+        # the host pool now asserts the page counts rather than transferring
+        # into a short buffer.
+        self.index_buf_size = size if index_buf_size is None else index_buf_size
+
+        # Layers that reuse the previous layer's top-k own no Indexer and cache
+        # no index-K -- 57 of 78 on GLM-5.2. This branch carried that as a
+        # layer-aligned `skip_topk_layers` bool mask (d0d279c97); upstream has
+        # since landed the same elision as `indexer_layer_ids` plus
+        # `indexer_layer_id_to_slot` above, which compacts the buffer instead of
+        # leaving zero-page holes in it. Upstream's is kept and ours is dropped.
+        # Read `self.num_indexer_layers` for the count and
+        # `self.indexer_layer_id_to_slot` to address a layer.
+
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -641,10 +682,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
+                # Pages come from index_buf_size, NOT self.size. Under DCP the
+                # latent KV is sharded so self.size is this rank's physical row
+                # count, while the indexer is replicated and has to address every
+                # GLOBAL position -- its span is size * dcp_size. At dcp_size 1
+                # the two are equal and this is the stock expression.
+                #
+                # The layer axis is num_indexer_layers, not layer_num: this pool
+                # now compacts index-K to the layers that own an Indexer and maps
+                # layer_id through indexer_layer_id_to_slot. That supersedes the
+                # ragged layer-aligned list this branch carried (d0d279c97) and
+                # is strictly better -- it also resolves the HiCache constraint
+                # that forced the ragged form, since transfer_kv_dim_exchange
+                # needs device and host layer counts to agree and both are now
+                # compacted the same way.
                 self.index_k_buffer = torch.zeros(
                     (
                         self.num_indexer_layers,
-                        self.size // self.page_size + 1,
+                        self.index_buf_size // self.page_size + 1,
                         self.page_size,
                         1,
                         self.index_head_dim,
@@ -704,9 +759,75 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.v_buffer[layer_id - self.start_layer],
         )
 
+    def get_kv_buffer_shape(self):
+        """One layer's KV as CUDA lays it out: ``(rows, 1, nope + rope)``.
+
+        The inherited implementation returns ``get_kv_buffer(start_layer)``'s
+        shapes, which on this pool are two *separate* paged tensors of
+        ``(pages, page_size, 1, dim)`` -- nope and rope kept apart, where CUDA's
+        MLA pool keeps one fused ``(rows, 1, kv_lora_rank + qk_rope_head_dim)``.
+
+        Its only caller is the DCP extend gather, which builds its buffer as
+        ``(seq_lens_sum, *shape[0][1:])`` (``layers/dcp/planner.py``). Under the
+        inherited reading that allocates ``page_size`` rows per token and drops
+        the rope half entirely: roughly a gigabyte at an 8k prefill and about
+        137 GiB at 1M, for a buffer that is then never read. So this reports
+        what the caller is actually asking -- how big is one token -- rather
+        than how this pool happens to store it, and reports it in CUDA's fused
+        form because that is the layout the gather writes and reads.
+
+        Note what the caller consumes: ``shape[0][1:]``, i.e. it drops the row
+        axis and keeps the rest as the per-token shape. So the row axis must be
+        PRESENT and leading even though its value is unused -- returning the
+        per-token shape directly makes the buffer 2-D and the gather then fails
+        on a rank with an empty prefix, which is where this was caught.
+
+        Both halves of the tuple are the same fused shape. The caller takes
+        ``[0]``; there is no separate v-shape to report once the two are fused,
+        and returning the rope-only shape as ``[1]`` would invite exactly the
+        per-half reading this override exists to prevent.
+        """
+        pages, page_size = self.k_buffer[0].shape[0], self.k_buffer[0].shape[1]
+        fused = torch.Size(
+            (pages * page_size, 1, self.kv_lora_rank + self.qk_rope_head_dim)
+        )
+        return fused, fused
+
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Gather ``(nope, rope)`` at physical rows ``loc``.
+
+        The inherited implementation reads a single fused ``kv_buffer`` through
+        ``get_mla_kv_buffer_triton``; this pool stores the halves in two paged
+        tensors, so that kernel would index the wrong memory rather than fail.
+
+        ``loc`` arrives already rank-local and physical -- the DCP caller
+        translates through ``translate_dcp_read_ids`` before calling, which is
+        the read door's stated contract -- so this must NOT apply the owner
+        filter or the ``// dcp_size`` again. Flattening the page axes and
+        selecting is then the whole operation, and it is correct at any
+        ``dcp_size`` including 1.
+        """
+        k = self.get_key_buffer(layer.layer_id).view(-1, self.kv_lora_rank)
+        v = self.get_value_buffer(layer.layer_id).view(-1, self.qk_rope_head_dim)
+        idx = loc.to(torch.int64)
+        cache_k_nope = k.index_select(0, idx).unsqueeze(1)
+        cache_k_rope = v.index_select(0, idx).unsqueeze(1)
+        if dst_dtype is not None and dst_dtype != cache_k_nope.dtype:
+            cache_k_nope = cache_k_nope.to(dst_dtype)
+            cache_k_rope = cache_k_rope.to(dst_dtype)
+        return cache_k_nope, cache_k_rope
+
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []
+        # Iterates the buffer, not range(layer_num): index_k_buffer is compacted
+        # to num_indexer_layers now, so a layer_num-length loop would run off the
+        # end. This replaces the ragged-aware _index_k_item_len this branch used.
         buffers = list(self.index_k_buffer)
         if self.index_k_scale_buffer is not None:
             buffers += list(self.index_k_scale_buffer)
@@ -814,6 +935,76 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         return packed.view(self.dtype)
 
+    def _resolve_dcp_write(
+        self,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        """Redirect a DCP-widened loc so this rank's tokens land on its rows.
+
+        The allocator hands every rank the same *virtual* locations, spanning
+        the whole sequence. The latent KV is sharded, so a rank keeps only the
+        positions it owns and collapses them into its own rows. The contract is
+        CUDA's, from the Triton kernel at kernels/ops/kvcache/mla_buffer.py:42:
+
+            is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+            loc      = loc // DCP_WORLD_SIZE
+
+        There the filter and the divide happen inside the store. Here they
+        cannot: `npu_scatter_nd_update_` is a fused vendor operator with no body
+        to edit, so both have to run as tensor ops before the call.
+
+        **This rewrites the destination rather than dropping rows, and that is
+        load-bearing.** The first version selected -- ``loc[owned]``,
+        ``cache_k[owned]``, ``cache_v[owned]`` -- which is the obvious reading of
+        the contract above and cannot be captured into a graph. A boolean index
+        has a data-dependent output shape, so torch_npu resolves it with
+        ``aclnnNonzeroV2`` and must synchronize the stream to learn how many rows
+        survived; synchronizing a captured stream is refused outright
+        (``rtStreamSynchronize ... reason=stream is captured``), so decode graph
+        capture died here on every rank. Nothing about it degrades gracefully:
+        the shape is genuinely unknown until the data is read.
+
+        So every row is written and the non-owned ones are aimed at physical row
+        0 instead. That row is the padding row -- the allocator seeds
+        ``free_pages`` from 1 (allocator/paged.py:339-343), so no real token is
+        ever issued a virtual loc below one page, and with the widened page of
+        ``page_size * dcp_size`` the smallest real virtual loc divides down to
+        ``page_size``. Physical page 0 is therefore never allocated on any rank,
+        which is precisely what CUDA's ``reserved_skip_index`` reserves it for.
+        Duplicate destinations are fine: every colliding write carries a value
+        nothing reads, so last-write-wins is deterministic in the only sense that
+        matters.
+
+        It costs ``dcp_size`` times the write volume -- 5.7 MB per decode step at
+        batch 64, dcp16, 78 layers, against 0.36 MB -- and buys back three
+        boolean gathers per layer, each of which allocated, copied, and launched
+        a NonZero. Eager mode should not be slower for it, and may be faster.
+        """
+        dcp_size = get_parallel().attn_dcp_size
+        # Bounds are checked against the WIDENED space, matching the CUDA
+        # pool's own widened check (memory_pool.py:4204). Checking the
+        # unscaled range here would reject every legitimate write above
+        # size/dcp_size the moment DCP came on.
+        maybe_detect_oob(
+            loc,
+            0,
+            (self.size + self.page_size) * dcp_size,
+            "set_kv_buffer (NPU MLA, widened loc)",
+        )
+        if dcp_size == 1:
+            return loc, cache_k, cache_v
+
+        owned = (loc % dcp_size) == get_parallel().attn_dcp_rank
+        # Static shape, no NonZero, no stream sync: capturable. See the note
+        # above for why row 0 is the right place to send the rest.
+        return (
+            torch.where(owned, loc // dcp_size, loc.new_zeros(())),
+            cache_k,
+            cache_v,
+        )
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
@@ -851,6 +1042,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
+        loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
+
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
             loc.view(-1, 1),
@@ -870,6 +1063,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
+        # Only layers that own an Indexer produce index-K, and those are exactly
+        # the layers given a non-empty buffer. A write here to an elided layer
+        # means the pool's mask disagrees with the model's own
+        # `self.indexer is None` decision -- fail loudly rather than scatter into
+        # a zero-page tensor.
+        # The indexer is replicated: this writes at the raw, untranslated loc,
+        # so the bound is index_buf_size rather than size. That makes the two
+        # numbers a contract, and this is where a breach shows up -- an
+        # index_buf_size that did not span the virtual range would run off the
+        # end here rather than wrap, because nothing masks the scatter.
+        maybe_detect_oob(
+            loc,
+            0,
+            self.index_buf_size + self.page_size,
+            "set_index_k_buffer (NPU MLA, raw virtual loc)",
+        )
+        assert layer_id in self.indexer_layer_id_to_slot, (
+            f"layer {layer_id} owns no Indexer but wrote index-K; the pool's "
+            "indexer_layer_ids disagrees with the model's indexer layout"
+        )
+
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
 

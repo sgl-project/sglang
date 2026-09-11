@@ -1425,6 +1425,53 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _dcp_comm_backend_default(view: Any) -> dict:
+    """Default the DCP attention-reduction comm backend to the fused a2a
+    exchange on NPU.
+
+    ``ag_rs`` (all-gather LSE, reduce-scatter output) costs three collectives
+    per layer; ``a2a`` packs output and LSE into a single HCCL all-to-all and
+    is the backend with a direct vLLM-Ascend precedent. This only replaces the
+    cross-platform default, the same way ``kv_cache_dtype``'s "auto" sentinel
+    is resolved per device elsewhere in this module.
+
+    **Holding ag_rs needs the env var, not the flag.** ``ag_rs`` is the field's
+    own default, so the resolution pipeline cannot tell an explicitly passed
+    ``--dcp-comm-backend ag_rs`` from an unset one and this pass promoted both.
+    The original version of this docstring claimed ag_rs "stays selectable (e.g.
+    to localize a merge bug)" while its own log message admitted the opposite --
+    and the first time that reference was actually needed, to split a
+    capture-only DCP defect between the merge collective and everything else, it
+    turned out to be unreachable. ``SGLANG_DCP_KEEP_AG_RS=1`` is the escape
+    hatch. It is deliberately an env var rather than a new flag: the flag
+    already exists and means the right thing; what is missing is a way to say
+    "explicitly".
+    """
+    if not get_platform().is_npu:
+        return {}
+    if view.dcp_size <= 1:
+        return {}
+    if view.dcp_comm_backend != "ag_rs":
+        return {}
+    if envs.SGLANG_DCP_KEEP_AG_RS.get():
+        logger.info(
+            "SGLANG_DCP_KEEP_AG_RS=1: holding the DCP communication backend at "
+            "'ag_rs' on NPU instead of promoting it to 'a2a'. This is the "
+            "correctness-reference path -- it costs three collectives per layer "
+            "where a2a costs one, so do not leave it set for a timed run."
+        )
+        return {}
+    logger.info(
+        "Ascend NPU selects the DCP communication backend: 'ag_rs' -> 'a2a'. "
+        "Note this promotes an explicitly passed --dcp-comm-backend ag_rs as "
+        "well, because 'ag_rs' is the field's own default and the resolution "
+        "pipeline cannot tell the two apart. Set SGLANG_DCP_KEEP_AG_RS=1 to "
+        "hold ag_rs as a correctness reference."
+    )
+    return {"dcp_comm_backend": "a2a"}
+
+
+@register_post_process
 def _tp_lm_head_all_to_all_default(view: Any) -> dict:
     """Enable the TP LM-head all-to-all path only for pure-DP decode nodes.
 

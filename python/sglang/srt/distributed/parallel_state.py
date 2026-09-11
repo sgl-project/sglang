@@ -92,16 +92,30 @@ def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
 
-    # Only create HCCL options for default group or MoE-related groups
-    if group_name is not None and "moe" not in group_name:
+    # Only create HCCL options for the default group, MoE-related groups, or
+    # the DCP group (decode context parallelism also needs a tuned HCCL
+    # buffer for its per-layer all-to-all/all-gather exchange).
+    is_dcp = group_name == "dcp"
+    if group_name is not None and "moe" not in group_name and not is_dcp:
         return None
 
     import torch_npu
 
+    if is_dcp:
+        # Deliberately not DEEPEP_HCCL_BUFFSIZE. That knob sizes the MoE
+        # dispatch/combine buffers and is routinely set far above what any
+        # other group needs; reading it here would make every DeepEP-tuned
+        # deployment pay that size a second time, per rank, for a group with
+        # no MoE traffic in it. The generic knob is the one an operator sets
+        # for the DCP exchange -- the A3 1M recipe exports HCCL_BUFFSIZE=768.
+        hccl_buffer_size = int(os.environ.get("HCCL_BUFFSIZE") or 200)
+    else:
+        hccl_buffer_size = int(
+            os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+            or os.environ.get("HCCL_BUFFSIZE")
+            or 200
+        )
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    hccl_buffer_size = int(
-        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
-    )
     options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
     return options
 
@@ -2539,12 +2553,13 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda()):
+    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda() or is_npu()):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP platform or CUDA platform, but got "
+            "currently only supported on the AMD HIP, CUDA or Ascend NPU "
+            "platform, but got "
             f"decode_context_parallel_size ({decode_context_parallel_size}) "
-            "on a non-HIP or non-CUDA platform."
+            "on an unsupported platform."
         )
     if tensor_model_parallel_size % decode_context_parallel_size != 0:
         raise RuntimeError(

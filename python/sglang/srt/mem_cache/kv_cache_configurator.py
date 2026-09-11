@@ -102,6 +102,59 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def dcp_virtual_loc_extent(
+    max_total_num_tokens: int, attn_dcp_size: int, loc_space_scale: int
+) -> int:
+    """How many token rows span the whole DCP virtual location space.
+
+    A replicated buffer -- the LightningIndexer's index-K, and a draft worker's
+    pools -- is addressed at a raw, untranslated ``loc``, so it must cover every
+    location the allocator can issue: ``max_total * dcp_size``. A sharded buffer
+    translates ``// dcp_size`` and stays at ``max_total``.
+
+    The subtlety this exists for: ``max_total_num_tokens`` reaches the pool
+    builders *already* multiplied by ``loc_space_scale`` (``_derive_pool_sizes``),
+    which is ``attn_dcp_size`` on a draft worker and 1 on the target. Multiplying
+    unconditionally therefore double-counts on the draft and asks for
+    ``max_total * dcp_size**2`` rows -- at 1M tokens and DCP16 that is sixteen
+    times the intended buffer, and it is invisible in every configuration CI runs
+    because both scales are 1 without DCP.
+    """
+    assert loc_space_scale in (1, attn_dcp_size), (
+        f"loc_space_scale {loc_space_scale} is neither 1 nor attn_dcp_size "
+        f"{attn_dcp_size}; the virtual extent below assumes one of the two"
+    )
+    return max_total_num_tokens * attn_dcp_size // loc_space_scale
+
+
+def dcp_index_buf_widening_factor(
+    attn_dcp_size: int, *, index_buf_is_replicated: bool
+) -> int:
+    """How many times the index-K buffer exceeds a per-rank token budget.
+
+    The companion to ``dcp_virtual_loc_extent`` above, for the *memory budget*
+    rather than the allocation. Both have to agree, and when they did not the
+    failure was a bare ``NPU out of memory`` during pool construction with
+    nothing naming DCP as the cause.
+
+    The asymmetry: under DCP the latent KV **shards** -- each rank stores
+    ``max_total`` rows and translates ``// dcp_size`` on the way in -- while the
+    LightningIndexer's index-K is **replicated** and spans the whole virtual
+    space, ``max_total * dcp_size``. A per-token cost that counts the indexer
+    once is therefore short by exactly ``attn_dcp_size`` on that term, so the
+    derived ``max_total`` overshoots and the pool cannot fit what the budget
+    promised. Measured on A3 at DCP16: 1.08 GiB budgeted against 17.35 GiB
+    allocated, a 16.27 GiB overshoot per die.
+
+    Returns 1 wherever the widening does not happen, so callers can multiply
+    unconditionally. Note this is invisible to CI, which runs at
+    ``dcp_size == 1`` where the factor collapses to 1 either way.
+    """
+    if not index_buf_is_replicated or attn_dcp_size <= 1:
+        return 1
+    return attn_dcp_size
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
     return (
@@ -1522,10 +1575,22 @@ class KVCacheConfigurator:
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         is_arch35 = is_npu_arch35()
-        use_compact_indexer_layout = (
-            is_dsa_model
-            and is_arch35
-            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+        # NOTE(dcp-port): upstream gated this on `is_arch35`, i.e. 950/A5 only.
+        # That gate is deliberately dropped here. Layers that reuse the previous
+        # layer's top-k own no Indexer and never write index-K on ANY Ascend
+        # arch -- the predicate is `dsa_layer_skips_topk`, which reads the model
+        # config, not the device. On 910/A3 this elides 57 of 78 layers on
+        # GLM-5.2 and reclaims ~222 GiB machine-wide, measured on the box
+        # 2026-09-07 (0.447 GiB at a 32,768-token pool, matching
+        # 57 x 257 pages x 32,768 B to the byte). Keeping the arch35 gate would
+        # silently drop that on the A3 target.
+        #
+        # If upstream gated it because some 910-only consumer needs a
+        # layer-aligned index_k_buffer, this is where that would surface. The
+        # pool itself is arch-independent: it addresses index-K through
+        # indexer_layer_id_to_slot everywhere.
+        use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:
@@ -1560,6 +1625,18 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            # The indexer's extent is a separate decision from the latent KV's,
+            # and under DCP they diverge: the latent KV is sharded, so this pool
+            # keeps max_total rows and translates writes into them, while the
+            # LightningIndexer is replicated, addresses every global position at
+            # a raw loc, and so spans the whole virtual range. Not a bare
+            # multiply -- see dcp_virtual_loc_extent for why the draft worker
+            # would otherwise be scaled twice.
+            index_buf_size=dcp_virtual_loc_extent(
+                max_total_num_tokens,
+                get_parallel().attn_dcp_size,
+                self.loc_space_scale,
+            ),
         )
         return token_to_kv_pool
 
@@ -2042,9 +2119,14 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
+                    # Widened by attn_dcp_size on both axes, matching the CUDA
+                    # branch below. The allocator issues *virtual* locs over the
+                    # whole sequence; each pool then keeps or translates them.
+                    # attn_dcp_size is 1 without DCP, so this is inert off it.
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
+                        sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
+                        page_size=get_schedule().page_size
+                        * get_parallel().attn_dcp_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,

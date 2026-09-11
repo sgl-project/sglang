@@ -353,9 +353,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
+                from sglang.srt.mem_cache.kv_cache_configurator import (
+                    dcp_index_buf_widening_factor,
+                )
+
+                # Under DCP the latent KV shards but the indexer is replicated
+                # over the whole virtual loc space, so its per-token cost is
+                # dcp_size times what one rank's share would suggest. Counting
+                # it once here derives a max_total the pool cannot honour, and
+                # the symptom is an unexplained OOM during pool construction.
                 cell_size += self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
+                ) * dcp_index_buf_widening_factor(
+                    dcp_size,
+                    index_buf_is_replicated=self._is_ascend_mla_pool(kvc),
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
@@ -429,6 +441,39 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return cell_size
 
     @staticmethod
+    def _is_ascend_mla_pool(kvc: KVCacheConfigurator) -> bool:
+        """Will ``NPUMLATokenToKVPool`` be the pool for this model?
+
+        Mirrors the gate on ``_build_ascend_mla_kv_pool``. Two budget terms
+        depend on it, and both were wrong before this predicate existed,
+        because that pool differs from the CUDA ``DSATokenToKVPool`` twice over:
+
+        1. **It widens index-K under DCP.** It is the only builder that passes
+           ``index_buf_size=dcp_virtual_loc_extent(...)``, spanning the whole
+           virtual loc space rather than one rank's shard.
+        2. **It stores index-K unquantized.** Plain ``index_head_dim`` at the
+           pool's own dtype, where the CUDA pool packs k-with-scale into uint8.
+
+        **Keep this in step with the builder.** If another backend adopts either
+        behaviour without teaching this predicate, it gets the same unexplained
+        load-time OOM Ascend did -- and CI will not catch it, because every
+        configuration CI runs has ``dcp_size == 1`` and a CUDA pool.
+
+        On CUDA the indexer is not widened today (``_build_dsa_kv_pool`` omits
+        ``index_buf_size`` entirely), so this returns False there and the CUDA
+        budget is untouched. That omission is a separate, known under-allocation
+        on the CUDA side; this predicate describes what the code does, not what
+        it should do.
+        """
+        return (
+            get_exec().kernel.attention_backend == "ascend"
+            and kvc.use_mla_backend
+            and not kvc.is_hybrid_swa
+            and not is_minimax_sparse(kvc.model_config.hf_config)
+            and mambaish_config(kvc.model_config) is None
+        )
+
+    @staticmethod
     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
         from sglang.srt.layers.attention.qsa.config import (
             QSA_VARIANT_COMPRESSED,
@@ -465,6 +510,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
+        # This NPU branch subsumes the _is_ascend_mla_pool pricing branch this
+        # port carried: both exist to price index-K unquantized at
+        # index_head_dim when the cache is not FP8. The predicate itself is
+        # still live -- index_buf_is_replicated above needs it for the DCP
+        # widening term, which upstream has no equivalent of.
         indexer_size_per_token = (
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
         )
@@ -472,15 +522,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
-            if not is_npu_arch35():
-                allocate_all_layers = True
+            # NOTE(dcp-port): upstream forced allocate_all_layers on
+            # non-arch35, pairing with its arch35 gate on the compact
+            # indexer layout. That gate is dropped in
+            # kv_cache_configurator._build_ascend_mla_kv_pool, so forcing it
+            # here would budget 78 layers of index-K while the pool only
+            # allocates 21 -- re-inflating the ~222 GiB the elision reclaims
+            # on A3. Both changes stand or fall together.
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

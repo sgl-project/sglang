@@ -99,7 +99,14 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla"}
+    # Backends whose attention returns a natural-log LSE. Getting this wrong
+    # does not fail loudly: feeding a base-e LSE to the base-2 merge is a
+    # monotone reweighting, so the output stays finite and plausible and only
+    # acceptance degrades. See test_the_wrong_log_base_is_not_silently_fine.
+    #
+    # "ascend": CANN defines softmax_sum as sum(exp(qk - max)) and the LSE is
+    # reconstructed as softmax_max + log(softmax_sum), which is natural log.
+    return attention_backend in {"flashmla", "cutedsl_mla", "ascend"}
 
 
 if _is_cuda:

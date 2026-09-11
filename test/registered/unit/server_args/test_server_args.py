@@ -3353,5 +3353,116 @@ class TestNoneMeansUnset(CustomTestCase):
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
+class TestDcpGroupGeometryValidation(CustomTestCase):
+    """A DCP group must be a whole number of ranks inside one attention-TP
+    group -- one DP replica at one CP rank.
+
+    Both group families are built as contiguous chunks of the same TP group:
+    DCP in chunks of dcp_size, attention-TP in chunks of attn_tp_size. So the
+    binding constraint is attn_tp_size % dcp_size, and tp_size % dcp_size does
+    not imply it.
+    """
+
+    @staticmethod
+    def _validate(**kwargs):
+        parallel_hook.handle_dcp_validation(ServerArgs(model_path="dummy", **kwargs))
+
+    def test_ragged_split_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            self._validate(tp_size=4, dcp_size=3)
+        self.assertIn("--dcp-size", str(caught.exception))
+        self.assertIn("tp_size=4", str(caught.exception))
+
+    def test_dcp_wider_than_the_attention_tp_group_is_rejected(self):
+        """The case tp_size % dcp_size misses: 4 % 4 == 0, but DP attention
+        halves the attention-TP width, so a 4-rank DCP group would straddle two
+        replicas decoding different batches."""
+        with self.assertRaises(ValueError) as caught:
+            self._validate(tp_size=4, dp_size=2, enable_dp_attention=True, dcp_size=4)
+        self.assertIn("attn_tp_size=2", str(caught.exception))
+
+    def test_dwdp_is_folded_in_before_it_forces_dp_attention(self):
+        """handle_dwdp runs after this handler and then sets dp_size and
+        enable_dp_attention itself, so dwdp_size has to be read directly or a
+        DWDP run slips past with attn_tp_size=1."""
+        with self.assertRaises(ValueError) as caught:
+            self._validate(tp_size=4, dwdp_size=4, dcp_size=2)
+        self.assertIn("attn_tp_size=1", str(caught.exception))
+
+    def test_dcp_nested_inside_each_dp_replica_is_accepted(self):
+        # Two 2-rank DCP groups, one per replica: [0,1] and [2,3].
+        self._validate(tp_size=4, dp_size=2, enable_dp_attention=True, dcp_size=2)
+
+    def test_dcp_spanning_the_whole_tp_group_is_accepted(self):
+        self._validate(tp_size=4, dcp_size=4)
+
+    def test_an_indivisible_attention_split_is_left_to_context_parallelism(self):
+        """tp_size not divisible by attn_dp_size * attn_cp_size is
+        handle_context_parallelism's error to raise. Reporting a truncated
+        attn_tp_size here would name the wrong flag."""
+        self._validate(tp_size=4, dp_size=3, enable_dp_attention=True, dcp_size=2)
+
+
+class TestDcpCommBackendDefault(CustomTestCase):
+    @override_platform(is_npu=True)
+    def test_npu_promotes_the_default_to_the_fused_a2a_exchange(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=4)
+        parallel_hook.handle_dcp_validation(args)
+        self.assertEqual(resolving_view(args).dcp_comm_backend, "a2a")
+
+    @override_platform(is_npu=True)
+    def test_no_promotion_without_a_dcp_group_to_exchange_over(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=1)
+        parallel_hook.handle_dcp_validation(args)
+        self.assertEqual(resolving_view(args).dcp_comm_backend, "ag_rs")
+
+    @override_platform(is_npu=False)
+    def test_other_platforms_keep_the_cross_platform_default(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=4)
+        parallel_hook.handle_dcp_validation(args)
+        self.assertEqual(resolving_view(args).dcp_comm_backend, "ag_rs")
+
+    @override_platform(is_npu=True)
+    def test_the_env_escape_hatch_holds_ag_rs_on_npu(self):
+        """ag_rs is kept as a correctness reference for localizing merge bugs,
+        and it has to be reachable at the moment one appears.
+
+        The flag alone cannot express it: 'ag_rs' is the field's own default, so
+        the pipeline cannot distinguish an explicit --dcp-comm-backend ag_rs
+        from an unset one and the NPU pass promotes both. The first time the
+        reference was actually wanted -- splitting a capture-only DCP defect
+        between the merge collective and everything else -- it turned out to be
+        unreachable, which is what this env var and this test exist to prevent
+        recurring.
+        """
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DCP_KEEP_AG_RS.override(True):
+            args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=4)
+            parallel_hook.handle_dcp_validation(args)
+            self.assertEqual(resolving_view(args).dcp_comm_backend, "ag_rs")
+
+    @override_platform(is_npu=True)
+    def test_the_escape_hatch_does_not_force_ag_rs_onto_an_a2a_request(self):
+        """It suppresses a promotion; it does not select a backend. Someone who
+        asked for a2a keeps a2a with the variable set."""
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DCP_KEEP_AG_RS.override(True):
+            args = ServerArgs(
+                model_path="dummy", tp_size=4, dcp_size=4, dcp_comm_backend="a2a"
+            )
+            parallel_hook.handle_dcp_validation(args)
+            self.assertEqual(resolving_view(args).dcp_comm_backend, "a2a")
+
+
 if __name__ == "__main__":
     unittest.main()

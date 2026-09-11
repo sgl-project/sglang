@@ -52,6 +52,108 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     return kv_indices
 
 
+def dcp_local_kv_block_table(loc_rows: torch.Tensor, page_size: int) -> torch.Tensor:
+    """The rank-local KV page table, from the same ``req_to_token`` slice.
+
+    Under DCP the attention backend needs *two* page tables over one allocation,
+    because the indexer and sparse attention read different pools:
+
+        indexer   replicated, pages of ``page_size`` over the full virtual span
+        latent KV sharded,     pages of ``page_size`` over this rank's rows
+
+    The existing expression in the backend --
+    ``req_to_token[reqs, :n][:, ::page_size] // page_size`` -- already produces
+    the **indexer's** table under DCP and needs no change. This produces the
+    other one.
+
+    The derivation, writing P for page_size and c for dcp_size. The allocator
+    pages in *virtual* space at ``P * c``, so allocator page number k of a
+    request has some physical id q_k and covers virtual locations
+    ``q_k * P * c + i`` for ``i`` in ``[0, P*c)``. Rank r owns the ones with
+    ``v % c == r``; since ``q_k * P * c`` is divisible by c that is ``i % c == r``,
+    and those map under ``// c`` to ``q_k * P + i // c`` -- physical page q_k,
+    offset ``i // c``. So a rank-local page is exactly an allocator page, and
+    reading the location at every ``P * c``-th position and dividing by ``P * c``
+    recovers its physical id.
+
+    At ``c == 1`` this is character-for-character the existing expression, which
+    is what makes it safe to route both through here.
+    """
+    stride = page_size * get_parallel().attn_dcp_size
+    return loc_rows[:, ::stride] // stride
+
+
+def remap_dcp_local_topk_indices(
+    topk_indices: torch.Tensor, invalid: int = -1
+) -> torch.Tensor:
+    """Global sparse top-k positions -> rank-local KV coordinates, shape preserved.
+
+    The sparse indexer selects top-k over the *replicated* index-K buffer, so it
+    returns positions in the full sequence's coordinate system. Sparse attention
+    reads the *sharded* latent KV and needs rank-local ones. This is the
+    translation between the two.
+
+    ``filter_dcp_local_kv_indices`` cannot be reused here even though the owner
+    rule is identical, because it *selects* and so returns a shorter tensor. A
+    top-k tensor is ``[..., K]`` with K fixed by ``index_topk``, and each row
+    keeps a different number of entries -- selecting would make it ragged, which
+    no kernel can take. So instead of dropping non-owned entries this marks them
+    ``invalid`` and stably compacts the survivors to the front, leaving the
+    shape untouched and the top-k order intact. Same approach as vLLM-Ascend
+    (``attention/context_parallel/sfa_cp.py:1023-1045``), which is the only
+    working reference for DCP composed with a sparse indexer.
+
+    The ``>= 0`` guard is load-bearing, not defensive: the indexer pads short
+    rows with -1, and ``-1 % dcp_size`` is ``dcp_size - 1`` under torch's
+    Python-style modulo, so on the highest rank every padding entry would
+    otherwise look owned and translate to a real row.
+    """
+    parallel = get_parallel()
+    dcp_size = parallel.attn_dcp_size
+    if dcp_size == 1:
+        return topk_indices
+
+    # Checked before any work, because it is a precondition on the compaction
+    # below rather than a property of the result -- see the sort-key note.
+    k = topk_indices.shape[-1]
+    assert 2 * k <= 1 << 24, (
+        f"top-k width {k} exceeds the exactly-representable float32 sort-key "
+        "range; keys would collide and the compaction would stop being a "
+        "permutation. Sort integer keys here instead, and pay AiCpu on Ascend."
+    )
+
+    owned = (topk_indices >= 0) & (topk_indices % dcp_size == parallel.attn_dcp_rank)
+    local = torch.where(
+        owned,
+        topk_indices // dcp_size,
+        torch.full_like(topk_indices, invalid),
+    )
+
+    # Stable compaction without relying on a stable sort: offsetting a
+    # non-owned entry's position by K keeps every key distinct, so the
+    # permutation is unique and the ordering is exact rather than tie-broken.
+    #
+    # The keys are float32 rather than the index dtype because Ascend has no
+    # AiCore ArgSort for int32/int64 -- it silently falls back to AiCpu and says
+    # so at warning level ("please cast dtype to float32",
+    # ArgSortKernelNpuOpApi.cpp:26). This runs once per layer per decode step,
+    # 78 times, and measured on A3 that fallback was the dominant term in the
+    # DCP decode penalty: ~9.6 ms per request per step against dcp1's own
+    # 2.5 ms, flat in dcp_size and flat in context length, which is the
+    # signature of [batch, K] work rather than anything touching the sequence.
+    # vLLM-Ascend sorts float32 keys (sfa_cp.py:1023-1045) for the same reason.
+    #
+    # Exact, not approximate. The keys are the distinct integers [0, 2K) and
+    # float32 represents every integer below 2**24 exactly, so the resulting
+    # permutation is identical to the integer sort's -- the distinctness the
+    # offset was introduced for is what makes the dtype change free. The assert
+    # states the bound rather than leaving it implicit; index_topk is three
+    # orders of magnitude below it, and the bound is asserted above.
+    order = torch.arange(k, device=topk_indices.device, dtype=torch.float32)
+    keys = order + (~owned).to(torch.float32) * k
+    return torch.gather(local, -1, torch.argsort(keys, dim=-1))
+
+
 def filter_dcp_local_chunk_kv_indices(
     kv_indices: torch.Tensor,
     chunk_starts_cpu: torch.Tensor,
