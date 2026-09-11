@@ -80,6 +80,7 @@ CONSISTENCY_THRESHOLD_FILE_BY_PLATFORM = {
     "h100": "h100.json",
     "b200": "b200.json",
     "5090": "5090.json",
+    "gfx1250": "gfx1250.json",
 }
 CONSISTENCY_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -91,6 +92,9 @@ CONSISTENCY_PLATFORM_ALIASES = {
     "sm120": "5090",
     "rtx5090": "5090",
     "5090": "5090",
+    "gfx1250": "gfx1250",
+    "mi45x": "gfx1250",
+    "mi455x": "gfx1250",
 }
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 DEFAULT_CLIP_THRESHOLD_IMAGE = 0.92
@@ -895,10 +899,33 @@ def _normalize_consistency_platform(platform: str) -> str:
     return CONSISTENCY_PLATFORM_ALIASES[normalized]
 
 
+def _rocm_gfx_arch() -> str:
+    """gfx name of the local ROCm device, or "" when it cannot be read.
+
+    ROCm reports its architecture through ``gcnArchName`` (e.g. "gfx1250:sramecc+:xnack-");
+    the compute capability that drives the CUDA branches below is meaningless here — gfx1250
+    reports (12, 5), which would otherwise read as sm120.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return ""
+        arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    except Exception:
+        return ""
+    return str(arch).split(":", 1)[0].strip().lower()
+
+
 def get_consistency_platform() -> str:
     override = os.getenv(CONSISTENCY_PLATFORM_ENV)
     if override:
         return _normalize_consistency_platform(override)
+    if current_platform.is_hip():
+        arch = _rocm_gfx_arch()
+        if arch in CONSISTENCY_PLATFORM_ALIASES:
+            return CONSISTENCY_PLATFORM_ALIASES[arch]
+        return "h100"
     if current_platform.is_sm120():
         return "5090"
     if current_platform.is_blackwell():
