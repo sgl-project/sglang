@@ -579,7 +579,7 @@ def _fuse_scale_shift_kernel_cpu(
     shift = expand_scale_shift_cpu_param(shift, x)
 
     return torch.ops.sgl_kernel.fused_scale_shift_cpu(
-        x.contiguous(),
+        x,
         scale,
         shift,
         scale_constant,

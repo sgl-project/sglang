@@ -26,6 +26,17 @@ enum class DiffusionNormMode {
   LayerNorm,
 };
 
+#define DISPATCH_DIFFUSION_NORM_TYPE(norm_type, name, ...)                                                \
+  [&] {                                                                                                   \
+    if ((norm_type) == "rms") {                                                                           \
+      using norm_mode_t = std::integral_constant<DiffusionNormMode, DiffusionNormMode::RMSNorm>;          \
+      return __VA_ARGS__(norm_mode_t{});                                                                  \
+    }                                                                                                     \
+    TORCH_CHECK((norm_type) == "layer", name, ": norm_type must be 'rms' or 'layer', got ", (norm_type)); \
+    using norm_mode_t = std::integral_constant<DiffusionNormMode, DiffusionNormMode::LayerNorm>;          \
+    return __VA_ARGS__(norm_mode_t{});                                                                    \
+  }()
+
 template <DiffusionNormMode M>
 struct DiffusionNormTraits;
 
@@ -65,6 +76,15 @@ struct ModulationParam {
     return data + b * stride_b + s * stride_s;
   }
 };
+
+template <typename RowFn>
+inline void parallel_for_rows(int64_t B, int64_t S, int64_t D, RowFn&& row_fn) {
+  at::parallel_for(0, B * S, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      row_fn(row / S, row % S, row * D);
+    }
+  });
+}
 
 template <typename T>
 inline void load_param_vec2(fVec& v0, fVec& v1, const T* __restrict__ p, int64_t stride_c, int64_t d) {
@@ -393,108 +413,6 @@ inline void fused_scale_residual_norm_scale_shift_row(
       eps);
 }
 
-template <typename scalar_t, typename param_t>
-void launch_fused_scale_shift(
-    scalar_t* __restrict__ output,
-    const scalar_t* __restrict__ input,
-    const ModulationParam<param_t>& scale,
-    const ModulationParam<param_t>& shift,
-    int64_t B,
-    int64_t S,
-    int64_t D,
-    float scale_constant) {
-  const int64_t rows = B * S;
-
-  at::parallel_for(0, rows, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t row = begin; row < end; ++row) {
-      const int64_t b = row / S;
-      const int64_t s = row % S;
-      const int64_t offset = row * D;
-      fused_scale_shift_row(
-          output + offset,
-          input + offset,
-          scale.row(b, s),
-          shift.row(b, s),
-          D,
-          scale.stride_c,
-          shift.stride_c,
-          scale_constant);
-    }
-  });
-}
-
-template <bool HasResidual, typename scalar_t, typename param_t>
-void launch_fused_norm(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ residual_output,
-    const scalar_t* __restrict__ residual,
-    const scalar_t* __restrict__ input,
-    const ModulationParam<scalar_t>& residual_gate,
-    const ModulationParam<float>& residual_gate_fp32,
-    const float* __restrict__ weight,
-    const float* __restrict__ bias,
-    const ModulationParam<param_t>& scale,
-    const ModulationParam<param_t>& shift,
-    int64_t B,
-    int64_t S,
-    int64_t D,
-    const std::string& norm_type,
-    float eps) {
-  auto launch = [&](auto mode_tag) {
-    constexpr DiffusionNormMode M = decltype(mode_tag)::value;
-    at::parallel_for(0, B * S, 0, [&](int64_t begin, int64_t end) {
-      for (int64_t row = begin; row < end; ++row) {
-        const int64_t b = row / S;
-        const int64_t s = row % S;
-        const int64_t offset = row * D;
-
-        const param_t* scale_ptr = scale.row(b, s);
-        const param_t* shift_ptr = shift.row(b, s);
-
-        if constexpr (HasResidual) {
-          const scalar_t* gate_ptr = residual_gate.row(b, s);
-          const float* gate_fp32_ptr = residual_gate_fp32.row(b, s);
-
-          const int64_t gate_stride_c = gate_fp32_ptr != nullptr ? residual_gate_fp32.stride_c : residual_gate.stride_c;
-          fused_scale_residual_norm_scale_shift_row<M, scalar_t, param_t>(
-              output + offset,
-              residual_output + offset,
-              residual + offset,
-              input + offset,
-              gate_ptr,
-              gate_fp32_ptr,
-              weight,
-              bias,
-              scale_ptr,
-              shift_ptr,
-              D,
-              gate_stride_c,
-              scale.stride_c,
-              shift.stride_c,
-              eps);
-        } else {
-          fused_norm_scale_shift_row<M, scalar_t, param_t>(
-              output + offset,
-              input + offset,
-              weight,
-              bias,
-              scale_ptr,
-              shift_ptr,
-              D,
-              scale.stride_c,
-              shift.stride_c,
-              eps);
-        }
-      }
-    });
-  };
-  if (norm_type == "rms") {
-    launch(std::integral_constant<DiffusionNormMode, DiffusionNormMode::RMSNorm>{});
-  } else {
-    launch(std::integral_constant<DiffusionNormMode, DiffusionNormMode::LayerNorm>{});
-  }
-}
-
 inline void check_modulation_param(const at::Tensor& param, const at::Tensor& input, const char* name) {
   CHECK_CPU(param);
   CHECK_DIM(3, param);
@@ -528,30 +446,39 @@ at::Tensor fused_scale_shift_cpu(
 
   CHECK_EQ(scale.scalar_type(), shift.scalar_type());
 
-  const auto st = input.scalar_type();
-
   const int64_t B = input.size(0);
   const int64_t S = input.size(1);
   const int64_t D = input.size(2);
 
-  at::Tensor output = at::empty_like(input);
+  // Output is contiguous even if input is only last-dim contiguous.
+  at::Tensor output = at::empty(input.sizes(), input.options());
 
   if (input.numel() == 0) {
     return output;
   }
 
-  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(st, scale.scalar_type(), "fused_scale_shift_cpu", [&] {
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input.scalar_type(), scale.scalar_type(), "fused_scale_shift_cpu", [&] {
     const ModulationParam<param_t> scale_param(scale);
     const ModulationParam<param_t> shift_param(shift);
-    launch_fused_scale_shift<scalar_t, param_t>(
-        output.data_ptr<scalar_t>(),
-        input.data_ptr<scalar_t>(),
-        scale_param,
-        shift_param,
-        B,
-        S,
-        D,
-        static_cast<float>(scale_constant));
+
+    const scalar_t* input_ptr = input.data_ptr<scalar_t>();
+    scalar_t* output_ptr = output.data_ptr<scalar_t>();
+
+    const int64_t input_stride_b = input.stride(0);
+    const int64_t input_stride_s = input.stride(1);
+
+    parallel_for_rows(B, S, D, [&](int64_t b, int64_t s, int64_t offset) {
+      const scalar_t* input_row = input_ptr + b * input_stride_b + s * input_stride_s;
+      fused_scale_shift_row<scalar_t, param_t>(
+          output_ptr + offset,
+          input_row,
+          scale_param.row(b, s),
+          shift_param.row(b, s),
+          D,
+          scale_param.stride_c,
+          shift_param.stride_c,
+          static_cast<float>(scale_constant));
+    });
   });
 
   return output;
@@ -567,8 +494,6 @@ at::Tensor fused_norm_scale_shift_cpu(
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_DIM(3, input);
 
-  TORCH_CHECK(norm_type == "rms" || norm_type == "layer", "norm_type must be \"rms\" or \"layer\".");
-
   check_modulation_param(scale, input, "scale");
   check_modulation_param(shift, input, "shift");
 
@@ -579,12 +504,9 @@ at::Tensor fused_norm_scale_shift_cpu(
   const int64_t D = input.size(2);
 
   const float* weight_ptr = get_norm_param_ptr(weight, D, "weight");
-
-  TORCH_CHECK(!bias.has_value() || norm_type == "layer", "bias is only supported for LayerNorm.");
-
   const float* bias_ptr = get_norm_param_ptr(bias, D, "bias");
 
-  at::Tensor output = at::empty_like(input);
+  at::Tensor output = at::empty(input.sizes(), input.options());
 
   if (input.numel() == 0) {
     return output;
@@ -592,30 +514,41 @@ at::Tensor fused_norm_scale_shift_cpu(
 
   CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input.scalar_type(), scale.scalar_type(), "fused_norm_scale_shift_cpu", [&] {
     const ModulationParam<param_t> scale_param(scale);
-
     const ModulationParam<param_t> shift_param(shift);
 
-    launch_fused_norm<false, scalar_t, param_t>(
-        output.data_ptr<scalar_t>(),
-        /*residual_output=*/nullptr,
-        /*residual=*/nullptr,
-        input.data_ptr<scalar_t>(),
-        /*residual_gate=*/{},
-        /*residual_gate_fp32=*/{},
-        weight_ptr,
-        bias_ptr,
-        scale_param,
-        shift_param,
-        B,
-        S,
-        D,
-        norm_type,
-        static_cast<float>(eps));
+    const scalar_t* input_ptr = input.data_ptr<scalar_t>();
+    scalar_t* output_ptr = output.data_ptr<scalar_t>();
+
+    const int64_t input_stride_b = input.stride(0);
+    const int64_t input_stride_s = input.stride(1);
+
+    DISPATCH_DIFFUSION_NORM_TYPE(norm_type, "fused_norm_scale_shift_cpu", [&](auto mode_tag) {
+      constexpr DiffusionNormMode M = decltype(mode_tag)::value;
+
+      if constexpr (!DiffusionNormTraits<M>::has_bias) {
+        TORCH_CHECK(!bias.has_value(), "bias is only supported for LayerNorm.");
+      }
+
+      parallel_for_rows(B, S, D, [&](int64_t b, int64_t s, int64_t offset) {
+        const scalar_t* input_row = input_ptr + b * input_stride_b + s * input_stride_s;
+
+        fused_norm_scale_shift_row<M, scalar_t, param_t>(
+            output_ptr + offset,
+            input_row,
+            weight_ptr,
+            bias_ptr,
+            scale_param.row(b, s),
+            shift_param.row(b, s),
+            D,
+            scale_param.stride_c,
+            shift_param.stride_c,
+            static_cast<float>(eps));
+      });
+    });
   });
 
   return output;
 }
-
 std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
     const at::Tensor& residual,
     const at::Tensor& input,
@@ -628,11 +561,12 @@ std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
     double eps) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_DIM(3, input);
+
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
   CHECK_DIM(3, residual);
+
   CHECK_EQ(residual.sizes(), input.sizes());
   CHECK_EQ(residual.scalar_type(), input.scalar_type());
-  TORCH_CHECK(norm_type == "rms" || norm_type == "layer", "norm_type must be \"rms\" or \"layer\".");
 
   check_modulation_param(scale, input, "scale");
   check_modulation_param(shift, input, "shift");
@@ -653,13 +587,11 @@ std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
   const int64_t D = input.size(2);
 
   const float* weight_ptr = get_norm_param_ptr(weight, D, "weight");
-
-  TORCH_CHECK(!bias.has_value() || norm_type == "layer", "bias is only supported for LayerNorm.");
-
   const float* bias_ptr = get_norm_param_ptr(bias, D, "bias");
 
-  at::Tensor output = at::empty_like(input);
-  at::Tensor residual_output = at::empty_like(input);
+  at::Tensor output = at::empty(input.sizes(), input.options());
+
+  at::Tensor residual_output = at::empty(input.sizes(), input.options());
 
   if (input.numel() == 0) {
     return {output, residual_output};
@@ -669,6 +601,7 @@ std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
       input.scalar_type(), scale.scalar_type(), "fused_scale_residual_norm_scale_shift_cpu", [&] {
         const ModulationParam<param_t> scale_param(scale);
         const ModulationParam<param_t> shift_param(shift);
+
         ModulationParam<scalar_t> gate_param{};
         ModulationParam<float> gate_fp32_param{};
 
@@ -680,23 +613,56 @@ std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
           }
         }
 
-        launch_fused_norm<true, scalar_t, param_t>(
-            output.data_ptr<scalar_t>(),
-            residual_output.data_ptr<scalar_t>(),
-            residual.data_ptr<scalar_t>(),
-            input.data_ptr<scalar_t>(),
-            gate_param,
-            gate_fp32_param,
-            weight_ptr,
-            bias_ptr,
-            scale_param,
-            shift_param,
-            B,
-            S,
-            D,
-            norm_type,
-            static_cast<float>(eps));
+        const scalar_t* input_ptr = input.data_ptr<scalar_t>();
+
+        const scalar_t* residual_ptr = residual.data_ptr<scalar_t>();
+
+        scalar_t* output_ptr = output.data_ptr<scalar_t>();
+
+        scalar_t* residual_output_ptr = residual_output.data_ptr<scalar_t>();
+
+        const int64_t input_stride_b = input.stride(0);
+        const int64_t input_stride_s = input.stride(1);
+
+        const int64_t residual_stride_b = residual.stride(0);
+        const int64_t residual_stride_s = residual.stride(1);
+
+        DISPATCH_DIFFUSION_NORM_TYPE(norm_type, "fused_scale_residual_norm_scale_shift_cpu", [&](auto mode_tag) {
+          constexpr DiffusionNormMode M = decltype(mode_tag)::value;
+          if constexpr (!DiffusionNormTraits<M>::has_bias) {
+            TORCH_CHECK(!bias.has_value(), "bias is only supported for LayerNorm.");
+          }
+          parallel_for_rows(B, S, D, [&](int64_t b, int64_t s, int64_t offset) {
+            const scalar_t* input_row = input_ptr + b * input_stride_b + s * input_stride_s;
+
+            const scalar_t* residual_row = residual_ptr + b * residual_stride_b + s * residual_stride_s;
+
+            const scalar_t* gate_ptr = gate_param.row(b, s);
+
+            const float* gate_fp32_ptr = gate_fp32_param.row(b, s);
+
+            const int64_t gate_stride_c = gate_fp32_ptr != nullptr ? gate_fp32_param.stride_c : gate_param.stride_c;
+
+            fused_scale_residual_norm_scale_shift_row<M, scalar_t, param_t>(
+                output_ptr + offset,
+                residual_output_ptr + offset,
+                residual_row,
+                input_row,
+                gate_ptr,
+                gate_fp32_ptr,
+                weight_ptr,
+                bias_ptr,
+                scale_param.row(b, s),
+                shift_param.row(b, s),
+                D,
+                gate_stride_c,
+                scale_param.stride_c,
+                shift_param.stride_c,
+                static_cast<float>(eps));
+          });
+        });
       });
 
   return {output, residual_output};
 }
+#undef DISPATCH_DIFFUSION_NORM_TYPE

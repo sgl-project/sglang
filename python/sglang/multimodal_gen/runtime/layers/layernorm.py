@@ -774,8 +774,8 @@ class _ScaleResidualNormScaleShift(CustomOp):
             gate_tensor = expand_scale_shift_cpu_param(gate_tensor, x)
 
         return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift_cpu(
-            residual.contiguous(),
-            x.contiguous(),
+            residual,
+            x,
             gate_tensor,
             _ensure_contiguous(weight),
             _ensure_contiguous(bias),
@@ -919,7 +919,7 @@ class _NormScaleShift(CustomOp):
         shift = expand_scale_shift_cpu_param(shift, x)
 
         return torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
-            x.contiguous(),
+            x,
             _ensure_contiguous(weight),
             _ensure_contiguous(bias),
             scale,

@@ -14,6 +14,13 @@ torch.manual_seed(1234)
 
 eps = 1e-6
 
+DTYPE_PAIRS = [
+    (torch.bfloat16, torch.bfloat16),
+    (torch.bfloat16, torch.float32),
+    (torch.float16, torch.float16),
+    (torch.float16, torch.float32),
+]
+
 
 class TestDiffusionNorm:
     def rmsnorm_ref(
@@ -31,15 +38,7 @@ class TestDiffusionNorm:
 
         return out
 
-    @pytest.mark.parametrize(
-        "input_dtype,param_dtype",
-        [
-            (torch.bfloat16, torch.bfloat16),
-            (torch.bfloat16, torch.float32),
-            (torch.float16, torch.float16),
-            (torch.float16, torch.float32),
-        ],
-    )
+    @pytest.mark.parametrize("input_dtype,param_dtype", DTYPE_PAIRS)
     @pytest.mark.parametrize("broadcast_c", [False, True])
     def test_fused_scale_shift(
         self,
@@ -85,15 +84,7 @@ class TestDiffusionNorm:
             rtol=precision[input_dtype],
         )
 
-    @pytest.mark.parametrize(
-        "input_dtype,param_dtype",
-        [
-            (torch.bfloat16, torch.bfloat16),
-            (torch.bfloat16, torch.float32),
-            (torch.float16, torch.float16),
-            (torch.float16, torch.float32),
-        ],
-    )
+    @pytest.mark.parametrize("input_dtype,param_dtype", DTYPE_PAIRS)
     @pytest.mark.parametrize("norm_type", ["rms", "layer"])
     def test_fused_norm_scale_shift(
         self,
@@ -247,7 +238,11 @@ class TestDiffusionNorm:
         norm_input = ref_residual.float()
 
         if norm_type == "rms":
-            normalized = self.rmsnorm_ref(norm_input, weight, eps)
+            normalized = self.rmsnorm_ref(
+                norm_input,
+                weight,
+                eps,
+            )
         else:
             normalized = torch.nn.functional.layer_norm(
                 norm_input,
@@ -270,7 +265,10 @@ class TestDiffusionNorm:
         )
 
         torch.testing.assert_close(
-            out, ref_out, atol=precision[input_dtype], rtol=precision[input_dtype]
+            out,
+            ref_out,
+            atol=precision[input_dtype],
+            rtol=precision[input_dtype],
         )
 
 
