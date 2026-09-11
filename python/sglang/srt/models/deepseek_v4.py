@@ -488,7 +488,7 @@ def _apply_wo_a_bf16_matmul(
             )
         )
         and o.shape[2] == 4096
-        and o.shape[1] in (1, 2)
+        and (o.shape[1] == 2 or (o.shape[1] == 1 and get_platform().is_sm90))
         and wo_a.shape == (o.shape[1], 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
