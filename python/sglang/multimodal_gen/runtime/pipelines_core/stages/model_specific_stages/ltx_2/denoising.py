@@ -1103,6 +1103,13 @@ class LTX2DenoisingStage(DenoisingStage):
         if valid is None:
             return None
         valid = int(valid)
+        # When the local shard has no padding (valid covers the whole sequence),
+        # the mask would be all-True: a no-op that still forces USPAttention onto
+        # the masked SDPA path (attn_mask is not None) instead of the fused
+        # backend (e.g. aiter fmha). Return None so the unmasked path runs. This
+        # is exact: an all-True key mask does not change attention outputs.
+        if valid >= int(seq_len):
+            return None
         mask = torch.ones((batch_size, int(seq_len)), device=device, dtype=torch.bool)
         if valid < int(seq_len):
             mask[:, max(0, valid) :] = False
