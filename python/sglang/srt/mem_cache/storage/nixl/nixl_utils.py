@@ -27,6 +27,31 @@ _SGLANG_NIXL_CONFIG_KEYS = {
     "l3_cleaner_low_watermark",
 }
 
+# SGLang's own plugin selector, read by get_specified_plugin(). No NIXL plugin
+# declares it, so forwarding it to create_backend passes an unknown option.
+_PLUGIN_SELECTOR_KEY = "active"
+
+
+def _normalize_initparam(key: str, value) -> str:
+    """NIXL plugins match their boolean-like options case-sensitively, so a JSON
+    ``true`` stringified to ``"True"`` is accepted and then silently ignored."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    # Only Python's bool repr is folded, not every casing: an option value is an
+    # opaque case-sensitive string to NIXL, so a value that really is "TRUE"
+    # reaches the plugin unchanged. Folding this one is still a guess, so say so.
+    if value in ("True", "False"):
+        logger.warning(
+            "NIXL extra-config: %s is the string %r, which NIXL would compare "
+            "case-sensitively against its lowercase boolean options; sending %r "
+            "instead. Write a JSON boolean to make this unambiguous.",
+            key,
+            value,
+            value.lower(),
+        )
+        return value.lower()
+    return str(value)
+
 
 class NixlBackendConfig:
     """Handles NIXL backend configurations"""
@@ -42,7 +67,38 @@ class NixlBackendConfig:
             2. flat form (for a specific selected plugin), assuming all params apply to a selected plugin
                 {'param1': 'value1', 'param2': 'value2', ...}
         """
-        self.config = config or {}
+        # Copied so promoting a misplaced key cannot mutate the caller's extra_config.
+        self.config = dict(config or {})
+        self._promote_misplaced_sglang_keys()
+
+    def _promote_misplaced_sglang_keys(self) -> None:
+        nested: dict[str, list] = {}
+        plugins = self.config.get("plugin")
+        if isinstance(plugins, dict):
+            for plugin_name, plugin_config in plugins.items():
+                if not isinstance(plugin_config, dict):
+                    continue
+                for key in sorted(_SGLANG_NIXL_CONFIG_KEYS & plugin_config.keys()):
+                    nested.setdefault(key, []).append((plugin_name, plugin_config[key]))
+
+        for key, occurrences in nested.items():
+            where = ", ".join(f"plugin.{name}" for name, _ in occurrences)
+            values = [value for _, value in occurrences]
+            if key in self.config:
+                resolution = "the top-level value is used instead"
+            elif any(value != values[0] for value in values[1:]):
+                resolution = "it is set to conflicting values there and is ignored"
+            else:
+                resolution = "honoring it as a top-level option"
+                self.config[key] = values[0]
+            logger.warning(
+                "NIXL extra-config: %s under %s is consumed by SGLang itself, not by "
+                "the NIXL plugin; %s. Move it to the top level of "
+                "--hicache-storage-backend-extra-config.",
+                key,
+                where,
+                resolution,
+            )
 
     def get_use_direct_io(self) -> bool:
         """Return True if O_DIRECT should be requested when opening files.
@@ -79,18 +135,31 @@ class NixlBackendConfig:
     def get_specified_plugin(self) -> str:
         """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
 
-        if "plugin" in self.config:
+        plugins = self.config.get("plugin")
+        if isinstance(plugins, dict):
             # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
             # choose the FIRST active plugin
-            for key, item in self.config["plugin"].items():
-                if item.get("active", False) in [True, "true", "True"]:
-                    plugin = key.upper()
-                    break
-        else:
-            # config is empty, or in flat form {'param1': 'value1', 'param2': 'value2', ...}
-            plugin = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
+            for key, item in plugins.items():
+                if isinstance(item, dict) and item.get("active", False) in [
+                    True,
+                    "true",
+                    "True",
+                ]:
+                    return key.upper()
+            logger.warning(
+                "NIXL extra-config: no plugin under 'plugin' is marked active; "
+                "selecting the backend from SGLANG_HICACHE_NIXL_BACKEND_PLUGIN instead."
+            )
+        elif plugins is not None:
+            logger.warning(
+                "NIXL extra-config: 'plugin' is a %s, not a mapping of plugin name "
+                "to options; selecting the backend from "
+                "SGLANG_HICACHE_NIXL_BACKEND_PLUGIN instead.",
+                type(plugins).__name__,
+            )
 
-        return plugin
+        # config is empty, or in flat form {'param1': 'value1', 'param2': 'value2', ...}
+        return os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
 
     def get_backend_initparams(self, backend_name) -> dict:
         """Get initialization parameters from config of NIXL backend for backend creation.
@@ -102,24 +171,27 @@ class NixlBackendConfig:
         initparams = {}
 
         # config can be in two forms:
-        if "plugin" in self.config:
+        plugins = self.config.get("plugin")
+        if plugins is not None:
             # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
-            if backend_name.lower() in self.config["plugin"]:
-                config_data = self.config["plugin"][backend_name.lower()]
-            else:
+            config_data = {}
+            if isinstance(plugins, dict):
+                # A malformed section carries no options; the plugin gets its defaults.
+                section = plugins.get(backend_name.lower())
+                config_data = section if isinstance(section, dict) else {}
+            if not config_data:
                 logger.debug(
                     f"No specific config found for plugin {backend_name} in extra_config. Use default init params."
                 )
-                config_data = {}
         else:
             # flat form {'param1': 'value1', 'param2': 'value2', ...}
             config_data = self.config
 
         for key, value in config_data.items():
             # These keys are consumed by SGLang itself, not by NIXL plugins.
-            if key in _SGLANG_NIXL_CONFIG_KEYS:
+            if key in _SGLANG_NIXL_CONFIG_KEYS or key == _PLUGIN_SELECTOR_KEY:
                 continue
-            initparams[key] = str(value)
+            initparams[key] = _normalize_initparam(key, value)
 
         return initparams
 
