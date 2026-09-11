@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{PolicyKind, SessionAffinityMode};
+use crate::config::{
+    ConflictPolicy, ParamSpec, PolicyKind, SamplingField, SamplingOverrides, SessionAffinityMode,
+};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
     resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_prefill_admitted,
@@ -31,7 +33,6 @@ use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Observability header carrying the final decode-pool URL for a
@@ -111,34 +112,255 @@ fn prefill_policy_reason(
 /// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
-/// Minimal probe over the request body — we only need the `stream` field
-/// and the `model` field to decide between buffered vs SSE forwarding and
-/// to select a worker. Deserializing into this struct (vs `serde_json::Value`)
-/// does two things:
+/// Minimal probe over the request body — the fields the ROUTER itself acts on,
+/// plus the sampling parameters the fleet-wide contract governs.
+/// Deserializing into this struct (vs `serde_json::Value`) does two things:
 ///
-/// 1. Avoids the per-field heap allocation of `Value` for a multi-MiB body.
+/// 1. Avoids building a `Value` tree over a multi-MiB body. NOTHING here
+///    retains client-sized data: an unrecognized key is skipped through
+///    `IgnoredAny`, and a sampling value that is not a number is drained the
+///    same way (see [`ProbedValue`]).
 /// 2. Pins the contract: the body MUST be a JSON object. Degenerate
 ///    shapes (`null`, `[]`, `"hi"`) fail at this step rather than being
 ///    silently forwarded with `stream=false`.
 ///
 /// All other fields are ignored — the worker is authoritative for the
 /// full request schema.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default)]
 struct RequestProbe {
-    #[serde(default)]
     stream: Option<bool>,
-    #[serde(default)]
     model: Option<String>,
     /// Explicit output budget used by Decode Bucket routing.
-    #[serde(default)]
     max_tokens: Option<u64>,
-    #[serde(default)]
     max_completion_tokens: Option<u64>,
+    /// What the request said about each governed sampling parameter, indexed
+    /// by [`SamplingField::index`] so governing another needs no change here.
+    /// Read by [`apply_sampling_overrides`]; see [`ProbedValue`].
+    sampling: [ProbedValue; SamplingField::ALL.len()],
+}
+
+/// What the request said about one governed sampling parameter.
+///
+/// WHY not `Option<serde_json::Value>`: these keys carry client-controlled
+/// JSON of arbitrary size and the probe runs on every request whether or not a
+/// contract is configured, so holding a `Value` would let
+/// `{"temperature": [1, 1, ...]}` allocate a tree proportional to a
+/// [`MAX_CHAT_BODY_BYTES`] body for a field nothing then reads. Each variant is
+/// resolved during deserialization; nothing client-sized is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum ProbedValue {
+    /// Omitted, or an explicit `null`. The OpenAI API types these parameters
+    /// as nullable with a documented default, so `null` asks for the default —
+    /// and on a governed fleet the configured value IS the default. Both mean
+    /// the configured value is injected.
+    #[default]
+    Absent,
+    /// A JSON number, or a string the engine's pydantic lax mode reads as one.
+    Number(f64),
+    /// Present but not numeric. Nobody's business but the engine's, which owns
+    /// the request schema and gives the better message — so the contract
+    /// neither compares it nor overwrites it.
+    Unusable,
+}
+
+impl<'de> Deserialize<'de> for ProbedValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ValueVisitor;
+        impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+            type Value = ProbedValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a sampling parameter value")
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Number(v as f64))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Number(v as f64))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Number(v))
+            }
+
+            /// Parsed, not retained: the engine reads a numeric string as a
+            /// number, so a `reject` contract must too or `"1.5"` slips past
+            /// a pin of 1.
+            fn visit_str<E>(self, v: &str) -> Result<ProbedValue, E> {
+                Ok(v.trim()
+                    .parse::<f64>()
+                    .map_or(ProbedValue::Unusable, ProbedValue::Number))
+            }
+
+            fn visit_unit<E>(self) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Absent)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Unusable)
+            }
+
+            /// Drained, never collected — the allocation this type exists to
+            /// avoid.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ProbedValue, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ProbedValue::Unusable)
+            }
+
+            /// Drained, never collected — as [`Self::visit_seq`].
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<ProbedValue, M::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(ProbedValue::Unusable)
+            }
+        }
+        d.deserialize_any(ValueVisitor)
+    }
+}
+
+/// A field the ROUTER acts on, as opposed to one it only forwards. A repeated
+/// occurrence of one of these is a 400: a body that says two different things
+/// about how to route itself is ambiguous at the edge, and the router must not
+/// decide on one copy while the engine serves the other.
+#[derive(Debug, Clone, Copy)]
+enum RoutingKey {
+    Stream,
+    Model,
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl RoutingKey {
+    /// Bit position in the visitor's occurrence mask. Unlike
+    /// [`SamplingField::index`] this indexes no array, so it needs no
+    /// agreement with a separate length constant.
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Stream => 1 << 0,
+            Self::Model => 1 << 1,
+            Self::MaxTokens => 1 << 2,
+            Self::MaxCompletionTokens => 1 << 3,
+        }
+    }
+
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Stream => "stream",
+            Self::Model => "model",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
+/// One key of the request object, resolved WITHOUT allocating: the visitor
+/// matches a borrowed `&str` and keeps only a discriminant, so a body's
+/// unrecognized majority costs no `String` per key.
+enum ProbeKey {
+    Routing(RoutingKey),
+    /// A governed sampling parameter. A repeat LAST-WINS, matching the
+    /// engine's own `json.loads` — so the value the contract compares against
+    /// and the value the engine actually samples with are the same one.
+    Sampling(SamplingField),
+    Other,
+}
+
+impl<'de> Deserialize<'de> for ProbeKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl serde::de::Visitor<'_> for KeyVisitor {
+            type Value = ProbeKey;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a request field name")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<ProbeKey, E> {
+                Ok(match v {
+                    "stream" => ProbeKey::Routing(RoutingKey::Stream),
+                    "model" => ProbeKey::Routing(RoutingKey::Model),
+                    "max_tokens" => ProbeKey::Routing(RoutingKey::MaxTokens),
+                    "max_completion_tokens" => ProbeKey::Routing(RoutingKey::MaxCompletionTokens),
+                    other => match SamplingField::from_wire_name(other) {
+                        Some(field) => ProbeKey::Sampling(field),
+                        None => ProbeKey::Other,
+                    },
+                })
+            }
+        }
+        d.deserialize_str(KeyVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ProbeVisitor;
+        impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
+            type Value = RequestProbe;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<RequestProbe, M::Error> {
+                let mut probe = RequestProbe::default();
+                let mut seen = 0u8;
+                while let Some(key) = map.next_key::<ProbeKey>()? {
+                    match key {
+                        ProbeKey::Routing(r) => {
+                            if seen & r.bit() != 0 {
+                                return Err(serde::de::Error::custom(format_args!(
+                                    "duplicate field `{}`",
+                                    r.wire_name()
+                                )));
+                            }
+                            seen |= r.bit();
+                            match r {
+                                RoutingKey::Stream => probe.stream = map.next_value()?,
+                                RoutingKey::Model => probe.model = map.next_value()?,
+                                RoutingKey::MaxTokens => probe.max_tokens = map.next_value()?,
+                                RoutingKey::MaxCompletionTokens => {
+                                    probe.max_completion_tokens = map.next_value()?
+                                }
+                            }
+                        }
+                        ProbeKey::Sampling(field) => {
+                            probe.sampling[field.index()] = map.next_value()?;
+                        }
+                        ProbeKey::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(probe)
+            }
+        }
+        // `deserialize_map` is what pins the body to a JSON object: `null`,
+        // `[]` and `"hi"` are all rejected here, so no separate shape-anchoring
+        // pass is needed.
+        d.deserialize_map(ProbeVisitor)
+    }
 }
 
 impl RequestProbe {
     fn requested_max_output_tokens(&self) -> Option<u64> {
         self.max_completion_tokens.or(self.max_tokens)
+    }
+
+    /// Lets [`apply_sampling_overrides`] loop over whatever the operator
+    /// configured instead of repeating a per-field ladder.
+    fn sampling_field(&self, field: SamplingField) -> ProbedValue {
+        self.sampling[field.index()]
     }
 }
 
@@ -198,11 +420,15 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
-    let probe = parse_probe(&body)?;
+    let mut probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let requested_max_output_tokens = probe.requested_max_output_tokens();
+    // `take`n rather than borrowed: the sampling contract further down reads
+    // the rest of `probe`, but nothing reads `model` again, so the `String`
+    // moves out instead of being cloned on every request.
     let model_str = probe
         .model
+        .take()
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
 
@@ -230,6 +456,16 @@ pub async fn chat_completions(
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
+
+    // Fleet-wide sampling contract (`--override-sampling-params`), applied
+    // once the model is known to be served (so a request naming an unknown
+    // model still gets that answer) and before anything is admitted: under
+    // `reject` a numeric value differing from the configured one is a 400
+    // here, costing no queue slot and no engine round-trip. Either way the
+    // configured values for fields the request omitted come back as the
+    // inject-set for the forwarded body.
+    let inject_sampling =
+        apply_sampling_overrides(&ctx.config.model.sampling_overrides, &probe, &ctx.metrics)?;
 
     // Tokenize once at ingress whenever it can pay off — decoupled from the
     // routing policy, because forwarding `input_ids` is a property of the
@@ -804,10 +1040,15 @@ pub async fn chat_completions(
     let bootstrap_room = bootstrap.as_ref().map(|b| b.room);
 
     // Build the body forwarded to the engine(s) exactly once — injecting the
-    // `input_ids` and/or bootstrap fields, or forwarding the original bytes
-    // untouched when neither applies.
-    let outgoing_body =
-        build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+    // `input_ids`, bootstrap fields and sampling values, or forwarding the
+    // original bytes untouched when none applies.
+    let outgoing_body = build_outgoing_body(
+        &body,
+        request_value,
+        forward_input_ids,
+        bootstrap.as_ref(),
+        &inject_sampling,
+    )?;
 
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
@@ -1202,38 +1443,102 @@ struct BootstrapFields {
     room: u64,
 }
 
+/// Write `members` in as top-level keys of the JSON object in `body`, without
+/// parsing it.
+///
+/// WHY: going through `serde_json` costs a full parse into a `Value` plus a
+/// full re-serialize, over a body that runs to [`MAX_CHAT_BODY_BYTES`].
+///
+/// Members go in before the CLOSING brace so they win the last-wins reading
+/// every JSON parser performs — the authority `obj.insert` has on the parse
+/// path. Inserting after the opening brace would lose to a client's own later
+/// copy of the key, which a request sending an explicit `null` for a governed
+/// parameter has: the probe reads `null` as absent, so the value IS injected.
+/// The last `}` is the object's closing brace, since `parse_probe` proved the
+/// body is an object and only whitespace may follow it.
+///
+/// `None` (braces not located) falls back to the parse path rather than
+/// panicking on a shape `parse_probe` should already have rejected.
+fn splice_top_level(
+    body: &Bytes,
+    members: &[(SamplingField, serde_json::Number)],
+) -> Option<Bytes> {
+    use std::io::Write as _;
+
+    let open = body.iter().position(|&b| b == b'{')?;
+    let close = body.iter().rposition(|&b| b == b'}')?;
+    if close <= open {
+        return None;
+    }
+    // An empty object takes no separating comma: `{"temperature":1}`, not
+    // `{,"temperature":1}`.
+    let has_members = body[open + 1..close]
+        .iter()
+        .any(|b| !b.is_ascii_whitespace());
+    // 24 bytes per member covers `"repetition_penalty":` plus a short number;
+    // an over-run just costs one realloc, never correctness.
+    let mut out = Vec::with_capacity(body.len() + 24 * members.len() + 1);
+    out.extend_from_slice(&body[..close]);
+    for (i, (field, value)) in members.iter().enumerate() {
+        if has_members || i > 0 {
+            out.push(b',');
+        }
+        // Wire names are a fixed set of JSON-safe identifiers and a
+        // `serde_json::Number` renders as valid JSON, so neither needs
+        // escaping. Written straight into `out` — no intermediate `String`.
+        write!(out, "\"{}\":{}", field.wire_name(), value).ok()?;
+    }
+    out.extend_from_slice(&body[close..]);
+    Some(Bytes::from(out))
+}
+
 /// Build the body forwarded to the engine, injecting (when present) the
-/// precomputed `input_ids` and/or the PD `bootstrap_*` fields into the
-/// already-parsed request object and serializing once. When neither is
-/// needed, returns the original bytes unchanged (no re-serialize).
+/// precomputed `input_ids`, the PD `bootstrap_*` fields and the fleet-wide
+/// sampling values into the already-parsed request object and serializing
+/// once. When none is needed, returns the original bytes unchanged (no
+/// re-serialize).
 ///
-/// `input_ids`: the router-computed prompt tokens. When set, the engine skips
-/// its own chat-template tokenization; `messages` are retained in the body so
-/// the engine still derives stop tokens / tool-call constraint and the OpenAI
-/// response shape. The caller sets this only when the tokens are
-/// engine-equivalent and `input_ids_safe_to_forward` held.
+/// `input_ids`: the router-computed prompt tokens. When set the engine skips
+/// its own chat-template tokenization, so `messages` are retained for the stop
+/// tokens, tool-call constraint and response shape it still derives from them.
+/// Set only when `input_ids_safe_to_forward` held.
 ///
-/// `value` is the already-parsed request body when one is on hand (the
-/// cache-aware path parses once at ingress); it is consumed so the mutation
-/// reuses that parse. It is `None` only for a load-only policy in PD mode — a
-/// path that never parses at ingress — so the bootstrap injection re-parses
-/// the bytes here (matching the pre-refactor behavior). The body shape was
-/// validated by `parse_probe`; the non-object arm defends against a TOCTOU
+/// `value` is the ingress parse when one is on hand, reused rather than
+/// repeated — and dropped unused when splicing makes it unnecessary. Sampling
+/// alone never reaches `serde_json`: only `input_ids` and bootstrap injection
+/// do, because those may have to OVERWRITE a key the client sent, which
+/// [`splice_top_level`] cannot. The non-object arm defends against a TOCTOU
 /// regression rather than panicking.
 fn build_outgoing_body(
     body: &Bytes,
     value: Option<serde_json::Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
+    sampling: &[(SamplingField, serde_json::Number)],
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() {
+    // `input_ids` and bootstrap injection may have to OVERWRITE a key the
+    // client sent, which only the parse path can do; sampling injection never
+    // does, because the inject-set holds only keys the request omitted.
+    let only_sampling = input_ids.is_none() && bootstrap.is_none();
+    if only_sampling && sampling.is_empty() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
+    // Splice regardless of whether a parse is already on hand: `value` is
+    // read-only up to this point, so having one does not make splicing wrong
+    // — it only means the parse was already paid for elsewhere. Gating on
+    // `value.is_none()` would have skipped the splice on exactly the
+    // configurations that parse at ingress (a chat encoder, the cache-aware
+    // policy, bucket routing), i.e. most governed fleets.
+    if only_sampling {
+        if let Some(spliced) = splice_top_level(body, sampling) {
+            return Ok(spliced);
+        }
+    }
     let parsed = match value {
         Some(v) => v,
-        // Load-only + PD: the ingress skipped the parse, so re-parse for the
-        // bootstrap injection (input_ids is never set on this path).
+        // The ingress skipped the parse, so re-parse. Reached for bootstrap
+        // injection, and as the fallback if `splice_top_level` declined.
         None => serde_json::from_slice(body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
         })?,
@@ -1246,6 +1551,15 @@ fn build_outgoing_body(
             ));
         }
     };
+    // The caller passes the inject-set from `apply_sampling_overrides` —
+    // configured values for fields the request omitted — so writing them here
+    // never masks a client value, in either conflict mode.
+    for (field, value) in sampling {
+        obj.insert(
+            field.wire_name().to_string(),
+            serde_json::Value::Number(value.clone()),
+        );
+    }
     if let Some(ids) = input_ids {
         obj.insert(
             "input_ids".to_string(),
@@ -1416,6 +1730,78 @@ fn request_is_multimodal(value: &serde_json::Value) -> bool {
         })
 }
 
+/// Apply the fleet-wide sampling contract (`--override-sampling-params` /
+/// `--sampling-param-conflict`) to one request, before admission.
+///
+/// Returns the inject-set: the configured value for every exact-valued
+/// parameter the request OMITTED, which [`build_outgoing_body`] writes into
+/// the forwarded body so the engine's own defaults can't drift from what the
+/// operator declared. A band ([`ParamSpec::Range`]) names no single value, so
+/// it never injects.
+///
+/// For a parameter the request DID send:
+///   * [`ConflictPolicy::Allow`] forwards the client value untouched, which
+///     is why the mode check comes before any comparison;
+///   * [`ConflictPolicy::Reject`] 400s a numeric value that differs from the
+///     configured one (or falls outside the band) — never a silent rewrite,
+///     which is the one behavior no client can detect;
+///   * a value that is not a number ([`ProbedValue::Unusable`]) is nobody's
+///     business but the engine's, which is authoritative for the request
+///     schema and produces the better message.
+///
+/// A rejection is counted per parameter before it is returned, because a
+/// contract rollout turns served traffic into 400s and the operator needs to
+/// see how much and where.
+fn apply_sampling_overrides(
+    overrides: &SamplingOverrides,
+    probe: &RequestProbe,
+    metrics: &MetricsRegistry,
+) -> Result<Vec<(SamplingField, serde_json::Number)>, ApiError> {
+    // Length is a startup constant, and `Vec::with_capacity(0)` does not
+    // allocate — so an unconfigured contract still costs nothing.
+    let mut inject = Vec::with_capacity(overrides.params.len());
+    for (&field, spec) in &overrides.params {
+        let name = field.wire_name();
+        let reject = |detail: String| {
+            metrics.record_sampling_contract_rejection(name);
+            ApiError::SamplingContract {
+                param: name,
+                detail,
+            }
+        };
+        let got = match probe.sampling_field(field) {
+            // A band names no single value, so it never injects — a request
+            // that omits the parameter gets the engine's own default.
+            ProbedValue::Absent => {
+                if let ParamSpec::Exact(v) = spec {
+                    inject.push((field, v.clone()));
+                }
+                continue;
+            }
+            ProbedValue::Unusable => continue,
+            // `allow` forwards a client value untouched, so the comparison
+            // below is `reject`-only.
+            ProbedValue::Number(_) if overrides.conflict == ConflictPolicy::Allow => continue,
+            ProbedValue::Number(got) => got,
+        };
+        match spec {
+            ParamSpec::Exact(want) => {
+                if Some(got) != want.as_f64() {
+                    return Err(reject(format!(
+                        "got {got}, expected {want} (or omit the field)"
+                    )));
+                }
+            }
+            &ParamSpec::Range { lo, hi } => {
+                if !(lo..=hi).contains(&got) {
+                    return Err(reject(format!("must be between {lo} and {hi}, got {got}")));
+                }
+            }
+        }
+    }
+    Ok(inject)
+}
+
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     // We deliberately do NOT echo the serde error into the client-visible
     // message — that risks leaking field-level detail and is also of little
@@ -1423,24 +1809,16 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     // Server-side, the full error is logged with `tracing::debug!` for
     // operator triage.
     //
-    // Two-step deserialize:
-    //   1. `Map<String, IgnoredAny>` *anchors* the shape to a JSON object.
-    //      This rejects `null` / `[]` / `"hi"` (all valid JSON but not
-    //      request shape) without walking the full value into a
-    //      `serde_json::Value` per field.
-    //   2. `RequestProbe` (struct of `Option<bool>` + `Option<String>`)
-    //      lifts out only the fields we care about — `stream` and `model`.
-    //      Other fields are ignored; the worker is authoritative for the
-    //      rest of the schema.
-    let _: HashMap<String, IgnoredAny> = serde_json::from_slice(body).map_err(|e| {
-        tracing::debug!(error = %e, "chat-completions body rejected as non-object JSON");
-        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-    })?;
-    let probe: RequestProbe = serde_json::from_slice(body).map_err(|e| {
+    // ONE deserialize. [`RequestProbe`]'s hand-written `visit_map` both
+    // anchors the shape (its `deserialize_map` rejects `null` / `[]` / `"hi"`
+    // — valid JSON, not request shape) and lifts out the probed fields,
+    // skipping the unknown majority through `IgnoredAny`. It never builds a
+    // `serde_json::Value` and allocates nothing per unrecognized key, so the
+    // shape check costs no separate pass over a multi-MiB body.
+    serde_json::from_slice(body).map_err(|e| {
         tracing::debug!(error = %e, "chat-completions request-probe deserialize failed");
         ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-    })?;
-    Ok(probe)
+    })
 }
 
 #[cfg(test)]
@@ -1596,7 +1974,8 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected = build_outgoing_body(&body, Some(value), None, Some(&bootstrap)).unwrap();
+        let injected =
+            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -1617,7 +1996,7 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -1632,7 +2011,7 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, &[]).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
@@ -1652,7 +2031,8 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap)).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(
@@ -1747,7 +2127,7 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap)).unwrap();
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),
@@ -1944,5 +2324,465 @@ mod tests {
             ),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    fn probe_of(body: &str) -> RequestProbe {
+        parse_probe(&Bytes::copy_from_slice(body.as_bytes())).unwrap()
+    }
+
+    /// Build a [`SamplingOverrides`] the only way production does — through
+    /// the flag parser.
+    ///
+    /// Hand-building the struct here would re-implement `canonical_number`'s
+    /// integral normalization in the test, so a regression in the parser would
+    /// leave these assertions green while the forwarded body changed.
+    fn overrides_of(conflict: ConflictPolicy, json: &str) -> SamplingOverrides {
+        crate::config::parse_sampling_overrides(json, conflict).expect("test config must parse")
+    }
+
+    /// A throwaway registry, so the contract's rejection counter has somewhere
+    /// to land.
+    fn metrics() -> Arc<MetricsRegistry> {
+        MetricsRegistry::new()
+    }
+
+    /// With nothing configured the sampling contract is inert: no request is
+    /// ever inspected, and nothing is injected.
+    #[test]
+    fn unconfigured_sampling_overrides_inject_nothing() {
+        let overrides = SamplingOverrides::default();
+        let p = probe_of(r#"{"model":"x","temperature":0.7,"n":4}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics()).unwrap(),
+            vec![]
+        );
+    }
+
+    /// The `reject` contract at the decision level: omitted -> inject the
+    /// configured value; equal to it -> pass untouched; any other numeric
+    /// value -> 400; non-numeric garbage -> forwarded for the engine's own
+    /// schema error. A band admits its range, 400s outside it, and injects
+    /// nothing.
+    #[test]
+    fn reject_mode_pins_configured_values_and_admits_a_band() {
+        let overrides = overrides_of(
+            ConflictPolicy::Reject,
+            r#"{"top_p": 0.95, "frequency_penalty": 0.0, "presence_penalty": 0.0,
+                "n": 1, "temperature": {"min": 0, "max": 1}}"#,
+        );
+
+        // Omitted params: accepted, exact values injected, band injects nothing.
+        let p = probe_of(r#"{"model":"x","messages":[]}"#);
+        let inject = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap();
+        assert_eq!(
+            inject
+                .iter()
+                .map(|(f, v)| (f.wire_name(), v.to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("top_p", "0.95".to_string()),
+                ("frequency_penalty", "0.0".to_string()),
+                ("presence_penalty", "0.0".to_string()),
+                ("n", "1".to_string()),
+            ]
+        );
+
+        for accepted in [
+            r#"{"model":"x","temperature":0.0}"#,
+            r#"{"model":"x","temperature":0.6}"#,
+            r#"{"model":"x","temperature":1.0}"#,
+            r#"{"model":"x","top_p":0.95}"#,
+            r#"{"model":"x","presence_penalty":0}"#,
+            r#"{"model":"x","frequency_penalty":0}"#,
+            r#"{"model":"x","n":1}"#,
+        ] {
+            let p = probe_of(accepted);
+            apply_sampling_overrides(&overrides, &p, &metrics())
+                .unwrap_or_else(|e| panic!("{accepted} must be accepted: {e:?}"));
+        }
+
+        // Nothing is injected over a field the client already sent.
+        let p = probe_of(r#"{"model":"x","top_p":0.95}"#);
+        let inject = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap();
+        assert!(!inject.iter().any(|(f, _)| *f == SamplingField::TopP));
+
+        for rejected in [
+            r#"{"model":"x","temperature":1.1}"#,
+            r#"{"model":"x","temperature":2.0}"#,
+            r#"{"model":"x","temperature":-0.1}"#,
+            r#"{"model":"x","top_p":0.8}"#,
+            r#"{"model":"x","presence_penalty":0.5}"#,
+            r#"{"model":"x","frequency_penalty":0.5}"#,
+            r#"{"model":"x","n":2}"#,
+        ] {
+            let p = probe_of(rejected);
+            let err = apply_sampling_overrides(&overrides, &p, &metrics())
+                .expect_err(&format!("{rejected} must be rejected"));
+            assert!(
+                matches!(err, ApiError::SamplingContract { .. }),
+                "{rejected}: got {err:?}"
+            );
+        }
+
+        // Non-numeric garbage is not ours to judge: forwarded untouched (and
+        // not injected over), the engine's schema validation owns the 400.
+        let p = probe_of(r#"{"model":"x","top_p":"hot","n":true}"#);
+        let inject = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap();
+        assert!(inject
+            .iter()
+            .all(|(f, _)| !matches!(f, SamplingField::TopP | SamplingField::N)));
+
+        // Numeric strings coerce the way the engine's pydantic lax mode does:
+        // "0.95" equals the configured value, "0.8" differs and 400s here.
+        let p = probe_of(r#"{"model":"x","top_p":"0.95"}"#);
+        assert!(apply_sampling_overrides(&overrides, &p, &metrics()).is_ok());
+        let p = probe_of(r#"{"model":"x","top_p":"0.8"}"#);
+        assert!(apply_sampling_overrides(&overrides, &p, &metrics()).is_err());
+
+        // An exact temperature (no band) rejects differing values and injects
+        // when absent, like every other parameter.
+        let exact = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
+        let p = probe_of(r#"{"model":"x","temperature":0.6}"#);
+        assert!(apply_sampling_overrides(&exact, &p, &metrics()).is_err());
+        let p = probe_of(r#"{"model":"x"}"#);
+        assert_eq!(
+            apply_sampling_overrides(&exact, &p, &metrics()).unwrap(),
+            vec![(
+                SamplingField::Temperature,
+                serde_json::Number::from_f64(1.0).unwrap()
+            )]
+        );
+    }
+
+    /// `allow` keeps the fill-when-absent half of the contract and drops the
+    /// rejection half: a client value — right, wrong or garbage — is forwarded
+    /// untouched, so the configured values are fleet-wide defaults.
+    #[test]
+    fn allow_mode_never_rejects_and_never_masks_a_client_value() {
+        let overrides = overrides_of(
+            ConflictPolicy::Allow,
+            r#"{"temperature": 1, "top_p": 0.95, "n": 1}"#,
+        );
+
+        // Omitted -> injected, exactly as under `reject`.
+        let p = probe_of(r#"{"model":"x"}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics())
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["temperature", "top_p", "n"]
+        );
+
+        // Every value `reject` would 400 is accepted here, and nothing is
+        // injected over it — the client's value reaches the engine.
+        let p = probe_of(r#"{"model":"x","temperature":0.6,"top_p":0.8,"n":4}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics()).unwrap(),
+            vec![]
+        );
+
+        // Partial overlap: the client set temperature, so only the untouched
+        // parameters are filled in.
+        let p = probe_of(r#"{"model":"x","temperature":0.6}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics())
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["top_p", "n"]
+        );
+    }
+
+    /// An explicit `null` is absent for the engine, so it is absent here too:
+    /// the configured value is injected rather than the field being read as a
+    /// client-supplied conflict.
+    #[test]
+    fn explicit_null_sampling_value_counts_as_omitted() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+        let p = probe_of(r#"{"model":"x","temperature":null}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p, &metrics())
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["temperature"]
+        );
+    }
+
+    /// The inject-set lands in the forwarded body, and rides the same
+    /// `build_outgoing_body` serialize as the forwarded `input_ids` — so
+    /// chat-encoder traffic gets the contract too, not just the raw-prompt
+    /// path.
+    #[test]
+    fn build_outgoing_body_injects_sampling_overrides_alongside_input_ids() {
+        let body =
+            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = [1u32, 2, 3];
+        let overrides = overrides_of(
+            ConflictPolicy::Reject,
+            r#"{"top_p": 0.95, "top_k": 1000, "frequency_penalty": 0.0,
+                "presence_penalty": 0.0, "n": 1}"#,
+        );
+        let inject = apply_sampling_overrides(
+            &overrides,
+            &probe_of(r#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#),
+            &metrics(),
+        )
+        .unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, &inject).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
+        // `top_k` and `n` are engine-typed `int`: the injected literals must
+        // not be `1000.0` / `1.0`.
+        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
+        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            parsed.get("frequency_penalty"),
+            Some(&serde_json::json!(0.0))
+        );
+        assert_eq!(
+            parsed.get("presence_penalty"),
+            Some(&serde_json::json!(0.0))
+        );
+        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
+        assert!(parsed.get("messages").is_some());
+    }
+    /// A repeated sampling key LAST-WINS instead of 400ing, matching the
+    /// engine's own `json.loads`: the value the contract compares against must
+    /// be the value the engine will actually sample with. Probing these fields
+    /// must not turn a body the router used to forward into a rejection.
+    #[test]
+    fn duplicate_sampling_key_takes_the_last_value_like_the_engine() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+
+        // Last value matches the contract -> accepted.
+        let p = probe_of(r#"{"model":"x","temperature":0.5,"temperature":1}"#);
+        assert!(apply_sampling_overrides(&overrides, &p, &metrics()).is_ok());
+
+        // Last value differs -> rejected on THAT value, not the first one.
+        let p = probe_of(r#"{"model":"x","temperature":1,"temperature":0.5}"#);
+        let err = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap_err();
+        assert!(
+            format!("{err}").contains("got 0.5"),
+            "must judge the last value; got {err}"
+        );
+    }
+
+    /// The router-actionable fields keep the stricter pre-existing contract:
+    /// a body that says two different things about how to route itself is
+    /// ambiguous at the edge. See
+    /// `parse_probe_handles_duplicate_stream_keys`.
+    #[test]
+    fn duplicate_routing_key_still_rejects() {
+        for body in [
+            r#"{"model":"a","model":"b"}"#,
+            r#"{"stream":true,"stream":false}"#,
+            r#"{"max_tokens":1,"max_tokens":2}"#,
+            r#"{"max_completion_tokens":1,"max_completion_tokens":2}"#,
+            // An explicit null still counts as an occurrence, so this is a
+            // duplicate even though the first value reads as `None`.
+            r#"{"stream":null,"stream":true}"#,
+        ] {
+            let b = Bytes::copy_from_slice(body.as_bytes());
+            assert!(
+                parse_probe(&b).is_err(),
+                "{body} must be rejected as ambiguous"
+            );
+        }
+    }
+
+    /// A sampling key carrying a huge non-numeric value must cost nothing: it
+    /// is drained, not materialized, and it does not fail the probe. Before
+    /// these fields were probed the value was skipped by `IgnoredAny`, and
+    /// probing them must not put a client-sized allocation back on the path
+    /// nor start rejecting bodies that used to be forwarded.
+    #[test]
+    fn oversized_non_numeric_sampling_value_is_drained_not_materialized() {
+        let big_array = format!("[{}]", "1,".repeat(50_000) + "1");
+        let big_string = format!("\"{}\"", "x".repeat(200_000));
+        let big_object = format!("{{{}\"k\":1}}", "\"j\":[[[1]]],".repeat(10_000));
+        for value in [&big_array, &big_string, &big_object] {
+            let body = format!(r#"{{"model":"x","temperature":{value}}}"#);
+            let probe = probe_of(&body);
+            assert_eq!(
+                probe.sampling_field(SamplingField::Temperature),
+                ProbedValue::Unusable,
+                "a non-numeric value must collapse to Unusable"
+            );
+            // ...and it stays the engine's business: neither compared nor
+            // injected over.
+            let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+            let inject = apply_sampling_overrides(&overrides, &probe, &metrics()).unwrap();
+            assert!(inject.is_empty(), "must not inject over a client value");
+        }
+    }
+
+    /// A numeric string is read the way the engine's pydantic lax mode reads
+    /// it, but is not retained as a string.
+    #[test]
+    fn probed_sampling_values_normalize_to_numbers() {
+        let p = probe_of(r#"{"model":"x","temperature":" 0.7 ","top_k":40,"min_p":0.05}"#);
+        assert_eq!(
+            p.sampling_field(SamplingField::Temperature),
+            ProbedValue::Number(0.7)
+        );
+        assert_eq!(
+            p.sampling_field(SamplingField::TopK),
+            ProbedValue::Number(40.0)
+        );
+        assert_eq!(
+            p.sampling_field(SamplingField::MinP),
+            ProbedValue::Number(0.05)
+        );
+        assert_eq!(p.sampling_field(SamplingField::N), ProbedValue::Absent);
+    }
+
+    /// A contract rejection must be distinguishable from every other 400 —
+    /// malformed JSON, a missing `model`, a bad SLO header — and must name the
+    /// parameter, since that is what an operator rolling the flag out needs.
+    #[test]
+    fn contract_rejection_has_its_own_error_code_and_counter() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"top_p": 0.95}"#);
+        let metrics = metrics();
+        let p = probe_of(r#"{"model":"x","top_p":0.5}"#);
+
+        let err = apply_sampling_overrides(&overrides, &p, &metrics).unwrap_err();
+        let ApiError::SamplingContract { param, .. } = &err else {
+            panic!("expected SamplingContract, got {err:?}");
+        };
+        assert_eq!(*param, "top_p");
+        // The parameter and the offending value both reach the client, so a
+        // 400 is self-explanatory without an operator in the loop. The
+        // distinct `x-router-error-code` is pinned in `server::error`.
+        let msg = format!("{err}");
+        assert!(msg.contains("top_p") && msg.contains("0.5"), "got {msg}");
+
+        apply_sampling_overrides(&overrides, &p, &metrics).unwrap_err();
+        assert!(
+            metrics
+                .render()
+                .contains(r#"sgl_router_sampling_contract_rejections_total{param="top_p"} 2"#),
+            "rejections must be counted per parameter:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The steady state of a governed fleet: a load-only policy on a model
+    /// with no chat encoder, so the ingress never parsed, and only sampling
+    /// scalars to add. This must NOT re-parse and re-serialize the body —
+    /// proven by the original bytes surviving verbatim, which a
+    /// `serde_json::Value` round-trip would have normalized away.
+    #[test]
+    fn build_outgoing_body_splices_sampling_without_reparsing() {
+        let body = Bytes::from_static(br#"{ "model" : "x" ,  "messages" : [ ] }"#);
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0, "n": 1}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,  "messages" : [ ] ,"temperature":1.0,"n":1}"#
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("temperature"), Some(&serde_json::json!(1.0)));
+        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
+        assert_eq!(parsed.get("model"), Some(&serde_json::json!("x")));
+    }
+
+    /// Splice edge cases: an empty object must not gain a trailing comma, and
+    /// leading whitespace before the root brace must not shift the insert.
+    #[test]
+    fn splice_top_level_handles_empty_objects_and_leading_whitespace() {
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        for (raw, want) in [
+            (r#"{}"#, r#"{"temperature":1.0}"#),
+            (r#"{ }"#, r#"{ "temperature":1.0}"#),
+            ("\n\t {\"a\":1}", "\n\t {\"a\":1,\"temperature\":1.0}"),
+            // A `}` inside a string literal is not the closing brace.
+            (r#"{"a":"}"}"#, r#"{"a":"}","temperature":1.0}"#),
+            // Trailing whitespace stays outside the object.
+            ("{\"a\":1} \n", "{\"a\":1,\"temperature\":1.0} \n"),
+        ] {
+            let out = splice_top_level(&Bytes::copy_from_slice(raw.as_bytes()), &inject).unwrap();
+            assert_eq!(std::str::from_utf8(&out).unwrap(), want, "input {raw:?}");
+            serde_json::from_slice::<serde_json::Value>(&out)
+                .unwrap_or_else(|e| panic!("{raw:?} spliced to invalid JSON: {e}"));
+        }
+    }
+
+    /// Nothing configured -> the body is forwarded as the same `Bytes`, with
+    /// neither a parse nor a copy.
+    #[test]
+    fn build_outgoing_body_without_injection_forwards_the_same_allocation() {
+        let body = Bytes::from_static(br#"{"model":"x"}"#);
+        let out = build_outgoing_body(&body, None, None, None, &[]).unwrap();
+        assert_eq!(
+            out.as_ptr(),
+            body.as_ptr(),
+            "must be an Arc clone, not a copy"
+        );
+    }
+    /// A request sending an explicit `null` for a governed parameter is the
+    /// one case where the inject-set and a key PRESENT in the body overlap:
+    /// the probe reads `null` as absent (the OpenAI contract), so the value is
+    /// injected even though the key is there. The injected value therefore has
+    /// to win the engine's last-wins parse — which is why members are spliced
+    /// in before the CLOSING brace. Inserting after the opening brace would
+    /// leave the client's trailing `null` authoritative and silently defeat
+    /// the contract.
+    #[test]
+    fn spliced_value_outranks_an_explicit_null_the_client_sent() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
+        let raw = r#"{"model":"x","temperature":null}"#;
+        let body = Bytes::copy_from_slice(raw.as_bytes());
+        let inject = apply_sampling_overrides(&overrides, &probe_of(raw), &metrics()).unwrap();
+        assert_eq!(inject.len(), 1, "null must be treated as omitted");
+
+        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("temperature"),
+            Some(&serde_json::json!(1.0)),
+            "the engine must read the configured value, not the client's null: {}",
+            std::str::from_utf8(&out).unwrap()
+        );
+    }
+
+    /// The splice must also fire when the ingress ALREADY parsed the body — a
+    /// chat-encoder model, the cache-aware policy or bucket routing — as long
+    /// as nothing needs overwriting. Gating on `value.is_none()` skipped
+    /// exactly those configurations, i.e. most governed fleets.
+    #[test]
+    fn splice_fires_even_when_a_parse_is_already_on_hand() {
+        let body = Bytes::from_static(br#"{ "model" : "x" }"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        let out = build_outgoing_body(&body, Some(value), None, None, &inject).unwrap();
+        // Byte-identical to the no-parse case: the parse was dropped unused.
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,"temperature":1.0}"#
+        );
     }
 }
