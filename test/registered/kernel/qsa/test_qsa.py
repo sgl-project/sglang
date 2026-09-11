@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
@@ -42,6 +43,60 @@ COMPRESS_RATIO = 4
 TOKEN_TOPK = 2048
 BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
+
+
+def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    num_requests, num_q_heads, num_kv_heads, head_dim, topk = 2, 4, 1, 128, 16
+    q = torch.randn(
+        num_requests, num_q_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        num_requests * topk,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    v = torch.randn(
+        num_requests * topk,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    indices = torch.arange(topk, dtype=torch.int32, device=device).repeat(
+        num_requests, 1
+    )
+    cu_q = torch.arange(num_requests + 1, dtype=torch.int32, device=device)
+    cu_k = torch.arange(
+        0,
+        (num_requests + 1) * topk,
+        topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_lens = torch.full((num_requests,), topk, dtype=torch.int32, device=device)
+    scale = head_dim**-0.5
+
+    actual = sparse_gqa_fwd_interface_triton_ck(
+        q, k, v, indices, cu_q, cu_k, kv_lens, scale
+    )
+    expected = sparse_gqa_fwd_interface_triton_ck(
+        q,
+        k.to(torch.bfloat16),
+        v.to(torch.bfloat16),
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize(

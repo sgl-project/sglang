@@ -4,7 +4,7 @@ import dataclasses
 import re
 import unittest
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 from torch import nn
@@ -711,7 +711,9 @@ class _SchedulerWorker:
             forward_stream=object(),
             prewarm_sampling=lambda: trace.append("prewarm"),
             token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
-            post_capture_resize_kv_pool=lambda: trace.append("resize"),
+            post_capture_resize_kv_pool=Mock(
+                side_effect=lambda *, draft_runners: trace.append("resize")
+            ),
         )
 
     def start_startup_weight_load(self):
@@ -750,7 +752,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         trace = []
         worker = _SchedulerWorker(trace, post_capture_active=True)
         draft_worker = (
-            SimpleNamespace(prewarm_sampling=lambda: trace.append("draft_prewarm"))
+            SimpleNamespace(
+                prewarm_sampling=lambda: trace.append("draft_prewarm"),
+                _draft_model_runners=lambda: (worker.model_runner,),
+            )
             if use_draft_worker
             else None
         )
@@ -795,6 +800,9 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         ):
             scheduler.init_model_worker()
 
+        worker.model_runner.post_capture_resize_kv_pool.assert_called_once_with(
+            draft_runners=(worker.model_runner,) if use_draft_worker else ()
+        )
         return trace
 
     def test_serial_path_skips_overlap_hooks(self):
