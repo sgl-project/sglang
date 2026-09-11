@@ -436,6 +436,7 @@ class MiMoV2MoE(nn.Module):
         # todo : implement tbo forward needed
         if (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
@@ -455,6 +456,7 @@ class MiMoV2MoE(nn.Module):
 
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
