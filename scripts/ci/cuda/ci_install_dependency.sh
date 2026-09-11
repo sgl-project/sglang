@@ -2,11 +2,14 @@
 # Install dependencies for CUDA CI jobs.
 #
 # CU_VERSION (default: cu130) controls PyTorch index URL, FlashInfer JIT cache
-# index, and nvrtc variant selection.
+# index, and the sglang wheel index. CUDA 13 only.
 set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
+# shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
+source "${SCRIPT_DIR}/../utils/git_clone_with_retry.sh"
 
 # ---------------------------------------------------------------------------
 # Timing helper
@@ -29,10 +32,14 @@ mark_step_done() {
 
 configure_environment() {
     # CU_VERSION controls PyTorch index URL, FlashInfer JIT cache index, and
-    # nvrtc variant selection (cu12 vs cu13).
+    # the sglang wheel index. Only CUDA 13 lanes exist: PyTorch 2.14 publishes
+    # no CUDA 12 wheels for the cu129 index the retired cu12 lane used.
     CU_VERSION="${CU_VERSION:-cu130}"
     CU_STRIP="${CU_VERSION#cu}"
-    CU_MAJOR="${CU_STRIP:0:2}"
+    case "${CU_STRIP}" in
+        13*) ;;
+        *) echo "FATAL: unsupported CU_VERSION=${CU_VERSION}; only CUDA 13 is supported"; exit 1 ;;
+    esac
 
     OPTIONAL_DEPS="${1:-}"
 
@@ -133,6 +140,18 @@ cleanup_stale_shm() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+is_apt_package_installed() {
+    local name
+    # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
+    # apt-get follows the Provides alias, dpkg -l does not.
+    for name in "$1" "${1}t64"; do
+        if dpkg -l "$name" 2>/dev/null | grep -q "^ii"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 install_apt_packages() {
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
@@ -149,7 +168,7 @@ install_apt_packages() {
     local pkg
     local -a MISSING_APT_PACKAGES=()
     for pkg in "${CI_APT_PACKAGES[@]}"; do
-        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+        is_apt_package_installed "$pkg" || MISSING_APT_PACKAGES+=("$pkg")
     done
 
     if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
@@ -207,9 +226,7 @@ install_gdrcopy() {
         done
     }
 
-    rm -rf "${gdrcopy_root}"
-    git clone --branch "v${gdrcopy_version}" --depth 1 \
-        https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
+    git_clone_with_retry https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}" "--branch v${gdrcopy_version}"
     (
         cd "${gdrcopy_root}/packages"
         CUDA=/usr/local/cuda ./build-deb-packages.sh
@@ -277,11 +294,24 @@ clean_site_packages() {
 }
 
 setup_cargo_cache() {
+    if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
+        echo "Using prebuilt Rust extensions; skipping Cargo target setup"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
     # actions/checkout's `git clean -ffdx` deletes the gitignored in-repo
     # rust/target, so every job recompiles the whole dependency graph. Move the
     # target dir out of the tree: setuptools-rust has no target-dir option of its
     # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
     export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    local cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
+    mkdir -p "${HOME}/.cache"
+    exec 9>"${cargo_target_lock}"
+    echo "Waiting for exclusive cargo target lock: ${cargo_target_lock}"
+    flock --exclusive 9
+    CARGO_TARGET_LOCK_HELD=1
+    echo "Acquired cargo target lock"
     mkdir -p "${CARGO_TARGET_DIR}"
 
     # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
@@ -296,6 +326,15 @@ setup_cargo_cache() {
     fi
 
     mark_step_done "${FUNCNAME[0]}"
+}
+
+release_cargo_cache_lock() {
+    if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
+        flock --unlock 9
+        exec 9>&-
+        CARGO_TARGET_LOCK_HELD=0
+        echo "Released cargo target lock"
+    fi
 }
 
 setup_pip_toolchain() {
@@ -330,11 +369,6 @@ remove_stale_cuda12_nvidia_wheels() {
     local -a INSTALLED_NVIDIA_WHEELS=()
     local -a NVIDIA_WHEELS_TO_RESTORE=()
     local -a STALE_CUDA12_NVIDIA_WHEELS=()
-
-    if [ "$CU_MAJOR" != "13" ]; then
-        mark_step_done "${FUNCNAME[0]}"
-        return
-    fi
 
     mapfile -t INSTALLED_NVIDIA_WHEELS < <(
         python3 -m pip list --format=freeze | sed -n '/^nvidia-.*==/p'
@@ -427,30 +461,6 @@ install_pytorch_stack() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_cuda12_deepep_wheel() {
-    if [ "$CU_MAJOR" = "13" ]; then
-        echo "CUDA 13 uses the public sgl-deep-ep wheel declared in python/pyproject.toml"
-        mark_step_done "${FUNCNAME[0]}"
-        return
-    fi
-
-    local version
-    version=$(grep -Po -m1 '"sgl-deep-ep==\K[^"]+' python/pyproject.toml || true)
-    if [ -z "$version" ]; then
-        echo "ERROR: python/pyproject.toml must pin sgl-deep-ep"
-        exit 1
-    fi
-
-    # CUDA 12 wheels intentionally live only on the SGLang wheel index. Their
-    # local version satisfies the public-version pyproject pin, so the later
-    # editable SGLang install keeps this CUDA-matched wheel.
-    $PIP_CMD install "sgl-deep-ep==${version}+${CU_VERSION}" \
-        --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" \
-        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 require_prebuilt_rust_exts() {
     # Stages whose download succeeded set this to none. Runs before
     # setup_pip_toolchain uninstalls sglang, so clearing it here still reaches
@@ -473,10 +483,19 @@ require_prebuilt_rust_exts() {
     for module in server grpc multimodal; do
         [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache${suffix}" ] \
+        || missing+=("mem_cache")
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache_inspection${suffix}" ] \
+        || missing+=("mem_cache_inspection")
     if [ ${#missing[@]} -gt 0 ]; then
         echo "::warning::no prebuilt Rust extension ${suffix} for: ${missing[*]}; building from source"
         ls -l python/sglang/srt/rust_extensions/_*.so 2>/dev/null || echo "(no extension modules at all)"
+        ls -l python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so 2>/dev/null || true
         export SGLANG_BUILD_RUST_EXTS=
+        export SGLANG_RUST_BUILD_MODE=auto
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            echo "SGLANG_RUST_BUILD_MODE=auto" >> "${GITHUB_ENV}"
+        fi
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -507,12 +526,10 @@ install_sglang() {
 }
 
 install_nccl() {
-    if [ "$CU_MAJOR" = "13" ]; then
-        $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
-            --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-    else
-        echo "CUDA ${CU_MAJOR} does not require the NCCL Gin wheel"
-    fi
+    # PyTorch pins 2.29.7, so this override must run after every command
+    # that resolves Python dependencies (including lmms-eval).
+    $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+        --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -582,8 +599,8 @@ install_sglang_kernel() {
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
         # The PyPI default wheel tracks one CUDA version (currently cu130); other
-        # runners (e.g. h20 / cu129) need the +${CU_VERSION}-tagged wheel from the
-        # sglang index, linked against the right libnvrtc.
+        # runners need the +${CU_VERSION}-tagged wheel from the sglang index,
+        # linked against the right libnvrtc.
         SGL_KERNEL_WANTED="${SGL_KERNEL_VERSION_FROM_SRT}+${CU_VERSION}"
         if installed_wheel_ok sglang-kernel "${SGL_KERNEL_WANTED}" reject-local; then
             echo "sglang-kernel==${SGL_KERNEL_WANTED} already installed, keeping it"
@@ -594,18 +611,11 @@ install_sglang_kernel() {
         echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
     SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
-    if [ "$CU_MAJOR" = "13" ]; then
-        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}"
-    else
-        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}+cu129"
-    fi
     # No reject-local: nothing builds sgl-deep-gemm locally.
-    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_WANTED}"; then
-        echo "sgl-deep-gemm==${SGL_DEEP_GEMM_WANTED} already installed, keeping it"
-    elif [ "$CU_MAJOR" = "13" ]; then
-        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
+    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_VERSION}"; then
+        echo "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION} already installed, keeping it"
     else
-        $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
+        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -691,21 +701,12 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.12.post1"
+    MOONCAKE_VERSION="0.3.13"
     NIXL_VERSION="1.3.0"
-    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
-    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
-    if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine"
-        NIXL_BIN_NAME="nixl-cu13"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
-    else
-        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
-        NIXL_BIN_NAME="nixl-cu12"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
-    fi
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
+    MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+    NIXL_BIN_NAME="nixl-cu13"
+    EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     # Both variants own the same mooncake/ package files and bin/ scripts
     # (mooncake_master, etc.). Uninstalling the stale variant deletes shared
     # files that the live variant's RECORD still references, so we force a
@@ -716,6 +717,8 @@ install_extra_deps() {
         $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+
+    $PIP_CMD install "helion==1.4.0" $PIP_INSTALL_SUFFIX
 
     NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
@@ -730,12 +733,9 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
-
     if [ "$IS_BLACKWELL" != "1" ]; then
-        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-        $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
-        # lmms-eval v0.5 pulls antlr4-python3-runtime==4.7.2, clobbering the
+        $PIP_CMD install "lmms_eval==0.5.0" $PIP_INSTALL_SUFFIX
+        # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
         $PIP_CMD install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
@@ -752,14 +752,6 @@ install_test_tools() {
     [ -e "${HOME}/.cache/sglang" ] && [ ! -d "${HOME}/.cache/sglang" ] && rm -f "${HOME}/.cache/sglang"
     mkdir -p "${HOME}/.cache/sglang/"
     mv python/kernels.lock "${HOME}/.cache/sglang/" || true
-
-    # Install human-eval (subshell keeps cd local)
-    $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
-    [ -d human-eval ] || git clone https://github.com/merrymercy/human-eval.git
-    (
-        cd human-eval
-        $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
-    )
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -796,6 +788,22 @@ verify_imports() {
     # One process; torch/cutlass do not import sglang, so the find_spec check
     # still runs ahead of any sglang import.
     SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+import ctypes
+import importlib.metadata
+import os
+
+if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+    raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
+nccl = ctypes.CDLL("libnccl.so.2")
+nccl_version = ctypes.c_int()
+status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
+if status != 0 or nccl_version.value != 23007:
+    raise SystemExit(
+        f"expected NCCL runtime 2.30.7, got status={status}, "
+        f"raw_version={nccl_version.value}"
+    )
+print("NCCL package and runtime versions are 2.30.7")
+
 import torch
 print(torch.version.cuda)
 import deep_ep
@@ -806,7 +814,7 @@ import cutlass.cute
 # A shadowed sglang still imports, so without this the failure only surfaces
 # as a missing submodule during the test step. find_spec, not import: the
 # finders alone answer this without importing sglang.
-import importlib.util, os
+import importlib.util
 want = os.environ["SGLANG_EXPECTED_INIT"]
 spec = importlib.util.find_spec("sglang")
 if spec is None:
@@ -846,15 +854,14 @@ main() {
     install_apt_packages
     install_gdrcopy
     clean_site_packages
-    setup_cargo_cache
     require_prebuilt_rust_exts
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_pytorch_stack
-    install_cuda12_deepep_wheel
+    setup_cargo_cache
     install_sglang
-    install_nccl
+    release_cargo_cache_lock
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
     if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
@@ -867,6 +874,7 @@ main() {
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
+    install_nccl
     prepare_runner
     setup_ld_library_path
     verify_imports

@@ -99,8 +99,8 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 - **Thinking is enabled by default.** Set `chat_template_kwargs.enable_thinking` to `false` for a direct answer. Set `enable_thinking` and `low_effort` to `true` for a shorter reasoning trace.
 - **Give thinking enough tokens.** At `temperature=1.0` the default thinking mode can run past 1,000 tokens on multi-step problems. Use a `max_tokens` of at least 2,048 for thinking requests so the answer is not cut off.
-- **Reasoning parser.** Launch with `--reasoning-parser nemotron_3` so OpenAI-compatible responses separate the trace into `message.reasoning_content` and the answer into `message.content`. Without a parser flag the reasoning markup stays inline in `message.content`. `--reasoning-parser auto` also resolves to `nemotron_3` for these checkpoints.
-- **Tool-call parser.** Launch with `--tool-call-parser qwen3_coder` so tool requests are returned through `message.tool_calls`. Without it, raw `<tool_call>` markup stays in `message.content`. `--tool-call-parser auto` also resolves to `qwen3_coder` for these checkpoints.
+- **Reasoning parser.** Launch with `--reasoning-parser auto`, which resolves to `nemotron_3` for these checkpoints, so OpenAI-compatible responses separate the trace into `message.reasoning_content` and the answer into `message.content`. Without a parser flag the reasoning markup stays inline in `message.content`.
+- **Tool-call parser.** Launch with `--tool-call-parser auto`, which resolves to `qwen3_coder` for these checkpoints, so tool requests are returned through `message.tool_calls`. Without it, raw `<tool_call>` markup stays in `message.content`.
 - **Single-GPU sizing.** All three BF16 checkpoints loaded and completed chat requests with `--tp 1 --mem-fraction-static 0.8` on one H200 and on one B200. Increase TP only after validating the new topology.
 - **Image selection.** The validated path uses `lmsysorg/sglang:dev`. A stable image tested during validation had an incompatible dependency set before model loading, so use the recipe's image until a newer tagged release is confirmed.
 
