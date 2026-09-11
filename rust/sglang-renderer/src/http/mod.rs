@@ -9,6 +9,7 @@ use crate::engine::HttpGenerateClient;
 mod chat;
 mod completions;
 mod error;
+mod proxy;
 mod render;
 mod response;
 mod tokenize;
@@ -72,7 +73,7 @@ pub(crate) fn hosted_routes(
     upstream_url: String,
 ) -> Result<Router<()>, String> {
     let renderer = frontend.renderer.clone();
-    let proxy = crate::runtime::RustServerProxy::new(upstream_url)?;
+    let proxy = proxy::RustServerProxy::new(upstream_url)?;
     Ok(inference_routes(frontend)
         .merge(renderer_routes(renderer))
         .merge(render::readiness_route())
