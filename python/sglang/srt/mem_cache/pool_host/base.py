@@ -48,14 +48,42 @@ def ranks_per_host() -> int:
     return max(world_group.world_size // get_parallel().nnodes, 1)
 
 
+def free_hugepage_bytes() -> int:
+    """Bytes still free in the kernel hugepage reservation, from /proc/meminfo."""
+    free_pages = 0
+    page_kb = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("HugePages_Free:"):
+                    free_pages = int(line.split()[1])
+                elif line.startswith("Hugepagesize:"):
+                    page_kb = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+    return free_pages * page_kb * 1024
+
+
 def host_memory_budget_bytes() -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
     psutil reports the whole machine, so co-located ranks each see the same free
     memory; without the split every rank sizes its pool against all of it and
     the host is oversubscribed by the number of ranks it holds.
+
+    With SGLANG_HUGEPAGE_SIZE set the pool is mmap'd out of the hugepage
+    reservation instead, and that reservation is carved out of normal memory.
+    Counting what psutil calls available is then wrong twice over: it cannot see
+    the memory the pool will use, and it shrinks as the reservation grows, so
+    enlarging the reservation to fit a pool makes this check fail sooner rather
+    than later. Measure the pool the allocation will really come from.
     """
-    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    from sglang.srt.environ import envs
+
+    if (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip():
+        free = free_hugepage_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    else:
+        free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
     return free // ranks_per_host()
 
 
