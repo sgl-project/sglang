@@ -193,6 +193,28 @@ class BaseKVSender(ABC):
         """
         pass
 
+    @property
+    def is_layerwise_enabled(self) -> bool:
+        """Whether this sender operates in layerwise mode."""
+        return False
+
+    def start_layerwise_send(self, num_layers: int) -> None:
+        """Called before the model forward pass begins. Layerwise backends
+        pre-compute per-layer transfer parameters for *num_layers* layers."""
+        pass
+
+    def save_kv_layer(self, layer_id: int) -> None:
+        """Called after layer *layer_id*'s attention completes. Layerwise
+        backends enqueue the transfer of this layer's KV cache so it
+        overlaps with the next layer's compute."""
+        pass
+
+    def finalize_layerwise_send(self) -> None:
+        """Called after the model forward pass completes. Layerwise backends
+        flush any remaining state (aux, Mamba, etc.) and signal completion
+        to the decode side."""
+        pass
+
 
 class BaseKVReceiver(ABC):
     @abstractmethod
