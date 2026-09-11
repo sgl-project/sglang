@@ -143,11 +143,13 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
         """Elision and DCP are independent axes and must compose: eliding layers
         must not change the 1/c latent behaviour, and sharding must not
         resurrect elided index-K rows."""
-        mask = [i % 2 == 1 for i in range(LAYER_NUM)]
-        live = mask.count(False)
+        # indexer_layer_ids, not the old skip_topk_layers bool mask: this pool
+        # now compacts index-K to the layers that own an Indexer.
+        live_ids = [i for i in range(LAYER_NUM) if i % 2 == 0]
+        live = len(live_ids)
 
-        base_latent, base_index = _measure(1, skip_topk_layers=mask)
-        latent, index = _measure(4, skip_topk_layers=mask)
+        base_latent, base_index = _measure(1, indexer_layer_ids=live_ids)
+        latent, index = _measure(4, indexer_layer_ids=live_ids)
 
         self.assertEqual(index, base_index)
         self.assertAlmostEqual(latent / base_latent, 1 / 4, delta=0.02)

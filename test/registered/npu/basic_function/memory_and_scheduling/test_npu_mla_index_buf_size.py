@@ -128,18 +128,32 @@ class TestNpuMlaIndexBufSize(CustomTestCase):
         self.assertEqual(buffer[last, 0, 0].item(), 3.0)
 
     def test_it_composes_with_the_skip_topk_elision(self):
-        """Widening must not resurrect rows for layers that own no Indexer."""
-        mask = [i % 2 == 1 for i in range(LAYER_NUM)]
-        pool = _build(index_buf_size=SIZE * 4, skip_topk_layers=mask)
+        """Widening must not resurrect rows for layers that own no Indexer.
 
-        for layer_idx, elided in enumerate(mask):
-            with self.subTest(layer=layer_idx):
-                if elided:
-                    self.assertEqual(_index_pages(pool, layer_idx), 0)
-                else:
+        The pool compacts index-K to the layers that own an Indexer and maps
+        layer_id through ``indexer_layer_id_to_slot``; an elided layer is absent
+        from that map rather than holding a zero-page tensor at its own index.
+        This test previously passed a ``skip_topk_layers`` bool mask and asserted
+        the zero-page form, which is the layout this pool no longer uses.
+        """
+        live = [i for i in range(LAYER_NUM) if i % 2 == 0]
+        pool = _build(index_buf_size=SIZE * 4, indexer_layer_ids=live)
+
+        # One slot per live layer, none for the elided ones -- that is the
+        # elision, and widening must not add rows back.
+        self.assertEqual(pool.num_indexer_layers, len(live))
+        self.assertEqual(pool.index_k_buffer.shape[0], len(live))
+        self.assertEqual(sorted(pool.indexer_layer_id_to_slot), live)
+
+        for layer_id in range(LAYER_NUM):
+            with self.subTest(layer=layer_id):
+                if layer_id in pool.indexer_layer_id_to_slot:
+                    slot = pool.indexer_layer_id_to_slot[layer_id]
                     self.assertEqual(
-                        _index_pages(pool, layer_idx), SIZE * 4 // PAGE_SIZE + 1
+                        _index_pages(pool, slot), SIZE * 4 // PAGE_SIZE + 1
                     )
+                else:
+                    self.assertNotIn(layer_id, pool.indexer_layer_id_to_slot)
 
     def test_reported_bytes_follow_the_widened_indexer(self):
         """get_kv_size_bytes is what the launch log prints, so it has to see the
