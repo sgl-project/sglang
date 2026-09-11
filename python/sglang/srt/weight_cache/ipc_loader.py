@@ -138,7 +138,7 @@ class IpcModelLoader(BaseModelLoader):
                 f"{preloaded_weights_bytes=}"
             )
         logger.info(
-            f"[IpcModelLoader] Fetched {len(entries)} tensors from daemon "
+            f"[IpcModelLoader] Fetched {len(entries)} state entries from daemon "
             f"(transport={self._transport_backend.name}) "
             f"in {time.perf_counter() - tic:.2f}s"
         )
@@ -305,6 +305,31 @@ class IpcModelLoader(BaseModelLoader):
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
 
+    @staticmethod
+    def _set_plain_module_value(model, name, value):
+        """Attach exact daemon-exported derived state as a plain attribute."""
+        parts = name.split(".")
+        obj = model
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        leaf_name = parts[-1]
+        if leaf_name in obj._parameters or leaf_name in obj._buffers:
+            raise RuntimeError(
+                f"[IpcModelLoader] Derived attribute {name} collides with registered state"
+            )
+        if not hasattr(obj, leaf_name):
+            raise RuntimeError(
+                f"[IpcModelLoader] Derived attribute is missing: {name}"
+            )
+        setattr(obj, leaf_name, value)
+
+    @staticmethod
+    def _set_plain_module_tensor(model, name, tensor):
+        """Attach an exact daemon-exported derived tensor as a plain attribute."""
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"derived tensor entry is not a Tensor: {name}")
+        IpcModelLoader._set_plain_module_value(model, name, tensor)
+
     def _load_zero_copy_mode(
         self,
         model_config,
@@ -352,14 +377,27 @@ class IpcModelLoader(BaseModelLoader):
         imported_count = 0
         mismatched = []
         new_params_count = 0
+        plain_tensor_count = 0
+        plain_value_count = 0
         map_tic = time.perf_counter()
 
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
         for name, entry in entries.items():
+            if entry.get("is_plain_value", False):
+                self._set_plain_module_value(model, name, entry.get("value"))
+                plain_value_count += 1
+                continue
             imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
+
+            if entry.get("is_plain_tensor", False):
+                self._set_plain_module_tensor(model, name, imported_tensor)
+                imported_refs.append(imported_tensor)
+                imported_count += 1
+                plain_tensor_count += 1
+                continue
 
             if name in existing_names:
                 # Existing parameter/buffer — validate shape/dtype
@@ -443,7 +481,9 @@ class IpcModelLoader(BaseModelLoader):
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
-            f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
+            f"({new_params_count} new post-quant, "
+            f"{plain_tensor_count} plain derived tensors, "
+            f"{plain_value_count} plain derived values), time={map_elapsed:.3f}s"
         )
 
         return model
