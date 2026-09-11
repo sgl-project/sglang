@@ -230,43 +230,56 @@ class TestDSV4UnifiedFp8PdLayout(CustomTestCase):
 
 class TestDSV4UnifiedFp8PpSlice(CustomTestCase):
     RATIOS = [4, 4, 128, 4]
+    # kv_data groups: 2*c4 + c128 bf16, 3*c4 + 2*c128 under the fp8 two-pool
+    BF16_KV_LEN = 7
+    FP8_KV_LEN = 11
 
-    def _slice(self, dst, start, end, state_type=None):
+    def _slice(self, dst, start, end, state_type=None, src=None):
         mgr = _pp_mgr(start, end, self.RATIOS)
-        src = list(range(100, 100 + 8))
+        if src is None:
+            src = list(range(100, 100 + 8))
         return mgr._mla_slice_ptrs_for_pp(src, dst, self.RATIOS, state_type)
 
     def test_bf16_kv_layout_unchanged(self):
         # [C4 x3 | indexer x3 | C128 x1]
-        dst = list(range(7))
+        dst = list(range(self.BF16_KV_LEN))
         _, sliced = self._slice(dst, 0, 2)
         self.assertEqual(sliced, [0, 1, 3, 4])
         _, sliced = self._slice(dst, 2, 3)
         self.assertEqual(sliced, [6])
 
-    def test_fp8_kv_layout_five_groups(self):
-        # [C4_nope x3 | C4_rope x3 | idx x3 | C128_nope x1 | C128_rope x1]
-        dst = list(range(11))
-        _, sliced = self._slice(dst, 0, 2)
-        self.assertEqual(sliced, [0, 1, 3, 4, 6, 7])
-        _, sliced = self._slice(dst, 2, 3)
-        self.assertEqual(sliced, [9, 10])
-        _, sliced = self._slice(dst, 3, 4)
-        self.assertEqual(sliced, [2, 5, 8])
+    def test_same_layout_peers_never_reach_the_slicer(self):
+        # PD with pp_size=1 always lands here, whichever pool layout is in use;
+        # the fp8 group counts are only ever produced on both sides at once.
+        mgr = _pp_mgr(0, len(self.RATIOS), self.RATIOS)
+        for n in (self.BF16_KV_LEN, self.FP8_KV_LEN):
+            ptrs = list(range(n))
+            src, dst, count = mgr.get_mla_kv_ptrs_with_pp(ptrs, list(ptrs))
+            self.assertEqual((src, dst, count), (ptrs, ptrs, n))
 
-    def test_swa_ring_fp8_splits_nope_then_rope(self):
-        dst = list(range(8))
-        _, sliced = self._slice(dst, 1, 3, StateType.SWA_RING)
-        self.assertEqual(sliced, [1, 2, 5, 6])
+    def test_mixed_fp8_and_bf16_peers_are_rejected(self):
+        cases = (
+            (None, self.BF16_KV_LEN, self.FP8_KV_LEN),
+            (None, self.FP8_KV_LEN, self.BF16_KV_LEN),
+            (StateType.SWA_RING, len(self.RATIOS), 2 * len(self.RATIOS)),
+            (StateType.SWA_RING, 2 * len(self.RATIOS), len(self.RATIOS)),
+        )
+        for state_type, src_len, dst_len in cases:
+            with self.subTest(state_type=state_type, src_len=src_len):
+                with self.assertRaisesRegex(ValueError, "SGLANG_DSV4_UNIFIED_KV_FP8"):
+                    self._slice(
+                        list(range(dst_len)),
+                        1,
+                        3,
+                        state_type,
+                        src=list(range(100, 100 + src_len)),
+                    )
 
-    def test_swa_ring_bf16_and_draft_len_not_double_sliced(self):
+    def test_swa_ring_bf16_slice_unchanged(self):
+        # stage [1, 3) registers 2 of the 4 bf16 rings
         dst = list(range(4))
-        _, sliced = self._slice(dst, 1, 3, StateType.SWA_RING)
+        _, sliced = self._slice(dst, 1, 3, StateType.SWA_RING, src=[100, 101])
         self.assertEqual(sliced, [1, 2])
-        # 1-layer fp8 draft: 2 ptrs, not 2 * len(mla_ratios)
-        dst = [10, 11]
-        _, sliced = self._slice(dst, 1, 3, StateType.SWA_RING)
-        self.assertEqual(sliced, [11])
 
 
 if __name__ == "__main__":

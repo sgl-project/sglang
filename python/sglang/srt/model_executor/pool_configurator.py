@@ -147,6 +147,30 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     )
 
 
+def check_dsv4_unified_fp8_pd_supported(
+    *, unified_fp8: bool, disaggregation_mode: str, pp_size: int, enable_hisparse: bool
+) -> None:
+    """PP and HiSparse still index kv_data as one region per layer; fp8 PD adds rope groups."""
+    if not unified_fp8 or disaggregation_mode == "null":
+        return
+    if pp_size > 1:
+        raise ValueError(
+            "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
+            f"with pp_size={pp_size}: the PP re-slicing of the per-stage KV "
+            "regions has no coverage for the extra rope regions. Run PD with "
+            "pp_size=1 or unset the fp8 switch."
+        )
+    if enable_hisparse:
+        # HiSparse appends its device tail to kv_data and locates it as
+        # dst_kv_ptrs[c4_layer_num:] (mooncake/conn.py, decode.py), i.e. the
+        # slice that fp8 fills with the C4 rope regions.
+        raise ValueError(
+            "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
+            "with --enable-hisparse: the host/device split locates its device "
+            "regions by layer count, which the fp8 rope regions shift."
+        )
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -1032,6 +1056,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 "SGLANG_DSV4_UNIFIED_KV_FP8=1 stores the latent as fp8. Unset the "
                 "env switch to get a bf16 unified pool."
             )
+
+        check_dsv4_unified_fp8_pd_supported(
+            unified_fp8=self._unified_fp8,
+            disaggregation_mode=self.disaggregation_mode,
+            pp_size=kvc.ps.pp_size,
+            enable_hisparse=get_memory().enable_hisparse,
+        )
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.

@@ -1143,6 +1143,42 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
         self.assertEqual(sizes.c4_state_pool_size, 0)
 
+    def test_dsv4_fp8_pd_refuses_pp_and_hisparse(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            check_dsv4_unified_fp8_pd_supported,
+        )
+
+        base = dict(
+            unified_fp8=True,
+            disaggregation_mode="prefill",
+            pp_size=1,
+            enable_hisparse=False,
+        )
+        check_dsv4_unified_fp8_pd_supported(**base)
+        # bf16 PD keeps both
+        check_dsv4_unified_fp8_pd_supported(
+            **{**base, "unified_fp8": False, "pp_size": 2, "enable_hisparse": True}
+        )
+        # fp8 without PD keeps both
+        check_dsv4_unified_fp8_pd_supported(
+            **{
+                **base,
+                "disaggregation_mode": "null",
+                "pp_size": 2,
+                "enable_hisparse": True,
+            }
+        )
+        for mode in ("prefill", "decode"):
+            for key, value, message in (
+                ("pp_size", 2, "pp_size=2"),
+                ("enable_hisparse", True, "enable-hisparse"),
+            ):
+                with self.subTest(disaggregation_mode=mode, refused=key):
+                    with self.assertRaisesRegex(ValueError, message):
+                        check_dsv4_unified_fp8_pd_supported(
+                            **{**base, "disaggregation_mode": mode, key: value}
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

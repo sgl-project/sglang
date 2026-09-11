@@ -998,11 +998,9 @@ class CommonKVManager(BaseKVManager):
         state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int]]:
         # Match the pool's flat buffer order, with layers grouped by ratio:
-        # KV: [C4 KV, C4 indexer KV, C128 KV]; fp8 two-pool inserts C4_rope
-        # and C128_rope beside the KV groups.
+        # KV: [C4 KV, C4 indexer KV, C128 KV].
         # SWA state: [SWA KV, C4 compressor state, C4 indexer state].
-        # DSV4_REQUEST_STATE: [C128 compressor state]; SWA_RING: [SWA rings]
-        # (fp8: nope layers then rope layers).
+        # DSV4_REQUEST_STATE: [C128 compressor state]; SWA_RING: [SWA rings].
         # Prefill src is stage-local; decode dst may cover the full model.
         start_layer = self.kv_args.prefill_start_layer
         end_layer = self.kv_args.prefill_end_layer
@@ -1013,10 +1011,26 @@ class CommonKVManager(BaseKVManager):
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
         kv_layout_len = 2 * c4_full + c128_full
-        # fp8 two-pool: C4_nope, C4_rope, C4_indexer, C128_nope, C128_rope.
-        # Pick by dst length so this slicer does not import DSV4; bf16 still
-        # matches kv_layout_len and keeps the original three-group cut.
-        kv_layout_len_fp8 = 3 * c4_full + 2 * c128_full
+
+        # A DSV4 two-pool peer registers a rope group beside each KV group and
+        # doubles the ring, and the switch that turns that on is read per
+        # process. Mixed peers would fall into the cuts below, match whichever
+        # side is shorter, and then index past the other one once per request.
+        if state_type in (StateType.SWA, StateType.DSV4_REQUEST_STATE):
+            single_pool_len = two_pool_len = None
+        elif state_type == StateType.SWA_RING:
+            single_pool_len, two_pool_len = len(mla_ratios), 2 * len(mla_ratios)
+        else:
+            single_pool_len, two_pool_len = kv_layout_len, 3 * c4_full + 2 * c128_full
+        peer_lens = {len(src_kv_ptrs), len(dst_kv_ptrs)}
+        if single_pool_len is not None and peer_lens == {single_pool_len, two_pool_len}:
+            raise ValueError(
+                "PD peers disagree on the compressed-MLA KV layout: prefill "
+                f"registered {len(src_kv_ptrs)} regions, decode "
+                f"{len(dst_kv_ptrs)} ({single_pool_len} is one pool per layer, "
+                f"{two_pool_len} is the fp8 two-pool). "
+                "SGLANG_DSV4_UNIFIED_KV_FP8 must be set the same on both sides."
+            )
 
         c4_off_s = sum(1 for r in mla_ratios[:start_layer] if r == 4)
         c4_off_e = sum(1 for r in mla_ratios[:end_layer] if r == 4)
@@ -1027,51 +1041,21 @@ class CommonKVManager(BaseKVManager):
             return src_kv_ptrs, list(dst_kv_ptrs[c128_off_s:c128_off_e])
 
         if state_type == StateType.SWA_RING:
-            n_layers = len(mla_ratios)
-            # fp8 target: [nope * n | rope * n]. A 1-layer draft ring has len 2
-            # (or 1 if DSpark bf16) and must not be cut as 2*n_target_layers.
-            if len(dst_kv_ptrs) == 2 * n_layers:
-                swa_s = min(start_layer, n_layers)
-                swa_e = min(end_layer, n_layers)
-                sliced_dst = list(dst_kv_ptrs[swa_s:swa_e]) + list(
-                    dst_kv_ptrs[n_layers + swa_s : n_layers + swa_e]
-                )
-                return src_kv_ptrs, sliced_dst
             swa_s = min(start_layer, len(dst_kv_ptrs))
             swa_e = min(end_layer, len(dst_kv_ptrs))
             return src_kv_ptrs, list(dst_kv_ptrs[swa_s:swa_e])
 
-        if state_type not in (
-            StateType.SWA,
-            StateType.SWA_RING,
-            StateType.DSV4_REQUEST_STATE,
+        if (
+            state_type
+            not in (StateType.SWA, StateType.SWA_RING, StateType.DSV4_REQUEST_STATE)
+            and len(dst_kv_ptrs) == kv_layout_len
         ):
-            if len(dst_kv_ptrs) == kv_layout_len:
-                sliced_dst = (
-                    list(dst_kv_ptrs[c4_off_s:c4_off_e])
-                    + list(dst_kv_ptrs[c4_full + c4_off_s : c4_full + c4_off_e])
-                    + list(
-                        dst_kv_ptrs[2 * c4_full + c128_off_s : 2 * c4_full + c128_off_e]
-                    )
-                )
-                return src_kv_ptrs, sliced_dst
-            if len(dst_kv_ptrs) == kv_layout_len_fp8:
-                sliced_dst = (
-                    list(dst_kv_ptrs[c4_off_s:c4_off_e])
-                    + list(dst_kv_ptrs[c4_full + c4_off_s : c4_full + c4_off_e])
-                    + list(dst_kv_ptrs[2 * c4_full + c4_off_s : 2 * c4_full + c4_off_e])
-                    + list(
-                        dst_kv_ptrs[3 * c4_full + c128_off_s : 3 * c4_full + c128_off_e]
-                    )
-                    + list(
-                        dst_kv_ptrs[
-                            3 * c4_full + c128_full + c128_off_s : 3 * c4_full
-                            + c128_full
-                            + c128_off_e
-                        ]
-                    )
-                )
-                return src_kv_ptrs, sliced_dst
+            sliced_dst = (
+                list(dst_kv_ptrs[c4_off_s:c4_off_e])
+                + list(dst_kv_ptrs[c4_full + c4_off_s : c4_full + c4_off_e])
+                + list(dst_kv_ptrs[2 * c4_full + c128_off_s : 2 * c4_full + c128_off_e])
+            )
+            return src_kv_ptrs, sliced_dst
 
         # SWA may omit nextn entries present in mla_ratios; use its buffer count.
         # C128 state ships separately as DSV4_REQUEST_STATE.
@@ -1079,9 +1063,9 @@ class CommonKVManager(BaseKVManager):
         if swa_L < 0 or swa_L > len(mla_ratios):
             raise ValueError(
                 f"Unexpected compressed-MLA dst_kv_ptrs length "
-                f"{len(dst_kv_ptrs)}; expected {kv_layout_len} (kv_data), "
-                f"{kv_layout_len_fp8} (kv_data fp8 two-pool), or "
-                f"swa_L + {2 * c4_full} (state_data) given compression_ratios "
+                f"{len(dst_kv_ptrs)}; expected either {kv_layout_len} "
+                f"(kv_data) or swa_L + {2 * c4_full} "
+                f"(state_data) given compression_ratios "
                 f"(c4={c4_full}, c128={c128_full}, "
                 f"total={len(mla_ratios)})."
             )
