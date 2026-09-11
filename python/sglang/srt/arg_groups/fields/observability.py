@@ -62,6 +62,10 @@ class Observability(msgspec.Struct):
         Optional[List[str]],
         "Target(s) for request logging: 'stdout' and/or directory path(s) for file output. Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
     ] = None
+    log_schedule_decisions: A[
+        bool,
+        "Log what each prefill scheduling pass admitted (picked vs left in queue, running count, KV budget and the picked rids). Fires on every prefill pass, so it is off by default.",
+    ] = False
     uvicorn_access_log_exclude_prefixes: A[
         List[str],
         Arg(
