@@ -498,7 +498,7 @@ def _apply_wo_a_bf16_matmul(
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
-        if 2 <= o.shape[0] <= 8:
+        if 2 <= o.shape[0] <= 8 and o.shape[1] == 2:
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
