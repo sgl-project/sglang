@@ -7,6 +7,7 @@ cases worth pinning down are the ones where it must refuse.
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -31,6 +32,9 @@ def _run(hf_home: str, **env_overrides):
     # Default to the inert configuration so each test opts in to what it needs.
     env.setdefault("RECLAIM_DIRS", "")
     env.setdefault("SEED_MODEL", "")
+    # One check instead of twenty minutes of waiting for blocks that, in a
+    # test, are never coming back.
+    env.setdefault("SETTLE_SECONDS", "0")
     env.update({k: str(v) for k, v in env_overrides.items()})
     with tempfile.TemporaryDirectory() as workdir:
         return subprocess.run(
@@ -98,6 +102,24 @@ class ReclaimAndSeedHfCache(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("Refusing to start", result.stderr)
+            self.assertIn("Waiting for the filesystem", result.stdout)
+
+    def test_waits_for_space_rather_than_reading_df_straight_after_rm(self):
+        # The reclaim that motivated the wait unlinked 372 GiB in under half a
+        # second and df had not moved when it was read two milliseconds later.
+        # A shortfall must cost the settle window before it is called one.
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_hub(tmp, "models--amd--GLM-5.2-MXFP4")
+            start = time.monotonic()
+            result = _run(
+                tmp,
+                SEED_MODEL="amd/GLM-5.2-MXFP4",
+                SEED_MIN_GIB=1_000_000_000,
+                SETTLE_SECONDS=16,
+            )
+            waited = time.monotonic() - start
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertGreaterEqual(waited, 15)
 
     def test_fails_when_the_cache_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp:

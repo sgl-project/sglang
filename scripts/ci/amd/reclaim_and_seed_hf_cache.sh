@@ -14,6 +14,9 @@
 #                 job only reclaims.
 #   SEED_MIN_GIB  Expected size of SEED_MODEL. The seed fails below it, so a
 #                 truncated download cannot be mistaken for a complete one.
+#   SETTLE_SECONDS  How long to wait for a reclaim to show up in df, default
+#                 1200. Zero makes the wait a single check, which is what the
+#                 tests want.
 #   HF_HOME       Cache root, default /sgl-data/hf-cache.
 #
 # Why the two halves are one job: freeing space and then queueing the job that
@@ -60,6 +63,33 @@ report_df() {
     echo "=== ${HUB} ($1) ==="
     df -h "$HUB" 2>/dev/null || df -h /sgl-data 2>/dev/null || true
     echo "======================================"
+}
+
+# Space is not free the moment rm returns. Run 34549258956 unlinked 372 GiB in
+# under half a second and df still read 775 MB two milliseconds later: this
+# filesystem drops the directory entries synchronously and releases the blocks
+# in the background. Deciding against that number refuses a download that has
+# room, so wait for the capacity to actually appear.
+wait_for_free_space() {
+    local needed="$1"
+    local deadline=$(( SECONDS + ${SETTLE_SECONDS:-1200} ))
+    local avail last=""
+    while :; do
+        avail="$(avail_gib "$HUB")"
+        if [[ -n "$avail" ]] && (( avail >= needed )); then
+            echo "Free space: ${avail} GiB against ${needed} GiB still to download."
+            return 0
+        fi
+        if [[ "$avail" != "$last" ]]; then
+            echo "Waiting for the filesystem to release the reclaimed blocks:" \
+                 "${avail:-?} GiB free, ${needed} GiB needed."
+            last="$avail"
+        fi
+        if (( SECONDS >= deadline )); then
+            return 1
+        fi
+        sleep 15
+    done
 }
 
 if [[ ! -d "$HUB" ]]; then
@@ -190,11 +220,12 @@ echo "free: ${avail_before:-?} GiB"
 # only a slower way to reach ENOSPC -- and it takes the rest of the volume with
 # it on the way. Stop before spending any of it.
 remaining=$(( SEED_MIN_GIB > ${cached_before:-0} ? SEED_MIN_GIB - ${cached_before:-0} : 0 ))
-if (( remaining > 0 )) && [[ -n "${avail_before}" ]] && (( avail_before < remaining )); then
+if (( remaining > 0 )) && ! wait_for_free_space "$remaining"; then
+    avail_now="$(avail_gib "$HUB")"
     echo "Refusing to start: ${SEED_MODEL} still needs ${remaining} GiB against" >&2
-    echo "only ${avail_before} GiB free. Reclaim more before seeding." >&2
+    echo "only ${avail_now:-?} GiB free. Reclaim more before seeding." >&2
     echo >> "$SUMMARY"
-    echo "Seed refused: needs ${remaining} GiB, ${avail_before} GiB free." >> "$SUMMARY"
+    echo "Seed refused: needs ${remaining} GiB, ${avail_now:-?} GiB free." >> "$SUMMARY"
     exit 1
 fi
 
