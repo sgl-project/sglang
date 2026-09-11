@@ -66,7 +66,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             if prefill_backend == "fa4":
                 if uses_mla:  # FA4 + MLA
                     KV4_FA4_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -87,7 +86,6 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             else:
                 if uses_mla:  # !FA4 + MLA
                     KV4_ATTENTION_MLA_BACKEND_CHOICES = [
-                        "cutlass_mla",
                         "flashinfer",
                         "trtllm_mla",
                     ]
@@ -249,6 +247,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "not translate speculative verify indices to the unified "
             "pool's kernel-facing space yet."
         )
+    assert not cfg.enable_two_batch_overlap, (
+        "--enable-unified-memory does not support --enable-two-batch-overlap: "
+        "TBO's replay split hands each child a view without the pre-translate "
+        "write loc, so a captured decode replay raises. "
+        "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
+    )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
@@ -365,7 +369,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # Allow-list. Every backend below reads through the translator, so what
     # gates one is only whether its kernels can address the per-layer views:
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
-    #     snap). cutlass_mla stays rejected (never exercised).
+    #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
     #   * Without the unified pool, plain page-major stays Triton-only.
