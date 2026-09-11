@@ -914,7 +914,7 @@ def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
                 patch(
                     "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
                     return_value=(
-                        torch.ones((4, 3), dtype=torch.float32),
+                        [torch.ones((4, 3), dtype=torch.float32)],
                         torch.tensor([[1, 2, 2]], dtype=torch.int64),
                     ),
                 ),
@@ -977,7 +977,7 @@ def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
         get_parallel().override(tp_size=1),
         patch(
             "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
-            return_value=(torch.full((1, 3), 2.0), torch.tensor([[1, 1, 1]])),
+            return_value=([torch.full((1, 3), 2.0)], torch.tensor([[1, 1, 1]])),
         ),
     ):
         output = model.get_image_feature([eager, deferred])
