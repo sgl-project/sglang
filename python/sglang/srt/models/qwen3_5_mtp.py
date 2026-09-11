@@ -68,16 +68,24 @@ def _mtp_quant_config(quant_config):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
         return None
-    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
-    # every `mtp.*` layer appears under the quantization exclude list. Detect
-    # that and skip quantization here so linear/MoE weight loaders allocate
-    # bf16 shapes (see sgl-project/sglang#23113).
+    # Some Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module
+    # entirely in bf16, listing every `mtp.*` layer under the quantization
+    # exclude list. Skip quantization for those so linear/MoE weight loaders
+    # allocate bf16 shapes (see sgl-project/sglang#23146).
+    #
+    # Others are mixed: the routed experts stay MXFP4 while attention, the
+    # shared expert and fc are excluded. Skipping there would make the MoE
+    # loader allocate bf16 experts that the MXFP4 checkpoint shards no longer
+    # fit. The routed experts are the bulk of the draft, so use them as the
+    # signal and skip only when they are excluded too; the per-layer
+    # exclusions keep the remaining bf16 modules bf16 on their own.
     if quant_config and quant_config.get_name() == "quark":
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            isinstance(layer, str) and layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
+        mtp_excludes = [
+            layer
+            for layer in getattr(quant_config, "exclude_layers", [])
+            if isinstance(layer, str) and layer.startswith("mtp.")
+        ]
+        if mtp_excludes and any("mlp.experts" in layer for layer in mtp_excludes):
             return None
     return quant_config
 
