@@ -11,7 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_hip, is_xpu
 
 from .utils import make_name
 
@@ -136,6 +136,8 @@ def topk_transform_paged_v2(
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
+    row_starts: Optional[torch.Tensor] = None,
+    row_to_batch: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -148,6 +150,21 @@ def topk_transform_paged_v2(
     * ``page_tables`` given -- ``out_page_indices`` receives the page-table
       transform of them.
 
+    ``row_starts`` and ``row_to_batch`` are both ``(rows,)`` int32 and both
+    optional; omitting them gives the decode layout this kernel was written for
+    (row ``i`` selects over ``scores[i, :seq_lens[i]]`` and maps through
+    ``page_tables[i]``). Supplying them describes DSA extend's packed scores:
+    row ``i`` selects over ``scores[i, row_starts[i] : row_starts[i] +
+    seq_lens[i]]`` and maps through ``page_tables[row_to_batch[i]]``. Selected
+    indices stay row-local either way, so the output meaning is unchanged.
+    ``row_to_batch`` entries are not range-checked against ``page_tables``.
+
+    Passing ``row_starts`` makes this call MODIFY ``scores`` IN PLACE. The
+    kernel rounds each row's read window down to a 16-byte boundary and masks
+    the columns it pulls in that way (at most three, and always inside the same
+    row, before ``row_starts[i]``) to ``-inf``. Callers must therefore not reuse
+    ``scores`` afterwards, and must not pass a view whose rows overlap.
+
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
     values. The kernel reads lengths as ``uint32_t``: a negative entry
@@ -157,6 +174,15 @@ def topk_transform_paged_v2(
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
     """
+    if row_starts is not None or row_to_batch is not None:
+        # Packed rows are compiled into the paged kernel only under USE_ROCM
+        # (CUDA reaches the same shape through topk_transform_ragged_v2, XPU
+        # has no such op at all), and every caller of them is ROCm-gated, so
+        # this is an invariant rather than a fallback.
+        assert is_hip(), (
+            "topk_transform_paged_v2 packed rows (row_starts / row_to_batch) "
+            "are only supported on ROCm"
+        )
     if is_xpu():
         torch.ops.sgl_kernel.topk_transform_paged(
             scores,
@@ -175,4 +201,6 @@ def topk_transform_paged_v2(
         out_page_indices,
         page_size,
         metadata,
+        row_starts,
+        row_to_batch,
     )
