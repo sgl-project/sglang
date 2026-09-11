@@ -6,6 +6,7 @@ Two model types, two scoring modes:
   TestSeqClsScoring          — SequenceClassification, single-item mode
   TestSeqClsMISScoring       — SequenceClassification, MIS mode (--enable-mis)
   TestSeqClsMISAdvancedScoring — SeqCls MIS with 12 labels (tensor shape stress)
+  TestSingleItemScoreShape   — unit: scalar/vector embedding row coercion
 
 The Engine (Python API) is the right layer for correctness testing: it
 exercises tokenization, forward pass, pooling, and score extraction without
@@ -23,6 +24,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.managers.tokenizer_manager_score_mixin import (
+    TokenizerManagerScoreMixin,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
@@ -485,6 +489,53 @@ class TestSeqClsMISAdvancedScoring(CustomTestCase):
         for row in scores:
             self.assertEqual(len(row), self.NUM_LABELS)
             self.assertAlmostEqual(sum(row), 1.0, places=5)
+
+
+# ---------------------------------------------------------------------------
+# Unit: single-item result shape (no Engine required)
+# ---------------------------------------------------------------------------
+
+
+class TestSingleItemScoreShape(CustomTestCase):
+    """Unit tests for _process_single_item_scoring_results row handling.
+
+    Single-label cross-encoder heads (BERT / XLM-RoBERTa rerankers such as
+    BAAI/bge-reranker-v2-m3) emit a scalar per item: CrossEncodingPooler
+    squeezes the [num_labels] classification logits with squeeze(-1).
+    ScoreResult.scores declares one row per item, so scalars must be
+    wrapped into a row before being appended.
+    """
+
+    class _Manager(TokenizerManagerScoreMixin):
+        is_generation = False
+
+    def _run(self, results, apply_softmax=False):
+        return self._Manager()._process_single_item_scoring_results(
+            results, label_token_ids=None, apply_softmax=apply_softmax
+        )
+
+    def test_scalar_embedding_becomes_single_element_row(self):
+        results = [
+            {"embedding": 5.875, "meta_info": {"prompt_tokens": 10}},
+            {"embedding": -10.109375, "meta_info": {"prompt_tokens": 17}},
+        ]
+        out = self._run(results)
+        self.assertEqual(out.scores, [[5.875], [-10.109375]])
+        self.assertEqual(out.prompt_tokens, 27)
+
+    def test_vector_embedding_keeps_row_shape(self):
+        results = [
+            {"embedding": [0.25, 0.75], "meta_info": {"prompt_tokens": 5}},
+        ]
+        out = self._run(results)
+        self.assertEqual(out.scores, [[0.25, 0.75]])
+
+    def test_scalar_with_softmax_stays_well_defined(self):
+        # A single-label softmax is degenerate (always 1.0), but it must not
+        # crash on a 0-d tensor and must still yield one row per item.
+        results = [{"embedding": 5.875, "meta_info": {"prompt_tokens": 3}}]
+        out = self._run(results, apply_softmax=True)
+        self.assertEqual(out.scores, [[1.0]])
 
 
 if __name__ == "__main__":
