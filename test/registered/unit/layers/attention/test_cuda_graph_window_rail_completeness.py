@@ -11,7 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Every cuda-graph forward mode must fill the sliding-window READ rail.
+"""The multi-step draft's sliding-window rails on the Triton backend.
+
+Every cuda-graph forward mode must fill the sliding-window READ rail, and each
+draft step must write its window layers through its OWN columns of the
+iteration's write window.
 
 BUG REGRESSION. `_build_cuda_graph_forward_metadata` builds one
 `ForwardMetadata` per captured forward mode. The draft-extend branch passed
@@ -33,7 +37,12 @@ mode branch that forgets the rail fails here rather than on a GPU.
 import ast
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+import torch
+
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind, KVLocPlan
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -89,6 +98,78 @@ class TestCudaGraphWindowRailCompleteness(CustomTestCase):
             "layer in that mode reaches the Triton kernel with a null index "
             "tensor. Pass the cuda-graph buffer, guarded on the sliding-window flag.",
         )
+
+
+class _Reader:
+    """A reader whose sliding-window ids are the virtual ids times ten."""
+
+    def __init__(self):
+        self._spaces = {
+            IdSpaceKind.FULL: IdSpace(key="full"),
+            IdSpaceKind.SLIDING_WINDOW: IdSpace(key="swa", write=lambda ids: ids * 10),
+        }
+
+    def space(self, kind):
+        return self._spaces.get(kind)
+
+
+class TestDraftStepWriteColumns(CustomTestCase):
+    """BUG REGRESSION. A draft step's per-step backend took its swa write ids
+    from the whole draft window, and the write then kept their first
+    ``bs * topk``: step 0's slots for request 0, step 1's for request 0, and so
+    on, since the window lays each row out step-minor. Each step must bind its
+    own columns while its backend derives the ids."""
+
+    def _check(self, *, bs, topk, num_steps, window_cols):
+        from sglang.srt.layers.attention.triton_backend import (
+            TritonMultiStepDraftBackend,
+        )
+
+        reader = _Reader()
+        plan = KVLocPlan(
+            source=reader,
+            req_pool_indices=torch.arange(bs),
+            seq_lens=torch.ones(bs, dtype=torch.int64),
+            seq_lens_cpu=None,
+            write_virtual=torch.arange(1, bs * topk * window_cols + 1),
+            read_extent=0,
+        )
+        # A chain draft (topk 1) inside a wider verify window writes its
+        # leading columns; otherwise the draft owns the whole window.
+        cols = None if window_cols == num_steps else slice(0, num_steps)
+        batch = SimpleNamespace(
+            batch_size=bs,
+            kv_loc_plan=plan,
+            kv_loc_cols=cols,
+            out_cache_loc=plan.write_ids(reader, cols=cols),
+        )
+        backend = object.__new__(TritonMultiStepDraftBackend)
+        backend.topk = topk
+        backend.speculative_num_steps = num_steps
+        backend.attn_backends = [
+            SimpleNamespace(use_sliding_window_kv_pool=True)
+        ] * num_steps
+        swa = plan.write_ids(reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=cols)
+        per_step = per_step_draft_out_cache_loc(swa, bs, topk, num_steps)
+        for step in range(num_steps):
+            with backend._step_writes(batch, step):
+                ids = plan.write_ids(
+                    reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=batch.kv_loc_cols
+                )
+                torch.testing.assert_close(ids, per_step[step], rtol=0, atol=0)
+                torch.testing.assert_close(
+                    batch.out_cache_loc * 10, ids, rtol=0, atol=0
+                )
+            self.assertIs(batch.kv_loc_cols, cols)
+        # The whole window's leading ids are not step 1's slots.
+        self.assertFalse(torch.equal(swa[: bs * topk], per_step[1]))
+
+    def test_the_draft_window(self):
+        self._check(bs=3, topk=1, num_steps=3, window_cols=3)
+        self._check(bs=2, topk=2, num_steps=3, window_cols=3)
+
+    def test_a_chain_draft_inside_the_verify_window(self):
+        self._check(bs=3, topk=1, num_steps=3, window_cols=5)
 
 
 if __name__ == "__main__":
