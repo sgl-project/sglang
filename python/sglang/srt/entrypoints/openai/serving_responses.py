@@ -285,6 +285,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "https://dashboard.exa.ai/api-keys."
             )
 
+        # Extract routed_dp_rank from header (has higher priority than body)
+        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+            raw_request, request.routed_dp_rank
+        )
+
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
         if prev_response_id is not None:
@@ -467,6 +472,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
+                        routed_dp_rank=effective_routed_dp_rank,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -2591,6 +2597,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
+                # Every turn of a tool loop must stay on the rank that holds
+                # the conversation's KV cache.
+                routed_dp_rank=adapted_request.routed_dp_rank,
             )
 
             # Update sampling params with reduced max_tokens

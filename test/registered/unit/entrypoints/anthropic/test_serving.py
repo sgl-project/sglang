@@ -438,6 +438,24 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual(messages[2]["content"], "Ready")
 
+    def test_routed_dp_rank_reaches_chat_request(self):
+        """A body pin dropped in the Anthropic->chat conversion is a 200 that
+        round-robins; the rank has to survive onto the ChatCompletionRequest."""
+        request = self._anthropic_request(routed_dp_rank=2)
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        self.assertEqual(chat_request.routed_dp_rank, 2)
+
+    def test_deprecated_data_parallel_rank_migrates(self):
+        request = self._anthropic_request(data_parallel_rank=1)
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        self.assertEqual(chat_request.routed_dp_rank, 1)
+
+    def test_unpinned_request_has_no_rank(self):
+        chat_request = self._serving()._convert_to_chat_completion_request(
+            self._anthropic_request()
+        )
+        self.assertIsNone(chat_request.routed_dp_rank)
+
     def test_mixed_tool_reference_content_renders_text_and_schema(self):
         template = Environment().from_string(self.GLM_TOOL_RESULT_TEMPLATE)
         request = self._tool_result_request(
