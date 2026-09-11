@@ -41,7 +41,17 @@ if TYPE_CHECKING:
 _NUM_COMPONENT_TYPES = len(ComponentType)
 
 _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
-_COMPONENT_UUID_COUNTER = 1
+_COMPONENT_UUID_RANGE_SIZE = 100_000_000_000_000
+_COMPONENT_UUID_RANGE_INDEX = {
+    ComponentType.SWA: 0,
+    ComponentType.FULL: 1,
+    ComponentType.MAMBA: 2,
+    ComponentType.C128: 3,
+}
+_COMPONENT_UUID_COUNTERS = {
+    component_type: (range_index + 1) * _COMPONENT_UUID_RANGE_SIZE
+    for component_type, range_index in _COMPONENT_UUID_RANGE_INDEX.items()
+}
 
 
 @dataclasses.dataclass
@@ -113,10 +123,9 @@ def get_and_increase_time_counter() -> float64:
     return ret
 
 
-def next_component_uuid() -> int:
-    global _COMPONENT_UUID_COUNTER
-    _COMPONENT_UUID_COUNTER += 1
-    return _COMPONENT_UUID_COUNTER
+def next_component_uuid(component_type: ComponentType) -> int:
+    _COMPONENT_UUID_COUNTERS[component_type] += 1
+    return _COMPONENT_UUID_COUNTERS[component_type]
 
 
 class TreeComponent(ABC):
@@ -575,7 +584,7 @@ class TreeComponent(ABC):
           node itself (mamba state is per-leaf, not per-path).
 
         When ``lock_host`` is True, the lock applies to host-side state:
-        - Full: single-node host lock.
+        - Full: a one-node UUID-bounded segment that expands across splits.
         - SWA: host window-lock with a dedicated host UUID boundary.
         - Mamba: single-node host lock with host LRU detach."""
         ...
@@ -596,7 +605,8 @@ class TreeComponent(ABC):
         - Mamba: single-node unlock — only decrements lock_ref on the
           node itself.
 
-        When ``lock_host`` is True, the inverse host-side semantics apply."""
+        When ``lock_host`` is True, Full and SWA replay their host boundary
+        UUIDs while Mamba retains its single-node semantics."""
         ...
 
     def prepare_for_caching_req(

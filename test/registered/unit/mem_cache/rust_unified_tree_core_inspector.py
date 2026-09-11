@@ -76,6 +76,13 @@ class RustUnifiedTreeCoreInspector(
             node_id, int(component_type)
         )
 
+    def get_component_host_lock_ref(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> int:
+        return self._binding.inspect_get_component_host_lock_ref(
+            node_id, int(component_type)
+        )
+
     def get_node_hit_count(self, node_id: NodeId) -> int:
         return self._binding.inspect_get_node_hit_count(node_id)
 

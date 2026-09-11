@@ -424,6 +424,10 @@ def _device_lock_ref(cache, node_id, component_type):
     return cache.tree_core.get_component_device_lock_ref(node_id, component_type)
 
 
+def _host_lock_ref(cache, node_id, component_type):
+    return cache.tree_core.get_component_host_lock_ref(node_id, component_type)
+
+
 def _aux_storage_key_transfers(cache, node_id):
     transfers = []
     if ComponentType.SWA in cache.tree_components:
@@ -5071,6 +5075,100 @@ class UnifiedRadixCacheSuite:
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", child_seq))))
         self.assertEqual(len(m.device_indices), 0)
         self.assertEqual(m.host_hit_length, 0)
+        cache.sanity_check()
+
+    def test_hicache_split_preserves_inflight_full_host_pin(self):
+        """A split prefix keeps an outstanding storage backup's host ownership."""
+        if self.cfg != CacheConfig():
+            self.skipTest("single Full page-size-1 ownership regression")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        host_pool = cache.cache_controller.mem_pool_host
+        baseline_host = host_pool.available_size()
+
+        seq = [1, 2, 3, 4]
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self._backup_node(cache, leaf)
+
+        lock_params = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self.assertIsNotNone(lock_params.full_uuid_for_host_lock)
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 9, 10])
+        split_parent = _node_parent(cache, leaf)
+        split_host = _host_value(cache, split_parent, ComponentType.FULL)
+        self.assertEqual(_host_lock_ref(cache, split_parent, ComponentType.FULL), 1)
+        self.assertEqual(_host_lock_ref(cache, leaf, ComponentType.FULL), 1)
+
+        # Before the fix the prefix had host_lock_ref == 0 and these slots were
+        # reclaimed while the storage thread could still be reading them.
+        self.assertEqual(cache.evict_host(len(split_host)), 0)
+
+        # A lock acquired after the split covers only the suffix and gets a new
+        # boundary there. Releasing it must not consume the older segment lock
+        # that was propagated to the prefix.
+        suffix_lock_params = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self.assertEqual(_host_lock_ref(cache, split_parent, ComponentType.FULL), 1)
+        self.assertEqual(_host_lock_ref(cache, leaf, ComponentType.FULL), 2)
+        self.assertNotEqual(
+            suffix_lock_params.full_uuid_for_host_lock,
+            lock_params.full_uuid_for_host_lock,
+        )
+        cache.dec_host_lock_ref(leaf, suffix_lock_params)
+        self.assertEqual(_host_lock_ref(cache, split_parent, ComponentType.FULL), 1)
+        self.assertEqual(_host_lock_ref(cache, leaf, ComponentType.FULL), 1)
+        self.assertEqual(cache.evict_host(len(split_host)), 0)
+
+        cache.dec_host_lock_ref(leaf, lock_params)
+        self.assertEqual(_host_lock_ref(cache, split_parent, ComponentType.FULL), 0)
+        self.assertEqual(_host_lock_ref(cache, leaf, ComponentType.FULL), 0)
+        self.assertEqual(cache.evict_host(len(seq)), len(seq))
+        self.assertEqual(host_pool.available_size(), baseline_host)
+        cache.sanity_check()
+
+    def test_hicache_split_preserves_inflight_swa_host_pin(self):
+        """A split SWA host segment stays pinned and releases without leaks."""
+        expected_cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        if self.cfg != expected_cfg:
+            self.skipTest("single page-size-1 Full+SWA host-lock regression")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        swa_host_pool = cache.swa_kv_pool_host
+
+        seq = [1, 2, 3, 4, 5, 6, 7, 8]
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        parent_before_split = _node_parent(cache, leaf)
+        self._backup_node(cache, leaf)
+        available_after_backup = swa_host_pool.available_size()
+
+        lock_params = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self.assertIsNotNone(lock_params.full_uuid_for_host_lock)
+        self.assertIsNotNone(lock_params.swa_uuid_for_host_lock)
+
+        # Diverge inside the locked SWA window. The leaf handle stays on the
+        # suffix while the lock boundary and copied host refs move to the new
+        # prefix, so neither half may be reclaimed by component host eviction.
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6, 9, 10])
+        split_parent = _node_parent(cache, leaf)
+        self.assertNotEqual(split_parent, parent_before_split)
+        self.assertEqual(_node_parent(cache, split_parent), parent_before_split)
+        self.assertEqual(_host_lock_ref(cache, split_parent, ComponentType.SWA), 1)
+        self.assertEqual(_host_lock_ref(cache, leaf, ComponentType.SWA), 1)
+
+        cache.dec_host_lock_ref(leaf, lock_params)
+        self.assertEqual(_host_lock_ref(cache, split_parent, ComponentType.SWA), 0)
+        self.assertEqual(_host_lock_ref(cache, leaf, ComponentType.SWA), 0)
+        self.assertEqual(swa_host_pool.available_size(), available_after_backup)
         cache.sanity_check()
 
     def _skip_unsupported_hicache_test(self):
@@ -9744,6 +9842,15 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
             cur = _node_parent(cache, cur)
         return nodes
 
+    @staticmethod
+    def _full_path(cache, leaf_id):
+        """Non-root node ids protected by a Full device lock."""
+        nodes, cur = [], leaf_id
+        while not cache.tree_core.is_root(cur):
+            nodes.append(cur)
+            cur = _node_parent(cache, cur)
+        return nodes
+
     def _match_leaf(self, cache, seq):
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         return m.last_device_node
@@ -9914,9 +10021,9 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         cache.sanity_check()
 
     def test_split_under_lock_releases_balanced(self):
-        """A mid-segment split mints a new node with copied refs and migrates
-        the boundary uuid; the original receipt (its anchor stays on the
-        deeper half) still releases exactly."""
+        """A mid-segment split copies Full and SWA device refs and migrates the
+        SWA boundary uuid; the original receipt (whose anchor stays on the
+        deeper half) releases every copied ref without leaking either lock."""
         sw = self.cfg.sliding_window_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2 * sw)
@@ -9924,18 +10031,25 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         leaf = self._match_leaf(cache, seq)
         lock = cache.inc_lock_ref(leaf)
         pre_segment = self._segment(cache, leaf, sw)
+        pre_full_path = self._full_path(cache, leaf)
 
         # Diverge inside the window to force a split of a locked node.
         fork = seq[: len(seq) - sw // 2] + self._make_seq(9000, sw)
         self._insert(cache, allocator, req_to_token_pool, fork)
         post_segment = self._segment(cache, leaf, sw)
+        post_full_path = self._full_path(cache, leaf)
         self.assertGreater(len(post_segment), len(pre_segment))
+        self.assertGreater(len(post_full_path), len(pre_full_path))
         for n in post_segment:
             self.assertEqual(self._swa_ref(cache, n), 1)
+        for n in post_full_path:
+            self.assertEqual(_device_lock_ref(cache, n, ComponentType.FULL), 1)
 
         cache.dec_lock_ref(leaf, lock.to_dec_params())
         for n in post_segment:
             self.assertEqual(self._swa_ref(cache, n), 0)
+        for n in post_full_path:
+            self.assertEqual(_device_lock_ref(cache, n, ComponentType.FULL), 0)
         cache.sanity_check()
 
     def test_aux_release_readmits_the_leaf_whatever_the_release_order(self):
