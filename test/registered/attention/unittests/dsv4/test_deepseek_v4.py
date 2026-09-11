@@ -700,7 +700,173 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     (2, expected_extent),
                 )
 
+class TestDSV41SM90CandidateSlots(CustomTestCase):
+    def test_ragged_verify_metadata_preserves_low_ratio_row_mapping(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as module
 
+        backend = object.__new__(module.DeepseekV4AttnBackend)
+        backend.speculative_num_draft_tokens = 6
+        backend.needs_cpu_seq_lens = False
+        backend.has_c4 = False
+        backend.has_c128 = False
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 384
+        backend.req_to_token = torch.empty((3, 384), dtype=torch.int32)
+        backend.token_to_kv_pool = SimpleNamespace()
+
+        repeated = torch.tensor([2, 2, 0, 0, 0, 1], dtype=torch.int64)
+        positions = torch.tensor([260, 261, 6, 7, 8, 129], dtype=torch.int32)
+        core = SimpleNamespace(low_ratios=(), positions_casual=positions)
+        backend._expand_prefill_casually_vectorized = mock.Mock(
+            return_value=(positions + 1, repeated)
+        )
+        backend.make_core_attn_metadata = mock.Mock(return_value=core)
+
+        raw = module.DSV4RawVerifyMetadata(
+            req_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([260, 6, 129], dtype=torch.int32),
+            out_cache_loc=torch.arange(6, dtype=torch.int64),
+            extend_seq_lens=torch.tensor([2, 3, 1], dtype=torch.int32),
+            extend_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+            verify_lens=torch.tensor([2, 3, 1], dtype=torch.int32),
+            total_verify_tokens=6,
+        )
+
+        metadata = backend.make_forward_metadata_from_raw_verify(raw)
+
+        torch.testing.assert_close(metadata.low_ratio_req_indices, repeated)
+        torch.testing.assert_close(
+            metadata.low_ratio_pos_i64, positions.to(torch.int64)
+        )
+
+    def _run_candidate_case(self, forward_mode, req, length_steps):
+        from sglang.srt.layers.attention import deepseek_v4_backend as module
+
+        width, ratio, topk = 384, 2, 3
+        pages = torch.tensor([[7, 5, 1], [6, 4, 2], [9, 8, 3]])
+        tokens = torch.arange(width * ratio)
+        mapping = pages[:, tokens // 256] * 256 + tokens % 256
+        page_indices = torch.full((len(req), topk), -1, dtype=torch.int32)
+        raw_indices = torch.full_like(page_indices, -1)
+        core = SimpleNamespace(
+            sparse_page_indices=lambda _: page_indices,
+            sparse_raw_indices=lambda _: raw_indices,
+        )
+        backend = object.__new__(module.DeepseekV4AttnBackend)
+        backend.forward_metadata = module.DSV4Metadata(
+            core_attn_metadata=core,
+            indexer_metadata=None,
+            c2_indexer_metadata=SimpleNamespace(max_compressed_seq_len=width),
+        )
+        backend.req_to_token = mapping
+        backend.candidate_masks = None
+        table = torch.zeros((1, 64 * 68), dtype=torch.uint8)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_index_k_with_scale_buffer=lambda _: table
+        )
+        indexer = SimpleNamespace(
+            queries=lambda q, _: q,
+            head_weights=lambda x: x,
+            candidate_topk_blocks=2,
+            candidate_block_size=4,
+            index_topk=topk,
+        )
+        layer = SimpleNamespace(
+            indexer=indexer,
+            freqs_cis=torch.zeros(width * ratio, 1),
+            compress_ratio=ratio,
+            layer_id=20,
+        )
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+        columns = torch.arange(width)
+
+        def score(q, weights, slots, lens, table, page_size):
+            # Distinct physical slots receive distinct scores for each query.
+            return (slots.float() * q).masked_fill(
+                torch.arange(slots.shape[1]) >= lens[:, None], -torch.inf
+            )
+
+        for lengths in length_steps:
+            lens = torch.tensor(lengths)
+            pos = (lens * ratio - 1).clamp_min(0)
+            mapping.copy_(mapping.roll(1, dims=0))
+            full_slots = mapping[req[:, None], columns * ratio] // ratio
+            source_scores = score(
+                torch.ones(len(req), 1), None, full_slots, lens, table, 64
+            )
+            candidates = module.select_candidate_blocks(
+                source_scores, lens[:, None], 2, 4
+            )
+            with mock.patch.object(
+                module, "fp4_index_logits_decode", side_effect=score
+            ) as logits:
+                for i in range(5):
+                    indexer.is_candidate_source = i == 0
+                    indexer.uses_candidates = i > 0
+                    layer.layer_id = 20 + i * 4
+                    q = torch.full((len(req), 1), (-1) ** i * (i + 1))
+                    backend._low_ratio_index_topk_sm90(
+                        layer, q, q, req, pos, forward_batch
+                    )
+                    expected_scores = score(q, None, full_slots, lens, table, 64)
+                    if i:
+                        expected_scores.masked_fill_(~candidates, -torch.inf)
+                    values, chosen = expected_scores.topk(topk, dim=1)
+                    chosen = (
+                        chosen.masked_fill(values == -torch.inf, width).sort(1).values
+                    )
+                    valid = chosen < width
+                    expected_pages = full_slots.gather(
+                        1, chosen.clamp_max(width - 1)
+                    ).masked_fill(~valid, -1)
+                    torch.testing.assert_close(
+                        page_indices, expected_pages.to(torch.int32)
+                    )
+                    torch.testing.assert_close(
+                        raw_indices, chosen.masked_fill(~valid, -1).to(torch.int32)
+                    )
+                    if i == 0:
+                        published = backend.forward_metadata.sm90_candidates
+                    else:
+                        self.assertIs(
+                            backend.forward_metadata.sm90_candidates, published
+                        )
+                        positions, slots, counts = published
+                        self.assertIs(logits.call_args.args[2], slots)
+                        torch.testing.assert_close(
+                            positions < lens[:, None],
+                            torch.arange(slots.shape[1]) < counts[:, None],
+                        )
+                        torch.testing.assert_close(
+                            slots,
+                            full_slots.gather(
+                                1, positions.clamp_max(width - 1)
+                            ).masked_fill(positions >= lens[:, None], 0),
+                        )
+                self.assertEqual(
+                    [call.args[2].shape[1] for call in logits.call_args_list],
+                    [width, 8, 8, 8, 8],
+                )
+
+    def test_decode_candidates_preserve_slots_across_layers_and_steps(self):
+        self._run_candidate_case(
+            ForwardMode.DECODE,
+            torch.tensor([2, 0, 1]),
+            ([261, 7, 0], [130, 260, 3]),
+        )
+
+    def test_static_verify_candidates_preserve_per_token_rows(self):
+        self._run_candidate_case(
+            ForwardMode.TARGET_VERIFY,
+            torch.tensor([2, 2, 0, 0, 1, 1]),
+            ([261, 262, 7, 8, 130, 131], [132, 133, 260, 261, 3, 4]),
+        )
+
+    def test_ragged_verify_candidates_preserve_per_token_rows(self):
+        self._run_candidate_case(
+            ForwardMode.TARGET_VERIFY,
+            torch.tensor([2, 2, 0, 0, 0, 1]),
+            ([261, 262, 7, 8, 9, 130], [132, 133, 260, 261, 262, 3]),
+        )
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """SWA writes must translate live locations for idle or missing/mismatched caches.
     A matching cache on an active forward must be reused.
