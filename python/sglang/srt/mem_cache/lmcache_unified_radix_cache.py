@@ -1136,12 +1136,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         it and may have mutated it.
         """
         flow = self._external_flows.get(req.rid)
-        # Always restore the real tree-owned boundary first. For Full/SWA-only
-        # flows, the regular UnifiedRadixCache callback below will adopt the
-        # loaded suffix; Mamba flows publish their exact checkpoint here.
-        self._prepare_external_slots_for_insert(req)
-        if flow is None or flow.load is None or flow.total_hit is None:
+        if (
+            flow is None
+            or flow.load is None
+            or flow.total_hit is None
+            or flow.prefix_published
+        ):
             return
+        # Restore the real tree-owned boundary exactly once. A flow may survive
+        # across multiple cache callbacks while its H2D completion is pending;
+        # lowering the boundary again would make the parent free tree-owned slots.
+        self._prepare_external_slots_for_insert(req)
         if flow.mamba_value is None:
             # The regular UnifiedRadixCache callback immediately below adopts
             # the Full/SWA slots. Its internal rematch must not classify those
