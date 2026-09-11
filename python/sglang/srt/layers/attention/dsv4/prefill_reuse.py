@@ -38,26 +38,20 @@ logger = logging.getLogger(__name__)
 
 # DeepSeek-V4-Flash has C4 indexers on the even layers 2..42; these are the ten deepest.
 _DEEP10_LAYERS = (24, 26, 28, 30, 32, 34, 36, 38, 40, 42)
-# Wider than any prefill chunk, so the whole chunk shares its first row's selection.
-_WHOLE_CHUNK = 999_999
 
 
 class ReusePreset(msgspec.Struct, frozen=True, kw_only=True):
     window: int
-    deep_window: int = 0
+    # These layers share one selection per chunk instead of using `window`.
     deep_layers: tuple[int, ...] = ()
 
-    def window_for(self, layer_id: int) -> int:
-        if self.deep_window and layer_id in self.deep_layers:
-            return self.deep_window
-        return self.window
+    def window_for(self, *, layer_id: int, query_rows: int) -> int:
+        return query_rows if layer_id in self.deep_layers else self.window
 
 
 PRESETS: dict[str, ReusePreset] = {
     "uniform-w4": ReusePreset(window=4),
-    "deep10-inf-w4": ReusePreset(
-        window=4, deep_window=_WHOLE_CHUNK, deep_layers=_DEEP10_LAYERS
-    ),
+    "deep10-inf-w4": ReusePreset(window=4, deep_layers=_DEEP10_LAYERS),
 }
 
 
@@ -116,7 +110,7 @@ def maybe_apply_reuse(
     if topk_backend.is_torch() or topk_backend.is_flashinfer():
         return False
     query_rows = q_indexer.shape[0]
-    window = preset.window_for(c4_indexer.layer_id)
+    window = preset.window_for(layer_id=c4_indexer.layer_id, query_rows=query_rows)
     num_leaders = -(-query_rows // window)
     if num_leaders >= query_rows:
         return False
@@ -170,6 +164,8 @@ def maybe_apply_reuse(
             leader_raw,
         )
 
+    # Followers longer than their leader read its -1 padding as part of their top-K;
+    # flash_mla_sparse_fwd skips -1, and compressed_base is 0 on this single-request path.
     c4_sparse_page_indices.copy_(leader_pages.index_select(0, row_to_leader))
     # Raw indices are sequence positions, not row-relative, so they broadcast as-is.
     if leader_raw is not None:
