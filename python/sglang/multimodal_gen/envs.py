@@ -394,9 +394,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VAE/ViT encode call (halve-on-OOM backoff on OOM). Opt-in, off by
     # default; the AR backbone resident on the same device makes full-batch
     # encoding tight on memory, so it must be explicitly enabled.
-    "SGLANG_HI3_COND_ENCODE_BATCHING": _lazy_bool(
-        "SGLANG_HI3_COND_ENCODE_BATCHING"
-    ),
+    "SGLANG_HI3_COND_ENCODE_BATCHING": _lazy_bool("SGLANG_HI3_COND_ENCODE_BATCHING"),
     # HunyuanImage-3: post-decode output geometry (native crop/pad plus
     # exact-size resample). On by default; 0 returns the raw native bucket.
     "SGLANG_HI3_OUTPUT_CROP": _lazy_bool("SGLANG_HI3_OUTPUT_CROP", "true"),

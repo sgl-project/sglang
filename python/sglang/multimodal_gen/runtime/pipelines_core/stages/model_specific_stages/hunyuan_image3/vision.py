@@ -130,7 +130,9 @@ class Siglip2Attention(nn.Module):
             vi = vi.transpose(0, 1)
 
             out_i = F.scaled_dot_product_attention(
-                qi.unsqueeze(0), ki.unsqueeze(0), vi.unsqueeze(0),
+                qi.unsqueeze(0),
+                ki.unsqueeze(0),
+                vi.unsqueeze(0),
                 is_causal=False,
             ).squeeze(0)
 
@@ -178,10 +180,9 @@ class Siglip2EncoderLayer(nn.Module):
 class Siglip2Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.layers = nn.ModuleList([
-            Siglip2EncoderLayer(config)
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [Siglip2EncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
 
     def forward(self, hidden_states, cu_seqlens):
         for layer in self.layers:
@@ -234,8 +235,11 @@ class Siglip2VisionTransformer(nn.Module):
         hidden_states = self.post_layernorm(hidden_states)
 
         output = torch.zeros(
-            batch_size, max_patches, self.embed_dim,
-            dtype=hidden_states.dtype, device=hidden_states.device,
+            batch_size,
+            max_patches,
+            self.embed_dim,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
         output[mask_bool] = hidden_states
 

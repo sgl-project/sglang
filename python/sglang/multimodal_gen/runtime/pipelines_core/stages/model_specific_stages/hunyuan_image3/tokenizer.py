@@ -10,8 +10,7 @@ import random
 import warnings
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -97,8 +96,12 @@ class JointImageInfo:
     ``joint_image`` section.
     """
 
-    def __init__(self, vae_image_info: ImageInfo, vision_image_info: ImageInfo,
-                 vision_encoder_kwargs: dict = None):
+    def __init__(
+        self,
+        vae_image_info: ImageInfo,
+        vision_image_info: ImageInfo,
+        vision_encoder_kwargs: dict = None,
+    ):
         self.vae_image_info = vae_image_info
         self.vision_image_info = vision_image_info
         self.vision_encoder_kwargs = vision_encoder_kwargs or {}
@@ -194,10 +197,14 @@ class HunyuanImage3TokenizerWrapper:
         self.img_token_id = self.tokenizer.convert_tokens_to_ids("<img>")
         self.cfg_token_id = self.tokenizer.convert_tokens_to_ids("<cfg>")
         self.end_answer_token_id = self.tokenizer.convert_tokens_to_ids("</answer>")
-        self.end_recaption_token_id = self.tokenizer.convert_tokens_to_ids("</recaption>")
+        self.end_recaption_token_id = self.tokenizer.convert_tokens_to_ids(
+            "</recaption>"
+        )
         self.end_think_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
         self.ratio_token_offset = self.tokenizer.convert_tokens_to_ids("<img_ratio_0>")
-        self.joint_img_sep_token_id = self.tokenizer.convert_tokens_to_ids("<joint_img_sep>")
+        self.joint_img_sep_token_id = self.tokenizer.convert_tokens_to_ids(
+            "<joint_img_sep>"
+        )
         self.special_token_map = self.tokenizer.added_tokens_encoder
 
     @staticmethod
@@ -339,7 +346,11 @@ class HunyuanImage3TokenizerWrapper:
             if key == "text":
                 token_seq.extend(source)
                 extra["<text>_start"].append(token_count)
-                if "<cfg>_start" not in extra and len(source) > 0 and source[0] == self.cfg_token_id:
+                if (
+                    "<cfg>_start" not in extra
+                    and len(source) > 0
+                    and source[0] == self.cfg_token_id
+                ):
                     extra["<cfg>_start"].append(token_count)
                 token_count += len(source)
                 extra["<text>_end"].append(token_count - 1)
@@ -357,7 +368,11 @@ class HunyuanImage3TokenizerWrapper:
                     + (1 if source.get("guidance", add_guidance_token) else 0)
                     + (2 if source.get("image_shape", add_image_shape_token) else 0)
                 )
-                if drop_last is True and total_length is not None and token_count + extra_count + source["length"] > total_length:
+                if (
+                    drop_last is True
+                    and total_length is not None
+                    and token_count + extra_count + source["length"] > total_length
+                ):
                     drop_last_break = True
                     break
                 if source.get("front_boi", use_front_boi_token):
@@ -365,10 +380,14 @@ class HunyuanImage3TokenizerWrapper:
                     extra["boi"].append(token_count)
                     token_count += 1
                 token_count = self._add_image_meta_info_token(
-                    token_seq, token_count, extra,
+                    token_seq,
+                    token_count,
+                    extra,
                     add_timestep_token=source.get("timestep", add_timestep_token),
                     add_guidance_token=source.get("guidance", add_guidance_token),
-                    add_image_shape_token=source.get("image_shape", add_image_shape_token),
+                    add_image_shape_token=source.get(
+                        "image_shape", add_image_shape_token
+                    ),
                     base_size=source.get("base_size"),
                     ratio_idx=source.get("ratio_idx"),
                     image_type=key,
@@ -377,7 +396,9 @@ class HunyuanImage3TokenizerWrapper:
                     token_seq.append(self.boi_token_id)
                     extra["boi"].append(token_count)
                     token_count += 1
-                token_seq.extend([self.img_token_id] * source["length"] + [self.eoi_token_id])
+                token_seq.extend(
+                    [self.img_token_id] * source["length"] + [self.eoi_token_id]
+                )
                 extra["<img>_start"].append(token_count)
                 extra["<all_img>_start"].append(token_count)
                 token_count += source["length"]
@@ -388,7 +409,9 @@ class HunyuanImage3TokenizerWrapper:
 
             elif key == "joint_image":
                 # joint_image has dual layout: VAE tokens + <joint_img_sep> + ViT tokens
-                assert isinstance(source["length"], list) and len(source["length"]) == 2, (
+                assert (
+                    isinstance(source["length"], list) and len(source["length"]) == 2
+                ), (
                     "joint_image length should be a list of two integers [vae_len, vit_len]"
                 )
                 vae_len, vit_len = source["length"]
@@ -398,7 +421,11 @@ class HunyuanImage3TokenizerWrapper:
                     + (1 if source.get("timestep", add_timestep_token) else 0)
                     + (2 if source.get("image_shape", add_image_shape_token) else 0)
                 )
-                if drop_last is True and total_length is not None and token_count + extra_count + vae_len + vit_len > total_length:
+                if (
+                    drop_last is True
+                    and total_length is not None
+                    and token_count + extra_count + vae_len + vit_len > total_length
+                ):
                     drop_last_break = True
                     break
                 if source.get("front_boi", use_front_boi_token):
@@ -407,10 +434,14 @@ class HunyuanImage3TokenizerWrapper:
                     token_count += 1
                 # image meta (timestep, image_shape; no guidance for joint_image)
                 token_count = self._add_image_meta_info_token(
-                    token_seq, token_count, extra,
+                    token_seq,
+                    token_count,
+                    extra,
                     add_timestep_token=source.get("timestep", add_timestep_token),
                     add_guidance_token=False,
-                    add_image_shape_token=source.get("image_shape", add_image_shape_token),
+                    add_image_shape_token=source.get(
+                        "image_shape", add_image_shape_token
+                    ),
                     base_size=source.get("base_size"),
                     ratio_idx=source.get("ratio_idx"),
                     image_type=key,
@@ -449,7 +480,9 @@ class HunyuanImage3TokenizerWrapper:
             extra["eos"].append(token_count)
             token_count += 1
         elif add_eos == "auto" and not drop_last_break:
-            if token_seq[-1] != self.eos_token_id and (total_length is None or token_count < total_length):
+            if token_seq[-1] != self.eos_token_id and (
+                total_length is None or token_count < total_length
+            ):
                 token_seq.append(self.eos_token_id)
                 extra["eos"].append(token_count)
                 token_count += 1
@@ -476,16 +509,24 @@ class HunyuanImage3TokenizerWrapper:
         return token_seq, extra
 
     def _add_image_meta_info_token(
-        self, token_seq, token_count, extra_token_pos,
-        add_timestep_token=False, add_image_shape_token=False,
-        add_guidance_token=False, base_size=None, ratio_idx=None,
+        self,
+        token_seq,
+        token_count,
+        extra_token_pos,
+        add_timestep_token=False,
+        add_image_shape_token=False,
+        add_guidance_token=False,
+        base_size=None,
+        ratio_idx=None,
         image_type=None,
     ):
         if add_image_shape_token:
-            token_seq.extend([
-                self.special_token_map[f"<img_size_{base_size}>"],
-                self.special_token_map[f"<img_ratio_{ratio_idx}>"],
-            ])
+            token_seq.extend(
+                [
+                    self.special_token_map[f"<img_size_{base_size}>"],
+                    self.special_token_map[f"<img_ratio_{ratio_idx}>"],
+                ]
+            )
             token_count += 2
         if add_timestep_token:
             token_seq.extend([self.special_token_map["<timestep>"]])
@@ -501,9 +542,16 @@ class HunyuanImage3TokenizerWrapper:
             token_count += 1
         return token_count
 
-    def encode_general(self, sections, max_token_length=None,
-                       add_eos="auto", use_text_mask=True,
-                       add_pad="auto", add_bos=True, drop_last="auto"):
+    def encode_general(
+        self,
+        sections,
+        max_token_length=None,
+        add_eos="auto",
+        use_text_mask=True,
+        add_pad="auto",
+        add_bos=True,
+        drop_last="auto",
+    ):
         """Encode a list of section dicts into a ``TokenizerEncodeOutput``."""
         sections = deepcopy(sections)
         template = "-".join(s["type"] for s in sections)
@@ -519,91 +567,135 @@ class HunyuanImage3TokenizerWrapper:
                     max_length=section.get("max_length"),
                 )
                 token_source["text"].append(text)
-                text_mask_specs.append(dict(
-                    ignore=section.get("ignore", False),
-                    start_offset=section.get("start_offset", 0),
-                    end_offset=section.get("end_offset", 0),
-                ))
+                text_mask_specs.append(
+                    dict(
+                        ignore=section.get("ignore", False),
+                        start_offset=section.get("start_offset", 0),
+                        end_offset=section.get("end_offset", 0),
+                    )
+                )
             elif section["type"] == "gen_image":
-                token_source["gen_image"].append(dict(
-                    length=section["token_length"],
-                    timestep=section.get("add_timestep_token", False),
-                    guidance=section.get("add_guidance_token", False),
-                    front_boi=section.get("use_front_boi_token", False),
-                    image_shape=section.get("add_image_shape_token", False),
-                    base_size=section.get("base_size"),
-                    ratio_idx=section.get("ratio_idx"),
-                ))
+                token_source["gen_image"].append(
+                    dict(
+                        length=section["token_length"],
+                        timestep=section.get("add_timestep_token", False),
+                        guidance=section.get("add_guidance_token", False),
+                        front_boi=section.get("use_front_boi_token", False),
+                        image_shape=section.get("add_image_shape_token", False),
+                        base_size=section.get("base_size"),
+                        ratio_idx=section.get("ratio_idx"),
+                    )
+                )
             elif section["type"] == "joint_image":
-                token_source["joint_image"].append(dict(
-                    length=section["token_length"],
-                    timestep=section.get("add_timestep_token", False),
-                    guidance=section.get("add_guidance_token", False),
-                    front_boi=section.get("use_front_boi_token", False),
-                    image_shape=section.get("add_image_shape_token", False),
-                    base_size=section.get("base_size"),
-                    ratio_idx=section.get("ratio_idx"),
-                ))
+                token_source["joint_image"].append(
+                    dict(
+                        length=section["token_length"],
+                        timestep=section.get("add_timestep_token", False),
+                        guidance=section.get("add_guidance_token", False),
+                        front_boi=section.get("use_front_boi_token", False),
+                        image_shape=section.get("add_image_shape_token", False),
+                        base_size=section.get("base_size"),
+                        ratio_idx=section.get("ratio_idx"),
+                    )
+                )
             else:
                 raise ValueError(f"Invalid section type: {section['type']}")
 
         full_token_seq, extra = self.encode_sequence(
-            template=template, token_source=dict(token_source),
-            total_length=max_token_length, add_eos=add_eos,
-            add_pad=add_pad, add_bos=add_bos, drop_last=drop_last,
+            template=template,
+            token_source=dict(token_source),
+            total_length=max_token_length,
+            add_eos=add_eos,
+            add_pad=add_pad,
+            add_bos=add_bos,
+            drop_last=drop_last,
         )
         full_tensor = torch.tensor(full_token_seq, dtype=torch.long)
 
-        timestep_idx = torch.tensor(extra["timestep"], dtype=torch.long) if "timestep" in extra else None
-        gen_ts_idx = torch.tensor(extra["gen_timestep"], dtype=torch.long) if "gen_timestep" in extra else None
-        cond_ts_idx = torch.tensor(extra["cond_timestep"], dtype=torch.long) if "cond_timestep" in extra else None
-        
+        timestep_idx = (
+            torch.tensor(extra["timestep"], dtype=torch.long)
+            if "timestep" in extra
+            else None
+        )
+        gen_ts_idx = (
+            torch.tensor(extra["gen_timestep"], dtype=torch.long)
+            if "gen_timestep" in extra
+            else None
+        )
+        cond_ts_idx = (
+            torch.tensor(extra["cond_timestep"], dtype=torch.long)
+            if "cond_timestep" in extra
+            else None
+        )
+
         gen_image_slices = []
         gen_image_mask = None
         if "<img>_start" in extra and "<img>_end" in extra:
-            gen_image_slices = [slice(s, e + 1) for s, e in zip(extra["<img>_start"], extra["<img>_end"])]
+            gen_image_slices = [
+                slice(s, e + 1)
+                for s, e in zip(extra["<img>_start"], extra["<img>_end"])
+            ]
             gen_image_mask = torch.zeros_like(full_tensor, dtype=torch.bool)
             for sl in gen_image_slices:
                 gen_image_mask[sl] = True
-        
+
         joint_image_slices = []
         cond_vae_image_mask = None
         cond_vit_image_mask = None
         cond_vae_image_slices = []
         cond_vit_image_slices = []
         if "<vae_img>_start" in extra and "<vae_img>_end" in extra:
-            cond_vae_image_slices = [slice(s, e + 1) for s, e in zip(extra["<vae_img>_start"], extra["<vae_img>_end"])]
+            cond_vae_image_slices = [
+                slice(s, e + 1)
+                for s, e in zip(extra["<vae_img>_start"], extra["<vae_img>_end"])
+            ]
             cond_vae_image_mask = torch.zeros_like(full_tensor, dtype=torch.bool)
             for sl in cond_vae_image_slices:
                 cond_vae_image_mask[sl] = True
         if "<vit_img>_start" in extra and "<vit_img>_end" in extra:
-            cond_vit_image_slices = [slice(s, e + 1) for s, e in zip(extra["<vit_img>_start"], extra["<vit_img>_end"])]
+            cond_vit_image_slices = [
+                slice(s, e + 1)
+                for s, e in zip(extra["<vit_img>_start"], extra["<vit_img>_end"])
+            ]
             cond_vit_image_mask = torch.zeros_like(full_tensor, dtype=torch.bool)
             for sl in cond_vit_image_slices:
                 cond_vit_image_mask[sl] = True
         if "<joint_img>_start" in extra and "<joint_img>_end" in extra:
-            joint_image_slices = [slice(s, e + 1) for s, e in zip(extra["<joint_img>_start"], extra["<joint_img>_end"])]
-        
+            joint_image_slices = [
+                slice(s, e + 1)
+                for s, e in zip(extra["<joint_img>_start"], extra["<joint_img>_end"])
+            ]
+
         all_image_slices = []
         if "<all_img>_start" in extra and "<all_img>_end" in extra:
-            all_image_slices = [slice(s, e + 1) for s, e in zip(extra["<all_img>_start"], extra["<all_img>_end"])]
-        
+            all_image_slices = [
+                slice(s, e + 1)
+                for s, e in zip(extra["<all_img>_start"], extra["<all_img>_end"])
+            ]
+
         text_slices = []
         if "<text>_start" in extra and "<text>_end" in extra:
-            text_slices = [slice(s, e + 1) for s, e in zip(extra["<text>_start"], extra["<text>_end"])]
-        
+            text_slices = [
+                slice(s, e + 1)
+                for s, e in zip(extra["<text>_start"], extra["<text>_end"])
+            ]
+
         text_mask = None
         if use_text_mask:
             text_mask = torch.zeros_like(full_tensor, dtype=torch.float32)
             for sl, spec in zip(text_slices, text_mask_specs):
                 if not spec["ignore"]:
-                    real = slice(sl.start + spec["start_offset"], sl.stop + spec["end_offset"])
+                    real = slice(
+                        sl.start + spec["start_offset"], sl.stop + spec["end_offset"]
+                    )
                     text_mask[real] = 1.0
-        
-        real_pos = torch.tensor(extra.get("first_pad", [full_tensor.shape[0]]), dtype=torch.long)
+
+        real_pos = torch.tensor(
+            extra.get("first_pad", [full_tensor.shape[0]]), dtype=torch.long
+        )
         think_end = extra.get("<think>_end", [None])[0]
         recaption_end = extra.get("<recaption>_end", [None])[0]
-        
+
         return TokenizerEncodeOutput(
             tokens=full_tensor,
             timestep_scatter_index=timestep_idx,
@@ -651,26 +743,61 @@ class HunyuanImage3TokenizerWrapper:
             if not isinstance(batch_gen_image_info, list):
                 batch_gen_image_info = [batch_gen_image_info] * batch_size
             batch_cot_text = batch_cot_text or [None] * batch_size
-            batch_cond_image_info = batch_cond_image_info or [[] for _ in range(batch_size)]
+            batch_cond_image_info = batch_cond_image_info or [
+                [] for _ in range(batch_size)
+            ]
 
             batch_message_list = []
             for prompt, sys_p, cot, img_info, cond_imgs in zip(
-                batch_prompt, batch_system_prompt, batch_cot_text,
-                batch_gen_image_info, batch_cond_image_info,
+                batch_prompt,
+                batch_system_prompt,
+                batch_cot_text,
+                batch_gen_image_info,
+                batch_cond_image_info,
             ):
                 ml = []
                 if sys_p:
-                    ml.append(dict(role="system", type="text", content=sys_p, context_type="str"))
+                    ml.append(
+                        dict(
+                            role="system",
+                            type="text",
+                            content=sys_p,
+                            context_type="str",
+                        )
+                    )
                 if len(cond_imgs) > 0:
-                    ml.extend([
-                        dict(role="user", type="joint_image", content=c, context_type="image_info")
-                        for c in cond_imgs
-                    ])
-                ml.append(dict(role="user", type="text", content=prompt, context_type="str"))
+                    ml.extend(
+                        [
+                            dict(
+                                role="user",
+                                type="joint_image",
+                                content=c,
+                                context_type="image_info",
+                            )
+                            for c in cond_imgs
+                        ]
+                    )
+                ml.append(
+                    dict(role="user", type="text", content=prompt, context_type="str")
+                )
                 if cot is not None:
-                    ml.append(dict(role="assistant", type="text", content=cot, context_type="str"))
+                    ml.append(
+                        dict(
+                            role="assistant",
+                            type="text",
+                            content=cot,
+                            context_type="str",
+                        )
+                    )
                 if mode == "gen_image":
-                    ml.append(dict(role="assistant", type="gen_image", content=img_info, context_type="image_info"))
+                    ml.append(
+                        dict(
+                            role="assistant",
+                            type="gen_image",
+                            content=img_info,
+                            context_type="image_info",
+                        )
+                    )
                 batch_message_list.append(ml)
 
         output, sections = self._apply_general_template(
@@ -687,11 +814,18 @@ class HunyuanImage3TokenizerWrapper:
         return dict(output=output, sections=sections)
 
     def _apply_general_template(
-        self, message_list, max_length=None,
-        add_assistant_prefix=False, answer="auto",
-        bot_task="auto", sequence_template="instruct",
-        uncond_p=0.0, cfg_factor=1, batchify=False,
-        image_base_size=1024, drop_think=False,
+        self,
+        message_list,
+        max_length=None,
+        add_assistant_prefix=False,
+        answer="auto",
+        bot_task="auto",
+        sequence_template="instruct",
+        uncond_p=0.0,
+        cfg_factor=1,
+        batchify=False,
+        image_base_size=1024,
+        drop_think=False,
     ):
         if batchify:
             # One prompt slot per request: _batch_gen_infer zips prompt_list
@@ -702,9 +836,11 @@ class HunyuanImage3TokenizerWrapper:
                 prompt_list=[[]] * len(message_list),
                 infer_fn_kwargs_list=[
                     dict(
-                        message_list=ml_i, max_length=max_length,
+                        message_list=ml_i,
+                        max_length=max_length,
                         add_assistant_prefix=add_assistant_prefix,
-                        answer=answer, bot_task=bot_task,
+                        answer=answer,
+                        bot_task=bot_task,
                         sequence_template=sequence_template,
                         image_base_size=image_base_size,
                         drop_think=drop_think,
@@ -741,7 +877,13 @@ class HunyuanImage3TokenizerWrapper:
                 ("assistant", bot_prefix, bot_suffix, answer_prefix, answer_suffix),
             ]:
                 sub, cur_idx = self._process_successive(
-                    message_list, cur_idx, role, pfx, sfx, apfx, asfx,
+                    message_list,
+                    cur_idx,
+                    role,
+                    pfx,
+                    sfx,
+                    apfx,
+                    asfx,
                     uncond_kwargs=uncond_kwargs,
                 )
                 sections.extend(sub)
@@ -764,7 +906,9 @@ class HunyuanImage3TokenizerWrapper:
             }[bot_task]
             sections.append(dict(type="text", text=bot_response_prefix))
 
-        output = self.encode_general(sections=sections, use_text_mask=False, add_eos=False, add_pad=False)
+        output = self.encode_general(
+            sections=sections, use_text_mask=False, add_eos=False, add_pad=False
+        )
 
         if max_length is not None and output.tokens.shape[-1] > max_length:
             raise ValueError(
@@ -772,9 +916,17 @@ class HunyuanImage3TokenizerWrapper:
             )
         return output, sections
 
-    def _process_successive(self, message_list, cur_idx, role,
-                            prefix, suffix, answer_prefix="", answer_suffix="",
-                            uncond_kwargs=None):
+    def _process_successive(
+        self,
+        message_list,
+        cur_idx,
+        role,
+        prefix,
+        suffix,
+        answer_prefix="",
+        answer_suffix="",
+        uncond_kwargs=None,
+    ):
         if uncond_kwargs is None:
             uncond_kwargs = {}
         sub_sections: list[dict] = []
@@ -790,15 +942,23 @@ class HunyuanImage3TokenizerWrapper:
                     ):
                         sub_sections.extend(self._get_cot_sections(text, uncond_kwargs))
                     else:
-                        sub_sections.append(dict(type="text", text=text, **uncond_kwargs))
+                        sub_sections.append(
+                            dict(type="text", text=text, **uncond_kwargs)
+                        )
                 else:
                     # User text: no answer tags, but apply uncond_kwargs for CFG
                     sub_sections.append(
-                        dict(type="text", text=f"{answer_prefix}{text}{answer_suffix}", **uncond_kwargs)
+                        dict(
+                            type="text",
+                            text=f"{answer_prefix}{text}{answer_suffix}",
+                            **uncond_kwargs,
+                        )
                     )
             elif msg["type"] in ("gen_image", "joint_image"):
                 info = msg["content"]
-                expected_cls = JointImageInfo if msg["type"] == "joint_image" else ImageInfo
+                expected_cls = (
+                    JointImageInfo if msg["type"] == "joint_image" else ImageInfo
+                )
                 assert isinstance(info, expected_cls), (
                     f"Expected {expected_cls.__name__}, got {type(info).__name__}"
                 )
@@ -816,9 +976,15 @@ class HunyuanImage3TokenizerWrapper:
             sub_sections.append(dict(type="text", text=suffix))
         return sub_sections, cur_idx
 
-    def _batch_gen_infer(self, infer_fn, prompt_list, infer_fn_kwargs_list,
-                         do_classifier_free_guidance=False,
-                         condition_repeat_times=1, uncondition_repeat_times=1):
+    def _batch_gen_infer(
+        self,
+        infer_fn,
+        prompt_list,
+        infer_fn_kwargs_list,
+        do_classifier_free_guidance=False,
+        condition_repeat_times=1,
+        uncondition_repeat_times=1,
+    ):
         if infer_fn_kwargs_list is None:
             infer_fn_kwargs_list = [{} for _ in prompt_list]
         if len(prompt_list) != len(infer_fn_kwargs_list):
@@ -836,7 +1002,12 @@ class HunyuanImage3TokenizerWrapper:
                 prompt = [prompt]
             cond_kw = {**kw, "uncond_p": 0.0} if do_classifier_free_guidance else kw
             results = infer_fn(*prompt, **cond_kw)
-            output_type_list.append((type(results), len(results) if isinstance(results, (list, tuple)) else 1))
+            output_type_list.append(
+                (
+                    type(results),
+                    len(results) if isinstance(results, (list, tuple)) else 1,
+                )
+            )
             if not isinstance(results, (list, tuple)):
                 results = (results,)
             if cond_results_list is None:
@@ -861,18 +1032,27 @@ class HunyuanImage3TokenizerWrapper:
         def _make_batch(cond_items, uncond_items):
             first = cond_items[0]
             if isinstance(first, torch.Tensor):
-                return torch.stack(self._pad(
-                    cond_items * condition_repeat_times + uncond_items * uncondition_repeat_times,
-                ))
+                return torch.stack(
+                    self._pad(
+                        cond_items * condition_repeat_times
+                        + uncond_items * uncondition_repeat_times,
+                    )
+                )
             if first is None:
                 return None
             if isinstance(first, list):
-                return cond_items * condition_repeat_times + uncond_items * uncondition_repeat_times
+                return (
+                    cond_items * condition_repeat_times
+                    + uncond_items * uncondition_repeat_times
+                )
             if isinstance(first, TokenizerEncodeOutput):
                 merged = {}
                 for key in list(first.__dataclass_fields__.keys()):
-                    vals = [getattr(c, key) for c in cond_items] * condition_repeat_times + \
-                           [getattr(u, key) for u in uncond_items] * uncondition_repeat_times
+                    vals = [
+                        getattr(c, key) for c in cond_items
+                    ] * condition_repeat_times + [
+                        getattr(u, key) for u in uncond_items
+                    ] * uncondition_repeat_times
                     if isinstance(vals[0], torch.Tensor):
                         if "mask" in key:
                             pv = 0.0
@@ -890,7 +1070,9 @@ class HunyuanImage3TokenizerWrapper:
                 return TokenizerEncodeOutput(**merged)
             raise TypeError(f"Cannot batch {type(first)}")
 
-        stacked = [_make_batch(c, u) for c, u in zip(cond_results_list, uncond_results_list)]
+        stacked = [
+            _make_batch(c, u) for c, u in zip(cond_results_list, uncond_results_list)
+        ]
         _, num = output_type_list[0]
         if num == 1:
             return stacked[0]

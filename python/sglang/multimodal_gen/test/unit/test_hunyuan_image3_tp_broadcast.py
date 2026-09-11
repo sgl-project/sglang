@@ -76,9 +76,7 @@ class TestHunyuanImage3TPBroadcast(CustomTestCase):
         sin = _FakeTensor((2, 8, 4))
 
         with (
-            patch.object(
-                ar_stage, "model_parallel_is_initialized", return_value=True
-            ),
+            patch.object(ar_stage, "model_parallel_is_initialized", return_value=True),
             patch.object(ar_stage, "get_tp_group", return_value=tp_group),
         ):
             result = stage._broadcast_static_inputs(attention_mask, (cos, sin))
@@ -100,14 +98,10 @@ class TestHunyuanImage3TPBroadcast(CustomTestCase):
         output.shape = (6, 4)
         output.view.return_value = "reshaped-output"
         stage._cache_dit_adapter = None
-        stage.ar_model = SimpleNamespace(
-            forward_block=MagicMock(return_value=output)
-        )
+        stage.ar_model = SimpleNamespace(forward_block=MagicMock(return_value=output))
 
         with (
-            patch.object(
-                ar_stage, "model_parallel_is_initialized", return_value=True
-            ),
+            patch.object(ar_stage, "model_parallel_is_initialized", return_value=True),
             patch.object(ar_stage, "get_tp_group", return_value=tp_group),
         ):
             result = stage._backbone_forward(

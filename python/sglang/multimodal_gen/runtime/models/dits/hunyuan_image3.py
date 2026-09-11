@@ -13,6 +13,20 @@ from einops import rearrange
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
+    HunyuanImage3DitConfig,
+)
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
+from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -27,18 +41,6 @@ from sglang.srt.models.hunyuan import (
     _get_cla_factor,
     _is_moe,
 )
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-
-from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
-from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import HunyuanImage3DitConfig
 
 from .hunyuan_image3_utils import (
     CachedRoPE,
@@ -47,8 +49,6 @@ from .hunyuan_image3_utils import (
     create_hunyuan_image_attention_meta,
     timestep_embedding,
 )
-
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -60,6 +60,7 @@ UNEXPECTED_KEYWORDS = [
 ]
 
 # Diffusion I/O helpers, ported from the official HunyuanImage-3 repository.
+
 
 def _conv_nd(dims, *args, **kwargs):
     if dims == 1:
@@ -84,7 +85,9 @@ def _normalization(channels, **kwargs):
 class _Upsample(nn.Module):
     """Upsample layer with optional convolution (dims=3 for spatial 2D)."""
 
-    def __init__(self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None):
+    def __init__(
+        self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None
+    ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.channels = channels
@@ -92,7 +95,9 @@ class _Upsample(nn.Module):
         self.use_conv = use_conv
         self.dims = dims
         if use_conv:
-            self.conv = _conv_nd(dims, self.channels, self.out_channels, 3, padding=1, **factory_kwargs)
+            self.conv = _conv_nd(
+                dims, self.channels, self.out_channels, 3, padding=1, **factory_kwargs
+            )
 
     def forward(self, x):
         assert x.shape[1] == self.channels
@@ -110,7 +115,9 @@ class _Upsample(nn.Module):
 class _Downsample(nn.Module):
     """Downsample layer with optional convolution (dims=3 for spatial 2D)."""
 
-    def __init__(self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None):
+    def __init__(
+        self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None
+    ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.channels = channels
@@ -120,7 +127,13 @@ class _Downsample(nn.Module):
         stride = 2 if dims != 3 else (1, 2, 2)
         if use_conv:
             self.op = _conv_nd(
-                dims, self.channels, self.out_channels, 3, stride=stride, padding=1, **factory_kwargs
+                dims,
+                self.channels,
+                self.out_channels,
+                3,
+                stride=stride,
+                padding=1,
+                **factory_kwargs,
             )
         else:
             assert self.channels == self.out_channels
@@ -135,8 +148,17 @@ class _ResBlock(nn.Module):
     """Residual block with timestep embedding conditioning."""
 
     def __init__(
-        self, in_channels, emb_channels, out_channels=None, dropout=0.0,
-        use_conv=False, dims=2, up=False, down=False, device=None, dtype=None,
+        self,
+        in_channels,
+        emb_channels,
+        out_channels=None,
+        dropout=0.0,
+        use_conv=False,
+        dims=2,
+        up=False,
+        down=False,
+        device=None,
+        dtype=None,
     ):
         factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
@@ -147,7 +169,14 @@ class _ResBlock(nn.Module):
         self.in_layers = nn.Sequential(
             _normalization(self.in_channels, **factory_kwargs),
             nn.SiLU(),
-            _conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs),
+            _conv_nd(
+                dims,
+                self.in_channels,
+                self.out_channels,
+                3,
+                padding=1,
+                **factory_kwargs,
+            ),
         )
 
         self.updown = up or down
@@ -170,7 +199,14 @@ class _ResBlock(nn.Module):
             nn.SiLU(),
             nn.Dropout(p=dropout),
             _zero_module(
-                _conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, **factory_kwargs)
+                _conv_nd(
+                    dims,
+                    self.out_channels,
+                    self.out_channels,
+                    3,
+                    padding=1,
+                    **factory_kwargs,
+                )
             ),
         )
 
@@ -178,7 +214,12 @@ class _ResBlock(nn.Module):
             self.skip_connection = nn.Identity()
         elif use_conv:
             self.skip_connection = _conv_nd(
-                dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs
+                dims,
+                self.in_channels,
+                self.out_channels,
+                3,
+                padding=1,
+                **factory_kwargs,
             )
         else:
             self.skip_connection = _conv_nd(
@@ -208,8 +249,16 @@ class _ResBlock(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, act_layer=nn.GELU, frequency_embedding_size=256,
-                 max_period=10000, out_size=None, dtype=None, device=None):
+    def __init__(
+        self,
+        hidden_size,
+        act_layer=nn.GELU,
+        frequency_embedding_size=256,
+        max_period=10000,
+        out_size=None,
+        dtype=None,
+        device=None,
+    ):
         factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
@@ -217,7 +266,9 @@ class TimestepEmbedder(nn.Module):
         if out_size is None:
             out_size = hidden_size
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True, **factory_kwargs),
+            nn.Linear(
+                frequency_embedding_size, hidden_size, bias=True, **factory_kwargs
+            ),
             act_layer(),
             nn.Linear(hidden_size, out_size, bias=True, **factory_kwargs),
         )
@@ -231,28 +282,59 @@ class TimestepEmbedder(nn.Module):
 class UNetDown(nn.Module):
     """Patch embed: converts noise latents (B, C, H, W) into sequence embeddings."""
 
-    def __init__(self, patch_size, in_channels, emb_channels, hidden_channels,
-                 out_channels, dropout=0.0, device=None, dtype=None):
+    def __init__(
+        self,
+        patch_size,
+        in_channels,
+        emb_channels,
+        hidden_channels,
+        out_channels,
+        dropout=0.0,
+        device=None,
+        dtype=None,
+    ):
         factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.patch_size = patch_size
 
-        self.model = nn.ModuleList([
-            _conv_nd(2, in_channels=in_channels, out_channels=hidden_channels,
-                     kernel_size=3, padding=1, **factory_kwargs)
-        ])
+        self.model = nn.ModuleList(
+            [
+                _conv_nd(
+                    2,
+                    in_channels=in_channels,
+                    out_channels=hidden_channels,
+                    kernel_size=3,
+                    padding=1,
+                    **factory_kwargs,
+                )
+            ]
+        )
         if self.patch_size == 1:
-            self.model.append(_ResBlock(
-                in_channels=hidden_channels, emb_channels=emb_channels,
-                out_channels=out_channels, dropout=dropout, **factory_kwargs,
-            ))
+            self.model.append(
+                _ResBlock(
+                    in_channels=hidden_channels,
+                    emb_channels=emb_channels,
+                    out_channels=out_channels,
+                    dropout=dropout,
+                    **factory_kwargs,
+                )
+            )
         else:
             for i in range(self.patch_size // 2):
-                self.model.append(_ResBlock(
-                    in_channels=hidden_channels, emb_channels=emb_channels,
-                    out_channels=(hidden_channels if (i + 1) * 2 != self.patch_size else out_channels),
-                    dropout=dropout, down=True, **factory_kwargs,
-                ))
+                self.model.append(
+                    _ResBlock(
+                        in_channels=hidden_channels,
+                        emb_channels=emb_channels,
+                        out_channels=(
+                            hidden_channels
+                            if (i + 1) * 2 != self.patch_size
+                            else out_channels
+                        ),
+                        dropout=dropout,
+                        down=True,
+                        **factory_kwargs,
+                    )
+                )
 
     def forward(self, x, t):
         assert x.shape[2] % self.patch_size == 0 and x.shape[3] % self.patch_size == 0
@@ -269,37 +351,72 @@ class UNetDown(nn.Module):
 class UNetUp(nn.Module):
     """Final layer: converts backbone output sequence into noise predictions."""
 
-    def __init__(self, patch_size, in_channels, emb_channels, hidden_channels,
-                 out_channels, dropout=0.0, device=None, dtype=None, out_norm=False):
+    def __init__(
+        self,
+        patch_size,
+        in_channels,
+        emb_channels,
+        hidden_channels,
+        out_channels,
+        dropout=0.0,
+        device=None,
+        dtype=None,
+        out_norm=False,
+    ):
         factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.patch_size = patch_size
         self.model = nn.ModuleList()
 
         if self.patch_size == 1:
-            self.model.append(_ResBlock(
-                in_channels=in_channels, emb_channels=emb_channels,
-                out_channels=hidden_channels, dropout=dropout, **factory_kwargs,
-            ))
+            self.model.append(
+                _ResBlock(
+                    in_channels=in_channels,
+                    emb_channels=emb_channels,
+                    out_channels=hidden_channels,
+                    dropout=dropout,
+                    **factory_kwargs,
+                )
+            )
         else:
             for i in range(self.patch_size // 2):
-                self.model.append(_ResBlock(
-                    in_channels=in_channels if i == 0 else hidden_channels,
-                    emb_channels=emb_channels, out_channels=hidden_channels,
-                    dropout=dropout, up=True, **factory_kwargs,
-                ))
+                self.model.append(
+                    _ResBlock(
+                        in_channels=in_channels if i == 0 else hidden_channels,
+                        emb_channels=emb_channels,
+                        out_channels=hidden_channels,
+                        dropout=dropout,
+                        up=True,
+                        **factory_kwargs,
+                    )
+                )
 
         if out_norm:
-            self.model.append(nn.Sequential(
-                _normalization(hidden_channels, **factory_kwargs),
-                nn.SiLU(),
-                _conv_nd(2, hidden_channels, out_channels, kernel_size=3,
-                         padding=1, **factory_kwargs),
-            ))
+            self.model.append(
+                nn.Sequential(
+                    _normalization(hidden_channels, **factory_kwargs),
+                    nn.SiLU(),
+                    _conv_nd(
+                        2,
+                        hidden_channels,
+                        out_channels,
+                        kernel_size=3,
+                        padding=1,
+                        **factory_kwargs,
+                    ),
+                )
+            )
         else:
-            self.model.append(_conv_nd(
-                2, hidden_channels, out_channels, kernel_size=3,
-                padding=1, **factory_kwargs))
+            self.model.append(
+                _conv_nd(
+                    2,
+                    hidden_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    **factory_kwargs,
+                )
+            )
 
     def forward(self, x, t, token_h, token_w):
         x = rearrange(x, "b (h w) c -> b c h w", h=token_h, w=token_w)
@@ -311,7 +428,9 @@ class UNetUp(nn.Module):
         return x
 
 
-def _make_rope(config: PretrainedConfig, head_dim: int, rope_theta, rope_scaling, max_position):
+def _make_rope(
+    config: PretrainedConfig, head_dim: int, rope_theta, rope_scaling, max_position
+):
     if rope_scaling is not None:
         rope_scaling = dict(rope_scaling)
         rope_scaling["rope_type"] = "default"
@@ -380,8 +499,11 @@ class HunYuanSparseMoeBlock(nn.Module):
     """
 
     def __init__(
-        self, config: PretrainedConfig, layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         assert layer_id >= 0
@@ -392,7 +514,9 @@ class HunYuanSparseMoeBlock(nn.Module):
         top_k = _get_layer_value(config, "moe_topk", layer_id)
         intermediate_size = _get_layer_value(config, "intermediate_size", layer_id, 0)
         if getattr(config, "moe_intermediate_size", None) is not None:
-            intermediate_size = _get_layer_value(config, "moe_intermediate_size", layer_id)
+            intermediate_size = _get_layer_value(
+                config, "moe_intermediate_size", layer_id
+            )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -573,14 +697,16 @@ class HunYuanAttention(nn.Module):
             k = ori_k
             q, _ = self.q_proj(hidden_states)
             q, _ = self._apply_rope(
-                positions, q, torch.empty_like(k), hidden_states, custom_pos_emb,
+                positions,
+                q,
+                torch.empty_like(k),
+                hidden_states,
+                custom_pos_emb,
             )
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._apply_rope(
-                positions, q, k, hidden_states, custom_pos_emb
-            )
+            q, k = self._apply_rope(positions, q, k, hidden_states, custom_pos_emb)
             ori_k = k
 
         if self.use_qk_norm:
@@ -591,9 +717,10 @@ class HunYuanAttention(nn.Module):
                 k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
             )
 
-
         if attn_meta is not None:
-            attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask)
+            attn_output = self.image_attn(
+                q, k, v, attn_meta, attention_mask=attention_mask
+            )
         else:
             q = q.view(-1, self.num_heads, self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -608,8 +735,11 @@ class HunYuanAttention(nn.Module):
 
 class HunyuanImage3DecoderLayer(nn.Module):
     def __init__(
-        self, config: PretrainedConfig, layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -621,52 +751,83 @@ class HunyuanImage3DecoderLayer(nn.Module):
         self.intermediate_size = intermediate_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
+        if rope_scaling is not None and getattr(
+            config, "original_max_position_embeddings", None
+        ):
             rope_scaling = dict(rope_scaling)
-            rope_scaling["original_max_position_embeddings"] = config.original_max_position_embeddings
+            rope_scaling["original_max_position_embeddings"] = (
+                config.original_max_position_embeddings
+            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
+        attention_bias = getattr(config, "attention_bias", False) or getattr(
+            config, "bias", False
+        )
 
         cla_factor = _get_cla_factor(config)
         attention_type = "cross" if layer_id % cla_factor != 0 else "self"
         attn_kwargs = dict(
-            config=config, hidden_size=self.hidden_size,
+            config=config,
+            hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=getattr(config, "num_key_value_heads", config.num_attention_heads),
-            layer_id=layer_id, rope_theta=rope_theta, rope_scaling=rope_scaling,
+            num_kv_heads=getattr(
+                config, "num_key_value_heads", config.num_attention_heads
+            ),
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config, bias=attention_bias,
+            quant_config=quant_config,
+            bias=attention_bias,
             prefix=f"{prefix}.self_attn",
         )
-        self.self_attn = HunYuanAttention(**attn_kwargs, is_cross_attention=attention_type == "cross")
+        self.self_attn = HunYuanAttention(
+            **attn_kwargs, is_cross_attention=attention_type == "cross"
+        )
 
         if _is_moe(config):
             self.mlp = HunYuanSparseMoeBlock(
-                config=config, layer_id=layer_id, quant_config=quant_config,
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
         else:
             self.mlp = HunYuanMLP(
-                hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
-                hidden_act=config.hidden_act, quant_config=quant_config,
-                bias=getattr(config, "mlp_bias", False), prefix=f"{prefix}.mlp",
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                bias=getattr(config, "mlp_bias", False),
+                prefix=f"{prefix}.mlp",
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
-        self, positions, hidden_states, forward_batch, residual,
-        kv_states=None, attn_meta=None, attention_mask=None, custom_pos_emb=None,
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        residual,
+        kv_states=None,
+        attn_meta=None,
+        attention_mask=None,
+        custom_pos_emb=None,
     ):
         if attention_mask is not None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-            
+
             hidden_states, ori_kv_states = self.self_attn(
-                positions=positions, hidden_states=hidden_states,
-                forward_batch=forward_batch, kv_states=kv_states,
-                attn_meta=attn_meta, attention_mask=attention_mask,
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                kv_states=kv_states,
+                attn_meta=attn_meta,
+                attention_mask=attention_mask,
                 custom_pos_emb=custom_pos_emb,
             )
             hidden_states = residual + hidden_states
@@ -681,18 +842,24 @@ class HunyuanImage3DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
             hidden_states, ori_kv_states = self.self_attn(
-                positions=positions, hidden_states=hidden_states,
-                forward_batch=forward_batch, kv_states=kv_states,
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                kv_states=kv_states,
             )
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
             hidden_states = self.mlp(hidden_states)
         return hidden_states, residual, ori_kv_states
 
 
 class HunyuanImage3Model(nn.Module):
     def __init__(
-        self, config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -700,16 +867,22 @@ class HunyuanImage3Model(nn.Module):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size,
-            quant_config=quant_config, prefix=f"{prefix}.embed_tokens",
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.embed_tokens",
         )
-        self.layers = nn.ModuleList([
-            HunyuanImage3DecoderLayer(
-                config=config, layer_id=i, quant_config=quant_config,
-                prefix=f"{prefix}.layers.{i}",
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                HunyuanImage3DecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{i}",
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids):
@@ -727,7 +900,11 @@ class HunyuanImage3Model(nn.Module):
         prev_kv_states = None
         for i, layer in enumerate(self.layers):
             hidden_states, residual, kv_states = layer(
-                positions, hidden_states, forward_batch, residual, prev_kv_states,
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                prev_kv_states,
             )
             if getattr(self.config, "use_cla", False) and i % cla_factor == 0:
                 prev_kv_states = kv_states
@@ -738,8 +915,13 @@ class HunyuanImage3Model(nn.Module):
         return hidden_states
 
     def forward_block(
-        self, hidden_states, attention_mask, custom_pos_emb,
-        attn_meta=None, num_image_tokens=None, first_step=False,
+        self,
+        hidden_states,
+        attention_mask,
+        custom_pos_emb,
+        attn_meta=None,
+        num_image_tokens=None,
+        first_step=False,
     ):
         if attn_meta is None:
             attn_meta = create_hunyuan_image_attention_meta(
@@ -751,8 +933,14 @@ class HunyuanImage3Model(nn.Module):
         prev_kv_states = None
         for i, layer in enumerate(self.layers):
             hidden_states, residual, kv_states = layer(
-                None, hidden_states, None, residual,
-                prev_kv_states, attn_meta, attention_mask, custom_pos_emb,
+                None,
+                hidden_states,
+                None,
+                residual,
+                prev_kv_states,
+                attn_meta,
+                attention_mask,
+                custom_pos_emb,
             )
             if getattr(self.config, "use_cla", False) and i % cla_factor == 0:
                 prev_kv_states = kv_states
@@ -763,12 +951,16 @@ class HunyuanImage3Model(nn.Module):
 
     def _split_qkv_weight(self, qkv):
         num_attention_heads = self.config.num_attention_heads
-        num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
+        num_kv_heads = getattr(
+            self.config, "num_key_value_heads", self.config.num_attention_heads
+        )
         num_key_value_groups = num_attention_heads // num_kv_heads
         hidden_size = self.config.hidden_size
         attention_head_dim = hidden_size // num_attention_heads
 
-        qkv = qkv.reshape(num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size)
+        qkv = qkv.reshape(
+            num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size
+        )
         q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
         q = q.reshape(-1, hidden_size)
         k = k.reshape(-1, hidden_size)
@@ -778,21 +970,26 @@ class HunyuanImage3Model(nn.Module):
 
 class HunyuanImage3ForCausalMM(CachableDiT):
     def __init__(
-        self, config: HunyuanImage3DitConfig, prefix: str = "", **kwargs,
+        self,
+        config: HunyuanImage3DitConfig,
+        prefix: str = "",
+        **kwargs,
     ):
         super().__init__(config=config, **kwargs)
 
         arch_config = self.config
 
         self.model = HunyuanImage3Model(
-            arch_config, prefix=f"{prefix}.model",
+            arch_config,
+            prefix=f"{prefix}.model",
         )
 
         self.unpadded_vocab_size = arch_config.vocab_size
         # multimodal_gen has no LM-head layer; the vocab-parallel embedding
         # shares its layout and only ``.weight`` is consumed downstream.
         self.lm_head = VocabParallelEmbedding(
-            self.unpadded_vocab_size, arch_config.hidden_size,
+            self.unpadded_vocab_size,
+            arch_config.hidden_size,
             org_num_embeddings=self.unpadded_vocab_size,
             prefix=f"{prefix}.lm_head",
         )
@@ -837,13 +1034,20 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             rope_type=getattr(arch_config, "rope_type", "2d"),
         )
 
-    def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, **kwargs):
+    def forward(
+        self, hidden_states, timestep=None, encoder_hidden_states=None, **kwargs
+    ):
         """DiT-style forward for denoising stage."""
         return hidden_states
 
     def forward_block(
-        self, hidden_states, attention_mask, custom_pos_emb,
-        num_image_tokens=None, first_step=False, timestep=None,
+        self,
+        hidden_states,
+        attention_mask,
+        custom_pos_emb,
+        num_image_tokens=None,
+        first_step=False,
+        timestep=None,
     ):
         # TeaCache gate: skip similar steps and reuse the cached residual;
         # one decision covers the packed CFG batch.
@@ -853,8 +1057,11 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             return self.retrieve_cached_states(hidden_states).contiguous()
 
         output = self.model.forward_block(
-            hidden_states, attention_mask, custom_pos_emb,
-            num_image_tokens=num_image_tokens, first_step=first_step,
+            hidden_states,
+            attention_mask,
+            custom_pos_emb,
+            num_image_tokens=num_image_tokens,
+            first_step=first_step,
         )
 
         if timestep is not None:
@@ -926,7 +1133,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         split_params_mapping = [
             (".gate_up_proj", ".gate_and_up_proj", 2, [(1, 1), (0, 1)], None),
             (
-                ".qkv_proj", ".qkv_proj",
+                ".qkv_proj",
+                ".qkv_proj",
                 num_attention_heads + num_kv_heads * 2,
                 [("q", num_attention_heads), ("k", num_kv_heads), ("v", num_kv_heads)],
                 self.model._split_qkv_weight,
@@ -972,7 +1180,10 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 name = name.replace("up_proj_bias", "up_proj.bias")
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 continue
-            if getattr(self.config, "tie_word_embeddings", False) and "lm_head.weight" in name:
+            if (
+                getattr(self.config, "tie_word_embeddings", False)
+                and "lm_head.weight" in name
+            ):
                 continue
 
             if name.endswith("wte.weight"):
@@ -1104,13 +1315,14 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         missing = all_param_names - loaded_params
         if missing:
             significant_missing = [
-                n for n in missing
-                if not any(k in n for k in ["rotary_emb", "lm_head"])
+                n for n in missing if not any(k in n for k in ["rotary_emb", "lm_head"])
             ]
             if significant_missing:
                 logger.warning(
                     "Weight loading: %d/%d params loaded, %d MISSING:",
-                    len(loaded_params), len(all_param_names), len(significant_missing),
+                    len(loaded_params),
+                    len(all_param_names),
+                    len(significant_missing),
                 )
                 for n in sorted(significant_missing)[:30]:
                     logger.warning("  MISSING: %s", n)
@@ -1119,12 +1331,14 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             else:
                 logger.info(
                     "Weight loading: %d/%d params loaded (all accounted for)",
-                    len(loaded_params), len(all_param_names),
+                    len(loaded_params),
+                    len(all_param_names),
                 )
         else:
             logger.info(
                 "Weight loading: %d/%d params loaded (complete)",
-                len(loaded_params), len(all_param_names),
+                len(loaded_params),
+                len(all_param_names),
             )
 
         return loaded_params
@@ -1171,7 +1385,14 @@ class _Hi3CacheBlock(nn.Module):
         # only reads query_lens from it, so build the metadata here.
         attn_meta = create_hunyuan_image_attention_meta(attention_mask, None, False)
         hidden_states, _, _ = self._layer(
-            None, hidden_states, None, None, None, attn_meta, attention_mask, custom_pos_emb,
+            None,
+            hidden_states,
+            None,
+            None,
+            None,
+            attn_meta,
+            attention_mask,
+            custom_pos_emb,
         )
         return hidden_states
 
@@ -1188,9 +1409,7 @@ class Hi3CacheBlockAdapter(nn.Module):
 
     def __init__(self, model: "HunyuanImage3Model"):
         super().__init__()
-        self.blocks = nn.ModuleList(
-            [_Hi3CacheBlock(layer) for layer in model.layers]
-        )
+        self.blocks = nn.ModuleList([_Hi3CacheBlock(layer) for layer in model.layers])
 
     def forward(self, hidden_states, attention_mask, custom_pos_emb):
         for block in self.blocks:

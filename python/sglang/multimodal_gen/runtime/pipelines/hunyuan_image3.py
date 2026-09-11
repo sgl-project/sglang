@@ -153,8 +153,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         with component_attn_backend_context_manager(
             attn_backend, component_name=matched_backend_key or "transformer"
         ):
-            with set_default_torch_dtype(param_dtype), torch.device(
-                checkpoint_load_device
+            with (
+                set_default_torch_dtype(param_dtype),
+                torch.device(checkpoint_load_device),
             ):
                 model = HunyuanImage3ForCausalMM(
                     config=pipeline_config.dit_config,

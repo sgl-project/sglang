@@ -597,9 +597,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         pipeline cannot keep per-request inside a merged dynamic batch."""
         if self.server_args.pipeline_config.supports_batching_image_conditioning():
             return False
-        return (
-            base_req.image_path is not None or candidate_req.image_path is not None
-        )
+        return base_req.image_path is not None or candidate_req.image_path is not None
 
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""

@@ -85,7 +85,9 @@ class HunYuanRotary2DEmbedder:
         cos, sin = custom_pos_emb
         bs, q_len = cos.shape[0], cos.shape[1]
 
-        assert hidden_states.shape[0] == bs * q_len, f"{hidden_states.shape[0]} != {bs * q_len}"
+        assert hidden_states.shape[0] == bs * q_len, (
+            f"{hidden_states.shape[0]} != {bs * q_len}"
+        )
 
         # [B*L, H*D] -> [B, L, H, D] for apply_rotary_pos_emb
         q = q.reshape(bs, q_len, self.num_heads, self.head_dim)
@@ -93,8 +95,12 @@ class HunYuanRotary2DEmbedder:
 
         q, k = apply_rotary_pos_emb(q.to(torch.float32), k.to(torch.float32), cos, sin)
 
-        q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(torch.bfloat16)
-        k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(torch.bfloat16)
+        q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(
+            torch.bfloat16
+        )
+        k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(
+            torch.bfloat16
+        )
         hidden_states = hidden_states.reshape(hidden_states_shape)
         return q, k
 
@@ -130,8 +136,12 @@ def build_2d_rope(
                 y_sections.append(torch.arange(last_pos, L, device=device))
                 x_sections.append(torch.arange(last_pos, L, device=device))
             elif h is None:
-                y_sections.append(torch.arange(sec_slice.start, sec_slice.stop, device=device))
-                x_sections.append(torch.arange(sec_slice.start, sec_slice.stop, device=device))
+                y_sections.append(
+                    torch.arange(sec_slice.start, sec_slice.stop, device=device)
+                )
+                x_sections.append(
+                    torch.arange(sec_slice.start, sec_slice.stop, device=device)
+                )
                 continue
             else:
                 pass
@@ -151,14 +161,20 @@ def build_2d_rope(
             y_sections.append(grid[0])
             x_sections.append(grid[1])
             last_pos = L + w * h
-        y_sections.append(torch.arange(last_pos, sample_seq_lens[sample_id], device=device))
-        x_sections.append(torch.arange(last_pos, sample_seq_lens[sample_id], device=device))
+        y_sections.append(
+            torch.arange(last_pos, sample_seq_lens[sample_id], device=device)
+        )
+        x_sections.append(
+            torch.arange(last_pos, sample_seq_lens[sample_id], device=device)
+        )
 
     x_pos = torch.cat(x_sections).long()
     y_pos = torch.cat(y_sections).long()
     x_pos = x_pos[:seq_len]
     y_pos = y_pos[:seq_len]
-    all_pos = torch.stack((y_pos, x_pos), dim=1).unsqueeze(1).to(device)  # [seq_len, 1, 2]
+    all_pos = (
+        torch.stack((y_pos, x_pos), dim=1).unsqueeze(1).to(device)
+    )  # [seq_len, 1, 2]
 
     # Tile the half-dim angles up to head_dim (official layout): rotate_half
     # pairs dim i with dim i + n_elem/2, both carrying the SAME angle;
@@ -181,7 +197,11 @@ def build_batch_2d_rope(
         image_infos = [None]
     for image_info in image_infos:
         cos, sin = build_2d_rope(
-            seq_len, n_elem, image_infos=image_info, device=device, base=base,
+            seq_len,
+            n_elem,
+            image_infos=image_info,
+            device=device,
+            base=base,
         )
         cos_list.append(cos)
         sin_list.append(sin)
@@ -203,7 +223,9 @@ class CachedRoPE:
         self.rope_image_info = None
 
     def __call__(self, seq_len, device, rope_image_info=None):
-        if (self.seq_len != seq_len) or (rope_image_info is not None and self.rope_image_info != rope_image_info):
+        if (self.seq_len != seq_len) or (
+            rope_image_info is not None and self.rope_image_info != rope_image_info
+        ):
             self.cos_cache, self.sin_cache = build_batch_2d_rope(
                 image_infos=rope_image_info,
                 seq_len=seq_len,
@@ -254,7 +276,9 @@ class ImageKVCacheManager:
         value = repeat_kv(value, repeat_num)
 
         attn_output = F.scaled_dot_product_attention(
-            query, key, value,
+            query,
+            key,
+            value,
             attn_mask=attention_mask.contiguous(),
             dropout_p=0.0,
             is_causal=False,

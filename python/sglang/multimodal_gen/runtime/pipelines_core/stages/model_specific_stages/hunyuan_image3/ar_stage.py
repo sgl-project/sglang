@@ -583,13 +583,12 @@ class HunyuanImage3AR(PipelineStage):
             try:
                 batched = self._encode_conditions_batched(flat_infos, device)
             except (torch.OutOfMemoryError, RuntimeError) as e:
-                if isinstance(e, RuntimeError) and "out of memory" not in str(
-                    e
-                ).lower():
+                if (
+                    isinstance(e, RuntimeError)
+                    and "out of memory" not in str(e).lower()
+                ):
                     raise
-                logger.warning(
-                    "Batched cond encoding OOM; falling back to sequential"
-                )
+                logger.warning("Batched cond encoding OOM; falling back to sequential")
                 _empty_device_cache()
         if batched is None:
             batched = self._encode_conditions_sequential(flat_infos, device)
@@ -1256,14 +1255,17 @@ class HunyuanImage3AR(PipelineStage):
             latent_bs = latent_model_input.shape[0]
             t_expand = t.repeat(latent_bs).to(device)
 
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=torch.bfloat16,
-                enabled=True,
-            ), set_forward_context(
-                current_timestep=step_idx,
-                attn_metadata=None,
-                forward_batch=head,
+            with (
+                torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=torch.bfloat16,
+                    enabled=True,
+                ),
+                set_forward_context(
+                    current_timestep=step_idx,
+                    attn_metadata=None,
+                    forward_batch=head,
+                ),
             ):
                 # Re-embed the full input_ids every step; shortening produces garbage.
                 hidden_states = self.ar_model.model.get_input_embeddings(input_ids)
@@ -1295,7 +1297,10 @@ class HunyuanImage3AR(PipelineStage):
                         n_req,
                         do_cfg,
                     )
-                    if cond_timestep_scatter_index is not None and all_cond_t is not None:
+                    if (
+                        cond_timestep_scatter_index is not None
+                        and all_cond_t is not None
+                    ):
                         cond_ts_index = cond_timestep_scatter_index
                         # Legacy tokenizer shapes: 1-D [P] or [1, P] must be
                         # expanded to one index row per sequence row.
