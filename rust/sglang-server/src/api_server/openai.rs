@@ -202,20 +202,5 @@ fn indexed_decode_stream(
     .boxed()
 }
 
-fn contains_media(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values.iter().any(contains_media),
-        serde_json::Value::Object(object) => {
-            object.keys().any(|key| {
-                matches!(
-                    key.as_str(),
-                    "image_url" | "video_url" | "input_audio" | "audio_url" | "file"
-                )
-            }) || object.values().any(contains_media)
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod test_utils;
