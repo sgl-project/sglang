@@ -309,7 +309,7 @@ class ServerArgs:
         return getattr(self, "_launch_command", None)
 
     def __repr__(self) -> str:
-        hidden = {"watermark_key", "watermark_config"}
+        hidden = {"watermark_key", "watermark_key_b", "watermark_config"}
         values = ", ".join(
             f"{field.name}={getattr(self, field.name)!r}"
             for field in record_fields(type(self))

@@ -612,6 +612,8 @@ class ModelRunner:
             context_window=features.watermark_context_window,
             max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
             key=features.watermark_key,
+            key_b=features.watermark_key_b,
+            mixing_probability=features.watermark_mixing_probability,
             device=self.device,
             default_enabled=features.watermark_default_enabled,
             enforce_all=features.watermark_enforce_all,

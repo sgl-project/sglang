@@ -34,7 +34,9 @@ def check_watermark_server_args(server_args: Any) -> None:
     has_watermark_setting = any(
         (
             cfg.watermark_key is not None,
+            cfg.watermark_key_b is not None,
             cfg.watermark_config is not None,
+            cfg.watermark_mixing_probability != 0.5,
             cfg.watermark_default_enabled,
             cfg.watermark_enforce_all,
         )
@@ -53,6 +55,18 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if cfg.watermark_key is not None:
         parse_watermark_key(cfg.watermark_key)
+    if cfg.watermark_key_b is not None:
+        parse_watermark_key(cfg.watermark_key_b)
+        if cfg.watermark_key is None:
+            raise ValueError(
+                "--watermark-key-b requires --watermark-key or --watermark-config"
+            )
+    if not 0 < cfg.watermark_mixing_probability < 1:
+        raise ValueError(
+            "--watermark-mixing-probability must be strictly between 0 and 1"
+        )
+    if cfg.watermark_key_b is None and cfg.watermark_mixing_probability != 0.5:
+        raise ValueError("--watermark-mixing-probability requires --watermark-key-b")
     if (
         cfg.watermark_default_enabled or cfg.watermark_enforce_all
     ) and cfg.watermark_key is None:

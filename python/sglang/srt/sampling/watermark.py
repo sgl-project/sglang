@@ -23,7 +23,7 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
         result = copy.copy(value)
         for field in dataclasses.fields(value):
             item = getattr(value, field.name)
-            if field.name in {"watermark_key", "watermark_config"}:
+            if field.name in {"watermark_key", "watermark_key_b", "watermark_config"}:
                 object.__setattr__(
                     result,
                     field.name,
@@ -52,7 +52,7 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
         return {
             key: (
                 "<redacted>"
-                if key in {"watermark_key", "watermark_config"}
+                if key in {"watermark_key", "watermark_key_b", "watermark_config"}
                 or (in_watermark_config and key == "key")
                 else redact_watermark_secrets(
                     item,
@@ -81,11 +81,13 @@ def redact_watermark_command_line(argv: Sequence[str]) -> str:
         if redact_next:
             result.append("<redacted>")
             redact_next = False
-        elif argument in {"--watermark-key", "--watermark-config"}:
+        elif argument in {"--watermark-key", "--watermark-key-b", "--watermark-config"}:
             result.append(argument)
             redact_next = True
         elif argument.startswith("--watermark-key="):
             result.append("--watermark-key=<redacted>")
+        elif argument.startswith("--watermark-key-b="):
+            result.append("--watermark-key-b=<redacted>")
         elif argument.startswith("--watermark-config="):
             result.append("--watermark-config=<redacted>")
         else:
@@ -298,13 +300,43 @@ def _watermark_hash32_torch(
     return _fmix32(state ^ 16)
 
 
+def _dual_key_a_mask_torch(
+    keys_a: torch.Tensor,
+    keys_b: torch.Tensor,
+    context_hashes: torch.Tensor,
+    mixing_thresholds: torch.Tensor,
+) -> torch.Tensor:
+    state = torch.zeros_like(keys_a, dtype=torch.int64)
+    state = _murmur3_mix(state, keys_a & _MASK32)
+    state = _murmur3_mix(state, (keys_a >> 32) & _MASK32)
+    state = _murmur3_mix(state, keys_b & _MASK32)
+    state = _murmur3_mix(state, (keys_b >> 32) & _MASK32)
+    state = _murmur3_mix(state, context_hashes & _MASK32)
+    hashed = _fmix32(state ^ 20)
+    return hashed < mixing_thresholds
+
+
 def select_watermark_tokens_torch(
     probabilities: torch.Tensor,
     context_hashes: torch.Tensor,
     keys: torch.Tensor,
+    keys_b: Optional[torch.Tensor] = None,
+    mixing_thresholds: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if (keys_b is None) != (mixing_thresholds is None):
+        raise ValueError(
+            "dual-key watermark selection requires both key B and mixing thresholds"
+        )
     token_ids = torch.arange(probabilities.shape[-1], device=probabilities.device)
     hashed = _watermark_hash32_torch(keys, context_hashes, token_ids)
+    if keys_b is not None:
+        if mixing_thresholds is None:
+            raise ValueError("dual-key watermark selection requires mixing thresholds")
+        hashed_b = _watermark_hash32_torch(keys_b, context_hashes, token_ids)
+        use_key_a = _dual_key_a_mask_torch(
+            keys, keys_b, context_hashes, mixing_thresholds
+        )
+        hashed = torch.where(use_key_a.view(-1, 1), hashed, hashed_b)
     uniform = (hashed.to(torch.float32) + 0.5) / _UINT32_SCALE
     scores = torch.where(
         probabilities > 0,
@@ -344,6 +376,8 @@ def force_watermark_tokens(
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
     keys: torch.Tensor,
+    keys_b: Optional[torch.Tensor] = None,
+    mixing_thresholds: Optional[torch.Tensor] = None,
 ) -> None:
     if logits.is_cuda:
         try:
@@ -362,6 +396,8 @@ def force_watermark_tokens(
                 top_ps,
                 min_ps,
                 keys,
+                keys_b,
+                mixing_thresholds,
             )
             return
 
@@ -374,6 +410,10 @@ def force_watermark_tokens(
     candidate_probabilities = probabilities[rows].to(torch.float32).contiguous()
     candidate_context_hashes = context_hashes[rows].contiguous()
     candidate_keys = keys[rows].contiguous()
+    candidate_keys_b = keys_b[rows].contiguous() if keys_b is not None else None
+    candidate_mixing_thresholds = (
+        mixing_thresholds[rows].contiguous() if mixing_thresholds is not None else None
+    )
     if candidate_probabilities.is_cuda:
         try:
             from sglang.kernels.ops.sampling.textseal_selector import (
@@ -384,18 +424,24 @@ def force_watermark_tokens(
                 candidate_probabilities,
                 candidate_context_hashes,
                 candidate_keys,
+                candidate_keys_b,
+                candidate_mixing_thresholds,
             )
         else:
             selected = select_watermark_tokens_triton(
                 candidate_probabilities,
                 candidate_context_hashes,
                 candidate_keys,
+                candidate_keys_b,
+                candidate_mixing_thresholds,
             )
     else:
         selected = select_watermark_tokens_torch(
             candidate_probabilities,
             candidate_context_hashes,
             candidate_keys,
+            candidate_keys_b,
+            candidate_mixing_thresholds,
         )
     logits[rows] = -torch.inf
     logits[rows, selected] = 0.0
@@ -410,11 +456,21 @@ class WatermarkState:
         max_contexts_per_req: int,
         key: Optional[str],
         device: str,
+        key_b: Optional[str] = None,
+        mixing_probability: float = 0.5,
         default_enabled: bool = False,
         enforce_all: bool = False,
     ) -> None:
         self.default_key_source = key
         self.default_key = parse_watermark_key(key) if key is not None else None
+        self.default_key_b = parse_watermark_key(key_b) if key_b is not None else None
+        if self.default_key_b is not None and self.default_key is None:
+            raise ValueError("watermark key B requires key A")
+        if not 0 < mixing_probability < 1:
+            raise ValueError(
+                "watermark mixing probability must be strictly between 0 and 1"
+            )
+        self.mixing_threshold = int(mixing_probability * (1 << 32))
         self.default_enabled = default_enabled
         self.enforce_all = enforce_all
         self.context_window = context_window
@@ -440,6 +496,18 @@ class WatermarkState:
         self.eligible_buffer = torch.empty(
             max_num_reqs, dtype=torch.bool, device=device
         )
+        self.key_b_buffer = torch.full(
+            (max_num_reqs,),
+            self.default_key_b if self.default_key_b is not None else 0,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.mixing_threshold_buffer = torch.full(
+            (max_num_reqs,),
+            self.mixing_threshold,
+            dtype=torch.int64,
+            device=device,
+        )
 
     @classmethod
     def create(
@@ -451,6 +519,8 @@ class WatermarkState:
         max_contexts_per_req: int,
         key: Optional[str],
         device: str,
+        key_b: Optional[str] = None,
+        mixing_probability: float = 0.5,
         default_enabled: bool = False,
         enforce_all: bool = False,
     ) -> Optional[WatermarkState]:
@@ -461,6 +531,8 @@ class WatermarkState:
             context_window=context_window,
             max_contexts_per_req=max_contexts_per_req,
             key=key,
+            key_b=key_b,
+            mixing_probability=mixing_probability,
             device=device,
             default_enabled=default_enabled,
             enforce_all=enforce_all,
@@ -777,6 +849,19 @@ class WatermarkState:
         expanded_req_pool_indices = req_pool_indices.repeat_interleave(draft_token_num)
         keys, _, watermark_enabled = self._watermark_batch_config(sampling_info)
         keys = keys.repeat_interleave(draft_token_num)
+        pool_indices = req_pool_indices.to(torch.int64)
+        keys_b = (
+            self.key_b_buffer[pool_indices].repeat_interleave(draft_token_num)
+            if self.default_key_b is not None
+            else None
+        )
+        mixing_thresholds = (
+            self.mixing_threshold_buffer[pool_indices].repeat_interleave(
+                draft_token_num
+            )
+            if self.default_key_b is not None
+            else None
+        )
         watermark_enabled = watermark_enabled.repeat_interleave(draft_token_num)
         top_ks = sampling_info.top_ks.repeat_interleave(draft_token_num, dim=0)
         eligible = (
@@ -810,6 +895,8 @@ class WatermarkState:
             top_ps=sampling_info.top_ps.repeat_interleave(draft_token_num, dim=0),
             min_ps=sampling_info.min_ps.repeat_interleave(draft_token_num, dim=0),
             keys=keys,
+            keys_b=keys_b,
+            mixing_thresholds=mixing_thresholds,
         )
         return context_hashes, selected
 
@@ -882,6 +969,16 @@ class WatermarkState:
                     top_ps=sampling_info.top_ps,
                     min_ps=sampling_info.min_ps,
                     keys=keys,
+                    keys_b=(
+                        self.key_b_buffer[req_pool_indices.to(torch.int64)]
+                        if self.default_key_b is not None
+                        else None
+                    ),
+                    mixing_thresholds=(
+                        self.mixing_threshold_buffer[req_pool_indices.to(torch.int64)]
+                        if self.default_key_b is not None
+                        else None
+                    ),
                 )
                 return
 
@@ -904,6 +1001,16 @@ class WatermarkState:
             top_ps=sampling_info.top_ps,
             min_ps=sampling_info.min_ps,
             keys=keys,
+            keys_b=(
+                self.key_b_buffer[req_pool_indices.to(torch.int64)]
+                if self.default_key_b is not None
+                else None
+            ),
+            mixing_thresholds=(
+                self.mixing_threshold_buffer[req_pool_indices.to(torch.int64)]
+                if self.default_key_b is not None
+                else None
+            ),
         )
         self._record_contexts(req_pool_indices, context_hashes, selected)
 

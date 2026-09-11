@@ -19,11 +19,14 @@ def _watermark_partial_argmax_kernel(
     probabilities,
     context_hashes,
     keys,
+    keys_b,
+    mixing_thresholds,
     partial_scores,
     partial_token_ids,
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    DUAL_KEY: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
@@ -39,9 +42,27 @@ def _watermark_partial_argmax_kernel(
     state: tl.uint32 = 0
     state = murmur3_mix(state, (key & 0xFFFFFFFF).to(tl.uint32))
     state = murmur3_mix(state, ((key >> 32) & 0xFFFFFFFF).to(tl.uint32))
-    state = murmur3_mix(state, tl.load(context_hashes + row).to(tl.uint32))
+    context_hash = tl.load(context_hashes + row).to(tl.uint32)
+    state = murmur3_mix(state, context_hash)
     state = murmur3_mix(state, token_ids.to(tl.uint32))
     hashed = fmix32(state ^ 16)
+    if DUAL_KEY:
+        key_b = tl.load(keys_b + row).to(tl.uint64)
+        mask_state: tl.uint32 = 0
+        mask_state = murmur3_mix(mask_state, (key & 0xFFFFFFFF).to(tl.uint32))
+        mask_state = murmur3_mix(mask_state, ((key >> 32) & 0xFFFFFFFF).to(tl.uint32))
+        mask_state = murmur3_mix(mask_state, (key_b & 0xFFFFFFFF).to(tl.uint32))
+        mask_state = murmur3_mix(mask_state, ((key_b >> 32) & 0xFFFFFFFF).to(tl.uint32))
+        mask_state = murmur3_mix(mask_state, context_hash)
+        use_key_a = fmix32(mask_state ^ 20).to(tl.uint64) < tl.load(
+            mixing_thresholds + row
+        ).to(tl.uint64)
+        state_b: tl.uint32 = 0
+        state_b = murmur3_mix(state_b, (key_b & 0xFFFFFFFF).to(tl.uint32))
+        state_b = murmur3_mix(state_b, ((key_b >> 32) & 0xFFFFFFFF).to(tl.uint32))
+        state_b = murmur3_mix(state_b, context_hash)
+        state_b = murmur3_mix(state_b, token_ids.to(tl.uint32))
+        hashed = tl.where(use_key_a, hashed, fmix32(state_b ^ 16))
     uniform = (hashed.to(tl.float32) + 0.5) / _UINT32_SCALE
 
     is_candidate = in_bounds & (candidate_probabilities > 0.0)
@@ -184,11 +205,14 @@ def _watermark_force_partial_argmax_kernel(
     top_ps,
     min_ps,
     keys,
+    keys_b,
+    mixing_thresholds,
     partial_scores,
     partial_token_ids,
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    DUAL_KEY: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
@@ -222,9 +246,27 @@ def _watermark_force_partial_argmax_kernel(
     state: tl.uint32 = 0
     state = murmur3_mix(state, (key & 0xFFFFFFFF).to(tl.uint32))
     state = murmur3_mix(state, ((key >> 32) & 0xFFFFFFFF).to(tl.uint32))
-    state = murmur3_mix(state, tl.load(context_hashes + row).to(tl.uint32))
+    context_hash = tl.load(context_hashes + row).to(tl.uint32)
+    state = murmur3_mix(state, context_hash)
     state = murmur3_mix(state, token_ids)
     hashed = fmix32(state ^ 16)
+    if DUAL_KEY:
+        key_b = tl.load(keys_b + row).to(tl.uint64)
+        mask_state: tl.uint32 = 0
+        mask_state = murmur3_mix(mask_state, (key & 0xFFFFFFFF).to(tl.uint32))
+        mask_state = murmur3_mix(mask_state, ((key >> 32) & 0xFFFFFFFF).to(tl.uint32))
+        mask_state = murmur3_mix(mask_state, (key_b & 0xFFFFFFFF).to(tl.uint32))
+        mask_state = murmur3_mix(mask_state, ((key_b >> 32) & 0xFFFFFFFF).to(tl.uint32))
+        mask_state = murmur3_mix(mask_state, context_hash)
+        use_key_a = fmix32(mask_state ^ 20).to(tl.uint64) < tl.load(
+            mixing_thresholds + row
+        ).to(tl.uint64)
+        state_b: tl.uint32 = 0
+        state_b = murmur3_mix(state_b, (key_b & 0xFFFFFFFF).to(tl.uint32))
+        state_b = murmur3_mix(state_b, ((key_b >> 32) & 0xFFFFFFFF).to(tl.uint32))
+        state_b = murmur3_mix(state_b, context_hash)
+        state_b = murmur3_mix(state_b, token_ids)
+        hashed = tl.where(use_key_a, hashed, fmix32(state_b ^ 16))
     uniform = (hashed.to(tl.float32) + 0.5) / _UINT32_SCALE
     safe_probabilities = tl.where(is_candidate, probabilities, 1.0)
     scores = tl.where(
@@ -280,6 +322,8 @@ def select_watermark_tokens_triton(
     probabilities: torch.Tensor,
     context_hashes: torch.Tensor,
     keys: torch.Tensor,
+    keys_b: torch.Tensor | None = None,
+    mixing_thresholds: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if probabilities.ndim != 2 or probabilities.dtype != torch.float32:
         raise ValueError("probabilities must be a 2D float32 tensor")
@@ -290,9 +334,25 @@ def select_watermark_tokens_triton(
         raise ValueError("context_hashes must be int64 with one value per row")
     if keys.shape != (batch_size,) or keys.dtype != torch.int64:
         raise ValueError("keys must be int64 with one value per row")
+    if (keys_b is None) != (mixing_thresholds is None):
+        raise ValueError(
+            "dual-key watermark selection requires both key B and mixing thresholds"
+        )
+    dual_key = keys_b is not None
+    if dual_key and (
+        keys_b.shape != (batch_size,)
+        or keys_b.dtype != torch.int64
+        or mixing_thresholds.shape != (batch_size,)
+        or mixing_thresholds.dtype != torch.int64
+    ):
+        raise ValueError("dual-key inputs must be int64 with one value per row")
+    keys_b = keys if keys_b is None else keys_b
+    mixing_thresholds = (
+        context_hashes if mixing_thresholds is None else mixing_thresholds
+    )
     if not all(
         tensor.is_cuda and tensor.is_contiguous()
-        for tensor in (probabilities, context_hashes, keys)
+        for tensor in (probabilities, context_hashes, keys, keys_b, mixing_thresholds)
     ):
         raise ValueError("Triton watermark inputs must be contiguous CUDA tensors")
 
@@ -313,11 +373,14 @@ def select_watermark_tokens_triton(
         probabilities,
         context_hashes,
         keys,
+        keys_b,
+        mixing_thresholds,
         partial_scores,
         partial_token_ids,
         vocab_size=vocab_size,
         num_splits=num_splits,
         BLOCK_SIZE=_BLOCK_SIZE,
+        DUAL_KEY=dual_key,
         num_warps=8,
     )
     _watermark_finalize_argmax_kernel[(batch_size,)](
@@ -398,7 +461,18 @@ def force_watermark_tokens_triton(
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
     keys: torch.Tensor,
+    keys_b: torch.Tensor | None = None,
+    mixing_thresholds: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if (keys_b is None) != (mixing_thresholds is None):
+        raise ValueError(
+            "dual-key watermark selection requires both key B and mixing thresholds"
+        )
+    dual_key = keys_b is not None
+    keys_b = keys if keys_b is None else keys_b
+    mixing_thresholds = (
+        context_hashes if mixing_thresholds is None else mixing_thresholds
+    )
     probabilities = torch.softmax(logits / temperatures, dim=-1)
     sorted_probabilities, sorted_token_ids = probabilities.sort(dim=-1, descending=True)
     cumulative_probabilities = torch.cumsum(sorted_probabilities, dim=-1)
@@ -425,11 +499,14 @@ def force_watermark_tokens_triton(
         top_ps,
         min_ps,
         keys,
+        keys_b,
+        mixing_thresholds,
         partial_scores,
         partial_token_ids,
         vocab_size=vocab_size,
         num_splits=num_splits,
         BLOCK_SIZE=_BLOCK_SIZE,
+        DUAL_KEY=dual_key,
         num_warps=8,
     )
     _watermark_finalize_and_write_kernel[(batch_size,)](

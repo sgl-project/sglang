@@ -148,6 +148,44 @@ def test_default_key_source_validation(tmp_path, monkeypatch):
         check_watermark_server_args(server_args)
 
 
+@pytest.mark.parametrize("mixing_probability", [0.0, 1.0])
+def test_dual_key_mixing_probability_is_open_interval(mixing_probability):
+    server_args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        watermark_key="0123456789abcdef",
+        watermark_key_b="fedcba9876543210",
+        watermark_mixing_probability=mixing_probability,
+    )
+    server_args.resolve_once()
+    with pytest.raises(ValueError, match="strictly between 0 and 1"):
+        check_watermark_server_args(server_args)
+
+
+def test_dual_key_requires_complete_server_config():
+    server_args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        watermark_key_b="fedcba9876543210",
+    )
+    server_args.resolve_once()
+    with pytest.raises(ValueError, match="requires --watermark-key"):
+        check_watermark_server_args(server_args)
+
+    server_args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        enable_watermark=True,
+        watermark_key="0123456789abcdef",
+        watermark_mixing_probability=0.25,
+    )
+    server_args.resolve_once()
+    with pytest.raises(ValueError, match="requires --watermark-key-b"):
+        check_watermark_server_args(server_args)
+
+
 @pytest.mark.parametrize(
     "mode_flag",
     ["watermark_default_enabled", "watermark_enforce_all"],
@@ -199,6 +237,7 @@ def test_watermarked_beam_search_is_rejected(monkeypatch):
 
 def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
     secret = "fedcba9876543210"
+    secret_b = "0123456789abcdee"
     config_path = tmp_path / f"watermark-{secret}.json"
     _write_config(config_path, key=secret)
     config = load_watermark_config(str(config_path))
@@ -208,15 +247,19 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
         model_path="dummy",
         enable_watermark=True,
         watermark_config=str(config_path),
+        watermark_key_b=secret_b,
     )
     server_args.resolve_once()
     logged_args = redact_watermark_secrets(server_args.resolved_dict())
     with caplog.at_level(logging.INFO):
         logging.getLogger(__name__).info("server_args=%s", logged_args)
     assert secret not in repr(server_args)
+    assert secret_b not in repr(server_args)
     assert secret not in caplog.text
+    assert secret_b not in caplog.text
     assert str(config_path) not in caplog.text
     assert logged_args["watermark_key"] == "<redacted>"
+    assert logged_args["watermark_key_b"] == "<redacted>"
     assert logged_args["watermark_config"] == "<redacted>"
 
     config_path.write_text(
@@ -259,10 +302,13 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
             "sglang.launch_server",
             "--watermark-key",
             secret,
+            "--watermark-key-b",
+            secret_b,
             "--watermark-config=/run/secrets/watermark.json",
         ]
     )
     assert secret not in command
+    assert secret_b not in command
     assert "/run/secrets/watermark.json" not in command
 
     server_args = prepare_server_args(
@@ -271,10 +317,12 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
             "dummy",
             "--watermark-key",
             secret,
+            f"--watermark-key-b={secret_b}",
             "--watermark-config=/run/secrets/watermark.json",
         ]
     )
     assert secret not in server_args.launch_command
+    assert secret_b not in server_args.launch_command
     assert "/run/secrets/watermark.json" not in server_args.launch_command
 
 

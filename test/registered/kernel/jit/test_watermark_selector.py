@@ -11,6 +11,7 @@ from sglang.kernels.ops.sampling.textseal_selector import (
 )
 from sglang.srt.sampling.watermark import (
     WatermarkState,
+    _dual_key_a_mask_torch,
     _hash_contexts,
     _truncate_probabilities,
     _watermark_hash32_torch,
@@ -46,6 +47,16 @@ def test_hash_matches_detector_vectors():
     actual = murmur_hash32(keys.cuda(), context_hashes.cuda(), token_ids.cuda())
     torch.testing.assert_close(actual.cpu().to(torch.int64), expected)
 
+    keys_b = torch.tensor(
+        [0x1111222233334444, 0x9999AAAABBBBCCCC - (1 << 64)], dtype=torch.int64
+    )
+    mixing_thresholds = torch.full((2,), 1 << 31, dtype=torch.int64)
+    expected_key_a_mask = torch.tensor([False, True])
+    torch.testing.assert_close(
+        _dual_key_a_mask_torch(keys, keys_b, context_hashes, mixing_thresholds),
+        expected_key_a_mask,
+    )
+
 
 def test_selector_matches_torch_across_split_boundaries():
     generator = torch.Generator().manual_seed(7)
@@ -62,6 +73,33 @@ def test_selector_matches_torch_across_split_boundaries():
     expected = select_watermark_tokens_torch(probabilities, context_hashes, keys)
     actual = select_watermark_tokens_triton(
         probabilities.cuda(), context_hashes.cuda(), keys.cuda()
+    ).cpu()
+
+    torch.testing.assert_close(actual.to(torch.int64), expected)
+
+
+def test_dual_key_selector_matches_torch_across_split_boundaries():
+    generator = torch.Generator().manual_seed(11)
+    batch_size = 5
+    vocab_size = 16397
+    probabilities = torch.rand(batch_size, vocab_size, generator=generator)
+    probabilities /= probabilities.sum(dim=-1, keepdim=True)
+    context_hashes = torch.tensor([0, 1, 2**31 - 1, 2**32 - 1, 1145416960])
+    keys_a = torch.tensor([0, 1, -1, -(2**63), 0x0123456789ABCDEF])
+    keys_b = torch.tensor([1, -1, 0, 0x1111222233334444, -(2**63)])
+    mixing_thresholds = torch.tensor(
+        [1, 1 << 30, 1 << 31, 3 << 30, (1 << 32) - 1], dtype=torch.int64
+    )
+
+    expected = select_watermark_tokens_torch(
+        probabilities, context_hashes, keys_a, keys_b, mixing_thresholds
+    )
+    actual = select_watermark_tokens_triton(
+        probabilities.cuda(),
+        context_hashes.cuda(),
+        keys_a.cuda(),
+        keys_b.cuda(),
+        mixing_thresholds.cuda(),
     ).cpu()
 
     torch.testing.assert_close(actual.to(torch.int64), expected)
@@ -123,6 +161,60 @@ def test_fused_force_matches_torch_truncation(dtype, vocab_size):
         top_ps,
         min_ps,
         keys,
+    )
+
+    assert torch.equal(actual.to(torch.int64), expected)
+    assert torch.equal(actual_logits, expected_logits)
+
+
+def test_dual_key_fused_force_matches_torch_truncation():
+    vocab_size = 16397
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    logits = torch.randn(
+        (5, vocab_size), generator=generator, device="cuda", dtype=torch.float16
+    )
+    temperatures = torch.tensor([[0.7], [1.0], [1.3], [0.9], [1.1]], device="cuda")
+    top_ks = torch.tensor([1, 7, 100, vocab_size, vocab_size], device="cuda")
+    top_ps = torch.tensor([1.0, 0.95, 0.5, 0.01, 1.0], device="cuda")
+    min_ps = torch.tensor([0.0, 0.0, 0.05, 0.0, 0.2], device="cuda")
+    context_hashes = torch.tensor(
+        [0, 1, 2**31 - 1, 2**32 - 1, 1145416960], device="cuda"
+    )
+    keys_a = torch.tensor([0, 1, -1, -(2**63), 0x0123456789ABCDEF], device="cuda")
+    keys_b = torch.tensor([1, -1, 0, 0x1111222233334444, -(2**63)], device="cuda")
+    mixing_thresholds = torch.tensor(
+        [1, 1 << 30, 1 << 31, 3 << 30, (1 << 32) - 1], device="cuda"
+    )
+    eligible = torch.tensor([False, True, True, True, True], device="cuda")
+
+    expected_logits = logits.clone()
+    probabilities = _truncate_probabilities(
+        expected_logits, temperatures, top_ks, top_ps, min_ps
+    )
+    rows = eligible.nonzero(as_tuple=True)[0]
+    expected = torch.full((5,), -1, dtype=torch.int64, device="cuda")
+    expected[rows] = select_watermark_tokens_torch(
+        probabilities[rows].float(),
+        context_hashes[rows],
+        keys_a[rows],
+        keys_b[rows],
+        mixing_thresholds[rows],
+    )
+    expected_logits[rows] = -torch.inf
+    expected_logits[rows, expected[rows]] = 0.0
+
+    actual_logits = logits.clone()
+    actual = force_watermark_tokens_triton(
+        actual_logits,
+        context_hashes,
+        eligible,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        keys_a,
+        keys_b,
+        mixing_thresholds,
     )
 
     assert torch.equal(actual.to(torch.int64), expected)
