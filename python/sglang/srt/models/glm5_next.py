@@ -328,6 +328,12 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
 
 GLM53_KDA_PTPC_BF16_MAX_M = {
     "qkv_proj": 4095,
+    "f_a_proj": 4095,
+    "g_a_proj": 4095,
+    "o_proj": 5631,
+}
+GLM53_KDA_PTPC_ALLOWED_K = {
+    "o_proj": (2048,),
 }
 
 
@@ -414,11 +420,18 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = self._can_fuse_proj(
+        ptpc_modules = set(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get())
+        use_ptpc_qkv = "qkv_proj" in ptpc_modules
+        use_ptpc_fg = bool({"f_a_proj", "g_a_proj"} & ptpc_modules)
+        self.do_fuse_qkvbfg = not (use_ptpc_qkv or use_ptpc_fg) and self._can_fuse_proj(
             quant_config, prefix, "fused_qkvbfg_a_proj", "fused_fg_b_proj"
         )
-        self.fuse_bfg = not self.do_fuse_qkvbfg and self._can_fuse_proj(
-            quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
+        self.fuse_bfg = (
+            not self.do_fuse_qkvbfg
+            and not use_ptpc_fg
+            and self._can_fuse_proj(
+                quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
+            )
         )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
@@ -604,6 +617,18 @@ class Glm5NextLinearAttention(nn.Module):
                 f"{sorted(unknown_ptpc_modules)}; supported: "
                 f"{sorted(supported_ptpc_modules)}"
             )
+        shared_input_modules = {"qkv_proj", "f_a_proj", "g_a_proj"}
+        selected_shared_input_modules = ptpc_modules & shared_input_modules
+        if selected_shared_input_modules not in (
+            set(),
+            {"qkv_proj"},
+            shared_input_modules,
+        ):
+            raise ValueError(
+                "GLM-5.3-Flash KDA PTPC requires qkv_proj, f_a_proj, and "
+                "g_a_proj to be selected together so their activation "
+                "quantization is shared"
+            )
         for module_name in ptpc_modules:
             module = getattr(self, module_name, None)
             if module is None:
@@ -618,10 +643,13 @@ class Glm5NextLinearAttention(nn.Module):
                 )
             module._glm53_kda_ptpc_module = module_name
             module._fp8_ptpc_bf16_max_m = GLM53_KDA_PTPC_BF16_MAX_M[module_name]
+            allowed_k = GLM53_KDA_PTPC_ALLOWED_K.get(module_name)
+            if allowed_k is not None:
+                module._fp8_ptpc_allowed_k = allowed_k
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        qkv_input = self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
-        qkv, _ = self.qkv_proj(qkv_input)
+        shared_input = self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+        qkv, _ = self.qkv_proj(shared_input)
 
         if self.fuse_bfg:
             fused_states = self.fused_bfg_a_proj(hidden_states)
@@ -631,8 +659,19 @@ class Glm5NextLinearAttention(nn.Module):
             )
         else:
             beta = self.b_proj(hidden_states)[0]
-            forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
-            g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+            num_tokens = hidden_states.numel() // hidden_states.shape[-1]
+            f_a_input = (
+                shared_input
+                if fp8_ptpc_linear_active(self.f_a_proj, num_tokens)
+                else hidden_states
+            )
+            g_a_input = (
+                shared_input
+                if fp8_ptpc_linear_active(self.g_a_proj, num_tokens)
+                else hidden_states
+            )
+            forget_gate = self.f_b_proj(self.f_a_proj(f_a_input)[0])[0]
+            g_proj_states = self.g_b_proj(self.g_a_proj(g_a_input)[0])[0]
 
         return (
             qkv,

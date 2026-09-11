@@ -13,7 +13,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=300, suite="jit-kernel-unit-test-amd")
 
 
 @unittest.skipUnless(
@@ -22,8 +22,17 @@ register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd-mi35x")
 )
 class TestGLM53KDAPTPC(CustomTestCase):
     TP_SHAPES = {
-        4: {"qkv_proj": (6144, 4096)},
-        8: {"qkv_proj": (3072, 4096)},
+        4: {
+            "qkv_proj": (6144, 4096),
+            "f_a_proj": (128, 4096),
+            "g_a_proj": (128, 4096),
+            "o_proj": (4096, 2048),
+        },
+        8: {
+            "qkv_proj": (3072, 4096),
+            "f_a_proj": (128, 4096),
+            "g_a_proj": (128, 4096),
+        },
     }
 
     def _run_shape(self, module_name: str, m: int, n: int, k: int):
@@ -80,8 +89,13 @@ class TestGLM53KDAPTPC(CustomTestCase):
             mean_abs = (actual.float() - expected.float()).abs().mean()
             self.assertGreater(cosine.item(), 0.995)
             self.assertLess(mean_abs.item(), 0.01)
+            replay_cosine = torch.nn.functional.cosine_similarity(
+                actual.float().flatten(), repeated.float().flatten(), dim=0
+            )
+            replay_mean_abs = (actual.float() - repeated.float()).abs().mean()
+            self.assertGreater(replay_cosine.item(), 0.9999)
+            self.assertLess(replay_mean_abs.item(), 1e-4)
         self.assertTrue(torch.isfinite(actual).all())
-        torch.testing.assert_close(actual, repeated, atol=0.002, rtol=0.01)
         self.assertIs(layer.weight, parameter)
         self.assertIn("_fp8_ptpc_weight", dict(layer.named_buffers()))
         self.assertNotIn("_fp8_ptpc_weight", layer.state_dict())
@@ -108,6 +122,43 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 for m in m_values:
                     with self.subTest(tp=tp, module=module_name, m=m):
                         self._run_shape(module_name, m, n, k)
+
+    def test_shared_input_ptpc_is_cuda_graph_capture_safe(self):
+        import aiter
+
+        m, n, k = 8192, 128, 4096
+        x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 0.1
+        layer = torch.nn.Module()
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(
+                torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.01,
+                requires_grad=False,
+            ),
+        )
+        layer._glm53_kda_ptpc_module = "f_a_proj"
+        layer._fp8_ptpc_bf16_max_m = GLM53_KDA_PTPC_BF16_MAX_M["f_a_proj"]
+        method = UnquantizedLinearMethod()
+        method._repack_bf16_to_fp8_ptpc(layer)
+
+        def run():
+            ptpc_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
+            return method.apply(layer, ptpc_input)
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertIn("_fp8_ptpc_weight", dict(layer.named_buffers()))
 
 
 if __name__ == "__main__":
