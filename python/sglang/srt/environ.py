@@ -951,6 +951,9 @@ class Envs:
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # NIXL plugin to use when --hicache-storage-backend-extra-config marks none
+    # active; "auto" lets NIXL pick by priority and availability.
+    SGLANG_HICACHE_NIXL_BACKEND_PLUGIN = EnvStr("auto")
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
