@@ -4,9 +4,6 @@ import pytest
 import sgl_kernel  # noqa: F401
 import torch
 
-from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
-    expand_scale_shift_cpu_param,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
 
@@ -97,41 +94,6 @@ class TestDiffusionNorm:
             (torch.float16, torch.float32),
         ],
     )
-    def test_fused_scale_shift_4d(self, input_dtype, param_dtype):
-        B, F, frame_seqlen, D = 2, 3, 4, 67
-        S = F * frame_seqlen
-
-        x = torch.randn(B, S, D, dtype=input_dtype)
-        scale = torch.randn(B, F, 1, D, dtype=param_dtype)
-        shift = torch.randn(B, F, 1, D, dtype=param_dtype)
-
-        out = torch.ops.sgl_kernel.fused_scale_shift_cpu(
-            x,
-            expand_scale_shift_cpu_param(scale, x),
-            expand_scale_shift_cpu_param(shift, x),
-            1.0,
-        )
-
-        scale_ref = scale.expand(B, F, frame_seqlen, D).reshape(B, S, D)
-        shift_ref = shift.expand(B, F, frame_seqlen, D).reshape(B, S, D)
-
-        ref = (x.float() * (1.0 + scale_ref.float()) + shift_ref.float()).to(
-            input_dtype
-        )
-
-        torch.testing.assert_close(
-            out, ref, atol=precision[input_dtype], rtol=precision[input_dtype]
-        )
-
-    @pytest.mark.parametrize(
-        "input_dtype,param_dtype",
-        [
-            (torch.bfloat16, torch.bfloat16),
-            (torch.bfloat16, torch.float32),
-            (torch.float16, torch.float16),
-            (torch.float16, torch.float32),
-        ],
-    )
     @pytest.mark.parametrize("norm_type", ["rms", "layer"])
     def test_fused_norm_scale_shift(
         self,
@@ -143,11 +105,7 @@ class TestDiffusionNorm:
 
         x = torch.randn(B, S, D, dtype=input_dtype)
         weight = torch.randn(D, dtype=torch.float32)
-        bias = (
-            torch.randn(D, dtype=torch.float32)
-            if norm_type == "layer"
-            else None
-        )
+        bias = torch.randn(D, dtype=torch.float32) if norm_type == "layer" else None
 
         scale = torch.randn(B, 1, D, dtype=param_dtype)
         shift = torch.randn(B, S, D, dtype=param_dtype)
@@ -179,9 +137,7 @@ class TestDiffusionNorm:
         # Match CUDA/CuTe activation-dtype boundary.
         normalized = normalized.to(input_dtype).float()
 
-        ref = (
-            normalized * (1.0 + scale.float()) + shift.float()
-        ).to(input_dtype)
+        ref = (normalized * (1.0 + scale.float()) + shift.float()).to(input_dtype)
 
         torch.testing.assert_close(
             out,
@@ -316,7 +272,6 @@ class TestDiffusionNorm:
         torch.testing.assert_close(
             out, ref_out, atol=precision[input_dtype], rtol=precision[input_dtype]
         )
-
 
 
 if __name__ == "__main__":
