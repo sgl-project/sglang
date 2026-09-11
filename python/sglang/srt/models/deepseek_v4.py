@@ -31,6 +31,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_gemv import wo_a_bf16_gemv
+from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
+    wo_a_bf16_small_batch,
+)
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -488,6 +491,8 @@ def _apply_wo_a_bf16_matmul(
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
+        if 2 <= o.shape[0] <= 8:
+            return wo_a_bf16_small_batch(o, wo_a)
         result = torch.empty(
             (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
         )
@@ -2693,10 +2698,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
         apply_pre: Optional[torch.Tensor],
+        norm: RMSNorm,
         stats_stream: Optional[torch.cuda.Stream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mixing coefficients come from x; the sublayer input is x collapsed with
-        apply_pre (None selects copy 0). Returns (y, pre, post, comb)."""
+        apply_pre (None selects copy 0), then RMS-normalized.
+        Returns (y, pre, post, comb)."""
         from sglang.kernels.ops.layernorm.mhc import (
             hc_combine,
             hc_mix_stats,
@@ -2705,6 +2712,31 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         dtype = x.dtype
         x_flat = x.flatten(1)
+
+        def combine_and_norm():
+            if apply_pre is None:
+                return norm(x[:, 0, :].contiguous())
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+            if (
+                x.is_cuda
+                and get_platform().is_blackwell
+                and 0 < x.shape[0] <= 8
+                and self.hc_mult == 4
+                and x_flat.shape[1] == 20480
+                and x.dtype == norm.weight.dtype == torch.bfloat16
+                and apply_pre.stride(1) == 1
+                and not norm.cast_x_before_out_mul
+                and norm.variance_size_override is None
+                and not is_batch_invariant_mode_enabled()
+            ):
+                from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
+
+                return hc_combine_norm(
+                    x_flat, apply_pre, norm.weight, norm.variance_epsilon
+                )
+            return norm(hc_combine(x_flat, apply_pre, self.hc_mult, dtype))
+
         if (
             x.is_cuda
             and torch.version.cuda is not None
@@ -2717,6 +2749,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             # The split-K partial fixes the reduction order;
             # fusing the reduction and sinkhorn preserves batch invariance.
             main_stream = torch.cuda.current_stream()
+            # Avoid competing with the statistics projection for a tiny input;
+            # the coefficients still overlap the attention or FFN that follows.
+            y = (
+                combine_and_norm()
+                if stats_stream is not None and 0 < x.shape[0] <= 8
+                else None
+            )
             if stats_stream is not None:
                 stats_stream.wait_stream(main_stream)
                 x.record_stream(stats_stream)
@@ -2740,10 +2779,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # after the caller joins it, on the main stream.
                 for coefficient in (pre, post, comb):
                     coefficient.record_stream(main_stream)
-            if apply_pre is None:
-                y = x[:, 0, :].contiguous()
-            else:
-                y = hc_combine(x_flat, apply_pre, self.hc_mult, dtype)
+            if y is None:
+                y = combine_and_norm()
             return y, pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
             # Keep mixing and RMS reductions batch-invariant; cuBLAS/torch reductions can
@@ -2763,10 +2800,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        if apply_pre is None:
-            y = x[:, 0, :].contiguous()
-        else:
-            y = hc_combine(x_flat, apply_pre, self.hc_mult, dtype)
+        y = combine_and_norm()
         return y, pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
 
     def _get_hc_stats_stream(self, hidden_states, forward_batch):
@@ -2804,9 +2838,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_scale,
             self.hc_attn_base,
             apply_pre=prev_pre,
+            norm=self.input_layernorm,
             stats_stream=stats_stream,
         )
-        x = self.input_layernorm(x)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(
                 x=x, positions=positions, forward_batch=forward_batch, x_quant=None
@@ -2822,9 +2856,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_scale,
             self.hc_ffn_base,
             apply_pre=attn_pre,
+            norm=self.post_attention_layernorm,
             stats_stream=stats_stream,
         )
-        x = self.post_attention_layernorm(x)
         x = self._run_moe_ffn_dp_sync(
             x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
         )

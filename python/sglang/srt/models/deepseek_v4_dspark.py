@@ -702,9 +702,9 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             self.hc_attn_scale,
             self.hc_attn_base,
             apply_pre=prev_pre,
+            norm=self.input_layernorm,
             stats_stream=stats_stream,
         )
-        x = self.input_layernorm(x)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(positions, x, forward_batch)
         if stats_stream is not None:
@@ -718,9 +718,9 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             self.hc_ffn_scale,
             self.hc_ffn_base,
             apply_pre=attn_pre,
+            norm=self.post_attention_layernorm,
             stats_stream=stats_stream,
         )
-        x = self.post_attention_layernorm(x)
         x = self._run_ffn(x, forward_batch)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
