@@ -161,14 +161,18 @@ class IncLockRefResult:
     ``node_id`` is the anchor the lock was taken on; a release replays the
     receipt on that node only. The SWA UUID marks the segment boundary;
     ``None`` means root. ``skipped_lock_components`` records the components
-    the acquire left untaken, so the release leaves them untouched.
+    the acquire left untaken, so the release leaves them untouched. A Full
+    host lock has its own UUID boundary, which starts on the anchor and moves
+    to the inserted prefix when that anchor is split.
     """
 
     delta: Optional[int] = None
     node_id: Optional[int] = None
+    # TODO: Replace component-specific UUID fields with ComponentType-to-UUID maps
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    full_uuid_for_host_lock: Optional[int] = None
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
@@ -177,6 +181,7 @@ class IncLockRefResult:
             swa_uuid_for_lock=self.swa_uuid_for_lock,
             swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
             skipped_lock_components=tuple(self.skipped_lock_components),
+            full_uuid_for_host_lock=self.full_uuid_for_host_lock,
         )
 
 
@@ -194,6 +199,7 @@ class DecLockRefParams:
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    full_uuid_for_host_lock: Optional[int] = None
 
 
 @dataclasses.dataclass
