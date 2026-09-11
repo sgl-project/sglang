@@ -118,6 +118,7 @@ class _CacheDitRecordingBlock(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.attention_type = "full_attention"
 
     def forward(self, hidden_states, *, sensenova_marker=None, **kwargs):
         self.calls.append((sensenova_marker, kwargs))
@@ -132,6 +133,7 @@ class _CacheDitSenseNovaTransformer(torch.nn.Module):
         self.layers = torch.nn.ModuleList(
             [_CacheDitRecordingBlock(), _CacheDitRecordingBlock()]
         )
+        self.config = SimpleNamespace(num_hidden_layers=2)
         self.used_native_layers = []
 
     def forward(
@@ -744,7 +746,10 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
 
 def test_sensenova_u1_cache_dit_mounts_refreshes_and_unmounts(monkeypatch):
     calls = _install_sensenova_cache_dit_stub(monkeypatch)
-    transformer = SimpleNamespace(layers=object())
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
     batch = SimpleNamespace(
@@ -760,6 +765,7 @@ def test_sensenova_u1_cache_dit_mounts_refreshes_and_unmounts(monkeypatch):
 
     assert len(calls["enable"]) == 1
     assert transformer._sensenova_cache_dit_native_layers is transformer.layers
+    assert transformer._sensenova_cache_dit_attention_type == "full_attention"
     config = calls["enable"][0][1]
     assert config.kwargs["num_inference_steps"] == 8
     assert config.kwargs["residual_diff_threshold"] == 0.1
@@ -772,12 +778,16 @@ def test_sensenova_u1_cache_dit_mounts_refreshes_and_unmounts(monkeypatch):
     stage._maybe_enable_cache_dit(batch, SimpleNamespace())
     assert calls["disable"] == [transformer]
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
 
 
 def test_sensenova_u1_cache_dit_rolls_back_partial_mount(monkeypatch):
     mount_error = RuntimeError("cache-dit mount failed")
     calls = _install_sensenova_cache_dit_stub(monkeypatch, enable_error=mount_error)
-    transformer = SimpleNamespace(layers=object())
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
     batch = SimpleNamespace(
@@ -795,6 +805,7 @@ def test_sensenova_u1_cache_dit_rolls_back_partial_mount(monkeypatch):
     assert calls["disable"] == [transformer]
     assert not hasattr(transformer, "_partial_cache_dit_hook")
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
     assert stage._cache_dit_enabled is False
     assert stage._cache_dit_active_key is None
     assert stage._cache_dit_cleanup_required is False
@@ -806,7 +817,10 @@ def test_sensenova_u1_cache_dit_failed_rollback_blocks_later_requests(monkeypatc
         enable_error=RuntimeError("cache-dit mount failed"),
         disable_error=RuntimeError("cache-dit cleanup failed"),
     )
-    transformer = SimpleNamespace(layers=object())
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
     batch = SimpleNamespace(
@@ -826,6 +840,7 @@ def test_sensenova_u1_cache_dit_failed_rollback_blocks_later_requests(monkeypatc
     assert stage._cache_dit_active_key is None
     assert stage._cache_dit_cleanup_required is True
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
 
     # A later ordinary request must retry cleanup and fail closed instead of
     # reaching the early return while the transformer may still be wrapped.
@@ -845,7 +860,10 @@ def test_sensenova_u1_cache_dit_remounts_when_cfg_mode_changes(
     monkeypatch, first_guidance_scale, second_guidance_scale
 ):
     calls = _install_sensenova_cache_dit_stub(monkeypatch)
-    transformer = SimpleNamespace(layers=object())
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
     batch = SimpleNamespace(
@@ -926,6 +944,7 @@ def test_sensenova_u1_real_cache_dit_wrapper_routes_only_denoising():
     assert transformer.layers is native_layers
     assert not hasattr(transformer, "_original_forward")
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
 
 
 def test_sensenova_u1_invalid_output_count_does_not_mount_cache_dit(monkeypatch):
@@ -1172,6 +1191,16 @@ def test_sensenova_cache_dit_effective_defaults_reuse_mount(
     transformer = SimpleNamespace(
         layers=[SimpleNamespace(attention_type="full_attention")],
         config=SimpleNamespace(num_hidden_layers=1),
+@pytest.mark.parametrize(
+    "attention_types", [[], ["full_attention", "sliding_attention"], [None]]
+)
+def test_sensenova_cache_dit_rejects_invalid_attention_before_mount(
+    monkeypatch, attention_types
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type=value) for value in attention_types],
+        config=SimpleNamespace(num_hidden_layers=len(attention_types)),
     )
     stage = SenseNovaU1GenerationStage(
         model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
@@ -1202,3 +1231,13 @@ def test_sensenova_cache_dit_effective_defaults_reuse_mount(
     assert len(calls["enable"]) == 2
     assert calls["enable"][1][1].kwargs["residual_diff_threshold"] == 0.1
     assert calls["disable"] == [transformer]
+    batch = SimpleNamespace(
+        num_inference_steps=8,
+        guidance_scale=1.0,
+        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
+    )
+    with pytest.raises(ValueError, match="attention type"):
+        stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    assert calls == {"enable": [], "disable": [], "refresh": []}
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")

@@ -38,6 +38,23 @@ _SENSENOVA_DBCACHE_KEYS = frozenset(
 )
 
 
+def _get_cache_dit_attention_type(transformer: torch.nn.Module) -> str:
+    """Validate once per mount: the unified wrapper passes one mask to all blocks."""
+    attention_types = {
+        layer.attention_type
+        for layer in transformer.layers[: transformer.config.num_hidden_layers]
+    }
+    if len(attention_types) != 1:
+        raise ValueError(
+            "SenseNova-U1 Cache-DiT requires all decoder layers to "
+            "use the same attention type."
+        )
+    attention_type = next(iter(attention_types))
+    if attention_type is None:
+        raise ValueError("SenseNova-U1 Cache-DiT requires a decoder attention type.")
+    return attention_type
+
+
 def _denorm_sensenova_output(x: torch.Tensor) -> torch.Tensor:
     """Convert SenseNova's normalized image tensor from [-1, 1] to [0, 1]."""
     return ((x.float() + 1.0) * 0.5).clamp(0, 1)
@@ -108,6 +125,8 @@ class SenseNovaU1GenerationStage(PipelineStage):
         finally:
             if hasattr(transformer, "_sensenova_cache_dit_native_layers"):
                 del transformer._sensenova_cache_dit_native_layers
+            if hasattr(transformer, "_sensenova_cache_dit_attention_type"):
+                del transformer._sensenova_cache_dit_attention_type
             self._cache_dit_enabled = False
             self._cache_dit_active_key = None
             # If rollback itself failed, do not let a later ordinary request
@@ -195,6 +214,8 @@ class SenseNovaU1GenerationStage(PipelineStage):
         if not requested:
             return
 
+        attention_type = _get_cache_dit_attention_type(transformer)
+
         # Cache-DiT's forward wrapper replaces ``transformer.layers`` only
         # dynamically. Preserve the genuine ModuleList so both Qwen3 backbones
         # can use it for prefix/Think/text forwards during this mounted session.
@@ -203,6 +224,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
         object.__setattr__(
             transformer, "_sensenova_cache_dit_native_layers", transformer.layers
         )
+        transformer._sensenova_cache_dit_attention_type = attention_type
         try:
             config = CacheDitConfig(
                 enabled=True,

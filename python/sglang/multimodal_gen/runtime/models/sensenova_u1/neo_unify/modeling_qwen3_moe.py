@@ -526,16 +526,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                     raise AttributeError(
                         "Decoder layer does not expose an attention_type."
                     )
-                attention_types = {
-                    layer.attention_type
-                    for layer in native_layers[: self.config.num_hidden_layers]
-                }
-                if len(attention_types) != 1:
-                    raise ValueError(
-                        "SenseNova-U1 Cache-DiT requires all decoder layers to "
-                        "use the same attention type."
-                    )
-                attention_type = next(iter(attention_types))
+                attention_type = self._sensenova_cache_dit_attention_type
 
             hidden_states = decoder_layer(
                 hidden_states,
