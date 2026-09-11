@@ -611,8 +611,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         if is_multimodal:
-            request_prompts = [processed_messages.prompt]
-            engine_prompts = [processed_messages.prompt]
+            # Custom encoders (the DSv4.1 encoder among them) render token ids
+            # and leave the string prompt empty, so a multimodal model would
+            # otherwise hand an empty text to the engine and fail with
+            # "texts cannot be empty and tokenizer must be initialized".
+            # Models that fill both keep using the string prompt.
+            prompt = processed_messages.prompt or processed_messages.prompt_ids
+            request_prompts = [prompt]
+            engine_prompts = [prompt]
         else:
             request_prompts = [processed_messages.prompt_ids]
             engine_prompts = [processed_messages.prompt_ids]

@@ -622,6 +622,65 @@ class MultimodalRequestTestCase(CustomTestCase):
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
+    def test_multimodal_custom_encoder_prompt_ids_reach_the_engine(self):
+        """A custom encoder (DSv4.1) renders token ids and leaves the string
+        prompt empty; the engine must receive the ids, not empty text.
+
+        Handing the empty string over made _tokenize_texts raise
+        "texts cannot be empty and tokenizer must be initialized" (400).
+        """
+        serving = make_serving(is_multimodal=True)
+        captured = {}
+
+        serving._process_messages = Mock(
+            return_value=MessageProcessingResult(
+                prompt="",
+                prompt_ids=[7, 8, 9],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=None,
+                stop=[],
+            )
+        )
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["request_prompt"] = request_prompt
+            captured["adapted_request"] = adapted_request
+            context.append_output(
+                {
+                    "text": "Paris",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="The capital of France is",
+            request_id="resp_ids",
+            store=False,
+        )
+
+        response = asyncio.run(serving.create_responses(request))
+
+        self.assertEqual(response.status, "completed")
+        self.assertEqual(captured["request_prompt"], [7, 8, 9])
+        self.assertEqual(captured["adapted_request"].input_ids, [7, 8, 9])
+        self.assertIsNone(captured["adapted_request"].text)
+
 
 class OutputItemsTestCase(CustomTestCase):
     def setUp(self):
