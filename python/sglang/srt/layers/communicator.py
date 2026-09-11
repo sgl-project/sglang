@@ -528,6 +528,7 @@ class LayerCommunicator:
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
+        enable_fused_ar_quant_mlp: bool = False,
         _is_sp_variant: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
@@ -544,6 +545,11 @@ class LayerCommunicator:
         self._context.force_layernorm_before_dp_gather = (
             force_layernorm_before_dp_gather
         )
+        # Separate opt-in from the attention-side one: turning this on makes
+        # prepare_mlp hand the MLP a (bf16, fp8, scale) triple, which the
+        # consuming block must be prepared for. Only models whose MoE block
+        # unpacks that tuple may enable it.
+        self._context.enable_fused_ar_quant_mlp = enable_fused_ar_quant_mlp
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -997,6 +1003,10 @@ class CommunicateContext:
     cache = None
     tp_rank: int
     force_layernorm_before_dp_gather: bool = False
+    # Mirror of LayerCommunicator's opt-in so the MLP-side communicate
+    # functions, which receive only (layernorm, context), can reach it. The
+    # attention side reads the flags off ``self`` directly in prepare_attn.
+    enable_fused_ar_quant_mlp: bool = False
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -1290,9 +1300,31 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
-                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual, use_attn_tp_group=True
-                )
+                # Prefer the fused AR+RMSNorm+per-group-quant kernel, which also
+                # absorbs the separate activation-quant launch the MoE block
+                # would otherwise do. keep_bf16 is always on here: the MoE block
+                # has bf16 consumers (router gate, shared-expert gate) alongside
+                # the FP8 shared-expert projection. Returns None when the model
+                # has not opted in or the shape is not serviceable, in which
+                # case we fall back to plain AR+RMSNorm below.
+                quant_result = None
+                if context.enable_fused_ar_quant_mlp and hasattr(
+                    layernorm, "forward_with_allreduce_fusion_quant_per_group"
+                ):
+                    quant_result = (
+                        layernorm.forward_with_allreduce_fusion_quant_per_group(
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=True,
+                            keep_bf16=True,
+                        )
+                    )
+                if quant_result is not None:
+                    hidden_states, residual = quant_result
+                else:
+                    hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                        hidden_states, residual, use_attn_tp_group=True
+                    )
                 handled = True
 
             if not handled:
