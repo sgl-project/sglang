@@ -4678,13 +4678,9 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_lmcache:
-            if_success = self.tree_cache.clear_storage_backend()
-            if if_success:
-                logger.info("Unified LMCache cleared successfully!")
-        elif self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_lmcache:
             self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
+            logger.info("Hierarchical cache or LMCache cleared successfully!")
             if_success = True
         else:
             logging.warning("Hierarchical cache or LMCache is not enabled.")

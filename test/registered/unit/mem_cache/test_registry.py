@@ -463,11 +463,6 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             )
             self.assertIs(result, fake_module.LMCacheUnifiedRadixCache.return_value)
 
-    def test_lmcache_rejects_hicache(self):
-        ctx = _make_ctx(self, enable_lmcache=True, enable_hierarchical_cache=True)
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            default_radix_cache_factory(ctx)
-
     def test_lmcache_supports_hybrid_swa_components(self):
         ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_swa=True)
         fake_module = MagicMock()
@@ -528,24 +523,50 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             (fake_components.ComponentType.FULL,),
         )
 
-    def test_lmcache_rejects_pure_swa(self):
+    def test_lmcache_exposes_c128_as_unsupported_component(self):
+        ctx = _make_ctx(self, enable_lmcache=True)
+        ctx.params.req_to_token_pool = MagicMock(spec=["req_to_c128_sidecar"])
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.C128,
+            ),
+        )
+
+    def test_lmcache_pure_swa_omits_full_component(self):
         ctx = _make_ctx(
             self,
             enable_lmcache=True,
             is_hybrid_swa=True,
             full_tokens_per_layer=0,
         )
-        with self.assertRaisesRegex(NotImplementedError, "pure-SWA"):
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
             default_radix_cache_factory(ctx)
 
-    def test_lmcache_and_external_linker_are_mutually_exclusive(self):
-        ctx = _make_ctx(
-            self,
-            enable_lmcache=True,
-            enable_unified_cache_external_linker=True,
+        self.assertEqual(
+            ctx.params.tree_components,
+            (fake_components.ComponentType.SWA,),
         )
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            default_radix_cache_factory(ctx)
 
 
 if __name__ == "__main__":

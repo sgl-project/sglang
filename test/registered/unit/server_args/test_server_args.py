@@ -35,7 +35,10 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     validate_prefill_only_disable_kv_cache_args,
 )
-from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.arg_groups.mamba_hook import (
+    handle_int8_mamba_checkpoint,
+    handle_mamba_backend,
+)
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
@@ -1808,6 +1811,35 @@ class TestHiCacheArgs(unittest.TestCase):
         )
 
         handle_cache_compatibility(args)
+
+
+class TestLMCacheArgs(unittest.TestCase):
+    def test_rejects_incompatible_server_args(self):
+        cases = [
+            ({"enable_hierarchical_cache": True}, "mutually exclusive"),
+            ({"enable_unified_cache_external_linker": True}, "mutually exclusive"),
+            ({"disable_radix_cache": True}, "requires radix cache"),
+            ({"speculative_algorithm": "EAGLE"}, "EAGLE bigram keys"),
+            ({"enable_dp_attention": True}, "DP attention"),
+            ({"dcp_size": 2}, "DCP-aware index translation"),
+            ({"enable_streaming_session": True}, "streaming sessions"),
+            ({"hicache_host_memory_mode": "buffer_only"}, "HiCache-only mode"),
+            ({"disaggregation_mode": "prefill"}, "colocated"),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                args = ServerArgs(model_path="dummy", enable_lmcache=True, **overrides)
+                with self.assertRaisesRegex((ValueError, NotImplementedError), message):
+                    handle_cache_compatibility(args)
+
+    def test_rejects_int8_mamba_checkpoint(self):
+        args = ServerArgs(
+            model_path="dummy",
+            enable_lmcache=True,
+            enable_int8_mamba_checkpoint=True,
+        )
+        with self.assertRaisesRegex(ValueError, "LMCache is not int8-aware"):
+            handle_int8_mamba_checkpoint(args)
 
 
 class TestNgramExternalSamArgs(CustomTestCase):
