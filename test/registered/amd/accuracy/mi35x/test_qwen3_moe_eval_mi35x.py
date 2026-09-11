@@ -1,7 +1,7 @@
 """MI35x Qwen3 MoE (unquantized) sgl-eval GSM8K Chat Evaluation Test (8-GPU)
 
-Tests unquantized (bf16) Qwen3 MoE (Qwen/Qwen3-30B-A3B) using a few-shot GSM8K
-completion benchmark on MI35x with aiter enabled (SGLANG_USE_AITER=1).
+Tests unquantized (bf16) Qwen3 MoE (Qwen/Qwen3-30B-A3B) using the sgl-eval GSM8K
+chat benchmark on MI35x with aiter enabled (SGLANG_USE_AITER=1).
 
 Registry: nightly-amd-8-gpu-mi35x suite
 """

@@ -122,21 +122,25 @@ def run_accuracy_benchmark(
     eval_type="openai_api",
 ):
 
-    if any(dataset in {"gsm8k", "mmlu"} for dataset in datasets):
+    from sgl_eval.registry import list_evals
+
+    supported_evals = {spec.name for spec in list_evals()}
+    eval_names = ["gpqa" if name == "gpqa_diamond" else name for name in datasets]
+    if any(name in supported_evals for name in eval_names):
         if len(datasets) != 1:
             raise ValueError(
                 "Run sgl-eval benchmarks separately to keep accuracy gates distinct"
             )
         if dataset_args or dataset_dir:
             raise ValueError(
-                "GSM8K/MMLU dataset and prompt configuration belongs to sgl-eval"
+                "Dataset and prompt configuration for this benchmark belongs to sgl-eval"
             )
         generation = dict(generation_config or {"max_tokens": 2048})
         extra_body = dict(generation.pop("extra_body", {}))
         chat_kwargs = extra_body.pop("chat_template_kwargs", {})
         return run_sgl_eval(
             SimpleNamespace(
-                eval_name=datasets[0],
+                eval_name=eval_names[0],
                 host=host,
                 port=port,
                 model=model,

@@ -5,8 +5,7 @@ datasets, prompts, sampling parameters, and grading. It creates an in-process
 `sgl.Engine`; there is no separate server process. Engine startup is excluded
 from the timed interval, and no additional request warmup is run.
 
-The runner downloads pinned revisions of GSM8K, MATH-500, AIME 2024, AIME
-2025, and AIME 2026. It applies the same boxed-answer instruction and Qwen
+The offline runner downloads a pinned revision of MATH-500. It applies the same boxed-answer instruction and Qwen
 reasoning chat template to every engine, then grades with `math_verify`.
 
 Install SGLang with its evaluation dependencies:
@@ -18,8 +17,7 @@ pip install -e "python[test]"
 ## Reproduce the H200 table
 
 Run from the SGLang repository root. Each invocation below produces one row of
-the PR table. GSM8K and MATH-500 use one sample per problem; AIME 2025 uses ten
-samples per problem, or 300 completions.
+the MATH-500 portion of the PR table, using one sample per problem.
 
 ```bash
 export MODEL_PATH=Qwen/Qwen3-8B
@@ -81,22 +79,18 @@ run_tree_uno() {
 }
 ```
 
-Run the four batch-64 AR and linear `B/K/V = 8/1/8` rows:
+Run the two batch-64 AR and linear `B/K/V = 8/1/8` rows:
 
 ```bash
 run_ar         math500 1  64 ar-math500-c64
 run_linear_uno math500 1  64 uno-linear-b8-k1-v8-math500-c64
-run_ar         aime25  10 64 ar-aime25-c64
-run_linear_uno aime25  10 64 uno-linear-b8-k1-v8-aime25-c64
 ```
 
-Run the four batch-1 AR and tree `B/K/V = 16/32/32` rows:
+Run the two batch-1 AR and tree `B/K/V = 16/32/32` rows:
 
 ```bash
 run_ar       math500 1  1 ar-math500-c1
 run_tree_uno math500 1  1 uno-tree-b16-k32-v32-math500-c1
-run_ar       aime25  10 1 ar-aime25-c1
-run_tree_uno aime25  10 1 uno-tree-b16-k32-v32-aime25-c1
 ```
 
 Each output directory contains raw generations, per-answer grades, and
@@ -143,4 +137,18 @@ PYTHONPATH=python python -m benchmark.uno.run_math_eval \
 For EAGLE and DFLASH, TPF follows SGLang's acceptance-length convention and
 counts generated tokens per target verification forward.
 
-For GSM8K accuracy, serve the model and run `sgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1`.
+## GSM8K and AIME
+
+For GSM8K and AIME, launch the model with `sglang serve` and the desired
+speculative-decoding options, then evaluate it with `sgl-eval`:
+
+```bash
+sgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1
+sgl-eval run aime25 --base-url http://127.0.0.1:30000/v1 \
+  --n-repeats 10 --num-threads 64 --max-tokens 32768 \
+  --temperature 1 --top-p 0.95 --seed 42
+```
+
+Use `aime24` or `aime26` for the other AIME editions. These commands use
+sgl-eval's dataset, prompt, and grader; historical scores from the offline
+runner must be remeasured with this protocol.
