@@ -7,12 +7,25 @@
 from typing import List, Optional, Union
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.spec import CapabilityRequirement, FormatSignature, KernelBackend
 
 PAD_SLOT_ID = -1
+
+
+def _normalize_activation(
+    activation: Optional[Union[str, bool]],
+) -> Optional[str]:
+    if isinstance(activation, bool):
+        activation = "silu" if activation else None
+    if activation not in (None, "silu", "swish"):
+        raise NotImplementedError("activation must be None, silu, or swish")
+    return activation
 
 
 @triton.jit()
@@ -170,7 +183,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
         # STEP 2:
         # here prepare data for updating conv_state
-        if (
+        if HAS_CACHE and (
             state_len <= seqlen
         ):  # SMALL_CACHE=True (only move part of 'x' into conv_state cache)
             # just read from 'x'
@@ -204,7 +217,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
             tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
-        else:
+        elif HAS_CACHE:
             if load_init_state:
                 # update conv_state by shifting left, i.e. take last few cols from conv_state + cols from 'x'
                 idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
@@ -390,16 +403,16 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
-def causal_conv1d_fn(
+def _causal_conv1d_fn_triton(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Union[torch.Tensor, None],
-    conv_states: torch.Tensor,
+    conv_states: Optional[torch.Tensor],
     query_start_loc: torch.Tensor,
     seq_lens_cpu: List[int],
     cache_indices: Optional[torch.Tensor] = None,
     has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
+    activation: Optional[Union[str, bool]] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
     **kwargs,
@@ -448,8 +461,10 @@ def causal_conv1d_fn(
 
     out: same shape as `x`
     """
-    if isinstance(activation, bool) and activation:
-        activation = "silu"
+    activation = _normalize_activation(activation)
+    if has_initial_state is not None:
+        if conv_states is None:
+            raise ValueError("has_initial_state requires conv_states")
 
     out = torch.empty_like(x)
 
@@ -514,6 +529,8 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
+    conv_states_arg = conv_states if conv_states is not None else x
+
     def grid(META):
         max_seq_len = max(seq_lens_cpu)
         return (
@@ -527,7 +544,7 @@ def causal_conv1d_fn(
         x,
         weight,
         bias,
-        conv_states,
+        conv_states_arg,
         cache_indices,
         has_initial_state,
         query_start_loc,
@@ -565,6 +582,319 @@ def causal_conv1d_fn(
         num_stages=2,
     )
     return out
+
+
+def _causal_conv1d_seq_native(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Union[torch.Tensor, None],
+    initial_state: Optional[torch.Tensor],
+    activation: Optional[Union[str, bool]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    state_len = weight.shape[1] - 1
+    x_float = x.to(torch.float32)
+    conv_input = (
+        F.pad(x_float, (state_len, 0))
+        if initial_state is None
+        else torch.cat([initial_state.to(torch.float32), x_float], dim=-1)
+    )
+    out = F.conv1d(
+        conv_input,
+        weight.unsqueeze(1),
+        bias,
+        groups=weight.shape[0],
+    )[..., : x.shape[-1]]
+    if activation in ("silu", "swish"):
+        out = F.silu(out)
+    final_state = conv_input[..., -state_len:] if state_len else conv_input[..., :0]
+    return out.to(x.dtype), final_state
+
+
+def _causal_conv1d_native_metadata(
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    cache_indices: Optional[torch.Tensor],
+    has_initial_state: Optional[torch.Tensor],
+    validate_data: bool,
+) -> tuple[list[int], list[int], list[bool]]:
+    batch_size = len(seq_lens_cpu)
+    if query_start_loc.numel() < batch_size + 1:
+        raise ValueError("query_start_loc is shorter than seq_lens_cpu")
+    if cache_indices is not None and cache_indices.numel() < batch_size:
+        raise ValueError("cache_indices is shorter than seq_lens_cpu")
+    if has_initial_state is not None and has_initial_state.numel() < batch_size:
+        raise ValueError("has_initial_state is shorter than seq_lens_cpu")
+
+    metadata_tensors = [query_start_loc[: batch_size + 1].to(torch.int64)]
+    if cache_indices is not None:
+        metadata_tensors.append(
+            cache_indices[:batch_size].to(query_start_loc.device, torch.int64)
+        )
+    if has_initial_state is not None:
+        metadata_tensors.append(
+            has_initial_state[:batch_size].to(query_start_loc.device, torch.int64)
+        )
+    metadata = torch.cat(metadata_tensors).tolist()
+
+    starts = metadata[: batch_size + 1]
+    if validate_data and [end - start for start, end in zip(starts, starts[1:])] != [
+        int(length) for length in seq_lens_cpu
+    ]:
+        raise ValueError("query_start_loc is inconsistent with seq_lens_cpu")
+
+    offset = batch_size + 1
+    state_indices = list(range(batch_size))
+    if cache_indices is not None:
+        state_indices = metadata[offset : offset + batch_size]
+        offset += batch_size
+    initial_state_flags = [False] * batch_size
+    if has_initial_state is not None:
+        initial_state_flags = [
+            bool(flag) for flag in metadata[offset : offset + batch_size]
+        ]
+    return starts, state_indices, initial_state_flags
+
+
+def _validate_causal_conv1d_native_inputs(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Union[torch.Tensor, None],
+    conv_states: Optional[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    cache_indices: Optional[torch.Tensor],
+    has_initial_state: Optional[torch.Tensor],
+) -> None:
+    assert x.dim() == 2
+    assert query_start_loc.dim() == 1
+    dim, _ = x.shape
+    _, width = weight.shape
+    assert weight.shape == (dim, width)
+    assert weight.stride(1) == 1
+    batch_size = len(seq_lens_cpu)
+    if conv_states is not None:
+        assert conv_states.dim() == 3
+        assert conv_states.shape[1] == dim
+        assert conv_states.shape[2] >= width - 1
+    if bias is not None:
+        assert bias.dim() == 1
+        assert bias.size(0) == dim
+    if cache_indices is not None:
+        assert cache_indices.dim() == 1
+        assert cache_indices.size(0) >= batch_size
+    if has_initial_state is not None:
+        assert has_initial_state.dim() == 1
+        assert has_initial_state.numel() >= batch_size
+
+
+def _causal_conv1d_fn_native(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Union[torch.Tensor, None],
+    conv_states: Optional[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    activation: Optional[Union[str, bool]] = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    **_kwargs,
+) -> torch.Tensor:
+    activation = _normalize_activation(activation)
+    if has_initial_state is not None:
+        if conv_states is None:
+            raise ValueError("has_initial_state requires conv_states")
+
+    if validate_data:
+        _validate_causal_conv1d_native_inputs(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            seq_lens_cpu,
+            cache_indices,
+            has_initial_state,
+        )
+
+    state_len = weight.shape[1] - 1
+    starts, state_indices, initial_state_flags = _causal_conv1d_native_metadata(
+        query_start_loc,
+        seq_lens_cpu,
+        cache_indices,
+        has_initial_state,
+        validate_data,
+    )
+    if validate_data and (starts[0] != 0 or starts[-1] > x.shape[-1]):
+        raise ValueError("query_start_loc must stay within the input tokens")
+    if conv_states is not None:
+        if cache_indices is None and len(seq_lens_cpu) > conv_states.shape[0]:
+            raise ValueError("conv_states is smaller than the implicit batch")
+        if cache_indices is not None and any(
+            start != end
+            and state_idx != pad_slot_id
+            and not 0 <= state_idx < conv_states.shape[0]
+            for state_idx, start, end in zip(state_indices, starts, starts[1:])
+        ):
+            raise ValueError("cache_indices contains an out-of-range state index")
+    # Triton also leaves padded and zero-length output ranges unspecified.
+    out = torch.empty_like(x)
+    weight = weight.to(torch.float32)
+    bias = bias.to(torch.float32) if bias is not None else None
+
+    for batch_idx, (start, end) in enumerate(zip(starts, starts[1:])):
+        if start == end:
+            continue
+        state_idx = state_indices[batch_idx]
+        if state_idx == pad_slot_id:
+            continue
+
+        use_initial_state = initial_state_flags[batch_idx]
+        initial_state = (
+            conv_states[state_idx, :, :state_len].unsqueeze(0)
+            if conv_states is not None and use_initial_state
+            else None
+        )
+        out_seq, final_state = _causal_conv1d_seq_native(
+            x[:, start:end].unsqueeze(0),
+            weight,
+            bias,
+            initial_state,
+            activation,
+        )
+        out[:, start:end].copy_(out_seq.squeeze(0))
+
+        if conv_states is not None:
+            conv_states[state_idx, :, :state_len].copy_(
+                final_state.squeeze(0).to(conv_states.dtype)
+            )
+
+    return out
+
+
+class CausalConv1dOp(BaseFusedOp):
+    op = "mamba.causal_conv1d_fn"
+    priority = (KernelBackend.TRITON,)
+    capabilities = {
+        KernelBackend.TRITON: frozenset(
+            {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
+        )
+    }
+    format_signature = FormatSignature(
+        in_place=True,
+        description="variable-length causal Conv1D with optional state-cache updates",
+    )
+    descriptions = {
+        KernelBackend.TORCH: "Variable-length causal Conv1D (torch).",
+        KernelBackend.TRITON: "Variable-length causal Conv1D (triton).",
+    }
+
+    def _torch_compile_forward(self, num_tokens: int) -> None:
+        # The native metadata path uses Python lists and loops.
+        return None
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Union[torch.Tensor, None],
+        conv_states: Optional[torch.Tensor],
+        query_start_loc: torch.Tensor,
+        seq_lens_cpu: List[int],
+        cache_indices: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        activation: Optional[Union[str, bool]] = "silu",
+        pad_slot_id: int = PAD_SLOT_ID,
+        validate_data=False,
+        **kwargs,
+    ) -> torch.Tensor:
+        return _causal_conv1d_fn_native(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            seq_lens_cpu,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            validate_data=validate_data,
+            **kwargs,
+        )
+
+    def forward_triton(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Union[torch.Tensor, None],
+        conv_states: Optional[torch.Tensor],
+        query_start_loc: torch.Tensor,
+        seq_lens_cpu: List[int],
+        cache_indices: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        activation: Optional[Union[str, bool]] = "silu",
+        pad_slot_id: int = PAD_SLOT_ID,
+        validate_data=False,
+        **kwargs,
+    ) -> torch.Tensor:
+        return _causal_conv1d_fn_triton(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            seq_lens_cpu,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            validate_data=validate_data,
+            **kwargs,
+        )
+
+    def forward_npu(self, *args, **kwargs):
+        return self.forward_triton(*args, **kwargs)
+
+    def forward_musa(self, *args, **kwargs):
+        return self.forward_triton(*args, **kwargs)
+
+    def forward_xpu(self, *args, **kwargs):
+        return self.forward_triton(*args, **kwargs)
+
+
+_CAUSAL_CONV1D_OP = CausalConv1dOp()
+
+
+def causal_conv1d_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Union[torch.Tensor, None],
+    conv_states: Optional[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    activation: Optional[Union[str, bool]] = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    **kwargs,
+) -> torch.Tensor:
+    return _CAUSAL_CONV1D_OP(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        seq_lens_cpu,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
+        validate_data=validate_data,
+        **kwargs,
+    )
 
 
 # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask
