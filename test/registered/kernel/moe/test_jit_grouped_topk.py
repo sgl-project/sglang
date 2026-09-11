@@ -11,6 +11,8 @@ gating dtype, and GLM-5.2 keeps that bias where bf16 cannot separate neighbours.
 It reorders routing on its own.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -178,3 +180,7 @@ def test_router_is_asked_for_the_total_width(monkeypatch, use_aiter):
         f"for {seen['topk']} slots, expected {TOPK_ROUTED + SHARED} "
         f"(routed {TOPK_ROUTED} + shared {SHARED})"
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
