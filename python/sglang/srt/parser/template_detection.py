@@ -336,9 +336,26 @@ def _is_glm45(ctx):
     )
 
 
+def _is_glm53(ctx):
+    # GLM-5.3 keeps the GLM-4.5 prompt and tool-call format but replaces the
+    # enable_thinking toggle with an always-on "Reasoning Effort:" header.
+    return (
+        ctx.has_text("[gMASK]<sop>")
+        and ctx.has_text("Reasoning Effort:")
+        and not ctx.has_text("enable_thinking")
+        and ctx.has_text("<tool_call>")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+
+
+def _is_glm_family(ctx):
+    return _is_glm45(ctx) or _is_glm53(ctx)
+
+
 def _is_glm47(ctx):
-    return _is_glm45(ctx) and ctx.has_pattern(
-        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*\+\s*tc\.name"
+    return _is_glm_family(ctx) and ctx.has_pattern(
+        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*[+~]\s*tc\.name"
     )
 
 
@@ -486,7 +503,7 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
     DetectionRule(name="nemotron_3", value="nemotron_3", predicate=_is_nemotron_3),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
@@ -526,7 +543,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
