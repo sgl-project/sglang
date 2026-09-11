@@ -33,7 +33,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -324,9 +324,16 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
     def gather_kv_cache(
-        self, x: Any, forward_batch, stream: Optional[Any] = None
+        self,
+        x: Any,
+        forward_batch,
+        stream: Optional[Any] = None,
+        *,
+        packed_for_gather: bool = False,
     ) -> Any:
-        gathered = self._all_gather_reorganized(x, forward_batch)
+        gathered = self._all_gather_reorganized(
+            x, forward_batch, packed_for_gather=packed_for_gather
+        )
         chunks = torch.split(
             gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
         )
@@ -410,9 +417,11 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             swa_loc = swa_loc[: cache_loc.shape[0]]
         k_dim = k.shape[-1]
         v_dim = v.shape[-1]
-        kv_cache = torch.cat([k, v], dim=-1).contiguous()
+        kv_cache = self._pack_local_kv_for_gather(
+            metadata=forward_batch.attn_cp_metadata, parts=[k, v]
+        )
         key_cache_full, value_cache_full = self.gather_kv_cache(
-            kv_cache, forward_batch
+            kv_cache, forward_batch, packed_for_gather=True
         ).split([k_dim, v_dim], dim=-1)
         key_cache_full = key_cache_full.contiguous()
         value_cache_full = value_cache_full.contiguous()
@@ -429,8 +438,12 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         self, forward_batch, layer: Any, k_nope: Any, k_rope: Any
     ) -> None:
         kv_lora_rank = k_nope.shape[-1]
-        latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
-        latent_full = self.gather_kv_cache(latent, forward_batch)
+        latent = self._pack_local_kv_for_gather(
+            metadata=forward_batch.attn_cp_metadata, parts=[k_nope, k_rope]
+        )
+        latent_full = self.gather_kv_cache(
+            latent, forward_batch, packed_for_gather=True
+        )
         get_token_to_kv_pool().set_mla_kv_buffer(
             layer,
             forward_batch.out_cache_loc,
@@ -438,20 +451,80 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             latent_full[..., kv_lora_rank:],
         )
 
-    def _all_gather_reorganized(self, x: torch.Tensor, forward_batch):
-        meta = forward_batch.attn_cp_metadata
-        per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
-        max_len = max(per_rank_token)
-        if per_rank_token == meta.per_rank_actual_token:
-            local_len = x.shape[0]
+    def _all_gather_pad_layout(
+        self, *, metadata, num_rows: int
+    ) -> Tuple[List[int], int, int]:
+        """Return (per-rank logical rows, padded rows per rank, this rank's rows)."""
+        per_rank_token = (
+            metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        )
+        if per_rank_token == metadata.per_rank_actual_token:
+            local_len = num_rows
         else:
             local_len = per_rank_token[self.cp_rank]
-        assert x.shape[0] >= local_len
-        x = x[:local_len]
-        pad_size = max_len - x.shape[0]
-        if pad_size > 0:
-            padding = [0, 0] * (x.ndim - 1) + [0, pad_size]
-            x = F.pad(x, padding, mode="constant", value=0)
+        assert num_rows >= local_len
+        return per_rank_token, max(per_rank_token), local_len
+
+    def _pack_local_kv_for_gather(
+        self, *, metadata, parts: List[torch.Tensor]
+    ) -> torch.Tensor:
+        """Cat K/V directly into the buffer that all-gather will send from.
+
+        The point is to put the sendbuf inside the NCCL symmetric window: NCCL only
+        picks the symmetric-memory kernel when *both* sendbuff and recvbuff are
+        registered there, and `_all_gather_reorganized` registers only its output, so
+        K/V coming from the regular allocator forced every gather onto the ring
+        kernel. Redirecting the cat these call sites already pay for is what moves
+        the sendbuf into the pool.
+
+        The buffer is sized by `max_len` (the largest per-rank row count), never by
+        this rank's own `local_len` -- a rank-dependent size would grow the pool
+        unevenly and desynchronize the collective `ncclCommWindowRegister`.
+        """
+        head = parts[0]
+        per_rank_token, max_len, local_len = self._all_gather_pad_layout(
+            metadata=metadata, num_rows=head.shape[0]
+        )
+        # The later gather step only reads back this rank's first
+        # per_rank_token[cp_rank] rows, so the cat below must fill at least that many.
+        assert local_len >= per_rank_token[self.cp_rank]
+        ctx = (
+            use_symmetric_memory(
+                get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
+            )
+            if head.is_cuda
+            else nullcontext()
+        )
+        with ctx:
+            packed = torch.empty(
+                max_len,
+                *head.shape[1:-1],
+                sum(part.shape[-1] for part in parts),
+                device=head.device,
+                dtype=head.dtype,
+            )
+        # Rows from local_len to max_len are left uninitialized (garbage) -- that's
+        # fine because all-gather is a plain copy, not a reduction, and the gather
+        # step trims each rank's padding rows before anyone reads them.
+        torch.cat([part[:local_len] for part in parts], dim=-1, out=packed[:local_len])
+        return packed
+
+    def _all_gather_reorganized(
+        self, x: torch.Tensor, forward_batch, *, packed_for_gather: bool = False
+    ):
+        per_rank_token, max_len, local_len = self._all_gather_pad_layout(
+            metadata=forward_batch.attn_cp_metadata, num_rows=x.shape[0]
+        )
+        if packed_for_gather:
+            # `_pack_local_kv_for_gather` already built a max_len-row buffer, so there
+            # is nothing left to truncate or pad.
+            assert x.shape[0] == max_len
+        else:
+            x = x[:local_len]
+            pad_size = max_len - x.shape[0]
+            if pad_size > 0:
+                padding = [0, 0] * (x.ndim - 1) + [0, pad_size]
+                x = F.pad(x, padding, mode="constant", value=0)
 
         group = get_parallel().attn_cp_group
         ctx = (
