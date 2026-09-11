@@ -400,12 +400,29 @@ class PackedTopKOutput(NamedTuple):
         return TopKOutputFormat.PACKED
 
 
+def _balanced_routing_num_ranks(num_experts: int) -> int:
+    """EP ranks to deal the balanced assignment across, or 1 when dealing cannot help.
+
+    Rank-first dealing needs equal contiguous blocks. When the EP size does not
+    divide ``num_experts`` the ranks own unequal blocks, no exact per-rank balance
+    exists, and dealing would leave the tail experts unreachable. The override is
+    also driven from standalone benchmark scripts with no distributed launch,
+    where the EP group does not exist and ``get_parallel()`` would assert.
+    """
+    if not torch.distributed.is_initialized():
+        return 1
+    num_ranks = get_parallel().moe_ep_size
+    return num_ranks if num_ranks > 0 and num_experts % num_ranks == 0 else 1
+
+
 @triton.jit
 def _simulate_balanced_routing_kernel(
     topk_ids_ptr,
     topk_weights_ptr,
     num_experts,
     step,
+    num_ranks,
+    experts_per_rank,
     inv_k,
     seed,
     layer_offset,
@@ -430,11 +447,13 @@ def _simulate_balanced_routing_kernel(
     - ``topk_weights_ptr``: ``[num_tokens, K]`` (row-major; strides passed in),
       overwritten in place
 
-    ``RANDOM=False`` is the deterministic round-robin base ``token + layer_offset``;
-    ``RANDOM=True`` is a random per-token base (uniform, balanced in expectation;
-    ``seed`` is a kernel arg, so it is baked at CUDA-graph capture and replays stay
-    balanced). Both spread the k experts by ``step`` and emit global expert ids
-    (any EP logical->physical remap happens later in ``_post_process_topk_ids``).
+    ``RANDOM=False`` numbers the (token, slot) assignments and deals ordinal ``a``
+    to rank ``a % num_ranks``, so every EP rank draws the same token count even
+    when the assignments do not cover all experts; ``RANDOM=True`` is a random
+    per-token base spread by ``step`` (uniform, balanced in expectation; ``seed``
+    is a kernel arg, so it is baked at CUDA-graph capture and replays stay
+    balanced). Both emit global expert ids (any EP logical->physical remap happens
+    later in ``_post_process_topk_ids``).
     ``token_shard_rank`` and ``num_token_shards`` ensure scattered DP ranks generate
     different expert assignments for their local tokens when DP > 1."""
     t = tl.program_id(0)
@@ -443,9 +462,12 @@ def _simulate_balanced_routing_kernel(
     mask = j < K
     if RANDOM:
         base = (tl.rand(seed, global_t) * num_experts).to(tl.int32)
+        gid = (base + j * step) % num_experts
     else:
-        base = global_t + layer_offset
-    gid = (base + j * step) % num_experts
+        deal = global_t * K + j + layer_offset
+        gid = (deal % num_ranks) * experts_per_rank + (
+            deal // num_ranks
+        ) % experts_per_rank
     tl.store(topk_ids_ptr + t * stride_im + j * stride_ik, gid, mask=mask)
     tl.store(
         topk_weights_ptr + t * stride_wm + j * stride_wk,
@@ -487,6 +509,7 @@ def _simulate_balanced_routing(
     if num_tokens == 0 or k == 0:
         return
     assert 0 <= token_shard_rank < num_token_shards
+    num_ranks = _balanced_routing_num_ranks(num_experts)
     if random and seed is None:
         seed = _simulate_uniform_seed
         _simulate_uniform_seed += 1
@@ -497,6 +520,8 @@ def _simulate_balanced_routing(
         topk_weights,
         num_experts,
         max(num_experts // k, 1),
+        num_ranks,
+        max(num_experts // num_ranks, 1),
         1.0 / k,
         seed,
         0 if layer_id is None else layer_id,
