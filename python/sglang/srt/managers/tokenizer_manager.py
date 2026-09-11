@@ -1487,7 +1487,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _batch_tokenize_and_process(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
-        """Handle batch tokenization for text inputs only."""
+        """Handle batch tokenization for texts and cross-encoder pairs."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
         # If batch does not have text nothing to tokenize
@@ -1500,7 +1500,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
-        texts = [req.text for req in requests]
+        texts = [
+            req.text[0]
+            if isinstance(req, EmbeddingReqInput) and req.is_cross_encoder_request
+            else req.text
+            for req in requests
+        ]
 
         # Check if any request is a cross-encoder request
         is_cross_encoder_request = any(
@@ -1512,6 +1517,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_ids_list, token_type_ids_list = await self._tokenize_texts(
             texts, is_cross_encoder_request
         )
+        # _tokenize_texts removes the batch dimension for a single cross-encoder pair.
+        if is_cross_encoder_request and batch_size == 1:
+            input_ids_list = [input_ids_list]
+            if token_type_ids_list is not None:
+                token_type_ids_list = [token_type_ids_list]
 
         # Process all requests
         tokenized_objs = []
