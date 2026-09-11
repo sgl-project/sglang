@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
-    resolve_transformer_safetensors_to_load,
+    resolve_transformer_checkpoint_files,
 )
 from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
@@ -126,8 +126,13 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         model_path: str,
         config_dict: dict[str, Any],
     ) -> torch.nn.Module:
-        safetensors_list = resolve_transformer_safetensors_to_load(
-            server_args, model_path
+        # resolve_transformer_checkpoint_files handles the --transformer-
+        # weights-path override (incl. GGUF/mixed-export selection) and the
+        # plain component directory, returning the shard list plus an
+        # optional override config path (unused here; the AR config comes
+        # from the unified checkpoint's config.json).
+        safetensors_list = list(
+            resolve_transformer_checkpoint_files(server_args, model_path).safetensors
         )
 
         local_torch_device = get_local_torch_device()
