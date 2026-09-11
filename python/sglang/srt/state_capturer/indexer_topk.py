@@ -5,7 +5,12 @@ import numpy as np
 import pybase64
 import torch
 
-from sglang.srt.configs.model_config import ModelConfig, get_num_indexer_layers
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    get_num_indexer_layers,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -97,17 +102,18 @@ def create_indexer_capturer(
 ) -> Optional[IndexerTopkCapturer]:
 
     enable = get_exec().features.enable_return_indexer_topk
-    # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
-    # path); other backends would create a capturer but never feed it.
-    if enable and device != "cuda":
+    hf_text_config = model_config.hf_text_config
+    npu_indexer_supported = device == "npu" and (
+        is_deepseek_dsa(hf_text_config) or is_deepseek_v4(hf_text_config)
+    )
+    if enable and device != "cuda" and not npu_indexer_supported:
         logger.warning(
-            "indexer-topk capture is CUDA-only; %s backend not yet wired. "
+            "indexer-topk capture is not wired for %s model/backend. "
             "Disabling capturer.",
             device,
         )
         return None
 
-    hf_text_config = model_config.hf_text_config
     num_indexer_layers = get_num_indexer_layers(hf_text_config)
     index_topk = getattr(hf_text_config, "index_topk", 0)
     return _create_indexer_capturer_raw(
@@ -130,8 +136,13 @@ def _create_indexer_capturer_raw(
 ) -> Optional[IndexerTopkCapturer]:
     if not enable:
         return None
-    if num_indexer_layers == 0:
+    if num_indexer_layers <= 0:
         logger.warning("No indexer layers found, IndexerTopkCapturer disabled")
+        return None
+    if index_topk <= 0:
+        logger.warning(
+            "Invalid index_topk=%s, IndexerTopkCapturer disabled", index_topk
+        )
         return None
     return IndexerTopkCapturer(
         num_tokens=num_tokens,
