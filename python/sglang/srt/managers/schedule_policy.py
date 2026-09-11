@@ -207,6 +207,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    HRRN = "hrrn"  # highest response ratio next, token-based aging
 
 
 class CacheAgnosticPolicy(Enum):
@@ -240,7 +241,10 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(
-        self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
+        self,
+        waiting_queue: List[Req],
+        running_batch: Optional[ScheduleBatch] = None,
+        processed_tokens: int = 0,
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -273,6 +277,10 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+            elif policy == CacheAwarePolicy.HRRN:
+                SchedulePolicy._sort_by_hrrn(
+                    waiting_queue, temporary_deprioritized, processed_tokens
+                )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -293,7 +301,14 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
-        if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
+        if (
+            self.policy
+            in (
+                CacheAwarePolicy.LPM,
+                CacheAwarePolicy.HRRN,
+            )
+            and len(waiting_queue) > 128
+        ):
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
         return self.policy
@@ -394,6 +409,48 @@ class SchedulePolicy:
                 else float("inf")
             )
         )
+
+    @staticmethod
+    def _uncached_len(r: Req) -> int:
+        """Number of tokens that must actually be prefilled for this req
+        (all cache levels — device + host via hicache — counted as cached)."""
+        return max(0, len(r.origin_input_ids) - r.num_matched_prefix_tokens)
+
+    @staticmethod
+    def _sort_by_hrrn(
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        processed_tokens: int,
+    ) -> None:
+        """Highest Response Ratio Next, with token-based aging.
+
+        Equivalence with classic HRRN when throughput is constant:
+            ratio = 1 + wait_sec / est_prefill_time
+                  = 1 + (processed_tokens - arrival_processed_tokens) / uncached
+
+        Caller (Scheduler) contract:
+          - Maintain a monotonically increasing counter of prefill tokens processed so far
+            (accumulate batch.extend_num_tokens per forward). Pass it in as `processed_tokens`.
+          - Snapshot `req.arrival_processed_tokens = counter` when the req enters waiting_queue
+            (pop_bootstrapped for disagg prefill, _add_request_to_queue for unified).
+
+        Call sites that omit `processed_tokens` (dllm, disagg decode)
+        degrade to rid-lexicographic order; those queues carry no prefill work.
+        """
+
+        def _key(r: Req):
+            rid = r.rid
+            if rid in temporary_deprioritized:
+                return (float("inf"), rid)
+            uncached = SchedulePolicy._uncached_len(r)
+            if uncached <= 0:
+                # No prefill work; drain immediately.
+                return (-float("inf"), rid)
+            waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
+            ratio_delta = waited_tokens / uncached
+            return (-ratio_delta, rid)
+
+        waiting_queue.sort(key=_key)
 
     @staticmethod
     def _sort_by_dfs_weight(
@@ -526,7 +583,6 @@ class PrefillAdder:
         self.log_device_hit_tokens = 0
         self.log_host_hit_tokens = 0
         self.log_storage_hit_tokens = 0
-        # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
 
@@ -859,6 +915,7 @@ class PrefillAdder:
         is_chunked_continuation: bool = False,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
+        raw_extend_input_len = extend_input_len
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
@@ -895,10 +952,10 @@ class PrefillAdder:
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
-        self.log_input_tokens += extend_input_len
+        self.log_input_tokens += raw_extend_input_len
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
-            self.reprocessed_log_input_tokens += extend_input_len
+            self.reprocessed_log_input_tokens += raw_extend_input_len
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if req.retracted_stain:
@@ -997,12 +1054,8 @@ class PrefillAdder:
         self._account_prefill_cache_admission(req, prefix_len)
 
     def _req_inc_lock_ref(self, req: Req):
-        result = self.tree_cache.inc_lock_ref(req.last_node)
-        if self.is_hybrid_swa:
-            req.swa_uuid_for_lock = result.swa_uuid_for_lock
-        # match locks this node's components, so clear any stale skip set
-        # carried from a previous scheduling of this req.
-        req.skip_lock_node_ids = {}
+        # Persist the release receipt.
+        req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -1107,9 +1160,8 @@ class PrefillAdder:
         try:
             result = self.tree_cache.inc_lock_ref(last_node)
             if self.tree_cache.is_tree_cache():
-                # init_load_back may revive SWA/Mamba tombstones while this
-                # temporary admission lock is held. Release must mirror the
-                # exact nodes skipped at acquire time.
+                # Replay the acquire's receipt (SWA boundary uuid, mamba flag)
+                # so release takes back exactly what this temporary lock took.
                 dec_lock_params = result.to_dec_params()
             yield None
         finally:
@@ -1452,7 +1504,7 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
-                    input_tokens,
+                    req.extend_range.length,
                     min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,

@@ -1271,6 +1271,7 @@
                   {
                     "group": "DeepSeek",
                     "pages": [
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V4_1",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V4",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
@@ -1378,6 +1379,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-3.0-flash-VL",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-tiny",
                       "cookbook/autoregressive/InclusionAI/Ring-2.6-1T",
@@ -1515,6 +1517,13 @@
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image-Edit"
+                    ]
+                  },
+                  {
+                    "group": "SenseNova",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
                     ]
                   },
                   {
