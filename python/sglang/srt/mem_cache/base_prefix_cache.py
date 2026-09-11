@@ -81,6 +81,11 @@ class InsertParams:
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
 
+    # Logical-page KV sharding: rotation base of the chain the inserted
+    # values belong to (stamped onto new tree nodes; None when sharding is
+    # off). See UnifiedTreeNode.rotation_base.
+    rotation_base: Optional[int] = None
+
 
 @dataclasses.dataclass
 class InsertResult:
@@ -91,6 +96,13 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     swa_branch_inserted: bool = False
+
+    # Logical-page KV sharding: the un-matched tail was NOT inserted because
+    # its rotation base disagrees with the matched chain's (a cross-chain
+    # graft would break the cyclic-owner gather contract). The tail's pages
+    # stay owned by the inserting request; callers must not dedup/rebind
+    # past prefix_len.
+    rotation_tail_declined: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
     adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
@@ -380,6 +392,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def get_prefix_hash_values(self, node: Any) -> list[str]:
         """The hash chain of the node's ancestors, in root-to-parent order."""
         return node.get_prefix_hash_values(node.parent)
+
+    def rotation_base_of(self, node: Any) -> Optional[int]:
+        """Logical-page KV sharding: the rotation base stamped on ``node``.
+
+        ``node`` is whatever this cache stores in ``req.last_node`` (a NodeId
+        for the unified tree, None for caches without tree nodes). None means
+        "no base available here", which sends the alloc path to the base the
+        request recorded at its previous alloc. Tree caches that keep the
+        per-chain base override this. See UnifiedTreeNode.rotation_base.
+        """
+        return None
 
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
