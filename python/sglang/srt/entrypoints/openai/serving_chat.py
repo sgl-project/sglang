@@ -704,7 +704,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
-                    if reasoning_text:
+                    if reasoning_text and request.include_reasoning is not False:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
@@ -984,7 +984,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     role="assistant",
                     content=text if text else None,
                     tool_calls=tool_calls,
-                    reasoning_content=reasoning_text if reasoning_text else None,
+                    reasoning_content=(
+                        reasoning_text
+                        if reasoning_text and request.include_reasoning is not False
+                        else None
+                    ),
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,

@@ -613,6 +613,10 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+    # When False, reasoning content is dropped from the response entirely
+    # (OpenAI-compatible with vLLM's extension); the default keeps current
+    # behavior.
+    include_reasoning: Optional[bool] = None
     chat_template_kwargs: Optional[Dict] = None
 
     # SGLang multimodal tiling controls (extensions)

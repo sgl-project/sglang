@@ -783,6 +783,53 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    # ------------- include_reasoning -------------
+    def _build_reasoning_response(self, include_reasoning):
+        """Build a non-stream response whose reasoning parser splits think text."""
+        self.template_manager.force_reasoning = False
+        self.chat.reasoning_parser = "mock-reasoning-parser"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=False,
+            include_reasoning=include_reasoning,
+        )
+        ret = [
+            {
+                "text": "想了一下正式回答",
+                "meta_info": {
+                    "id": "test-id",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 9,
+                },
+            }
+        ]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.ReasoningParser"
+        ) as parser_mock:
+            parser_mock.return_value.parse_non_stream.return_value = (
+                "想了一下",
+                "正式回答",
+            )
+            return self.chat._build_chat_response(req, ret, created=0)
+
+    def test_include_reasoning_false_drops_reasoning_content(self):
+        # #39103: the request field existed nowhere, so reasoning always came
+        # back even when the caller asked to suppress it.
+        resp = self._build_reasoning_response(False)
+        self.assertIsNone(resp.choices[0].message.reasoning_content)
+        # The reasoning split still runs, so the visible content stays clean.
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
+    def test_include_reasoning_default_keeps_reasoning_content(self):
+        resp = self._build_reasoning_response(None)
+        self.assertEqual(
+            resp.choices[0].message.reasoning_content, "想了一下"
+        )
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
