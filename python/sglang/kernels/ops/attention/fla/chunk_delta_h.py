@@ -18,37 +18,23 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.utils import is_gfx95_supported
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
+_GDN_CHUNK_H_CONFIG_OVERRIDDEN = any(
+    name in os.environ
+    for name in (
+        "SGLANG_GDN_CHUNK_H_BV",
+        "SGLANG_GDN_CHUNK_H_NUM_WARPS",
+        "SGLANG_GDN_CHUNK_H_NUM_STAGES",
+    )
+)
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 
-@triton.autotune(
-    # Single hardcoded config. The kernel writes ht (final state) back into
-    # initial_state in-place; with multiple configs, triton's autotune benchmark
-    # phase invokes the kernel many times for timing and corrupts the cache pool,
-    # producing silently wrong output on the first user request. Restoring via
-    # `restore_value=["initial_state"]` works for unit tests but OOMs on
-    # production-scale models (e.g. Kimi-Linear-48B at default mem_fraction)
-    # because cloning the cache pool for each benchmark exceeds available memory.
-    # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
-    # future per-bucket configs once the kernel is refactored to write final
-    # state to a separate output buffer). The env knobs keep this single-config
-    # property while allowing model/hardware-local validation of the selected
-    # tile without corrupting the state pool through multi-config autotune.
-    configs=[
-        triton.Config(
-            {"BV": GDN_CHUNK_H_BV},
-            num_warps=GDN_CHUNK_H_NUM_WARPS,
-            num_stages=GDN_CHUNK_H_NUM_STAGES,
-        )
-    ],
-    key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -348,6 +334,64 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
+_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_jit = (
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+)
+
+
+def _single_config_kernel(*, bv: int, num_warps: int, num_stages: int):
+    # The kernel updates initial_state in place, so each dispatcher must contain
+    # exactly one config. Benchmarking multiple configs would corrupt the state.
+    return triton.autotune(
+        configs=[
+            triton.Config(
+                {"BV": bv},
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+        ],
+        key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
+        **autotune_cache_kwargs,
+    )(_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_jit)
+
+
+chunk_gated_delta_rule_fwd_kernel_h_blockdim64 = _single_config_kernel(
+    bv=GDN_CHUNK_H_BV,
+    num_warps=GDN_CHUNK_H_NUM_WARPS,
+    num_stages=GDN_CHUNK_H_NUM_STAGES,
+)
+_chunk_gated_delta_rule_fwd_kernel_h_gfx950_128 = _single_config_kernel(
+    bv=16,
+    num_warps=4,
+    num_stages=4,
+)
+
+
+def _use_gfx950_128_config(
+    *,
+    num_heads: int,
+    num_sequences: int,
+    num_chunks: int,
+    k_dim: int,
+    v_dim: int,
+    use_gk: bool,
+    is_varlen: bool,
+    track_state: Optional[torch.Tensor],
+) -> bool:
+    return (
+        not _GDN_CHUNK_H_CONFIG_OVERRIDDEN
+        and is_gfx95_supported()
+        and num_heads in (8, 16)
+        and num_sequences == 1
+        and 2 <= num_chunks <= 2048
+        and k_dim == 128
+        and v_dim == 128
+        and use_gk
+        and is_varlen
+        and track_state is None
+    )
+
+
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -400,7 +444,22 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+    use_gfx950_128_config = _use_gfx950_128_config(
+        num_heads=H,
+        num_sequences=N,
+        num_chunks=NT,
+        k_dim=K,
+        v_dim=V,
+        use_gk=gk is not None,
+        is_varlen=cu_seqlens is not None,
+        track_state=track_state,
+    )
+    kernel = (
+        _chunk_gated_delta_rule_fwd_kernel_h_gfx950_128
+        if use_gfx950_128_config
+        else chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+    )
+    kernel[grid](
         k=k,
         v=u,
         w=w,
