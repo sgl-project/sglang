@@ -531,19 +531,38 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
+    # Encoder-decoder models prepend the encoder KV to the request's row, so the
+    # decoder token at decoder position L lives at row position
+    # encoder_len + L (see the req_to_token write below). The paged decode math
+    # indexes and measures that row -- last_loc is read from it, and the
+    # new-page decision is `row_len % page_size == 1` -- so it must use the row
+    # length, not the encoder-stripped seq_len. With the stripped length,
+    # last_loc + 1 resolves to row[L], the slot already held by encoder
+    # position L: the row stops satisfying
+    # row[j] == page[j // page_size] * page_size + (j % page_size), which is the
+    # invariant the paged free path relies on to release each page exactly once.
+    if batch.model_config.is_encoder_decoder:
+        row_lens_gpu = batch.encoder_lens + seq_lens_gpu
+        row_lens_cpu = batch.seq_lens_cpu + torch.tensor(
+            batch.encoder_lens_cpu, dtype=batch.seq_lens_cpu.dtype
+        )
+    else:
+        row_lens_gpu = seq_lens_gpu
+        row_lens_cpu = batch.seq_lens_cpu
+
     if _alloc_page_size(batch) == 1:
-        # Non-paged allocation
+        # Non-paged allocation (page_size == 1 needs no row arithmetic at all)
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, seq_lens_gpu - 1
+            batch.req_pool_indices, row_lens_gpu - 1
         ]
-        seq_lens_next = seq_lens_gpu + token_per_req
+        row_lens_next = row_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
-            seq_lens=seq_lens_next,
-            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+            seq_lens=row_lens_next,
+            seq_lens_cpu=row_lens_cpu + token_per_req,
             last_loc=last_loc,
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
@@ -552,7 +571,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
+        locs = row_lens_gpu
     else:
         locs = seq_lens_gpu.clone()
 
