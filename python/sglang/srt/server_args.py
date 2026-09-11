@@ -40,12 +40,15 @@ import functools
 import logging
 import tempfile
 import uuid
-from contextlib import contextmanager
 from typing import Any, NoReturn
+
+import msgspec
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
+    is_record,
+    record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
@@ -53,7 +56,7 @@ from sglang.srt.arg_groups.argparse_actions import (
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
-    resolution_projection,
+    resolution_result,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -170,6 +173,25 @@ from sglang.srt.utils.common import (  # noqa: F401
 )
 
 
+def _plain(value: Any) -> Any:
+    """``asdict``'s conversion, applied to one value: a record -- Struct or
+    dataclass, since nested config values are both -- becomes a dict, containers
+    recurse, everything else is deep-copied (a caller mutating the dump must not
+    reach the live configuration)."""
+    if not isinstance(value, type) and is_record(value):
+        return {
+            field.name: _plain(getattr(value, field.name))
+            for field in record_fields(type(value))
+        }
+    if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
+        return type(value)(*(_plain(item) for item in value))
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain(item) for item in value)
+    if isinstance(value, dict):
+        return type(value)((_plain(k), _plain(v)) for k, v in value.items())
+    return copy.deepcopy(value)
+
+
 class ServerArgs:
     """Server-wide configuration for SGLang.
 
@@ -252,9 +274,8 @@ class ServerArgs:
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
         # Sealed for the duration, not just afterwards: everything below this
-        # line reads the input and declares against it, and the one channel
-        # that still writes the record (`declare_direct_writes`, for
-        # out-of-tree platform plugins) asks for the seal to be lifted by name.
+        # line reads the input and declares against it. No exceptions -- even a
+        # resolver from outside this tree assigns onto a stand-in, not here.
         self._input_frozen = True
         try:
             run_resolution_pipeline(self)
@@ -291,65 +312,17 @@ class ServerArgs:
         """This configuration as a plain dict of resolved field values.
 
         What the whole-object readbacks report (`/server_info` and its gRPC and
-        in-process twins). `dataclasses.asdict(self)` reads the fields, which
+        in-process twins). A plain `asdict` reads the fields, which
         carry the raw input; this reads the declarations, so it answers with what
         resolution decided. Nested dataclass fields are expanded
         the way `asdict` expands them; the private resolution bookkeeping and the
         `model_config` memo are not fields and do not appear.
         """
 
-        return resolution_projection(self)
-
-    def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
-        """A copy of this record that stays resolved, and says what it changed.
-
-        `dataclasses.replace` builds a new instance, so the copy carries none of
-        what makes a record resolved: no raw snapshot, no declarations, no
-        finished flag. The next publish therefore resolves it again, which
-        drops every decision the stash held -- the late ones (the auto-detected
-        parsers) and the direct ones alike -- and re-runs the device probes in
-        whatever process opened the copy. The Ray paths replace
-        `dist_init_addr` on a resolved record, which is how they reach this.
-
-        The change is appended to the stash rather than left on the field: the
-        projection reads the raw snapshot plus the declarations, so a field the
-        copy set on its own would publish the parent's raw value instead.
-
-        The carry is shallow. The containers are copied so the copy's own
-        declaration does not travel back into the parent, but everything inside
-        them -- the stash entries, the raw-input values, the memoized
-        `ModelConfig` -- is shared. That is fine for what this is for: a copy
-        that immediately crosses a process boundary (Ray actors, the gateway's
-        workers), where pickling severs the sharing. A caller that mutates the
-        copy's deep structure in-process mutates the parent's too.
-        """
-        replacement = dataclasses.replace(self, **changes)
-        # Provenance, not resolution state: a copy was still launched by
-        # whatever launched its parent, resolved or not.
-        object.__setattr__(replacement, "_launch_command", self.launch_command)
-        if not getattr(self, "_resolution_finished", False):
-            # Not resolved yet: the copy goes through the gate itself.
-            return replacement
-
-        # Everything outside the fields, enumerated from the instance: the raw
-        # snapshot, the stash, and what resolution memoized -- including the
-        # model-configuration memo, which the copy carries over rather than
-        # rebuild.
-        field_names = {field.name for field in dataclasses.fields(self)}
-        for name, value in vars(self).items():
-            if name in field_names or name == "_resolution_finished":
-                continue
-            if isinstance(value, (dict, list, set)):
-                value = copy.copy(value)
-            object.__setattr__(replacement, name, value)
-        stash = getattr(replacement, "_resolved_overrides", None)
-        if stash is None:
-            stash = []
-            object.__setattr__(replacement, "_resolved_overrides", stash)
-        if changes:
-            stash.append((source, dict(changes)))
-        object.__setattr__(replacement, "_resolution_finished", True)
-        return replacement
+        return {
+            field.name: _plain(resolution_result(self, field.name))
+            for field in record_fields(type(self))
+        }
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -382,7 +355,7 @@ class ServerArgs:
             "--sampling-backend",
             type=str,
             choices=sampling_backend_choices,
-            default=ServerArgs.sampling_backend,
+            default=_declared_default("sampling_backend"),
             help="Choose the kernels for sampling layers.",
         )
 
@@ -391,7 +364,7 @@ class ServerArgs:
             "--reasoning-parser",
             type=str,
             choices=["auto"] + reasoning_parser_choices,
-            default=ServerArgs.reasoning_parser,
+            default=_declared_default("reasoning_parser"),
             help=f"Specify the parser for reasoning models. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
@@ -401,7 +374,7 @@ class ServerArgs:
             "--tool-call-parser",
             type=str,
             choices=["auto"] + tool_call_parser_choices,
-            default=ServerArgs.tool_call_parser,
+            default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {tool_call_parser_choices}.",
@@ -409,7 +382,7 @@ class ServerArgs:
         parser.add_argument(
             "--kv-canary-real-data",
             type=str,
-            default=ServerArgs.kv_canary_real_data,
+            default=_declared_default("kv_canary_real_data"),
             choices=[m.name.lower() for m in RealKvHashMode],
             help=(
                 "Check the real KV-cache in the canary. "
@@ -447,9 +420,7 @@ class ServerArgs:
         # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
         # surface and won't appear on the argparse Namespace. Skip them so the
         # dataclass default applies.
-        attrs = [
-            attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
-        ]
+        attrs = [attr.name for attr in record_fields(cls) if hasattr(args, attr.name)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def get_tokenizer_worker_class(self):
@@ -501,7 +472,26 @@ class ServerArgs:
                     "resolved config; a value one runner owns travels as a "
                     "constructor argument."
                 )
-        object.__setattr__(self, name, value)
+        # The Struct's own setter, spelled explicitly: this method is copied
+        # into the class `defstruct` builds, so a zero-argument `super()` would
+        # still close over the class it was written in. `object.__setattr__`
+        # does not reach a Struct's fields at all.
+        msgspec.Struct.__setattr__(self, name, value)
+
+    def __reduce__(self):
+        """Pickle the record *and* what resolution left on it.
+
+        A Struct pickles its fields; everything else lives in the `dict=True`
+        namespace and would be dropped, which for this record means the input
+        snapshot, the declaration stash and the resolution flags -- the whole
+        reason a child can publish what its parent decided without resolving
+        again. Reconstruction restores the fields first and the bookkeeping
+        after, so the seal is re-armed only once the fields are in place.
+        """
+        return (
+            _rebuild_server_args,
+            (type(self), msgspec.structs.asdict(self), dict(self.__dict__)),
+        )
 
     def check_server_args(self):
         from sglang.srt.arg_groups.validation_hook import check_server_args
@@ -554,9 +544,23 @@ ServerArgs._NS_BY_FIELD = _namespaces
 # The classes themselves, so the bag projection can find the declarations
 # that are not fields -- the derived half of each namespace.
 ServerArgs._NAMESPACES = _INPUT_NAMESPACES
-for _name, _value in _defaults.items():
-    setattr(ServerArgs, _name, _value)
-ServerArgs = dataclasses.dataclass(ServerArgs)
+# `dict=True` so the record can carry what is not configuration -- the input
+# snapshot, the declaration stash, the resolution flags, the memo slots. A
+# Struct has no `__dict__` without it, and those are exactly the underscore
+# names `_underscore_field_names()` is careful *not* to include.
+ServerArgs = msgspec.defstruct(
+    "ServerArgs",
+    [
+        (_name, _ann, _defaults[_name]) if _name in _defaults else (_name, _ann)
+        for _name, _ann in ServerArgs.__annotations__.items()
+    ],
+    namespace={
+        _k: _v
+        for _k, _v in vars(ServerArgs).items()
+        if _k not in ("__dict__", "__weakref__", "__annotations__")
+    },
+    dict=True,
+)
 
 
 # --------------------------------------------------------------------------
@@ -618,9 +622,7 @@ def _underscore_field_names() -> frozenset:
     by spelling would leave exactly one leaf writable on a read-only record.
     """
     return frozenset(
-        field.name
-        for field in dataclasses.fields(ServerArgs)
-        if field.name.startswith("_")
+        field.name for field in record_fields(ServerArgs) if field.name.startswith("_")
     )
 
 
@@ -663,25 +665,26 @@ def get_global_server_args() -> NoReturn:
     )
 
 
-@contextmanager
-def record_writable(server_args: Any):
-    """Lift the input seal for a resolver that genuinely writes the record.
+def _rebuild_server_args(cls, fields, bookkeeping):
+    """Rebuild a pickled record: fields through the constructor, the rest after."""
+    record = cls(**fields)
+    record.__dict__.update(bookkeeping)
+    return record
 
-    There is exactly one: `declare_direct_writes`, which hands the record to an
-    out-of-tree platform plugin that sets fields on it. Those implementations
-    live outside this tree and cannot be converted by editing a resolver here,
-    so the write stays and is captured into the stash afterwards. Naming the
-    exception is the point -- an in-tree resolver that reaches for this is
-    doing something it should be declaring instead.
+
+def _declared_default(name: str):
+    """The declared default of a field, for a manual `add_argument`.
+
+    `ServerArgs.<field>` used to answer with it. The record is a Struct now, so
+    that expression returns the slot descriptor instead -- which argparse
+    happily stores as the default, and the first reader gets a
+    `member_descriptor` where it expected a string.
     """
-    frozen = getattr(server_args, "_input_frozen", False)
-    if frozen:
-        object.__setattr__(server_args, "_input_frozen", False)
-    try:
-        yield
-    finally:
-        if frozen:
-            object.__setattr__(server_args, "_input_frozen", True)
+    return next(
+        field.default
+        for field in msgspec.structs.fields(ServerArgs)
+        if field.name == name
+    )
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
@@ -730,7 +733,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    object.__setattr__(server_args, "_launch_command", " ".join(argv))
+    server_args._launch_command = " ".join(argv)
     return server_args
 
 

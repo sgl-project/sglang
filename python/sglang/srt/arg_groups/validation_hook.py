@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
@@ -448,6 +449,22 @@ def default_unset_prefill_decode_interval(server_args: Any):
             server_args,
             "prefill_decode_interval_default",
             prefill_decode_interval=0,
+        )
+
+
+def validate_sampling_mask_max_tokens(server_args: Any):
+    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
+            "Unset it. To enable sampling masks for disaggregated serving, set "
+            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
+            "--sampling-mask-max-tokens value on both prefill and decode servers."
+        )
+    cfg = resolving_view(server_args)
+    if cfg.sampling_mask_max_tokens <= 0:
+        raise ValueError(
+            "--sampling-mask-max-tokens must be positive "
+            f"(got {cfg.sampling_mask_max_tokens})."
         )
 
 

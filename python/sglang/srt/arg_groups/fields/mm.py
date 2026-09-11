@@ -9,7 +9,6 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from typing import (
     Any,
@@ -20,14 +19,15 @@ from typing import (
     Union,
 )
 
+import msgspec
+
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
 
 
-@dataclasses.dataclass
-class Mm:
+class Mm(msgspec.Struct):
     """Namespace ``mm``."""
 
     _NS_PATH = "mm"
@@ -91,7 +91,7 @@ class Mm:
         "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
         "exact hostnames. Redirect destinations are checked against the same "
         "allowlist. When unset, remote media from any domain is allowed.",
-    ] = dataclasses.field(default_factory=list)
+    ] = msgspec.field(default_factory=list)
     media_url_max_file_size_mb: A[
         int,
         "Maximum size in MiB for one client-supplied remote media download. "
