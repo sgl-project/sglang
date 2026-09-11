@@ -67,6 +67,12 @@ class Mm(msgspec.Struct):
         bool,
         "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
     ] = False
+    mm_max_encoder_input_tokens_per_batch: A[
+        Optional[int],
+        "Maximum number of encoder input tokens in one multimodal encoder "
+        "batch. Larger cross-request batches are split into multiple encoder "
+        "calls. A single item larger than the limit is encoded alone.",
+    ] = None
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(

@@ -3,13 +3,15 @@
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
-from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.utils import is_hip, is_npu, is_xpu
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.runtime_context import get_mm, get_parallel, get_schedule
+from sglang.srt.utils import is_hip, is_npu, is_xpu, print_warning_once
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
 
@@ -320,14 +322,91 @@ class PerImageRequestInfo:
     )
 
 
+def _get_encoder_input_token_count(item: MultimodalDataItem) -> Optional[int]:
+    """Return the number of patch rows consumed by the multimodal encoder."""
+    feature = item.feature
+    if isinstance(feature, (torch.Tensor, np.ndarray)) and feature.ndim == 2:
+        return int(feature.shape[0])
+    if isinstance(feature, CudaIpcTensorTransportProxy):
+        shape = feature.proxy_state.get("ipc_extra", {}).get("recons_shape")
+        if shape is not None and len(shape) == 2:
+            return int(shape[0])
+
+    for key in ("image_grid_thw", "video_grid_thw", "image_grid_hws"):
+        grid = item.model_specific_data.get(key)
+        if grid is None:
+            continue
+        if isinstance(grid, torch.Tensor):
+            grid = grid.detach().cpu().numpy()
+        else:
+            grid = np.asarray(grid)
+        if grid.ndim == 1:
+            return int(np.prod(grid))
+        if grid.ndim == 2:
+            return int(np.prod(grid, axis=-1).sum())
+
+    return None
+
+
+def _split_items_by_encoder_token_budget(
+    items: List[MultimodalDataItem], max_tokens: Optional[int]
+) -> List[List[MultimodalDataItem]]:
+    """Split items into stable microbatches bounded by encoder input tokens."""
+    if not items:
+        return []
+    if max_tokens is None:
+        return [items]
+
+    batches = []
+    current_batch = []
+    current_tokens = 0
+
+    def flush_current_batch():
+        nonlocal current_batch, current_tokens
+        if current_batch:
+            batches.append(current_batch)
+            current_batch = []
+            current_tokens = 0
+
+    for item in items:
+        item_tokens = _get_encoder_input_token_count(item)
+        if item_tokens is None:
+            flush_current_batch()
+            batches.append([item])
+            print_warning_once(
+                "Cannot determine multimodal encoder input token count; "
+                "encoding the item in its own batch."
+            )
+            continue
+
+        if item_tokens > max_tokens:
+            flush_current_batch()
+            batches.append([item])
+            print_warning_once(
+                f"A multimodal item has {item_tokens} encoder input tokens, "
+                f"exceeding the configured batch limit {max_tokens}; "
+                "encoding the item alone."
+            )
+            continue
+
+        if current_batch and current_tokens + item_tokens > max_tokens:
+            flush_current_batch()
+        current_batch.append(item)
+        current_tokens += item_tokens
+
+    flush_current_batch()
+    return batches
+
+
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
     device: torch.device,
 ) -> Dict[Tuple[Optional[int], int], torch.Tensor]:
     """
-    Collect cache misses across ALL per-image requests, deduplicate by hash and
-    expected token count, encode in a single ViT call, and populate the cache.
+    Collect cache misses across all per-image requests, deduplicate by hash and
+    expected token count, encode in token-bounded ViT batches, and populate the
+    cache.
 
     Returns:
         hash_to_embedding: mapping from (item.hash, token_count) to its full
@@ -370,37 +449,41 @@ def _batch_encode_per_image_misses(
             elif cache_key not in unique_misses:
                 unique_misses[cache_key] = (item, expected_token_count)
 
-    # Phase 1b: single ViT call for all unique cache misses
+    # Phase 1b: encode unique cache misses in bounded ViT microbatches
     if unique_misses:
         ordered_cache_keys = list(unique_misses.keys())
         miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
-        token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
+        max_tokens = get_mm().mm_max_encoder_input_tokens_per_batch
+        item_batches = _split_items_by_encoder_token_budget(miss_items, max_tokens)
 
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(miss_items, device)
-        all_miss_embedding = data_embedding_func(miss_items)
-
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached). Mirrors
-            # _get_chunked_embedding_by_item.
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+        item_offset = 0
+        for item_batch in item_batches:
+            batch_cache_keys = ordered_cache_keys[
+                item_offset : item_offset + len(item_batch)
             ]
-        else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
-            )
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-        for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
-            embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb))
-            # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
-            hash_to_embedding[cache_key] = emb
+            item_offset += len(item_batch)
+            token_counts = [unique_misses[key][1] for key in batch_cache_keys]
+
+            if not _can_skip_pre_embed_feature_move(data_embedding_func):
+                _move_items_to_device(item_batch, device)
+            batch_embedding = data_embedding_func(item_batch)
+
+            if isinstance(batch_embedding, list):
+                assert len(batch_embedding) == len(item_batch), (
+                    f"per-item embedding count {len(batch_embedding)} != "
+                    f"cache-miss item count {len(item_batch)}"
+                )
+                split_embeddings = [
+                    emb.reshape(-1, emb.shape[-1]) for emb in batch_embedding
+                ]
+            else:
+                batch_embedding = batch_embedding.reshape(-1, batch_embedding.shape[-1])
+                split_embeddings = torch.split(batch_embedding, token_counts, dim=0)
+
+            for cache_key, emb in zip(batch_cache_keys, split_embeddings):
+                embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb))
+                # Keep a local ref so assembly cannot fail after LRU eviction.
+                hash_to_embedding[cache_key] = emb
 
     return hash_to_embedding
 
@@ -589,7 +672,7 @@ def _get_chunked_prefill_embedding(
         else:
             full_path_requests.append(req_info)
 
-    # Phase 1: batch encode all per-image cache misses in ONE ViT call
+    # Phase 1: batch encode per-image cache misses under the encoder token budget
     hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor] = {}
     if per_image_requests:
         hash_to_embedding = _batch_encode_per_image_misses(

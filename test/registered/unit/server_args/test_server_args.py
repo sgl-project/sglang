@@ -340,6 +340,23 @@ class TestPrepareServerArgs(CustomTestCase):
 
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
+    def test_encoder_input_token_batch_limit(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--mm-max-encoder-input-tokens-per-batch",
+                "16384",
+            ]
+        )
+        self.assertEqual(parsed.mm_max_encoder_input_tokens_per_batch, 16384)
+
+        args = ServerArgs(model_path="dummy", mm_max_encoder_input_tokens_per_batch=0)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            serving_hook.handle_multimodal(args)
+
     def test_logs_when_encoder_dp_has_no_parallelism(self):
         server_args = ServerArgs(
             model_path="dummy", mm_enable_dp_encoder=True, tp_size=1

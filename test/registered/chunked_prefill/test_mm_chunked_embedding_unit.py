@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_mm, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -107,6 +107,18 @@ def _make_items():
     ]
 
 
+def _make_items_with_encoder_tokens(token_counts):
+    return [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=2000 + i,
+            feature=torch.zeros(token_count, 4),
+            offsets=[(0, 1)],
+        )
+        for i, token_count in enumerate(token_counts)
+    ]
+
+
 def _run_by_item_chunks(encoder):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
@@ -186,6 +198,55 @@ def test_tensor_cache_entries_share_storage():
         assert (
             emb.untyped_storage().nbytes() == total_tokens * HIDDEN * emb.element_size()
         )
+
+
+def test_encoder_token_budget_splits_items_in_stable_order():
+    items = _make_items_with_encoder_tokens([6, 5, 7])
+
+    batches = mm_schedule._split_items_by_encoder_token_budget(items, max_tokens=12)
+
+    assert [[item.hash for item in batch] for batch in batches] == [
+        [2000, 2001],
+        [2002],
+    ]
+
+
+def test_oversized_encoder_item_runs_alone():
+    items = _make_items_with_encoder_tokens([5, 13, 6])
+
+    batches = mm_schedule._split_items_by_encoder_token_budget(items, max_tokens=12)
+
+    assert [[item.hash for item in batch] for batch in batches] == [
+        [2000],
+        [2001],
+        [2002],
+    ]
+
+
+def test_cross_request_encoder_batch_respects_token_budget():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items_with_encoder_tokens([6, 5, 7])
+    requests = [
+        mm_schedule.PerImageRequestInfo(
+            req_idx=i,
+            items=[item],
+            items_offset=[(0, 1)],
+            extend_prefix_len=0,
+            extend_seq_len=2,
+        )
+        for i, item in enumerate(items)
+    ]
+    calls = []
+
+    def encoder(item_batch):
+        calls.append([item.hash for item in item_batch])
+        return torch.zeros(len(item_batch) * 2, HIDDEN)
+
+    with get_mm().override(mm_max_encoder_input_tokens_per_batch=12):
+        embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+
+    assert calls == [[2000, 2001], [2002]]
+    assert list(embeddings) == [(2000, 2), (2001, 2), (2002, 2)]
 
 
 def test_by_item_mismatched_cache_entry_is_reencoded():

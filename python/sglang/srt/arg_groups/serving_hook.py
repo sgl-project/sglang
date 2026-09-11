@@ -118,6 +118,11 @@ def handle_multimodal(server_args: Any):
     """Validate mm_process_config structure before model loading."""
     cfg = resolving_view(server_args)
     if (
+        cfg.mm_max_encoder_input_tokens_per_batch is not None
+        and cfg.mm_max_encoder_input_tokens_per_batch <= 0
+    ):
+        raise ValueError("--mm-max-encoder-input-tokens-per-batch must be positive")
+    if (
         cfg.mm_preprocess_cache_size_mb is not None
         and cfg.mm_preprocess_cache_size_mb < 0
     ):

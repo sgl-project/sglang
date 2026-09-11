@@ -377,6 +377,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_broadcast_mm_inputs_process",
     "enable_prefix_mm_cache",
     "mm_enable_dp_encoder",
+    "mm_max_encoder_input_tokens_per_batch",
     "mm_process_config",
     "mm_processor_worker_num",
     "mm_io_worker_num",
