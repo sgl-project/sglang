@@ -1,44 +1,27 @@
 from __future__ import annotations
 
-import copy
 import json
 import logging
-import math
 import time
 import uuid
-from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from sglang.srt.runtime_context import get_model, get_serving
-
-
-class ThinkingMode(str, Enum):
-    """Mode for message encoding - chat vs thinking/reasoning."""
-
-    CHAT = "chat"
-    THINKING = "thinking"
-
-
-import jinja2
 import orjson
 from fastapi import Request
-
-try:
-    from mistral_common.exceptions import MistralCommonException
-
-    _MISTRAL_COMMON_ERRORS: tuple[type[BaseException], ...] = (MistralCommonException,)
-except ImportError:
-    _MISTRAL_COMMON_ERRORS = ()
-
-_CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
-    jinja2.TemplateError,
-    TypeError,
-) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.chat_input.validation import (
+    validate_chat_input,
+    validate_media_content,
+)
+from sglang.srt.entrypoints.openai import chat_encoding
+from sglang.srt.entrypoints.openai.chat_input_adapter import (
+    create_chat_input_processor,
+    from_chat_request,
+    validate_chat_generation_options,
+    with_prepared_options,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -56,9 +39,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     FunctionResponse,
     LogProbs,
-    MessageProcessingResult,
     PromptTokensDetails,
-    ResponseParserProtocol,
     SglExt,
     Tool,
     ToolCall,
@@ -78,7 +59,6 @@ from sglang.srt.entrypoints.openai.utils import (
     process_spec_tokens_details_from_ret,
     should_include_usage,
     spec_tokens_details_from_meta_info,
-    to_generate_prompt_kwargs,
     to_openai_style_logprobs,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
@@ -86,21 +66,12 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import (
-    get_json_schema_constraint,
-    normalize_json_schema_types,
-)
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
-    normalize_hunyuan_reasoning_effort,
     uses_hunyuan_reasoning_effort,
 )
-from sglang.srt.parser.jinja_template_utils import (
-    MEDIA_URL_PART_TYPES,
-    process_content_for_template_format,
-)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -111,68 +82,6 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
-
-_MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
-
-
-def normalize_tool_content(role: str, content):
-    """Normalize tool message content from OpenAI array format to plain string.
-
-    OpenAI clients may send tool content as a list of content parts
-    (e.g. [{"type":"text","text":"..."}]) but most chat templates expect
-    a plain string for tool messages. Only flatten when ALL items are
-    pure OpenAI text parts; preserve lists containing non-text-type items
-    that some templates intentionally iterate over.
-    """
-    if role != "tool" or not isinstance(content, list):
-        return content
-    parts = content
-    is_openai_text_parts = all(
-        (isinstance(p, dict) and p.get("type") == "text") or isinstance(p, str)
-        for p in parts
-    )
-    if is_openai_text_parts:
-        text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
-        return " ".join(text_parts)
-    return content
-
-
-def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
-    """Parse OpenAI tool call arguments for chat templates."""
-    try:
-        parsed_arguments = orjson.loads(arguments)
-    except orjson.JSONDecodeError as exc:
-        raise ValueError(
-            "Assistant tool call function.arguments must be valid JSON."
-        ) from exc
-
-    if not isinstance(parsed_arguments, dict):
-        raise ValueError(
-            "Assistant tool call function.arguments must be a JSON object."
-        )
-
-    return parsed_arguments
-
-
-def normalize_assistant_tool_call_arguments(
-    message: Dict[str, Any], *, strict: bool = True
-) -> None:
-    """Normalize assistant history tool call arguments in-place."""
-    if message.get("role") != "assistant" or not isinstance(
-        message.get("tool_calls"), list
-    ):
-        return
-
-    for item in message["tool_calls"]:
-        function = item.get("function") if isinstance(item, dict) else None
-        if not isinstance(function, dict):
-            continue
-        if "arguments" in function and isinstance(function["arguments"], str):
-            try:
-                function["arguments"] = parse_tool_call_arguments(function["arguments"])
-            except ValueError:
-                if strict:
-                    raise
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -199,27 +108,6 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
-
-
-KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
-KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
-
-
-def neutralize_kimi_k3_image_placeholder(text: str) -> str:
-    return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
-
-
-def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
-    if isinstance(value, str):
-        return neutralize_kimi_k3_image_placeholder(value)
-    if isinstance(value, list):
-        return [neutralize_kimi_k3_image_placeholder_value(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: neutralize_kimi_k3_image_placeholder_value(item)
-            for key, item in value.items()
-        }
-    return value
 
 
 def _extract_video_question(request: ChatCompletionRequest) -> Optional[str]:
@@ -264,29 +152,23 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         tokenizer_manager: TokenizerManager,
         template_manager: TemplateManager,
+        *,
+        input_processor=None,
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
-        self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
-        self.default_chat_template_kwargs = (
-            get_serving().default_chat_template_kwargs or {}
+        self.input_processor = (
+            input_processor
+            if input_processor is not None
+            else create_chat_input_processor(tokenizer_manager, template_manager)
         )
-        self._reasoning_detector = None
-        if self.reasoning_parser:
-            try:
-                rp = ReasoningParser(
-                    model_type=self.reasoning_parser,
-                    stream_reasoning=True,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                )
-                self._reasoning_detector = rp.detector
-            except ValueError as e:
-                logger.warning(
-                    "Failed to initialize reasoning detector for parser '%s': %s",
-                    self.reasoning_parser,
-                    e,
-                )
+        config = self.input_processor.config
+        self.tool_call_parser = config.tool_call_parser
+        self.reasoning_parser = config.reasoning_parser
+        self._reasoning_detector = config.reasoning_detector
+        self.chat_encoding_spec = config.chat_encoding_spec
+        self.is_gpt_oss = config.is_gpt_oss
+        self.is_gemma4 = config.is_gemma4
 
         # Get default sampling parameters from model's generation config
         self.default_sampling_params = (
@@ -301,125 +183,6 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             OpenAIServingChat._default_sampling_params_logged = True
 
-        # Check if the model is a GPT-OSS model
-        self.is_gpt_oss = (
-            hasattr(self.tokenizer_manager.model_config, "hf_config")
-            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
-        )
-        self.is_gemma4 = (
-            hasattr(self.tokenizer_manager.model_config, "hf_config")
-            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type
-            in ("gemma4", "gemma4_unified")
-        )
-
-        # Which Python-based chat encoder (if any) bypasses apply_chat_template.
-        # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
-        self.chat_encoding_spec = self._resolve_chat_encoding_spec()
-        self._dsv4_reasoning_effort_profile = (
-            chat_encoding.resolve_dsv4_reasoning_effort_profile(
-                model_path=self.tokenizer_manager.model_path,
-                revision=get_model().revision,
-                override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
-                    chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
-                ),
-            )
-            if self.chat_encoding_spec == "dsv4"
-            else None
-        )
-
-        # Resolve the env-configured Inkling effort default once: the env var is
-        # frozen for the server's lifetime, and a misconfigured value should
-        # fail at boot, not 400 every request.
-        self._inkling_default_reasoning_effort: Optional[float] = (
-            self._get_inkling_default_reasoning_effort()
-            if self.chat_encoding_spec == "inkling"
-            else None
-        )
-
-        # Per-request response parser for custom decoding (set by _encode_messages)
-        self._response_parser: Optional[ResponseParserProtocol] = None
-
-        # Probe whether ``encode("")`` returns specials. If it does, we must
-        # keep ``add_special_tokens=False`` at the chat-template encode site
-        # to avoid double BOS; otherwise the kwarg is a no-op and dropping it
-        # lets slow tokenizers (e.g. Kimi's TikTokenTokenizer) stay on the
-        # fast internal path.
-        try:
-            self._tokenizer_auto_adds_specials = (
-                len(self.tokenizer_manager.tokenizer.encode("")) > 0
-            )
-        except Exception:
-            self._tokenizer_auto_adds_specials = True
-
-    def _handle_last_assistant_message(
-        self,
-        messages: List[Dict[str, Any]],
-        request: ChatCompletionRequest,
-    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
-        """
-        Handle continue_final_message feature: separate final assistant message.
-
-        If continue_final_message is enabled and the last message is from assistant,
-        extract its content and remove it from the message list.
-        If continue_final_message is False and the last message is from assistant,
-        convert it to a user message to ensure the last message is always from user.
-
-        Only processes text-based content (strings), ignoring multimodal content (lists).
-
-        Args:
-            messages: List of message dictionaries
-            request: ChatCompletionRequest with continue_final_message flag
-
-        Returns:
-            Tuple of (processed_messages, assistant_prefix)
-            - processed_messages: Messages with last assistant message handled appropriately
-            - assistant_prefix: Content of the last assistant message (string only), or None
-        """
-        assistant_prefix = None
-        if messages and messages[-1].get("role") == "assistant":
-            last_content = messages[-1].get("content")
-            # Only process string content, ignore multimodal content (lists)
-            if isinstance(last_content, str):
-                if request.continue_final_message:
-                    # Extract content and remove the assistant message
-                    assistant_prefix = last_content
-                    messages = messages[:-1]
-                else:
-                    # Convert the last assistant message to user message
-                    messages[-1] = {"role": "user", "content": last_content}
-        return messages, assistant_prefix
-
-    def _append_assistant_prefix_to_prompt_ids(
-        self, prompt_ids: List[int], assistant_prefix: str
-    ) -> List[int]:
-        """
-        Append assistant prefix to prompt_ids.
-
-        Args:
-            prompt_ids: Current prompt token IDs
-            assistant_prefix: Assistant message content to append
-
-        Returns:
-            Updated prompt_ids with assistant prefix appended
-        """
-        encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-        if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
-            encoded = encoded[1:]
-        return prompt_ids + encoded
-
-    def _resolve_chat_encoding_spec(self) -> Optional[str]:
-        """Determine which chat encoding spec to use.
-
-        Override in subclass to add custom encoding specs.
-        """
-        return chat_encoding.resolve_chat_encoding_spec(
-            hf_config=self.tokenizer_manager.model_config.hf_config,
-            tokenizer=self.tokenizer_manager.tokenizer,
-            tool_call_parser=self.tool_call_parser,
-        )
-
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
@@ -433,273 +196,6 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 tools.extend(message.tools)
         return tools
-
-    def _prepare_kimi_k3_messages(
-        self,
-        messages: List[Dict[str, Any]],
-        request: ChatCompletionRequest,
-    ) -> tuple[List[Dict[str, Any]], int, Optional[str]]:
-        image_count = 0
-        for index, message in enumerate(messages):
-            content = message.get("content")
-            if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    part_type = part.get("type")
-                    if part_type in ("text", "input_text"):
-                        parts.append(
-                            {
-                                "type": "text",
-                                "text": neutralize_kimi_k3_image_placeholder(
-                                    part["text"]
-                                ),
-                            }
-                        )
-                    elif part_type in ("image_url", "input_image"):
-                        image = part.get("image_url") or {}
-                        if isinstance(image, str):
-                            image = {"url": image, "detail": part.get("detail")}
-                        parts.append({"type": "image_url", "image_url": image})
-                        image_count += 1
-                message["content"] = parts
-            elif isinstance(content, str):
-                message["content"] = neutralize_kimi_k3_image_placeholder(content)
-            elif content is None:
-                message["content"] = ""
-
-            if message.get("role") == "assistant":
-                for key in ("reasoning_content", "reasoning"):
-                    if key in message:
-                        message[key] = neutralize_kimi_k3_image_placeholder_value(
-                            message[key]
-                        )
-                for tool_call in message.get("tool_calls") or []:
-                    function = (
-                        tool_call.get("function")
-                        if isinstance(tool_call, dict)
-                        else None
-                    )
-                    if isinstance(function, dict) and "arguments" in function:
-                        function["arguments"] = (
-                            neutralize_kimi_k3_image_placeholder_value(
-                                function["arguments"]
-                            )
-                        )
-
-            source = request.messages[index]
-            if (
-                isinstance(source, ChatCompletionMessageGenericParam)
-                and source.role in ("system", "developer")
-                and source.tools
-            ):
-                message["tools"] = [
-                    tool.model_dump(exclude_unset=True, by_alias=True)
-                    for tool in source.tools
-                ]
-            if message.get("role") == "developer":
-                message["role"] = "system"
-
-        assistant_prefix = None
-        if request.continue_final_message:
-            messages, assistant_prefix = self._handle_last_assistant_message(
-                messages, request
-            )
-        return messages, image_count, assistant_prefix
-
-    def _encode_messages(
-        self,
-        messages: List[Dict[str, Any]],
-        request: ChatCompletionRequest,
-        thinking_mode: ThinkingMode,
-        tools: Optional[List[Dict]] = None,
-    ) -> Optional[List[int]]:
-        """Encode messages for custom chat_encoding_spec values.
-
-        Returns prompt_ids if handled, None to use default encoding.
-        """
-        if self.chat_encoding_spec == "inkling":
-            # Inkling: render messages -> input_ids with framing tokens + ONE placeholder per
-            # media (encoding/expansion happens later in InklingMultimodalProcessor). The
-            # server's tokenizer is the base tiktoken backend; wrap it so encode_special
-            # supplies the framing-token overlay.
-            from sglang.srt.parser.inkling_renderer import render_inkling_messages
-            from sglang.srt.parser.inkling_tokenizer import (
-                CONTENT_TEXT,
-                MESSAGE_MODEL,
-                InklingTokenizer,
-            )
-
-            inkling_tokenizer = InklingTokenizer(
-                tokenizer=self.tokenizer_manager.tokenizer
-            )
-            reasoning_effort = self._parse_inkling_reasoning_effort(
-                request.reasoning_effort
-            )
-            if reasoning_effort is None:
-                reasoning_effort = self._inkling_default_reasoning_effort
-            assistant_prefix = self._pop_inkling_assistant_prefix(messages, request)
-            prompt_ids = render_inkling_messages(
-                messages,
-                inkling_tokenizer,
-                add_generation_prompt=False,
-                tools=tools,
-                reasoning_effort=reasoning_effort,
-            )
-            if assistant_prefix is not None:
-                # Continue the final assistant message inside an OPEN model text
-                # block: header + payload, no <|end_message|> and no
-                # <|content_model_end_sampling|>, so the model resumes the turn.
-                prompt_ids += [
-                    inkling_tokenizer.encode_special(MESSAGE_MODEL),
-                    inkling_tokenizer.encode_special(CONTENT_TEXT),
-                    *inkling_tokenizer.encode_text(assistant_prefix),
-                ]
-            return prompt_ids
-        if self.chat_encoding_spec == "kimi_k3":
-            messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
-                messages, request
-            )
-            template_kwargs = dict(request.chat_template_kwargs or {})
-            template_kwargs.pop("tokenize", None)
-            template_kwargs.pop("return_dict", None)
-            template_kwargs.pop("image_prompts", None)
-            if image_count:
-                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
-
-            if (
-                request.reasoning_effort in ("low", "high", "max")
-                and "thinking_effort" not in template_kwargs
-            ):
-                template_kwargs["thinking_effort"] = request.reasoning_effort
-            elif request.reasoning_effort not in (
-                None,
-                "none",
-                "low",
-                "high",
-                "max",
-            ):
-                logger.warning(
-                    "Kimi K3 does not support reasoning_effort=%r; using the "
-                    "encoder default.",
-                    request.reasoning_effort,
-                )
-
-            effective_tools = self._effective_tools(request)
-            if (
-                effective_tools
-                and isinstance(request.tool_choice, str)
-                and request.tool_choice in ("required", "none")
-            ):
-                template_kwargs.setdefault("tool_choice", request.tool_choice)
-            if request.response_format is not None:
-                template_kwargs.setdefault(
-                    "response_format",
-                    request.response_format.model_dump(
-                        exclude_unset=True, by_alias=True
-                    ),
-                )
-
-            request_tools = (
-                [
-                    tool.model_dump(exclude_unset=True, by_alias=True)
-                    for tool in request.tools
-                ]
-                if request.tools
-                else None
-            )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=request_tools,
-                return_dict=False,
-                **template_kwargs,
-            )
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
-            return prompt_ids
-        return None
-
-    @staticmethod
-    def _pop_inkling_assistant_prefix(
-        messages: List[Dict[str, Any]],
-        request: ChatCompletionRequest,
-    ) -> Optional[str]:
-        """Extract the trailing assistant text for ``continue_final_message``.
-
-        Only a plain-string assistant message with no tool calls and no
-        reasoning content can be continued; anything else renders as a closed
-        historical turn. Mutates ``messages`` in place (callers pass a copy).
-        """
-        if not request.continue_final_message or not messages:
-            return None
-        last = messages[-1]
-        if (
-            last.get("role") != "assistant"
-            or not isinstance(last.get("content"), str)
-            or last.get("tool_calls")
-            or last.get("reasoning_content")
-        ):
-            return None
-        messages.pop()
-        return last["content"]
-
-    @staticmethod
-    def _parse_inkling_reasoning_effort(
-        value: Optional[Union[str, float]],
-    ) -> Optional[float]:
-        """Convert an OpenAI-style reasoning_effort to an Inkling float."""
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            raise ValueError("Inkling reasoning_effort must not be a boolean")
-        if isinstance(value, (int, float)):
-            parsed = float(value)
-            if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-                raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
-            return parsed
-        _EFFORT_MAP = {
-            "none": 0.0,
-            "minimal": 0.1,
-            "low": 0.2,
-            "medium": 0.7,
-            "high": 0.9,
-            "xhigh": 0.99,
-            "max": 0.99,
-        }
-        if value in _EFFORT_MAP:
-            return _EFFORT_MAP[value]
-        try:
-            parsed = float(value)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"invalid Inkling reasoning_effort: {value!r}") from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-            raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
-        return parsed
-
-    @staticmethod
-    def _get_inkling_default_reasoning_effort() -> float:
-        """Read the default Inkling reasoning effort from the environment."""
-        from sglang.srt.environ import envs
-
-        val = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT.get()
-        if not val:
-            return 0.9
-        try:
-            parsed = float(val)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be numeric"
-            ) from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-            raise ValueError(
-                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be in [0.0, 0.99]"
-            )
-        return parsed
 
     def _decode_response(self, ret_item: Dict[str, Any]) -> Union[str, ErrorResponse]:
         """Extract text from response."""
@@ -737,66 +233,6 @@ class OpenAIServingChat(OpenAIServingBase):
             # reference API excludes it from billed/reported prompt tokens.
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
-
-    @staticmethod
-    def _sort_tool_message_run(
-        run: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Order a tool-message run by tool_call position.
-
-        Templates that associate results by tool_call_id render the run in
-        tool_calls order; sorting the run upfront keeps extraction order and
-        placeholder order the same. Runs the template itself would refuse to
-        associate (missing/duplicate/unknown ids) are left untouched, as are
-        text-only runs, whose order text-only templates may rely on.
-        """
-        if len(run) < 2:
-            return run
-        call_ids = [tc.get("id") for tc in tool_calls]
-        if any(call_id is None for call_id in call_ids) or len(set(call_ids)) != len(
-            call_ids
-        ):
-            return run
-        result_ids = [message.get("tool_call_id") for message in run]
-        if any(result_id not in call_ids for result_id in result_ids) or len(
-            set(result_ids)
-        ) != len(result_ids):
-            return run
-        has_media = any(
-            isinstance(message.get("content"), list)
-            and any(
-                isinstance(part, dict) and part.get("type") in MEDIA_URL_PART_TYPES
-                for part in message["content"]
-            )
-            for message in run
-        )
-        if not has_media:
-            return run
-        position = {call_id: index for index, call_id in enumerate(call_ids)}
-        return sorted(run, key=lambda message: position[message["tool_call_id"]])
-
-    @classmethod
-    def _canonicalize_tool_message_order(
-        cls, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        canonical = []
-        index = 0
-        while index < len(messages):
-            message = messages[index]
-            canonical.append(message)
-            index += 1
-            tool_calls = message.get("tool_calls") or []
-            if message.get("role") != "assistant" or not tool_calls:
-                continue
-            run = []
-            while index < len(messages) and messages[index].get("role") in (
-                "tool",
-                "function",
-            ):
-                run.append(messages[index])
-                index += 1
-            canonical.extend(cls._sort_tool_message_run(run, tool_calls))
-        return canonical
 
     async def _generate_stream_content(
         self,
@@ -945,103 +381,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
-        if not request.messages:
-            return "Messages cannot be empty."
-
-        if request.return_sampling_mask and not request.return_meta_info:
-            return "return_sampling_mask requires return_meta_info=true."
-
-        media_error = self._validate_media_content(request)
-        if media_error:
-            return media_error
-
-        effective_tools = self._effective_tools(request)
-        has_message_tools = any(
-            isinstance(message, ChatCompletionMessageGenericParam)
-            and message.role in ("system", "developer")
-            and message.tools
-            for message in request.messages
-        )
-        if (
-            isinstance(request.tool_choice, str)
-            and request.tool_choice.lower() == "required"
-            and not effective_tools
-        ):
-            return "Tools cannot be empty if tool choice is set to required."
-
-        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
-            if not effective_tools:
-                return "Tools cannot be empty if tool choice is set to a specific tool."
-            tool_name = request.tool_choice.function.name
-            tool_exists = any(
-                tool.function.name == tool_name for tool in effective_tools
-            )
-            if not tool_exists:
-                return f"Tool '{tool_name}' not found in tools list."
-
-        if has_message_tools:
-            names = [tool.function.name for tool in effective_tools]
-            if len(names) != len(set(names)):
-                return "Tool names must be unique across request and message tools."
-
-        # Validate tool definitions
-        for i, tool in enumerate(effective_tools):
-            if tool.function.parameters is None:
-                continue
-            try:
-                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
-                # to standard JSON Schema types before validation. RecursionError
-                # guards against hand-crafted cyclic schemas so the request gets
-                # a 400 instead of crashing into a 500.
-                normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
-            except SchemaError as e:
-                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
-            except RecursionError:
-                return (
-                    f"Tool {i} function 'parameters' schema is too deeply nested "
-                    "or contains a cycle."
-                )
-
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
-        server_context_length = get_model().context_length
-        if (
-            max_output_tokens
-            and server_context_length
-            and max_output_tokens > server_context_length
-        ) and not get_serving().allow_auto_truncate:
-            return (
-                f"max_completion_tokens is too large: {max_output_tokens}."
-                f"This model supports at most {server_context_length} completion tokens."
-            )
-
-        if request.response_format and request.response_format.type == "json_schema":
-            schema = getattr(request.response_format.json_schema, "schema_", None)
-            if schema is None:
-                return "schema_ is required for json_schema response format request."
-
-        return None
-
-    def _validate_media_content(self, request: ChatCompletionRequest) -> Optional[str]:
-        if self.tokenizer_manager.model_config.is_multimodal:
-            return None
-
-        media_type = next(
-            (
-                part.type
-                for message in request.messages
-                if isinstance(message.content, list)
-                for part in message.content
-                if part.type in _MEDIA_CONTENT_PART_TYPES
-            ),
-            None,
-        )
-        if media_type is None:
-            return None
-
+        chat_input = from_chat_request(request)
         return (
-            "Model only supports text input; "
-            f"received unsupported content type '{media_type}'."
+            validate_chat_input(chat_input)
+            or validate_media_content(
+                chat_input, self.tokenizer_manager.model_config.is_multimodal
+            )
+            or validate_chat_generation_options(request)
         )
 
     def _convert_to_internal_request(
@@ -1049,6 +395,8 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+
+        request = request.model_copy(deep=True)
 
         # Header-based opt-in (same rationale as request_headers.py).
         if raw_request is not None and not request.return_input_ids_in_sglext:
@@ -1095,10 +443,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     "Please set stream=false when using return_meta_info=true."
                 )
 
-        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-
-        # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        processed_messages = self.input_processor.prepare(from_chat_request(request))
+        request = with_prepared_options(request, processed_messages)
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1110,7 +456,7 @@ class OpenAIServingChat(OpenAIServingBase):
             sampling_params, processed_messages.reasoning_end_token_ids
         )
 
-        prompt_kwargs = to_generate_prompt_kwargs(processed_messages.engine_prompt)
+        prompt_kwargs = processed_messages.prompt.to_generate_kwargs()
 
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
@@ -1175,458 +521,6 @@ class OpenAIServingChat(OpenAIServingBase):
             apply_header_overrides(adapted_request, raw_request.headers)
 
         return adapted_request, request
-
-    def _process_messages(
-        self, request: ChatCompletionRequest, is_multimodal: bool
-    ) -> MessageProcessingResult:
-        """Process chat messages and apply chat template"""
-        if self.default_chat_template_kwargs:
-            ctk = dict(request.chat_template_kwargs or {})
-            for k, v in self.default_chat_template_kwargs.items():
-                ctk.setdefault(k, v)
-            request.chat_template_kwargs = ctk
-            effort = ctk.get("reasoning_effort")
-            if effort is not None and request.reasoning_effort is None:
-                request.reasoning_effort = effort
-
-        normalize_hunyuan_reasoning_effort(
-            request, self.reasoning_parser, self.template_manager.reasoning_config
-        )
-
-        # GptOss model needs to keep special tokens for harmony parsing
-        if self.is_gpt_oss or self.is_gemma4:
-            request.skip_special_tokens = False
-
-        self._patch_reasoning_skip_special_tokens(request)
-
-        thinking_mode = self._get_reasoning_from_request(request)
-        # SGLang's ReasonerGrammarBackend owns the reasoning prefix
-        # when --reasoning-parser is configured, so builtin xgrammar
-        # tags must describe only the post-reasoning tool-call suffix.
-        xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
-        tool_call_constraint = None
-
-        # Apply chat template and its stop strings
-        tools = None
-        tool_call_stop = None
-        required_parsed_natively = False
-        effective_tools = self._effective_tools(request)
-        if effective_tools and request.tool_choice != "none":
-            request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
-                tools = [
-                    item.model_dump()
-                    for item in request.tools or []
-                    if item.function.name == request.tool_choice.function.name
-                ] or None
-            elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
-            if self.tool_call_parser:
-                parser = FunctionCallParser(
-                    effective_tools,
-                    self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                )
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice,
-                    parallel_tool_calls=request.parallel_tool_calls,
-                    thinking_mode=xgrammar_reasoning,
-                )
-                required_parsed_natively = parser.detector.parses_required_natively()
-                if self.chat_encoding_spec == "kimi_k3":
-                    tool_call_stop = parser.detector.eot_token
-            if (
-                tool_call_constraint is None
-                and not required_parsed_natively
-                and not (
-                    self.chat_encoding_spec == "kimi_k3"
-                    and self.tool_call_parser == "kimi_k3"
-                )
-                and (
-                    request.tool_choice == "required"
-                    or isinstance(request.tool_choice, ToolChoice)
-                )
-            ):
-                json_schema = get_json_schema_constraint(
-                    effective_tools,
-                    request.tool_choice,
-                    parallel_tool_calls=request.parallel_tool_calls,
-                )
-                tool_call_constraint = ("json_schema", json_schema)
-
-        # When input_ids are provided, skip template tokenization entirely;
-        # only stop tokens and tool_call_constraint are needed.
-        if request.input_ids is not None:
-            result = MessageProcessingResult(
-                engine_prompt=request.input_ids,
-                prompt="",
-                prompt_ids=request.input_ids,
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
-                stop=request.stop or [],
-            )
-        elif self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools, is_multimodal)
-        else:
-            result = self._apply_conversation_template(request, is_multimodal)
-
-        if tool_call_stop is not None:
-            if isinstance(result.stop, str):
-                result.stop = [result.stop]
-            elif result.stop is None:
-                result.stop = []
-            else:
-                result.stop = list(result.stop)
-            if tool_call_stop not in result.stop:
-                result.stop.append(tool_call_stop)
-
-        result.tool_call_constraint = tool_call_constraint
-        result.require_reasoning = thinking_mode
-        result.skip_special_tokens = request.skip_special_tokens
-        if self.reasoning_parser == "k2_horizon" and thinking_mode:
-            parser = ReasoningParser(
-                model_type=self.reasoning_parser,
-                stream_reasoning=False,
-                force_reasoning=True,
-                request=request,
-                tokenizer=self.tokenizer_manager.tokenizer,
-            )
-            token_ids = self.tokenizer_manager.tokenizer.encode(
-                parser.detector.think_end_token,
-                add_special_tokens=False,
-            )
-            if hasattr(token_ids, "tolist"):
-                token_ids = token_ids.tolist()
-            if (
-                not isinstance(token_ids, list)
-                or not token_ids
-                or any(
-                    type(token_id) is not int or token_id < 0 for token_id in token_ids
-                )
-            ):
-                raise ValueError(
-                    "The selected K2 reasoning terminator could not be encoded"
-                )
-            result.reasoning_end_token_ids = list(token_ids)
-        return result
-
-    def _apply_jinja_template(
-        self,
-        request: ChatCompletionRequest,
-        tools: Optional[List[Dict]],
-        is_multimodal: bool,
-    ) -> MessageProcessingResult:
-        """Apply Jinja chat template"""
-        prompt = ""
-        prompt_ids = []
-        openai_compatible_messages = []
-        image_data = []
-        video_data = []
-        audio_data = []
-        modalities = []
-
-        template_content_format = self.template_manager.jinja_template_content_format
-
-        # Try custom encoding first (override in subclass for custom renderers)
-        thinking_requested = (request.chat_template_kwargs or {}).get(
-            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
-        )
-        thinking_mode = (
-            ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
-        )
-        messages = [msg.model_dump() for msg in request.messages]
-        for message in messages:
-            normalize_assistant_tool_call_arguments(
-                message, strict=self.chat_encoding_spec != "kimi_k3"
-            )
-
-        prompt_ids = self._encode_messages(
-            copy.deepcopy(messages),
-            request,
-            thinking_mode,
-            tools=tools,
-        )
-
-        if prompt_ids is not None:
-            engine_prompt = prompt_ids
-            if self.chat_encoding_spec in ("inkling", "kimi_k3"):
-                for message in request.messages:
-                    msg_dict = message.model_dump()
-                    if msg_dict.get("content") is None:
-                        msg_dict["content"] = ""
-                    process_content_for_template_format(
-                        msg_dict,
-                        "openai",
-                        image_data,
-                        video_data,
-                        audio_data,
-                        modalities,
-                    )
-        elif self.chat_encoding_spec is not None:
-            # dsv4/dsv32 encoding path
-            messages = copy.deepcopy(messages)
-
-            # dsv4/dsv32 are text-only and consume string content; flatten
-            # OpenAI parts-list content here so the encoder sees a plain string.
-            for i, msg in enumerate(messages):
-                if isinstance(msg.get("content"), list):
-                    messages[i] = process_content_for_template_format(
-                        msg, "string", [], [], [], []
-                    )
-
-            for msg in messages:
-                if msg.get("content") is None:
-                    msg["content"] = ""
-                processed_msg = process_content_for_template_format(
-                    msg,
-                    template_content_format,
-                    image_data,
-                    video_data,
-                    audio_data,
-                    modalities,
-                    use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
-                )
-                msg.update(processed_msg)
-
-            # Handle continue_final_message: separate final assistant message
-            messages, assistant_prefix = self._handle_last_assistant_message(
-                messages, request
-            )
-
-            if messages[0]["role"] != "system":
-                # insert an empty system prompt to help render tool system prompt
-                messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
-                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-
-            # Default encoding (dsv4/dsv32)
-            if self.chat_encoding_spec == "dsv4":
-                effort_source = request.reasoning_effort
-                if effort_source is None:
-                    env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
-                    if env_val:
-                        effort_source = env_val
-                reasoning_effort_profile = self._dsv4_reasoning_effort_profile
-                assert reasoning_effort_profile is not None
-                accepted_efforts = encoding_dsv4.REASONING_EFFORT_PROFILES[
-                    reasoning_effort_profile
-                ]
-                v4_reasoning_effort = (
-                    effort_source if effort_source in accepted_efforts else None
-                )
-                if request.task is not None:
-                    encoding_dsv4.attach_task_to_last_user_message(
-                        messages, request.task
-                    )
-                real_input = encoding_dsv4.encode_messages(
-                    messages,
-                    thinking_mode=thinking_mode,
-                    reasoning_effort=v4_reasoning_effort,
-                    reasoning_effort_profile=reasoning_effort_profile,
-                )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
-            else:
-                real_input = encoding_dsv32.encode_messages(
-                    messages, thinking_mode=thinking_mode
-                )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
-
-            # Append assistant prefix if continue_final_message is enabled
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
-            engine_prompt = prompt_ids
-        else:
-            if self.template_manager.jinja_template_may_reorder_tool_results:
-                messages = self._canonicalize_tool_message_order(messages)
-            for msg_dict in copy.deepcopy(messages):
-                if msg_dict.get("content") is None:
-                    msg_dict["content"] = ""
-
-                # Process content based on detected template format
-                processed_msg = process_content_for_template_format(
-                    msg_dict,
-                    template_content_format,
-                    image_data,
-                    video_data,
-                    audio_data,
-                    modalities,
-                )
-
-                processed_msg["content"] = normalize_tool_content(
-                    processed_msg["role"], processed_msg.get("content")
-                )
-
-                openai_compatible_messages.append(processed_msg)
-
-            # Handle continue_final_message: separate final assistant message
-            openai_compatible_messages, assistant_prefix = (
-                self._handle_last_assistant_message(openai_compatible_messages, request)
-            )
-
-            extra_template_kwargs = {}
-            if request.reasoning_effort is not None:
-                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
-            if request.chat_template_kwargs:
-                extra_template_kwargs.update(request.chat_template_kwargs)
-
-            rc = self.template_manager.reasoning_config
-            if rc is not None and rc.effort_kwarg is not None:
-                if request.reasoning_effort == "low":
-                    extra_template_kwargs.setdefault(rc.effort_kwarg, True)
-                elif request.reasoning_effort in ("medium", "high", "max"):
-                    logger.warning(
-                        "Model '%s' supports only 'low' reasoning effort; "
-                        "requested '%s' treated as default thinking",
-                        self.tokenizer_manager.served_model_name,
-                        request.reasoning_effort,
-                    )
-
-            # Split apply_chat_template(tokenize=True) into render + encode so we
-            # can skip add_special_tokens=False on tokenizers that don't auto-add
-            # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
-            # templates already include role/special tokens, so the encode must
-            # avoid double BOS on tokenizers that would add it.
-            encode_kwargs = (
-                {"add_special_tokens": False}
-                if self._tokenizer_auto_adds_specials
-                else {}
-            )
-            try:
-                rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-                    openai_compatible_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    tools=tools,
-                    return_dict=False,
-                    **extra_template_kwargs,
-                )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
-                )
-            except Exception:
-                # If the first attempt fails, try with flat function-only format.
-                # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
-                tools = (
-                    [t["function"] if "function" in t else t for t in tools]
-                    if tools
-                    else None
-                )
-                try:
-                    rendered_prompt = (
-                        self.tokenizer_manager.tokenizer.apply_chat_template(
-                            openai_compatible_messages,
-                            tokenize=False,
-                            add_generation_prompt=True,
-                            tools=tools,
-                            return_dict=False,
-                            **extra_template_kwargs,
-                        )
-                    )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, **encode_kwargs
-                    )
-                except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
-                    # Template errors (e.g., from raise_exception in Jinja templates)
-                    # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
-                    # should be treated as client errors (400 BadRequest)
-                    raise ValueError(str(template_error)) from template_error
-
-            # Append assistant prefix if continue_final_message is enabled
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
-
-            if is_multimodal:
-                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
-            engine_prompt = prompt if is_multimodal else prompt_ids
-
-        stop = request.stop
-        image_data = image_data if image_data else None
-        audio_data = audio_data if audio_data else None
-        video_data = video_data if video_data else None
-        modalities = modalities if modalities else []
-        return MessageProcessingResult(
-            engine_prompt=engine_prompt,
-            prompt=prompt,
-            prompt_ids=prompt_ids,
-            image_data=image_data,
-            video_data=video_data,
-            audio_data=audio_data,
-            modalities=modalities,
-            stop=stop,
-        )
-
-    def _apply_conversation_template(
-        self,
-        request: ChatCompletionRequest,
-        is_multimodal: bool,
-    ) -> MessageProcessingResult:
-        """Apply conversation template"""
-        prompt = ""
-        prompt_ids = []
-        conv = generate_chat_conv(request, self.template_manager.chat_template_name)
-
-        # If we should continue the final assistant message, adjust the conversation.
-        if (
-            request.continue_final_message
-            and request.messages
-            and request.messages[-1].role == "assistant"
-        ):
-            # Remove the auto-added blank assistant turn, if present.
-            if conv.messages and conv.messages[-1][1] is None:
-                conv.messages.pop()
-            # Rebuild the prompt from the conversation.
-            prompt = conv.get_prompt()
-            # Strip trailing stop tokens or separators that indicate end-of-assistant.
-            if isinstance(conv.stop_str, list):
-                for stop_token in conv.stop_str:
-                    if prompt.endswith(stop_token):
-                        prompt = prompt[: -len(stop_token)]
-            elif isinstance(conv.stop_str, str) and prompt.endswith(conv.stop_str):
-                prompt = prompt[: -len(conv.stop_str)]
-            if conv.sep and prompt.endswith(conv.sep):
-                prompt = prompt[: -len(conv.sep)]
-            if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
-                prompt = prompt[: -len(conv.sep2)]
-        else:
-            prompt = conv.get_prompt()
-            if self._get_reasoning_from_request(request) and (
-                self._reasoning_detector is None
-                or not self._reasoning_detector.thinks_internally
-            ):
-                # Models with thinks_internally=True think without a leading <think> token
-                prompt += "<think>"  # Note(Xinyuan): hard code thinking token
-
-        image_data = conv.image_data if conv.image_data else None
-        video_data = conv.video_data if conv.video_data else None
-        audio_data = conv.audio_data if conv.audio_data else None
-        modalities = conv.modalities if conv.modalities else []
-        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
-
-        if request.stop:
-            if isinstance(request.stop, str):
-                stop.append(request.stop)
-            else:
-                stop.extend(request.stop)
-
-        if not is_multimodal:
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
-
-        return MessageProcessingResult(
-            engine_prompt=prompt if is_multimodal else prompt_ids,
-            prompt=prompt,
-            prompt_ids=prompt_ids,
-            image_data=image_data,
-            video_data=video_data,
-            audio_data=audio_data,
-            modalities=modalities,
-            stop=stop,
-        )
 
     async def _handle_streaming_request(
         self,
@@ -2099,7 +993,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.reasoning_parser and request.separate_reasoning:
                 force_reasoning = (
                     self.template_manager.force_reasoning
-                    or self._get_reasoning_from_request(request)
+                    or self.input_processor._get_reasoning_from_request(
+                        from_chat_request(request)
+                    )
                 )
                 try:
                     parser = ReasoningParser(
@@ -2440,7 +1336,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
                 self.template_manager.force_reasoning
-                or self._get_reasoning_from_request(request)
+                or self.input_processor._get_reasoning_from_request(
+                    from_chat_request(request)
+                )
             )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.reasoning_parser,
@@ -2479,30 +1377,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = getattr(msg, "tool_calls", None)
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
-
-    def _patch_reasoning_skip_special_tokens(
-        self, request: ChatCompletionRequest
-    ) -> None:
-        """Keep parser-specific reasoning markers in the decoded text.
-
-        Some reasoning parsers rely on special-token delimiters that would be
-        removed during detokenization when ``skip_special_tokens=True``.
-        """
-        if self.reasoning_parser == "apertus2509":
-            request.skip_special_tokens = False
-        if self.reasoning_parser == "kimi_k3" or self.chat_encoding_spec == "kimi_k3":
-            request.skip_special_tokens = False
-
-        if (
-            self.reasoning_parser in ["mistral"]
-            and request.reasoning_effort is not None
-            and request.reasoning_effort != "none"
-        ):
-            request.skip_special_tokens = False
-        elif self.reasoning_parser == "inkling":
-            request.skip_special_tokens = False
-        elif self.reasoning_parser == "muse":
-            request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder takes history as ``reasoning_content`` rather
@@ -2625,87 +1499,6 @@ class OpenAIServingChat(OpenAIServingBase):
         chat_template_kwargs = dict(request.chat_template_kwargs or {})
         chat_template_kwargs[toggle_param] = enabled
         request.chat_template_kwargs = chat_template_kwargs
-
-    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Determine whether reasoning mode should be enabled for this request.
-
-        NOTE: This is predefined based on model's chat template
-        """
-        if not self.reasoning_parser:
-            return False
-
-        if self.reasoning_parser == "minimax-m3":
-            # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
-            # appears in output and reasoning must be forced. Mirrors reasoning_parser.py.
-            return (request.chat_template_kwargs or {}).get(
-                "thinking_mode"
-            ) == "enabled"
-
-        if self.reasoning_parser == "hunyuan":
-            config = self.template_manager.reasoning_config
-            if config is not None and config.special_case == "hunyuan_effort":
-                return request.reasoning_effort not in ("none", "no_think")
-            # Hy3-preview template emits no <think> when reasoning_effort is
-            # "no_think" / "none" / unset; forcing reasoning would route all
-            # output into reasoning_content.
-            return request.reasoning_effort not in (None, "none", "no_think")
-
-        config = self.template_manager.reasoning_config
-        if config is None:
-            # Fallback to parser-level defaults when template toggle config
-            # cannot be inferred (e.g., parser-only <think> templates).
-            mode = (
-                self._reasoning_detector.reasoning_default
-                if self._reasoning_detector is not None
-                else None
-            )
-            if mode is None:
-                return False
-            if mode == "always":
-                return True
-            if mode == "mistral":
-                return (
-                    request.reasoning_effort is not None
-                    and request.reasoning_effort != "none"
-                )
-            if mode in ("thinking", "enable_thinking"):
-                return (
-                    not request.chat_template_kwargs
-                    or request.chat_template_kwargs.get(mode) is not False
-                )
-            if mode in ("explicit_thinking", "explicit_enable_thinking"):
-                toggle = mode.replace("explicit_", "")
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get(toggle) is True
-                )
-            logger.warning(
-                "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
-                mode,
-            )
-            return False
-
-        if config.special_case == "always":
-            return True
-
-        if config.special_case == "mistral":
-            return (
-                request.reasoning_effort is not None
-                and request.reasoning_effort != "none"
-            )
-
-        if config.toggle_param is None or config.default_enabled is None:
-            return False
-
-        if config.default_enabled:
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get(config.toggle_param) is not False
-            )
-        return (
-            request.chat_template_kwargs is not None
-            and request.chat_template_kwargs.get(config.toggle_param) is True
-        )
 
     async def _process_tool_call_stream(
         self,

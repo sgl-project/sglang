@@ -38,6 +38,8 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
 )
 from openai_harmony import Message as OpenAIMessage
 
+from sglang.srt.entrypoints.chat_input.types import PreparedChat, TokenPrompt
+from sglang.srt.entrypoints.chat_input.validation import MediaInputError
 from sglang.srt.entrypoints.context import (
     ConversationContext,
     HarmonyContext,
@@ -54,11 +56,13 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai.chat_input_adapter import (
+    from_responses_request,
+    with_prepared_options,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
-    ChatCompletionRequest,
     Function,
-    MessageProcessingResult,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
@@ -69,7 +73,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import (
-    to_generate_prompt_kwargs,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -87,10 +90,6 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
-
-
-class _MediaInputValidationError(ValueError):
-    pass
 
 
 def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
@@ -151,8 +150,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         enable_prompt_tokens_details: bool = False,
         tool_server: Optional[ToolServer] = None,
+        input_processor=None,
     ) -> None:
-        super().__init__(tokenizer_manager, template_manager)
+        super().__init__(
+            tokenizer_manager, template_manager, input_processor=input_processor
+        )
 
         # template_manager is already set by parent class; reasoning_parser comes
         # from the parent, which reads the manager's control-plane overlay.
@@ -303,23 +305,22 @@ class OpenAIServingResponses(OpenAIServingChat):
         try:
             model_name = request.model
             tokenizer = self.tokenizer_manager.tokenizer
-            processed_messages: Optional[MessageProcessingResult] = None
+            processed_messages: Optional[PreparedChat] = None
 
             if self.use_harmony:
-                messages, request_prompts, engine_prompts = (
-                    self._make_request_with_harmony(request, prev_response)
+                messages, engine_prompt = self._make_request_with_harmony(
+                    request, prev_response
                 )
                 require_reasoning = self._is_thinking_enabled_for_request(request)
             else:
-                (
-                    messages,
-                    request_prompts,
-                    engine_prompts,
-                    processed_messages,
-                ) = await self._make_request(request, prev_response, tokenizer)
+                messages, processed_messages = await self._make_request(
+                    request, prev_response, tokenizer
+                )
+                engine_prompt = processed_messages.prompt
+                request = with_prepared_options(request, processed_messages)
                 require_reasoning = processed_messages.require_reasoning
 
-        except _MediaInputValidationError as e:
+        except MediaInputError as e:
             return self.create_error_response(str(e))
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -344,7 +345,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         # Schedule the request and get the result generator
-        generators: list[AsyncGenerator[Any, None]] = []
         tool_list = []
         if self.use_harmony:
             if self.supports_browsing:
@@ -366,124 +366,106 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     assert len(tool_list) == 0
                     tool_sessions = {}
-                for i, engine_prompt in enumerate(engine_prompts):
-                    # Calculate default max tokens from context length minus prompt length
-                    if isinstance(engine_prompt, list):
-                        prompt_length = len(engine_prompt)
-                    elif isinstance(engine_prompt, str):
-                        prompt_length = len(tokenizer.encode(engine_prompt))
-                    else:
-                        prompt_length = 0
+                # Calculate default max tokens from context length minus prompt length
+                if isinstance(engine_prompt, TokenPrompt):
+                    prompt_length = len(engine_prompt.token_ids)
+                else:
+                    prompt_length = len(tokenizer.encode(engine_prompt.text))
 
-                    context_len = (
-                        self.tokenizer_manager.model_config.context_len
-                        if hasattr(self.tokenizer_manager.model_config, "context_len")
-                        else 4096
-                    )
-                    # Account for reserved tokens (e.g., EAGLE speculative decoding slots)
-                    # that the tokenizer_manager adds during validation
-                    num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
-                    default_max_tokens = max(
-                        context_len - prompt_length - num_reserved_tokens, 512
-                    )  # Ensure minimum 512 tokens
-                    sampling_params = request.to_sampling_params(
-                        default_max_tokens,
-                        self.default_sampling_params,
-                        stop=(
-                            processed_messages.stop
-                            if processed_messages
-                            else request.stop
-                        ),
-                        tool_call_constraint=(
-                            processed_messages.tool_call_constraint
-                            if processed_messages
-                            else None
-                        ),
-                    )
-                    if processed_messages is not None:
-                        set_request_reasoning_end_token_ids(
-                            sampling_params,
-                            processed_messages.reasoning_end_token_ids,
-                        )
-                    # _process_messages set skip_special_tokens on a chat_request
-                    # we then discard, so re-apply it to the engine sampling dict.
-                    if processed_messages is not None and (
-                        not processed_messages.skip_special_tokens
-                    ):
-                        sampling_params["skip_special_tokens"] = False
-
-                    context: ConversationContext
-                    if self.use_harmony:
-                        if request.stream:
-                            context = StreamingHarmonyContext(messages, tool_sessions)
-                        else:
-                            context = HarmonyContext(messages, tool_sessions)
-                    else:
-                        context = SimpleContext()
-
-                    # Create GenerateReqInput for SGLang
-                    prompt_kwargs = to_generate_prompt_kwargs(engine_prompt)
-
-                    logprob_kwargs = (
-                        {
-                            "return_logprob": True,
-                            "logprob_start_len": -1,
-                            "top_logprobs_num": request.top_logprobs or 0,
-                            "return_text_in_logprobs": True,
-                        }
-                        if request.is_include_output_logprobs()
-                        else {}
-                    )
-
-                    adapted_request = GenerateReqInput(
-                        **prompt_kwargs,
-                        **logprob_kwargs,
-                        image_data=(
-                            processed_messages.image_data
-                            if processed_messages
-                            else None
-                        ),
-                        video_data=(
-                            processed_messages.video_data
-                            if processed_messages
-                            else None
-                        ),
-                        audio_data=(
-                            processed_messages.audio_data
-                            if processed_messages
-                            else None
-                        ),
-                        modalities=(
-                            processed_messages.modalities
-                            if processed_messages
-                            else None
-                        ),
-                        sampling_params=sampling_params,
-                        stream=request.stream,
-                        rid=request.request_id,
-                        session_id=request.session_id,
-                        extra_key=request.extra_key,
-                        cache_salt=request.cache_salt,
-                        # background+stream streams on this connection, so don't detach.
-                        background=request.background and not request.stream,
-                        require_reasoning=require_reasoning,
-                    )
-
-                    generator = self._generate_with_builtin_tools(
-                        request.request_id,
-                        request_prompts[i],
-                        adapted_request,
+                context_len = (
+                    self.tokenizer_manager.model_config.context_len
+                    if hasattr(self.tokenizer_manager.model_config, "context_len")
+                    else 4096
+                )
+                # Account for reserved tokens (e.g., EAGLE speculative decoding slots)
+                # that the tokenizer_manager adds during validation
+                num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
+                default_max_tokens = max(
+                    context_len - prompt_length - num_reserved_tokens, 512
+                )  # Ensure minimum 512 tokens
+                sampling_params = request.to_sampling_params(
+                    default_max_tokens,
+                    self.default_sampling_params,
+                    stop=(
+                        processed_messages.stop if processed_messages else request.stop
+                    ),
+                    tool_call_constraint=(
+                        processed_messages.tool_call_constraint
+                        if processed_messages
+                        else None
+                    ),
+                )
+                if processed_messages is not None:
+                    set_request_reasoning_end_token_ids(
                         sampling_params,
-                        context,
-                        raw_request=raw_request,
-                        priority=request.priority,
+                        processed_messages.reasoning_end_token_ids,
                     )
-                    generators.append(generator)
+                if processed_messages is not None and (
+                    not processed_messages.skip_special_tokens
+                ):
+                    sampling_params["skip_special_tokens"] = False
+
+                context: ConversationContext
+                if self.use_harmony:
+                    if request.stream:
+                        context = StreamingHarmonyContext(messages, tool_sessions)
+                    else:
+                        context = HarmonyContext(messages, tool_sessions)
+                else:
+                    context = SimpleContext()
+
+                # Create GenerateReqInput for SGLang
+                prompt_kwargs = engine_prompt.to_generate_kwargs()
+
+                logprob_kwargs = (
+                    {
+                        "return_logprob": True,
+                        "logprob_start_len": -1,
+                        "top_logprobs_num": request.top_logprobs or 0,
+                        "return_text_in_logprobs": True,
+                    }
+                    if request.is_include_output_logprobs()
+                    else {}
+                )
+
+                adapted_request = GenerateReqInput(
+                    **prompt_kwargs,
+                    **logprob_kwargs,
+                    image_data=(
+                        processed_messages.image_data if processed_messages else None
+                    ),
+                    video_data=(
+                        processed_messages.video_data if processed_messages else None
+                    ),
+                    audio_data=(
+                        processed_messages.audio_data if processed_messages else None
+                    ),
+                    modalities=(
+                        processed_messages.modalities if processed_messages else None
+                    ),
+                    sampling_params=sampling_params,
+                    stream=request.stream,
+                    rid=request.request_id,
+                    session_id=request.session_id,
+                    extra_key=request.extra_key,
+                    cache_salt=request.cache_salt,
+                    # background+stream streams on this connection, so don't detach.
+                    background=request.background and not request.stream,
+                    require_reasoning=require_reasoning,
+                )
+
+                generator = self._generate_with_builtin_tools(
+                    request.request_id,
+                    adapted_request,
+                    sampling_params,
+                    context,
+                    raw_request=raw_request,
+                    priority=request.priority,
+                )
             except ValueError as e:
                 return self.create_error_response(str(e))
 
-            assert len(generators) == 1
-            (result_generator,) = generators
+            result_generator = generator
 
             # Store the input messages
             if request.store:
@@ -573,48 +555,10 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         messages = self._construct_input_messages(request, prev_response)
 
-        chat_tools = self._response_tools_to_chat_tools(request)
-        chat_request = ChatCompletionRequest(
-            model=request.model,
-            messages=messages,
-            stream=request.stream,
-            tools=chat_tools or None,
-            tool_choice=(
-                self._chat_tool_choice(request.effective_tool_choice())
-                if chat_tools
-                else "none"
-            ),
-            parallel_tool_calls=(
-                request.parallel_tool_calls
-                if request.parallel_tool_calls is not None
-                else True
-            ),
-            stop=request.stop,
-            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
-            chat_template_kwargs=request.chat_template_kwargs,
+        processed_messages = self.input_processor.prepare(
+            from_responses_request(request, messages)
         )
-
-        media_error = self._validate_media_content(chat_request)
-        if media_error:
-            raise _MediaInputValidationError(media_error)
-
-        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-        processed_messages = self._process_messages(chat_request, is_multimodal)
-        # ``_process_messages`` merges server defaults into the temporary Chat
-        # request before rendering. Response parsing happens later from the
-        # original request, so carry over the exact template kwargs that selected
-        # the wire-format delimiters.
-        request.chat_template_kwargs = (
-            dict(chat_request.chat_template_kwargs)
-            if chat_request.chat_template_kwargs is not None
-            else None
-        )
-
-        engine_prompt = processed_messages.engine_prompt
-        request_prompts = [engine_prompt]
-        engine_prompts = [engine_prompt]
-
-        return messages, request_prompts, engine_prompts, processed_messages
+        return messages, processed_messages
 
     def _make_request_with_harmony(
         self,
@@ -627,8 +571,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
-        engine_prompt = prompt_token_ids
-        return messages, [prompt_token_ids], [engine_prompt]
+        return messages, TokenPrompt(prompt_token_ids)
 
     async def responses_full_generator(
         self,
@@ -2541,7 +2484,6 @@ class OpenAIServingResponses(OpenAIServingChat):
     async def _generate_with_builtin_tools(
         self,
         request_id: str,
-        request_prompt: Any,
         adapted_request: GenerateReqInput,
         sampling_params: Any,
         context: ConversationContext,

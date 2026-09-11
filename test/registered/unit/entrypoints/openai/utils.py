@@ -43,6 +43,7 @@ if torch is not None:
 
 class MockTokenizerManager:
     def __init__(self, *, is_multimodal: bool = False):
+        self.model_path = "dummy"
         self.model_config = Mock(is_multimodal=is_multimodal, context_len=4096)
         self.model_config.get_default_sampling_params.return_value = {}
         self.model_config.hf_config = Mock(
@@ -175,3 +176,96 @@ class StreamFixture:
         """``run`` plus (event type, payload) pairing, the common assertion shape."""
         events = self.run(chunks)
         return list(zip(event_types(events), event_payloads(events)))
+
+
+def input_processor(serving, **overrides):
+    from dataclasses import replace
+
+    from sglang.srt.entrypoints.chat_input.processor import ChatInputProcessor
+    from sglang.srt.entrypoints.chat_input.types import ChatModelConfig
+
+    processor = getattr(serving, "input_processor", None)
+    if processor is None:
+        config = ChatModelConfig(
+            tokenizer=serving.tokenizer_manager.tokenizer,
+            template_manager=getattr(
+                serving, "template_manager", Mock(reasoning_config=None)
+            ),
+            is_multimodal=False,
+        )
+        processor = ChatInputProcessor(config)
+        serving.input_processor = processor
+    aliases = {
+        "chat_encoding_spec": "chat_encoding_spec",
+        "tool_call_parser": "tool_call_parser",
+        "reasoning_parser": "reasoning_parser",
+        "reasoning_detector": "_reasoning_detector",
+        "default_chat_template_kwargs": "default_chat_template_kwargs",
+        "dsv4_reasoning_effort_profile": "_dsv4_reasoning_effort_profile",
+        "inkling_default_reasoning_effort": "_inkling_default_reasoning_effort",
+        "tokenizer_auto_adds_specials": "_tokenizer_auto_adds_specials",
+        "is_gpt_oss": "is_gpt_oss",
+        "is_gemma4": "is_gemma4",
+    }
+    values = {
+        name: vars(serving)[alias]
+        for name, alias in aliases.items()
+        if alias in vars(serving)
+    }
+    values["tokenizer"] = serving.tokenizer_manager.tokenizer
+    model_config = getattr(serving.tokenizer_manager, "model_config", None)
+    if model_config is not None and isinstance(model_config.is_multimodal, bool):
+        values["is_multimodal"] = model_config.is_multimodal
+    values.update(overrides)
+    processor.config = replace(processor.config, **values)
+    processor.renderer.config = processor.config
+    return processor
+
+
+def sync_serving(serving):
+    input_processor(serving)
+    return serving
+
+
+def prepared_chat(
+    prompt,
+    *,
+    image_data=None,
+    audio_data=None,
+    video_data=None,
+    modalities=None,
+    stop=None,
+    tool_call_constraint=None,
+    skip_special_tokens=True,
+    require_reasoning=False,
+    reasoning_end_token_ids=None,
+    chat_template_kwargs=None,
+    reasoning_effort=None,
+):
+    from sglang.srt.entrypoints.chat_input.types import (
+        PreparedChat,
+        TextPrompt,
+        TokenPrompt,
+    )
+
+    return PreparedChat(
+        prompt=TextPrompt(prompt) if isinstance(prompt, str) else TokenPrompt(prompt),
+        image_data=image_data,
+        audio_data=audio_data,
+        video_data=video_data,
+        modalities=modalities or [],
+        stop=stop,
+        tool_call_constraint=tool_call_constraint,
+        skip_special_tokens=skip_special_tokens,
+        require_reasoning=require_reasoning,
+        reasoning_end_token_ids=reasoning_end_token_ids,
+        chat_template_kwargs=chat_template_kwargs,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def prompt_value(result):
+    from sglang.srt.entrypoints.chat_input.types import TextPrompt
+
+    prompt = result.prompt
+    return prompt.text if isinstance(prompt, TextPrompt) else prompt.token_ids

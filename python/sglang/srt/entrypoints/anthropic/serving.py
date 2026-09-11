@@ -43,6 +43,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     ToolUseBlock,
     is_server_tool,
 )
+from sglang.srt.entrypoints.openai.chat_input_adapter import from_chat_request
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -1420,7 +1421,7 @@ class AnthropicServing:
         """Handle /v1/messages/count_tokens endpoint.
 
         Converts the request to a ChatCompletionRequest, applies the chat
-        template via the OpenAI handler to tokenize, and returns the count.
+        template via the shared input processor, and returns the count.
         """
         try:
             # Build a minimal AnthropicMessagesRequest so we can reuse conversion
@@ -1445,19 +1446,11 @@ class AnthropicServing:
             )
 
         try:
-            is_multimodal = (
-                self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
+            prepared = self.openai_serving_chat.input_processor.prepare(
+                from_chat_request(chat_request)
             )
-            processed = self.openai_serving_chat._process_messages(
-                chat_request, is_multimodal
-            )
-
-            if isinstance(processed.prompt_ids, list):
-                input_tokens = len(processed.prompt_ids)
-            else:
-                # prompt_ids is a string (multimodal case) — tokenize it
-                tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
-                input_tokens = len(tokenizer.encode(processed.prompt_ids))
+            tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
+            input_tokens = len(prepared.prompt.tokenize(tokenizer))
 
             return JSONResponse(
                 content=AnthropicCountTokensResponse(

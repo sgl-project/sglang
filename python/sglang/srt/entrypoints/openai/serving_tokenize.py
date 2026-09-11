@@ -1,9 +1,15 @@
 import logging
 from http import HTTPStatus
-from typing import List, Optional, Union
+from typing import List, Union
 
 from fastapi import Request
 
+from sglang.srt.entrypoints.chat_input.validation import validate_chat_input
+from sglang.srt.entrypoints.openai.chat_input_adapter import (
+    create_chat_input_processor,
+    from_tokenize_request,
+    validate_chat_generation_options,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     DetokenizeRequest,
     DetokenizeResponse,
@@ -12,7 +18,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +25,18 @@ logger = logging.getLogger(__name__)
 class OpenAIServingTokenize(OpenAIServingBase):
     """Handler for /v1/tokenize requests"""
 
-    def __init__(self, tokenizer_manager, template_manager=None):
+    def __init__(
+        self, tokenizer_manager, template_manager=None, *, input_processor=None
+    ):
         super().__init__(tokenizer_manager)
-        self.chat_serving: Optional[OpenAIServingChat] = (
-            OpenAIServingChat(tokenizer_manager, template_manager)
-            if template_manager is not None
-            else None
+        self.input_processor = (
+            input_processor
+            if input_processor is not None
+            else (
+                create_chat_input_processor(tokenizer_manager, template_manager)
+                if template_manager is not None
+                else None
+            )
         )
 
     def _request_id_prefix(self) -> str:
@@ -90,34 +101,16 @@ class OpenAIServingTokenize(OpenAIServingBase):
             )
 
     def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
-        if self.chat_serving is None:
+        if self.input_processor is None:
             raise ValueError("Chat template tokenization requires a template manager.")
-
-        chat_request = request.to_chat_completion_request()
-        validation_error = self.chat_serving._validate_request(chat_request)
-        if validation_error:
-            raise ValueError(validation_error)
-
-        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-        processed_messages = self.chat_serving._process_messages(
-            chat_request, is_multimodal
+        chat_input = from_tokenize_request(request)
+        error = validate_chat_input(chat_input) or validate_chat_generation_options(
+            request
         )
-
-        prompt_ids = processed_messages.prompt_ids
-        if isinstance(prompt_ids, list) and (
-            prompt_ids or not processed_messages.prompt
-        ):
-            return prompt_ids
-        if isinstance(prompt_ids, str):
-            return self.tokenizer_manager.tokenizer.encode(
-                prompt_ids, add_special_tokens=False
-            )
-        if processed_messages.prompt:
-            return self.tokenizer_manager.tokenizer.encode(
-                processed_messages.prompt, add_special_tokens=False
-            )
-
-        raise ValueError("Failed to render chat messages into token ids.")
+        if error:
+            raise ValueError(error)
+        prepared = self.input_processor.prepare(chat_input)
+        return prepared.prompt.tokenize(self.tokenizer_manager.tokenizer)
 
 
 class OpenAIServingDetokenize(OpenAIServingBase):
