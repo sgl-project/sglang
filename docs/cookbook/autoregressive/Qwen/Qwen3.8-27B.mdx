@@ -19,7 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 pip install --upgrade pip
 pip install uv
 
-uv pip install --prerelease=allow "sglang[all]==0.5.19"
+uv pip install --prerelease=allow sglang
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -59,11 +59,10 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 <Note>
   Every cell above — RTX 5090, RTX PRO 6000 and DGX Spark, across all five
   checkpoints and every Speculative Decoding / Serving Strategy / SSM dtype
-  combination — is measured on **v0.5.19**, the release the Install section
-  pins. That is 202 cells, each one served and scored on the full
-  1319-question GSM8K (93.18-95.15%). The serving envelope behind the pins is
-  ISL 8192 / OSL 1024 at concurrency 1; throughput and acceptance-length
-  numbers were not re-taken in that sweep.
+  combination — is measured on **v0.5.19**. That is 202 cells, each one served
+  and scored on the full 1319-question GSM8K (93.18-95.15%). The serving
+  envelope behind the pins is ISL 8192 / OSL 1024 at concurrency 1; throughput
+  and acceptance-length numbers were not re-taken in that sweep.
 </Note>
 
 ### Mamba ratio calculator

@@ -207,12 +207,12 @@ export const config = {
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
             "--speculative-num-draft-tokens 8",
-            // Measured on the 5090 on v0.5.19, the build the Install
-            // accordion pins. This is the only cell on the page that also needs
-            // a prefill chunk smaller than the engine default: at 0.91 the pools
-            // fit but a 2048-token chunk's activations do not. The pair together
-            // is the fastest recipe on this card (4.92ms median TPOT, 4.29
-            // accept length). fp32 is greyed out by the SSM dtype row.
+            // Measured on the 5090 on v0.5.19. This cell needs a prefill chunk
+            // smaller than the engine default (DSPARK is the other row that
+            // does): at 0.91 the pools fit but a 2048-token chunk's activations
+            // do not. The pair together is the fastest recipe on this card
+            // (4.92ms median TPOT, 4.29 accept length). fp32 is greyed out by
+            // the SSM dtype row.
             ...(sel.hw === "rtx5090"
               ? sel.ssmDtype === "float32"
                 // FP4-head export, High-Throughput only (the SSM dtype row
