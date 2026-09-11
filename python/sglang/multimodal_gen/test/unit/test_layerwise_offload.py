@@ -1,4 +1,5 @@
 import gc
+import os
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -2385,3 +2386,30 @@ def test_small_pinned_stores_keep_using_the_pool(monkeypatch):
     tensor = layerwise_offload_mod._pinned_empty(1024, dtype=torch.float32)
     assert tensor.is_pinned()
     assert len(pooled) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+
+    # copies do not fit: the mapping is re-read from the drive every pass
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _b: True
+    )
+    assert manager._ensure_mapped_courier().direct_read
+
+    # the host can cache it: keep the page cache path
+    cached = _mapped_manager(tmp_path / "cached", monkeypatch, available_gib=0.001)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _b: False
+    )
+    assert not cached._ensure_mapped_courier().direct_read
