@@ -3,6 +3,7 @@
 from sglang.kernels.jit.utils.arch import (
     get_jit_cuda_arch,
     is_arch_support_pdl,
+    is_pre_ampere_cuda,
     override_jit_cuda_arch,
 )
 from sglang.kernels.jit.utils.common import (
@@ -29,5 +30,6 @@ __all__ = [
     "override_jit_cuda_arch",
     "get_jit_cuda_arch",
     "is_arch_support_pdl",
+    "is_pre_ampere_cuda",
     "KERNEL_PATH",
 ]

@@ -550,6 +550,20 @@ class RMSNorm(BaseFusedOp):
                     -1, post_residual_addition.shape[-1]
                 )
 
+        # sgl_kernel AOT rmsnorm/fused_add_rmsnorm lack sm_75 cubins on some
+        # wheels; use the native path on Volta/Turing instead of NoKernelImage.
+        from sglang.kernels.jit.utils import is_pre_ampere_cuda
+
+        if is_pre_ampere_cuda():
+            result = self.forward_native(x, residual, post_residual_addition)
+            if needs_reshape:
+                if residual is not None:
+                    return result[0].reshape(original_shape), result[1].reshape(
+                        residual_shape
+                    )
+                return result.reshape(original_shape)
+            return result
+
         if self.cast_x_before_out_mul and residual is None:
             # Use HF-semantics kernel (cast to dtype before weight multiply).
             if (

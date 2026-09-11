@@ -249,11 +249,26 @@ class TestCudaDeviceMixin(CustomTestCase):
         mock_torch_seed.assert_called_once_with(123)
         mock_cuda_seed.assert_called_once_with(123)
 
-    def test_cuda_srt_platform_capabilities(self):
+    @patch(
+        "sglang.srt.layers.quantization.fp8_utils.cutlass_fp8_supported",
+        return_value=True,
+    )
+    def test_cuda_srt_platform_capabilities(self, _cutlass_fp8):
         base = CudaSRTPlatform()
         self.assertTrue(base.supports_fp8())
         self.assertTrue(base.support_cuda_graph())
         self.assertTrue(base.support_piecewise_cuda_graph())
+
+    @patch(
+        "sglang.srt.layers.quantization.fp8_utils.cutlass_fp8_supported",
+        return_value=False,
+    )
+    def test_cuda_supports_fp8_follows_cutlass_on_ampere_86(self, _cutlass_fp8):
+        # RTX 3050 / sm86: cutlass_fp8_supported() is False; supports_fp8 must
+        # not stay hard-coded True (pre-fix main advertised FP8 TC it lacks).
+        base = CudaSRTPlatform()
+        self.assertFalse(base.supports_fp8())
+        self.assertTrue(base.support_cuda_graph())
 
 
 class TestXpuDeviceMixin(CustomTestCase):
