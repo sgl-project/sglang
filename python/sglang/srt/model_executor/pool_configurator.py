@@ -1033,17 +1033,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 "env switch to get a bf16 unified pool."
             )
 
-        # get_contiguous_buf_infos ships one pointer per layer and prices a row as
-        # buf[0].nbytes, which under fp8 covers the nope pool only. Fail at startup
-        # rather than at the first transfer.
-        # TODO(danli103): drop this once the transfer ships the rope pool.
-        if self._unified_fp8 and self.disaggregation_mode != "null":
-            raise ValueError(
-                "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
-                f"(disaggregation_mode={self.disaggregation_mode!r}). Unset the fp8 "
-                "switch or run without disaggregation."
-            )
-
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
             self._assert_ring_serves_draft_tokens(

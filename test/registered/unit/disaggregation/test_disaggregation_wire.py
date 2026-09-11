@@ -718,6 +718,33 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
 
+    def test_fp8_draft_ring_registers_rope(self):
+        target = _make_dsv4_target(unified=True)
+        draft = _make_dsv4_draft(unified=True)
+        draft._unified_kv_fp8 = True
+        draft.unified_kv_pool.kv_buffer_rope = [
+            torch.empty((524, 64), dtype=torch.bfloat16)
+        ]
+        expected_infos = draft.get_unified_swa_ring_buf_infos()
+        self.assertEqual(len(expected_infos[0]), 2)
+        self.assertEqual(expected_infos[2], [16, 128])
+
+        kv_args = KVArgs()
+        setup_state_kv_args(kv_args, target, draft)
+        self.assertEqual(kv_args.state_types[-1], StateType.SWA_RING)
+        self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
+        self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+
+    def test_dspark_draft_ignores_stray_rope_buffer(self):
+        draft = _make_dsv4_draft(unified=True)
+        draft._unified_kv_fp8 = False
+        draft.unified_kv_pool.kv_buffer_rope = [
+            torch.empty((524, 64), dtype=torch.bfloat16)
+        ]
+        ptrs, _, items = draft.get_unified_swa_ring_buf_infos()
+        self.assertEqual(len(ptrs), 1)
+        self.assertEqual(items, [16])
+
 
 if __name__ == "__main__":
     unittest.main()

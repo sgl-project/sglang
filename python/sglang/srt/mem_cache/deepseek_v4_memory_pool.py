@@ -634,10 +634,7 @@ class DeepSeekV4UnifiedKVPool:
 
     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         if self.fp8:
-            # same single-pool assumption as the outer get_contiguous_buf_infos:
-            # one pointer and one row size per layer describes the nope pool only,
-            # so whoever picks this up next would move half a row and not notice.
-            # TODO(danli103): report both pools once a consumer needs them.
+            # one ptr/layer; PD uses get_contiguous_buf_infos / SWA_RING
             raise NotImplementedError(
                 "get_buf_infos describes one pool per layer; the fp8 rope pool "
                 "would be dropped (SGLANG_DSV4_UNIFIED_KV_FP8=1)."
@@ -864,43 +861,48 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self._unified_kv_fp8:
-            # The page-block transfer below prices one row as buf[0].nbytes and
-            # ships a single pointer per layer. Under fp8 that covers the nope
-            # pool only -- the parallel bf16 rope pool would be dropped and the
-            # remote side would decode rows against stale rope. Refuse instead.
-            # TODO(danli103): ship the rope pool as a second per-layer entry.
-            raise NotImplementedError(
-                "PD disaggregation is not supported with "
-                "SGLANG_DSV4_UNIFIED_KV_FP8=1 (the transfer assumes a single "
-                "unified pool; the rope pool would be silently dropped)."
-            )
-
         def append_page_buffer(buf: torch.Tensor) -> None:
             assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
             data_ptrs.append(buf.data_ptr())
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
 
+        def append_unified_compress(
+            buf: torch.Tensor, swa_pages: int, ratio: int
+        ) -> None:
+            # Compressed pages sit after the SWA ring; PD indices are page ids
+            # into this region. SWA itself ships as StateType.SWA_RING.
+            assert buf is not None and buf.ndim == 2, buf
+            row_bytes = buf[0].nbytes
+            rows_per_page = self.page_size // ratio
+            compress_rows = buf.shape[0] - swa_pages
+            data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
+            data_lens.append(compress_rows * row_bytes)
+            item_lens.append(rows_per_page * row_bytes)
+
         stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
-        # Registration order defines the PD wire layout: C4 KV, C4 indexer, C128 KV.
-        # Keep each indexer immediately after the KV buffers of the same ratio.
+        # C4 KV, C4 indexer, C128 KV. fp8 inserts a rope group (128 B/row)
+        # beside each KV group; same page indices, or decode reads stale RoPE.
         for ratio, kv_pool in self.kv_pools.items():
             if self._unified_kv:
-                # Unified buffers store token rows after the SWA ring. Transfer
-                # compressed pages from the offset; SWA ships as StateType.SWA_RING.
                 swa_pages = self.unified_kv_pool.swa_pages
                 for local_layer_id, layer_ratio in enumerate(stage_ratios):
                     if layer_ratio != ratio:
                         continue
-                    buf = self.unified_kv_pool.kv_buffer[local_layer_id]
-                    assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                    row_bytes = buf[0].nbytes
-                    rows_per_page = self.page_size // ratio
-                    compress_rows = buf.shape[0] - swa_pages
-                    data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
-                    data_lens.append(compress_rows * row_bytes)
-                    item_lens.append(rows_per_page * row_bytes)
+                    append_unified_compress(
+                        self.unified_kv_pool.kv_buffer[local_layer_id],
+                        swa_pages,
+                        ratio,
+                    )
+                if self._unified_kv_fp8:
+                    for local_layer_id, layer_ratio in enumerate(stage_ratios):
+                        if layer_ratio != ratio:
+                            continue
+                        append_unified_compress(
+                            self.unified_kv_pool.kv_buffer_rope[local_layer_id],
+                            swa_pages,
+                            ratio,
+                        )
             else:
                 for buf in kv_pool.kv_buffer:
                     append_page_buffer(buf)
@@ -921,22 +923,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item_lens: List[int] = []
         if not self._unified_kv:
             return data_ptrs, data_lens, item_lens
+
+        def append_ring(bufs) -> None:
+            swa_pages = self.unified_kv_pool.swa_pages
+            for buf in bufs:
+                assert buf is not None and buf.ndim == 2, buf
+                row_bytes = buf[0].nbytes
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(swa_pages * row_bytes)
+                item_lens.append(row_bytes)
+
+        append_ring(self.unified_kv_pool.kv_buffer)
+        # all-nope then all-rope, so PP can slice dst[start:end] + dst[n+start:n+end]
         if self._unified_kv_fp8:
-            # Other half of the PD path -- get_contiguous_buf_infos ships the
-            # compressed region, this one the ring. Same single-pool assumption,
-            # same silently dropped rope, same fix -- land them together.
-            raise NotImplementedError(
-                "PD disaggregation is not supported with "
-                "SGLANG_DSV4_UNIFIED_KV_FP8=1 (the SWA_RING component assumes a "
-                "single unified pool; the rope pool would be silently dropped)."
-            )
-        swa_pages = self.unified_kv_pool.swa_pages
-        for buf in self.unified_kv_pool.kv_buffer:
-            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-            row_bytes = buf[0].nbytes
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(swa_pages * row_bytes)
-            item_lens.append(row_bytes)
+            append_ring(self.unified_kv_pool.kv_buffer_rope)
         return data_ptrs, data_lens, item_lens
 
     def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
