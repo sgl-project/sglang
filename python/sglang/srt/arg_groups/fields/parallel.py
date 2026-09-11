@@ -10,8 +10,9 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 from typing import Optional
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -20,8 +21,7 @@ from sglang.srt.arg_groups.arg_utils import (
 )
 
 
-@dataclasses.dataclass
-class Parallel:
+class Parallel(msgspec.Struct):
     """Namespace ``parallel``."""
 
     _NS_PATH = "parallel"
@@ -152,7 +152,7 @@ class Parallel:
     cp_strategy: A[
         Optional[str],
         Arg(
-            help="Sharding strategy for prefill CP. 'zigzag' is the former in-seq-split mode; 'interleave' is the former round-robin-split mode.",
+            help="Sharding strategy for prefill CP. 'zigzag' assigns each rank one early and one late sequence block; 'interleave' assigns token indices modulo the CP size.",
             choices=("zigzag", "interleave"),
         ),
     ] = None
@@ -161,10 +161,6 @@ class Parallel:
         bool,
         "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
     ] = False
-    enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
-    dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
-    enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
-    prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
