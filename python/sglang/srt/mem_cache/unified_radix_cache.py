@@ -1521,8 +1521,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Left queued: check_hicache_events submits one D2H op per step for
+        # every node backed up during the step (all pools, all requests).
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None
+            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
         )
 
     def _track_write_through_node(
@@ -2921,7 +2923,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if write_back:
-            # Blocking: wait for all pending write-backs
+            # Blocking: submit what is still queued, then wait for every ack.
+            cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
@@ -3096,6 +3099,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        self.cache_controller.start_writing()
 
         (
             write_finish_count,
