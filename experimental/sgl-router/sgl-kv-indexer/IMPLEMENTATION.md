@@ -47,7 +47,61 @@
 - GPU 首轮测试修正：5 秒 HTTP 预热超时不足以等待首次 kernel 编译，单独将推理超时设为 120 秒；Router tokenizer 参数须指向 `tokenizer.json` 文件而不是目录。最终副本 RPC 仍是 1 秒断言超时，生产 Router query deadline 不变。
 - GPU Router 最终指标：complete queries=16、fallback queries=4、failed attempts=10；请求日志验证故障期间 HTTP 200，恢复后使用新副本。原始日志位于 `/tmp/pytest-of-root/pytest-8/test_real_two_gpu_workers_rout0/`，XML 摘要 `/tmp/kv-rebuild-gpu.xml`。
 - 扩展进程测试：3 passed、1 GPU-opt-in skipped（32.02s）；覆盖尾事件丢失且没有后续 PUB 时的 Replay 修复、暂停单 Indexer 触发本地 Bridge overflow/恢复、另一副本持续更新、Worker 热加入、第二 Router 独立注册并共享副本。XML 摘要 `/tmp/kv-rebuild-process.xml`。
+- 最终完整进程复跑：`KV_REPLICA_GPU_TESTS=1 PYTHONPATH=python .venv/bin/python -m pytest experimental/sgl-router/sgl-kv-indexer/tests/test_replica_processes.py -q --junitxml=/tmp/kv-rebuild-process-all.xml`，4 passed、0 skipped（70.06s）。GPU 指标 complete=16、fallback=4、failed attempts=11；最终日志 `/tmp/pytest-of-root/pytest-10/test_real_two_gpu_workers_rout0/`。失败尝试数随随机副本选择变化，不作为固定数断言。
 
 ## 验收证据
 
-尚未完成；后续逐项补充实测结果，不以构建成功代替架构验收。
+| TASK / 架构要求 | 实现入口 | 验证证据 |
+|---|---|---|
+| 多 Indexer 随机选择 | `src/fleet.rs`、Router `replica_control.rs` | 30 次 cache route 的日志包含两个副本地址；副本失败改选其余副本 |
+| 每 Bridge 配多个 Worker、每副本全量恢复 | `src/replica_bridge.rs`、`KV_BRIDGE_CONFIG` | 两个既有 Worker 缓存早于副本启动；每副本 snapshot 后拥有相同 coverage/prefix |
+| Router 横向扩展 | 每 Router 独立 Load Monitor / target lease | 进程测试新增第二 Router，双方 fresh cache routing 成功；移除第二 Router 不影响第一 Router |
+| Worker 横向扩展 | Worker discovery + hot Worker list + Router registry | 第三 Worker 预存缓存，两个既有 pair 热发现并恢复；删除成员后该副本不再声明完整 coverage |
+| Bridge+Indexer 横向扩展 | 全量 soft-state 副本，Router `@file` 发现 | 启动第三 pair、切换仅第三 endpoint、停止旧 pair，推理继续且新副本有缓存 |
+| 本地 2 Worker / 1 Router / 2 Indexer | `tests/test_replica_processes.py` GPU opt-in | 两张 A10 上真实 CUDA Scheduler、KV cache、Publisher、Reporter、Router、Bridge、Indexer 全链路；正常与故障阶段推理成功 |
+| Indexer 挂掉时的调度 | random retry + deadline + fresh-load fallback | 单副本 kill 保持 cache affinity；全部 kill 的确定性负载测试选择 idle Worker；真实推理测试全部故障阶段仍成功 |
+| Indexer 重启恢复原有缓存 | hidden staging + barrier + Replay + atomic replace | kill/restart 后从仍运行 Worker 恢复，非仅等待新请求重新产生事件 |
+| Worker epoch / event fencing | Worker v2、Indexer session/sequence 状态机 | 旧 epoch、重复、乱序、缺口、冲突 session、错误 barrier/offset/count 被隔离；Worker 重启旧 cache 不残留 |
+| Ready coverage，不把 not-ready 当 miss | `ReplicaPrefixResponse.coverage` | staging 不可查询、缺失 rank 不完整、同步后无命中为 complete；Router 拒绝 stale/重复/缺失 coverage |
+| tier/component v2 | publisher mirror、native event recorder、prefix scanner | namespace/hash/tier 隔离，FULL/SWA/MAMBA 与 parent/size 保留；原生 SWA eviction/Mamba boundary GPU 断言 |
+| 同 hash 持有关系隔离 | flat map + per-stream reverse holdings | worker/rank/namespace/tier remove 隔离；过期 GC 不影响活跃 owner；未知 spec 不替换可见旧状态 |
+| bounded buffer / replay / 慢副本隔离 | Bridge bounded queue、Worker bounded replay | 丢失末尾 PUB 无后续事件仍恢复且不取新 snapshot；暂停 Indexer 触发本地 overflow，另一副本进度不受阻，恢复后重新完整 |
+| 新鲜负载与 placement generation 一致 | `load_reporter.py`、Router `replica_control.rs` | 同 publisher epoch；多目标独立 lease、序列去重、旧 measurement 不刷新、所有 DP rank 必须新鲜 |
+| Router 不保存 placement / 不订阅 KV | `main.rs`、route context | indexer 模式不启动 KVEventManager、不向本地 HashTree 填数据；仅保留既有 policy 工厂所需的空结构 |
+| 版本与可观测性 | v1/v2、独立 legacy service、metrics | 旧协议回归通过；不支持的 schema fail-closed；complete/fallback/failed-attempt counters 与 READY/recovery 日志 |
+
+最终 Rust 回归命令（工作目录 `experimental/sgl-router`）：
+
+```bash
+cargo fmt --all --check
+cargo test --workspace --tests --quiet
+```
+
+结果：844 passed（82 Indexer unit + 4 server + 10 gRPC contract + 29 memory +
+8 replica recovery + 563 Router unit + 4 Router binary + 58 component + 86 proxy），
+0 failed。Python 相关选择集最终 63 + 9 passed，另有 41 + 2 subtests passed；
+语法/未定义名 Ruff 检查和 `git diff --check` 通过。
+
+复现 Python 相关选择集：
+
+```bash
+PYTHONPATH=python .venv/bin/python -m pytest \
+  test/registered/unit/managers/test_loadstat_wire.py \
+  test/registered/unit/managers/test_scheduler_on_idle_load.py \
+  test/registered/unit/disaggregation/test_kv_events.py \
+  test/registered/unit/disaggregation/test_load_reporter.py \
+  test/registered/unit/disaggregation/test_kv_snapshot_v2.py -q
+PYTHONPATH=python:test/registered/unit/mem_cache .venv/bin/python -m pytest \
+  test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py -k KVEvents -q
+```
+
+## 交付与限制
+
+- 工作树基于指定远端分支重新创建，不触碰原工作树的冲突/暂存修改。所有测试启动的子进程均已清理，既有 PID 83601 的服务未停止。
+- 功能提交：`e669562dc8` 任务拆解；`58037b4aa1` Worker v2；`131a5e823b` Indexer；`cfdc483993` Bridge；`79c5e606a0` Router/Load；`ab604b356d` 原生 component 与 Scheduler 集成。额外测试和部署/验收文档各自独立提交。
+- [README.md](README.md) 给出两副本部署、Worker 配置、每 Router 负载监听地址、热更新/扩缩容、协议边界和复现步骤。
+- 当前支持架构要求的 FULL/SWA/MAMBA；不支持的 C128 / 缺少 component event 合同的 hybrid alternative core 会被 schema fencing 排除，不能误报命中。SSD placement 保留，但现有候选扫描只使用 HBM/DRAM。
+- 本轮验证是功能与故障恢复，不是吞吐/长时间 soak/多机网络分区或大模型精度基准。GPU 使用随机初始化的两层 Qwen2，不能据此宣称 7B 生产负载的性能。
+- 全量 Unified Cache 文件执行曾 exit 139，原因未定位；本次直接涉及的 9 项 KVEvents/GPU 路径已独立通过。该限制不影响上述已执行功能测试的结果，但不应据此宣称所有可选缓存后端均已验证。
+- 控制面部署在可信网络；未新增 TLS/租户鉴权。内存随当前 holdings 增长；Snapshot staging 在恢复期间增加峰值内存。生成协议依赖 Protobuf 6，旧客户端只能使用隔离的 legacy API，不能混入 READY 副本数据。
+- GitHub 交付分支：`yangbodong22011/sglang` 的 `codex/kv-placement-rebuild-20260911`；上传后通过 `git ls-remote` 核实最终提交。
