@@ -21,7 +21,11 @@ from .modeling_fm_modules import (
     TimestepEmbedder,
 )
 from .modeling_neo_vit import NEOVisionModel
-from .modeling_qwen3 import Qwen3ForCausalLM, create_block_causal_mask
+from .modeling_qwen3 import (
+    Qwen3ForCausalLM,
+    create_block_causal_mask,
+    npu_fia_enabled,
+)
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
 
@@ -37,19 +41,38 @@ def version_cmp(v1, v2, op="eq"):
     return op_func(version.parse(v1), version.parse(v2))
 
 
+def _copy_right_aligned_prefix_bnsd(destination, source, lengths):
+    prefix_width = source.shape[2]
+    for batch_index, length in enumerate(lengths):
+        destination[batch_index, :, prefix_width - length : prefix_width].copy_(
+            source[batch_index, :, :length]
+        )
+
+
 def prepare_flash_kv_cache(
     past_key_values,
     current_len: int,
     batch_size: int,
+    prefix_lengths: Optional[torch.Tensor] = None,
 ):
     """
-    Convert prefix cache from [B, H, S, D] to flash-attn friendly [B, S, H, D],
-    and preallocate full KV buffer for [prefix + current].
+    Preallocate the full KV buffer for [prefix + current]. CUDA/SDPA use
+    [B, S, H, D], while NPU FIA keeps the source [B, H, S, D] layout.
 
     This is done once before denoising loop.
     """
     if past_key_values is None:
         return
+
+    lengths = None
+    if prefix_lengths is not None:
+        lengths = [int(length) for length in prefix_lengths.reshape(-1).tolist()]
+        if len(lengths) == 1 and batch_size > 1:
+            lengths *= batch_size
+        if len(lengths) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} prefix lengths, got {len(lengths)}"
+            )
 
     for layer in past_key_values.layers:
         past_k = layer.keys
@@ -60,28 +83,60 @@ def prepare_flash_kv_cache(
             layer.flash_total_len = current_len
             layer.flash_k_cache = None
             layer.flash_v_cache = None
+            layer.flash_actual_seq_lengths_kv = None
+            layer.flash_kv_padding_size = None
+            layer.flash_cache_layout = None
             continue
 
-        # original cache layout assumed: [B, H, S, D]
-        past_k_flash = past_k.transpose(1, 2).contiguous()  # [B, S, H, D]
-        past_v_flash = past_v.transpose(1, 2).contiguous()  # [B, S, H, D]
-
-        prefix_len = past_k_flash.shape[1]
+        # original cache layout: [B, H, S, D]
+        prefix_len = past_k.shape[2]
         total_len = prefix_len + current_len
 
-        k_cache = torch.empty(
-            (batch_size, total_len, past_k_flash.shape[2], past_k_flash.shape[3]),
-            device=past_k_flash.device,
-            dtype=past_k_flash.dtype,
+        use_npu_fia = (
+            past_k.device.type == "npu" and lengths is not None and npu_fia_enabled()
         )
-        v_cache = torch.empty(
-            (batch_size, total_len, past_v_flash.shape[2], past_v_flash.shape[3]),
-            device=past_v_flash.device,
-            dtype=past_v_flash.dtype,
-        )
-
-        k_cache[:, :prefix_len].copy_(past_k_flash)
-        v_cache[:, :prefix_len].copy_(past_v_flash)
+        if use_npu_fia:
+            if any(length < 0 or length > prefix_len for length in lengths):
+                raise ValueError(
+                    f"Prefix lengths must be between 0 and {prefix_len}, got {lengths}"
+                )
+            k_cache = torch.empty(
+                (batch_size, past_k.shape[1], total_len, past_k.shape[3]),
+                device=past_k.device,
+                dtype=past_k.dtype,
+            )
+            v_cache = torch.empty(
+                (batch_size, past_v.shape[1], total_len, past_v.shape[3]),
+                device=past_v.device,
+                dtype=past_v.dtype,
+            )
+            _copy_right_aligned_prefix_bnsd(k_cache, past_k, lengths)
+            _copy_right_aligned_prefix_bnsd(v_cache, past_v, lengths)
+            layer.flash_actual_seq_lengths_kv = [
+                length + current_len for length in lengths
+            ]
+            layer.flash_kv_padding_size = torch.zeros(
+                1, dtype=torch.int64, device=past_k.device
+            )
+            layer.flash_cache_layout = "BNSD"
+        else:
+            past_k_flash = past_k.transpose(1, 2).contiguous()
+            past_v_flash = past_v.transpose(1, 2).contiguous()
+            k_cache = torch.empty(
+                (batch_size, total_len, past_k_flash.shape[2], past_k_flash.shape[3]),
+                device=past_k_flash.device,
+                dtype=past_k_flash.dtype,
+            )
+            v_cache = torch.empty(
+                (batch_size, total_len, past_v_flash.shape[2], past_v_flash.shape[3]),
+                device=past_v_flash.device,
+                dtype=past_v_flash.dtype,
+            )
+            k_cache[:, :prefix_len].copy_(past_k_flash)
+            v_cache[:, :prefix_len].copy_(past_v_flash)
+            layer.flash_actual_seq_lengths_kv = None
+            layer.flash_kv_padding_size = None
+            layer.flash_cache_layout = "BSND"
 
         layer.flash_prefix_len = prefix_len
         layer.flash_total_len = total_len
@@ -101,6 +156,12 @@ def clear_flash_kv_cache(past_key_values):
             delattr(layer, "flash_k_cache")
         if hasattr(layer, "flash_v_cache"):
             delattr(layer, "flash_v_cache")
+        if hasattr(layer, "flash_actual_seq_lengths_kv"):
+            delattr(layer, "flash_actual_seq_lengths_kv")
+        if hasattr(layer, "flash_kv_padding_size"):
+            delattr(layer, "flash_kv_padding_size")
+        if hasattr(layer, "flash_cache_layout"):
+            delattr(layer, "flash_cache_layout")
 
 
 def optimized_scale(positive_flat, negative_flat):
@@ -127,7 +188,21 @@ def optimized_scale(positive_flat, negative_flat):
     return st_star
 
 
-def _randn_with_seed(shape, *, device, dtype, seed: int) -> torch.Tensor:
+def _randn_with_seed(shape, *, device, dtype, seed: int | list[int]) -> torch.Tensor:
+    if isinstance(seed, list):
+        if len(shape) == 0 or len(seed) != shape[0]:
+            raise ValueError(
+                f"expected one seed per batch item, got {len(seed)} seeds for shape {shape}"
+            )
+        return torch.cat(
+            [
+                _randn_with_seed(
+                    (1, *shape[1:]), device=device, dtype=dtype, seed=item_seed
+                )
+                for item_seed in seed
+            ],
+            dim=0,
+        )
     try:
         generator = torch.Generator(device)
     except (RuntimeError, TypeError):
@@ -554,21 +629,81 @@ class NEOChatModel(PreTrainedModel):
             return template.get_prompt() + append_text
         return template.get_prompt()
 
-    def _build_t2i_text_inputs(self, tokenizer, query: str):
-        model_inputs = tokenizer(query, return_tensors="pt")
-        input_ids = model_inputs["input_ids"].to(self.device)
+    def _build_t2i_text_inputs(self, tokenizer, query: str | list[str]):
+        if isinstance(query, str):
+            input_ids = tokenizer(query, return_tensors="pt")["input_ids"].to(
+                self.device
+            )
+            text_length = input_ids.shape[1]
+            t_idx = torch.arange(text_length, dtype=torch.long, device=input_ids.device)
+            indexes = torch.stack(
+                [t_idx, torch.zeros_like(t_idx), torch.zeros_like(t_idx)]
+            )
+            key_valid_mask = torch.ones(
+                (1, text_length), dtype=torch.bool, device=self.device
+            )
+            return (
+                input_ids,
+                indexes,
+                {"full_attention": create_block_causal_mask(t_idx)},
+                key_valid_mask,
+                torch.tensor([text_length], dtype=torch.long, device=self.device),
+            )
+
+        queries = query
+        if not queries:
+            raise ValueError("query batch must not be empty")
+        encoded = [
+            tokenizer(item, return_tensors="pt")["input_ids"][0] for item in queries
+        ]
+        lengths = [item.shape[0] for item in encoded]
+        prefix_lengths = torch.tensor(lengths, dtype=torch.long, device=self.device)
+        max_length = max(lengths)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        input_ids = torch.full(
+            (len(encoded), max_length),
+            int(pad_token_id),
+            dtype=encoded[0].dtype,
+            device=self.device,
+        )
+        key_valid_mask = torch.zeros(
+            (len(encoded), max_length), dtype=torch.bool, device=self.device
+        )
+        for batch_index, item in enumerate(encoded):
+            item = item.to(self.device)
+            item_length = item.shape[0]
+            input_ids[batch_index, :item_length] = item
+            key_valid_mask[batch_index, :item_length] = True
 
         t_idx = torch.arange(
-            0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
-        )
+            max_length, dtype=torch.long, device=input_ids.device
+        ).expand(len(encoded), -1)
         h_idx = torch.zeros_like(t_idx)
         w_idx = torch.zeros_like(t_idx)
-        indexes = torch.stack([t_idx, h_idx, w_idx], dim=0)
+        batched_indexes = torch.stack([t_idx, h_idx, w_idx], dim=1)
+        indexes = batched_indexes[0] if len(encoded) == 1 else batched_indexes
 
-        attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
-        return input_ids, indexes, attention_mask
+        attention_mask = {
+            "full_attention": create_block_causal_mask(t_idx, key_valid_mask)
+        }
+        return input_ids, indexes, attention_mask, key_valid_mask, prefix_lengths
 
     def _build_t2i_image_indexes(self, token_h, token_w, text_len, device):
+        if isinstance(text_len, torch.Tensor):
+            text_len = text_len.to(device=device, dtype=torch.long).reshape(-1)
+            batch_size = text_len.shape[0]
+            image_len = token_h * token_w
+            t_image = text_len[:, None].expand(batch_size, image_len)
+            idx = torch.arange(image_len, device=device, dtype=torch.long)
+            h_image = (idx // token_w).expand(batch_size, -1)
+            w_image = (idx % token_w).expand(batch_size, -1)
+            return torch.stack([t_image, h_image, w_image], dim=1)
+
         t_image = torch.full(
             (token_h * token_w,), text_len, dtype=torch.long, device=device
         )
@@ -703,7 +838,6 @@ class NEOChatModel(PreTrainedModel):
         image_size=None,
     ):
         B, L = z.shape[0], z.shape[1]
-
         outputs = self.language_model.model(
             inputs_embeds=input_embeds,
             image_gen_indicators=torch.ones(
@@ -2140,6 +2274,16 @@ class NEOChatModel(PreTrainedModel):
             timesteps = self._apply_time_schedule(
                 timesteps, token_h * token_w, timestep_shift
             )
+        denoise_embeddings = None
+        if device.type == "npu":
+            denoise_embeddings = self.fm_modules["timestep_embedder"](timesteps[:-1])
+            if self.add_noise_scale_embedding:
+                noise_level = timesteps.new_tensor(
+                    [noise_scale / self.noise_scale_max_value]
+                )
+                denoise_embeddings = denoise_embeddings + self.fm_modules[
+                    "noise_scale_embedder"
+                ](noise_level)
 
         for step_i in range(num_steps):
             t = timesteps[step_i]
@@ -2157,18 +2301,20 @@ class NEOChatModel(PreTrainedModel):
                 gen_model=True,
                 grid_hw=grid_hw,
             ).view(batch_size, token_h * token_w, -1)
-            t_expanded = t.expand(batch_size * token_h * token_w)
-            timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
-                batch_size, token_h * token_w, -1
-            )
-            if self.add_noise_scale_embedding:
-                noise_scale_tensor = torch.full_like(
-                    t_expanded, noise_scale / self.noise_scale_max_value
-                )
-                noise_embeddings = self.fm_modules["noise_scale_embedder"](
-                    noise_scale_tensor
+            if denoise_embeddings is not None:
+                timestep_embeddings = denoise_embeddings[step_i].view(1, 1, -1)
+            else:
+                t_expanded = t.expand(batch_size * token_h * token_w)
+                timestep_embeddings = self.fm_modules["timestep_embedder"](
+                    t_expanded
                 ).view(batch_size, token_h * token_w, -1)
-                timestep_embeddings += noise_embeddings
+                if self.add_noise_scale_embedding:
+                    noise_scale_tensor = torch.full_like(
+                        t_expanded, noise_scale / self.noise_scale_max_value
+                    )
+                    timestep_embeddings += self.fm_modules["noise_scale_embedder"](
+                        noise_scale_tensor
+                    ).view(batch_size, token_h * token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
 
             out_cond = self._t2i_predict_v(
@@ -2296,24 +2442,43 @@ class NEOChatModel(PreTrainedModel):
     ):
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        if not prompts:
+            raise ValueError("prompt batch must not be empty")
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if isinstance(prompt, list) and len(prompts) != batch_size:
+            raise ValueError(
+                f"batch_size={batch_size} does not match {len(prompts)} prompts"
+            )
+        if len(prompts) > 1 and think_mode:
+            raise ValueError(
+                "batched SenseNova-U1 generation does not support think_mode"
+            )
+        if len(prompts) > 1 and self.device.type != "npu":
+            raise ValueError(
+                "batched SenseNova-U1 generation is only supported on Ascend NPU"
+            )
         self._notify_layer_offload_phase("prefix")
         merge_size = int(1 / self.downsample_ratio)
 
         self.config.t_eps = t_eps
-        # question_condition = f"Please generate an image based on the following description: {prompt}"
-        question_condition = f"{prompt}"
-        # question_condition += f"\nThe resolution of the image should be {image_size}"
-
         think_text = ""
         needs_cfg = cfg_scale > 1
 
         think_content = (
             "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
         )
-        query_condition = self._build_t2i_query(
-            question_condition,
-            system_message=SYSTEM_MESSAGE_FOR_GEN,
-            append_text=think_content,
+        query_conditions = [
+            self._build_t2i_query(
+                item,
+                system_message=SYSTEM_MESSAGE_FOR_GEN,
+                append_text=think_content,
+            )
+            for item in prompts
+        ]
+        query_condition = (
+            query_conditions[0] if len(query_conditions) == 1 else query_conditions
         )
         query_uncondition = (
             self._build_t2i_query("", append_text=IMG_START_TOKEN)
@@ -2321,19 +2486,26 @@ class NEOChatModel(PreTrainedModel):
             else None
         )
 
-        input_ids_condition, indexes_condition, attention_mask_condition_prefix = (
-            self._build_t2i_text_inputs(tokenizer, query_condition)
-        )
+        (
+            input_ids_condition,
+            indexes_condition,
+            attention_mask_condition_prefix,
+            condition_key_valid_mask,
+            condition_prefix_lengths,
+        ) = self._build_t2i_text_inputs(tokenizer, query_condition)
         if query_uncondition is not None:
             (
                 input_ids_uncondition,
                 indexes_uncondition,
                 attention_mask_uncondition_prefix,
+                _,
+                uncondition_prefix_lengths,
             ) = self._build_t2i_text_inputs(tokenizer, query_uncondition)
         else:
             input_ids_uncondition = indexes_uncondition = (
                 attention_mask_uncondition_prefix
             ) = None
+            uncondition_prefix_lengths = None
 
         token_h = image_size[1] // (self.patch_size * merge_size)
         token_w = image_size[0] // (self.patch_size * merge_size)
@@ -2341,14 +2513,18 @@ class NEOChatModel(PreTrainedModel):
         indexes_image_condition = self._build_t2i_image_indexes(
             token_h,
             token_w,
-            indexes_condition.shape[1],
+            (
+                int(condition_prefix_lengths[0].item())
+                if len(prompts) == 1
+                else condition_prefix_lengths
+            ),
             device=input_ids_condition.device,
         )
         indexes_image_uncondition = (
             self._build_t2i_image_indexes(
                 token_h,
                 token_w,
-                indexes_uncondition.shape[1],
+                int(uncondition_prefix_lengths[0].item()),
                 device=input_ids_uncondition.device,
             )
             if indexes_uncondition is not None
@@ -2436,12 +2612,16 @@ class NEOChatModel(PreTrainedModel):
             past_key_values_condition,
             current_len=token_h * token_w,
             batch_size=batch_size,
+            prefix_lengths=(condition_prefix_lengths if device.type == "npu" else None),
         )
         if past_key_values_uncondition is not None:
             prepare_flash_kv_cache(
                 past_key_values_uncondition,
                 current_len=token_h * token_w,
                 batch_size=batch_size,
+                prefix_lengths=(
+                    uncondition_prefix_lengths if device.type == "npu" else None
+                ),
             )
 
         # init noise image tokens
@@ -2465,6 +2645,27 @@ class NEOChatModel(PreTrainedModel):
         )
 
         attention_mask_condition = {"full_attention": None}
+        if device.type == "npu" and batch_size > 1:
+            condition_key_valid_mask = condition_key_valid_mask.expand(batch_size, -1)
+            image_key_valid_mask = torch.ones(
+                (batch_size, token_h * token_w),
+                dtype=torch.bool,
+                device=device,
+            )
+            denoise_key_valid_mask = torch.cat(
+                [condition_key_valid_mask, image_key_valid_mask], dim=1
+            )
+            if not npu_fia_enabled():
+                attention_mask_condition["full_attention"] = denoise_key_valid_mask[
+                    :, None, None, :
+                ]
+                # Ascend FlashAttention requires an explicit query dimension.
+                # Materialize once and reuse across all layers and denoise steps.
+                attention_mask_condition["full_attention"] = (
+                    attention_mask_condition["full_attention"]
+                    .expand(-1, -1, token_h * token_w, -1)
+                    .contiguous()
+                )
         attention_mask_uncondition = {"full_attention": None}
 
         timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
@@ -2472,6 +2673,16 @@ class NEOChatModel(PreTrainedModel):
             timesteps = self._apply_time_schedule(
                 timesteps, token_h * token_w, timestep_shift
             )
+        denoise_embeddings = None
+        if device.type == "npu":
+            denoise_embeddings = self.fm_modules["timestep_embedder"](timesteps[:-1])
+            if self.add_noise_scale_embedding:
+                noise_level = timesteps.new_tensor(
+                    [noise_scale / self.noise_scale_max_value]
+                )
+                denoise_embeddings = denoise_embeddings + self.fm_modules[
+                    "noise_scale_embedder"
+                ](noise_level)
 
         for step_i in range(num_steps):
             t = timesteps[step_i]
@@ -2486,18 +2697,20 @@ class NEOChatModel(PreTrainedModel):
                 gen_model=True,
                 grid_hw=grid_hw,
             ).view(batch_size, token_h * token_w, -1)
-            t_expanded = t.expand(batch_size * token_h * token_w)
-            timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
-                batch_size, token_h * token_w, -1
-            )
-            if self.add_noise_scale_embedding:
-                noise_scale_tensor = torch.full_like(
-                    t_expanded, noise_scale / self.noise_scale_max_value
-                )
-                noise_embeddings = self.fm_modules["noise_scale_embedder"](
-                    noise_scale_tensor
+            if denoise_embeddings is not None:
+                timestep_embeddings = denoise_embeddings[step_i].view(1, 1, -1)
+            else:
+                t_expanded = t.expand(batch_size * token_h * token_w)
+                timestep_embeddings = self.fm_modules["timestep_embedder"](
+                    t_expanded
                 ).view(batch_size, token_h * token_w, -1)
-                timestep_embeddings += noise_embeddings
+                if self.add_noise_scale_embedding:
+                    noise_scale_tensor = torch.full_like(
+                        t_expanded, noise_scale / self.noise_scale_max_value
+                    )
+                    timestep_embeddings += self.fm_modules["noise_scale_embedder"](
+                        noise_scale_tensor
+                    ).view(batch_size, token_h * token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
 
             v_pred_condition = self._t2i_predict_v(

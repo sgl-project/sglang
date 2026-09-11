@@ -23,6 +23,7 @@ from .modeling_qwen3 import (
     Qwen3Attention,
     Qwen3RMSNorm,
     create_block_causal_mask,
+    position_ids_from_indexes,
 )
 from .transformers_compat import (
     causal_mask_kwargs,
@@ -499,11 +500,13 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 )
             else:
                 causal_mask_mapping = {
-                    "full_attention": create_block_causal_mask(indexes[0]),
+                    "full_attention": create_block_causal_mask(
+                        position_ids_from_indexes(indexes, 0)
+                    ),
                 }
-                self.current_index = indexes[0].max()
+                self.current_index = position_ids_from_indexes(indexes, 0).max()
         else:
-            self.current_index = indexes[0].max()
+            self.current_index = position_ids_from_indexes(indexes, 0).max()
 
         hidden_states = inputs_embeds
 
