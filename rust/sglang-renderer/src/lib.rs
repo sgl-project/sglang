@@ -12,8 +12,7 @@ mod config;
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod engine;
 mod error;
-#[cfg(feature = "http")]
-mod http;
+mod frontend;
 #[cfg(feature = "http")]
 mod launcher;
 #[cfg_attr(not(feature = "http"), allow(dead_code))]

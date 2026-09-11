@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::{DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer};
 
 use crate::engine::{GenerationService, HttpGenerateClient, TokenDecoder};
-use crate::http::{hosted_routes, render_only_routes, standalone_routes};
+use crate::frontend::http::{hosted_routes, render_only_routes, standalone_routes};
 use crate::openai::OpenAIService;
 
 #[derive(Clone, Debug)]
