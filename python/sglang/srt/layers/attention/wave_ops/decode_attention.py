@@ -25,8 +25,8 @@ dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
 
 
 @functools.lru_cache(maxsize=None)
-def _is_rocm10_gfx942(device_index: int) -> bool:
-    """Return whether a device needs the ROCm 10 Wave decode workaround."""
+def _is_rocm10_or_newer() -> bool:
+    """Return whether the runtime needs the ROCm 10 Wave decode workaround."""
     hip_version = torch.version.hip
     if hip_version is None:
         return False
@@ -36,22 +36,17 @@ def _is_rocm10_gfx942(device_index: int) -> bool:
     except ValueError:
         return False
 
-    arch = torch.cuda.get_device_properties(device_index).gcnArchName.split(":", 1)[0]
     # torch 2.11's ROCm 10 build reports HIP 7.15.
-    return arch == "gfx942" and hip_major_minor >= (7, 15)
+    return hip_major_minor >= (7, 15)
 
 
 def _needs_triton_fallback(q, k_buffer, v_buffer) -> bool:
-    # Wave's paged decode kernel returns NaNs for this shape on gfx942 with
-    # ROCm 10. Keep Wave enabled for every other shape and architecture.
+    # Wave's paged decode kernel returns NaNs for this shape with ROCm 10 on
+    # gfx942. Keep Wave enabled for every other shape and older ROCm versions.
     shape = (q.shape[1], k_buffer.shape[1], q.shape[2], v_buffer.shape[2])
     if shape != (128, 1, 576, 512):
         return False
-
-    device_index = q.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    return _is_rocm10_gfx942(device_index)
+    return _is_rocm10_or_newer()
 
 
 @functools.lru_cache(maxsize=4096)
