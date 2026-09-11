@@ -778,7 +778,17 @@ class SchedulerPPMixin:
         if draft_input is not None and draft_input.topk_p is not None:
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
             tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
-            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+            if draft_input.hidden_states is not None:
+                tensor_dict[
+                    "draft_hidden_states"
+                ] = draft_input.hidden_states.contiguous()
+
+        if result.spec_accept_indices is not None:
+            tensor_dict[
+                "spec_accept_indices"
+            ] = result.spec_accept_indices.contiguous()
+        if result.accept_lens is not None:
+            tensor_dict["spec_accept_lens"] = result.accept_lens.contiguous()
 
         has_sampling_mask_output = (
             result.logits_output is not None
@@ -928,6 +938,11 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        if not self.spec_algorithm.is_none():
+            # Spec V2 result processing consumes host-side accept lengths and
+            # token ids. The output ring carries device tensors, so stage the
+            # small metadata payload before process_batch_result.
+            next_token_ids = next_token_ids.to("cpu")
 
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
@@ -938,7 +953,7 @@ class SchedulerPPMixin:
             next_draft_input = EagleDraftInput(
                 topk_p=pp_outputs["draft_topk_p"],
                 topk_index=pp_outputs["draft_topk_index"],
-                hidden_states=pp_outputs["draft_hidden_states"],
+                hidden_states=pp_outputs.tensors.get("draft_hidden_states"),
                 bonus_tokens=next_token_ids,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
@@ -971,6 +986,19 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+        output_result.spec_accept_indices = pp_outputs.tensors.get(
+            "spec_accept_indices"
+        )
+        accept_lens = pp_outputs.tensors.get("spec_accept_lens")
+        output_result.accept_lens = (
+            accept_lens.to("cpu") if accept_lens is not None else None
+        )
+        if (
+            not self.pp_group.is_last_rank
+            and self.draft_worker is not None
+            and hasattr(self.draft_worker, "reconcile_after_verify")
+        ):
+            self.draft_worker.reconcile_after_verify(batch, output_result)
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
 

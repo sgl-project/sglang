@@ -68,10 +68,21 @@ def check_server_args(server_args: Any):
                     "on prefill nodes (disaggregation-mode=prefill)"
                 )
         else:
-            # Non-NPU: PP + speculative decoding is not supported
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            # The synchronous Spec V2 multi-layer EAGLE worker supports PP for
+            # non-chain MTP (MiMo V2). Other speculative algorithms still need
+            # the old restriction until they gain a PP state relay.
+            pp_spec_supported = (
+                cfg.speculative_algorithm is not None
+                and cfg.enable_multi_layer_eagle
+                and cfg.speculative_algorithm.upper() in ("EAGLE", "EAGLE3")
             )
+            assert cfg.disable_overlap_schedule and (
+                cfg.speculative_algorithm is None or pp_spec_supported
+            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            if pp_spec_supported:
+                assert cfg.pp_async_batch_depth == 0, (
+                    "PP + multi-layer EAGLE requires pp_async_batch_depth == 0"
+                )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
             "parallelism: allocatable slots per microbatch are bounded by "

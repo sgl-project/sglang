@@ -2375,6 +2375,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    # Saved target-verify allocation on non-last PP ranks. The last stage's
+    # accept decision arrives through the output ring on the next iteration.
+    spec_pp_verify_ctx: Optional[Any] = None
 
     @classmethod
     def init_new(
