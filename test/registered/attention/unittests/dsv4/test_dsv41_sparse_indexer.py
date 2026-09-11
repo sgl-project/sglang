@@ -52,6 +52,7 @@ def _reference_blocks(logits, lens, block_size=8):
 
 class TestSparseIndexer(CustomTestCase):
     def test_amax_topk_blocks_matches_reference(self):
+        from sglang.kernels.ops.attention.dsv4.topk import sort_candidate_blocks
         from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
             amax_topk_blocks,
             valid_lens,
@@ -67,9 +68,15 @@ class TestSparseIndexer(CustomTestCase):
         logits.masked_fill_(
             torch.arange(width, device="cuda")[None, :] >= lens[:, None], 1e4
         )
+        pages = (width + PAGE - 1) // PAGE
+        page_table = torch.stack(
+            [torch.randperm(pages, device="cuda") for _ in range(bs)]
+        ).to(torch.int32)
         blocks = amax_topk_blocks(logits, lens, BLOCKS)
+        phys = sort_candidate_blocks(blocks, lens, page_table, PAGE)
         valid = valid_lens(lens, BLOCKS)
         keys = logits.view(bs, -1, 8).amax(-1)
+        bpp = PAGE // 8
         for b, ref in enumerate(_reference_blocks(logits, lens)):
             nb = (int(lens[b]) + 7) // 8
             n = min(nb, BLOCKS)
@@ -91,6 +98,10 @@ class TestSparseIndexer(CustomTestCase):
             )
             # past the valid count nothing looks like a block DeepGEMM could read
             self.assertTrue(bool((blocks[b, n:] >= nb).all()))
+            # the same blocks as pool slots / 8 through the row's page table
+            ref_phys = page_table[b][got // bpp].long() * bpp + got % bpp
+            self.assertTrue(torch.equal(phys[b, :n].long(), ref_phys))
+            self.assertTrue(bool((phys[b, n:] == torch.iinfo(torch.int32).max).all()))
             expect_valid = 8 * (n - 1) + ((int(lens[b]) - 1) % 8 + 1)
             self.assertEqual(int(valid[b]), expect_valid)
 
