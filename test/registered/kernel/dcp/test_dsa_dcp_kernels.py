@@ -1,8 +1,4 @@
-"""Exercise DCP KV writes and sparse partials beyond the per-rank watermark.
-
-Emulates ranks on one GPU and checks their merged result against dense PyTorch
-attention over the selected tokens, including a rank with an empty selection.
-"""
+"""Check sharded KV writes and merged sparse attention against dense PyTorch."""
 
 import unittest
 
@@ -27,7 +23,6 @@ class TestDSADCPKernels(CustomTestCase):
         device = "cuda"
         dim, heads, rows, per_rank_capacity = 512, 16, 3, 128
         q = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
-        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         for size in (1, 2, 4, 8):
             with self.subTest(dcp_size=size):
                 capacity = per_rank_capacity * size
@@ -47,7 +42,9 @@ class TestDSADCPKernels(CustomTestCase):
                         attn_dcp_size=size, attn_dcp_rank=rank
                     ):
                         set_mla_kv_buffer_dcp_sharded_triton(cache, locs, k, None)
-                        local = backend._dcp_localize_page_table(virtual)
+                        local = DeepseekSparseAttnBackend._dcp_localize_page_table(
+                            virtual
+                        )
                     expected_cache = torch.zeros_like(cache)
                     owned = locs % size == rank
                     expected_cache[locs[owned] // size] = k[owned]

@@ -92,8 +92,7 @@ def _select_local_dcp_heads_for_autotune(
 def is_dcp_mla_decode_phase(
     forward_batch: ForwardBatch, *, is_dsa_draft: bool = False
 ) -> bool:
-    # DSA draft KV is replicated, so draft decode uses local Q heads and
-    # ordinary attention rather than sharded partials and an LSE collective.
+    # Replicated DSA draft KV needs no Q gather or LSE reduction.
     if not get_parallel().dcp_enabled or is_dsa_draft:
         return False
     return (
