@@ -1293,7 +1293,7 @@ fn build_outgoing_body(
 ///
 /// Replicated-and-safe: plain text `messages` with a string `content`.
 /// Not replicated → omit:
-///   * `tools` / `functions` — the encoder doesn't render tool schemas.
+///   * `tools` / `functions` — tool-schema rendering can differ from the engine.
 ///   * multimodal (array) `content` — a text tokenizer can't represent images.
 ///   * `chat_template` — an OpenAI-compatible per-request template override
 ///     (e.g. vLLM); the router renders with the model's default template, so a
@@ -1305,6 +1305,9 @@ fn build_outgoing_body(
 ///   * `continue_final_message: true`, or a trailing `assistant` message — the
 ///     engine rewrites/strips the final assistant turn; the encoder renders it
 ///     verbatim.
+///   * message-level `reasoning_content` — Dynamo may inject it into `content`
+///     as `<think>` blocks when the HF template does not reference it, whereas
+///     the engine leaves it separate for the template to consume or ignore.
 ///
 /// NOTE: the encoder threads `chat_template_kwargs` for routing hashes, but
 /// the guard still omits them: Python's DeepSeek-V4 `reasoning_effort`
@@ -1316,6 +1319,19 @@ fn build_outgoing_body(
 /// leading special, undetectable from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value) || request_is_multimodal(value) {
+        return false;
+    }
+    if value
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("reasoning_content")
+                    .is_some_and(|v| !v.is_null())
+            })
+        })
+    {
         return false;
     }
     // Fields that steer the engine's template tokenization but which the
@@ -1385,10 +1401,9 @@ fn last_message_is_assistant(value: &serde_json::Value) -> bool {
         == Some("assistant")
 }
 
-/// Whether the request carries tool / function definitions. The router's chat
-/// encoder renders only `messages`, so its `input_ids` would omit the tool
-/// schemas the engine's template injects into the prompt — the caller must let
-/// the engine tokenize these itself.
+/// Whether the request carries tool / function definitions. Tool-schema
+/// normalization can differ between Dynamo and the engine, so the caller must
+/// let the engine tokenize these itself.
 fn request_has_tools(value: &serde_json::Value) -> bool {
     let nonempty = |key: &str| {
         value.get(key).is_some_and(|v| match v {
@@ -1712,6 +1727,7 @@ mod tests {
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"assistant","content":"A1","reasoning_content":"R1"},{"role":"user","content":"U2"}]}),
         ];
         for b in blockers {
             assert!(
@@ -1725,7 +1741,10 @@ mod tests {
     #[test]
     fn input_ids_safe_to_forward_ignores_null_and_false_fields() {
         assert!(input_ids_safe_to_forward(&serde_json::json!({
-            "messages": [{"role": "user", "content": "hi"}],
+            "messages": [
+                {"role": "assistant", "content": "hello", "reasoning_content": null},
+                {"role": "user", "content": "hi"}
+            ],
             "chat_template": null,
             "reasoning_effort": null,
             "chat_template_kwargs": null,

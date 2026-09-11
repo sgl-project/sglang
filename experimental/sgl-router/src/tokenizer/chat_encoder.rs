@@ -18,6 +18,18 @@ use minijinja::Value;
 
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
+// HuggingFace supplies these names through special_tokens_map. Dynamo supplies
+// only bos/eos/unk itself; the remaining tokens need to be template defaults.
+const SPECIAL_TOKEN_KEYS: [&str; 7] = [
+    "bos_token",
+    "eos_token",
+    "unk_token",
+    "sep_token",
+    "pad_token",
+    "cls_token",
+    "mask_token",
+];
+
 pub struct ChatEncoder {
     formatter: PromptFormatter,
     /// Engine-side defaults a request's `chat_template_kwargs` override.
@@ -28,6 +40,21 @@ impl ChatEncoder {
     /// HF Jinja template from `tokenizer_config.json`; `Ok(None)` when it ships none.
     pub fn from_tokenizer_config(cfg: &serde_json::Value) -> Result<Option<Self>> {
         let mut cfg = cfg.clone();
+        let defaults = SPECIAL_TOKEN_KEYS
+            .into_iter()
+            .map(|key| {
+                let token = cfg[key]
+                    .as_str()
+                    .or_else(|| cfg[key]["content"].as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                // An absent bos/eos/unk otherwise becomes a Jinja None, which
+                // prints "None" instead of HF's empty undefined value. Strings
+                // also accept AddedToken objects without requiring unused flags.
+                cfg[key] = token.clone().into();
+                (key.to_owned(), token.into())
+            })
+            .collect();
         // HF's `[{name, template}]` list form -> Dynamo's `[{name: template}]`.
         for entry in cfg["chat_template"].as_array_mut().into_iter().flatten() {
             if let (Some(name), Some(template)) =
@@ -49,7 +76,7 @@ impl ChatEncoder {
         .context("compile chat template")?;
         Ok(Some(Self {
             formatter,
-            defaults: HashMap::new(),
+            defaults,
         }))
     }
 
@@ -166,6 +193,32 @@ mod tests {
                           "rstrip": false, "single_word": false, "special": true},
         }));
         assert_eq!(enc.render(&request(json!([]))).unwrap(), "<|begin|>X");
+    }
+
+    #[test]
+    fn absent_special_tokens_render_empty() {
+        let enc = jinja(json!({
+            "chat_template": "A{{ bos_token }}{{ eos_token }}{{ unk_token }}{{ sep_token }}{{ pad_token }}{{ cls_token }}{{ mask_token }}B"
+        }));
+        assert_eq!(enc.render(&request(json!([]))).unwrap(), "AB");
+    }
+
+    #[test]
+    fn all_special_tokens_from_config_are_supplied() {
+        let enc = jinja(json!({
+            "chat_template": "{{ bos_token }}{{ eos_token }}{{ unk_token }}{{ sep_token }}{{ pad_token }}{{ cls_token }}{{ mask_token }}",
+            "bos_token": {"content": "<s>"},
+            "eos_token": "</s>",
+            "unk_token": {"content": "<unk>"},
+            "sep_token": "<sep>",
+            "pad_token": {"content": "<pad>"},
+            "cls_token": "<cls>",
+            "mask_token": "<mask>"
+        }));
+        assert_eq!(
+            enc.render(&request(json!([]))).unwrap(),
+            "<s></s><unk><sep><pad><cls><mask>"
+        );
     }
 
     #[test]

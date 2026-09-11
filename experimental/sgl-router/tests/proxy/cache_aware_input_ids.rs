@@ -149,6 +149,26 @@ async fn thinking_request_omits_input_ids() {
 }
 
 #[tokio::test]
+async fn reasoning_history_omits_input_ids_and_preserves_messages() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    let messages = json!([
+        {"role": "user", "content": "U1"},
+        {"role": "assistant", "content": "A1", "reasoning_content": "R1"},
+        {"role": "user", "content": "U2"}
+    ]);
+    let status = send(ctx, json!({"model": MODEL, "messages": messages})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body = captured(&mock);
+    assert!(
+        body.get("input_ids").is_none(),
+        "the engine must render reasoning history with its own template; got {body}"
+    );
+    assert_eq!(body["messages"], messages);
+}
+
+#[tokio::test]
 async fn multimodal_request_omits_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());

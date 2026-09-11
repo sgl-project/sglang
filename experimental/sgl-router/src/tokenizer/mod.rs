@@ -407,6 +407,31 @@ mod tests {
     }
 
     #[test]
+    fn routing_tokenization_receives_tools_and_template_kwargs() {
+        let reg = TokenizerRegistry::default();
+        let tok = adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap();
+        reg.inner.insert("tiny".into(), Arc::clone(&tok));
+        reg.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": "{{ tools[0].function.name }} {{ greeting }}"
+            }),
+        );
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "hello"}}],
+            "chat_template_kwargs": {"greeting": "world"}
+        });
+        let tokens = crate::policies::request_tokens_for(
+            &reg,
+            &crate::discovery::ModelId("tiny".into()),
+            &request,
+        )
+        .expect("request tokenizes");
+        assert_eq!(tokens.ids, adapter::encode(&tok, "hello world").unwrap());
+    }
+
+    #[test]
     fn encode_chat_none_without_template() {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
