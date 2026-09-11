@@ -27,6 +27,9 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
     resolve_hf_gguf_reference,
 )
+from sglang.srt.utils.hf_transformers.config import (
+    _apply_gemma4_attention_overrides,
+)
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -826,6 +829,123 @@ class TestPixtralVisionRope(CustomTestCase):
 
         torch.testing.assert_close(cos, expected.cos(), rtol=0, atol=1e-6)
         torch.testing.assert_close(sin, expected.sin(), rtol=0, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 attention overrides
+# ---------------------------------------------------------------------------
+
+
+class TestGemma4AttentionOverrides(CustomTestCase):
+    """Gemma4 states its global/SWA attention split as a heterogeneous
+    `per_layer_config`, which makes a plain `config.head_dim` read raise. Every
+    Gemma4 server launch died in `get_config` until the parser read the split
+    off the per-layer configs and dropped the spec once it had flattened it."""
+
+    def _make_config(self, **text_overrides):
+        from transformers import Gemma4Config
+
+        text_config = dict(
+            num_hidden_layers=6,
+            head_dim=128,
+            global_head_dim=256,
+            num_key_value_heads=2,
+            num_global_key_value_heads=4,
+            # Gates the kv-head override; without it every layer keeps the base count.
+            attention_k_eq_v=True,
+        )
+        text_config.update(text_overrides)
+        return Gemma4Config(text_config=text_config)
+
+    def test_full_attention_values_come_from_the_per_layer_overrides(self):
+        config = self._make_config()
+        self.assertTrue(config.text_config.is_heterogeneous)
+
+        _apply_gemma4_attention_overrides(config)
+
+        text_config = config.text_config
+        self.assertEqual(text_config.head_dim, 256)
+        self.assertEqual(text_config.v_head_dim, 256)
+        self.assertEqual(text_config.num_key_value_heads, 4)
+        self.assertEqual(text_config.swa_head_dim, 128)
+        self.assertEqual(text_config.swa_v_head_dim, 128)
+        self.assertEqual(text_config.swa_num_key_value_heads, 2)
+
+    def test_per_layer_spec_is_dropped_so_later_reads_do_not_raise(self):
+        config = self._make_config()
+
+        _apply_gemma4_attention_overrides(config)
+
+        self.assertFalse(config.text_config.is_heterogeneous)
+        # The reads every downstream consumer (ModelConfig, the model itself) makes.
+        self.assertEqual(config.text_config.head_dim, 256)
+
+    def test_config_without_a_per_layer_spec_states_one_shape(self):
+        config = self._make_config(per_layer_config=None)
+        self.assertFalse(config.text_config.is_heterogeneous)
+
+        _apply_gemma4_attention_overrides(config)
+
+        text_config = config.text_config
+        self.assertEqual(text_config.head_dim, 128)
+        self.assertEqual(text_config.swa_head_dim, 128)
+        self.assertEqual(text_config.num_key_value_heads, 2)
+        self.assertEqual(text_config.swa_num_key_value_heads, 2)
+
+    def test_unflattenable_per_layer_attribute_is_rejected(self):
+        """Dropping the spec would revert such an attribute to its global value
+        and build the model with the wrong per-layer shapes, silently."""
+        config = self._make_config(
+            intermediate_size=1024,
+            per_layer_config={
+                **{layer_idx: {"intermediate_size": 512} for layer_idx in range(5)},
+                5: {"head_dim": 256},
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "intermediate_size"):
+            _apply_gemma4_attention_overrides(config)
+
+    def test_layer_type_with_more_than_one_shape_is_rejected(self):
+        """SGLang carries one shape per layer type; such a config must be
+        rejected here rather than deep inside the transformers layer view."""
+        config = self._make_config(
+            per_layer_config={0: {"head_dim": 64}, 5: {"head_dim": 256}}
+        )
+
+        with self.assertRaisesRegex(ValueError, "single shape per layer type"):
+            _apply_gemma4_attention_overrides(config)
+
+
+# ---------------------------------------------------------------------------
+# Transformers-backend TP styles
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeTpStyle(CustomTestCase):
+    """transformers appends `embed_tokens: embedding_rowwise` to the TP plan of
+    every tied-embedding config, and the Transformers backend raised on the
+    unknown style before it ever reached a module, so those models stopped
+    loading entirely."""
+
+    def test_tied_embedding_plan_normalizes(self):
+        from transformers import AutoConfig
+
+        from sglang.srt.models.transformers import _normalize_tp_style
+
+        plan = AutoConfig.for_model(
+            "llama", tie_word_embeddings=True
+        ).base_model_tp_plan
+        self.assertIn("embedding_rowwise", plan.values())
+        for pattern, style in plan.items():
+            with self.subTest(pattern=pattern):
+                _normalize_tp_style(style)
+
+    def test_unknown_style_still_raises(self):
+        from sglang.srt.models.transformers import _normalize_tp_style
+
+        with self.assertRaises(ValueError):
+            _normalize_tp_style("mla_kv_a_proj")
 
 
 if __name__ == "__main__":

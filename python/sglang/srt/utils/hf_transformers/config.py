@@ -54,6 +54,101 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+_GEMMA4_MODEL_TYPES = (
+    "gemma4",
+    "gemma4_assistant",
+    "gemma4_unified",
+    "gemma4_unified_assistant",
+)
+
+
+# The per-layer attributes SGLang folds into its own global / `swa_*` pair.
+_GEMMA4_FLATTENED_PER_LAYER_ATTRS = frozenset({"head_dim", "num_key_value_heads"})
+
+
+def _gemma4_attention_shapes(text_config) -> dict:
+    """`{layer_type: (head_dim, num_key_value_heads)}`, read off the layer configs.
+
+    Reading either attribute off the global config raises while the per-layer
+    spec is attached, and indexing the view by layer type demands that the whole
+    type be uniform, so the values come off concrete layer indices instead.
+    """
+    # `is_heterogeneous` is `hasattr(_heterogeneity_spec)`, and the spec is the
+    # only statement of which attributes the checkpoint declared per layer.
+    spec = text_config._heterogeneity_spec
+    unsupported = set(spec.per_layer_attributes) - _GEMMA4_FLATTENED_PER_LAYER_ATTRS
+    if any("skip" in overrides for overrides in spec.per_layer_overrides.values()):
+        unsupported.add("skip")
+    if unsupported:
+        raise ValueError(
+            f"Gemma4 config declares per-layer {sorted(unsupported)}, which SGLang "
+            f"cannot express: it carries one full-attention and one sliding-window "
+            f"shape, and flattens only {sorted(_GEMMA4_FLATTENED_PER_LAYER_ATTRS)}."
+        )
+
+    per_layer = text_config.per_layer_config
+    shapes: dict[str, set] = {}
+    for layer_idx, layer_type in enumerate(text_config.layer_types):
+        layer = per_layer[layer_idx]
+        shapes.setdefault(layer_type, set()).add(
+            (layer.head_dim, layer.num_key_value_heads)
+        )
+
+    for layer_type, layer_shapes in shapes.items():
+        if len(layer_shapes) > 1:
+            raise ValueError(
+                f"Gemma4 config gives its '{layer_type}' layers more than one "
+                f"(head_dim, num_key_value_heads): {sorted(layer_shapes)}. SGLang "
+                f"carries a single shape per layer type."
+            )
+
+    return {layer_type: shape.pop() for layer_type, shape in shapes.items()}
+
+
+def _apply_gemma4_attention_overrides(config):
+    # Gemma4 states its attention shapes SWA-first: the base attributes are the
+    # sliding-window values and the full-attention layers override them. SGLang
+    # expects the opposite -- base = full attention, `swa_*` = the overrides.
+    text_config = config.text_config
+
+    if text_config.is_heterogeneous:
+        # transformers >= 5.16 states that split as a heterogeneous
+        # `per_layer_config` instead of `global_head_dim` /
+        # `num_global_key_value_heads`, which it consumes building the spec.
+        shapes = _gemma4_attention_shapes(text_config)
+        full_head_dim, full_kv_heads = shapes["full_attention"]
+        # The last layer is forced to full attention, so that key is always
+        # present; a model without sliding layers leaves `swa_*` unused.
+        swa_head_dim, swa_kv_heads = shapes.get(
+            "sliding_attention", shapes["full_attention"]
+        )
+        # `_gemma4_attention_shapes` rejects every per-layer attribute except the
+        # two flattened here, so dropping the spec discards nothing -- and while
+        # it is attached, every later read of `head_dim` raises
+        # `AmbiguousGlobalPerLayerAttributeError`.
+        text_config.per_layer_config = None
+    else:
+        # No spec means no split to recover: transformers pops `global_head_dim`
+        # and `num_global_key_value_heads` whether or not it builds one, so a
+        # config that reaches here states a single attention shape.
+        full_head_dim = swa_head_dim = text_config.head_dim
+        full_kv_heads = swa_kv_heads = text_config.num_key_value_heads
+
+    text_config.head_dim = full_head_dim
+    text_config.num_key_value_heads = full_kv_heads
+    text_config.swa_head_dim = swa_head_dim
+    text_config.swa_v_head_dim = swa_head_dim
+    text_config.swa_num_key_value_heads = swa_kv_heads
+
+    if not hasattr(text_config, "v_head_dim"):
+        text_config.v_head_dim = text_config.head_dim
+
+    # Unified Gemma4 names the end-of-audio token `eoa_token_index`,
+    # but the multimodal processor expects `eoa_token_id`.
+    if not hasattr(config, "eoa_token_id") and hasattr(config, "eoa_token_index"):
+        config.eoa_token_id = config.eoa_token_index
+
+
 _LONGCAT_ARCHS = {
     "LongcatCausalLM",
     "LongcatFlashForCausalLM",
@@ -158,42 +253,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config.model_type == "multi_modality":
             _set_architectures(config, "MultiModalityCausalLM")
 
-        if config.model_type in (
-            "gemma4",
-            "gemma4_assistant",
-            "gemma4_unified",
-            "gemma4_unified_assistant",
-        ):
-            # Gemma4 configs use base attributes for SWA layers and `global_*`
-            # variants for full-attention layers.  SGLang expects the opposite:
-            # base = full-attention, `swa_*` = sliding-window overrides.
-            text_config = config.text_config
-            global_head_dim = getattr(text_config, "global_head_dim", None)
-            global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
-
-            swa_head_dim = text_config.head_dim
-            swa_kv_heads = text_config.num_key_value_heads
-
-            text_config.swa_head_dim = swa_head_dim
-            text_config.swa_v_head_dim = swa_head_dim
-            text_config.swa_num_key_value_heads = swa_kv_heads
-
-            if global_head_dim is not None:
-                text_config.head_dim = global_head_dim
-            if global_kv_heads is not None:
-                text_config.num_key_value_heads = global_kv_heads
-
-            if not hasattr(text_config, "v_head_dim"):
-                text_config.v_head_dim = text_config.head_dim
-            if not hasattr(text_config, "swa_v_head_dim"):
-                text_config.swa_v_head_dim = text_config.swa_head_dim
-
-            # Unified Gemma4 names the end-of-audio token `eoa_token_index`,
-            # but the multimodal processor expects `eoa_token_id`.
-            if not hasattr(config, "eoa_token_id") and hasattr(
-                config, "eoa_token_index"
-            ):
-                config.eoa_token_id = config.eoa_token_index
+        if config.model_type in _GEMMA4_MODEL_TYPES:
+            _apply_gemma4_attention_overrides(config)
 
         if config.model_type == "longcat_flash":
             _set_architectures(config, "LongcatFlashForCausalLM")
