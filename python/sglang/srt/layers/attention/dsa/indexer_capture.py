@@ -27,8 +27,7 @@ class DsaGraphVariants:
     def select(self, forward_batch: ForwardBatch) -> str:
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
-            # Host-side mirror (maintained incrementally for plain decode) — no
-            # d2h sync needed.
+            # Plain decode maintains this host mirror without a D2H sync.
             max_kv_len = int(seq_lens_cpu.max().item())
         elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
             # Fallback: a single scalar reduction d2h (cheap, per-step).

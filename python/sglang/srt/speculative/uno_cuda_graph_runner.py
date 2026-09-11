@@ -130,7 +130,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         variant_label=None,
         attention_variant=None,
     ):
-        """capture one CUDA graph with/out UNO LoRA."""
         if self._tree_draft_mode:
             self._lora_state.capture_draft(size)
             try:

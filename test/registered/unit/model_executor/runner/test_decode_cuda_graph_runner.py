@@ -1,27 +1,3 @@
-"""Unit tests for ``DecodeCudaGraphRunner`` capture profiling and variant dispatch — CPU-only.
-
-Two capture-trace modes plus their precedence:
-
-  * **Original single-trace** (``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE``):
-    ``_init_profile_context_and_memory_record`` builds an *unscheduled* profiler
-    (``record_shapes`` only, no schedule / no ``on_trace_ready``); the combined
-    trace is exported in ``_post_process_after_profile`` via
-    ``export_cuda_graph_capture_trace``.
-  * **Per-batch-size traces** (``SGLANG_GRAPH_BATCH_CAPTURE``): a *scheduled*
-    profiler (``wait=2, warmup=0, active=1, repeat=0``) with the trace-export
-    knobs (record_shapes / with_stack / with_flops / profile_memory) and an
-    ``on_trace_ready`` hook that writes one trace per batch size to
-    ``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile/`` named
-    ``{runner_name}_bs_{bs}_rank{rank}.json.gz``.
-  * **Precedence**: when both env vars are set, the original single-trace path
-    wins (no per-bs schedule / dir / bookkeeping).
-
-The profiler / CUDA-memory APIs are mocked; the directory + naming + schedule
-logic is pure-Python and runs on CPU. The method is invoked unbound against a
-lightweight stand-in (with the real precedence helper bound) so no model or
-server is constructed.
-"""
-
 import os
 import tempfile
 import unittest

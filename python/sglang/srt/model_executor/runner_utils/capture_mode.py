@@ -69,7 +69,6 @@ def _set_capture_lora_variant(variant: Optional[str]) -> None:
 
 
 def get_capture_attention_variant() -> Optional[str]:
-    """Return the attention execution variant being captured, or None."""
     return _capture_attention_variant
 
 
