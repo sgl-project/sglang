@@ -434,6 +434,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         else:
             self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
 
+    @staticmethod
+    def _has_matched_prefix_lock(
+        decode_req: DecodeRequest, prefix_match: Optional[DecodePrefixMatch]
+    ) -> bool:
+        # A request restored from L2/L3 may have no device hit at all while its
+        # FULL admission lock is still held (only the SWA half was released
+        # early by the full-only lock convention).
+        return prefix_match is not None and (
+            prefix_match.l1_prefix_len > 0
+            or getattr(decode_req.req, "swa_prefix_lock_released", False)
+        )
+
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str
     ) -> Optional[str]:
@@ -1223,23 +1235,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Cap full-attention prefix reuse at the sliding-window start so
                 # the SWA window lands entirely in the fresh delta, keeping
                 # alloc_extend_swa_tail's tail->full mapping in range. Costs reuse
-                # of only the last ~window_size full-attention tokens.
-                if uses_swa_tail_prealloc and prefix_len > 0:
+                # of only the last ~window_size full-attention tokens. The cap is
+                # the page-aligned window start, so the trimmed restore stays
+                # page aligned.
+                if uses_swa_tail_prealloc and total_prefix_len > 0:
                     swa_prefix_cap = fill_len - self._swa_tail_len(fill_len)
-                    if prefix_len > swa_prefix_cap:
-                        prefix_len = swa_prefix_cap
-                        prefix_indices = prefix_indices[:prefix_len]
-                        # Cap the prefill-committed prefix too: tokens past the
-                        # cap are not device-resident, so prefill must transfer
-                        # them.
-                        total_prefix_len = prefix_len
+                    if prefix_match.decode_prefix_len > swa_prefix_cap:
+                        # The whole match -- device slice first, then the L3/L2
+                        # restore -- shrinks to the cap; tokens past it are
+                        # re-transferred by prefill.
+                        prefix_match.cap_restore(swa_prefix_cap)
+                        prefix_len = prefix_match.l1_prefix_len
+                        prefix_indices = prefix_match.prefix_indices
+                        total_prefix_len = prefix_match.decode_prefix_len
 
                 # Decode transfers the SWA tail fresh, so retain only the
-                # full-attention prefix lock needed for reuse.
-                if (
-                    uses_swa_tail_prealloc
-                    and prefix_match.l1_prefix_len > 0
-                    and hasattr(self.tree_cache, "dec_swa_lock_only")
+                # full-attention prefix lock needed for reuse. Unconditional for
+                # SWA-tail models: with L2/L3 a request can have no device hit
+                # but still restore a prefix, and the restored node's lock
+                # (_try_hicache_queue_load_back) follows this same convention.
+                # dec_swa_lock_only walks up from the node, so a root last_node
+                # (no hit at all) is a no-op.
+                if uses_swa_tail_prealloc and hasattr(
+                    self.tree_cache, "dec_swa_lock_only"
                 ):
                     self.tree_cache.dec_swa_lock_only(
                         decode_req.req.last_node, decode_req.req.lock_receipt
@@ -1288,11 +1306,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 > full_allocatable_tokens
             ):
-                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                if self._has_matched_prefix_lock(decode_req, prefix_match):
                     self._release_matched_prefix_lock(decode_req.req)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
-                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                if self._has_matched_prefix_lock(decode_req, prefix_match):
                     self._release_matched_prefix_lock(decode_req.req)
                 break
 
@@ -1310,7 +1328,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     > swa_allocatable_tokens
                 ):
-                    if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    if self._has_matched_prefix_lock(decode_req, prefix_match):
                         self._release_matched_prefix_lock(decode_req.req)
                     break
 
@@ -1318,7 +1336,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     swa_len, decode_req.req.rid
                 )
                 if reclaim_error is not None:
-                    if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    if self._has_matched_prefix_lock(decode_req, prefix_match):
                         self._release_matched_prefix_lock(decode_req.req)
                     logger.error(reclaim_error)
                     prepare_abort(
@@ -1993,12 +2011,17 @@ def alloc_for_decode_prealloc(
             )
         if uses_swa_tail:
             # Full-attention layers reuse prefix KV; SWA layers allocate only
-            # the live window tail.
+            # the live window tail. The full-attention prefix is the whole
+            # committed prefix: [prefix_len, total_prefix_len) is restored from
+            # host by HiCache, so only [total_prefix_len, fill_len) is allocated
+            # here. total_prefix_len is page aligned whenever it exceeds
+            # prefix_len, so last_loc (a page tail from the device prefix) is
+            # not consulted by alloc_extend.
             kv_loc = allocator.alloc_extend_swa_tail(
                 prefix_lens=torch.tensor(
-                    [prefix_len], dtype=torch.int64, device=device
+                    [total_prefix_len], dtype=torch.int64, device=device
                 ),
-                prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,

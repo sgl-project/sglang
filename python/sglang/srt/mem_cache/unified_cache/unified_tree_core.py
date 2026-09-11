@@ -775,8 +775,56 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
+    def match_prefix_from_anchor(
+        self,
+        params: MatchPrefixParams,
+        anchor_node_id: NodeId,
+        anchor_prefix_len: int,
+        prefix_indices: torch.Tensor,
+    ) -> MatchResult:
+        """Match only the suffix after a trusted device-resident anchor."""
+        key, _ = params.key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        anchor = self.node_by_id(anchor_node_id)
+        if (
+            anchor is self.root_node
+            or anchor_prefix_len <= 0
+            or anchor_prefix_len > len(key)
+            or anchor_prefix_len % self.page_size != 0
+            or anchor.component_data[BASE_COMPONENT_TYPE].value is None
+            or anchor.component_data[BASE_COMPONENT_TYPE].lock_ref <= 0
+        ):
+            return self.match_prefix(params)
+
+        (
+            value,
+            best_match_node,
+            best_match_device_node,
+            best_match_device_value_len,
+            full_kv_hit_length,
+            action,
+        ) = self._match_prefix_helper(
+            key[anchor_prefix_len:],
+            start_node=anchor,
+            start_prefix_len=anchor_prefix_len,
+            initial_value=prefix_indices,
+        )
+        return self._match_post_processor(
+            params,
+            value,
+            best_match_node,
+            best_match_device_node,
+            best_match_device_value_len,
+            full_kv_hit_length,
+            action,
+        )
+
     def _match_prefix_helper(
-        self, key: RadixKey
+        self,
+        key: RadixKey,
+        start_node: Optional[UnifiedTreeNode] = None,
+        start_prefix_len: int = 0,
+        initial_value: Optional[torch.Tensor] = None,
     ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
@@ -789,14 +837,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
-        node = self.root_node
+        node = start_node if start_node is not None else self.root_node
         key_offset = 0
         child_key = key.child_key_at(key_offset, self.page_size)
-        value: list[torch.Tensor] = []
+        value: list[torch.Tensor] = [initial_value] if initial_value is not None else []
         best_match_node = node
         best_match_device_node = node
-        best_match_device_value_len = 0
-        full_kv_hit_length = 0
+        best_match_device_value_len = 1 if initial_value is not None else 0
+        full_kv_hit_length = start_prefix_len
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
         if separate_device_match:
@@ -1028,18 +1076,27 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     ),
                 )
 
+        start_node, start_prefix_len, anchor_actions = self._prepare_insert_anchor(
+            params, key, priority
+        )
+
         self._ongoing_insert_walk_state = _InsertWalkState(
             phase=_InsertPhase.WALK,
-            node=self.root_node,
-            key=key,
-            value=value,
+            node=start_node,
+            key=key[start_prefix_len:],
+            value=value[start_prefix_len:],
             params=params,
             priority=priority,
             result=InsertResult(
                 prefix_len=0,
                 adopted_ranges={} if params.track_adopted_ranges else None,
             ),
+            total_prefix_length=start_prefix_len,
+            pending_actions=anchor_actions,
         )
+        if anchor_actions and not all(map(self._is_deferrable_action, anchor_actions)):
+            self._ongoing_insert_walk_state.pending_actions = []
+            return InsertStepResult(actions=anchor_actions)
         return self._advance_insert()
 
     def _rotation_conflict(
@@ -1087,6 +1144,51 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if node is self.root_node or node.rotation_base == rotation_base:
             return None
         return total_prefix_length, node
+
+    def _prepare_insert_anchor(
+        self, params: InsertParams, key: RadixKey, priority: int
+    ) -> tuple[UnifiedTreeNode, int, list[CacheAction | ComponentAction]]:
+        """Revalidate a trusted anchor without refreshing cache policy state."""
+        anchor_node_id = params.insert_anchor_node
+        anchor_prefix_len = params.insert_anchor_prefix_len
+        if anchor_node_id is None or anchor_prefix_len <= 0:
+            return self.root_node, 0, []
+
+        try:
+            candidate = self.node_by_id(anchor_node_id)
+        except KeyError:
+            return self._reject_insert_anchor(params, key, "node_not_found")
+
+        base_data = candidate.component_data[BASE_COMPONENT_TYPE]
+        if anchor_prefix_len > len(key):
+            return self._reject_insert_anchor(params, key, "anchor_exceeds_insert_key")
+        if anchor_prefix_len % self.page_size != 0:
+            return self._reject_insert_anchor(params, key, "anchor_not_page_aligned")
+        if candidate.evicted or base_data.value is None:
+            return self._reject_insert_anchor(params, key, "full_device_value_missing")
+        if base_data.lock_ref <= 0:
+            return self._reject_insert_anchor(params, key, "full_device_lock_missing")
+
+        return candidate, anchor_prefix_len, []
+
+    def _reject_insert_anchor(
+        self,
+        params: InsertParams,
+        key: RadixKey,
+        reason: str,
+    ) -> tuple[UnifiedTreeNode, int, list[CacheAction | ComponentAction]]:
+        logger.warning(
+            "Unified radix insert anchor rejected; falling back to root walk: "
+            "rid=%s anchor_node=%s anchor_prefix_len=%d insert_key_len=%d "
+            "page_size=%d reason=%s",
+            params.insert_anchor_rid,
+            params.insert_anchor_node,
+            params.insert_anchor_prefix_len,
+            len(key),
+            self.page_size,
+            reason,
+        )
+        return self.root_node, 0, []
 
     def resume_insert(self) -> InsertStepResult:
         """Continue the suspended insert after its step actions were executed."""

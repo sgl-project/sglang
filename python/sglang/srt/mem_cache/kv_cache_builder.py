@@ -257,24 +257,38 @@ def build_kv_cache(
         and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
+            is_dsv4 = getattr(model_config, "is_deepseek_v4_arch", False)
             if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache with sliding "
                     "window attention (SWA) models requires the unified radix "
                     "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
                 )
-            if enable_hierarchical_cache:
+            if enable_hierarchical_cache and not is_dsv4:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache with sliding "
                     "window attention (SWA) models currently supports only "
                     "device-resident cache and is incompatible with "
                     "--enable-hierarchical-cache."
                 )
-            if getattr(model_config, "is_deepseek_v4_arch", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
-                )
+            if is_dsv4:
+                # Reusing a prefix hands the matching compressed rows along with
+                # the full pages, and a compressed row only exists for a whole
+                # block. A page-aligned prefix is therefore block-aligned only
+                # while the page covers whole blocks -- which the DSV4 page-size
+                # override (256, or 128 on NPU) guarantees today.
+                compress_ratios = [
+                    ratio
+                    for ratio in getattr(model_config, "compress_ratios", None) or []
+                    if ratio > 0
+                ]
+                if compress_ratios and page_size % max(compress_ratios) != 0:
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
+                        f"requires page_size ({page_size}) to be a multiple of the "
+                        f"largest compression ratio ({max(compress_ratios)}) so that "
+                        "a page-aligned prefix reuses whole compressed blocks."
+                    )
             if getattr(model_config, "is_hybrid_swa_compress", False):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache does not support "

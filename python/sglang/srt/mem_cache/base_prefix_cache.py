@@ -85,6 +85,13 @@ class InsertParams:
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
 
+    # Optional fast path for a trusted request admission match whose device
+    # prefix remains locked and resident. UnifiedTreeCore revalidates the
+    # structural and component-residency invariants before using the anchor.
+    insert_anchor_node: Optional[Any] = None
+    insert_anchor_prefix_len: int = 0
+    insert_anchor_rid: Optional[Any] = None
+
 
 @dataclasses.dataclass
 class InsertResult:

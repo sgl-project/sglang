@@ -558,6 +558,30 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
+    def match_prefix_from_anchor(
+        self,
+        params: MatchPrefixParams,
+        anchor_node_id: NodeId,
+        anchor_prefix_len: int,
+        prefix_indices: torch.Tensor,
+    ) -> MatchResult:
+        """Match only the suffix after a request's existing device prefix."""
+        if (
+            self.disable
+            or anchor_node_id is None
+            or anchor_prefix_len <= 0
+            or prefix_indices.numel() < anchor_prefix_len
+        ):
+            return self.match_prefix(params)
+        result = self.tree_core.match_prefix_from_anchor(
+            params, anchor_node_id, anchor_prefix_len, prefix_indices
+        )
+        self._apply_cache_actions(result.cache_actions)
+        for component in self._components_tuple:
+            result = component.finalize_match_result_in_cache(params, result)
+        assert not result.cache_actions
+        return result
+
     def is_chunk_cache(self) -> bool:
         return self.disable
 
@@ -960,6 +984,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 priority=getattr(req, "priority", 0) or 0,
                 rotation_base=req.kv_rotation_base,
             )
+            self._set_insert_anchor(insert_params, req)
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
@@ -1033,7 +1058,12 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+    def cache_unfinished_req(
+        self,
+        req: Req,
+        chunked: bool = False,
+        **kwargs,
+    ) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
@@ -1057,6 +1087,7 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=getattr(req, "priority", 0) or 0,
             rotation_base=req.kv_rotation_base,
         )
+        self._set_insert_anchor(insert_params, req)
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
@@ -1121,7 +1152,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
+        match_result = self.match_prefix_from_anchor(
+            MatchPrefixParams(key=radix_key, req=req),
+            insert_params.insert_anchor_node,
+            insert_params.insert_anchor_prefix_len,
+            req.prefix_indices[: insert_params.insert_anchor_prefix_len],
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -1174,6 +1210,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+
+    @staticmethod
+    def _set_insert_anchor(insert_params: InsertParams, req: Req) -> None:
+        """Reuse the request's current device prefix for the next insert."""
+        anchor_node = getattr(req, "last_node", None)
+        anchor_len = req.kv.cache_protected_len
+        if anchor_node is not None and anchor_len > 0:
+            insert_params.insert_anchor_node = anchor_node
+            insert_params.insert_anchor_prefix_len = anchor_len
+            insert_params.insert_anchor_rid = getattr(req, "rid", None)
 
     # ---- Internal Helpers ----
 
@@ -1685,6 +1731,24 @@ class UnifiedRadixCache(BasePrefixCache):
 
         return True
 
+    def _build_storage_query_transfers(self) -> list[PoolTransfer]:
+        """Existence-probe transfers: one per registered sidecar pool.
+
+        A storage query moves no data, so it needs neither indices nor
+        component sources -- just each pool's name and hit policy.
+        ``batch_exists_v2`` derives the per-pool object keys from the page
+        hashes; a TRAILING_PAGES pool without explicit keys requires only
+        its last page to exist.
+        """
+        return [
+            PoolTransfer(
+                name=spec.pool_name,
+                hit_policy=spec.hit_policy,
+                indices_from_pool=spec.indices_from_pool,
+            )
+            for spec in self.sidecar_pool_specs
+        ]
+
     def _build_sidecar_transfers(
         self,
         phase: CacheTransferPhase,
@@ -1814,11 +1878,17 @@ class UnifiedRadixCache(BasePrefixCache):
             PrefetchOperation,
         )
 
+        # DeepSeek-V4 uses a logical KV anchor.  Its physical L3 objects are
+        # stored in the sidecar pools (C4/C4_INDEXER/C128 plus the SWA-derived
+        # state sidecars), so probing only the legacy KV key always reports a
+        # false miss.
+        sidecar_xfers = self._build_storage_query_transfers()
         operation = PrefetchOperation(
             "__storage_hit_query__",
             prefetch_key,
             last_hash,
-            prefix_keys,
+            prefix_keys=prefix_keys,
+            pool_transfers=sidecar_xfers or None,
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)

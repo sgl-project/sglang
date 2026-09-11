@@ -1337,6 +1337,60 @@ class UnifiedRadixCacheSuite:
             params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         return cache.insert(params)
 
+    def _assert_insert_walk_skips_admitted_prefix(
+        self, cache, prepared_anchors, walked_states, admitted_prefix_len, full_len
+    ):
+        """Prove every insert walk starts at/below the trusted prefix boundary."""
+        self.assertTrue(prepared_anchors)
+        self.assertTrue(walked_states)
+        anchor_node_id, anchor_ancestor_ids, anchor_offset = prepared_anchors[0]
+        first_node_id, first_ancestor_ids, first_offset, first_key_len = walked_states[
+            0
+        ]
+        self.assertEqual(
+            (first_node_id, first_ancestor_ids),
+            (anchor_node_id, anchor_ancestor_ids),
+            "the first walk must start from _prepare_insert_anchor's canonical node",
+        )
+        self.assertEqual(anchor_offset, admitted_prefix_len)
+        self.assertEqual(first_offset, admitted_prefix_len)
+        self.assertEqual(first_key_len, full_len - admitted_prefix_len)
+        self.assertTrue(
+            all(
+                node_id != cache.root_node.id
+                and anchor_node_id in (node_id, *ancestor_ids)
+                and offset >= admitted_prefix_len
+                and key_len <= full_len - admitted_prefix_len
+                for node_id, ancestor_ids, offset, key_len in walked_states
+            ),
+            "trusted-anchor insertion must not re-walk any admitted-prefix tokens",
+        )
+
+    @staticmethod
+    def _insert_walk_snapshot(state):
+        """Capture stable topology evidence before a walk step can mutate it."""
+        ancestor_ids = []
+        ancestor = state.node.parent
+        while ancestor is not None:
+            ancestor_ids.append(ancestor.id)
+            ancestor = ancestor.parent
+        return (
+            state.node.id,
+            tuple(ancestor_ids),
+            state.total_prefix_length,
+            len(state.key),
+        )
+
+    @staticmethod
+    def _prepared_anchor_snapshot(prepared):
+        node, offset, _ = prepared
+        ancestor_ids = []
+        ancestor = node.parent
+        while ancestor is not None:
+            ancestor_ids.append(ancestor.id)
+            ancestor = ancestor.parent
+        return node.id, tuple(ancestor_ids), offset
+
     def test_insert_and_match_basic(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -1560,6 +1614,86 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), aligned_len)
         cache.sanity_check()
 
+    def test_cache_finished_req_reuses_locked_insert_anchor(self):
+        if self.cfg.has_mamba:
+            self.skipTest("finished-request anchor coverage uses FULL/SWA cache data")
+        if self.cfg.has_swa and self.cfg.sliding_window_size < self.cfg.page_size:
+            self.skipTest("SWA window smaller than one page cannot form this anchor")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        prefix = self._make_seq(1, 2)
+        suffix = self._make_seq(100, 2)
+        full_tokens = prefix + suffix
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+
+        req = self._make_req(req_to_token_pool)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", full_tokens)), req=req)
+        )
+        self.assertEqual(len(match.device_indices), len(prefix))
+        anchor_node_id = match.last_device_node
+        lock_result = cache.inc_lock_ref(anchor_node_id)
+
+        kv_indices = self._alloc(allocator, len(full_tokens))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(full_tokens))), kv_indices
+        )
+        req.origin_input_ids = array("q", prefix)
+        req.output_ids = array("q", suffix)
+        req.full_untruncated_fill_ids = array("q", full_tokens)
+        req.set_extend_range(len(prefix), len(full_tokens))
+        req.kv.kv_committed_len = len(full_tokens)
+        req.prefix_indices = torch.cat(
+            [match.device_indices, kv_indices[len(prefix) :]]
+        )
+        req.kv.cache_protected_len = len(prefix)
+        req.last_node = match.last_device_node
+        req.lock_receipt = lock_result.to_dec_params()
+
+        walked_states = []
+        prepared_anchors = []
+        original_walk_step = cache.tree_core._insert_walk_step
+        original_prepare_anchor = cache.tree_core._prepare_insert_anchor
+
+        def record_walk_step(state):
+            walked_states.append(self._insert_walk_snapshot(state))
+            return original_walk_step(state)
+
+        def record_prepare_anchor(*args, **kwargs):
+            prepared = original_prepare_anchor(*args, **kwargs)
+            prepared_anchors.append(self._prepared_anchor_snapshot(prepared))
+            return prepared
+
+        with (
+            mock.patch.object(
+                cache.tree_core,
+                "_prepare_insert_anchor",
+                side_effect=record_prepare_anchor,
+            ),
+            mock.patch.object(
+                cache.tree_core, "_insert_walk_step", side_effect=record_walk_step
+            ),
+        ):
+            cache.cache_finished_req(
+                req,
+                is_insert=True,
+                kv_len_to_handle=req.effective_kv_committed_len(),
+            )
+
+        self._assert_insert_walk_skips_admitted_prefix(
+            cache,
+            prepared_anchors,
+            walked_states,
+            len(prefix),
+            len(full_tokens),
+        )
+        self.assertNotEqual(req.last_node, anchor_node_id)
+        rematch = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", full_tokens)))
+        )
+        self.assertEqual(len(rematch.device_indices), len(full_tokens))
+        cache.sanity_check()
+
     def test_cache_finished_req_strips_thinking(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -1675,6 +1809,237 @@ class UnifiedRadixCacheSuite:
             req.last_node,
             req.lock_receipt,
         )
+        cache.sanity_check()
+
+    def test_cache_unfinished_req_reuses_locked_insert_anchor(self):
+        if self.cfg.has_swa and self.cfg.sliding_window_size < self.cfg.page_size:
+            self.skipTest("SWA window smaller than one page cannot form this anchor")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        prefix = self._make_seq(1, 2)
+        suffix = self._make_seq(100, 2)
+        full_tokens = prefix + suffix
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+
+        req = self._make_req(req_to_token_pool)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", full_tokens)), req=req)
+        )
+        self.assertEqual(len(match.device_indices), len(prefix))
+        anchor_node_id = match.last_device_node
+        lock_result = cache.inc_lock_ref(anchor_node_id)
+
+        suffix_indices = self._alloc(allocator, len(suffix))
+        req_indices = torch.cat([match.device_indices, suffix_indices])
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(full_tokens))), req_indices
+        )
+        req.origin_input_ids = array("q", full_tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", full_tokens)
+        req.set_extend_range(len(prefix), len(full_tokens))
+        req.kv.kv_committed_len = len(full_tokens)
+        if self.cfg.has_mamba:
+            req.kv.mamba_last_track_seqlen = len(full_tokens)
+        req.prefix_indices = req_indices
+        req.kv.cache_protected_len = len(prefix)
+        req.last_node = match.last_device_node
+        req.lock_receipt = lock_result.to_dec_params()
+
+        walked_states = []
+        prepared_anchors = []
+        original_walk_step = cache.tree_core._insert_walk_step
+        original_prepare_anchor = cache.tree_core._prepare_insert_anchor
+
+        def record_walk_step(state):
+            walked_states.append(self._insert_walk_snapshot(state))
+            return original_walk_step(state)
+
+        def record_prepare_anchor(*args, **kwargs):
+            prepared = original_prepare_anchor(*args, **kwargs)
+            prepared_anchors.append(self._prepared_anchor_snapshot(prepared))
+            return prepared
+
+        with (
+            mock.patch.object(
+                cache.tree_core,
+                "_prepare_insert_anchor",
+                side_effect=record_prepare_anchor,
+            ),
+            mock.patch.object(
+                cache.tree_core, "_insert_walk_step", side_effect=record_walk_step
+            ),
+        ):
+            cache.cache_unfinished_req(req)
+
+        # Component hooks may add traversal steps, but the trusted anchor must
+        # still keep every insert walk below the already-admitted prefix.  The
+        # final rematch and lock handoff remain enabled.
+        self._assert_insert_walk_skips_admitted_prefix(
+            cache,
+            prepared_anchors,
+            walked_states,
+            len(prefix),
+            len(full_tokens),
+        )
+        self.assertEqual(req.kv.cache_protected_len, len(full_tokens))
+        self.assertEqual(req.prefix_indices.tolist(), req_indices.tolist())
+        self.assertNotEqual(req.last_node, anchor_node_id)
+        self.assertGreater(
+            cache.resolve_node_handle(req.last_node)
+            .component_data[ComponentType.FULL]
+            .lock_ref,
+            0,
+        )
+
+        cache.dec_lock_ref(
+            req.last_node,
+            req.lock_receipt,
+        )
+        cache.sanity_check()
+
+    def test_insert_anchor_does_not_refresh_cache_policy(self):
+        if self.cfg != CacheConfig():
+            self.skipTest("single FULL/page-size-1 cache-policy coverage")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        shared = self._make_seq(1, 2)
+        anchor_tokens = shared + self._make_seq(100, 2)
+        sibling_tokens = shared + self._make_seq(200, 2)
+        self._insert(cache, allocator, req_to_token_pool, anchor_tokens)
+        self._insert(cache, allocator, req_to_token_pool, sibling_tokens)
+
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", anchor_tokens)))
+        )
+        lock_result = cache.inc_lock_ref(match.last_device_node)
+        anchor = cache.resolve_node_handle(match.last_device_node)
+        ancestor = anchor.parent
+        self.assertIsNotNone(ancestor)
+        self.assertIsNot(ancestor, cache.root_node)
+        anchor.hit_count = 10
+        anchor.priority = 1
+        ancestor.hit_count = 3
+        ancestor.priority = 2
+        before = {
+            anchor.id: (
+                anchor.last_access_time,
+                anchor.hit_count,
+                anchor.priority,
+            ),
+            ancestor.id: (
+                ancestor.last_access_time,
+                ancestor.hit_count,
+                ancestor.priority,
+            ),
+        }
+        cache.tree_core.enable_hicache = True
+        cache.tree_core.write_through_threshold = 11
+        params = InsertParams(
+            insert_anchor_node=match.last_device_node,
+            insert_anchor_prefix_len=len(anchor_tokens),
+            insert_anchor_rid="no-refresh",
+        )
+
+        start_node, prefix_len, actions = cache.tree_core._prepare_insert_anchor(
+            params,
+            RadixKey(array("q", anchor_tokens + [999])),
+            priority=7,
+        )
+
+        self.assertIs(start_node, anchor)
+        self.assertEqual(prefix_len, len(anchor_tokens))
+        self.assertEqual(actions, [])
+        self.assertEqual(
+            (anchor.last_access_time, anchor.hit_count, anchor.priority),
+            before[anchor.id],
+        )
+        self.assertEqual(
+            (ancestor.last_access_time, ancestor.hit_count, ancestor.priority),
+            before[ancestor.id],
+        )
+
+        cache.tree_core.enable_hicache = False
+        cache.dec_lock_ref(match.last_device_node, lock_result.to_dec_params())
+        cache.sanity_check()
+
+    def test_cache_unfinished_req_falls_back_without_matched_anchor(self):
+        if self.cfg.has_swa and self.cfg.sliding_window_size < self.cfg.page_size:
+            self.skipTest("SWA window smaller than one page cannot form this anchor")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        prefix = self._make_seq(1, 2)
+        suffix = self._make_seq(100, 2)
+        full_tokens = prefix + suffix
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+
+        req = self._make_req(req_to_token_pool)
+        req_indices = self._alloc(allocator, len(full_tokens))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(full_tokens))), req_indices
+        )
+        req.origin_input_ids = array("q", full_tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", full_tokens)
+        req.set_extend_range(0, len(full_tokens))
+        req.kv.kv_committed_len = len(full_tokens)
+        if self.cfg.has_mamba:
+            req.kv.mamba_last_track_seqlen = len(full_tokens)
+        req.prefix_indices = req_indices
+        req.kv.cache_protected_len = 0
+        req.last_node = cache.root_node.id
+        req.lock_receipt = DecLockRefParams()
+
+        with mock.patch.object(
+            cache.tree_core,
+            "_insert_walk_step",
+            wraps=cache.tree_core._insert_walk_step,
+        ) as walk_step:
+            cache.cache_unfinished_req(req)
+
+        self.assertGreater(walk_step.call_count, 1)
+        self.assertEqual(req.kv.cache_protected_len, len(full_tokens))
+        cache.dec_lock_ref(
+            req.last_node,
+            req.lock_receipt,
+        )
+        cache.sanity_check()
+
+    def test_insert_anchor_rejection_logs_fallback_reason(self):
+        if self.cfg != CacheConfig():
+            self.skipTest("single FULL/page-size-1 fallback diagnostic coverage")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        prefix = self._make_seq(1, 2)
+        suffix = self._make_seq(100, 1)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix + suffix)))
+        )
+        lock_result = cache.inc_lock_ref(match.last_device_node)
+        params = InsertParams(
+            insert_anchor_node=match.last_device_node,
+            insert_anchor_prefix_len=len(prefix) + len(suffix) + 1,
+            insert_anchor_rid="fallback-rid",
+        )
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.unified_cache.unified_tree_core",
+            level="WARNING",
+        ) as logs:
+            node, prefix_len, actions = cache.tree_core._prepare_insert_anchor(
+                params,
+                RadixKey(array("q", prefix + suffix)),
+                priority=0,
+            )
+
+        self.assertEqual(node.id, cache.root_node.id)
+        self.assertEqual(prefix_len, 0)
+        self.assertEqual(actions, [])
+        self.assertIn("rid=fallback-rid", logs.output[0])
+        self.assertIn("reason=anchor_exceeds_insert_key", logs.output[0])
+
+        cache.dec_lock_ref(match.last_device_node, lock_result.to_dec_params())
         cache.sanity_check()
 
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
