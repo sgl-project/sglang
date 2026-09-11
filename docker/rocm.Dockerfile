@@ -154,7 +154,7 @@ ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 # Every ROCm/PyTorch artifact below is pinned to the 10.0.0 release.
 #
 # Python 3.12 (the Ubuntu 24.04 default) rather than 3.13/3.14: st_attn==0.0.7,
-# vsa==0.0.4, petit_kernel==0.0.2 and wave-lang==3.8.2 publish wheels only up to
+# vsa==0.0.4, petit_kernel==0.0.2 and wave-lang==3.9.1 publish wheels only up to
 # cp313 and no sdist, so pip has no candidate at all for srt_hip on 3.14.
 FROM $BASE_IMAGE_ROCM1000 AS rocm1000-base
 
