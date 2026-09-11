@@ -38,6 +38,13 @@ class TestFlashinferDispatcher(CustomTestCase):
         rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
         torch.cuda.set_device(device)
+        # world_size is only known post-dist-init, so the first publish above
+        # necessarily used the tp/ep defaults (1); republish with the width
+        # about to be built so get_parallel()'s derived widths (moe_ep_size,
+        # attn_tp_size, ...) reflect it too.
+        server_args.tp_size = world_size
+        server_args.ep_size = world_size
+        publish(server_args, role="scheduler")
         initialize_model_parallel(
             tensor_model_parallel_size=world_size, expert_model_parallel_size=world_size
         )

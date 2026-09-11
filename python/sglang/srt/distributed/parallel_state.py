@@ -2832,8 +2832,6 @@ def initialize_model_parallel(
             group_name="self_pp",
         )
 
-    get_parallel().stamp_derived_widths(**derived_widths)
-
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
