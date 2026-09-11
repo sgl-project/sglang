@@ -2,4 +2,3 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod parity;
-mod render_parity;

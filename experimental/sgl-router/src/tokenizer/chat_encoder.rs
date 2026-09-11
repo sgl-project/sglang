@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chat-prompt rendering for cache-aware routing, via `dynamo-renderer`.
-//!
-//! The engine caches KV blocks keyed on the tokens of the *rendered* chat
-//! prompt, so the router renders the same prompt before hashing. Tokenization
-//! adds no special tokens, so the rendered text carries BOS and role markers.
+//! Chat rendering via Dynamo for routing and optional tokenization offload.
 
 use std::collections::HashMap;
 
@@ -32,7 +28,7 @@ const SPECIAL_TOKEN_KEYS: [&str; 7] = [
 
 pub struct ChatEncoder {
     formatter: PromptFormatter,
-    /// Engine-side defaults a request's `chat_template_kwargs` override.
+    /// Defaults overridden by request template kwargs.
     defaults: ChatTemplateKwargs,
 }
 
@@ -56,9 +52,7 @@ impl ChatEncoder {
                     .or_else(|| cfg[key]["content"].as_str())
                     .unwrap_or_default()
                     .to_owned();
-                // An absent bos/eos/unk otherwise becomes a Jinja None, which
-                // prints "None" instead of HF's empty undefined value. Strings
-                // also accept AddedToken objects without requiring unused flags.
+                // Normalize absent tokens and HF AddedToken objects to strings.
                 cfg[key] = token.clone().into();
                 (key.to_owned(), token.into())
             })
@@ -113,15 +107,9 @@ impl ChatEncoder {
         })
     }
 
-    /// Render a chat request (`messages`, `tools`, `chat_template_kwargs`) into
-    /// the prompt text the engine tokenizes, with `add_generation_prompt = true`.
+    /// Render a chat request with its tools and template kwargs.
     pub fn render(&self, request: &serde_json::Value) -> Result<String> {
         let mut kwargs = self.defaults.clone();
-        // The engine folds the top-level `reasoning_effort` into the template
-        // kwargs, with explicit `chat_template_kwargs` winning.
-        if let Some(effort) = request.get("reasoning_effort").filter(|v| !v.is_null()) {
-            kwargs.insert("reasoning_effort".into(), effort.clone());
-        }
         if let Some(extra) = request
             .get("chat_template_kwargs")
             .and_then(|v| v.as_object())
@@ -140,40 +128,6 @@ struct ChatRequest<'a> {
     kwargs: ChatTemplateKwargs,
 }
 
-/// Message fields the engine's request schema keeps for non-user roles.
-const GENERIC_MESSAGE_KEYS: [&str; 7] = [
-    "role",
-    "content",
-    "tool_call_id",
-    "name",
-    "reasoning_content",
-    "tool_calls",
-    "tools",
-];
-
-/// Reshape a message the way the engine's pydantic schema does before it
-/// reaches the template: lowercase the role, drop unknown and null fields
-/// (a user message keeps only `role` and `content`), and default a missing
-/// `content` to `""`.
-fn engine_message(message: &serde_json::Value) -> serde_json::Value {
-    let role = message["role"].as_str().unwrap_or_default().to_lowercase();
-    let mut out = serde_json::Map::new();
-    if role != "user" {
-        for key in GENERIC_MESSAGE_KEYS {
-            if let Some(v) = message.get(key).filter(|v| !v.is_null()) {
-                out.insert(key.into(), v.clone());
-            }
-        }
-    }
-    let content = match &message["content"] {
-        serde_json::Value::Null => "".into(),
-        content => content.clone(),
-    };
-    out.insert("role".into(), role.into());
-    out.insert("content".into(), content);
-    out.into()
-}
-
 impl OAIChatLikeRequest for ChatRequest<'_> {
     fn model(&self) -> String {
         self.request["model"]
@@ -182,11 +136,7 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
             .to_owned()
     }
     fn messages(&self) -> Value {
-        let messages: Vec<_> = self.request["messages"]
-            .as_array()
-            .map(|m| m.iter().map(engine_message).collect())
-            .unwrap_or_default();
-        Value::from_serialize(&messages)
+        Value::from_serialize(&self.request["messages"])
     }
     fn tools(&self) -> Option<Value> {
         may_be_fix_tool_schema(self.request.get("tools")?.clone())
@@ -241,27 +191,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(enc.render(&request(json!([]))).unwrap(), "FILE");
-    }
-
-    /// Messages reach the template shaped like the engine's pydantic dump:
-    /// lowercase role, no unknown or null fields, `content` defaulting to "".
-    #[test]
-    fn messages_match_engine_schema() {
-        let enc = jinja(json!({"chat_template": "{{ messages | tojson }}"}));
-        let out = enc
-            .render(&request(json!([
-                {"role": "User", "content": "hi", "name": "bob", "extra": 1},
-                {"role": "assistant", "name": "a", "tool_calls": null, "tool_call_id": "c1"}
-            ])))
-            .unwrap();
-        let rendered: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            rendered,
-            json!([
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "", "name": "a", "tool_call_id": "c1"}
-            ])
-        );
     }
 
     #[test]

@@ -121,11 +121,7 @@ impl TokenizerRegistry {
         self.encoders.contains_key(model_id)
     }
 
-    /// Render a chat `request` through the model's chat encoder, then tokenize
-    /// the result the same way the engine does (`add_special_tokens = false`, so
-    /// the rendered `bos_token`/role markers carry the specials). Returns
-    /// `None` — caller falls back to raw routing — when the model has no
-    /// encoder, no tokenizer, or rendering/encoding fails or yields no tokens.
+    /// Render with Dynamo and tokenize; return `None` when unavailable or unsuccessful.
     pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.

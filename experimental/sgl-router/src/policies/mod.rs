@@ -33,8 +33,8 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
-    /// Whether the token ids are safe to forward as engine `input_ids`.
-    pub engine_equivalent: bool,
+    /// Whether the IDs came from chat rendering rather than raw-text fallback.
+    pub chat_rendered: bool,
 }
 
 /// External indexer answer prepared by the async ingress path for the
@@ -44,28 +44,25 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Tokenizes a request for routing. Chat-encoder tokens are engine-equivalent;
-/// raw prompt tokens are used only for routing.
+/// Render and tokenize for routing; forwarding eligibility is checked separately.
 pub fn request_tokens_for(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
-    if tokenizers.has_chat_encoder(&model_id.0) {
-        if let Some(_messages) = value.get("messages").filter(|m| m.is_array()) {
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
-                return Some(RequestTokens {
-                    ids,
-                    engine_equivalent: true,
-                });
-            }
+    if value.get("messages").is_some_and(|m| m.is_array()) {
+        if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
+            return Some(RequestTokens {
+                ids,
+                chat_rendered: true,
+            });
         }
     }
     let text = extract_prompt_text_from_value(value)?;
     let ids = tokenize_text(tokenizers, model_id, &text)?;
     Some(RequestTokens {
         ids,
-        engine_equivalent: false,
+        chat_rendered: false,
     })
 }
 
