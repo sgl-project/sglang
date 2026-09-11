@@ -9,7 +9,7 @@ Serve DeepSeek-OCR-2 (and DeepSeek-OCR) with SGLang, and run pages through it.
 #     page's output budget down to `8192 - expanded_input` (see below).
 python -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-OCR-2 --enable-multimodal \
-    --context-length 8192 --enable-custom-logit-processor
+    --context-length 8192 --allow-auto-truncate --enable-custom-logit-processor
 
 # (B) Full output budget on long pages. Any --context-length above the derived
 #     8192 needs this env var (9000 needs it exactly as much as 16384 does), and
