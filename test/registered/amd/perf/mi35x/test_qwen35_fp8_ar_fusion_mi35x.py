@@ -124,6 +124,7 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
                 model=self.model,
                 num_examples=GSM8K_NUM_QUESTIONS,
                 num_threads=GSM8K_NUM_QUESTIONS,
+                max_tokens=16384,
                 sgl_eval_thinking=True,
             )
         )

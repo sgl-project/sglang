@@ -1,8 +1,11 @@
 """SGLang CI transport and metric reporting for sgl-eval benchmarks."""
 
 import json
+import multiprocessing
 import os
+import threading
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,6 +22,13 @@ def api_base_url(args):
 
 
 def run_sgl_eval(args):
+    # math_verify uses SIGALRM, which requires the process's main thread.
+    if threading.current_thread() is not threading.main_thread():
+        with ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn")
+        ) as executor:
+            return executor.submit(run_sgl_eval, args).result()
+
     from sgl_eval.predictions import PredictionsWriter
     from sgl_eval.registry import get
     from sgl_eval.sampler import ChatCompletionSampler
@@ -47,6 +57,7 @@ def run_sgl_eval(args):
     thinking = getattr(args, "sgl_eval_thinking", None)
     if thinking is not None:
         chat_kwargs.setdefault("thinking", thinking)
+        chat_kwargs.setdefault("enable_thinking", thinking)
     if chat_kwargs:
         overrides["chat_template_kwargs"] = {
             **(spec.default_gen.chat_template_kwargs or {}),
@@ -120,6 +131,11 @@ def run_sgl_eval(args):
             indent=2,
         )
     )
+    if result.aggregate.get("error_rate", 0) > 0:
+        raise RuntimeError(
+            f"{spec.name} evaluation had request errors "
+            f"(error_rate={result.aggregate['error_rate']}); results: {out_dir}"
+        )
     for name, value in (("score", metrics["score"]), ("latency", metrics["latency"])):
         dump_metric(
             f"{spec.name}_{name}",

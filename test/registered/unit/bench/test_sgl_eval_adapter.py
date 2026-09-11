@@ -5,6 +5,7 @@ import runpy
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -90,6 +91,25 @@ class TestSglEvalAdapter(CustomTestCase):
                 evaluate.assert_called_once_with(args)
 
     def test_real_sgl_eval_chat_grading_and_metrics(self):
+        self._check_chat_grading()
+
+    def test_real_sgl_eval_grading_from_worker_thread(self):
+        self._check_chat_grading(from_worker=True, thinking=True)
+
+    def test_request_errors_are_not_accuracy_results(self):
+        self._check_chat_grading(request_error=True)
+
+    def test_explicit_chat_template_kwargs_override_thinking_flag(self):
+        self._check_chat_grading(thinking=True, explicit_thinking=False)
+
+    def _check_chat_grading(
+        self,
+        *,
+        from_worker=False,
+        thinking=False,
+        request_error=False,
+        explicit_thinking=None,
+    ):
         requests = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -101,6 +121,21 @@ class TestSglEvalAdapter(CustomTestCase):
                     self.rfile.read(int(self.headers["Content-Length"]))
                 )
                 requests.append((self.path, payload))
+                if request_error:
+                    body = json.dumps(
+                        {
+                            "error": {
+                                "message": "Missing chat template",
+                                "type": "BadRequest",
+                            }
+                        }
+                    ).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 prompt = json.dumps(payload["messages"])
                 answer = (
                     r"The answer is \boxed{7}. Confidence: 99"
@@ -158,10 +193,28 @@ class TestSglEvalAdapter(CustomTestCase):
                     top_p=0.9,
                     top_k=20,
                     min_p=0.1,
-                    chat_template_kwargs={"enable_thinking": False},
+                    sgl_eval_thinking=thinking,
                     return_latency=True,
                 )
-                metrics, latency = run_sgl_eval(args)
+                if explicit_thinking is not None:
+                    args.chat_template_kwargs = json.dumps(
+                        {
+                            "thinking": explicit_thinking,
+                            "enable_thinking": explicit_thinking,
+                        }
+                    )
+                if request_error:
+                    with self.assertRaisesRegex(RuntimeError, "error_rate=1.0"):
+                        run_sgl_eval(args)
+                    self.assertTrue(list(Path(directory).glob("*/metrics.json")))
+                    return
+                if from_worker:
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        metrics, latency = executor.submit(run_sgl_eval, args).result(
+                            timeout=60
+                        )
+                else:
+                    metrics, latency = run_sgl_eval(args)
                 self.assertEqual(metrics["score"], 0.5)
                 self.assertEqual(metrics["accuracy"], metrics["score"])
                 self.assertEqual(metrics["invalid"], 0.5)
@@ -183,7 +236,15 @@ class TestSglEvalAdapter(CustomTestCase):
             self.assertEqual(payload["min_p"], 0.1)
             self.assertEqual(payload["temperature"], 0.7)
             self.assertEqual(payload["top_p"], 0.9)
-            self.assertFalse(payload["chat_template_kwargs"]["enable_thinking"])
+            expected_thinking = (
+                thinking if explicit_thinking is None else explicit_thinking
+            )
+            self.assertEqual(
+                payload["chat_template_kwargs"]["enable_thinking"], expected_thinking
+            )
+            self.assertEqual(
+                payload["chat_template_kwargs"]["thinking"], expected_thinking
+            )
 
 
 if __name__ == "__main__":

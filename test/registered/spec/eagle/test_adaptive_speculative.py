@@ -11,7 +11,9 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -39,8 +41,8 @@ MAX_DOWNSHIFT_ATTEMPTS = 6
 class TestAdaptiveSpeculativeServer(CustomTestCase):
     """Test adaptive speculative decoding with state switching and GSM8K accuracy."""
 
-    model = DEFAULT_TARGET_MODEL_EAGLE
-    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
@@ -70,7 +72,7 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                     "--attention-backend",
                     "triton",
                     "--speculative-algorithm",
-                    "EAGLE",
+                    "EAGLE3",
                     "--speculative-draft-model-path",
                     cls.draft_model,
                     "--speculative-adaptive",
@@ -168,7 +170,7 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=512,
+            max_tokens=2048,
             num_examples=100,
             num_threads=64,
         )

@@ -77,7 +77,8 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=512,
+            max_tokens=2048,
+            sgl_eval_thinking=False,
             num_examples=200,
             num_threads=128,
         )

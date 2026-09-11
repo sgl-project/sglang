@@ -20,7 +20,7 @@ register_amd_ci(est_time=42, suite="stage-b-test-1-gpu-small-amd")
 class TestCompressedTensorsLlama3FP8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "RedHatAI/Meta-Llama-3.1-8B-FP8"
+        cls.model = "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -38,7 +38,7 @@ class TestCompressedTensorsLlama3FP8(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=512,
+            max_tokens=2048,
             num_examples=200,
             num_threads=128,
         )

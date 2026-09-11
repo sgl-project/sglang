@@ -51,7 +51,8 @@ class TestUnifiedQwenHybridTriton(DefaultServerBase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=self.num_gsm8k_questions,
-            max_tokens=512,
+            max_tokens=2048,
+            sgl_eval_thinking=False,
             num_threads=self.parallel,
             host=f"http://{url.hostname}",
             port=int(url.port),

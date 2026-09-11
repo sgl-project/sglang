@@ -63,7 +63,8 @@ class TestKimiK2Instruct0905(CustomTestCase):
             eval_name="gsm8k",
             num_examples=1319,
             num_threads=512,
-            max_tokens=512,
+            max_tokens=2048,
+            sgl_eval_thinking=False,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
