@@ -7,7 +7,7 @@ The pre-RoPE latent is also returned for the index-key projection.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -18,6 +18,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 
+from .kv_layout import KVLayout
 from .utils import make_name
 
 if TYPE_CHECKING:
@@ -25,8 +26,13 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int) -> Module:
+def _jit_c1_module(
+    head_dim: int, rope_dim: int, page_size: int, layout: KVLayout = KVLayout.V4
+) -> Module:
     args = make_cpp_args(head_dim, rope_dim, page_size, is_arch_support_pdl())
+    if layout is not KVLayout.V4:
+        # Trailing template argument; V4 keeps the default and its build key.
+        args = make_cpp_args(*args, layout.cpp_name)
     return load_jit(
         make_name("c1"),
         *args,
@@ -47,6 +53,7 @@ def c1_decode_norm_rope_store(
     k_cache: torch.Tensor,
     *,
     page_size: int,
+    layout: Union[KVLayout, str] = KVLayout.V4,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """RMSNorm ``kv_input`` and write the main KV slot, in a single launch.
@@ -74,6 +81,9 @@ def c1_decode_norm_rope_store(
     :param k_cache: the compressed KV pool buffer for this layer.
     :param page_size: slots per page of that pool (``page_size // ratio``, i.e.
                       the FULL page size at ratio 1).
+    :param layout: the pool's :class:`KVLayout`. The fp8 layouts (``V4``,
+                   ``V41``) store the fp4 fake-quantized value; ``V41_FP4``
+                   stores the e2m1 codes themselves, rounding once.
     :param out: ``[num_tokens, head_dim]`` bf16 destination for the pre-RoPE
                 latent. Pass a persistent buffer under CUDA graphs.
     :return: ``out``, the pre-RoPE post-norm latent.
@@ -82,7 +92,9 @@ def c1_decode_norm_rope_store(
     if out is None:
         out = kv_input.new_empty((num_tokens, head_dim))
 
-    _jit_c1_module(head_dim, freqs_cis.shape[-1], page_size).decode_fusion(
+    _jit_c1_module(
+        head_dim, freqs_cis.shape[-1], page_size, KVLayout.parse(layout)
+    ).decode_fusion(
         kv_input,
         out,
         norm_weight,

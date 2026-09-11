@@ -1,4 +1,4 @@
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 import triton
@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 
+from .kv_layout import KVLayout
 from .utils import make_name
 
 
@@ -30,15 +31,23 @@ def _jit_fused_store_module(
     input_dtype: torch.dtype,
     index_dtype: torch.dtype,
     page_size: int,
+    layout: KVLayout = KVLayout.V4,
 ):
     args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
     cname = "FlashMLA" if name == "flashmla" else "Indexer"
+    wrappers = ["run"]
+    if layout is not KVLayout.V4:
+        assert name == "flashmla", "only the FlashMLA cache has V4.1 layouts"
+        # The layout is a trailing template argument; V4 keeps the default so
+        # that its build key does not change.
+        args = make_cpp_args(*args, layout.cpp_name)
+        wrappers.append("run_rope")
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
     return load_jit(
         make_name("store_" + name),
         *args,
         cuda_files=["deepseek_v4/store.cuh"],
-        cuda_wrappers=[("run", f"{kernel_class}::run")],
+        cuda_wrappers=[(w, f"{kernel_class}::{w}") for w in wrappers],
     )
 
 
@@ -70,8 +79,26 @@ def fused_store_cache(
     *,
     page_size: int,
     type: Literal["flashmla", "indexer"],
+    layout: Union[KVLayout, str] = KVLayout.V4,
+    freqs_cis: Optional[torch.Tensor] = None,
 ) -> None:
+    """Quantize ``input`` ``[num_tokens, 512]`` (bf16, normed and rotated) into the
+    paged cache at ``indices``.
+
+    :param layout: the cache's :class:`KVLayout`. ``V4`` is the 584-byte layout
+        (fp8 nope, bf16 rope); ``V41`` (528 B) and ``V41_FP4`` (288 B) are the
+        V4.1 formats, fp8 with per-32 ue8m0 scales and e2m1 with per-16 e4m3
+        scales over all 512 dims.
+    :param freqs_cis: V4.1 layouts only. ``[num_tokens, 32]`` complex or
+        ``[num_tokens, 64]`` fp32 (real / imag interleaved): rotate the 64-dim
+        RoPE tail in-kernel first, so that the caller passes the un-rotated,
+        un-quantized latent and the fp4 / fp8 rounding happens exactly once.
+    """
+    layout = KVLayout.parse(layout)
     if is_hip_runtime():
+        assert layout is KVLayout.V4 and freqs_cis is None, (
+            "the V4.1 KV layouts are CUDA (sm100) only"
+        )
         from sglang.kernels.ops.kvcache.triton_store_cache import (
             triton_fused_store_cache,
         )
@@ -83,8 +110,15 @@ def fused_store_cache(
             input_dtype=input.dtype,
             index_dtype=indices.dtype,
             page_size=page_size,
+            layout=layout,
         )
-        module.run(input, cache, indices)
+        if freqs_cis is None:
+            module.run(input, cache, indices)
+        else:
+            assert layout is not KVLayout.V4, "the V4 layout has no in-kernel RoPE"
+            if freqs_cis.is_complex():
+                freqs_cis = torch.view_as_real(freqs_cis).flatten(-2)
+            module.run_rope(input, cache, indices, freqs_cis.contiguous())
 
 
 @triton.jit
