@@ -420,6 +420,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
                 # No variant means the full indexer path for any context length.
                 return get_capture_attention_variant() == DSA_DENSE
+            # Eager k-only decode skip is validated on ROCm only.
             if not _is_hip:
                 return False
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
