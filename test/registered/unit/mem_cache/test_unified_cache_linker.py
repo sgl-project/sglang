@@ -4,6 +4,7 @@ from array import array
 from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import test_unified_radix_cache_unittest as shared_cache_suite
@@ -17,10 +18,13 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertResult,
     MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -34,10 +38,12 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
+    LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    ExternalCacheHitMarker,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
@@ -139,6 +145,8 @@ class _FakeExternalTreeCore:
 
 def _cache_for_wrapper(**kwargs):
     defaults = {
+        "_components_tuple": (),
+        "components": {},
         "tree_core": SimpleNamespace(enable_external_cache_linker=False),
         "tree_components": (ComponentType.FULL,),
         "write_through_threshold": 256,
@@ -149,6 +157,14 @@ def _cache_for_wrapper(**kwargs):
     return SimpleNamespace(**defaults)
 
 
+def _swa_allocator(swa_req_ring):
+    if swa_req_ring is None:
+        return SimpleNamespace()
+    allocator = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
+    allocator._swa_req_ring = swa_req_ring
+    return allocator
+
+
 def test_cache_linker_attachment_is_backend_independent():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.tree_core = SimpleNamespace(
@@ -157,6 +173,8 @@ def test_cache_linker_attachment_is_backend_independent():
     )
     cache.tree_components = (ComponentType.FULL,)
     cache.linker = None
+    cache._components_tuple = ()
+    cache.components = {}
     linker = _FakeLinker()
 
     cache.init_cache_linker(linker)
@@ -1061,6 +1079,258 @@ def test_component_commit_keeps_only_adopted_pages():
     mapped_full, mapped_swa = mapping.mapping[0]
     assert mapped_full.tolist() == [102, 103, 106, 107]
     assert mapped_swa.tolist() == [202, 203, 206, 207]
+
+
+@pytest.mark.parametrize(
+    "swa_req_ring",
+    [None, False, True],
+    ids=["other-allocator", "paged", "request-ring"],
+)
+@pytest.mark.parametrize("enable_hicache", [False, True])
+def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
+    monkeypatch, swa_req_ring, enable_hicache
+):
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
+
+    unified_kv = swa_req_ring is True
+    monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
+    component = SWAComponent.__new__(SWAComponent)
+    component.sliding_window_size = 128
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
+    cache.components = {ComponentType.SWA: component}
+    cache.cache_controller = object() if enable_hicache else None
+    cache.tree_core = SimpleNamespace(
+        enable_hicache=enable_hicache,
+        has_swa_host_pool=enable_hicache and not unified_kv,
+    )
+    component.cache = cache
+    component.tree_core = cache.tree_core
+    # #32759: request-relative SWA needs tail re-prefill even without HiCache.
+    assert cache.swa_reprefill_tail_tokens() == (128 if unified_kv else 0)
+    node = SimpleNamespace(
+        component_data={
+            ComponentType.SWA: SimpleNamespace(value=None, host_value=None)
+        },
+        backuped=False,
+        evicted=False,
+    )
+    assert component.create_match_validator(match_device_only=True)(node) is unified_kv
+
+
+def test_cache_without_swa_needs_no_reprefill():
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.components = {}
+    assert cache.swa_reprefill_tail_tokens() == 0
+
+
+@pytest.fixture
+def full_linker_component():
+    def build_transfer(phase, node, keys):
+        keys = ["offload"] if phase == LinkerTransferPhase.OFFLOAD else list(keys)
+        return PoolTransfer(
+            name=PoolName.KV,
+            keys=keys,
+            device_indices=None
+            if phase == LinkerTransferPhase.LOOKUP
+            else torch.arange(len(keys) * 2),
+        )
+
+    return SimpleNamespace(
+        component_type=ComponentType.FULL,
+        build_external_linker_transfer=MagicMock(side_effect=build_transfer),
+        update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
+            transfer
+        ),
+    )
+
+
+def test_linker_filters_request_relative_swa_from_lookup(
+    full_linker_component,
+):
+    full = full_linker_component
+    swa = SWAComponent.__new__(SWAComponent)
+    swa.build_external_linker_transfer = MagicMock(
+        side_effect=AssertionError("excluded SWA reached linker")
+    )
+    node = SimpleNamespace(id=1, external_cache_stored=False)
+    cache = _cache_for_wrapper(
+        _components_tuple=(full, swa),
+        components={ComponentType.FULL: full, ComponentType.SWA: swa},
+        token_to_kv_pool_allocator=_swa_allocator(True),
+        tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
+        page_size=2,
+        _all_reduce_attn_groups=lambda value, op: None,
+        get_last_hash_value=lambda node: None,
+        resolve_node_handle=lambda node_id: node,
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: object()),
+        dec_lock_ref=MagicMock(),
+    )
+    backend = _FakeLinker()
+    backend.restorable = [2]
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    assert wrapper._components == (full,)
+    result = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+    matched = wrapper.match(
+        RadixKey(array("q", [1, 2, 3, 4])), SimpleNamespace(rid="match"), result
+    )
+    assert matched.host_hit_length == 4
+    assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
+        LinkerTransferPhase.LOOKUP,
+    ]
+    swa.build_external_linker_transfer.assert_not_called()
+
+
+@pytest.mark.parametrize("swa_req_ring", [False, True], ids=["paged", "request-ring"])
+@pytest.mark.parametrize(
+    "completion", [True, False, None], ids=["success", "failure", "reset"]
+)
+def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
+    swa_req_ring, completion
+):
+    node = SimpleNamespace(
+        id=7, external_cache_stored=False, write_through_pending_id=None
+    )
+    transfers = [
+        PoolTransfer(name=PoolName.KV, keys=["page"]),
+        PoolTransfer(name=PoolName.SWA, keys=["page"]),
+    ]
+    core = _FakeExternalTreeCore({node.id: node}, transfers)
+    swa = SWAComponent.__new__(SWAComponent)
+    lock_params = object()
+    cache = _cache_for_wrapper(
+        components={ComponentType.SWA: swa},
+        _components_tuple=(swa,),
+        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
+        tree_core=core,
+        inc_lock_ref=MagicMock(
+            return_value=SimpleNamespace(to_dec_params=lambda: lock_params)
+        ),
+        dec_lock_ref=MagicMock(),
+    )
+    backend = _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+
+    wrapper.offload_nodes([node.id, node.id])
+    expected = transfers[:1] if swa_req_ring else transfers
+    assert backend.queued_offloads == [expected]
+    assert core.offload_transfers == transfers
+    assert node.write_through_pending_id == node.id
+    assert not node.external_cache_stored
+    cache.inc_lock_ref.assert_called_once_with(node.id)
+    cache.dec_lock_ref.assert_not_called()
+
+    if completion is None:
+        wrapper.reset()
+        assert backend.reset_count == 1
+    else:
+        backend.completed_offloads.append(completion)
+        wrapper.commit_completed_offloads(wrapper.take_completed_offloads(1))
+    assert not wrapper.pending_offloads
+    assert node.write_through_pending_id is None
+    assert node.external_cache_stored is (completion is True)
+    cache.dec_lock_ref.assert_called_once_with(node.id, lock_params)
+    if completion is True:
+        wrapper.offload_nodes([node.id])
+        assert backend.queued_offloads == [expected]
+    else:
+        wrapper.offload_nodes([node.id])
+        assert backend.queued_offloads == [expected, expected]
+        wrapper.reset()
+
+
+@pytest.mark.parametrize(
+    "swa_req_ring,previous_boundary,expected_boundary",
+    [
+        pytest.param(True, None, 4, id="unified-tombstones"),
+        pytest.param(True, 8, 8, id="preserve-existing-boundary"),
+        pytest.param(False, None, 2, id="paged-prepare-boundary"),
+        pytest.param(None, None, 2, id="other-allocator-prepare-boundary"),
+    ],
+)
+def test_linker_load_preserves_swa_boundaries(
+    full_linker_component, swa_req_ring, previous_boundary, expected_boundary
+):
+    full = full_linker_component
+    swa = SWAComponent.__new__(SWAComponent)
+    participates = not swa_req_ring
+
+    def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            req.kv = ReqKvInfo(
+                kv_allocated_len=prefix_len, swa_evicted_seqlen=prefix_len - 2
+            )
+        return transfer
+
+    swa.build_external_linker_transfer = MagicMock(
+        return_value=PoolTransfer(
+            name=PoolName.SWA, keys=["a", "b"], device_indices=torch.arange(20, 24)
+        )
+    )
+    swa.update_external_linker_load = MagicMock(side_effect=prepare)
+    full_indices = torch.arange(4, dtype=torch.int64)
+    adopted = {ComponentType.FULL: [(0, 4)]}
+    if participates:
+        adopted[ComponentType.SWA] = [(0, 4)]
+    cache = _cache_for_wrapper(
+        _components_tuple=(full, swa),
+        page_size=2,
+        components={ComponentType.FULL: full, ComponentType.SWA: swa},
+        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(
+                device_indices=torch.empty(0, dtype=torch.int64)
+            ),
+            collect_full_device_indices=lambda node, ancestor: full_indices,
+            mark_external_cache_stored_path=MagicMock(),
+        ),
+        insert=MagicMock(
+            return_value=InsertResult(
+                prefix_len=4, total_len=4, last_device_node=0, adopted_ranges=adopted
+            )
+        ),
+        resolve_node_handle=lambda node_id: SimpleNamespace(id=0),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+        prefix_key=RadixKey(array("q", [1, 2, 3, 4])),
+        tail_hashes=["a", "b"],
+        device_hit_len=0,
+    )
+    wrapper._queue_load = MagicMock()
+    kv = (
+        None
+        if previous_boundary is None
+        else ReqKvInfo(
+            kv_allocated_len=previous_boundary, swa_evicted_seqlen=previous_boundary
+        )
+    )
+    req = SimpleNamespace(
+        rid="rid",
+        kv=kv,
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+        last_node=0,
+        priority=0,
+    )
+    restored, last_node = wrapper.load_back(req)
+
+    assert restored.tolist() == full_indices.tolist()
+    assert last_node == 0
+    assert req.kv.swa_evicted_seqlen == expected_boundary
+    assert req.kv.kv_allocated_len == (previous_boundary or 4)
+    assert cache.insert.call_args.args[0].swa_evicted_seqlen == expected_boundary
+    cache.tree_core.mark_external_cache_stored_path.assert_called_once_with(0, 0)
+    assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
+        LinkerTransferPhase.LOAD
+    ]
+    if not participates:
+        swa.build_external_linker_transfer.assert_not_called()
+        swa.update_external_linker_load.assert_not_called()
 
 
 if __name__ == "__main__":
