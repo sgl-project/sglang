@@ -123,7 +123,9 @@ class Model(msgspec.Struct):
         "Disable the L2 normalization applied by the embedding Pooler after pooling. "
         "By default, models that construct their Pooler with normalize=True L2-normalize "
         "the pooled embedding; this flag turns that off at serve time without modifying "
-        "the model code. Models that already pool without normalization are unaffected.",
+        "the model code. Models that already pool without normalization are unaffected, "
+        "and so are models with a custom pooler that does not go through Pooler (for "
+        "example the cross-encoder, BERT-pooler and vision-pooler paths).",
     ] = False
     revision: A[
         Optional[str],
