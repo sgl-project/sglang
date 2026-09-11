@@ -61,10 +61,8 @@ def _gemm_ag_op(
     b: torch.Tensor,
     c: Optional[torch.Tensor],
     out: torch.Tensor,
-    ws_mc_base: int,
 ) -> None:
-    comm = _COMM_MAP[world_size].obj
-    _jit_module().run(comm, x, weight, b, c, out, ws_mc_base)
+    _jit_module().run(_COMM_MAP[world_size], x, weight, b, c, out)
 
 
 def gemm_ag_up_proj(
@@ -74,15 +72,12 @@ def gemm_ag_up_proj(
     b: torch.Tensor,
     c: Optional[torch.Tensor],
     out: torch.Tensor,
-    *,
-    ws_mc_base: int,
 ) -> torch.Tensor:
     """``out = x @ weight.T (allgathered) + b (+ c)``, all bf16.
 
     ``x`` is [M, 3584] with M in [1, MAX_TOKENS]; ``weight`` is the FULL
     replicated [7168, 3584] up_proj weight (each rank reads only its own
     row block); ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is
-    output-only). ``ws_mc_base`` is the multicast VA of the v2 workspace
-    slab base (``comm.mc_base_ptr``)."""
-    _gemm_ag_op(world_size, x, weight, b, c, out, ws_mc_base)
+    output-only)."""
+    _gemm_ag_op(world_size, x, weight, b, c, out)
     return out

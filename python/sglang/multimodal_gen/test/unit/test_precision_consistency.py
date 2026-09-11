@@ -1,69 +1,11 @@
-import importlib.util
-import sys
-import types
 import unittest
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
+from sglang.multimodal_gen.runtime.utils import precision
 
-def _load_precision_module():
-    package_names = (
-        "sglang",
-        "sglang.multimodal_gen",
-        "sglang.multimodal_gen.runtime",
-        "sglang.multimodal_gen.runtime.utils",
-    )
-    stub_names = (
-        *package_names,
-        "sglang.multimodal_gen.runtime.platforms",
-        "sglang.multimodal_gen.utils",
-    )
-    missing = object()
-    previous_modules = {name: sys.modules.get(name, missing) for name in stub_names}
-
-    try:
-        utils_module = types.ModuleType("sglang.multimodal_gen.utils")
-        utils_module.PRECISION_TO_TYPE = {
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-            "fp32": torch.float32,
-        }
-        platforms_module = types.ModuleType("sglang.multimodal_gen.runtime.platforms")
-        platforms_module.current_platform = SimpleNamespace(
-            device_type="cpu",
-            is_mps=lambda: False,
-            is_amp_supported=lambda: True,
-        )
-        for package_name in package_names:
-            package = types.ModuleType(package_name)
-            package.__path__ = []
-            sys.modules[package_name] = package
-        sys.modules["sglang.multimodal_gen.runtime.platforms"] = platforms_module
-        sys.modules["sglang.multimodal_gen.utils"] = utils_module
-
-        precision_path = (
-            Path(__file__).resolve().parents[2] / "runtime/utils/precision.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "_diffusion_precision_under_test", precision_path
-        )
-        precision = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = precision
-        spec.loader.exec_module(precision)
-    finally:
-        for module_name, previous_module in previous_modules.items():
-            if previous_module is missing:
-                sys.modules.pop(module_name, None)
-            else:
-                sys.modules[module_name] = previous_module
-
-    return precision
-
-
-precision = _load_precision_module()
 align_tensor_to_module_dtype = precision.align_tensor_to_module_dtype
 autocast_context = precision.autocast_context
 autocast_enabled = precision.autocast_enabled
@@ -113,7 +55,9 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             "text_encoder_precisions": ["fp16", "bf16"],
         }
         config.update(overrides)
-        return SimpleNamespace(pipeline_config=SimpleNamespace(**config))
+        return SimpleNamespace(
+            component_precisions={}, pipeline_config=SimpleNamespace(**config)
+        )
 
     def test_precision_lookup(self):
         server_args = self._server_args()
@@ -150,6 +94,13 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         self.assertEqual(
             resolve_decode_precision(
                 self._server_args(vae_decode_precision_high="bf16"),
+                quality="extra-high",
+            ),
+            torch.float16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
                 quality="lossless",
             ),
             torch.float16,
@@ -163,8 +114,27 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
                 self._server_args(vae_decode_precision_high="fp8"), quality="high"
             )
 
+    def test_exact_vae_precision_overrides_load_and_decode_defaults(self):
+        server_args = self._server_args(vae_decode_precision="bf16")
+        server_args.component_precisions["vae"] = "fp16"
+        server_args.component_precisions["video_vae"] = "bf16"
+
+        self.assertEqual(
+            resolve_precision(server_args, "vae", precision_attr="vae_precision"),
+            torch.float16,
+        )
+        self.assertEqual(resolve_decode_precision(server_args, "vae"), torch.float16)
+        self.assertEqual(
+            resolve_precision(server_args, "video_vae", precision_attr="vae_precision"),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(server_args, "video_vae"), torch.bfloat16
+        )
+
     def test_component_precision_mapping(self):
         server_args = self._server_args()
+        server_args.component_precisions["text_encoder_2"] = "fp32"
         expected = {
             "vae": torch.float16,
             "video_vae": torch.float16,
@@ -178,7 +148,7 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             "dual_tower_bridge": torch.float32,
             "image_encoder": torch.float16,
             "text_encoder": torch.float16,
-            "text_encoder_2": torch.bfloat16,
+            "text_encoder_2": torch.float32,
         }
 
         for module_name, expected_dtype in expected.items():
@@ -188,7 +158,11 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
                 module_name,
             )
 
-        self.assertIsNone(resolve_component_precision(SimpleNamespace(), "vae"))
+        self.assertIsNone(
+            resolve_component_precision(
+                SimpleNamespace(component_precisions={}, pipeline_config=None), "vae"
+            )
+        )
         self.assertIsNone(
             resolve_component_precision(server_args, "unregistered_component")
         )
