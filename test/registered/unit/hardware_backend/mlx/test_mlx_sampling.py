@@ -557,6 +557,14 @@ class TestRunnerSelectTokens(CustomTestCase):
         runner._enable_sampling = enable_sampling
         runner._cache_layout = self._FakeLayout()
         runner._req_sampling = {}
+        runner._req_penalty_counts = {}
+        runner._req_penalty_seed_ids = {}
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._req_pool_idx = {}
+        runner._req_synced_offset = {}
+        runner._decode_step_ct = 0
+        runner._clear_steps = 0
         runner._rng_key = mx.random.key(0) if enable_sampling else None
         return runner
 
@@ -601,6 +609,386 @@ class TestRunnerSelectTokens(CustomTestCase):
         mx.eval(tok)
         self.assertEqual(tok.tolist(), [0])  # argmax of zeros
         self.assertIs(runner._rng_key, key_before)
+
+    def test_first_output_ignores_prompt_and_advances_once(self):
+        """The first output sees no prompt history, then becomes lazy state."""
+        runner = self._runner(enable_sampling=True)
+        runner._req_sampling = {
+            "a": _params(top_k=1, repetition_penalty=2.0),
+        }
+        runner._req_token_ids = {"a": [101, 1, 103]}
+        logits = mx.array([[0.0, 5.0, 4.0]])
+        caches = [[self._FakeCache(4)]]
+
+        first = runner._select_tokens_with_logprobs(logits, ["a"], caches)[0]
+        second = runner._select_tokens_with_logprobs(logits, ["a"], caches)[0]
+
+        mx.eval(first, second, runner._req_penalty_counts["a"])
+        self.assertEqual(first.tolist(), [1])
+        self.assertEqual(second.tolist(), [2])
+        self.assertEqual(runner._req_penalty_counts["a"].tolist(), [0, 1, 1])
+
+    def test_discarded_chunk_does_not_advance_penalty_history(self):
+        """A discarded chunk cannot seed state; the next valid output adds one."""
+        runner = self._runner(enable_sampling=True)
+        runner.model = lambda input_ids, cache=None: mx.zeros(
+            (1, input_ids.shape[1], 3)
+        )
+        runner._req_sampling = {
+            "a": _params(top_k=1, repetition_penalty=2.0),
+        }
+
+        discarded, lazy_logprobs = runner._forward_lazy_token(
+            mx.array([[3, 4]], dtype=mx.int32),
+            [self._FakeCache(2)],
+            needs_logits=False,
+            req_id="a",
+        )
+        self.assertIsNone(lazy_logprobs)
+        mx.eval(discarded)
+        self.assertEqual(runner._req_penalty_counts, {})
+
+        valid = runner._select_tokens_with_logprobs(
+            mx.array([[0.0, 5.0, 4.0]]),
+            ["a"],
+            [[self._FakeCache(2)]],
+        )[0]
+        mx.eval(valid, runner._req_penalty_counts["a"])
+        self.assertEqual(valid.tolist(), [1])
+        self.assertEqual(runner._req_penalty_counts["a"].tolist(), [0, 1, 0])
+
+    def test_discarded_reprefill_preserves_accepted_output_history(self):
+        """The first valid extend sees accepted outputs, not the discarded token."""
+        from types import SimpleNamespace
+
+        runner = self._runner(enable_sampling=True)
+        runner.disable_radix_cache = True
+        runner._acquire_cache = lambda: [self._FakeCache(0)]
+        runner._store_auxiliary_state = lambda req_pool_idx, cache: None
+        runner.model = lambda input_ids, cache=None: mx.array(
+            [[[0.0, 5.0, 4.0]]]
+        )
+        req = SimpleNamespace(
+            kv=SimpleNamespace(mamba_last_track_seqlen=None),
+            output_ids=[1],
+            sampling_params=SimpleNamespace(
+                temperature=1.0,
+                top_k=1,
+                top_p=1.0,
+                min_p=0.0,
+                sampling_seed=None,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                repetition_penalty=2.0,
+            ),
+        )
+
+        discarded = runner.prefill_start(
+            req_id="a",
+            new_token_ids=[101],
+            full_token_ids=[101, 1],
+            prefix_slot_ids=[],
+            new_slot_ids=[],
+            req_pool_idx=0,
+            req=req,
+            needs_logits=False,
+        )
+        self.assertEqual(discarded.penalty_states, ())
+        mx.eval(discarded.lazy_token)
+        self.assertEqual(discarded.lazy_token.tolist(), [1])
+        runner.prefill_finalize(discarded)
+
+        valid = runner.extend_start(
+            req_id="a",
+            new_token_ids=[102],
+            new_slot_ids=[],
+            needs_logits=True,
+        )
+        mx.eval(valid.lazy_token, *valid.penalty_states)
+        self.assertEqual(valid.lazy_token.tolist(), [2])
+        self.assertEqual(runner._req_penalty_counts["a"].tolist(), [0, 1, 1])
+
+    def test_prefill_and_extend_pending_carry_penalty_states(self):
+        """Valid prefill and extend outputs expose their lazy count rows."""
+        from types import SimpleNamespace
+
+        runner = self._runner(enable_sampling=True)
+        runner.disable_radix_cache = True
+        runner._req_penalty_counts = {
+            "a": mx.array([0, 0, 1], dtype=mx.uint32),
+        }
+        runner._acquire_cache = lambda: [self._FakeCache(0)]
+        runner._store_auxiliary_state = lambda req_pool_idx, cache: None
+        runner.model = lambda input_ids, cache=None: mx.array(
+            [[[0.0, 5.0, 4.0]]]
+        )
+        req = SimpleNamespace(
+            kv=SimpleNamespace(mamba_last_track_seqlen=None),
+            output_ids=[1],
+            sampling_params=SimpleNamespace(
+                temperature=1.0,
+                top_k=1,
+                top_p=1.0,
+                min_p=0.0,
+                sampling_seed=None,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                repetition_penalty=2.0,
+            ),
+        )
+
+        prefill = runner.prefill_start(
+            req_id="a",
+            new_token_ids=[101],
+            full_token_ids=[101, 1],
+            prefix_slot_ids=[],
+            new_slot_ids=[],
+            req_pool_idx=0,
+            req=req,
+        )
+        self.assertEqual(len(prefill.penalty_states), 1)
+        mx.eval(prefill.lazy_token, *prefill.penalty_states)
+        self.assertEqual(prefill.penalty_states[0].tolist(), [0, 1, 1])
+        runner.prefill_finalize(prefill)
+
+        extend = runner.extend_start(
+            req_id="a",
+            new_token_ids=[102],
+            new_slot_ids=[],
+        )
+        self.assertEqual(len(extend.penalty_states), 1)
+        self.assertIs(extend.penalty_states[0], runner._req_penalty_counts["a"])
+
+    def test_penalty_state_is_request_aligned_in_mixed_batch(self):
+        """Rows follow req_ids, not penalty-state dictionary insertion order."""
+        logits = mx.array([[0.0, 5.0, 4.0], [0.0, 5.0, 4.0]])
+        params = _params(top_k=1, repetition_penalty=2.0)
+
+        runner = self._runner(enable_sampling=True)
+        runner._req_sampling = {"b": params, "a": params}
+        runner._req_penalty_counts = {
+            "b": mx.zeros((3,), dtype=mx.uint32),
+            "a": mx.array([0, 1, 0], dtype=mx.uint32),
+        }
+        caches = [[self._FakeCache(4)], [self._FakeCache(4)]]
+        tokens = runner._select_tokens_with_logprobs(
+            logits, ["a", "b"], caches
+        )[0]
+        mx.eval(tokens)
+        self.assertEqual(tokens.tolist(), [2, 1])
+
+        swapped = self._runner(enable_sampling=True)
+        swapped._req_sampling = {"b": params, "a": params}
+        swapped._req_penalty_counts = {
+            "b": mx.zeros((3,), dtype=mx.uint32),
+            "a": mx.array([0, 1, 0], dtype=mx.uint32),
+        }
+        swapped_tokens = swapped._select_tokens_with_logprobs(
+            logits, ["b", "a"], caches
+        )[0]
+        mx.eval(swapped_tokens)
+        self.assertEqual(swapped_tokens.tolist(), [1, 2])
+
+    def test_penalty_updates_are_row_local(self):
+        """Each persistent update is built from a one-row graph."""
+        from unittest.mock import patch
+
+        from sglang.srt.hardware_backend.mlx import model_runner as runner_module
+
+        params = [_params(top_k=1, repetition_penalty=2.0)] * 2
+        runner = self._runner(enable_sampling=True)
+        runner._req_sampling = {"a": params[0], "b": params[1]}
+        runner._req_penalty_counts = {
+            "a": mx.array([0, 1, 0], dtype=mx.uint32),
+            "b": mx.array([1, 0, 0], dtype=mx.uint32),
+        }
+        counts = mx.array([[0, 1, 0], [1, 0, 0]], dtype=mx.uint32)
+        tokens = mx.array([2, 1], dtype=mx.uint32)
+
+        with patch.object(
+            runner_module,
+            "increment_token_counts",
+            wraps=increment_token_counts,
+        ) as increment:
+            runner._advance_penalty_counts(
+                ["a", "b"], params, counts, tokens
+            )
+
+        self.assertEqual(
+            [call.args[0].shape for call in increment.call_args_list],
+            [(1, 3), (1, 3)],
+        )
+        self.assertEqual(
+            [state.shape for state in runner._req_penalty_counts.values()],
+            [(3,), (3,)],
+        )
+
+    def test_default_penalty_path_is_identity_and_stateless(self):
+        """Default sampling must not allocate or carry persistent penalty state."""
+        runner = self._runner(enable_sampling=True)
+        runner._req_sampling = {"a": GREEDY_PARAMS}
+        logits = mx.zeros((1, 3))
+
+        prepared, token_counts = runner._apply_sampling_penalties(logits, ["a"])
+
+        self.assertIs(prepared, logits)
+        self.assertIsNone(token_counts)
+        self.assertEqual(runner._req_penalty_counts, {})
+        self.assertEqual(runner._req_penalty_seed_ids, {})
+
+    def test_logprobs_use_penalty_adjusted_distribution(self):
+        """Sampling and every reported logprob share the penalized logits."""
+        import math
+
+        runner = self._runner(enable_sampling=True)
+        runner._req_sampling = {
+            "a": _params(top_k=1, repetition_penalty=2.0),
+        }
+        runner._req_penalty_counts = {
+            "a": mx.array([0, 1, 0], dtype=mx.uint32),
+        }
+        spec = MlxLogprobSpec(top_ks=(2,), token_ids=((1, 2),))
+        tokens, logprobs = runner._select_tokens_with_logprobs(
+            mx.array([[0.0, 5.0, 4.0]]),
+            ["a"],
+            [[self._FakeCache(4)]],
+            logprob_spec=spec,
+        )
+
+        assert logprobs is not None
+        mx.eval(
+            tokens,
+            logprobs.chosen,
+            logprobs.top_val,
+            logprobs.top_idx,
+            logprobs.token_ids_val[0],
+        )
+        self.assertEqual(tokens.tolist(), [2])
+
+        adjusted = [0.0, 2.5, 4.0]
+        normalizer = math.log(sum(math.exp(value) for value in adjusted))
+        expected = [value - normalizer for value in adjusted]
+        self.assertAlmostEqual(logprobs.chosen.tolist()[0], expected[2], places=5)
+        self.assertEqual(logprobs.top_idx.tolist(), [[2, 1]])
+        for actual, wanted in zip(
+            logprobs.top_val.tolist()[0], [expected[2], expected[1]]
+        ):
+            self.assertAlmostEqual(actual, wanted, places=5)
+        for actual, wanted in zip(
+            logprobs.token_ids_val[0].tolist(), [expected[1], expected[2]]
+        ):
+            self.assertAlmostEqual(actual, wanted, places=5)
+
+    def test_penalties_precede_static_edits_custom_hook_and_sanitization(self):
+        """Hook input is penalty-then-edit; hook NaNs are sanitized afterward."""
+        import numpy as np
+
+        runner = self._runner(enable_sampling=True)
+        runner._sanitize_nan = True
+        runner._req_sampling = {
+            "a": _params(top_k=1, repetition_penalty=2.0),
+        }
+        runner._req_penalty_counts = {
+            "a": mx.array([0, 1, 0], dtype=mx.uint32),
+        }
+        observed = []
+
+        def hook(values):
+            observed.append(values.copy())
+            values[0, 1] = np.nan
+            return values
+
+        tokens = runner._select_tokens_with_logprobs(
+            mx.array([[0.0, 4.0, 1.0]]),
+            ["a"],
+            [[self._FakeCache(4)]],
+            edit_rows=mx.array([[0.0, 1.0, 0.0]]),
+            logits_hook=hook,
+        )[0]
+
+        mx.eval(tokens)
+        self.assertEqual(observed[0][0].tolist(), [0.0, 3.0, 1.0])
+        self.assertEqual(tokens.tolist(), [2])
+
+    def test_chained_decode_sees_lazy_penalty_state_without_materialization(self):
+        """Step N+1 depends on step N's lazy token before either is finalized."""
+        from unittest.mock import patch
+
+        runner = self._runner(enable_sampling=True)
+        runner._req_sampling = {
+            "a": _params(top_k=1, repetition_penalty=2.0),
+        }
+        runner._req_caches = {"a": [self._FakeCache(3)]}
+        runner._req_token_ids = {"a": [7]}
+        logits = mx.array([[0.0, 5.0, 4.0]])
+        runner._decode_with_batched_attention = lambda caches, inputs, req_ids: logits
+
+        with patch.object(
+            mx, "eval", side_effect=AssertionError("graph construction evaluated MLX")
+        ):
+            first = runner.decode_batch_start(["a"])
+            second = runner.decode_batch_start_chained(first)
+
+        self.assertEqual(len(first.penalty_states), 1)
+        self.assertEqual(len(second.penalty_states), 1)
+        mx.async_eval(
+            first.lazy_tokens,
+            *first.penalty_states,
+            second.lazy_tokens,
+            *second.penalty_states,
+        )
+        self.assertEqual(runner.decode_batch_finalize(first), [1])
+        self.assertEqual(runner.decode_batch_finalize(second), [2])
+        self.assertEqual(runner._req_penalty_counts["a"].tolist(), [0, 1, 1])
+
+    def test_eval_pending_includes_lazy_penalty_states(self):
+        """The synchronous pending boundary evaluates count outputs too."""
+        from unittest.mock import patch
+
+        runner = self._runner(enable_sampling=True)
+        runner._req_sampling = {
+            "a": _params(top_k=1, repetition_penalty=2.0),
+        }
+        runner._req_caches = {"a": [self._FakeCache(3)]}
+        runner._req_token_ids = {"a": [7]}
+        def fake_decode(caches, inputs, req_ids):
+            return mx.array([[0.0, 5.0, 4.0]])
+
+        runner._decode_with_batched_attention = fake_decode
+        pending = runner.decode_batch_start(["a"])
+
+        with patch.object(mx, "eval") as eval_mock:
+            runner.eval_pending(pending)
+
+        self.assertTrue(
+            any(
+                arg is pending.penalty_states[0]
+                for arg in eval_mock.call_args.args
+            )
+        )
+
+    def test_remove_and_clear_release_penalty_state(self):
+        """Request removal and runner clear drop all persistent count rows."""
+        runner = self._runner(enable_sampling=True)
+        runner.disable_radix_cache = True
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._req_sampling = {}
+        runner._req_pool_idx = {}
+        runner._req_synced_offset = {}
+        runner._attention_kv_pool = None
+        runner._req_penalty_counts = {
+            "a": mx.zeros((3,), dtype=mx.uint32),
+            "b": mx.zeros((3,), dtype=mx.uint32),
+        }
+        runner._req_penalty_seed_ids = {"a": [1], "b": [2]}
+
+        runner.remove_request("a")
+        self.assertEqual(set(runner._req_penalty_counts), {"b"})
+        self.assertEqual(set(runner._req_penalty_seed_ids), {"b"})
+        runner.clear()
+        self.assertEqual(runner._req_penalty_counts, {})
+        self.assertEqual(runner._req_penalty_seed_ids, {})
 
     def test_logit_edits_gate_greedy_and_sampled_and_logprobs(self):
         """An additive -inf edit row must exclude a token from greedy argmax,
