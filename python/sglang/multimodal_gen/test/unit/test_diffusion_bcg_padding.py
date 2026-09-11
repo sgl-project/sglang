@@ -37,6 +37,10 @@ class OtherTransformer2DModel(torch.nn.Module):
     pass
 
 
+class FluxTransformer2DModel(torch.nn.Module):
+    pass
+
+
 class Ideogram4Transformer2DModel(torch.nn.Module):
     pass
 
@@ -70,22 +74,26 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
     def _batch(quality: str):
         return SimpleNamespace(sampling_params=SimpleNamespace(quality=quality))
 
-    def test_rejects_high_when_dit_fusion_would_replace_captured_graph(self):
-        unmounted = []
-        handlers = (
-            (
-                "test fusion",
-                lambda _: True,
-                lambda transformer: unmounted.append(transformer),
-            ),
-        )
+    def test_rejects_fusion_levels_when_they_would_replace_captured_graph(self):
+        for quality in ("extra-high", "high"):
+            with self.subTest(quality=quality):
+                unmounted = []
+                handlers = (
+                    (
+                        "test fusion",
+                        lambda _: True,
+                        lambda transformer: unmounted.append(transformer),
+                    ),
+                )
 
-        with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
-            with self.assertRaisesRegex(ValueError, "lossless warmup graphs"):
-                self.stage._maybe_toggle_quality_fusions(self._batch("high"))
+                with patch.object(
+                    denoising_module, "_QUALITY_FUSION_HANDLERS", handlers
+                ):
+                    with self.assertRaisesRegex(ValueError, "lossless warmup graphs"):
+                        self.stage._maybe_toggle_quality_fusions(self._batch(quality))
 
-        self.assertEqual(unmounted, [self.stage.transformer])
-        self.assertFalse(self.stage._quality_fusions_mounted)
+                self.assertEqual(unmounted, [self.stage.transformer])
+                self.assertFalse(self.stage._quality_fusions_mounted)
 
     def test_allows_high_when_model_has_no_dit_quality_fusions(self):
         handlers = (("test fusion", lambda _: False, lambda _: None),)
@@ -93,6 +101,21 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
             self.stage._maybe_toggle_quality_fusions(self._batch("high"))
 
+        self.assertTrue(self.stage._quality_fusions_mounted)
+
+    def test_high_keeps_extra_high_fusions_mounted(self):
+        self.stage.server_args.enable_breakable_cuda_graph = False
+        mounted = []
+        handlers = (
+            ("test fusion", lambda _: mounted.append(True) or True, lambda _: None),
+        )
+
+        with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
+            self.stage._maybe_toggle_quality_fusions(self._batch("extra-high"))
+            self.assertTrue(self.stage._quality_fusions_mounted)
+            self.stage._maybe_toggle_quality_fusions(self._batch("high"))
+
+        self.assertEqual(mounted, [True])
         self.assertTrue(self.stage._quality_fusions_mounted)
 
 
@@ -113,6 +136,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.zimage_model = ZImageTransformer2DModel()
         self.sana_video_model = SanaVideoTransformer3DModel()
         self.other_model = OtherTransformer2DModel()
+        self.flux_model = FluxTransformer2DModel()
 
     def _patch_buckets(self, *buckets: int):
         resolved = tuple(sorted({b for b in buckets if b > 0}))
@@ -500,6 +524,26 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "SanaVideoPipelineConfig",
             BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
         )
+
+    def test_flux_unmasked_conditioning_keeps_one_signature_for_all_buckets(self):
+        # FLUX attends to all 512 T5 tokens, including tokenizer padding.
+        # Adding unmasked tokens would change attention and generated pixels.
+        kwargs = {
+            "hidden_states": torch.zeros(1, 4096, 64, dtype=torch.bfloat16),
+            "encoder_hidden_states": torch.ones(1, 512, 4096, dtype=torch.bfloat16),
+            "pooled_projections": torch.ones(1, 768, dtype=torch.bfloat16),
+            "timestep": torch.zeros(1),
+            "guidance": torch.full((1,), 3.5, dtype=torch.bfloat16),
+            "freqs_cis": (torch.zeros(4608, 64), torch.ones(4608, 64)),
+        }
+        signature = _signature_kwargs(kwargs)
+        for bucket in (64, 128, 256, 512, 1024):
+            with self.subTest(bucket=bucket):
+                out = self.stage._bcg_pad_prompt_kwargs(
+                    kwargs, current_model=self.flux_model, force_bucket=bucket
+                )
+                self.assertIs(out, kwargs)
+                self.assertEqual(_signature_kwargs(out), signature)
 
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()

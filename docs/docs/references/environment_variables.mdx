@@ -84,6 +84,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>~/.cache/sglang</code></td>
     </tr>
 <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CUTE_AOT_CACHE_DIR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Trusted directory for persistent CuTe DSL AOT objects shared across process restarts. Artifacts are namespaced by source, runtime ABI, host platform, and target GPU architecture. Set to an empty string to keep compilation process-local. Only use a directory writable by trusted users because SGLang loads cached object files into the process.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{SGLANG_CACHE_DIR}`}/cute_aot</code></td>
+    </tr>
+<tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PREFETCH_BLOCK_SIZE_MB</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>16</code></td>
@@ -320,6 +325,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"1024"`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer NVFP4 MegaMOE cross-rank combine wire format. Supported values are <code>bf16</code>, <code>mxfp8</code>, and <code>nvfp4</code>. Quantized formats are incompatible with <code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"bf16"</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank FlashInfer MegaMOE symmetric-workspace token capacity. A value of <code>0</code> derives the capacity from the runtime token limits.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the CuTe DSL MegaMOE in-kernel FC2 reduction. This can reduce workspace size and improve large-batch performance, but BF16 atomic accumulation is nondeterministic. It is incompatible with quantized combine dtypes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS`</td>
@@ -1831,6 +1851,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_DISABLE_LINEARQUANT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable linear-layer quantization on ROCm.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm: fold the KDA <code>[f_a|b]</code> tail into the wide <code>[q,k,v,g]</code> projection so the whole input projection is one GEMM. Applies to unquantized weights only; falls back to the split projection otherwise.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
   </tbody>
 </table>

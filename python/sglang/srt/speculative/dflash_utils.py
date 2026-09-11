@@ -17,6 +17,7 @@ from sglang.srt.layers.sampler import (
     top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
@@ -35,6 +36,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        "XPUAttentionBackend",
     }
 )
 
@@ -221,8 +223,7 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -538,6 +539,15 @@ class DFlashDraftConfig:
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    projector_type: Optional[str]
+    shift_label: Optional[bool]
+    pure_draft_prefix_len: Optional[int]
+    gru_hidden_dim: Optional[int]
+    emb_dim: Optional[int]
+
+    @property
+    def is_domino(self) -> bool:
+        return self.projector_type == "domino"
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -698,6 +708,72 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    projector_type = dflash_cfg.get(
+        "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
+    )
+    shift_label = None
+    pure_draft_prefix_len = None
+    gru_hidden_dim = None
+    emb_dim = None
+    if projector_type == "domino":
+        shift_label = dflash_cfg.get(
+            "shift_label", _cfg_get(draft_hf_config, "shift_label", None)
+        )
+        pure_draft_prefix_len = _parse_optional_int(
+            dflash_cfg.get(
+                "pure_draft_prefix_len",
+                _cfg_get(draft_hf_config, "pure_draft_prefix_len", None),
+            ),
+            field_name="DFLASH Domino pure_draft_prefix_len",
+            min_value=0,
+        )
+        gru_hidden_dim = _parse_optional_int(
+            dflash_cfg.get(
+                "gru_hidden_dim", _cfg_get(draft_hf_config, "gru_hidden_dim", None)
+            ),
+            field_name="DFLASH Domino gru_hidden_dim",
+            min_value=1,
+        )
+        nested_emb_dim = _parse_optional_int(
+            dflash_cfg.get("emb_dim", None),
+            field_name="DFLASH Domino dflash_config.emb_dim",
+            min_value=1,
+        )
+        top_level_emb_dim = _parse_optional_int(
+            _cfg_get(draft_hf_config, "emb_dim", None),
+            field_name="DFLASH Domino top-level emb_dim",
+            min_value=1,
+        )
+        if (
+            nested_emb_dim is not None
+            and top_level_emb_dim is not None
+            and nested_emb_dim != top_level_emb_dim
+        ):
+            raise ValueError(
+                "DFLASH Domino emb_dim differs between dflash_config and the "
+                f"top-level config: {nested_emb_dim} != {top_level_emb_dim}."
+            )
+        emb_dim = nested_emb_dim if nested_emb_dim is not None else top_level_emb_dim
+
+        if not isinstance(shift_label, bool):
+            raise ValueError(
+                "DFLASH Domino requires dflash_config.shift_label to be a bool, "
+                f"got {shift_label!r}."
+            )
+        if pure_draft_prefix_len != 1:
+            raise ValueError(
+                "DFLASH Domino currently requires pure_draft_prefix_len=1, "
+                f"got {pure_draft_prefix_len!r}."
+            )
+        if gru_hidden_dim is None:
+            raise ValueError("DFLASH Domino requires dflash_config.gru_hidden_dim.")
+        if emb_dim is None:
+            raise ValueError("DFLASH Domino requires dflash_config.emb_dim.")
+        if block_size is not None and block_size <= 1:
+            raise ValueError(
+                f"DFLASH Domino requires block_size > 1, got {block_size}."
+            )
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -711,6 +787,11 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        projector_type=projector_type,
+        shift_label=shift_label,
+        pure_draft_prefix_len=pure_draft_prefix_len,
+        gru_hidden_dim=gru_hidden_dim,
+        emb_dim=emb_dim,
     )
 
 
@@ -893,8 +974,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape
@@ -914,54 +994,30 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-
         threshold_single = get_spec().speculative_accept_threshold_single
     if threshold_acc is None:
-
         threshold_acc = get_spec().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
     device = next_token_logits.device
 
-    if uniform_samples is None:
-        uniform_samples = torch.rand(
-            (bs, draft_token_num), dtype=torch.float32, device=device
+    if uniform_samples is not None and uniform_samples.shape != (bs, draft_token_num):
+        raise ValueError(
+            "uniform_samples shape mismatch. "
+            f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
         )
-    else:
-        if uniform_samples.shape != (bs, draft_token_num):
-            raise ValueError(
-                "uniform_samples shape mismatch. "
-                f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
-            )
-        uniform_samples = uniform_samples.to(device=device, dtype=torch.float32)
-
-    if uniform_samples_for_final_sampling is None:
-        uniform_samples_for_final_sampling = torch.rand(
-            (bs,), dtype=torch.float32, device=device
-        )
-    else:
-        if uniform_samples_for_final_sampling.shape != (bs,):
-            raise ValueError(
-                "uniform_samples_for_final_sampling shape mismatch. "
-                f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
-            )
-        uniform_samples_for_final_sampling = uniform_samples_for_final_sampling.to(
-            device=device,
-            dtype=torch.float32,
+    if (
+        uniform_samples_for_final_sampling is not None
+        and uniform_samples_for_final_sampling.shape != (bs,)
+    ):
+        raise ValueError(
+            "uniform_samples_for_final_sampling shape mismatch. "
+            f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
         )
 
-    target_probs = build_dflash_verify_target_probs(
-        next_token_logits=next_token_logits,
-        sampling_info=sampling_info,
-        draft_token_num=draft_token_num,
-        bs=bs,
-        max_top_k=max_top_k,
-        uniform_top_k_value=uniform_top_k_value,
-        use_sparse_topk=use_sparse_topk,
-    )
-    draft_probs = torch.zeros_like(target_probs)
-
+    # Cached across steps, and `correct_len` below aliases `accept_token_num`,
+    # so these must predate the borrow scope the next replay reclaims.
     (
         retrieve_index,
         retrieve_next_token,
@@ -974,25 +1030,59 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         draft_token_num=draft_token_num,
         device=device,
     )
-    candidates_i64 = (
-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
-    )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
+
+    # The full-vocabulary matrices die with this step, so their bytes may come
+    # from the graph pool's idle storage. Anything outliving the scope is not.
+    with borrow_graph_pool(user="DFLASH verify probabilities"):
+        if uniform_samples is None:
+            coins = torch.rand(
+                (bs, draft_token_num), dtype=torch.float32, device=device
+            )
+        else:
+            coins = uniform_samples.to(device=device, dtype=torch.float32)
+        if uniform_samples_for_final_sampling is None:
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
+        else:
+            coins_for_final_sampling = uniform_samples_for_final_sampling.to(
+                device=device,
+                dtype=torch.float32,
+            )
+
+        target_probs = build_dflash_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+            bs=bs,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+            use_sparse_topk=use_sparse_topk,
+        )
+        draft_probs = torch.zeros_like(target_probs)
+        candidates_i64 = (
+            candidates
+            if candidates.dtype == torch.int64
+            else candidates.to(torch.int64)
+        )
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+        )
+        del target_probs, draft_probs, candidates_i64
+        del coins, coins_for_final_sampling
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)

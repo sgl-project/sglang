@@ -828,6 +828,28 @@ class CommonKVManager(BaseKVManager):
             "prefill_http_port": get_serving().port,
         }
 
+        if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
+            topology_rows = get_world_group().all_gather_object(payload)
+            # Every scheduler contributes a topology row. Only the scheduler
+            # ranks that own a Rust listener populate their local registry.
+            if self.kv_args.rust_http_port is None:
+                return
+            registry_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(
+                self.bootstrap_host, self.bootstrap_host
+            )
+            registry = NetworkAddress(registry_host, self.kv_args.rust_http_port)
+            url = f"{registry.to_url()}/route"
+            for topology_row in topology_rows:
+                registry_row = {
+                    **topology_row,
+                    "prefill_http_port": self.kv_args.rust_http_port,
+                }
+                self._register_topology_row(url, registry_row)
+            return
+
+        self._register_topology_row(url, payload)
+
+    def _register_topology_row(self, url: str, payload: Dict) -> None:
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         for attempt in range(max_retries):
             try:
@@ -950,10 +972,8 @@ class CommonKVManager(BaseKVManager):
 
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:
-            # Compressed-MLA (e.g. DeepSeek V4): the flat list is organized
-            # by buffer type (compression-ratio bucket) rather than by
-            # layer, so we locate the sub-range for this PP stage inside each
-            # section of the dst flat list.
+            # Compressed-MLA pointers are grouped by buffer type;
+            # each group needs its own PP-stage slice.
             sliced_src_kv_ptrs, sliced_dst_kv_ptrs = self._mla_slice_ptrs_for_pp(
                 src_kv_ptrs, dst_kv_ptrs, mla_ratios, state_type
             )
@@ -977,42 +997,16 @@ class CommonKVManager(BaseKVManager):
         mla_ratios: List[int],
         state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int]]:
-        """Produce aligned (src, dst) pointer lists for compressed-MLA
-        pools (e.g. DeepSeek V4) under PP.
-
-        The pool produces two possible flat-list layouts (selected via dst
-        length):
-
-        - kv_data layout, length = 2 * c4_L + c128_L:
-            [c4_layer_{0..c4_L-1},
-             c4_indexer_layer_{0..c4_L-1},
-             c128_layer_{0..c128_L-1}]
-          Each section is indexed by compressed-layer id within that
-          compression bucket.
-
-        - SWA state_data layout, length = swa_L + 2 * c4_L:
-            [swa_layer_{0..swa_L-1},
-             c4_compress_state_{0..c4_L-1},
-             c4_indexer_compress_state_{0..c4_L-1}]
-          ``swa_L`` is the SWA pool's actual buffer count
-          (``num_effective_layers``), which can be smaller than
-          ``len(mla_ratios)`` when the HF config's ``compress_ratios``
-          list contains entries for layers not materialized into the SWA
-          pool (e.g. an MTP/nextn slot at the tail).
-
-        - C128_STATE layout, length = c128_L:
-            [c128_compress_state_{0..c128_L-1}]
-
-        src is already PP-filtered on the prefill side. dst is the
-        decode-side full-model list (when decode is PP=1). We slice dst to
-        match src's PP stage. If src itself is also full-model, it is
-        returned unchanged.
-        """
+        # Match the pool's flat buffer order, with layers grouped by ratio:
+        # KV: [C4 KV, C4 indexer KV, C128 KV].
+        # SWA state: [SWA KV, C4 compressor state, C4 indexer state].
+        # DSV4_REQUEST_STATE: [C128 compressor state]; SWA_RING: [SWA rings].
+        # Prefill src is stage-local; decode dst may cover the full model.
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert (
-            end_layer is not None
-        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        end_layer = self.kv_args.prefill_end_layer
+        assert end_layer is not None, (
+            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        )
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1023,7 +1017,7 @@ class CommonKVManager(BaseKVManager):
         c128_off_s = sum(1 for r in mla_ratios[:start_layer] if r == 128)
         c128_off_e = sum(1 for r in mla_ratios[:end_layer] if r == 128)
 
-        if state_type == StateType.C128_STATE:
+        if state_type == StateType.DSV4_REQUEST_STATE:
             return src_kv_ptrs, list(dst_kv_ptrs[c128_off_s:c128_off_e])
 
         if state_type == StateType.SWA_RING:
@@ -1032,7 +1026,8 @@ class CommonKVManager(BaseKVManager):
             return src_kv_ptrs, list(dst_kv_ptrs[swa_s:swa_e])
 
         if (
-            state_type not in (StateType.SWA, StateType.SWA_RING, StateType.C128_STATE)
+            state_type
+            not in (StateType.SWA, StateType.SWA_RING, StateType.DSV4_REQUEST_STATE)
             and len(dst_kv_ptrs) == kv_layout_len
         ):
             sliced_dst = (
@@ -1042,11 +1037,8 @@ class CommonKVManager(BaseKVManager):
             )
             return src_kv_ptrs, sliced_dst
 
-        # SWA state-data layout. ``swa_L`` is derived from the actual dst
-        # length so we tolerate cases where the SWA pool has fewer buffers
-        # than ``len(mla_ratios)`` (e.g. nextn padding). C128 state ships as
-        # a separate StateType.C128_STATE component and must not be counted
-        # here.
+        # SWA may omit nextn entries present in mla_ratios; use its buffer count.
+        # C128 state ships separately as DSV4_REQUEST_STATE.
         swa_L = len(dst_kv_ptrs) - 2 * c4_full
         if swa_L < 0 or swa_L > len(mla_ratios):
             raise ValueError(
@@ -1066,8 +1058,7 @@ class CommonKVManager(BaseKVManager):
             list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
-                    compress_section_start
-                    + c4_off_s : compress_section_start
+                    compress_section_start + c4_off_s : compress_section_start
                     + c4_off_e
                 ]
             )
