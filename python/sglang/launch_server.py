@@ -27,9 +27,8 @@ def run_server(server_args):
     # exist yet; resolution only folds `--grpc-mode` INTO `smg_grpc_mode`, so
     # checking both covers it.
     if (
-        (server_args.smg_grpc_mode or server_args.grpc_mode)
-        and server_args.tokenizer_path is None
-    ):
+        server_args.smg_grpc_mode or server_args.grpc_mode
+    ) and server_args.tokenizer_path is None:
         server_args.tokenizer_path = server_args.model_path
 
     # The flags dispatched on below are decided by resolution (`--grpc-mode`
