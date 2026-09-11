@@ -1263,6 +1263,9 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        # Opt-in, per-prefill-pass diagnostic: log what each scheduling pass
+        # admitted. Cached here because this is read on every prefill pass.
+        self.log_schedule_decisions = get_observability().log_schedule_decisions
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -3700,6 +3703,24 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _log_schedule_decision(
+        self,
+        can_run_list: List[Req],
+        running_batch: ScheduleBatch,
+        adder: PrefillAdder,
+    ) -> None:
+        # KV budget this pass saw: free now plus what eviction could reclaim.
+        pool_stats = self.pool_stats_observer.get_pool_stats()
+        logger.info(
+            f"Schedule prefill: #picked={len(can_run_list)}, "
+            f"#left-in-queue={len(self.waiting_queue)}, "
+            f"#running={len(running_batch.reqs)}, "
+            f"#preempted={len(adder.preempt_list)}, "
+            f"kv-free-tokens={pool_stats.full_available_size}, "
+            f"kv-evictable-tokens={pool_stats.full_evictable_size}, "
+            f"picked-rids={[req.rid for req in can_run_list]}"
+        )
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3939,6 +3960,10 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # A pass that admitted nothing while the queue is non-empty is the
+            # most diagnostic event for head-of-line blocking, so log it too.
+            if self.log_schedule_decisions:
+                self._log_schedule_decision(can_run_list, running_batch, adder)
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -3946,6 +3971,11 @@ class Scheduler(
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+
+        # Logged after the preemption re-queue above so that #left-in-queue
+        # reflects the queue the next pass will actually see.
+        if self.log_schedule_decisions:
+            self._log_schedule_decision(can_run_list, running_batch, adder)
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill
@@ -5731,8 +5761,11 @@ def configure_scheduler_process(
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
 
-    # Configure the logger
-    configure_logger(server_args, prefix=prefix)
+    # Configure the logger. Append the OS pid so every scheduler log line
+    # identifies which subprocess emitted it. Kept out of the proctitle above,
+    # since ps already shows the pid there. Note: debug_utils/log_parser.py
+    # parses this prefix and has a matching optional PID group.
+    configure_logger(server_args, prefix=f"{prefix} PID{os.getpid()}")
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
