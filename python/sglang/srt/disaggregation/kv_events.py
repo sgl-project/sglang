@@ -19,8 +19,8 @@ KV caching events
 
 import atexit
 import enum
-import logging
 import json
+import logging
 import queue
 import threading
 import time
@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 import msgspec
 import zmq
 from pydantic import BaseModel, ConfigDict, ValidationError
-
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -547,7 +546,9 @@ class ZmqEventPublisher(EventPublisher):
         if worker_id and snapshot_endpoint:
             from sglang.srt.disaggregation.load_reporter import LoadReporter
 
-            self.load_reporter = LoadReporter(namespace, worker_id, self._dp_rank, self._epoch)
+            self.load_reporter = LoadReporter(
+                namespace, worker_id, self._dp_rank, self._epoch
+            )
         self._topic_bytes = topic.encode("utf-8")
         # Preserve the exact legacy topic when snapshots are disabled. A
         # snapshot-capable publisher appends backward-compatible metadata to
@@ -780,7 +781,11 @@ class ZmqEventPublisher(EventPublisher):
                 for block_hash in event.block_hashes:
                     self._snapshot_blocks.pop(block_hash, None)
                     self._snapshot_blocks_v2.pop(
-                        (self._namespace, block_hash, self._placement_tier(event.medium)),
+                        (
+                            self._namespace,
+                            block_hash,
+                            self._placement_tier(event.medium),
+                        ),
                         None,
                     )
             elif isinstance(event, AllBlocksCleared):
@@ -877,12 +882,18 @@ class ZmqEventPublisher(EventPublisher):
                 if not sock.poll(100):
                     continue
                 frames = sock.recv_multipart()
-                if len(frames) == 4 and frames[1] == b"" and frames[2] == b"start-reporting-v1":
+                if (
+                    len(frames) == 4
+                    and frames[1] == b""
+                    and frames[2] == b"start-reporting-v1"
+                ):
                     try:
                         if self.load_reporter is None:
                             raise ValueError("load reporting requires worker_id")
                         identity = self.load_reporter.register(**json.loads(frames[3]))
-                        sock.send_multipart((frames[0], b"", b"registered", encoder.encode(identity)))
+                        sock.send_multipart(
+                            (frames[0], b"", b"registered", encoder.encode(identity))
+                        )
                     except Exception as exc:
                         self._send_snapshot_error(sock, frames[0], str(exc).encode())
                     continue

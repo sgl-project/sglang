@@ -40,6 +40,13 @@
 - 实测：单独运行 `test_router_random_failover_all_down_restart_and_membership`，1 passed（15.51s）。实际 Router/Bridge/Indexer 进程、生产 Reporter/Publisher、模拟推理响应：两副本随机使用、单副本 kill、全部 kill 时 fresh min-load、重启缓存恢复、新副本加入、旧副本移除、空列表及坏配置保留。
 - 实测：Worker KV/Reporter/LoadStat/idle 路径回归，62 passed、41 subtests passed。Reporter 双 target 租约、旧测量不重发、generation 验证通过。
 - GPU 环境：两张 A10 的大部分显存被既有 PID 83601 的 TP=2 Qwen2.5-7B 服务占用。未终止该服务，已询问是否可以暂停；并继续准备小型真实 Worker 验证，避免模拟响应代替推理验收。
+- 原生 Worker 集成：Scheduler 向 Publisher 提供真实 model/page size/bigram；Unified Cache 发出 FULL/SWA/MAMBA 每页驻留状态，覆盖 auxiliary eviction、load-back、host 写入与 Mamba 边界。Reporter 接入 Scheduler 的实际负载采样；补全 grpcio/Protobuf 运行时依赖和注册错误响应测试。
+- 实测：相关 Python 单元测试 63 passed、41 subtests passed（14.26s）；`test_unified_radix_cache_unittest.py -k KVEvents`，9 passed、2 subtests passed（7.12s），包括真实 GPU Unified Cache 的 SWA/Mamba component 更新。
+- 扩大回归时运行了整个 Unified Cache 文件（约 2573 个参数化用例），进程在约 17% 时 exit 139，没有完整结果。尚未定位，不能声称整个缓存后端矩阵通过；随后本次修改直接涉及的 KVEvents 选择集独立复跑通过。保留为明确验证限制，不把失败隐去。
+- 真实 GPU 集成实测：`KV_REPLICA_GPU_TESTS=1 PYTHONPATH=python .venv/bin/python -m pytest experimental/sgl-router/sgl-kv-indexer/tests/test_replica_processes.py -k real_two_gpu -q`，1 passed（41.66s）。两个真实 SGLang CUDA Worker 使用小型随机初始化 Qwen2，预热缓存早于 Indexer 启动；两副本都从 snapshot 找到原有 prefix，真实 Router 完成正常、单副本故障、全部故障、重启、扩缩容后的推理。不是质量或性能测试。原有 7B 服务未停止。
+- GPU 首轮测试修正：5 秒 HTTP 预热超时不足以等待首次 kernel 编译，单独将推理超时设为 120 秒；Router tokenizer 参数须指向 `tokenizer.json` 文件而不是目录。最终副本 RPC 仍是 1 秒断言超时，生产 Router query deadline 不变。
+- GPU Router 最终指标：complete queries=16、fallback queries=4、failed attempts=10；请求日志验证故障期间 HTTP 200，恢复后使用新副本。原始日志位于 `/tmp/pytest-of-root/pytest-8/test_real_two_gpu_workers_rout0/`，XML 摘要 `/tmp/kv-rebuild-gpu.xml`。
+- 扩展进程测试：3 passed、1 GPU-opt-in skipped（32.02s）；覆盖尾事件丢失且没有后续 PUB 时的 Replay 修复、暂停单 Indexer 触发本地 Bridge overflow/恢复、另一副本持续更新、Worker 热加入、第二 Router 独立注册并共享副本。XML 摘要 `/tmp/kv-rebuild-process.xml`。
 
 ## 验收证据
 

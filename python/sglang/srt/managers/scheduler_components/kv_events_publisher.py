@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import (
@@ -11,7 +12,6 @@ from typing import (
 
 import msgspec
 import zmq
-
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
@@ -57,6 +57,7 @@ class SchedulerKvEventsPublisher:
     get_stats: Callable
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
+    model: str = ""
 
     def __post_init__(self) -> None:
         self.init_kv_events(self.kv_events_config)
@@ -65,6 +66,51 @@ class SchedulerKvEventsPublisher:
         self.enable_kv_cache_events = is_kv_publisher_rank(kv_events_config, self.ps)
 
         if self.enable_kv_cache_events:
+            config = json.loads(kv_events_config)
+            components = getattr(self.tree_cache, "tree_components", ())
+            if (
+                config.get("publisher") == "zmq"
+                and config.get("snapshot_endpoint")
+                and config.get("worker_id")
+            ):
+                core = getattr(self.tree_cache, "tree_core", self.tree_cache)
+                recorder = getattr(core, "kv_events", None)
+                if recorder is not None:
+                    config["page_size"] = recorder.page_size
+                config["model"] = config.get("model") or self.model
+                config["is_bigram"] = bool(getattr(self.tree_cache, "is_eagle", False))
+                kv_events_config = json.dumps(config)
+            if (
+                config.get("publisher") == "zmq"
+                and config.get("snapshot_endpoint")
+                and config.get("worker_id")
+                and len(components) > 1
+            ):
+                names = {str(component) for component in components}
+                supported = names <= {"full", "swa", "mamba"}
+                # Python UnifiedTreeCore emits the component residency updates.
+                # Alternative cores must provide the same contract before they
+                # can advertise a queryable v1 component spec.
+                python_core = (
+                    type(getattr(self.tree_cache, "tree_core", None)).__name__
+                    == "UnifiedTreeCore"
+                )
+                if supported and python_core:
+                    self.tree_cache.tree_core.kv_events.component_aware = True
+                config["cache_spec"] = {
+                    "version": 1 if supported and python_core else 2,
+                    "components": sum(
+                        {"full": 1, "swa": 2, "mamba": 4}.get(name, 0) for name in names
+                    ),
+                    "swa_window_tokens": getattr(
+                        self.tree_cache, "_sliding_window_size", 0
+                    )
+                    or 0,
+                    "full_tier_mask": 6,
+                    "swa_tier_mask": 6,
+                    "mamba_tier_mask": 6,
+                }
+                kv_events_config = json.dumps(config)
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config,
                 select_kv_publisher_dp_rank(

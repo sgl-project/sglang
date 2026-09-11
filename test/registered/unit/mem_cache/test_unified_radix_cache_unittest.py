@@ -14,9 +14,6 @@ from typing import Optional
 from unittest import mock
 
 import torch
-from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
-from unified_tree_core_inspector import UnifiedTreeCoreInspector
-
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
@@ -103,6 +100,8 @@ from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
+from unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
@@ -999,6 +998,46 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+
+    def test_snapshot_v2_tracks_auxiliary_eviction_and_mamba_boundaries(self):
+        from sglang.srt.disaggregation.kv_events import KVEventBatch, ZmqEventPublisher
+
+        for auxiliary in (ComponentType.SWA, ComponentType.MAMBA):
+            with self.subTest(auxiliary=auxiliary):
+                cfg = replace(
+                    self.cfg,
+                    page_size=1,
+                    components=(ComponentType.FULL, auxiliary),
+                    sliding_window_size=4 if auxiliary == ComponentType.SWA else None,
+                )
+                cache, allocator, pool = build_fixture(cfg, enable_kv_cache_events=True)
+                cache.tree_core.kv_events.component_aware = True
+                cache.take_events()
+                TestUnifiedRadixAllocationEvictionRealComponents._insert(
+                    self, cache, allocator, pool, [1, 2, 3, 4]
+                )
+                mirror = ZmqEventPublisher.__new__(ZmqEventPublisher)
+                mirror._namespace = "test"
+                mirror._snapshot_blocks = {}
+                mirror._snapshot_blocks_v2 = {}
+                mirror._apply_snapshot_events(
+                    KVEventBatch(ts=0, events=cache.take_events())
+                )
+                blocks = list(mirror._snapshot_blocks_v2.values())
+                self.assertEqual(len(blocks), 4)
+                if auxiliary == ComponentType.SWA:
+                    self.assertEqual([b.component_mask for b in blocks], [3, 3, 3, 3])
+                    cache.evict(EvictParams(swa_num_tokens=4))
+                else:
+                    self.assertEqual([b.component_mask for b in blocks], [1, 1, 1, 5])
+                    cache.evict(EvictParams(mamba_num=1))
+                mirror._apply_snapshot_events(
+                    KVEventBatch(ts=0, events=cache.take_events())
+                )
+                # The eviction policy may also drop FULL. Every surviving
+                # placement must accurately show that the auxiliary is gone.
+                for block in mirror._snapshot_blocks_v2.values():
+                    self.assertEqual(block.component_mask, 1)
 
     def _insert(
         self,

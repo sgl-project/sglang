@@ -6,7 +6,6 @@ import uuid
 
 import msgspec
 import zmq
-
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
@@ -79,9 +78,13 @@ class TestSnapshotV2(unittest.TestCase):
         return header, blocks
 
     def test_tiers_components_and_current_state(self):
-        self.send(self.store("GPU", ["full", "swa"]), self.store("CPU_PINNED", ["full"]))
+        self.send(
+            self.store("GPU", ["full", "swa"]), self.store("CPU_PINNED", ["full"])
+        )
         header, blocks = self.cut()
-        self.assertEqual({(b["tier"], b["component_mask"]) for b in blocks}, {(1, 3), (2, 1)})
+        self.assertEqual(
+            {(b["tier"], b["component_mask"]) for b in blocks}, {(1, 3), (2, 1)}
+        )
         self.assertEqual(header["worker_id"], "worker-a")
         self.assertEqual(header["namespace"], "model-a")
         self.assertEqual(header["model"], "test-model")

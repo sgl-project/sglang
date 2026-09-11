@@ -2213,9 +2213,13 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
         "dp_size": resolved.dp_size,
         "namespace": cfg.namespace,
         "worker_id": cfg.worker_id,
-        "model": cfg.model,
+        "model": cfg.model
+        or getattr(resolved, "served_model_name", None)
+        or getattr(resolved, "model_path", ""),
         "hash_schema_version": cfg.hash_schema_version,
-        "is_bigram": cfg.is_bigram,
+        "is_bigram": cfg.is_bigram
+        or str(getattr(resolved, "speculative_algorithm", "")).upper()
+        in ("EAGLE", "EAGLE3", "FROZEN_KV_MTP"),
         "snapshot_versions": [1, 2],
     }
     resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)

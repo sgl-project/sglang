@@ -18,13 +18,14 @@ consumed by KV-aware routers (e.g. dynamo). A cache holds one recorder and calls
 it; the recorder owns the queue and needs nothing back from its owner.
 """
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
     BlockStoredMetadata,
+    BlockStoredWithComponents,
     BlockStoredWithMetadata,
     StorageMedium,
 )
@@ -45,6 +46,7 @@ class KVCacheEventRecorder:
     def __init__(self, *, enabled: bool, page_size: int):
         self.enabled = enabled
         self.page_size = page_size
+        self.component_aware = False
         self._queue: list = []
 
     def enqueue(self, event) -> None:
@@ -63,19 +65,15 @@ class KVCacheEventRecorder:
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
-                tail_metadata = (
-                    tail.metadata if isinstance(tail, BlockStoredWithMetadata) else None
-                )
-                event_metadata = (
-                    event.metadata
-                    if isinstance(event, BlockStoredWithMetadata)
-                    else None
-                )
+                tail_metadata = getattr(tail, "metadata", None)
+                event_metadata = getattr(event, "metadata", None)
                 if (
                     tail.medium == event.medium
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail_metadata == event_metadata
+                    and getattr(tail, "component_types", None)
+                    == getattr(event, "component_types", None)
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
@@ -112,7 +110,12 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
-    def record_store(self, node: Any, medium=None) -> None:
+    def record_store(
+        self,
+        node: Any,
+        medium=None,
+        component_types_for_page: Optional[Callable[[int, int], list[str]]] = None,
+    ) -> None:
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
         # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
@@ -148,7 +151,19 @@ class KVCacheEventRecorder:
                 "lora_id": None,
                 "medium": medium,
             }
-            if node.key.cache_salt is None:
+            if component_types_for_page is not None:
+                components = component_types_for_page(start, end)
+                if components:
+                    event = BlockStoredWithComponents(
+                        **event_args,
+                        component_types=components,
+                        metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt)
+                        if node.key.cache_salt is not None
+                        else None,
+                    )
+                else:
+                    event = BlockRemoved(block_hashes=[block_hash], medium=medium)
+            elif node.key.cache_salt is None:
                 event = BlockStored(**event_args)
             else:
                 event = BlockStoredWithMetadata(

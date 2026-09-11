@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import zmq
-
 from sglang.srt.disaggregation.kv_events import (
     LOAD_TOPIC,
     KVEventsConfig,

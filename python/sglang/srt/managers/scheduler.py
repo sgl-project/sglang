@@ -2385,6 +2385,7 @@ class Scheduler(
             max_running_requests=self.max_running_requests,
             max_total_num_tokens=self.max_total_num_tokens,
             get_stats=lambda: self.metrics_reporter.stats,
+            model=get_serving().served_model_name or get_serving().model_path,
         )
 
     def init_load_publisher(self) -> None:
@@ -2397,6 +2398,9 @@ class Scheduler(
             ps=self.ps,
             load_publish_endpoint=get_observability().load_publish_endpoint,
             publish_interval=get_observability().load_snapshot_publish_interval,
+            reporter=getattr(
+                self.kv_events_publisher.kv_event_publisher, "load_reporter", None
+            ),
         )
 
     def init_load_inquirer(self) -> None:
