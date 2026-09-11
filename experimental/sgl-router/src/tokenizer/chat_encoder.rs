@@ -37,10 +37,18 @@ pub struct ChatEncoder {
 }
 
 impl ChatEncoder {
-    /// HF Jinja template from `tokenizer_config.json`; `Ok(None)` when it ships none.
-    pub fn from_tokenizer_config(cfg: &serde_json::Value) -> Result<Option<Self>> {
+    /// HF Jinja template from `tokenizer_config.json`, overridden by a sibling
+    /// `chat_template.jinja` when present (transformers' precedence); `Ok(None)`
+    /// when the model ships neither.
+    pub fn from_tokenizer_config(
+        cfg: &serde_json::Value,
+        chat_template_jinja: Option<&str>,
+    ) -> Result<Option<Self>> {
         let mut cfg = cfg.clone();
-        let defaults = SPECIAL_TOKEN_KEYS
+        if let Some(template) = chat_template_jinja {
+            cfg["chat_template"] = template.into();
+        }
+        let mut defaults: ChatTemplateKwargs = SPECIAL_TOKEN_KEYS
             .into_iter()
             .map(|key| {
                 let token = cfg[key]
@@ -55,6 +63,12 @@ impl ChatEncoder {
                 (key.to_owned(), token.into())
             })
             .collect();
+        if let Some(extra) = cfg
+            .get("additional_special_tokens")
+            .filter(|v| v.is_array())
+        {
+            defaults.insert("additional_special_tokens".into(), extra.clone());
+        }
         // HF's `[{name, template}]` list form -> Dynamo's `[{name: template}]`.
         for entry in cfg["chat_template"].as_array_mut().into_iter().flatten() {
             if let (Some(name), Some(template)) =
@@ -87,8 +101,12 @@ impl ChatEncoder {
         let name = model_id.rsplit('/').next().unwrap_or(model_id);
         let formatter =
             native_formatter_for(&model_type.map(str::to_lowercase), &name.to_lowercase())?;
-        // Engine default is chat mode (`SGLANG_DEFAULT_THINKING=false`); Dynamo's is thinking.
-        let defaults = HashMap::from([("thinking".into(), false.into())]);
+        // Engine defaults: chat mode (`SGLANG_DEFAULT_THINKING=false`) and no
+        // reasoning-effort preamble; Dynamo defaults to thinking at high effort.
+        let defaults = HashMap::from([
+            ("thinking".into(), false.into()),
+            ("reasoning_effort".into(), "low".into()),
+        ]);
         Some(Self {
             formatter,
             defaults,
@@ -99,6 +117,11 @@ impl ChatEncoder {
     /// the prompt text the engine tokenizes, with `add_generation_prompt = true`.
     pub fn render(&self, request: &serde_json::Value) -> Result<String> {
         let mut kwargs = self.defaults.clone();
+        // The engine folds the top-level `reasoning_effort` into the template
+        // kwargs, with explicit `chat_template_kwargs` winning.
+        if let Some(effort) = request.get("reasoning_effort").filter(|v| !v.is_null()) {
+            kwargs.insert("reasoning_effort".into(), effort.clone());
+        }
         if let Some(extra) = request
             .get("chat_template_kwargs")
             .and_then(|v| v.as_object())
@@ -117,6 +140,40 @@ struct ChatRequest<'a> {
     kwargs: ChatTemplateKwargs,
 }
 
+/// Message fields the engine's request schema keeps for non-user roles.
+const GENERIC_MESSAGE_KEYS: [&str; 7] = [
+    "role",
+    "content",
+    "tool_call_id",
+    "name",
+    "reasoning_content",
+    "tool_calls",
+    "tools",
+];
+
+/// Reshape a message the way the engine's pydantic schema does before it
+/// reaches the template: lowercase the role, drop unknown and null fields
+/// (a user message keeps only `role` and `content`), and default a missing
+/// `content` to `""`.
+fn engine_message(message: &serde_json::Value) -> serde_json::Value {
+    let role = message["role"].as_str().unwrap_or_default().to_lowercase();
+    let mut out = serde_json::Map::new();
+    if role != "user" {
+        for key in GENERIC_MESSAGE_KEYS {
+            if let Some(v) = message.get(key).filter(|v| !v.is_null()) {
+                out.insert(key.into(), v.clone());
+            }
+        }
+    }
+    let content = match &message["content"] {
+        serde_json::Value::Null => "".into(),
+        content => content.clone(),
+    };
+    out.insert("role".into(), role.into());
+    out.insert("content".into(), content);
+    out.into()
+}
+
 impl OAIChatLikeRequest for ChatRequest<'_> {
     fn model(&self) -> String {
         self.request["model"]
@@ -125,7 +182,11 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
             .to_owned()
     }
     fn messages(&self) -> Value {
-        Value::from_serialize(&self.request["messages"])
+        let messages: Vec<_> = self.request["messages"]
+            .as_array()
+            .map(|m| m.iter().map(engine_message).collect())
+            .unwrap_or_default();
+        Value::from_serialize(&messages)
     }
     fn tools(&self) -> Option<Value> {
         may_be_fix_tool_schema(self.request.get("tools")?.clone())
@@ -146,7 +207,7 @@ mod tests {
     const SIMPLE_TEMPLATE: &str = "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>\n{{ m['content'] }}<|end|>\n{% endfor %}{% if add_generation_prompt %}<|assistant|>\n{% endif %}";
 
     fn jinja(cfg: serde_json::Value) -> ChatEncoder {
-        ChatEncoder::from_tokenizer_config(&cfg)
+        ChatEncoder::from_tokenizer_config(&cfg, None)
             .unwrap()
             .expect("config has a chat_template")
     }
@@ -162,7 +223,54 @@ mod tests {
     #[test]
     fn no_chat_template_returns_none() {
         let cfg = json!({"bos_token": "<s>", "eos_token": "</s>"});
-        assert!(ChatEncoder::from_tokenizer_config(&cfg).unwrap().is_none());
+        assert!(ChatEncoder::from_tokenizer_config(&cfg, None)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A sibling `chat_template.jinja` wins over `tokenizer_config.json`, as in
+    /// transformers, and suffices on its own.
+    #[test]
+    fn chat_template_jinja_file_takes_precedence() {
+        let cfg = json!({"chat_template": "CONFIG"});
+        let enc = ChatEncoder::from_tokenizer_config(&cfg, Some("FILE"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(enc.render(&request(json!([]))).unwrap(), "FILE");
+        let enc = ChatEncoder::from_tokenizer_config(&json!({}), Some("FILE"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(enc.render(&request(json!([]))).unwrap(), "FILE");
+    }
+
+    /// Messages reach the template shaped like the engine's pydantic dump:
+    /// lowercase role, no unknown or null fields, `content` defaulting to "".
+    #[test]
+    fn messages_match_engine_schema() {
+        let enc = jinja(json!({"chat_template": "{{ messages | tojson }}"}));
+        let out = enc
+            .render(&request(json!([
+                {"role": "User", "content": "hi", "name": "bob", "extra": 1},
+                {"role": "assistant", "name": "a", "tool_calls": null, "tool_call_id": "c1"}
+            ])))
+            .unwrap();
+        let rendered: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            rendered,
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "name": "a", "tool_call_id": "c1"}
+            ])
+        );
+    }
+
+    #[test]
+    fn additional_special_tokens_are_supplied() {
+        let enc = jinja(json!({
+            "chat_template": "{{ additional_special_tokens | join(',') }}",
+            "additional_special_tokens": ["<a>", "<b>"]
+        }));
+        assert_eq!(enc.render(&request(json!([]))).unwrap(), "<a>,<b>");
     }
 
     #[test]

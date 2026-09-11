@@ -69,15 +69,12 @@ fn download_repo_file(repo_id: &str, file: &str) -> Result<std::path::PathBuf> {
         .with_context(|| format!("download {file} for HuggingFace repo {repo_id:?}"))
 }
 
-/// Load the JSON `file` co-located with the tokenizer named by `source` (the
+/// Resolve the `file` co-located with the tokenizer named by `source` (the
 /// same value passed to [`load`]): a sibling of a local `tokenizer.json`, or a
-/// download from the same HF repo. `Ok(None)` when the model ships no such file.
-pub fn load_sibling_json(source: &str, file: &str) -> Result<Option<serde_json::Value>> {
+/// download from the same HF repo. `None` when the model ships no such file.
+fn sibling_path(source: &str, file: &str) -> Option<std::path::PathBuf> {
     let path = if Path::new(source).is_file() || looks_like_path(source) {
-        match Path::new(source).parent() {
-            Some(dir) => dir.join(file),
-            None => return Ok(None),
-        }
+        Path::new(source).parent()?.join(file)
     } else {
         // The download error does not distinguish a benign 404 from auth or
         // network failures, so warn with the cause rather than hiding it.
@@ -87,17 +84,25 @@ pub fn load_sibling_json(source: &str, file: &str) -> Result<Option<serde_json::
                 tracing::warn!(repo = %source, %file, error = %e,
                     "could not download; chat-encoder detection may be degraded for this model \
                      (expected if the repo ships none, otherwise check HF_TOKEN / network)");
-                return Ok(None);
+                return None;
             }
         }
     };
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .with_context(|| format!("parse {}", path.display()))
+    path.is_file().then_some(path)
+}
+
+/// Read the text `file` co-located with the tokenizer named by `source`.
+pub fn load_sibling_text(source: &str, file: &str) -> Result<Option<String>> {
+    sibling_path(source, file)
+        .map(|p| std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display())))
+        .transpose()
+}
+
+/// Parse the JSON `file` co-located with the tokenizer named by `source`.
+pub fn load_sibling_json(source: &str, file: &str) -> Result<Option<serde_json::Value>> {
+    load_sibling_text(source, file)?
+        .map(|text| serde_json::from_str(&text).with_context(|| format!("parse {file}")))
+        .transpose()
 }
 
 pub fn encode(t: &Tokenizer, text: &str) -> Result<Vec<u32>> {

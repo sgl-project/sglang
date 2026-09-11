@@ -1305,9 +1305,15 @@ fn build_outgoing_body(
 ///   * `continue_final_message: true`, or a trailing `assistant` message — the
 ///     engine rewrites/strips the final assistant turn; the encoder renders it
 ///     verbatim.
+///   * tool history (`tool` / `function` turns, `tool_calls`, `function_call`,
+///     message-level `tools`) — the engine and Dynamo normalize tool-call
+///     arguments and tool results differently.
 ///   * message-level `reasoning_content` — Dynamo may inject it into `content`
 ///     as `<think>` blocks when the HF template does not reference it, whereas
 ///     the engine leaves it separate for the template to consume or ignore.
+///   * a `system` turn after the first message, or two adjacent `user` turns —
+///     Dynamo silently reshapes these for templates that reject them, where
+///     the engine would return the template's error.
 ///
 /// NOTE: the encoder threads `chat_template_kwargs` for routing hashes, but
 /// the guard still omits them: Python's DeepSeek-V4 `reasoning_effort`
@@ -1321,17 +1327,7 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value) || request_is_multimodal(value) {
         return false;
     }
-    if value
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message
-                    .get("reasoning_content")
-                    .is_some_and(|v| !v.is_null())
-            })
-        })
-    {
+    if messages_need_engine_render(value) {
         return false;
     }
     // Fields that steer the engine's template tokenization but which the
@@ -1387,6 +1383,27 @@ fn ingress_tokenize_offload_failed(
         return false;
     }
     !request_tokens.is_some_and(|t| t.engine_equivalent)
+}
+
+/// Whether the message history carries a shape the router's render is not
+/// known to reproduce: tool history, `reasoning_content`, a non-leading
+/// `system` turn, or adjacent `user` turns (see [`input_ids_safe_to_forward`]).
+fn messages_need_engine_render(value: &serde_json::Value) -> bool {
+    let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    let role = |m: &serde_json::Value| m["role"].as_str().unwrap_or_default().to_lowercase();
+    let has = |m: &serde_json::Value, key| m.get(key).is_some_and(|v| !v.is_null());
+    messages.iter().enumerate().any(|(i, m)| {
+        let r = role(m);
+        r == "tool"
+            || r == "function"
+            || (r == "system" && i > 0)
+            || (r == "user" && i > 0 && role(&messages[i - 1]) == "user")
+            || ["tool_calls", "function_call", "tools", "reasoning_content"]
+                .iter()
+                .any(|key| has(m, key))
+    })
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -1728,6 +1745,10 @@ mod tests {
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
             serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"assistant","content":"A1","reasoning_content":"R1"},{"role":"user","content":"U2"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"ok"},{"role":"user","content":"U2"}]}),
+            serde_json::json!({"messages":[{"role":"system","content":"S","tools":[{"type":"function","function":{"name":"f"}}]},{"role":"user","content":"hi"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"system","content":"late"},{"role":"user","content":"again"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"user","content":"U2"}]}),
         ];
         for b in blockers {
             assert!(
@@ -1742,7 +1763,9 @@ mod tests {
     fn input_ids_safe_to_forward_ignores_null_and_false_fields() {
         assert!(input_ids_safe_to_forward(&serde_json::json!({
             "messages": [
-                {"role": "assistant", "content": "hello", "reasoning_content": null},
+                {"role": "system", "content": "S"},
+                {"role": "user", "content": "U1"},
+                {"role": "assistant", "content": "hello", "reasoning_content": null, "tool_calls": null},
                 {"role": "user", "content": "hi"}
             ],
             "chat_template": null,

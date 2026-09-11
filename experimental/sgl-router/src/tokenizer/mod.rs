@@ -72,29 +72,35 @@ impl TokenizerRegistry {
     }
 
     /// Pick the chat encoder for a model, logging the outcome on every branch:
-    /// the `tokenizer_config.json` template, else Dynamo's built-in encoder for
-    /// the model's `config.json` `model_type` (or id), else none.
+    /// the HF template (`chat_template.jinja` or `tokenizer_config.json`), else
+    /// Dynamo's built-in encoder for the model's `config.json` `model_type` (or
+    /// id), else none.
     fn resolve_chat_encoder(&self, model_id: &str, tokenizer_path: &str) -> Option<ChatEncoder> {
-        let load = |file| {
+        let warn = |file, e: anyhow::Error| tracing::warn!(model = %model_id, %file, error = %e, "failed to load");
+        let load_json = |file| {
             adapter::load_sibling_json(tokenizer_path, file).unwrap_or_else(|e| {
-                tracing::warn!(model = %model_id, %file, error = %e, "failed to load");
+                warn(file, e);
                 None
             })
         };
-        if let Some(cfg) = load("tokenizer_config.json") {
-            match ChatEncoder::from_tokenizer_config(&cfg) {
-                Ok(Some(encoder)) => {
-                    tracing::info!(model = %model_id,
-                        "chat-template routing enabled; chat requests route by templated tokens");
-                    return Some(encoder);
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(model = %model_id, error = %e,
-                    "failed to compile chat template; falling back to built-in detection"),
+        let cfg = load_json("tokenizer_config.json").unwrap_or_else(|| serde_json::json!({}));
+        let jinja = adapter::load_sibling_text(tokenizer_path, "chat_template.jinja")
+            .unwrap_or_else(|e| {
+                warn("chat_template.jinja", e);
+                None
+            });
+        match ChatEncoder::from_tokenizer_config(&cfg, jinja.as_deref()) {
+            Ok(Some(encoder)) => {
+                tracing::info!(model = %model_id,
+                    "chat-template routing enabled; chat requests route by templated tokens");
+                return Some(encoder);
             }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(model = %model_id, error = %e,
+                "failed to compile chat template; falling back to built-in detection"),
         }
         let model_type =
-            load("config.json").and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
+            load_json("config.json").and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
         let encoder = ChatEncoder::native(model_type.as_deref(), model_id);
         match &encoder {
             Some(_) => tracing::info!(model = %model_id, ?model_type,
@@ -169,7 +175,7 @@ impl TokenizerRegistry {
         model_id: &str,
         tokenizer_config: &serde_json::Value,
     ) {
-        let encoder = ChatEncoder::from_tokenizer_config(tokenizer_config)
+        let encoder = ChatEncoder::from_tokenizer_config(tokenizer_config, None)
             .expect("valid test chat template")
             .expect("test tokenizer_config has a chat_template");
         self.attach_chat_encoder_for_test(model_id, encoder);
