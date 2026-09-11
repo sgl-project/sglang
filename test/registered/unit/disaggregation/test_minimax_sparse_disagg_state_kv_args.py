@@ -61,6 +61,7 @@ class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
         self.assertEqual(len(kv_args.state_data_ptrs), 1)
         self.assertEqual(len(kv_args.state_data_ptrs[0]), pool.index_k_pool.layer_num)
         self.assertEqual(len(kv_args.state_item_lens[0]), pool.index_k_pool.layer_num)
+        self.assertEqual(kv_args.state_layer_ids, [[3, 4, 5, 6]])
 
     def test_index_kv_pool_raises(self):
         pool = _make_kv_pool()
