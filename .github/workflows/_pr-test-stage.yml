@@ -59,7 +59,10 @@ on:
         type: string
         default: ''
       skip_prebuilt_rust_ext:
-        description: 'Take neither the artifact nor the cache, and compile during install. For a stage no prebuild targets: the cache key is arch-blind, so an aarch64 stage would be handed x86_64 modules.'
+        description: >
+          Take neither the artifact nor the cache, and compile during install. No
+          stage sets it: both architectures have a prebuild. Kept as the opt-out for
+          a pool that gets one later than its stages do.
         type: boolean
         default: false
 

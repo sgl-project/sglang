@@ -16,6 +16,7 @@
 import dataclasses
 import logging
 from contextlib import contextmanager
+from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -81,6 +82,30 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 # Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
 # under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
+
+
+class SamplingMaskStatus(IntEnum):
+    """Ordered by severity so distributed MAX reaches one policy decision."""
+
+    OK = 0
+    OVERFLOW = 1
+    INVALID = 2
+
+
+@dataclasses.dataclass
+class SamplingMaskOutput:
+    """Tensor result for opted-in rows in batch order."""
+
+    token_ids: torch.Tensor
+    lengths: torch.Tensor
+    selected_logprobs: torch.Tensor
+    statuses: torch.Tensor
+
+    def map_device_tensors(self, fn) -> None:
+        self.token_ids = fn(self.token_ids)
+        self.lengths = fn(self.lengths)
+        self.selected_logprobs = fn(self.selected_logprobs)
+        self.statuses = fn(self.statuses)
 
 
 def _trace_e2e_logits(stage: str, **fields) -> None:
@@ -196,10 +221,12 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
-    # Sparse top-k/top-p/min-p support ids and selected-token logprob after
-    # truncation/renormalization. Only populated when requested.
+    # Post-filter support IDs, bounded by server capacity, and selected-token
+    # logprob over the full realized support.
+    sampling_mask_output: Optional[SamplingMaskOutput] = None
     next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
     next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
@@ -271,6 +298,9 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
+    attn_tp_sequence_sharded: bool = False
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
@@ -324,6 +354,7 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
+            attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -382,7 +413,9 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
-        self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
+        self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
+            config, "enable_lm_head_fp32", False
+        )
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
