@@ -20,8 +20,7 @@ limitations under the License.
 
 // FlashMLA exposes these two entry points only from csrc/api/*.cpp (its own pybind layer lives
 // behind FLASH_MLA_LIBTORCH_ONLY), so declare them here the way csrc/python_api.cpp does.
-std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
-dense_attn_decode_interface(
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> dense_attn_decode_interface(
     at::Tensor& q,
     const at::Tensor& kcache,
     const int head_size_v,
@@ -32,8 +31,7 @@ dense_attn_decode_interface(
     std::optional<at::Tensor>& tile_scheduler_metadata,
     std::optional<at::Tensor>& num_splits);
 
-std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
-sparse_attn_decode_interface(
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sparse_attn_decode_interface(
     const at::Tensor& q,
     const at::Tensor& kv,
     const at::Tensor& indices,
