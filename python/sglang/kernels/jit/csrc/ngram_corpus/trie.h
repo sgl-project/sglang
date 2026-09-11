@@ -51,6 +51,8 @@ struct NodeRef {
 // the full request length covered by those cached anchors.
 struct MatchState {
   uint64_t trie_epoch = 0;
+  // Reuse cached misses only while the trie has not grown.
+  uint64_t growth_epoch = 0;
   size_t processed_total_len = 0;
   std::vector<NodeRef> anchors;
 };
@@ -97,8 +99,8 @@ class Trie {
   // Advance the cached anchors by consuming the newly appended suffix one
   // token at a time, without re-walking all suffixes from root.
   bool advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const;
-  // Check that every non-empty cached NodeRef in MatchState still resolves to
-  // the same logical trie node under the current trie_epoch_.
+  // Validate cached misses against trie growth and live references against
+  // node generations and the current trie_epoch_.
   bool validateMatchState_(const MatchState& state) const;
   // MatchState keeps all live suffix matches, including leaves. This helper
   // filters the cached anchors down to the suffixes that currently have children and
@@ -139,6 +141,7 @@ class Trie {
   std::vector<TrieNode*> path_;
   Param param_;
   uint64_t trie_epoch_ = 1;
+  uint64_t growth_epoch_ = 1;
 };
 
 }  // namespace ngram
