@@ -8,10 +8,8 @@ Run the SGLang OpenAI-compatible server on a [Nebius Serverless AI Endpoint](htt
 The Endpoint keeps running until you stop or delete it. This example uses a regular GPU instance and does not configure autoscaling or automatic scale-to-zero. Nebius bills its underlying Compute resources; mounted storage is billed separately. See [pricing and quotas](https://docs.nebius.com/serverless/pricing-quotas).
 
 <Note>
-This example has not yet been validated on a live Nebius Endpoint. Its image, model revision, and CLI options have been checked against their published interfaces; GPU compatibility, cold starts, streaming through ingress, and cleanup still require end-to-end validation.
+The configuration below was tested on 2026-09-11 with Nebius CLI `0.12.265` and OpenAI Python `3.12.0`. Two starts on fresh L40S VMs reached model readiness in approximately nine minutes each. Authenticated chat, incremental streaming, and smoke tests with one, two, and four concurrent requests passed. Stop/start and deletion of the Endpoint, VMs, and boot disks were verified. These timings are observations from this test, not a startup or throughput guarantee.
 </Note>
-
-{/* TODO: Complete live validation of this exact configuration before removing the note above. */}
 
 ## Prerequisites
 
@@ -54,10 +52,10 @@ nebius ai endpoint create \
     --auth token --token "$ENDPOINT_TOKEN" \
     --disk-size 250Gi --shm-size 16Gi \
     --public=false --preemptible=false \
-    --retries 1
+    --retries 1 --async
 ```
 
-Save the ID from the created Endpoint. If you need to locate it, run `nebius ai endpoint list --parent-id "$PROJECT_ID"` and inspect the matching resources. Copy the correct ID rather than assuming that a name is unique:
+`--async` returns after submission and prints the Endpoint ID. Save that resource ID. If you need to recover it, run `nebius ai endpoint list --parent-id "$PROJECT_ID"` and inspect matching resources by name and configuration; names are not guaranteed unique:
 
 ```bash
 export ENDPOINT_ID="<endpoint-id>"
@@ -252,7 +250,7 @@ nebius ai endpoint stop "$ENDPOINT_ID" --retries 1
 nebius ai endpoint get "$ENDPOINT_ID"
 ```
 
-Wait for `STOPPED` before starting it again. Stopped compute is not charged, but separately mounted volumes remain billable. To start the same Endpoint:
+Let the stop command complete and confirm `STOPPED` before starting it again. If you stop asynchronously, wait for the stop operation to finish too: `STOPPED` can appear while VM and disk cleanup is still running, and starting during that interval can return an operation conflict. Stopped compute is not charged, but separately mounted volumes remain billable. To start the same Endpoint:
 
 ```bash
 nebius ai endpoint start "$ENDPOINT_ID" --retries 1
