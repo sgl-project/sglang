@@ -44,6 +44,47 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
     return cpu_t
 
 
+def _can_batch_d2h(tensors: List[torch.Tensor]) -> bool:
+    """Whether ``tensors`` can be concatenated along dim 0 for a single D2H copy.
+
+    Requires CUDA sources (the pinned-buffer batching only pays off there; a CPU
+    ``torch.cat`` would add a copy where the per-tensor path does none) and a
+    uniform dtype, device, rank and trailing shape so the concat is exactly
+    invertible by ``torch.split``.
+    """
+    first = tensors[0]
+    if not first.is_cuda:
+        return False
+    suffix = first.shape[1:]
+    return all(
+        t.dtype == first.dtype
+        and t.device == first.device
+        and t.dim() == first.dim()
+        and t.shape[1:] == suffix
+        for t in tensors
+    )
+
+
+def _batched_async_d2h(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
+    """Async D2H for a list of tensors using a single pinned buffer and copy.
+
+    The per-request embedding tensors produced by multi-item scoring are slices of
+    one pooler output (``scores_flat.split(...)``), so copying them individually
+    costs one pinned allocation and one async copy per request. Concatenating on
+    device collapses that into one of each, which matters at the large fan-out the
+    scoring path produces; the host-side split afterwards returns views, not copies.
+
+    Falls back to the per-tensor path when the tensors cannot be concatenated, so
+    the result is identical in every case.
+    """
+    if not _can_batch_d2h(tensors):
+        return [_async_d2h(t) for t in tensors]
+
+    sizes = [t.shape[0] for t in tensors]
+    flat_cpu = _async_d2h(torch.cat(tensors, dim=0))
+    return list(torch.split(flat_cpu, sizes, dim=0))
+
+
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
@@ -360,13 +401,14 @@ class EmbeddingBatchResult:
                 return
 
             self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
-            self.embeddings = [_async_d2h(emb) for emb in self.embeddings]
+            self.embeddings = _batched_async_d2h(self.embeddings)
 
         if self.pooled_hidden_states is not None:
             if isinstance(self.pooled_hidden_states, list):
-                self.pooled_hidden_states = [
-                    _async_d2h(t) for t in self.pooled_hidden_states
-                ]
+                if self.pooled_hidden_states:
+                    self.pooled_hidden_states = _batched_async_d2h(
+                        self.pooled_hidden_states
+                    )
             else:
                 self.pooled_hidden_states = _async_d2h(self.pooled_hidden_states)
 
