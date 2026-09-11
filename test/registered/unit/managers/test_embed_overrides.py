@@ -128,6 +128,48 @@ class TestValidatePositionalEmbedOverridesHiddenDim(CustomTestCase):
         with self.assertRaises(ValueError):
             self._tm()._validate_positional_embed_overrides_hidden_dim([good, bad])
 
+    def test_non_positional_embeds_entry_raises(self):
+        # positional_embed_overrides is typed Any and bound straight from the
+        # FastAPI body, so a raw JSON value can land here. It must be rejected
+        # as ValueError (-> HTTP 400) rather than forwarded to the scheduler,
+        # where msgpack_decode would raise outside any handler and kill the
+        # process.
+        for bogus in ([{"embeds": [[1, 2]], "positions": [0]}], ["str"], [123]):
+            with self.subTest(bogus=bogus):
+                with self.assertRaisesRegex(ValueError, "must be PositionalEmbeds"):
+                    self._tm()._validate_positional_embed_overrides_hidden_dim(bogus)
+
+    def test_non_list_non_struct_raises(self):
+        for bogus in (5, "abc", {"embeds": 1}):
+            with self.subTest(bogus=bogus):
+                with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
+                    self._tm()._validate_positional_embed_overrides_hidden_dim(bogus)
+
+    def test_all_none_list_is_noop(self):
+        # A list whose only entry is None previously passed validation and then
+        # failed msgpack_decode in the scheduler; it is a legitimate no-op, but
+        # it must stay a no-op rather than becoming a forwarded malformed value.
+        self._tm()._validate_positional_embed_overrides_hidden_dim([None])
+
+
+class TestPositionalEmbedsRankAndEmptiness(CustomTestCase):
+    def test_three_dim_embeds_rejected(self):
+        # [N, 1, hidden] satisfies both the positions-length check and the
+        # last-dim hidden check, but breaks the scheduler's scatter and aborts
+        # every co-batched request, so it must be rejected at construction.
+        with self.assertRaisesRegex(ValueError, "must be 2-D"):
+            PositionalEmbeds(embeds=torch.zeros(1, 1, HIDDEN_DIM), positions=[0])
+
+    def test_empty_embeds_list_raises_value_error(self):
+        # Must be ValueError (-> HTTP 400), not the RuntimeError torch.cat([])
+        # would raise, which the entrypoints do not map and would surface as 500.
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            PositionalEmbeds(embeds=[], positions=[])
+
+    def test_two_dim_still_accepted(self):
+        pe = PositionalEmbeds(embeds=[_vec(1), _vec(2)], positions=[0, 1])
+        self.assertEqual(tuple(pe.embeds.shape), (2, HIDDEN_DIM))
+
 
 # ========================================================================
 # convert_embeds_to_tensors

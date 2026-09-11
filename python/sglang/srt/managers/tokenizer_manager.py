@@ -1487,21 +1487,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
         ],
     ) -> None:
-        """Validate hidden_dim on any PositionalEmbeds reaching the scheduler.
+        """Validate any positional embed overrides reaching the scheduler.
 
         Handles both the single-request shape (``PositionalEmbeds``) and the
         score-request shape (``List[Optional[PositionalEmbeds]]``). Skips None
         entries. No-op when the request carries no overrides.
+
+        The field is typed ``Any`` on the request dataclasses and those are used
+        directly as FastAPI bodies, so arbitrary JSON can land here. Anything that
+        is not the expected type is rejected with ValueError (mapped to HTTP 400)
+        rather than forwarded: msgpack encoding is untyped, so a malformed value
+        encodes fine and then fails ``msgpack_decode`` inside the scheduler's
+        receive loop, which only catches ``zmq.ZMQError`` and would take the
+        scheduler process down.
         """
         if positional_embed_overrides is None:
             return
         expected = self.model_config.hidden_size
         if isinstance(positional_embed_overrides, PositionalEmbeds):
             positional_embed_overrides.validate_hidden_dim(expected)
-        else:
+        elif isinstance(positional_embed_overrides, (list, tuple)):
             for item in positional_embed_overrides:
-                if item is not None:
-                    item.validate_hidden_dim(expected)
+                if item is None:
+                    continue
+                if not isinstance(item, PositionalEmbeds):
+                    raise ValueError(
+                        "positional_embed_overrides entries must be PositionalEmbeds "
+                        f"or null, got {type(item).__name__}."
+                    )
+                item.validate_hidden_dim(expected)
+        else:
+            raise ValueError(
+                "positional_embed_overrides must be a PositionalEmbeds or a list of "
+                f"them, got {type(positional_embed_overrides).__name__}."
+            )
 
     @staticmethod
     def _resolve_embed_overrides(
