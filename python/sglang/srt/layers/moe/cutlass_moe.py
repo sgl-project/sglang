@@ -4,7 +4,8 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -49,6 +50,7 @@ def cutlass_fused_experts_fp8(
     use_mxfp8: bool = False,
     output: Optional[torch.Tensor] = None,
     enable_es: Tuple[bool, bool] = (False, False),
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
@@ -145,7 +147,7 @@ def cutlass_fused_experts_fp8(
 
     if use_mxfp8:
         assert es_up and es_down, "MXFP8 requires expert-specialization for both GEMMs"
-        assert is_sm100_supported(), "MXFP8 requires SM100"
+        assert get_platform().is_sm100, "MXFP8 requires SM100"
         assert k % 32 == 0, "MXFP8 requires hidden size to be divisible by 32"
         assert n % 32 == 0, "MXFP8 requires intermediate size to be divisible by 32"
         assert w1_scale.dtype == torch.uint8, "MXFP8 w1_scale must be uint8"
@@ -160,12 +162,12 @@ def cutlass_fused_experts_fp8(
             w2_q.shape[1] // 32,
             w2_q.shape[2],
         )
-        assert (
-            w1_scale.shape == expected_w1_scale_shape
-        ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
-        assert (
-            w2_scale.shape == expected_w2_scale_shape
-        ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+        assert w1_scale.shape == expected_w1_scale_shape, (
+            f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
+        )
+        assert w2_scale.shape == expected_w2_scale_shape, (
+            f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+        )
 
         mxfp8_blockscale_align = 128
         total_tokens = m * topk
@@ -222,7 +224,7 @@ def cutlass_fused_experts_fp8(
     a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
     w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
 
-    if is_sm90_supported() and es_up:
+    if get_platform().is_sm90 and es_up:
         es_fp8_blockwise_scaled_grouped_mm(
             c1,
             rep_a_q,
@@ -270,7 +272,12 @@ def cutlass_fused_experts_fp8(
         )
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
-    silu_and_mul(c1, intermediate)
+    if swiglu_limit is None:
+        silu_and_mul(c1, intermediate)
+    else:
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+
+        silu_and_mul_clamp(c1, intermediate, swiglu_limit)
 
     if use_mxfp8 and es_down:
         intemediate_q = torch.empty_like(intermediate, dtype=torch.float8_e4m3fn)
@@ -288,7 +295,7 @@ def cutlass_fused_experts_fp8(
     else:
         intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
-    if is_sm90_supported() and es_down:
+    if get_platform().is_sm90 and es_down:
         es_fp8_blockwise_scaled_grouped_mm(
             c2,
             intemediate_q,

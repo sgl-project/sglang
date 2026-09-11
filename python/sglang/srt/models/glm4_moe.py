@@ -368,19 +368,16 @@ class Glm4MoeGate(nn.Module):
     ):
         super().__init__()
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size), dtype=torch.float32
+            )
         )
         self.e_score_correction_bias = nn.Parameter(
             torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
-        # GLM requires FP32 gate projection; cache to avoid per-forward cast.
-        # FIXME: if gate weight is updated at runtime (e.g. expert rebalancing), _weight_fp32 must be invalidated.
-        self.register_buffer("_weight_fp32", None, persistent=False)
 
     def forward(self, hidden_states):
-        if self._weight_fp32 is None:
-            self._weight_fp32 = self.weight.data.to(torch.float32)
-        logits = F.linear(hidden_states.to(torch.float32), self._weight_fp32, None)
+        logits = F.linear(hidden_states.to(torch.float32), self.weight, None)
         return logits
 
 
@@ -471,17 +468,20 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_flashinfer_megamoe()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
             )
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
+            is_packed_weight = (
+                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+                in {
+                    "awq",
+                    "awq_marlin",
+                    "moe_wna16",
+                }
+            )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -503,9 +503,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                         == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
                     )
-                    self.shared_experts_weight_block_size = (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    )
+                    self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
 
         self.top_k = config.num_experts_per_tok
 

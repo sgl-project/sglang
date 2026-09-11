@@ -107,6 +107,120 @@ def fused_pack_qkv(
     )
 
 
+@triton.jit
+def _fused_pack_segmented_qkv_kernel(
+    Q_prefix_ptr,
+    K_prefix_ptr,
+    V_prefix_ptr,
+    Q_main_ptr,
+    K_main_ptr,
+    V_main_ptr,
+    Q_unpad_ptr,
+    K_unpad_ptr,
+    V_unpad_ptr,
+    indices_ptr,
+    PREFIX_ROWS,
+    MAIN_ROWS,
+    HD,
+    prefix_row_stride,
+    main_row_stride,
+    dst_row_stride,
+    BLOCK_HD: tl.constexpr,
+):
+    """Pack a virtual ``[prefix, main]`` sequence without materializing it."""
+    out_row = tl.program_id(0)
+    src_row = tl.load(indices_ptr + out_row).to(tl.int64)
+    joint_rows = PREFIX_ROWS + MAIN_ROWS
+    batch = src_row // joint_rows
+    row_in_batch = src_row - batch * joint_rows
+    from_prefix = row_in_batch < PREFIX_ROWS
+
+    prefix_row = batch * PREFIX_ROWS + row_in_batch
+    main_row = batch * MAIN_ROWS + row_in_batch - PREFIX_ROWS
+    cols = tl.arange(0, BLOCK_HD)
+    col_mask = cols < HD
+    prefix_mask = col_mask & from_prefix
+    main_mask = col_mask & ~from_prefix
+
+    prefix_offset = prefix_row * prefix_row_stride + cols
+    main_offset = main_row * main_row_stride + cols
+    dst_offset = out_row * dst_row_stride + cols
+
+    q_val = tl.load(Q_prefix_ptr + prefix_offset, mask=prefix_mask, other=0.0)
+    k_val = tl.load(K_prefix_ptr + prefix_offset, mask=prefix_mask, other=0.0)
+    v_val = tl.load(V_prefix_ptr + prefix_offset, mask=prefix_mask, other=0.0)
+    q_val += tl.load(Q_main_ptr + main_offset, mask=main_mask, other=0.0)
+    k_val += tl.load(K_main_ptr + main_offset, mask=main_mask, other=0.0)
+    v_val += tl.load(V_main_ptr + main_offset, mask=main_mask, other=0.0)
+
+    tl.store(Q_unpad_ptr + dst_offset, q_val, mask=col_mask)
+    tl.store(K_unpad_ptr + dst_offset, k_val, mask=col_mask)
+    tl.store(V_unpad_ptr + dst_offset, v_val, mask=col_mask)
+
+
+def fused_pack_segmented_qkv(
+    q_prefix: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    q_main: torch.Tensor,
+    k_main: torch.Tensor,
+    v_main: torch.Tensor,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack Q/K/V from a virtual ``[prefix, main]`` joint sequence.
+
+    This is bitwise equivalent to concatenating each prefix/main pair and
+    calling :func:`fused_pack_qkv`, but skips the three dense concatenations.
+    All inputs use ``[B, S, H, D]`` layout and share batch/head dimensions.
+    """
+    prefixes = (q_prefix, k_prefix, v_prefix)
+    mains = (q_main, k_main, v_main)
+    assert q_prefix.shape == k_prefix.shape == v_prefix.shape
+    assert q_main.shape == k_main.shape == v_main.shape
+    assert q_prefix.dim() == q_main.dim() == 4
+    assert q_prefix.shape[0] == q_main.shape[0]
+    assert q_prefix.shape[2:] == q_main.shape[2:]
+    assert all(t.dtype == q_prefix.dtype for t in (*prefixes, *mains))
+    assert indices.dtype in (torch.int32, torch.int64)
+
+    q_prefix, k_prefix, v_prefix = (t.contiguous() for t in prefixes)
+    q_main, k_main, v_main = (t.contiguous() for t in mains)
+    prefixes = (q_prefix, k_prefix, v_prefix)
+    mains = (q_main, k_main, v_main)
+    batch_size, prefix_rows, num_heads, head_dim = q_prefix.shape
+    main_rows = q_main.shape[1]
+    hd = num_heads * head_dim
+    n_valid = indices.shape[0]
+    if n_valid == 0:
+        return tuple(
+            t.new_empty(0, num_heads, head_dim) for t in (q_prefix, k_prefix, v_prefix)
+        )
+
+    prefix_flat = tuple(t.view(batch_size * prefix_rows, hd) for t in prefixes)
+    main_flat = tuple(t.view(batch_size * main_rows, hd) for t in mains)
+    outputs = tuple(
+        torch.empty(n_valid, hd, dtype=q_prefix.dtype, device=q_prefix.device)
+        for _ in range(3)
+    )
+    block_hd = triton.next_power_of_2(hd)
+    with torch.get_device_module().device(q_prefix.device):
+        _fused_pack_segmented_qkv_kernel[(n_valid,)](
+            *prefix_flat,
+            *main_flat,
+            *outputs,
+            indices,
+            prefix_rows,
+            main_rows,
+            hd,
+            prefix_flat[0].stride(0),
+            main_flat[0].stride(0),
+            outputs[0].stride(0),
+            BLOCK_HD=block_hd,
+        )
+
+    return tuple(out.view(n_valid, num_heads, head_dim) for out in outputs)
+
+
 # ---------------------------------------------------------------------------
 # Scatter (pad) — write packed output to [B, S, H, D] with zeros at invalid
 # ---------------------------------------------------------------------------
