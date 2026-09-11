@@ -123,6 +123,9 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
+                # Capture before releasing the request's token-to-KV mapping.
+                self._maybe_collect_routed_experts(req)
+                self._maybe_collect_indexer_topk(req)
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
