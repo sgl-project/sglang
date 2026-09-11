@@ -2621,8 +2621,11 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    # The groups below are built at these numbers, and the same dict is stamped
-    # once they exist.
+    # The groups below are built at this width. Not stamped: every real
+    # caller of this function forwards leaves already published from this
+    # same config, so `get_parallel().attn_tp_size` and its siblings already
+    # answer with this value (see 16-field-registry-design.md §6e and
+    # TestDerivedWidths.test_recomputing_from_published_leaves_matches_the_publish_bag).
     derived_widths = derive_parallel_widths(
         tp_size=tensor_model_parallel_size,
         attn_cp_size=attn_cp_size,
@@ -2831,8 +2834,6 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="self_pp",
         )
-
-    get_parallel().stamp_derived_widths(**derived_widths)
 
 
 def create_custom_parallel_group(

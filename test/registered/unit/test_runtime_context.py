@@ -1590,6 +1590,57 @@ class TestDerivedWidths(_IsolatedOverrides):
             self.assertEqual(attn_tp_size, widths["attn_tp_size"])
             self.assertEqual(attn_dp_size, widths["attn_dp_size"])
 
+    def test_recomputing_from_published_leaves_matches_the_publish_bag(self):
+        """§6e's precondition for deleting `initialize_model_parallel`'s full
+        stamp: does anything between that stamp and `publish` depend on the
+        stamp giving a *different* answer than the bag already has? It
+        cannot, for any of the three real callers -- every one of them
+        forwards leaves read off this same published bag
+        (`ps.attn_dp_size`/`ps.moe_ep_size`/etc. in `scheduler.py`, or the
+        daemon's own already-published config), through the very functions
+        (`derive_attention_widths`, `derive_parallel_widths`) the bag itself
+        was projected with. This pins that across the widths
+        `test_the_rank_helper_agrees_with_the_stamp` does not vary --
+        moe_ep_size, moe_dp_size, and dcp_size -- using real `publish()`,
+        not bare integers, so a change to either the projection or a
+        caller's forwarding would surface here.
+        """
+        shapes = (
+            dict(tp_size=8),
+            dict(tp_size=8, dp_size=2, enable_dp_attention=True),
+            dict(tp_size=8, ep_size=4, moe_dp_size=2),
+            dict(tp_size=8, dcp_size=8),
+        )
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                reset_context()
+                self.addCleanup(reset_context)
+                publish(ServerArgs(model_path="dummy", **shape), role="test")
+                parallel = get_parallel()
+                published = {
+                    "attn_tp_size": parallel.attn_tp_size,
+                    "attn_dp_size": parallel.attn_dp_size,
+                    "moe_ep_size": parallel.moe_ep_size,
+                    "moe_tp_size": parallel.moe_tp_size,
+                    "dcp_enabled": parallel.dcp_enabled,
+                    "attn_dcp_size": parallel.attn_dcp_size,
+                }
+                # What every real `initialize_model_parallel` caller forwards:
+                # its own already-published leaves, through the same two
+                # functions the bag was projected with.
+                recomputed = derive_parallel_widths(
+                    tp_size=parallel.tp_size,
+                    attn_cp_size=parallel.attn_cp_size,
+                    attn_dp_size=(
+                        parallel.dp_size if parallel.enable_dp_attention else 1
+                    ),
+                    moe_ep_size=parallel.ep_size,
+                    moe_dp_size=parallel.moe_dp_size,
+                    dcp_size=parallel.dcp_size,
+                    dcp_enabled=parallel.dcp_size > 1,
+                )
+                self.assertEqual(published, recomputed)
+
 
 class TestTheDerivedHalfIsDeclared(CustomTestCase):
     """The quotients are declared beside the leaves, in the same class.
