@@ -1,12 +1,14 @@
-"""Serving the same context under DCP costs 1/c of the latent KV and the same indexer.
+"""Pool geometry under DCP: the latent KV shards, the indexer does not.
 
 [Test Category] Memory
-[Test Target] NPUMLATokenToKVPool allocation geometry under decode context parallelism
+[Test Target] NPUMLATokenToKVPool allocation geometry and index_buf_size under
+              decode context parallelism
 
 This is P2's fourth exit criterion, and it is the only one that fails loudly when
-the geometry is merely *wasteful* rather than wrong. The other tests here check
-that locations land where they should; this one checks that the pool costs what
-it is supposed to.
+the geometry is merely *wasteful* rather than wrong. The other tests in this
+directory check that locations land where they should; this one checks that the
+pool costs what it is supposed to, and that the widened indexer is addressable to
+its last row.
 
 The comparison is at a fixed **served context** S, which is the thing an operator
 actually holds constant -- not at a fixed per-rank pool size:
@@ -31,7 +33,7 @@ import torch
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=90, suite="full-1-npu-a3")
+register_npu_ci(est_time=80, suite="full-1-npu-a3")
 
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
@@ -127,24 +129,34 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
                 _, index = _measure(dcp_size)
                 self.assertEqual(index, base_index)
 
-    def test_the_saving_is_the_whole_point(self):
-        """State the headline directly, so a regression reads as a number rather
-        than as a shape mismatch somewhere else."""
-        base_latent, base_index = _measure(1)
-        latent, index = _measure(8)
+    def test_the_widened_indexer_reaches_its_last_global_position(self):
+        """Flat bytes are necessary but not sufficient: a replicated indexer is
+        addressed at a raw, untranslated loc, so the TOP of the widened range has
+        to be writable and readable. This is the only case here that performs a
+        real write, and it is what turns index_buf_size from an allocation size
+        into a contract with set_index_k_buffer."""
+        dcp_size = 4
+        pool = _build(size=SERVED_CONTEXT // dcp_size, index_buf_size=SERVED_CONTEXT)
 
-        saved = (base_latent + base_index) - (latent + index)
-        self.assertGreater(saved, 0)
-        # The saving is entirely latent-KV; the indexer contributes nothing.
-        self.assertEqual(saved, base_latent - latent)
-        self.assertEqual(index, base_index)
+        last = SERVED_CONTEXT - 1
+        loc = torch.tensor([last], dtype=torch.int32, device=DEVICE)
+        value = torch.full(
+            (1, INDEX_HEAD_DIM), 3.0, dtype=torch.bfloat16, device=DEVICE
+        )
+        pool.set_index_k_buffer(0, loc, value)
 
-    def test_it_holds_with_the_indexer_elision_on(self):
+        buffer = pool.get_index_k_buffer(0).view(-1, 1, INDEX_HEAD_DIM)
+        self.assertEqual(buffer[last, 0, 0].item(), 3.0)
+
+    def test_it_composes_with_the_indexer_elision(self):
         """Elision and DCP are independent axes and must compose: eliding layers
-        must not change the 1/c latent behaviour, and sharding must not
-        resurrect elided index-K rows."""
-        # indexer_layer_ids, not the old skip_topk_layers bool mask: this pool
-        # now compacts index-K to the layers that own an Indexer.
+        must not change the 1/c latent behaviour, sharding must not resurrect
+        elided index-K rows, and widening must not add them back either.
+
+        Uses indexer_layer_ids, not a skip_topk_layers bool mask: this pool
+        compacts index-K to the layers that own an Indexer and addresses it
+        through indexer_layer_id_to_slot.
+        """
         live_ids = [i for i in range(LAYER_NUM) if i % 2 == 0]
         live = len(live_ids)
 
@@ -154,11 +166,37 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
         self.assertEqual(index, base_index)
         self.assertAlmostEqual(latent / base_latent, 1 / 4, delta=0.02)
 
-        # And the elision itself is still worth what it was: only live layers
-        # hold index-K rows.
+        # The elision is still worth what it was: only live layers hold rows,
+        # and the compacted buffer has exactly one slot per live layer.
         pages = SERVED_CONTEXT // PAGE_SIZE + 1
         per_page = PAGE_SIZE * INDEX_HEAD_DIM * BYTES_PER_ELEM
         self.assertEqual(index, live * pages * per_page)
+
+        pool = _build(
+            size=SERVED_CONTEXT // 4,
+            index_buf_size=SERVED_CONTEXT,
+            indexer_layer_ids=live_ids,
+        )
+        self.assertEqual(pool.num_indexer_layers, live)
+        self.assertEqual(pool.index_k_buffer.shape[0], live)
+        self.assertEqual(sorted(pool.indexer_layer_id_to_slot), live_ids)
+
+    def test_reported_bytes_follow_the_widened_indexer(self):
+        """get_kv_size_bytes is what the launch log prints, so it has to see the
+        widening -- otherwise the pool silently costs more than it reports, and
+        the one number an operator reads to size a deployment is wrong."""
+        narrow = _build(size=SERVED_CONTEXT, index_buf_size=SERVED_CONTEXT)
+        narrow_bytes = narrow.get_kv_size_bytes()
+        del narrow
+        torch.npu.empty_cache()
+
+        wide = _build(size=SERVED_CONTEXT, index_buf_size=SERVED_CONTEXT * 2)
+        index_bytes_per_page = PAGE_SIZE * 1 * INDEX_HEAD_DIM * BYTES_PER_ELEM
+
+        expected_growth = (
+            LAYER_NUM * (SERVED_CONTEXT // PAGE_SIZE) * index_bytes_per_page
+        )
+        self.assertEqual(wide.get_kv_size_bytes() - narrow_bytes, expected_growth)
 
 
 if __name__ == "__main__":
