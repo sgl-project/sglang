@@ -118,6 +118,7 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
 
         self.assertEqual(reasoning_parser, "ling3")
         self.assertEqual(tool_call_parser, "ling3")
+
     def test_glm53_effort_template_resolves_glm_parsers(self):
         # Without an enable_thinking toggle the GLM-4.5 rule misses, and the
         # template used to fall through to deepseek-r1 + the xml_kv fallback
