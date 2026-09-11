@@ -4,7 +4,11 @@
 per-step dispatch through `self` -- there is nothing on `ServerArgs` left to
 subclass in order to change how one step decides. This is the replacement
 for that: a decorator that wraps whatever currently runs under a given name,
-and a dispatcher the pipeline calls instead of the bare function.
+and a dispatcher the pipeline calls instead of the bare function. The name
+itself is never spelled out at the call site -- `run_hook` reads it off the
+function it was handed -- so there is exactly one place a step's name is
+written by hand: the whitelist below, and whatever a downstream registrant
+passes to the decorator.
 
 Whitelisted names only, the same discipline `Arg(resolvable=True)` uses for
 declarable fields: this project has already been bitten once by an
@@ -75,20 +79,26 @@ def register_resolution_hook(name: str):
     return decorator
 
 
-def run_hook(name: str, builtin: Callable[[Any], None], server_args: Any) -> None:
-    """Run the pipeline step named ``name`` -- the registered chain if
-    anything overrode it, ``builtin`` otherwise.
+def run_hook(builtin: Callable[[Any], None], server_args: Any) -> None:
+    """Run ``builtin`` -- the registered chain if anything overrode it under
+    its name, ``builtin`` directly otherwise.
 
-    Called from the step's fixed position in `run_resolution_pipeline`;
-    `builtin` is that position's own local import, so this never needs the
-    built-in registered anywhere in advance. The chain is rebuilt from the
-    registry on every call rather than cached at registration time, because
-    at registration time (import time, before any `ServerArgs` exists) there
-    is no `server_args` yet and the first registrant's `previous` cannot be
-    bound to anything real until a call actually happens.
+    The name is ``builtin.__name__``, not a second argument: the call site
+    already has the function in scope (a function-local import, same as
+    every other step), and spelling the name out again next to it is the
+    exact "two copies that can silently disagree" shape this project keeps
+    removing elsewhere. ``builtin`` must therefore be a plain, named
+    function -- every real call site is -- not a lambda or a bound method.
+
+    Called from the step's fixed position in `run_resolution_pipeline`. The
+    chain is rebuilt from the registry on every call rather than cached at
+    registration time, because at registration time (import time, before any
+    `ServerArgs` exists) there is no `server_args` yet and the first
+    registrant's `previous` cannot be bound to anything real until a call
+    actually happens.
     """
     step = builtin
-    for fn in _HOOKS.get(name, ()):
+    for fn in _HOOKS.get(builtin.__name__, ()):
         step = _bind(fn, step)
     step(server_args)
 

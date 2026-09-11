@@ -196,7 +196,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Out-of-tree replaceable: see arg_groups/resolution_hooks.py. This is the
     # step's fixed position in the pipeline either way -- registering an
     # override changes what runs here, not when.
-    run_hook("handle_cuda_graph_config", handle_cuda_graph_config, server_args)
+    run_hook(handle_cuda_graph_config, server_args)
     # Requires the parsed backend and explicit-input locks, and must precede
     # handle_gpu_memory_settings so the chunk size feeds memory budgeting.
     apply_glm5_chunked_prefill_default(server_args)

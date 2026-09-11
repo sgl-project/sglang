@@ -63,9 +63,15 @@ class TestWhitelist(_IsolatedRegistry):
 
 
 class TestRunHook(_IsolatedRegistry):
+    """``run_hook`` reads the name off the function it is handed
+    (``builtin.__name__``), so every ``builtin`` stand-in below that needs to
+    line up with a registration is a real named function called
+    ``handle_cuda_graph_config`` -- a lambda's ``__name__`` is ``'<lambda>'``
+    and would silently miss the registry entirely."""
+
     def test_nothing_registered_runs_the_builtin_directly(self):
         calls = []
-        run_hook("handle_cuda_graph_config", calls.append, "sa")
+        run_hook(calls.append, "sa")
         self.assertEqual(calls, ["sa"])
 
     def test_an_override_that_calls_previous_wraps_the_builtin(self):
@@ -77,9 +83,10 @@ class TestRunHook(_IsolatedRegistry):
             previous(server_args)
             order.append(("after", server_args))
 
-        run_hook(
-            "handle_cuda_graph_config", lambda sa: order.append(("builtin", sa)), "sa"
-        )
+        def handle_cuda_graph_config(server_args):
+            order.append(("builtin", server_args))
+
+        run_hook(handle_cuda_graph_config, "sa")
         self.assertEqual(
             order,
             [("before", "sa"), ("builtin", "sa"), ("after", "sa")],
@@ -92,7 +99,10 @@ class TestRunHook(_IsolatedRegistry):
         def _replaces(server_args, previous):
             pass  # deliberately does not call `previous`
 
-        run_hook("handle_cuda_graph_config", builtin_ran.append, "sa")
+        def handle_cuda_graph_config(server_args):
+            builtin_ran.append(server_args)
+
+        run_hook(handle_cuda_graph_config, "sa")
         self.assertEqual(builtin_ran, [], "the replaced builtin must not have run")
 
     def test_two_registrants_compose_last_registered_outermost(self):
@@ -110,11 +120,10 @@ class TestRunHook(_IsolatedRegistry):
             previous(server_args)
             order.append("second-after")
 
-        run_hook(
-            "handle_cuda_graph_config",
-            lambda sa: order.append("builtin"),
-            "sa",
-        )
+        def handle_cuda_graph_config(server_args):
+            order.append("builtin")
+
+        run_hook(handle_cuda_graph_config, "sa")
         self.assertEqual(
             order,
             [
