@@ -29,7 +29,7 @@ Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on A3 mean
 From a deployment perspective, the two key differences between A2 and A3 are:
 
 1. dies per card — which drives both total memory and `--tp-size` configuration
-2. PD disaggregation — A2 requires setting `export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"`, while A3 uses the default protocol. A5 (Atlas 950) uses `host_rdma`, which also requires setting `ASCEND_MF_NIC` to the NIC endpoint (`IP:PORT`); each NPU rank then listens on `PORT + npu_id * 100`.
+2. PD disaggregation — A2 requires setting `export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"`, while A3 uses the default protocol. A5 (Atlas 950) uses `host_rdma`, which also requires setting `ASCEND_MF_NIC` to the NIC endpoint (`IP:PORT`). The endpoint is passed verbatim to the transfer engine; if the port conflicts, the engine reports an error and a different port should be configured.
 </Note>
 
 ### NPU

@@ -503,8 +503,8 @@ export SGLANG_SET_CPU_AFFINITY=1
 # FREE_PORT: any available port
 # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
 export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-# host_rdma transfer for A5; ASCEND_MF_NIC is the NIC endpoint (IP:PORT),
-# each NPU rank listens on PORT + npu_id * 100
+# host_rdma transfer for A5; ASCEND_MF_NIC is the NIC endpoint (IP:PORT)
+# used verbatim by the transfer engine; pick an unused port
 export ASCEND_MF_TRANSFER_PROTOCOL="host_rdma"
 export ASCEND_MF_NIC="PREFILL_IP:29000"
 python3 -m sglang.launch_server \
@@ -577,8 +577,8 @@ export SGLANG_SET_CPU_AFFINITY=1
 # FREE_PORT: any available port
 # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
 export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-# host_rdma transfer for A5; ASCEND_MF_NIC is the NIC endpoint (IP:PORT),
-# each NPU rank listens on PORT + npu_id * 100
+# host_rdma transfer for A5; ASCEND_MF_NIC is the NIC endpoint (IP:PORT)
+# used verbatim by the transfer engine; pick an unused port
 export ASCEND_MF_TRANSFER_PROTOCOL="host_rdma"
 export ASCEND_MF_NIC="PREFILL_IP:29000"
 python3 -m sglang.launch_server \

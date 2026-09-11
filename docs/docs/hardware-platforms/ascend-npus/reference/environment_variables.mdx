@@ -139,7 +139,7 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>ASCEND_MF_NIC</code></td>
-      <td>The NIC endpoint (<code>IP:PORT</code>) used by the transfer engine. Only effective<br/> with <code>ASCEND_MF_TRANSFER_PROTOCOL=host_rdma</code>; each NPU rank listens<br/> on <code>PORT + npu_id * 100</code> so that ranks do not conflict.</td>
+      <td>The NIC endpoint (<code>IP:PORT</code>) used by the transfer engine. Only effective<br/> with <code>ASCEND_MF_TRANSFER_PROTOCOL=host_rdma</code>. The endpoint is passed<br/> verbatim to the engine; if the port conflicts, the engine reports an error<br/> and a different port should be configured.</td>
       <td></td>
     </tr>
     <tr>
