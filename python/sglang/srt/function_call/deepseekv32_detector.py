@@ -256,6 +256,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in current_text:
                     current_text = current_text.replace(e_token, "")
+            if self.current_tool_id >= 0 and not current_text.strip():
+                return StreamingParseResult(normal_text="")
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
