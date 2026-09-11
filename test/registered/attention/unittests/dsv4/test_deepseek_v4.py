@@ -848,7 +848,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 req_to_token[req_rows[:, None], positions.clamp_max(width - 1) * ratio]
                 // ratio
             ).masked_fill(~valid, 0)
-            return positions, slots, valid.sum(dim=-1)
+            return positions, slots, valid.sum(dim=-1), torch.empty(0)
 
         def finalize_topk(
             selected,
@@ -957,7 +957,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                         self.assertIs(
                             backend.forward_metadata.sm90_candidates, published
                         )
-                        positions, slots, counts = published
+                        positions, slots, counts, _ = published
                         self.assertIs(compact_logits.call_args.args[2], slots)
                         torch.testing.assert_close(
                             positions < lens[:, None],
@@ -970,7 +970,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                             ).masked_fill(positions >= lens[:, None], 0),
                         )
                 self.assertEqual(full_logits.call_args.args[-1], width)
-                self.assertEqual(full_topk.call_count, int(use_topk_v2))
+                self.assertEqual(full_topk.call_count, 5 if use_topk_v2 else 4)
                 self.assertEqual(
                     [call.args[2].shape[1] for call in compact_logits.call_args_list],
                     [8, 8, 8, 8],

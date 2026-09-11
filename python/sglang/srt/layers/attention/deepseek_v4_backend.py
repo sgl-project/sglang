@@ -947,7 +947,9 @@ class DSV4Metadata:
     low_ratio_pos_i64: Optional[torch.Tensor] = None
 
     # Source-produced logical positions, physical slots and valid lengths.
-    sm90_candidates: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    sm90_candidates: Optional[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -3465,13 +3467,14 @@ class DeepseekV4AttnBackend(
         positions = None
         score_lens = lens
         candidate_scores = candidate_lens = None
+        compact_topk_metadata = None
 
         if compact and indexer.uses_candidates and not indexer.is_candidate_source:
             candidates = self.forward_metadata.sm90_candidates
             assert candidates is not None and candidates[0].shape[0] == bs, (
                 "candidate slots missing for SM90 indexer"
             )
-            positions, slots, score_lens = candidates
+            positions, slots, score_lens, compact_topk_metadata = candidates
             table = pool.get_index_k_with_scale_buffer(layer.layer_id)
             s = fp4_index_logits_decode(
                 q, weights, slots, score_lens, table, table.shape[1] // 68
@@ -3530,15 +3533,20 @@ class DeepseekV4AttnBackend(
             s = s.masked_fill(~consume[:, :lmax], -torch.inf)
         width = s.shape[1]
         k = min(indexer.index_topk, width)
-        if positions is None and metadata.use_topk_v2:
+        topk_metadata = (
+            metadata.topk_metadata
+            if positions is None and metadata.use_topk_v2
+            else compact_topk_metadata
+        )
+        if topk_metadata is not None:
             selected = torch.empty_like(page_indices)
             topk_transform_paged_v2(
                 s,
-                metadata.c4_seq_lens,
+                score_lens,
                 None,
                 selected,
                 1,
-                metadata.topk_metadata,
+                topk_metadata,
             )
             idx = selected[:bs, :k]
         else:
