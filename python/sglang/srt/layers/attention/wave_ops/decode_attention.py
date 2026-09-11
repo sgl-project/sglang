@@ -166,9 +166,7 @@ def decode_attention_wave(
             o,
             b_req_idx,
             req_to_token,
-            attn_logits.reshape(
-                num_seqs, num_query_heads, max_kv_splits, head_size_kv
-            ),
+            attn_logits.reshape(num_seqs, num_query_heads, max_kv_splits, head_size_kv),
             attn_logits_max.reshape(num_seqs, num_query_heads, max_kv_splits),
             num_kv_splits,
             max_kv_splits,
