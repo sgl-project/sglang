@@ -1425,6 +1425,25 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _dcp_symm_mem_nccl_guard(view: Any) -> dict:
+    if not (view.enable_symm_mem and view.dcp_size > 1 and not view.disable_cuda_graph):
+        return {}
+
+    from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
+        nccl_has_symmetric_pdl_fix,
+    )
+
+    if nccl_has_symmetric_pdl_fix():
+        return {}
+
+    logger.warning(
+        "Disabling --enable-symm-mem: NCCL before 2.30.7 corrupts small decode "
+        "CUDA-graph batches under DCP. Upgrade NCCL to keep symmetric memory."
+    )
+    return {"enable_symm_mem": False}
+
+
+@register_post_process
 def _tp_lm_head_all_to_all_default(view: Any) -> dict:
     """Enable the TP LM-head all-to-all path only for pure-DP decode nodes.
 
