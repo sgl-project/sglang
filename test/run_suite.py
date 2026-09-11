@@ -160,7 +160,9 @@ NIGHTLY_SUITES = {
     HWBackend.MUSA: [
         "nightly-musa-1-gpu",
     ],
-    HWBackend.CPU: [],
+    HWBackend.CPU: [
+        "nightly-xeon-models",
+    ],
     HWBackend.NPU: [
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
