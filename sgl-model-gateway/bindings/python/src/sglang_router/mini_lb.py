@@ -3,6 +3,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import base64
 import ipaddress
 import logging
 import random
@@ -32,6 +33,51 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return f"[{address}]"
     except ValueError:
         return address
+
+
+def _needs_prefill_replay(request: dict, endpoint: str) -> bool:
+    return endpoint == "generate" and (
+        request.get("return_routed_experts", False)
+        or request.get("return_indexer_topk", False)
+    )
+
+
+def _merge_prefill_replay(prefill, decode):
+    if isinstance(prefill, list) and isinstance(decode, list):
+        for prefill_item, decode_item in zip(prefill, decode):
+            _merge_prefill_replay(prefill_item, decode_item)
+        return
+    if not isinstance(prefill, dict) or not isinstance(decode, dict):
+        return
+    prefill_meta = prefill.get("meta_info") or {}
+    for key in ("routed_experts", "indexer_topk"):
+        if prefill_meta.get(key) is None:
+            continue
+        decode_meta = decode.get("meta_info") or {}
+        decode["meta_info"] = decode_meta
+        if decode_meta.get(key) is None:
+            decode_meta[key] = prefill_meta[key]
+            continue
+        # Prefill owns the prompt rows; retain decode's generated-token rows.
+        prefill_bytes = base64.b64decode(prefill_meta[key], validate=True)
+        decode_bytes = base64.b64decode(decode_meta[key], validate=True)
+        decode_meta[key] = base64.b64encode(
+            prefill_bytes + decode_bytes[len(prefill_bytes) :]
+        ).decode("utf-8")
+
+
+async def _iter_sse_lines(content):
+    # Replay payloads can exceed aiohttp.readline's buffer limit.
+    pending = []
+    async for chunk in content.iter_chunked(AIOHTTP_STREAM_READ_CHUNK_SIZE):
+        parts = chunk.split(b"\n")
+        for part in parts[:-1]:
+            pending.append(part)
+            yield b"".join(pending) + b"\n"
+            pending.clear()
+        pending.append(parts[-1])
+    if pending:
+        yield b"".join(pending)
 
 
 class MiniLoadBalancer:
@@ -139,17 +185,20 @@ class MiniLoadBalancer:
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if "return_logprob" in modified_request:
+            merge_replay = _needs_prefill_replay(modified_request, endpoint)
+            if "return_logprob" in modified_request or merge_replay:
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
 
                 # merge `meta_info.input_token_logprobs` from prefill to decode
-                if "meta_info" in ret_json:
+                if "return_logprob" in modified_request and "meta_info" in ret_json:
                     if "input_token_logprobs" in ret_json["meta_info"]:
                         ret_json["meta_info"]["input_token_logprobs"] = (
                             prefill_json["meta_info"]["input_token_logprobs"]
                             + ret_json["meta_info"]["input_token_logprobs"]
                         )
+                if merge_replay:
+                    _merge_prefill_replay(prefill_json, ret_json)
             else:
                 ret_json = await decode_response.json()
 
@@ -192,32 +241,39 @@ class MiniLoadBalancer:
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
-                if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
+                merge_replay = _needs_prefill_replay(modified_request, endpoint)
+                if modified_request.get("return_logprob", False) or merge_replay:
+                    prefill_by_index = {}
+                    async for chunk in _iter_sse_lines(prefill_response.content):
+                        if (
+                            chunk.startswith(b"data:")
+                            and chunk[5:].strip() != b"[DONE]"
+                        ):
+                            prefill_json = orjson.loads(chunk[5:])
+                            prefill_by_index[prefill_json.get("index")] = prefill_json
 
-                    first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    )
-                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
-
-                    async for chunk in decode_response.content:
+                    async for chunk in _iter_sse_lines(decode_response.content):
                         # Note: This is inefficient
                         # merge prefill input_token_logprobs, output_token_logprobs to decode
                         decoded_chunk = chunk.decode("utf-8")
                         if (
                             decoded_chunk
                             and decoded_chunk.startswith("data:")
-                            and "[DONE]" not in decoded_chunk
+                            and decoded_chunk[5:].strip() != "[DONE]"
                         ):
                             ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
-                            ret_json["meta_info"]["input_token_logprobs"] = (
-                                first_prefill_chunk_json["meta_info"][
-                                    "input_token_logprobs"
-                                ]
-                                + ret_json["meta_info"]["input_token_logprobs"]
+                            prefill_json = prefill_by_index.get(
+                                ret_json.get("index"), {}
                             )
+                            if modified_request.get("return_logprob", False):
+                                ret_json["meta_info"]["input_token_logprobs"] = (
+                                    prefill_json["meta_info"]["input_token_logprobs"]
+                                    + ret_json["meta_info"]["input_token_logprobs"]
+                                )
+                            if merge_replay and ret_json.get("meta_info", {}).get(
+                                "finish_reason"
+                            ):
+                                _merge_prefill_replay(prefill_json, ret_json)
 
                             yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
                         else:
