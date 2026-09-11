@@ -1024,11 +1024,9 @@ _STATE_VARLEN_SMALL_HEAD_CONFIG = helion.Config(
     range_unroll_factors=[0, 0],
 )
 
-# Track variants of the two varlen configs. The fp32 track snapshot adds one
-# load + one store mid-body, which would shift the positional indexing /
-# eviction lists above; separate kernels keep the non-track configs untouched.
-# Tracked batches are rare (prefix-cache checkpointing only), so these trade
-# the hand-tuned positional lists for plainly correct settings.
+# The fp32 track snapshot adds one load + one store mid-body, which would
+# shift the positional indexing / eviction lists above; tracked batches are
+# rare, so these use plainly correct settings over hand-tuned lists.
 _STATE_VARLEN_TRACK_CONFIG = helion.Config(
     atomic_indexing=[],
     block_sizes=[64],

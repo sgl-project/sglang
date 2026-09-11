@@ -869,12 +869,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
             and self.forward_metadata.track_ssm_h_src.numel() > 0
         ):
-            # fp32 scratch the kernel snapshots the tracked chunk-boundary
-            # states into (rows follow the batch; untracked rows stay unread).
-            # A kernel that does not declare support would leave the buffer
-            # unwritten and corrupt prefix-cache restores — fail loudly here.
-            # Check the kernel the dispatcher will actually run (safe-gate
-            # reroute included), not just the configured one.
+            # fp32 scratch for the kernel's tracked chunk-boundary snapshots
+            # (rows follow the batch; untracked rows stay unread). Assert on
+            # the kernel the dispatcher will actually run — safe-gate reroute
+            # included.
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
                 layer.lower_bound
             )

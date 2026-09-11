@@ -76,8 +76,7 @@ def _from_nvidia_kda_state_layout(
 
 
 class NvidiaKDAKernel(LinearAttnKernelBase):
-    # Tracked batches route to the embedded Triton fallback, which forwards
-    # the fp32 snapshot arguments (see _triton_extend).
+    # Snapshot support comes via the Triton fallback's kwargs forwarding.
     supports_track_state_snapshot: bool = True
 
     def __init__(self):
