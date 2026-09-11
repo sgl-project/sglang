@@ -670,6 +670,10 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    # Enable on both P and D with the same --sampling-mask-max-tokens value.
+    SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
+    # Retained only to reject the removed setting during startup.
+    SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
@@ -683,7 +687,6 @@ class Envs:
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
-    SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
     # pages/slot until the prefill acks the transfer drained, or the timeout
@@ -993,6 +996,21 @@ class Envs:
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # means each call site keeps its own default.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
+    # FlashInfer MegaMOE (generic moe_ep.MoEEpMegaLayer backend). Sizes the
+    # per-rank symmetric workspace; must be >= the largest padded per-rank batch
+    # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
+    SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
+    # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
+    # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
+    # region and can win at large batch, but makes the output accumulation order
+    # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
+    # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
+    SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
+    # Cross-rank combine wire format for the FlashInfer NVFP4 cutedsl MegaMOE
+    # kernel. "bf16" is exact/default; "mxfp8" and "nvfp4" reduce combine
+    # traffic with a small accuracy tradeoff and require FC2 reduce outside the
+    # kernel.
+    SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
