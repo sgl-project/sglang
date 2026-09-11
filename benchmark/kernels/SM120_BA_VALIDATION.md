@@ -28,6 +28,12 @@ The September 10 measurements below used source commit
 dependency environment. Later test-registration/documentation corrections do
 not change the kernel or dispatcher; they are not a new GPU measurement.
 
+The branch was subsequently rebased onto upstream
+`ad7f57c9ea796e64b1c244597a552d8a01ee60de` to satisfy the CI base-commit gate.
+The kernel and `unquant.py` are unchanged across that rebase, but other upstream
+code changed. The recorded full-model results therefore do not constitute a
+new full-model validation of that newer base.
+
 Hardware: TP2 RTX 5090. Tested checkpoint: Qwen3.8-27B NVFP4 RTX5090 export,
 with BF16 BA projections. Relevant settings: FP8 E4M3 KV, BF16 SSM, page size
 256, chunked prefill 4096, static memory fraction 0.85, max-running 8, Mamba
