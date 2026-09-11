@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
+from sglang.srt.layers.attention.qsa.mqa import HAS_TILELANG, qsa_mqa_decode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -119,3 +120,45 @@ def test_qsa_hip_aiter_varlen_matches_torch_reference():
         scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * scale
         expected = torch.einsum("hk,khd->hd", scores.softmax(dim=-1), values)
         torch.testing.assert_close(out[row].float(), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_qsa_hip_tilelang_decode_matches_production_shape():
+    """Exercise Qwen3.8's 4x128 indexer shape through the real ROCm MFMA path."""
+
+    if not (is_hip() and torch.cuda.is_available()):
+        pytest.skip("ROCm-only kernel")
+    if not HAS_TILELANG:
+        pytest.skip("TileLang is unavailable")
+
+    torch.manual_seed(2029)
+    device = torch.device("cuda")
+    batch, num_q_heads, head_dim = 4, 4, 128
+    page_size, max_pages = 64, 4
+    q = torch.randn(batch, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    cache = torch.randn(12, page_size, 1, head_dim, device=device, dtype=torch.bfloat16)
+    page_table = torch.tensor(
+        [[3, 1, 5, 8], [4, 2, 0, 9], [7, 6, 11, 10], [1, 8, 3, 5]],
+        device=device,
+        dtype=torch.int32,
+    )
+    context_lens = torch.tensor([1, 64, 130, 255], device=device, dtype=torch.int32)
+    max_model_len = page_size * max_pages
+
+    actual = qsa_mqa_decode(
+        q,
+        cache,
+        page_table,
+        context_lens,
+        max_model_len=max_model_len,
+    )
+    torch.cuda.synchronize()
+
+    gathered = cache[page_table.long(), :, 0].reshape(batch, max_model_len, head_dim)
+    expected = torch.einsum("bhd,bnd->bnh", q.float(), gathered.float())
+    expected = torch.relu(expected).sum(-1) / (head_dim**0.5)
+    positions = torch.arange(max_model_len, device=device).unsqueeze(0)
+    expected.masked_fill_(positions >= context_lens[:, None], -float("inf"))
+
+    finite = torch.isfinite(expected)
+    assert torch.equal(torch.isfinite(actual), finite)
+    torch.testing.assert_close(actual[finite], expected[finite], atol=5e-2, rtol=2e-2)
