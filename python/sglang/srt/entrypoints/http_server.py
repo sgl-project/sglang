@@ -772,6 +772,10 @@ async def model_info():
         "tool_call_parser": _global_state.tokenizer_manager.config_value(
             "tool_call_parser"
         ),
+        # The transport a client must speak to reach this server, alongside the
+        # tokenizer and sampling defaults it needs for the same reason.
+        # sgl-router reads it to pick a forwarding client per worker.
+        "enable_http2": get_serving().enable_http2,
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
