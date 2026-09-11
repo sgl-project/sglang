@@ -352,6 +352,178 @@ class TestDSV41DSparkPD(CustomTestCase):
                 "hidden",
             )
 
+    def test_cp_v2_engram_uses_local_input_ids(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4Model
+
+        local_input_ids = torch.arange(16)
+        local_input_ids[3] = 99
+        hidden_states = torch.zeros(16, 1, 4)
+        engram = Mock(return_value=torch.ones_like(hidden_states))
+        engram.layer_hash_index = 0
+
+        def forward_layer(**kwargs):
+            return kwargs["hidden_states"], torch.zeros_like(kwargs["hidden_states"])
+
+        model = object.__new__(DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(world_size=1)
+        model.config = SimpleNamespace(
+            model_type="deepseek_v41",
+            vision_n_layers=1,
+            image_token_id=99,
+        )
+        model.start_layer = 0
+        model.end_layer = 1
+        model.late_layer_start = None
+        model.engram_hasher = Mock(return_value=torch.zeros(128, 1, dtype=torch.int64))
+        model.engram_prefetch_stream = None
+        model.layers = [
+            SimpleNamespace(
+                engram=engram,
+                forward_hc_pre_from_prev=forward_layer,
+            )
+        ]
+        model.dspark_layers_to_capture = None
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(128),
+            forward_mode=SimpleNamespace(is_extend=lambda: True),
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=128),
+        )
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4.is_cp_v2_active",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.cp_shard_hidden_states",
+                return_value=local_input_ids,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.get_parallel",
+                return_value=SimpleNamespace(attn_cp_rank=2, attn_cp_size=8),
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.check_cuda_graph_backend",
+                return_value=True,
+            ),
+        ):
+            output, _, _ = model._forward_layers_hc_pre_from_prev(
+                positions=torch.arange(16),
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                input_ids=torch.arange(128),
+                input_ids_global=torch.arange(128),
+                capture_dspark=False,
+                dspark_aux_hidden_states=[],
+            )
+
+        torch.testing.assert_close(output[3], torch.zeros_like(output[3]))
+        torch.testing.assert_close(output[:3], torch.ones_like(output[:3]))
+        torch.testing.assert_close(output[4:], torch.ones_like(output[4:]))
+
+    def test_cp_v2_rebuilds_global_input_ids_for_decoder_replay(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+        from sglang.srt.models.deepseek_v4 import DeepseekV4Model
+
+        tail_cp_metadata = object()
+        tail = LateLayerTail(
+            token_indices=torch.tensor([2, 3]),
+            positions=torch.tensor([6, 7]),
+            extend_seq_lens=torch.tensor([4], dtype=torch.int32),
+            extend_seq_lens_cpu=[4],
+            swa_out_cache_loc=torch.tensor([4, 5, 6, 7]),
+            cp_metadata=tail_cp_metadata,
+            global_token_indices=torch.tensor([4, 5, 6, 7]),
+        )
+        seen_input_ids = []
+
+        def forward_layer(**kwargs):
+            seen_input_ids.append(
+                (kwargs["input_ids"].clone(), kwargs["input_ids_global"].clone())
+            )
+            return kwargs["hidden_states"], torch.ones_like(kwargs["hidden_states"])
+
+        model = object.__new__(DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(world_size=1)
+        model.config = SimpleNamespace(
+            model_type="deepseek_v41",
+            vision_n_layers=1,
+            image_token_id=99,
+        )
+        model.start_layer = 0
+        model.end_layer = 2
+        model.late_layer_start = 1
+        model.engram_hasher = None
+        model.engram_prefetch_stream = None
+        model.layers = [
+            SimpleNamespace(engram=None, forward_hc_pre_from_prev=forward_layer),
+            SimpleNamespace(engram=None, forward_hc_pre_from_prev=forward_layer),
+        ]
+        model.dspark_layers_to_capture = None
+        full_cp_metadata = object()
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: True,
+                is_extend_without_speculative=lambda: True,
+            ),
+            attn_cp_metadata=full_cp_metadata,
+            capture_hidden_mode=object(),
+            return_logprob=False,
+        )
+        backend = SimpleNamespace(
+            tail_forward_metadata=SimpleNamespace(late_layer_tail=tail),
+        )
+
+        def enter_late_layer_tail(batch):
+            batch.attn_cp_metadata = tail_cp_metadata
+            return object()
+
+        backend.enter_late_layer_tail = Mock(side_effect=enter_late_layer_tail)
+        backend.exit_late_layer_tail = Mock()
+        tail_global_input_ids = torch.tensor([4, 6, 5, 7])
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4.is_cp_v2_active",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.cp_shard_hidden_states",
+                return_value=torch.tensor([0, 2, 4, 6]),
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.cp_round_robin_input_ids_v2",
+                return_value=tail_global_input_ids,
+            ) as reorder,
+            patch(
+                "sglang.srt.models.deepseek_v4.get_attn_backend",
+                return_value=backend,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.check_cuda_graph_backend",
+                return_value=True,
+            ),
+        ):
+            model._forward_layers_hc_pre_from_prev(
+                positions=torch.arange(4),
+                hidden_states=torch.zeros(4, 1, 4),
+                forward_batch=forward_batch,
+                input_ids=torch.arange(8),
+                input_ids_global=torch.arange(8),
+                capture_dspark=False,
+                dspark_aux_hidden_states=[],
+            )
+
+        torch.testing.assert_close(
+            reorder.call_args.args[0], torch.tensor([4, 5, 6, 7])
+        )
+        self.assertIs(reorder.call_args.args[1].attn_cp_metadata, tail_cp_metadata)
+        torch.testing.assert_close(seen_input_ids[1][0], tail_global_input_ids)
+        torch.testing.assert_close(seen_input_ids[1][1], tail_global_input_ids)
+
     def test_cp_v2_preserves_decoder_replay_hidden_indices(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
         from sglang.srt.model_executor.runner.eager_runner import EagerRunner
