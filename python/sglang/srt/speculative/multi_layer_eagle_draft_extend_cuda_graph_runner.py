@@ -180,6 +180,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Disable parent paths that don't apply.
         self.compile_bs = []
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()

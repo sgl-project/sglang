@@ -32,7 +32,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         self._tree_draft_mode = tree_draft_width is not None
 
         if self._tree_draft_mode:
-            self.record_nolora_graph = False
             self._capture_spec_input_type = SpecInputType.UNO_DRAFT
             self._lora_state = UnoCudaGraphLoRAState(
                 model_runner.lora_manager,
@@ -52,7 +51,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         if self._tree_mode:
             # Capture exactly one base-model target graph.  The internal UNO
             # adapter is active only in the rejected F-wide draft phase.
-            self.record_nolora_graph = False
             model_runner.lora_manager.reset_lora_batch()
             kwargs.update(
                 attn_backend=model_runner.attn_backend,
@@ -64,7 +62,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             return
 
         forward_width = model_runner.decode_num_tokens_per_req()
-        self.record_nolora_graph = forward_width > 1
         self._capture_spec_input_type = SpecInputType.UNO_VERIFY
         self._lora_state = UnoCudaGraphLoRAState(
             model_runner.lora_manager,
@@ -72,7 +69,7 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             forward_width,
         )
         model_runner.lora_manager.reset_lora_batch()
-        super().__init__(model_runner, **kwargs)
+        super().__init__(model_runner, record_nolora_graph=forward_width > 1, **kwargs)
 
     def capture_prepare(self, size, stream_idx=None, num_tokens=None):
         forward_batch, attn_backend, pp_proxy_tensors = super().capture_prepare(

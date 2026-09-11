@@ -218,9 +218,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
-    attention_graph_variants: Optional[AttentionGraphVariants] = None
-    record_nolora_graph: bool = False
-
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -228,8 +225,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend=None,
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        record_nolora_graph: bool = False,
     ):
         super().__init__(model_runner)
+        self.record_nolora_graph = record_nolora_graph
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -302,8 +301,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
-        self.attention_graph_variants = create_attention_graph_variants(
-            model_runner.model_config.hf_config, self.capture_forward_mode
+        self.attention_graph_variants: Optional[AttentionGraphVariants] = (
+            create_attention_graph_variants(
+                model_runner.model_config.hf_config, self.capture_forward_mode
+            )
         )
 
         # --- bucket sizes ---------------------------------------------
@@ -1075,7 +1076,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.record_nolora_graph
             else [(None, None)]
         )
-        # Draft runners can reuse capture without initializing attention variants.
         variants = self.attention_graph_variants
         attention_variants = (
             variants.capture_labels if variants is not None else (None,)

@@ -111,6 +111,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()

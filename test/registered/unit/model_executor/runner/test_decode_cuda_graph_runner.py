@@ -314,7 +314,7 @@ class TestCaptureVariants(CustomTestCase):
                     ],
                 )
                 self.assertIsNone(capture_mode.get_capture_attention_variant())
-                del runner.attention_graph_variants
+                runner.attention_graph_variants = None
                 runner.record_nolora_graph = False
                 captured.clear()
                 runner.capture_one_shape = lambda size, forward, stream, lora: capture(
