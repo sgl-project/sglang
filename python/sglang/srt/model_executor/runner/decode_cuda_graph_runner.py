@@ -49,7 +49,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.attention.graph_variants import create_attention_graph_variants
+from sglang.srt.layers.attention.graph_variants import (
+    AttentionGraphVariants,
+    create_attention_graph_variants,
+)
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -214,6 +217,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     attention backend, two-batch-overlap plugin, DeepEP adapter, and the
     pluggable self.backend that handles the actual capture/replay.
     """
+
+    attention_graph_variants: Optional[AttentionGraphVariants] = None
+    record_nolora_graph: bool = False
 
     def __init__(
         self,
@@ -548,11 +554,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return num_tokens if self.ragged_verify_mode else bs
 
     def _resolve_attention_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
-        variants = getattr(self, "attention_graph_variants", None)
+        variants = self.attention_graph_variants
         return variants.select(forward_batch) if variants is not None else None
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
-        if not getattr(self, "record_nolora_graph", False):
+        if not self.record_nolora_graph:
             return None
         if forward_batch.lora_ids is not None and any(
             uid is not None for uid in forward_batch.lora_ids
@@ -1066,11 +1072,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
-            if getattr(self, "record_nolora_graph", False)
+            if self.record_nolora_graph
             else [(None, None)]
         )
         # Draft runners can reuse capture without initializing attention variants.
-        variants = getattr(self, "attention_graph_variants", None)
+        variants = self.attention_graph_variants
         attention_variants = (
             variants.capture_labels if variants is not None else (None,)
         )
