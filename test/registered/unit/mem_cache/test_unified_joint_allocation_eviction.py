@@ -205,11 +205,14 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                     kv_pool = bundle.token_to_kv_pool
                     full = allocator.full_attn_allocator
                     swa = allocator.swa_attn_allocator
+                    markers = slots.to(torch.float16).view(-1, 1, 1)
                     for layer in range(6):
                         member = full if layer < 4 else swa
                         kernel_ids = member.translate_kv_loc_for_kernel(slots)
-                        kv_pool.get_key_buffer(layer)[kernel_ids] = layer + 1
-                        kv_pool.get_value_buffer(layer)[kernel_ids] = layer + 11
+                        kv_pool.get_key_buffer(layer)[kernel_ids] = markers + 10 * layer
+                        kv_pool.get_value_buffer(layer)[kernel_ids] = (
+                            markers + 100 + 10 * layer
+                        )
                     # FULL-only bindings model tokens whose SWA window has retired.
                     extra = full.alloc(full.available_size() - 2)
                     self.assertIsNotNone(extra)
@@ -240,13 +243,14 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                         kernel_ids = member.translate_kv_loc_for_kernel(slots)
                         self.assertTrue(
                             torch.all(
-                                kv_pool.get_key_buffer(layer)[kernel_ids] == layer + 1
+                                kv_pool.get_key_buffer(layer)[kernel_ids]
+                                == markers + 10 * layer
                             )
                         )
                         self.assertTrue(
                             torch.all(
                                 kv_pool.get_value_buffer(layer)[kernel_ids]
-                                == layer + 11
+                                == markers + 100 + 10 * layer
                             )
                         )
                     self.assertFalse(allocator.verify_byte_accounting())
