@@ -5,8 +5,8 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
-    - cron: '0 */12 * * *' # rocm724: twice daily (UTC)
-    - cron: '30 17 * * *'  # rocm10/rocm720: once daily, aligned with ROCm 7.0
+    - cron: '0 */12 * * *' # rocm10: twice daily (UTC)
+    - cron: '30 17 * * *'  # rocm724/rocm720: once daily, aligned with ROCm 7.0
   pull_request:
     paths:
       - "python/**"
@@ -21,7 +21,7 @@ on:
         description: 'ROCm image version'
         required: false
         type: choice
-        default: rocm724
+        default: rocm10
         options:
           - rocm10
           - rocm724
@@ -95,7 +95,7 @@ on:
         description: 'ROCm image version'
         required: false
         type: string
-        default: rocm724
+        default: rocm10
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
@@ -165,11 +165,11 @@ jobs:
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
-      # Keep rocm724 on its existing twice-daily cadence. The 17:30 UTC
-      # schedule runs rocm10 and rocm720 once daily alongside the ROCm 7.0
+      # Keep rocm10 on the twice-daily cadence. The 17:30 UTC schedule runs
+      # rocm724 and rocm720 once daily alongside the ROCm 7.0
       # shadow workflow. Dispatch/call inputs select one version, while a
-      # pull_request falls through to the single rocm724 default.
-      rocm_versions: ${{ inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '30 17 * * *' && '["rocm10","rocm720"]' || '["rocm724"]' }}
+      # pull_request falls through to the single rocm10 default.
+      rocm_versions: ${{ inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '30 17 * * *' && '["rocm724","rocm720"]' || '["rocm10"]' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
