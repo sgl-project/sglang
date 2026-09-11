@@ -1172,21 +1172,22 @@ def prepare_segment_cu_seqlens(
 
 
 @functools.lru_cache(maxsize=8)
-def _identity_state_template(
-    n_slots: int, H: int, V: int, K: int, device: str
-) -> torch.Tensor:
+def _eye(K: int, device: str) -> torch.Tensor:
+    return torch.eye(K, device=device, dtype=torch.float32)
+
+
+def _zero_identity_state(n_slots: int, H: int, V: int, K: int, device) -> torch.Tensor:
     """[n_slots, H, V + K, K] fp32: rows [0, V) zero, rows [V, V + K) identity."""
     t = torch.zeros(n_slots, H, V + K, K, device=device, dtype=torch.float32)
-    t[:, :, V:, :] = torch.eye(K, device=device, dtype=torch.float32)
+    t[:, :, V:, :] = _eye(K, str(device))
     return t
 
 
 @tensor_cache
 def prepare_segment_plan(
+    cu_seqlens: torch.LongTensor,
     seg_cu_seqlens: torch.LongTensor,
     initial_state_indices: Optional[torch.Tensor],
-    N: int,
-    S: int,
 ):
     """Per-forward metadata of the segmented state pass (cached per object).
 
@@ -1195,8 +1196,11 @@ def prepare_segment_plan(
     stored s-major, ``s * N + n``, so per-segment slices are contiguous); the
     pool indices clamped at 0; a float mask of valid (``>= 0``) rows; their
     positions when some are invalid; and whether all rows are valid. The one
-    host sync (``valid.all()``) happens once per forward, not per layer.
+    host sync (``valid.all()``) happens once per forward, not per layer. Keyed
+    on tensor identity only (``tensor_cache`` compares arguments with ``is``).
     """
+    N = cu_seqlens.numel() - 1
+    S = (seg_cu_seqlens.numel() - 1) // N
     dev = seg_cu_seqlens.device
     n = torch.arange(N, device=dev, dtype=torch.int64)
     s = torch.arange(S, device=dev, dtype=torch.int64)
@@ -1251,12 +1255,12 @@ def _segmented_chunk_fwd_h(
     dev = kg.device
     seg_indices = prepare_chunk_indices(seg_cu_seqlens, chunk_size)
     slot_perm, idx0, valid_f, valid_pos, valid_all = prepare_segment_plan(
-        seg_cu_seqlens, initial_state_indices, N, S
+        cu_seqlens, seg_cu_seqlens, initial_state_indices
     )
 
     # Pass 1: [B_s | M_s] in one launch of state width V + K (slots s-major).
     u_ap = torch.cat([u, u.new_zeros(*u.shape[:-1], K)], dim=-1)
-    state_ap = _identity_state_template(N * S, H, V, K, str(dev)).clone()
+    state_ap = _zero_identity_state(N * S, H, V, K, dev)
     chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -1265,6 +1269,7 @@ def _segmented_chunk_fwd_h(
         initial_state=state_ap,
         initial_state_indices=slot_perm,
         save_new_value=False,
+        save_h=False,
         cu_seqlens=seg_cu_seqlens,
         chunk_indices=seg_indices,
         use_exp2=True,
