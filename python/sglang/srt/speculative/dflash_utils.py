@@ -17,6 +17,8 @@ from sglang.srt.layers.sampler import (
     top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
@@ -34,6 +36,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        "XPUAttentionBackend",
     }
 )
 
@@ -220,8 +223,7 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -413,6 +415,8 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
+    if sliding_window is None and is_nemotron_35_draft_config(config):
+        sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -463,6 +467,46 @@ def _get_dflash_config(config: Any) -> dict:
         return {}
 
 
+def is_nemotron_35_draft_config(config: Any) -> bool:
+    """Identify the published Nemotron 3.5 DFlash/DSpark draft layout.
+
+    Keep the non-anchor query layout and checkpoint-local vocabulary modules
+    scoped to this structurally distinct family instead of changing every
+    DFlash/DSpark checkpoint that happens to expose one of these fields.
+    """
+    architectures = _cfg_get(config, "architectures", None) or []
+    if not {"DFlashDraftModel", "Qwen3DSparkModel"}.intersection(architectures):
+        return False
+    if not bool(_cfg_get(config, "has_embed_tokens", False)):
+        return False
+    if bool(_cfg_get(config, "has_lm_head", False)):
+        return False
+
+    quant_config = _cfg_get(config, "quantization_config", None) or {}
+    if _cfg_get(quant_config, "quant_algo", None) != "W4A16_NVFP4":
+        return False
+
+    dflash_config = _get_dflash_config(config)
+    target_layer_ids = dflash_config.get(
+        "target_layer_ids", _cfg_get(config, "target_layer_ids", None)
+    )
+    aux_layer_ids = _cfg_get(config, "eagle_aux_hidden_state_layer_ids", None)
+    if not target_layer_ids or not aux_layer_ids:
+        return False
+    if len(target_layer_ids) != len(aux_layer_ids):
+        return False
+    if any(
+        int(target) + 1 != int(aux)
+        for target, aux in zip(target_layer_ids, aux_layer_ids)
+    ):
+        return False
+
+    sample_from_anchor = dflash_config.get(
+        "sample_from_anchor", _cfg_get(config, "sample_from_anchor", True)
+    )
+    return sample_from_anchor is False
+
+
 def _parse_optional_int(
     value: Any,
     *,
@@ -486,9 +530,24 @@ class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
+    conv_kernel_size: int
+    conv_group_size: int
+    selector_rank: int
+    selector_top_k: int
+    output_multiplier: float
+    final_logit_softcapping: Optional[float]
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    projector_type: Optional[str]
+    shift_label: Optional[bool]
+    pure_draft_prefix_len: Optional[int]
+    gru_hidden_dim: Optional[int]
+    emb_dim: Optional[int]
+
+    @property
+    def is_domino(self) -> bool:
+        return self.projector_type == "domino"
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -564,6 +623,44 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
+    conv_kernel_size = _parse_optional_int(
+        dflash_cfg.get("conv_kernel_size", 0),
+        field_name="DFLASH conv_kernel_size",
+        min_value=0,
+    )
+    conv_group_size = _parse_optional_int(
+        dflash_cfg.get("conv_group_size", 0),
+        field_name="DFLASH conv_group_size",
+        min_value=0,
+    )
+    if bool(conv_kernel_size) != bool(conv_group_size):
+        raise ValueError(
+            "DFLASH grouped convolution needs conv_kernel_size and conv_group_size "
+            f"together. Got conv_kernel_size={conv_kernel_size}, "
+            f"conv_group_size={conv_group_size}."
+        )
+    selector_rank = _parse_optional_int(
+        dflash_cfg.get("selector_rank", 0),
+        field_name="DFLASH selector rank",
+        min_value=0,
+    )
+    selector_top_k = _parse_optional_int(
+        dflash_cfg.get("selector_top_k", 0),
+        field_name="DFLASH selector top_k",
+        min_value=0,
+    )
+    if bool(selector_rank) != bool(selector_top_k):
+        raise ValueError(
+            "DFLASH selector needs rank and top_k together. "
+            f"Got rank={selector_rank}, top_k={selector_top_k}."
+        )
+
+    output_multiplier = float(dflash_cfg.get("output_multiplier", 1.0))
+    if output_multiplier <= 0:
+        raise ValueError("DFLASH output_multiplier must be positive.")
+    softcap = float(dflash_cfg.get("final_logit_softcapping") or 0.0)
+    final_logit_softcapping = softcap if softcap > 0 else None
+
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -611,14 +708,102 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    projector_type = dflash_cfg.get(
+        "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
+    )
+    shift_label = None
+    pure_draft_prefix_len = None
+    gru_hidden_dim = None
+    emb_dim = None
+    if projector_type == "domino":
+        shift_label = dflash_cfg.get(
+            "shift_label", _cfg_get(draft_hf_config, "shift_label", None)
+        )
+        pure_draft_prefix_len = _parse_optional_int(
+            dflash_cfg.get(
+                "pure_draft_prefix_len",
+                _cfg_get(draft_hf_config, "pure_draft_prefix_len", None),
+            ),
+            field_name="DFLASH Domino pure_draft_prefix_len",
+            min_value=0,
+        )
+        gru_hidden_dim = _parse_optional_int(
+            dflash_cfg.get(
+                "gru_hidden_dim", _cfg_get(draft_hf_config, "gru_hidden_dim", None)
+            ),
+            field_name="DFLASH Domino gru_hidden_dim",
+            min_value=1,
+        )
+        nested_emb_dim = _parse_optional_int(
+            dflash_cfg.get("emb_dim", None),
+            field_name="DFLASH Domino dflash_config.emb_dim",
+            min_value=1,
+        )
+        top_level_emb_dim = _parse_optional_int(
+            _cfg_get(draft_hf_config, "emb_dim", None),
+            field_name="DFLASH Domino top-level emb_dim",
+            min_value=1,
+        )
+        if (
+            nested_emb_dim is not None
+            and top_level_emb_dim is not None
+            and nested_emb_dim != top_level_emb_dim
+        ):
+            raise ValueError(
+                "DFLASH Domino emb_dim differs between dflash_config and the "
+                f"top-level config: {nested_emb_dim} != {top_level_emb_dim}."
+            )
+        emb_dim = nested_emb_dim if nested_emb_dim is not None else top_level_emb_dim
+
+        if not isinstance(shift_label, bool):
+            raise ValueError(
+                "DFLASH Domino requires dflash_config.shift_label to be a bool, "
+                f"got {shift_label!r}."
+            )
+        if pure_draft_prefix_len != 1:
+            raise ValueError(
+                "DFLASH Domino currently requires pure_draft_prefix_len=1, "
+                f"got {pure_draft_prefix_len!r}."
+            )
+        if gru_hidden_dim is None:
+            raise ValueError("DFLASH Domino requires dflash_config.gru_hidden_dim.")
+        if emb_dim is None:
+            raise ValueError("DFLASH Domino requires dflash_config.emb_dim.")
+        if block_size is not None and block_size <= 1:
+            raise ValueError(
+                f"DFLASH Domino requires block_size > 1, got {block_size}."
+            )
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
         block_size=block_size,
+        conv_kernel_size=conv_kernel_size,
+        conv_group_size=conv_group_size,
+        selector_rank=selector_rank,
+        selector_top_k=selector_top_k,
+        output_multiplier=output_multiplier,
+        final_logit_softcapping=final_logit_softcapping,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        projector_type=projector_type,
+        shift_label=shift_label,
+        pure_draft_prefix_len=pure_draft_prefix_len,
+        gru_hidden_dim=gru_hidden_dim,
+        emb_dim=emb_dim,
     )
+
+
+# is_floating_point() is True for fp8; list dtypes explicitly.
+_DENSE_HEAD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def is_dense_head_weight(weight: Any) -> bool:
+    """Whether an lm_head weight can be read as a plain matrix. A quantized head
+    stores packed values, which a dense matmul would read as if they were
+    activations."""
+    return weight is not None and weight.dtype in _DENSE_HEAD_DTYPES
 
 
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
@@ -789,8 +974,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape
@@ -810,56 +994,30 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.runtime_context import get_spec
-
         threshold_single = get_spec().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.runtime_context import get_spec
-
         threshold_acc = get_spec().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
     device = next_token_logits.device
 
-    if uniform_samples is None:
-        uniform_samples = torch.rand(
-            (bs, draft_token_num), dtype=torch.float32, device=device
+    if uniform_samples is not None and uniform_samples.shape != (bs, draft_token_num):
+        raise ValueError(
+            "uniform_samples shape mismatch. "
+            f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
         )
-    else:
-        if uniform_samples.shape != (bs, draft_token_num):
-            raise ValueError(
-                "uniform_samples shape mismatch. "
-                f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
-            )
-        uniform_samples = uniform_samples.to(device=device, dtype=torch.float32)
-
-    if uniform_samples_for_final_sampling is None:
-        uniform_samples_for_final_sampling = torch.rand(
-            (bs,), dtype=torch.float32, device=device
-        )
-    else:
-        if uniform_samples_for_final_sampling.shape != (bs,):
-            raise ValueError(
-                "uniform_samples_for_final_sampling shape mismatch. "
-                f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
-            )
-        uniform_samples_for_final_sampling = uniform_samples_for_final_sampling.to(
-            device=device,
-            dtype=torch.float32,
+    if (
+        uniform_samples_for_final_sampling is not None
+        and uniform_samples_for_final_sampling.shape != (bs,)
+    ):
+        raise ValueError(
+            "uniform_samples_for_final_sampling shape mismatch. "
+            f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
         )
 
-    target_probs = build_dflash_verify_target_probs(
-        next_token_logits=next_token_logits,
-        sampling_info=sampling_info,
-        draft_token_num=draft_token_num,
-        bs=bs,
-        max_top_k=max_top_k,
-        uniform_top_k_value=uniform_top_k_value,
-        use_sparse_topk=use_sparse_topk,
-    )
-    draft_probs = torch.zeros_like(target_probs)
-
+    # Cached across steps, and `correct_len` below aliases `accept_token_num`,
+    # so these must predate the borrow scope the next replay reclaims.
     (
         retrieve_index,
         retrieve_next_token,
@@ -872,25 +1030,59 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         draft_token_num=draft_token_num,
         device=device,
     )
-    candidates_i64 = (
-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
-    )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
+
+    # The full-vocabulary matrices die with this step, so their bytes may come
+    # from the graph pool's idle storage. Anything outliving the scope is not.
+    with borrow_graph_pool(user="DFLASH verify probabilities"):
+        if uniform_samples is None:
+            coins = torch.rand(
+                (bs, draft_token_num), dtype=torch.float32, device=device
+            )
+        else:
+            coins = uniform_samples.to(device=device, dtype=torch.float32)
+        if uniform_samples_for_final_sampling is None:
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
+        else:
+            coins_for_final_sampling = uniform_samples_for_final_sampling.to(
+                device=device,
+                dtype=torch.float32,
+            )
+
+        target_probs = build_dflash_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+            bs=bs,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+            use_sparse_topk=use_sparse_topk,
+        )
+        draft_probs = torch.zeros_like(target_probs)
+        candidates_i64 = (
+            candidates
+            if candidates.dtype == torch.int64
+            else candidates.to(torch.int64)
+        )
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+        )
+        del target_probs, draft_probs, candidates_i64
+        del coins, coins_for_final_sampling
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)

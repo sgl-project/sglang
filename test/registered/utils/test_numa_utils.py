@@ -20,15 +20,16 @@ from sglang.srt.utils.numa_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=7, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=6, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestIsNumaAvailable(unittest.TestCase):
     """Tests for _is_numa_available on both NUMA and non-NUMA systems."""
 
+    @patch("sglang.srt.utils.numa_utils._is_xpu", False)
     @patch("sglang.srt.utils.numa_utils._is_cuda", False)
-    def test_returns_false_when_not_cuda(self):
+    def test_returns_false_when_not_cuda_or_xpu(self):
         self.assertFalse(_is_numa_available())
 
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
@@ -65,6 +66,9 @@ class TestIsNumaAvailable(unittest.TestCase):
         mock_isdir.assert_called_with("/sys/devices/system/node/node1")
 
 
+# Pin _is_xpu=False so these cases still reach the mocked pynvml on a real XPU
+# host, where _query_numa_node_for_gpu short-circuits into the XPU sysfs branch.
+@patch("sglang.srt.utils.numa_utils._is_xpu", False)
 class TestQueryNumaNodeForGpu(unittest.TestCase):
     """Tests for _query_numa_node_for_gpu with mocked pynvml."""
 
@@ -196,12 +200,15 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
     def test_auto_bind_disabled_skips_numa_detection(self, mock_avail, mock_query):
         args = self._make_server_args(numa_node=None)
         for bind_v2 in ("0", "1"):
-            with self.subTest(bind_v2=bind_v2), patch.dict(
-                os.environ,
-                {
-                    "SGLANG_AUTO_NUMA_BIND": "0",
-                    "SGLANG_NUMA_BIND_V2": bind_v2,
-                },
+            with (
+                self.subTest(bind_v2=bind_v2),
+                patch.dict(
+                    os.environ,
+                    {
+                        "SGLANG_AUTO_NUMA_BIND": "0",
+                        "SGLANG_NUMA_BIND_V2": bind_v2,
+                    },
+                ),
             ):
                 self.assertIsNone(get_numa_node_if_available(args, 0))
         mock_avail.assert_not_called()

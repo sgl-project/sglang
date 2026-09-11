@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
+    ModelSlimW4A4MXFP4MoE,
     ModelSlimW4A8Int8MoE,
     ModelSlimW4A8MXFP4MoE,
     ModelSlimW8A8Int8,
@@ -163,9 +164,9 @@ class ModelSlimConfig(QuantizationConfig):
             if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
                 continue
             if rest.startswith("markov_head."):
-                alias = f"markov_head.{rest[len('markov_head.'):]}"
+                alias = f"markov_head.{rest[len('markov_head.') :]}"
             elif rest.startswith("confidence_head."):
-                alias = f"confidence_head.{rest[len('confidence_head.'):]}"
+                alias = f"confidence_head.{rest[len('confidence_head.') :]}"
             else:
                 mapped_rest = rest
                 if mapped_rest.startswith("attn."):
@@ -325,8 +326,7 @@ class ModelSlimConfig(QuantizationConfig):
                 return scheme_class(quant_config=self.quant_description, prefix=prefix)
 
         logger.warning(
-            f"Unsupported Linear modelslim scheme: "
-            f"{quant_schemes} in layer: {prefix}"
+            f"Unsupported Linear modelslim scheme: {quant_schemes} in layer: {prefix}"
         )
         return None
 
@@ -336,6 +336,7 @@ class ModelSlimConfig(QuantizationConfig):
         prefix: str,
     ):
         moe_quant_schemes = [
+            ("W4A4_MXFP4", ModelSlimW4A4MXFP4MoE),
             ("W4A8_MXFP", ModelSlimW4A8MXFP4MoE),
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
@@ -471,7 +472,6 @@ class ModelSlimConfig(QuantizationConfig):
 
 
 class ModelSlimLinearMethod(_NPULinearMethodBase):
-
     def __init__(self, quantization_config: ModelSlimConfig):
         self.quantization_config = quantization_config
 

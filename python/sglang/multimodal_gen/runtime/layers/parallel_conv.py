@@ -18,12 +18,14 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 if current_platform.is_cuda():
-    from sglang.kernels.ops.diffusion.causal_conv3d_cat_pad import (
+    from sglang.kernels.ops.diffusion import (
         can_use_fused_causal_conv3d_cat_pad_cuda,
-        fused_causal_conv3d_cat_pad_cuda,
     )
-    from sglang.kernels.ops.diffusion.triton.causal_conv3d_pad import (
+    from sglang.kernels.ops.diffusion import (
         fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
+    )
+    from sglang.kernels.ops.diffusion import (
+        fused_causal_conv3d_cat_pad_cuda,
     )
 else:
     can_use_fused_causal_conv3d_cat_pad_cuda = None
@@ -180,6 +182,11 @@ def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
         and x.is_contiguous(memory_format=torch.channels_last)
         and not x.is_contiguous()
     ):
+        return x.contiguous()
+    # Permuted views (e.g. the platform Conv2D fast path's NTCHW -> NCTHW
+    # permute) are neither contiguous nor channels-last; NCCL still needs a
+    # contiguous buffer for the height gather.
+    if not x.is_contiguous():
         return x.contiguous()
     return x
 
@@ -632,6 +639,9 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
+        # Set only by the ROCm Conv3D->Conv2D fast path, to swap the inner
+        # conv without displacing the halo exchange and output trim.
+        self._halo_conv_forward = None
         self.rank = get_decode_parallel_rank()
         self.world_size = get_decode_parallel_world_size()
 
@@ -655,10 +665,19 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
                 self.groups,
             )
 
+        # Bind ``super().forward`` lazily: doing it unconditionally costs two
+        # extra Dynamo frames per conv when the ROCm hook is what runs.  The
+        # hook is only ever installed on ROCm, so it doubles as the platform
+        # check.
+        if self._halo_conv_forward is not None:
+            conv_forward = self._halo_conv_forward
+        else:
+            conv_forward = super().forward
+
         return _spatial_parallel_conv_forward(
             self,
             x,
-            super().forward,
+            conv_forward,
             height_pad_mode="zeros",
             match_conv3d_format=True,
         )
@@ -710,6 +729,9 @@ class SpatialParallelConv3d(nn.Conv3d):
         _set_conv_padding(self, (self.padding[0], 0, self.padding[2]))
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
+        # Set only by the ROCm Conv3D->Conv2D fast path, to swap the inner
+        # conv without displacing the halo exchange and output trim.
+        self._halo_conv_forward = None
         self.rank = get_decode_parallel_rank()
         self.world_size = get_decode_parallel_world_size()
 
@@ -720,10 +742,19 @@ class SpatialParallelConv3d(nn.Conv3d):
         if any(self._padding):
             x = _pad_with_mode(x, self._padding, self.padding_mode)
 
+        # Bind ``super().forward`` lazily: doing it unconditionally costs two
+        # extra Dynamo frames per conv when the ROCm hook is what runs.  The
+        # hook is only ever installed on ROCm, so it doubles as the platform
+        # check.
+        if self._halo_conv_forward is not None:
+            conv_forward = self._halo_conv_forward
+        else:
+            conv_forward = super().forward
+
         return _spatial_parallel_conv_forward(
             self,
             x,
-            super().forward,
+            conv_forward,
             height_pad_mode=self.padding_mode,
             match_conv3d_format=True,
         )

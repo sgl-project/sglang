@@ -7,7 +7,7 @@ from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ChunkStatus(enum.Enum):
@@ -93,7 +93,7 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             },
         ]
         handle = _make_runtime_handle(responses)
-        obj = SimpleNamespace(rid="logical", batch_size=1, parallel_sample_num=2)
+        obj = SimpleNamespace(rid="logical", sampling_params={"n": 2})
 
         asyncio.run(
             handle._run_generate(

@@ -41,15 +41,20 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
-from sglang.srt.distributed import (
-    get_world_group,
+from sglang.srt.configs.model_config import (
+    REQUANTIZATION_METHODS,
+    ModelConfig,
+    is_qwen3_5_mtp_draft,
 )
+from sglang.srt.distributed import get_world_group
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
+)
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
 )
 from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
@@ -60,6 +65,7 @@ from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
     is_cpu,
+    is_hip,
     log_info_on_rank0,
     print_warning_once,
 )
@@ -258,6 +264,54 @@ def _resolve_explicit_draft_quant_config(
     return quant_config
 
 
+def _quark_draft_online_quant_config(
+    model_config: ModelConfig, hf_quant_config: dict
+) -> Optional[QuantizationConfig]:
+    """Explicit ``--speculative-draft-model-quantization quark_mxfp4`` on a Quark
+    checkpoint whose MTP/NextN draft experts were exported in bf16 (listed under
+    ``exclude``): quantize the draft's routed experts online to MXFP4 instead of
+    running them through the bf16 MoE path. Only the draft model is affected; the
+    target model keeps its serialized Quark scheme."""
+    if not (
+        model_config.is_draft_model
+        and model_config.is_draft_quantization_explicit
+        and model_config.quantization == "quark_mxfp4"
+        and hf_quant_config.get("quant_method") == "quark"
+        # ROCm + Qwen3.5 MTP draft only (validated combination); anything else is
+        # left exactly as before.
+        and is_hip()
+        and is_qwen3_5_mtp_draft(model_config.hf_config)
+    ):
+        return None
+    excluded = hf_quant_config.get("exclude") or []
+    if not any(str(name).startswith("mtp.layers.0.mlp.experts") for name in excluded):
+        return None
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    logger.info(
+        "Draft MTP experts are unquantized in the Quark checkpoint; "
+        "quantizing them online to MXFP4 (quark_mxfp4) for the draft model."
+    )
+    return QuarkConfig(online_scheme="quark_mxfp4", hf_config=model_config.hf_config)
+
+
+def _modelopt_quant_section(config: dict) -> dict:
+    """Return ModelOpt quant settings from nested or flat ``hf_quant_config.json``.
+
+    Nested LLM format::
+
+        {"quantization": {"quant_algo": "FP8", "exclude_modules": [...]}}
+
+    Flat format (``config.json`` ``quantization_config`` / Cosmos3-style exports)::
+
+        {"quant_algo": "FP8", "ignore": [...], "quant_method": "modelopt", ...}
+    """
+    quantization = config.get("quantization")
+    if isinstance(quantization, dict):
+        return quantization
+    return config
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -271,18 +325,9 @@ def get_quant_config(
     if model_config.quantization == "gguf":
         return quant_cls.from_config({})
 
-    # Read the quantization config from the HF model config, if available.
-    hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
-    # some vision model may keep quantization_config in their text_config
-    hf_text_config = getattr(model_config.hf_config, "text_config", None)
-    if hf_quant_config is None and hf_text_config is not None:
-        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
-    if hf_quant_config is None:
-        # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
-    if hf_quant_config is not None:
-        if not isinstance(hf_quant_config, dict):
-            hf_quant_config = hf_quant_config.to_dict()
+    checkpoint_quant_spec = resolve_checkpoint_quant_spec(model_config.hf_config)
+    if checkpoint_quant_spec is not None:
+        hf_quant_config = checkpoint_quant_spec.config
         # For modelopt_mixed, config.json's quantization_config may not
         # contain all runtime metadata. Fall through to the file-based
         # hf_quant_config.json path when the per-layer map or KV-cache
@@ -304,7 +349,11 @@ def get_quant_config(
             # This is only used by quantization methods that support requantization (e.g. from nvfp4/fp8 to mxfp4).
             if model_config.quantization in REQUANTIZATION_METHODS:
                 hf_quant_config["requantization_method"] = model_config.quantization
-
+            draft_online = _quark_draft_online_quant_config(
+                model_config, hf_quant_config
+            )
+            if draft_online is not None:
+                return draft_online
             return _resolve_explicit_draft_quant_config(
                 model_config, quant_cls.from_config(hf_quant_config)
             )
@@ -394,12 +443,17 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        quant_section = _modelopt_quant_section(config)
         if remap_prefix is not None:
-            exclude_modules = [
-                replace_prefix(key, remap_prefix)
-                for key in config["quantization"]["exclude_modules"]
-            ]
-            config["quantization"]["exclude_modules"] = exclude_modules
+            # Nested configs use ``exclude_modules``; flat ModelOpt exports use ``ignore``.
+            exclude_key = (
+                "exclude_modules" if "exclude_modules" in quant_section else "ignore"
+            )
+            if exclude_key in quant_section:
+                quant_section[exclude_key] = [
+                    replace_prefix(key, remap_prefix)
+                    for key in quant_section[exclude_key]
+                ]
         config["packed_modules_mapping"] = packed_modules_mapping
 
         if model_config.quantization == "bitsandbytes":
@@ -407,7 +461,7 @@ def get_quant_config(
         elif model_config.quantization.startswith("modelopt") and (
             config.get("producer", {}).get("name", "").startswith("modelopt")
         ):
-            quant_algo = config["quantization"]["quant_algo"]
+            quant_algo = quant_section.get("quant_algo")
             if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
                 if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
@@ -431,15 +485,19 @@ def get_quant_config(
         )
 
 
-def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
+def _check_index_files_exist(
+    snapshot_dir: str, allow_patterns: Optional[List[str]] = None
+) -> Tuple[bool, Optional[str]]:
     """
-    Check if all files listed in safetensors index files actually exist on disk.
+    Check if files listed in safetensors index files actually exist on disk.
 
     This catches cases where the snapshot directory exists but files are missing
-    (e.g., due to incomplete downloads or corrupted cache).
+    (e.g., due to incomplete downloads or corrupted cache). If allow_patterns is
+    provided, only indexed files matching those patterns are validated.
 
     Args:
         snapshot_dir: Path to the model snapshot directory
+        allow_patterns: Optional source patterns to scope validation.
 
     Returns:
         Tuple of (all_exist, error_message)
@@ -461,6 +519,15 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
             if not weight_map:
                 continue
             required_files = set(weight_map.values())
+            if allow_patterns is not None:
+                required_files = {
+                    fn
+                    for fn in required_files
+                    if any(
+                        fnmatch.fnmatch(fn.replace(os.sep, "/"), pattern)
+                        for pattern in allow_patterns
+                    )
+                }
             missing_files = [
                 fn
                 for fn in required_files
@@ -563,7 +630,9 @@ def _find_local_hf_snapshot_dir_unlocked(
     # Check for missing files from index (lightweight, for all users)
     # This catches incomplete downloads before they cause cryptic load errors
     if local_weight_files:
-        is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
+        is_complete, error_msg = _check_index_files_exist(
+            found_local_snapshot_dir, allow_patterns
+        )
         if not is_complete:
             log_info_on_rank0(
                 logger,
@@ -723,7 +792,10 @@ def download_safetensors_index_file_from_hf(
 # So, we use the index_file to
 # look up which safetensors files should be used.
 def filter_duplicate_safetensors_files(
-    hf_weights_files: List[str], hf_folder: str, index_file: str
+    hf_weights_files: List[str],
+    hf_folder: str,
+    index_file: str,
+    allow_patterns: Optional[List[str]] = None,
 ) -> List[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
@@ -747,9 +819,18 @@ def filter_duplicate_safetensors_files(
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
     # Fail fast if the index references shard files that are not on disk (e.g. an
-    # incomplete or interrupted download). Otherwise those shards are silently
-    # dropped and the model loads with uninitialized weights.
-    missing_files = sorted(f for f in weight_files_in_index if not os.path.isfile(f))
+    # incomplete or interrupted download). For subfolder-scoped loads, only
+    # validate the indexed shards that match the requested source patterns.
+    if allow_patterns is None:
+        files_to_validate = weight_files_in_index
+    else:
+        files_to_validate = set()
+        for f in weight_files_in_index:
+            rel_path = os.path.relpath(f, hf_folder).replace(os.sep, "/")
+            if any(fnmatch.fnmatch(rel_path, pattern) for pattern in allow_patterns):
+                files_to_validate.add(f)
+
+    missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
     if missing_files:
         raise RuntimeError(
             f"{index_file} references {len(missing_files)} shard file(s) missing "
@@ -980,7 +1061,7 @@ def _prefetch_all_checkpoints(
     succeeded_event = threading.Event()
     errors: List[Tuple[str, Exception]] = []
 
-    logger.info(
+    logger.debug(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
         "(background, %d local ranks sharing the work, %d threads per rank)...",
         local_rank,
@@ -1001,7 +1082,7 @@ def _prefetch_all_checkpoints(
             if total_for_rank > 0 and next_log_pct <= 100:
                 pct = 100 * completed / total_for_rank
                 while pct >= next_log_pct and next_log_pct <= 100:
-                    logger.info(
+                    logger.debug(
                         "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
                         local_rank,
                         next_log_pct,
@@ -1052,9 +1133,8 @@ def _prefetch_all_checkpoints(
         start = time.perf_counter()
         _prefetch_all()
         succeeded_event.set()
-        logger.info(
-            "Rank %d: prefetching checkpoint files into page cache "
-            "finished in %.2fs",
+        logger.debug(
+            "Rank %d: prefetching checkpoint files into page cache finished in %.2fs",
             local_rank,
             time.perf_counter() - start,
         )
@@ -1531,11 +1611,18 @@ def row_parallel_weight_loader(
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
+def sharded_weight_loader(
+    shard_axis: int,
+    tp_rank_getter=None,
+) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_parallel().attn_tp_rank
+        tp_rank = (
+            tp_rank_getter()
+            if tp_rank_getter is not None
+            else get_parallel().attn_tp_rank
+        )
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
@@ -1590,7 +1677,6 @@ def runai_safetensors_weights_iterator(
     device = device if is_distributed and is_cuda_alike() else "cpu"
 
     with SafetensorsStreamer() as streamer:
-
         streamer.stream_files(
             hf_weights_files,
             device=device,
@@ -1672,8 +1758,11 @@ def initialize_dummy_weights(
     is fixed, the random values generated by this function only depends on
     the parameter's number of elements and its data type.
     """
-    for param in model.state_dict().values():
+    for name, param in model.state_dict().items():
         if torch.is_floating_point(param):
+            if name.endswith("weight_scale_inv"):
+                param.fill_(1.0)
+                continue
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
             # Tensor subclasses such as MXFP8 wrappers expose a low-bit raw
@@ -1804,9 +1893,9 @@ class KVCacheQuantSchema(BaseModel):
                     f"{len(layer_maps)}."
                 )
             for i in range(tp_size):
-                assert (
-                    i in self.scaling_factor
-                ), f"KV cache scales map for TP rank {i} not found."
+                assert i in self.scaling_factor, (
+                    f"KV cache scales map for TP rank {i} not found."
+                )
         return self
 
     @model_validator(mode="after")
@@ -1954,9 +2043,9 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
             int(output_size / total_output_size * raw_output_size)
             for output_size in output_sizes
         ]
-        assert (
-            sum(weight_split_size) == raw_output_size
-        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        assert sum(weight_split_size) == raw_output_size, (
+            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        )
 
         split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
         for i, output_size in enumerate(output_sizes):

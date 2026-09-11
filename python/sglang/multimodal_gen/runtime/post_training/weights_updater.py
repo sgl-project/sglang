@@ -57,8 +57,12 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+)
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
     stack_or_compose_fused_lora,
 )
@@ -184,6 +188,7 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     and returns an HTTP error.
     """
     with torch.inference_mode():
+        restore_weight_snapshot(module)
         model_params = dict(module.named_parameters())
         weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
 
@@ -194,7 +199,13 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
             ]
 
         if offload_managers:
-            weight_dict = dict(weights_iter)
+            entries = list(weights_iter)
+            if any(shard_id is not None for _, _, shard_id in entries):
+                raise NotImplementedError(
+                    "Fused-parameter weight updates are not supported for "
+                    "layerwise-offloaded modules."
+                )
+            weight_dict = {n: w for n, w, _ in entries}
             offloaded_names: set[str] = set()
             for manager in offload_managers:
                 offloaded_names.update(manager.update_cpu_weights(weight_dict))
@@ -267,17 +278,22 @@ def _iter_module_weight_updates(
     weights_iter,
     model_params: dict,
 ):
+    """Yield (mapped_name, weight, shard_id); shard_id is the merge index for
+    weights that map into a fused parameter (e.g. q/k/v -> to_qkv), else None.
+    """
     map_name = _build_module_weight_name_mapper(module)
     module_name = type(module).__name__
 
     for name, loaded_weight in weights_iter:
         if name in model_params:
-            yield name, loaded_weight
+            yield name, loaded_weight, None
             continue
 
-        mapped_name = map_name(name)[0] if map_name is not None else name
+        mapped_name, merge_index = (
+            map_name(name) if map_name is not None else (name, None)
+        )
         if mapped_name in model_params:
-            yield mapped_name, loaded_weight
+            yield mapped_name, loaded_weight, merge_index
             continue
 
         logger.warning(
@@ -291,15 +307,21 @@ def _iter_module_weight_updates(
 def load_weights_into_model(
     weights_iter, model_params: dict, module_name: str | None = None
 ) -> None:
-    """Copy weights from weights_iter into model_params in-place."""
-    for name, loaded_weight in weights_iter:
+    """Copy weights into model_params in-place; entries are (name, weight) or
+    (name, weight, shard_id), shard_id routing fused parts via weight_loader."""
+    for entry in weights_iter:
+        name, loaded_weight, *rest = entry
+        shard_id = rest[0] if rest else None
         if name not in model_params:
             logger.warning("Skipping weight update: parameter %r not found", name)
             continue
         param = model_params[name]
         weight_loader = getattr(param, "weight_loader", None)
         if callable(weight_loader):
-            weight_loader(param, loaded_weight.to(param.dtype))
+            if shard_id is not None:
+                weight_loader(param, loaded_weight.to(param.dtype), shard_id)
+            else:
+                weight_loader(param, loaded_weight.to(param.dtype))
         else:
             dtensor_param = param if isinstance(param, DTensor) else None
             if dtensor_param is None and isinstance(
@@ -380,6 +402,16 @@ class WeightsUpdater:
             logger.error(error_msg)
             return False, error_msg
 
+        try:
+            for module_name, module in modules_to_update:
+                if isinstance(module, BaseDiT):
+                    module.validate_weight_update_source(
+                        weights_path=weights_map[module_name]
+                    )
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
         logger.info(
             f"Updating {len(weights_map)} modules: "
             + ", ".join(f"{n} <- {p}" for n, p in weights_map.items())
@@ -392,6 +424,14 @@ class WeightsUpdater:
                 self._module_weight_dirs[module_name] = weights_map[module_name]
             if target_modules is None:
                 self.pipeline.model_path = local_model_path
+            for module_name, module in modules_to_update:
+                if isinstance(module, BaseDiT):
+                    # Weight-derived caches must not survive a weight swap
+                    # (regardless of flush_cache, which only governs
+                    # optimization caches like TeaCache).
+                    module.refresh_weight_derived_caches(
+                        weights_path=weights_map[module_name]
+                    )
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -526,6 +566,14 @@ class WeightsUpdater:
             logger.error(str(e))
             return False, str(e)
 
+        try:
+            for _module_name, module in modules_to_update:
+                if isinstance(module, BaseDiT):
+                    module.validate_weight_update_source(weights_path=None)
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
         updated_modules: list[str] = []
         for module_name, module in modules_to_update:
             try:
@@ -541,6 +589,13 @@ class WeightsUpdater:
                 )
                 logger.error(error_msg, exc_info=True)
                 return False, error_msg
+
+        for module_name, module in modules_to_update:
+            if isinstance(module, BaseDiT):
+                # Same invariant as the disk path. Any model whose derived
+                # state needs an on-disk source rejected this update above, so
+                # what reaches here only has caches to drop.
+                module.refresh_weight_derived_caches(weights_path=None)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -603,6 +658,19 @@ class WeightsUpdater:
         if not pairs:
             return False, "No LoRA A/B tensor pairs found in payload"
 
+        dit_module = dict(modules_to_update).get(target_module)
+        if dit_module is None:
+            return False, f"No DiT module found for LoRA IPC target {target_module!r}"
+        if isinstance(dit_module, BaseDiT):
+            # Before convert_to_lora_layers() wraps anything: a layer the model
+            # cannot host is skipped as "unknown" further down, which would
+            # publish success for a partially applied adapter.
+            try:
+                dit_module.validate_lora_layers(list(pairs))
+            except ValueError as e:
+                logger.error(str(e))
+                return False, str(e)
+
         lora_pipeline: LoRAPipeline = self.pipeline
         if not lora_pipeline.lora_initialized:
             convert_target = (
@@ -627,10 +695,6 @@ class WeightsUpdater:
         except ValueError as e:
             logger.error(str(e))
             return False, str(e)
-
-        dit_module = dict(modules_to_update).get(target_module)
-        if dit_module is None:
-            return False, f"No DiT module found for LoRA IPC target {target_module!r}"
 
         updated = 0
         skipped = 0
