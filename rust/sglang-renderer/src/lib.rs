@@ -8,14 +8,15 @@
 //! shared services own request preparation, submission policy, and decoding.
 
 mod config;
-#[cfg(feature = "http")]
+// Shared serving code is compiled without HTTP; production adapters are optional.
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod engine;
 mod error;
 #[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "http")]
 mod launcher;
-#[cfg(feature = "http")]
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod openai;
 mod preprocessing;
 mod response;
@@ -24,7 +25,6 @@ mod runtime;
 mod types;
 
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
-#[cfg(feature = "http")]
 pub(crate) use engine::{
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
     MatchedStop, PositionLogprobs, TokenLogprob,
@@ -33,7 +33,6 @@ pub use error::{RendererError, RendererErrorKind};
 #[cfg(feature = "http")]
 pub use launcher::run_cli;
 pub(crate) use preprocessing::ChatFormatter;
-#[cfg(feature = "http")]
 pub(crate) use preprocessing::SamplingParamsOverrides;
 pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
 pub use preprocessing::{

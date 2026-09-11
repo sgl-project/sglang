@@ -13,7 +13,6 @@ http = [
     "dep:reqwest",
     "dep:tokio",
     "dep:tracing-subscriber",
-    "dep:uuid",
     "hf-hub/rustls-tls",
     "hf-hub/tokio",
 ]
@@ -32,7 +31,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
+uuid = { workspace = true }
 
 axum = { version = "0.8.9", features = ["json"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
@@ -49,6 +48,7 @@ regex-syntax = "=0.8.11"
 dynamo-tokenizers = "1.7.0"
 
 [dev-dependencies]
+tokio = { workspace = true }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 tower = { version = "0.5", features = ["util"] }

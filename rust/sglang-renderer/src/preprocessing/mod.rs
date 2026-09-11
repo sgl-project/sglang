@@ -16,11 +16,10 @@ pub use request::{
 };
 pub(crate) use request::{GenerateRequestIdentity, TextRequestGroup};
 pub use sampling::SamplingParams;
-#[cfg(feature = "http")]
 pub(crate) use sampling::SamplingParamsOverrides;
 pub use service::{PreparedChat, RendererService};
 pub(crate) use template::ChatFormatter;
-#[cfg(all(test, feature = "http"))]
+#[cfg(test)]
 pub(crate) fn load_test_chat_formatter(name: &str) -> ChatFormatter {
     template::load_chat_formatter(None, None, Some(name)).unwrap()
 }

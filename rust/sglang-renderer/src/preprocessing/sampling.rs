@@ -200,7 +200,6 @@ pub struct SamplingParams {
 /// request schemas. Keeping these outside Dynamo's DTO prevents dependency
 /// omissions from silently changing SGLang request behavior.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[cfg(any(feature = "http", test))]
 pub struct SamplingParamsOverrides {
     #[serde(default)]
     pub top_k: Option<i64>,
@@ -228,7 +227,6 @@ pub struct SamplingParamsOverrides {
     pub custom_params: Option<serde_json::Value>,
 }
 
-#[cfg(any(feature = "http", test))]
 impl SamplingParamsOverrides {
     pub fn apply(self, params: &mut SamplingParams) {
         if let Some(value) = self.top_k {
