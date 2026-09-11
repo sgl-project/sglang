@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     QwenImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 
 def prepare_mu(batch: Req, server_args: ServerArgs):

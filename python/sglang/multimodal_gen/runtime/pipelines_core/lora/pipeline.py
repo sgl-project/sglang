@@ -23,6 +23,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+    weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -300,9 +304,10 @@ class LoRAPipeline(ComposedPipelineBase):
         # Record every target, including coarse component offload. The current
         # coarse path can already materialize the full component here, and the
         # planner must preserve that phase if it later chooses layerwise mode.
+        residency_manager = getattr(self, "component_residency_manager", None)
         residency_transition = (
-            self.component_residency_manager.full_weight_transition(module_names)
-            if self.component_residency_manager is not None
+            residency_manager.full_weight_transition(module_names)
+            if residency_manager is not None
             else nullcontext()
         )
 
@@ -311,6 +316,12 @@ class LoRAPipeline(ComposedPipelineBase):
             if torch.get_device_module().is_available():
                 torch.get_device_module().synchronize()
                 torch.get_device_module().empty_cache()
+
+            # snapshot-offloaded components merge into their restored weights
+            for module_name in module_names:
+                module = self.modules.get(module_name)
+                if isinstance(module, torch.nn.Module):
+                    restore_weight_snapshot(module)
 
             offload_disabled_modules = []
             for module_name in offloaded_module_names:
@@ -337,6 +348,11 @@ class LoRAPipeline(ComposedPipelineBase):
             if any(layer.merged for layer in lora_layers_dict.values()):
                 return True
             module = self.modules.get(module_name)
+            if (
+                isinstance(module, torch.nn.Module)
+                and weight_snapshot(module) is not None
+            ):
+                return True
             if module is not None and is_layerwise_offloaded_module(module):
                 return True
         return False
