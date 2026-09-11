@@ -907,6 +907,7 @@ class GenerateReqInput:
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
+            background=self.background,
             return_hidden_states=(
                 self.return_hidden_states[i]
                 if isinstance(self.return_hidden_states, list)
