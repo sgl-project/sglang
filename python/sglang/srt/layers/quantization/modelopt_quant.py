@@ -2952,11 +2952,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # tuple). Defer per-attribute access to the branches that actually
         # consume them.
         activation = self.moe_runner_config.activation
-        # Resolved once in create_weights and cached here. Dispatch MUST use this, not
-        # the live global: under speculative decoding the global is the draft model's
-        # backend (--speculative-moe-runner-backend), so a global read disagrees with
-        # this layer's own backend, falls through to the NotImplementedError below, and
-        # then reports this cached value -- naming the backend already in use.
+        # Use the cached backend: the global differs under speculative decoding.
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
