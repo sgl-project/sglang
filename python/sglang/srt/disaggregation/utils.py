@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -71,6 +71,10 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
         return 0
+    # QSA models reuse the same flag for their draft-side index sharing but
+    # carry no DSA seed metadata over PD.
+    if not is_deepseek_dsa(hf_config):
+        return 0
     return get_dsa_mtp_topk_width(hf_config)
 
 
@@ -85,13 +89,8 @@ def get_dsv4_c4_state_indices(
     *,
     ring_size: int,
 ) -> np.ndarray:
-    """Return physical rows for the live C4 compressor history.
-
-    Prefill and decode may use different C4 ring sizes (8 without speculative
-    decoding and 16 with EAGLE/MTP).  State transfer must therefore pair rows
-    by logical token position instead of copying a whole request-local bank.
-    The C4 overlap compressor keeps ``seq_len % 4 + 4`` live rows.
-    """
+    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
+    # pair the overlap compressor's live rows by logical token position.
     if ring_size < 8 or ring_size % 4 != 0:
         raise ValueError(
             f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
@@ -325,18 +324,14 @@ class MetadataBuffers:
         size: int,
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
+        max_sampling_mask_tokens: int,
         max_top_logprobs_num: int = 128,
-        max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
-        if max_sampling_mask_tokens is None:
-            max_sampling_mask_tokens = (
-                envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
-            )
-        self.enable_sampling_mask = max_sampling_mask_tokens > 0
+        self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -419,38 +414,23 @@ class MetadataBuffers:
             self.output_token_logprobs_idx,
             self.output_top_logprobs_val,
             self.output_top_logprobs_idx,
+            self.output_token_sampling_mask_len,
+            self.output_token_sampling_mask_idx,
+            self.output_token_sampling_logprobs,
+            self.output_topk_p,
+            self.output_topk_index,
+            self.output_hidden_states,
         ]
-        if self.enable_sampling_mask:
-            bufs.extend(
-                [
-                    self.output_token_sampling_mask_len,
-                    self.output_token_sampling_mask_idx,
-                    self.output_token_sampling_logprobs,
-                ]
-            )
-        bufs.extend(
-            [
-                self.output_topk_p,
-                self.output_topk_index,
-                self.output_hidden_states,
-            ]
-        )
         if self.output_dsa_topk_indices is not None:
             bufs.append(self.output_dsa_topk_indices)
         bufs.append(self.bootstrap_room)
+        bufs = [buf for buf in bufs if buf is not None]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
-        sampling_mask_len = None
-        sampling_mask_idx = None
-        sampling_logprobs = None
-        if self.enable_sampling_mask:
-            sampling_mask_len = self.output_token_sampling_mask_len[idx].clone()
-            sampling_mask_idx = self.output_token_sampling_mask_idx[idx].clone()
-            sampling_logprobs = self.output_token_sampling_logprobs[idx].clone()
         return (
             self.output_ids[idx].clone(),
             self.cached_tokens[idx].clone(),
@@ -458,9 +438,21 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
-            sampling_mask_len,
-            sampling_mask_idx,
-            sampling_logprobs,
+            (
+                self.output_token_sampling_mask_len[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_mask_idx[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_logprobs[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
@@ -528,11 +520,6 @@ class MetadataBuffers:
                     device="cpu",
                 )
         if req.return_sampling_mask:
-            if not self.enable_sampling_mask:
-                raise RuntimeError(
-                    "return_sampling_mask with disaggregation requires "
-                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-                )
             # Sentinel -1: the decode side records None for this handoff token.
             self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
             sampling_masks = req.output_token_sampling_mask
@@ -547,7 +534,7 @@ class MetadataBuffers:
                         raise RuntimeError(
                             f"Sampling mask length {mask_len} exceeds disaggregation "
                             f"metadata capacity {max_mask_len}. Increase "
-                            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
+                            "--sampling-mask-max-tokens."
                         )
                     self.output_token_sampling_mask_len[req.metadata_buffer_index][
                         0
@@ -1284,10 +1271,6 @@ def setup_state_kv_args(
     total_kv_layers: int = None,
     req_to_token_pool=None,
 ) -> None:
-    """Populate ``kv_args`` state-buffer fields from the given pool.
-    Shared by prefill and decode bootstrap paths so the state_type dispatch
-    lives in one place.
-    """
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -1381,14 +1364,14 @@ def setup_state_kv_args(
                         ring_lens,
                         ring_item_lens,
                     )
-            if hasattr(token_to_kv_pool, "get_c128_state_buf_infos"):
+            if hasattr(token_to_kv_pool, "get_request_state_buf_infos"):
                 c128_ptrs, c128_lens, c128_item_lens = (
-                    token_to_kv_pool.get_c128_state_buf_infos()
+                    token_to_kv_pool.get_request_state_buf_infos()
                 )
                 if c128_ptrs:
                     append_state_component(
                         kv_args,
-                        StateType.C128_STATE,
+                        StateType.DSV4_REQUEST_STATE,
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
@@ -1466,7 +1449,10 @@ def setup_state_kv_args(
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
-                kv_args.total_kv_layers = total_kv_layers
+                kv_args.hidden_kv_layers = total_kv_layers
+                kv_args.draft_kv_layers = (
+                    draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
+                )
             else:
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
