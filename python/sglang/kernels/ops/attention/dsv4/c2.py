@@ -37,6 +37,7 @@ def _jit_c2_module(head_dim: int, rope_dim: int = 64, page_size: int = 128) -> M
         cuda_wrappers=[
             ("decode", f"FlashC2DecodeKernel<{args}>::run_decode"),
             ("decode_fusion", f"FlashC2DecodeKernel<{args}>::run_decode_fusion"),
+            ("verify_fusion", f"FlashC2DecodeKernel<{args}>::run_verify_fusion"),
         ],
     )
 
@@ -148,5 +149,61 @@ def c2_decode_norm_rope_store(
         freqs_cis,
         k_cache,
         int(ring_size),
+    )
+    return out
+
+
+def c2_verify_norm_rope_store(
+    kv_input: torch.Tensor,
+    kv_state: torch.Tensor,
+    norm_weight: torch.Tensor,
+    positions: torch.Tensor,
+    req: torch.Tensor,
+    raw_out_loc: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    k_cache: torch.Tensor,
+    *,
+    page_size: int,
+    ring_size: int,
+    draft_len: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``c2_decode_norm_rope_store`` for a target-verify block.
+
+    A block is ``draft_len`` rows of one request at consecutive positions, laid
+    out request-major, so every row but the first pairs with the row before it
+    in ``kv_input`` rather than through the ring. Reading the in-block partner
+    from the input is what makes that safe: the row that publishes it into the
+    ring belongs to the same launch, with nothing ordering the two. The block's
+    first row does read the ring, at the slot before the block's own, which the
+    launch cannot reach while ``ring_size > draft_len`` -- a precondition the
+    kernel checks and ``get_compress_state_ring_size`` satisfies by
+    construction.
+
+    Nothing else changes, the pair state included: replaying a block one
+    position at a time through ``c2_decode_norm_rope_store`` gives the same
+    latents, the same ring and the same cache bytes.
+
+    :param draft_len: rows per request, ``speculative_num_draft_tokens``.
+    """
+    num_tokens, fused_dim = kv_input.shape
+    head_dim = fused_dim // 2
+    if out is None:
+        out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
+
+    _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size).verify_fusion(
+        kv_input,
+        kv_state,
+        out,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        float(eps),
+        freqs_cis,
+        k_cache,
+        int(ring_size),
+        int(draft_len),
     )
     return out

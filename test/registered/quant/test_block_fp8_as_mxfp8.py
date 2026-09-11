@@ -104,6 +104,83 @@ class TestLinearNumerics(_OptInCase):
     SHAPES = [(1792, 5120), (5120, 576)]
     MS = [1, 17, 300]
 
+    def test_fused_wo_a_quantized_input(self):
+        from flashinfer import mxfp8_quantize
+
+        from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
+            _quantize_partial,
+            _wo_a_reduce,
+            wo_a_bf16_small_batch,
+            wo_a_bf16_small_batch_mxfp8,
+        )
+        from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+
+        method = Fp8LinearMethod(_block32_config())
+        w = torch.randn(5120, 2048, device=DEVICE, dtype=torch.bfloat16) / 2048**0.5
+        qweight, scale = _quant_block32(w)
+        layer = _build_layer(method, qweight, scale)
+        for rows in range(2, 9):
+            for magnitude in (0.0, 1e-37, 1e-7, 1.0, 448.0, 1e10):
+                partial = torch.randn(8, rows, 2, 1024, device=DEVICE) * magnitude
+                bf16 = torch.empty(rows, 2048, dtype=torch.bfloat16, device=DEVICE)
+                _wo_a_reduce[(rows * 8,)](partial, bf16, rows * 2048, num_warps=4)
+                expected_q, expected_s = mxfp8_quantize(bf16, True, alignment=32)
+                actual_q, actual_s = _quantize_partial(partial)
+                torch.testing.assert_close(
+                    actual_q.view(torch.uint8),
+                    expected_q.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
+                actual = method.apply(layer, Mxfp8SwizzledInput(actual_q, actual_s))
+                expected = method.apply(layer, bf16)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+            x = torch.randn(rows, 64, 512, device=DEVICE, dtype=torch.bfloat16)[
+                :, :16
+            ].view(rows, 2, 4096)
+            wo_a = (
+                torch.randn(2, 1024, 4096, device=DEVICE, dtype=torch.bfloat16) * 0.02
+            )
+            bf16 = wo_a_bf16_small_batch(x, wo_a).flatten(1)
+            q, s = wo_a_bf16_small_batch_mxfp8(x, wo_a)
+            expected_q, expected_s = mxfp8_quantize(bf16, True, alignment=32)
+            torch.testing.assert_close(
+                q.view(torch.uint8), expected_q.view(torch.uint8), rtol=0, atol=0
+            )
+            torch.testing.assert_close(s, expected_s, rtol=0, atol=0)
+
+        # Ordinary block-FP8 tuples must retain their existing dispatch path.
+        sentinel = torch.empty(0)
+        with patch.object(
+            method, "w8a8_block_fp8_linear", return_value=sentinel
+        ) as legacy:
+            self.assertIs(method.apply(layer, (q, s)), sentinel)
+            legacy.assert_called_once()
+
+        partial = torch.randn(8, 6, 2, 1024, device=DEVICE)
+        _quantize_partial(partial)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            q, s = _quantize_partial(partial)
+            output = method.apply(layer, Mxfp8SwizzledInput(q, s))
+        for _ in range(3):
+            partial.normal_()
+            # The replay must regenerate scale padding as well as live rows.
+            s.fill_(255)
+            graph.replay()
+            bf16 = torch.empty(6, 2048, dtype=torch.bfloat16, device=DEVICE)
+            _wo_a_reduce[(48,)](partial, bf16, 6 * 2048, num_warps=4)
+            eq, es = mxfp8_quantize(bf16, True, alignment=32)
+            torch.testing.assert_close(
+                q.view(torch.uint8), eq.view(torch.uint8), rtol=0, atol=0
+            )
+            torch.testing.assert_close(s, es, rtol=0, atol=0)
+            torch.testing.assert_close(
+                output, method.apply(layer, bf16), rtol=0, atol=0
+            )
+
     def test_against_dequantized_reference(self):
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
