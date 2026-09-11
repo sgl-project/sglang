@@ -372,17 +372,11 @@ export const config = {
   ],
 
   dockerImages: {
-    // One release for the whole page. Every SM12x recipe (RTX PRO 6000,
-    // RTX 5090, DGX Spark) is measured on it; the H200 and GB300 recipes were
-    // validated on earlier builds and carry over unchanged. Multi-arch
-    // (linux/amd64 + linux/arm64), so it pulls natively on DGX Spark's GB10.
-    // This tag and v0.5.19-cu130 are the same image (same digest); the sweep
-    // ran the -cu130 name.
-    h200:    "lmsysorg/sglang:v0.5.19",
-    rtx6000: "lmsysorg/sglang:v0.5.19",
-    rtx5090: "lmsysorg/sglang:v0.5.19",
-    "dgx-spark": "lmsysorg/sglang:v0.5.19",
-    gb300:   "lmsysorg/sglang:v0.5.19",
+    h200:    "lmsysorg/sglang:latest",
+    rtx6000: "lmsysorg/sglang:latest",
+    rtx5090: "lmsysorg/sglang:latest",
+    "dgx-spark": "lmsysorg/sglang:latest",
+    gb300:   "lmsysorg/sglang:latest",
   },
 
   github: {
