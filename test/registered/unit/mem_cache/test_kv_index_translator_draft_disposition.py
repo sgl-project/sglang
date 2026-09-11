@@ -436,10 +436,10 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         self.assertIsNone(passthrough.full_v2p_table)
 
     def test_multi_step_containers_read_the_plans_table(self):
-        """Every `generate_draft_decode_kv_indices` launch must gather from
-        `read_source` with its entry granularity. A launch over raw
-        req_to_token emits VIRTUAL ids, which the fused draft pool cannot
-        address -- silent garbage drafts."""
+        """Every `generate_draft_decode_kv_indices` launch, and every launch of
+        its sliding-window sibling, must gather from `read_source` with its
+        entry granularity. A launch over raw req_to_token emits VIRTUAL ids,
+        which the fused draft pool cannot address -- silent garbage drafts."""
         import pathlib
         import re
 
@@ -449,7 +449,9 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         launching = {}
         for path in sorted(root.glob("*.py")):
             text = path.read_text()
-            launches = len(re.findall(r"generate_draft_decode_kv_indices\[", text))
+            launches = len(
+                re.findall(r"generate_draft_decode_(?:window_)?kv_indices\[", text)
+            )
             if launches:
                 launching[path.name] = (
                     launches,
