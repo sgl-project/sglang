@@ -1,197 +1,172 @@
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 import queue
 import threading
 from enum import Enum, auto
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional
 
-_Key = Union[int, str]
+import zmq
 
-from torch.distributed import TCPStore
-
-from sglang.srt.utils.network import get_free_port, get_local_ip_auto
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_local_ip_auto,
+    get_zmq_socket,
+    get_zmq_socket_on_host,
+)
 
 logger = logging.getLogger(__name__)
-
-_FLUSH_DONE_PREFIX = "pp_consensus_flush_done"
 
 
 class _OpKind(Enum):
     PUT = auto()
     DELETE = auto()
-    FLUSH = auto()
-    SHUTDOWN = auto()
 
 
 class PPConsensusStore:
-    """Cross-PP-rank key/value store backed by TCPStore for bootstrap consensus."""
+    """A map that replicates metadata to PP rank 0.
+
+    All ranks may use this as a normal Dict, e.g. ``store["key"] = value`` or ``del store["key"]``.
+    All modifications done by all ranks are replicated to rank 0 in background.  Rank 0 calls
+    ``collect`` to retrieve values of all ranks for the specified key.
+    """
 
     def __init__(self, pp_size: int, pp_rank: int, pp_group) -> None:
-        self.pp_size = pp_size
-        self.pp_rank = pp_rank
-        self.pp_group = pp_group
-        self._local_cache: Dict[str, Any] = {}
+        self._pp_size = pp_size
+        self._pp_rank = pp_rank
+        self._pp_group = pp_group
+        self._local_map: Dict[Any, Any] = {}
+        self._peer_map: Dict[int, Dict[Any, Any]] = {}
         self._cache_lock = threading.Lock()
-        self._pending_queue: queue.Queue = queue.Queue()
-        self._flush_seq = 0
-        self._store, host, port = self._init_tcp_store()
-        logger.info(
-            "PPConsensusStore rank=%d connected to %s:%d",
-            pp_rank,
-            host,
-            port,
-        )
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
-        self._worker.start()
+        self._replication_queue: Optional[queue.Queue] = None
+        self._zmq_ctx: Optional[zmq.Context] = None
+        self._socket: Optional[zmq.Socket] = None
+        self._init_zmq()
+        if self._pp_rank > 0:
+            self._replication_queue = queue.Queue()
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
 
-    def _init_tcp_store(self) -> Tuple[TCPStore, str, int]:
-        if self.pp_rank == 0:
+    def _init_zmq(self) -> None:
+        self._zmq_ctx = zmq.Context()
+        # PP0 listens.
+        if self._pp_rank == 0:
             host = get_local_ip_auto()
-            port = get_free_port()
-            store = TCPStore(
-                host_name=host,
-                port=port,
-                world_size=self.pp_size,
-                is_master=True,
-                wait_for_workers=False,
+            port, self._socket = get_zmq_socket_on_host(
+                self._zmq_ctx, zmq.PULL, host=host
             )
             store_info = (host, port)
+            logger.info("PPConsensusStore is listening at %s:%d", host, port)
         else:
             store_info = None
-        store_info = self.pp_group.broadcast_object(store_info, src=0)
-        host, port = store_info
-        if self.pp_rank > 0:
-            store = TCPStore(
-                host_name=host,
-                port=port,
-                world_size=self.pp_size,
-                is_master=False,
+
+        # Broadcast our zmq host and port to other ranks.
+        host, port = self._pp_group.broadcast_object(store_info, src=0)
+
+        # PP>0 connects to PP0.
+        if self._pp_rank > 0:
+            self._socket = get_zmq_socket(
+                self._zmq_ctx,
+                zmq.PUSH,
+                NetworkAddress(host, port).to_tcp(),
+                bind=False,
             )
-        return store, host, port
+            logger.info("PPConsensusStore connected to %s:%d", host, port)
 
-    @staticmethod
-    def _normalize_key(key: _Key) -> str:
-        return str(key)
+    def _maybe_replicate_to_rank0(self, op: tuple) -> None:
+        if self._pp_rank > 0:
+            self._replication_queue.put(op)
 
-    def _store_key(self, pp_rank: int, key: _Key) -> str:
-        return f"pp_{pp_rank}/{self._normalize_key(key)}"
-
-    def _worker_loop(self) -> None:
-        logger.debug("worker loop")
-        while True:
-            op = self._pending_queue.get()
-            try:
-                if op[0] == _OpKind.SHUTDOWN:
-                    return
-                if op[0] == _OpKind.PUT:
-                    _, key, value = op
-                    logger.debug(f"put {key} = {value}")
-                    self._store.set(
-                        self._store_key(self.pp_rank, key), pickle.dumps(value)
-                    )
-                elif op[0] == _OpKind.DELETE:
-                    _, key = op
-                    store_key = self._store_key(self.pp_rank, key)
-                    try:
-                        self._store.delete_key(store_key)
-                    except Exception:
-                        # Key may already be absent; treat as success.
-                        pass
-                elif op[0] == _OpKind.FLUSH:
-                    _, done_event = op
-                    self._run_flush_barrier()
-                    done_event.set()
-            finally:
-                self._pending_queue.task_done()
-
-    def _run_flush_barrier(self) -> None:
-        self._flush_seq += 1
-        seq = self._flush_seq
-        self._store.set(f"{_FLUSH_DONE_PREFIX}/{self.pp_rank}/{seq}", b"1")
-        wait_keys = [
-            f"{_FLUSH_DONE_PREFIX}/{rank}/{seq}" for rank in range(self.pp_size)
-        ]
-        self._store.wait(wait_keys)
-
-    def put(self, key: _Key, value: Any) -> None:
-        key = self._normalize_key(key)
+    def pop(self, key: Any, default: Any = None) -> Any:
         with self._cache_lock:
-            self._local_cache[key] = value
-            self._pending_queue.put((_OpKind.PUT, key, value))
-
-    def delete(self, key: _Key) -> None:
-        key = self._normalize_key(key)
-        with self._cache_lock:
-            self._local_cache.pop(key, None)
-            self._pending_queue.put((_OpKind.DELETE, key))
-
-    def pop(self, key: _Key, default: Any = None) -> Any:
-        key = self._normalize_key(key)
-        with self._cache_lock:
-            if key not in self._local_cache:
+            if key not in self._local_map:
                 return default
-            value = self._local_cache.pop(key)
-            self._pending_queue.put((_OpKind.DELETE, key))
+            value = self._local_map.pop(key)
+            self._maybe_replicate_to_rank0((_OpKind.DELETE, self._pp_rank, key))
         return value
 
-    def get(self, key: _Key, default: Any = None) -> Any:
-        key = self._normalize_key(key)
+    def get(self, key: Any, default: Any = None) -> Any:
         with self._cache_lock:
-            return self._local_cache.get(key, default)
+            return self._local_map.get(key, default)
 
-    def __contains__(self, key: object) -> bool:
-        if not isinstance(key, (int, str)):
-            return False
-        key = self._normalize_key(key)
+    def __contains__(self, key: Any) -> bool:
         with self._cache_lock:
-            return key in self._local_cache
+            return key in self._local_map
 
-    def flush(self) -> None:
-        done_event = threading.Event()
-        self._pending_queue.put((_OpKind.FLUSH, done_event))
-        done_event.wait()
-
-    def get_local_rank(self, key: _Key) -> Any:
-        key = self._normalize_key(key)
+    def __getitem__(self, key: Any) -> Any:
         with self._cache_lock:
-            return self._local_cache.get(key)
+            return self._local_map[key]
 
-    def get_all_ranks(self, key: _Key) -> List[Any]:
-        values: List[Any] = []
-        for rank in range(self.pp_size):
-            store_key = self._store_key(rank, key)
-            if not self._store.check([store_key]):
-                values.append(None)
-                continue
-            logger.debug(f"get {store_key}")
-            raw = self._store.get(store_key)
-            if not raw:
-                values.append(None)
-                continue
-            values.append(pickle.loads(raw))
-        return values
-
-    def multiget_all_ranks(self, keys: List[_Key]) -> Dict[str, List[Any]]:
-        return {self._normalize_key(key): self.get_all_ranks(key) for key in keys}
-
-    def __getitem__(self, key: _Key) -> Any:
-        key = self._normalize_key(key)
+    def __setitem__(self, key: Any, value: Any) -> None:
         with self._cache_lock:
-            if key not in self._local_cache:
+            self._local_map[key] = value
+            self._maybe_replicate_to_rank0((_OpKind.PUT, self._pp_rank, key, value))
+
+    def __delitem__(self, key: Any) -> None:
+        with self._cache_lock:
+            if key not in self._local_map:
                 raise KeyError(key)
-            return self._local_cache[key]
-
-    def __setitem__(self, key: _Key, value: Any) -> None:
-        self.put(key, value)
-
-    def __delitem__(self, key: _Key) -> None:
-        key = self._normalize_key(key)
-        if key not in self:
-            raise KeyError(key)
-        self.delete(key)
+            self._local_map.pop(key)
+            self._maybe_replicate_to_rank0((_OpKind.DELETE, self._pp_rank, key))
 
     def close(self) -> None:
-        self._pending_queue.put((_OpKind.SHUTDOWN,))
-        self._worker.join(timeout=5)
+        if self._pp_rank > 0:
+            self._replication_queue.put(None)
+        self._zmq_ctx.term()  # This blocks until all zmq socket closed.
+        self._worker_thread.join()
+
+    def _worker_loop(self) -> None:
+        try:
+            if self._pp_rank == 0:
+                self._recv_loop()
+            else:
+                self._send_loop()
+        except zmq.error.ContextTerminated:
+            pass  # Raised by close().
+        except Exception as e:
+            logger.critical(
+                "PPConsensusStore background thread crashed: %s",
+                e,
+            )
+            for handler in logger.handlers:
+                handler.flush()
+            os._exit(1)
+        finally:
+            self._socket.close(linger=0)
+
+    def _recv_once(self) -> None:
+        op = pickle.loads(self._socket.recv())
+        if op[0] == _OpKind.PUT:
+            _, rank, key, value = op
+            logger.debug("recv put rank=%s %s = %s", rank, key, value)
+            with self._cache_lock:
+                self._peer_map.setdefault(rank, {})[key] = value
+        elif op[0] == _OpKind.DELETE:
+            _, rank, key = op
+            logger.debug("recv delete rank=%s %s", rank, key)
+            with self._cache_lock:
+                self._peer_map.get(rank, {}).pop(key, None)
+
+    def _recv_loop(self) -> None:
+        assert self._pp_rank == 0
+        while True:
+            self._recv_once()
+
+    def _send_loop(self) -> None:
+        assert self._pp_rank > 0
+        while True:
+            op = self._replication_queue.get()
+            if op is None:  # A signal for shutdown.
+                return
+            logger.debug("send %s", op)
+            self._socket.send(pickle.dumps(op))
+
+    def collect(self, key: Any) -> List[Any]:
+        assert self._pp_rank == 0, "collect can only be used on PP rank 0"
+        with self._cache_lock:
+            values: List[Any] = [self._local_map.get(key)]
+            for rank in range(1, self._pp_size):
+                values.append(self._peer_map.get(rank, {}).get(key))
+            return values

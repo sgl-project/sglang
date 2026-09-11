@@ -217,10 +217,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
-        if self.pp_size > 1 and disaggregation_mode == DisaggregationMode.PREFILL:
-            self.request_status = PPConsensusStore(
-                self.pp_size, self.pp_rank, self.pp_group
-            )
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
