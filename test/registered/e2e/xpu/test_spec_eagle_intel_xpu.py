@@ -1,4 +1,4 @@
-"""intel_xpu attention backend (EAGLE3 topk=1 chain + EAGLE/Llama-2 spec)."""
+"""intel_xpu attention backend (EAGLE3 topk=1 chain + EAGLE/Llama-3.1 spec)."""
 
 import unittest
 
@@ -12,7 +12,7 @@ from sglang.test.kits.spec_server_kits import (
     SpecLogprobKit,
     SpecPenaltyKit,
 )
-from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
+from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama3Base
 
 register_xpu_ci(est_time=1800, suite="nightly-xpu-1-gpu", nightly=True)
 
@@ -36,10 +36,10 @@ class TestEagle3IntelXPU(
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
-class TestEagleLlama2IntelXPU(
-    EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit, SpecHiddenStatesKit
+class TestEagleLlama3IntelXPU(
+    EagleLlama3Base, SpecAccuracyKit, SpecFeatureKit, SpecHiddenStatesKit
 ):
-    """EAGLE/Llama-2 on intel_xpu using the supported topk = 1 paged config."""
+    """EAGLE/Llama-3.1 on intel_xpu using the supported topk = 1 paged config."""
 
     attention_backend = "intel_xpu"
     spec_topk = 1

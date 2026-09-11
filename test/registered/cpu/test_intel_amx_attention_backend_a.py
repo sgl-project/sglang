@@ -9,7 +9,6 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.run_eval import run_eval
-from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -107,11 +106,11 @@ class TestDPAttention(CustomTestCase):
             eval_name="gsm8k",
             num_examples=32,
             num_threads=32,
-            max_tokens=512,
+            max_tokens=2048,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_gsm8k_eval(args)
+        metrics = run_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
         self.assertGreater(metrics["accuracy"], 0.7)

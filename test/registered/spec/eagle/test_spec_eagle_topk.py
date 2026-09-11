@@ -1,4 +1,4 @@
-"""topk > 1 tree drafting at page_size=1 (EAGLE3 topk16 + EAGLE/Llama-2 topk8).
+"""topk > 1 tree drafting at page_size=1 (EAGLE3 topk16 + EAGLE/Llama-3.1 topk8).
 
 flashinfer is pinned because this runs on the cheap (5090) runner, where fa3
 (Hopper-only) isn't available -- functional sanity only, no perf/stress.
@@ -18,7 +18,7 @@ from sglang.test.kits.spec_server_kits import (
     SpecLogprobKit,
     SpecPenaltyKit,
 )
-from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
+from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama3Base
 
 register_cuda_ci(est_time=876, stage="base-b", runner_config="1-gpu-small")
 
@@ -50,8 +50,8 @@ class TestEagle3Topk16(
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
-class TestEagleLlama2Suite(
-    EagleLlama2Base,
+class TestEagleLlama3Suite(
+    EagleLlama3Base,
     SpecCorrectnessKit,
     SpecAccuracyKit,
     SpecLogprobKit,
@@ -59,7 +59,7 @@ class TestEagleLlama2Suite(
     SpecFeatureKit,
     AbortAllMixin,
 ):
-    """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases).
+    """EAGLE/Llama-3.1 topk=8 full coverage (kits listed in bases).
 
     Hosts AbortAllMixin: aborting mid-decode has to release the tree draft
     state, and the strict mem check below turns a leak into a failure. It needs
@@ -70,14 +70,14 @@ class TestEagleLlama2Suite(
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
-class TestEagleLlama2Chunked4(EagleLlama2Base, SpecCorrectnessKit):
+class TestEagleLlama3Chunked4(EagleLlama3Base, SpecCorrectnessKit):
     """Correctness under tiny chunked prefill."""
 
     chunked_prefill_size = 4
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
-class TestEagleLlama3TokenMap(EagleLlama2Base, SpecAccuracyKit):
+class TestEagleLlama3TokenMap(EagleLlama3Base, SpecAccuracyKit):
     """EAGLE on Llama-3-8B with a FR-Spec token map (topk=4)."""
 
     model = "meta-llama/Meta-Llama-3-8B-Instruct"

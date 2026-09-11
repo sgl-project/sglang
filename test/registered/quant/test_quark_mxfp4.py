@@ -160,12 +160,13 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             # Weights initialized on meta device (not for dense BF16->MXFP4)
             assert peak_memory_before_load < 5
 
-    def _test_gsm8k(self, accuracy_threshold, *, max_tokens=512):
+    def _test_gsm8k(self, accuracy_threshold, *, max_tokens=2048):
         """Helper method to test GSM8K accuracy against a threshold."""
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=500,
             max_tokens=max_tokens,
+            sgl_eval_thinking=False if self.model.startswith("Qwen/Qwen3") else None,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),

@@ -203,7 +203,7 @@ class SpecAccuracyKit:
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=512,
+            max_tokens=2048,
             num_examples=self.gsm8k_num_examples,
             num_threads=128,
         )

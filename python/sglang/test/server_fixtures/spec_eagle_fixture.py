@@ -19,9 +19,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_DRAFT_MODEL_EAGLE3,
-    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -235,11 +233,11 @@ class Eagle3Base(SpecEagleServerBase):
     gsm8k_accept_len_thres = 1.3
 
 
-class EagleLlama2Base(SpecEagleServerBase):
-    """EAGLE (Llama-2) config preset. topk=8 tree -> synchronous path; gsm8k is low."""
+class EagleLlama3Base(SpecEagleServerBase):
+    """EAGLE (Llama-3.1 Instruct) config preset with a synchronous topk=8 tree."""
 
-    model = DEFAULT_TARGET_MODEL_EAGLE
-    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    draft_model = "yuhuili/EAGLE-LLaMA3.1-Instruct-8B"
     spec_algo = "EAGLE"
     spec_steps = 5
     spec_topk = 8
@@ -247,7 +245,7 @@ class EagleLlama2Base(SpecEagleServerBase):
     attention_backend = "flashinfer"
     chunked_prefill_size = 128
     mem_fraction_static = 0.7
-    gsm8k_score_thres = 0.20
+    gsm8k_score_thres = 0.7
     acc_length_thres = 3.0
     batch_accept_len_thres = 1.8
     # topk>1 tree verify runs on the synchronous (non-overlap) path.

@@ -15,7 +15,7 @@ from sglang.test.kits.spec_server_kits import (
     SpecPenaltyKit,
     SpecPerfKit,
 )
-from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
+from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama3Base
 
 register_cuda_ci(est_time=281, stage="base-b", runner_config="1-gpu-large")
 
@@ -33,15 +33,15 @@ class TestEagle3Fa3(Eagle3Base, SpecAccuracyKit, SpecLogprobKit):
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
-class TestEagleLlama2Fa3Page256(
-    EagleLlama2Base,
+class TestEagleLlama3Fa3Page256(
+    EagleLlama3Base,
     SpecAccuracyKit,
     SpecLogprobKit,
     SpecPenaltyKit,
     SpecPerfKit,
     SpecFeatureKit,
 ):
-    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256, overlap off."""
+    """EAGLE/Llama-3.1 topk=5 tree on fa3 + page_size=256, overlap off."""
 
     spec_topk = 5
     spec_steps = 8
