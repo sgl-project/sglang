@@ -365,6 +365,9 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
     for token, value in subpattern:
         if token in {
             sre_parse.LITERAL,  # `value` is any one character
+            # A single-character negated class: the parser emits NOT_LITERAL rather
+            # than IN, so `[^a]` reaches here while `[^ab]` arrives as IN.
+            sre_parse.NOT_LITERAL,  # Any one character other than `value`
             sre_parse.IN,  # Any character within `value`
             sre_parse.ANY,  # "."
         }:
