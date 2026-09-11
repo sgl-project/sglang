@@ -26,6 +26,14 @@ constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
 constexpr int32_t HASH_EMPTY = -1;
 
+// Planned copy's own item body (64B-aligned read + batched loads) exists only
+// where it was measured: CUDA sm120. This macro is the single arch gate, so no
+// function below carries an arch branch -- where it is undefined the body is not
+// compiled at all and copy_cache_planned_kernel falls through to copy_miss_item.
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define SGLANG_HISPARSE_PLANNED_ALIGNED_BODY 1
+#endif
+
 // Knuth multiplicative hash for open-addressing table of size hash_size.
 __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
   return ((uint32_t)key * 2654435761u) % (uint32_t)hash_size;
@@ -164,6 +172,113 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
   }
 }
+
+#ifdef SGLANG_HISPARSE_PLANNED_ALIGNED_BODY
+// Bulk of one item: kChunksInFlight 16B chunks per lane issued before any store.
+// `off` is how far the read base was rounded down to hit a 64B boundary, `skip ==
+// off/16` the leading chunks belonging to the previous item (loaded, never
+// stored), `last == skip + item_bytes/16` the exact end. No `volatile` and no
+// "memory" clobber on purpose: those block the very hoisting this shape is for.
+template <int kChunksInFlight>
+__device__ __forceinline__ void
+transfer_item_warp_unrolled(int32_t lane_id, const void* src_addr, void* dst_addr, int off, int skip, int last) {
+  const uint64_t* __restrict__ src = reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) - off);
+  uint64_t* __restrict__ dst = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) - off);
+  for (int j = lane_id; j < last; j += WARP_SIZE * kChunksInFlight) {
+    uint64_t lo[kChunksInFlight], hi[kChunksInFlight];
+#pragma unroll
+    for (int u = 0; u < kChunksInFlight; ++u) {
+      const int jj = j + u * WARP_SIZE;
+      if (jj < last) {
+        const uint64_t* s = src + jj * 2;
+        asm("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo[u]), "=l"(hi[u]) : "l"(s));
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kChunksInFlight; ++u) {
+      const int jj = j + u * WARP_SIZE;
+      if (jj >= skip && jj < last) {
+        uint64_t* d = dst + jj * 2;
+        asm("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo[u]), "l"(hi[u]));
+      }
+    }
+  }
+}
+
+// Copy one item host->device with one warp, reading from a 64B-aligned base.
+// CALLED ONLY FROM copy_cache_planned_kernel's linear branch; not reachable from
+// copy_miss_item, which stays on transfer_item_warp bit for bit.
+//
+// Root cause of the 4-18x collapse it fixes: sysmem fill granularity is 64B and
+// coalescing happens only WITHIN one instruction, so a `v2.b64` load (32 lanes x
+// 16B = 512B = 8 sectors) lands on sector boundaries only if its base is 64B
+// aligned. item_size_bytes is a per-token stride, so at 656B (GLM-5.2 NVFP4 with
+// fp8_e4m3 KV) item starts cycle through offsets {16,32,48} and one 64B unit is
+// requested twice -- +1 sector in 8, i.e. +12% of traffic. The 12% is not the
+// cost; the second request queueing behind an in-flight fill of the same unit
+// is, and how much that costs is up to the SASS issue schedule. Measured at
+// grid=4 x 1024 on sm_120, same bytes/addresses/instruction count per row:
+//
+//                                   640B (off 0)  656B (off 16)   ratio
+//   misaligned, ptxas's own U=1        116.8us       1577.7us     13.51x
+//   misaligned, U=4 ld desc            116.9          537.5        4.60x
+//   misaligned, U=4 ld asc             116.9          192.3        1.64x
+//   ALIGNED,    U=4 ld asc             116.9          127.2        1.09x
+//
+// 640B is 117us under every schedule; 656B spans 8.2x, and load direction alone
+// is 2.8x. That is why H200 and per-request never collapsed: ptxas picked a
+// different order. Aligning the base is the fix because it removes the order
+// sensitivity (2.8x spread -> 1.02x) and lands on the wire ratio 704/656 =
+// 1.07x, which is the ceiling at that stride. Residual: 528B/544B stay ~1.35x
+// (33-34 chunks over 32 lanes = a second trip 3-6% occupied, which no unroll can
+// fill); not production strides.
+//
+// Scope is part of the fix -- two costs it would impose on other callers: the
+// rounded-down read is real wire traffic at any stride that is not a multiple of
+// 64, and U=4 holds 8 more 64-bit registers, which the fused swap-in kernel's
+// shared-memory LRU state has no measured budget for.
+//
+// Memory safety: reads stay in [src & ~63, src + item_size_bytes) -- `last` is
+// exact, so nothing past the item is touched, and rounding down stays within one
+// 64B unit so it cannot cross a page. Stores are bounded by `j >= skip`, so the
+// leading chunks have no store instruction at all. One precondition invisible
+// from the code: at src_loc == 0 with a base that is not 64B aligned the read
+// starts below host_cache's first byte -- still inside the allocation, since an
+// allocation base is at least 64B aligned. Production never reaches it (host
+// pool is layer_first, one page-aligned pinned allocation per layer); a
+// non-64B-aligned slice view as host_cache would.
+__device__ __forceinline__ void
+transfer_item_warp_planned(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
+  const int total_pairs = item_size_bytes / 16;
+
+  // Rounding the read base down shifts the store address by the same `off`, so
+  // it stays 16B aligned only when off is a multiple of 16, i.e. when the stride
+  // is. A stride of 8 mod 16 keeps the unaligned base and only gets the unroll.
+  const int off = (item_size_bytes % 16 == 0) ? static_cast<int>(reinterpret_cast<uintptr_t>(src_addr) & 63) : 0;
+  const int skip = off / 16;
+  const int last = skip + total_pairs;
+  // Smallest unroll whose single trip covers the item: a warp covers 32*U chunks
+  // per trip, and a stride landing just past that pays a full round trip for a
+  // near-empty lane mask. A fixed U=2 cost 1088B 264 vs 199us this way; U=8 is
+  // noise at the lengths it fits and worse at the ones it does not.
+  if (last <= 2 * WARP_SIZE) {
+    transfer_item_warp_unrolled<2>(lane_id, src_addr, dst_addr, off, skip, last);
+  } else {
+    transfer_item_warp_unrolled<4>(lane_id, src_addr, dst_addr, off, skip, last);
+  }
+
+  // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
+  const int tail_8B = (item_size_bytes - total_pairs * 16) / 8;
+  if (tail_8B > 0 && lane_id < tail_8B) {
+    const uint64_t* __restrict__ src8 =
+        reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
+    uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
+    uint64_t tmp;
+    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
+    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
+  }
+}
+#endif  // SGLANG_HISPARSE_PLANNED_ALIGNED_BODY
 #endif
 
 __device__ __forceinline__ int popc_mask(BallotMask mask) {
@@ -876,15 +991,33 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
       for (int m = m0; m < cnt; m += total_warps) {
         // Timing probe: the plan is still walked; only the bytes stay put.
         if constexpr (SkipIO) continue;
-        copy_miss_item<IsMLA, IsDsv4Layout>(
-            lane_id,
-            host_cache_k,
-            host_cache_v,
-            device_buffer_k,
-            device_buffer_v,
-            src_row[m],
-            static_cast<int64_t>(dst_row[m]),
-            item_size_bytes);
+        const int64_t src_loc = src_row[m];
+        const int64_t dst_loc = static_cast<int64_t>(dst_row[m]);
+#ifdef SGLANG_HISPARSE_PLANNED_ALIGNED_BODY
+        // Linear layout on sm120: this kernel owns its item body, so the
+        // 64B-aligned read lives here and nowhere else. `loc * item_size_bytes`
+        // is the layout contract copy_miss_item's generic path also spells out;
+        // DSv4's page-padded C4 addressing is not that, so it falls through.
+        if constexpr (!IsDsv4Layout) {
+          transfer_item_warp_planned(
+              lane_id,
+              static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes,
+              static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes,
+              item_size_bytes);
+          if constexpr (!IsMLA) {
+            transfer_item_warp_planned(
+                lane_id,
+                static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes,
+                static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes,
+                item_size_bytes);
+          }
+        } else
+#endif
+        {
+          // DSv4, plus every configuration with no aligned body (ROCm, pre-sm120).
+          copy_miss_item<IsMLA, IsDsv4Layout>(
+              lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src_loc, dst_loc, item_size_bytes);
+        }
       }
       start += cnt;
     }
