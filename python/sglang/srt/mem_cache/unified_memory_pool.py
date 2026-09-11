@@ -432,11 +432,7 @@ class UnifiedKVPool:
         self._bs1_floor_terms = bs1_floor_terms or []
         self.fused_draft = fused_draft
         for spec in sub_pool_specs:
-            expected = (
-                fused_draft.region
-                if fused_draft is not None and spec.name == "full"
-                else None
-            )
+            expected = None if fused_draft is None else fused_draft.region(spec.name)
             assert spec.draft_region is expected, (
                 f"sub-pool {spec.name!r}: draft_region {spec.draft_region} does "
                 f"not match the fused draft placement's {expected}"
@@ -1552,7 +1548,7 @@ def init_unified_mamba_pools(
             qk_rope_head_dim=qk_rope_head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
-            draft_region=None if fused_draft is None else fused_draft.region,
+            draft_region=None if fused_draft is None else fused_draft.region("full"),
         )
     else:
         full_spec = MHASubPoolSpec(
@@ -1564,7 +1560,7 @@ def init_unified_mamba_pools(
             store_dtype=store_dtype,
             kv_cache_dtype=kv_cache_dtype,
             grow_direction="down",
-            draft_region=None if fused_draft is None else fused_draft.region,
+            draft_region=None if fused_draft is None else fused_draft.region("full"),
         )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
@@ -1576,6 +1572,7 @@ def init_unified_mamba_pools(
         temporal_dtype=cp.dtype.temporal,
         conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
+        draft_region=None if fused_draft is None else fused_draft.region("mamba"),
     )
     if unified_total_bytes is not None:
         # PROFILED byte budget for the token side (captured pre-ratio-floor);
@@ -2051,10 +2048,10 @@ def init_unified_swa_pools(
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack.
 
-    With ``fused_draft``, every entry of the "full" sub-pool carries the
-    draft model's K/V parts after the host parts, and each draft runner
-    binds a `UnifiedDraftKVPool` over its own lanes instead of allocating a
-    pool of its own.
+    With ``fused_draft``, every entry of a sub-pool the placement names
+    carries the draft model's K/V parts after the host parts, and each draft
+    runner binds a `UnifiedDraftKVPool` over its own lanes instead of
+    allocating a pool of its own.
     """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWATokenToKVPoolAllocator,
@@ -2081,7 +2078,7 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
-        draft_region=None if fused_draft is None else fused_draft.region,
+        draft_region=None if fused_draft is None else fused_draft.region("full"),
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -2092,6 +2089,7 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="up",
+        draft_region=None if fused_draft is None else fused_draft.region("swa"),
     )
     legacy_allocator_capacities = {}
     if total_bytes is None:
@@ -2251,8 +2249,9 @@ def init_unified_mamba_swa_pools(
 
     Sizing inputs are the same token counts the 2-pool factories take (ratio-
     fed until the byte configurator lands); the buffer budget is their byte
-    sum and the runtime split floats. With ``fused_draft``, every entry of the
-    "full" sub-pool carries the draft's parts, as in the 2-pool factories.
+    sum and the runtime split floats. With ``fused_draft``, every entry of a
+    sub-pool the placement names carries the draft's parts, as in the 2-pool
+    factories.
     """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedMambaSWATokenToKVPoolAllocator,
@@ -2279,7 +2278,7 @@ def init_unified_mamba_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
-        draft_region=None if fused_draft is None else fused_draft.region,
+        draft_region=None if fused_draft is None else fused_draft.region("full"),
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -2290,6 +2289,7 @@ def init_unified_mamba_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="float",
+        draft_region=None if fused_draft is None else fused_draft.region("swa"),
     )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
@@ -2300,6 +2300,7 @@ def init_unified_mamba_swa_pools(
         temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
         temporal_dtype=cp.dtype.temporal,
         grow_direction="up",
+        draft_region=None if fused_draft is None else fused_draft.region("mamba"),
     )
     if unified_total_bytes is not None:
         # PROFILED byte budget for the token side (captured pre-ratio-floor);
