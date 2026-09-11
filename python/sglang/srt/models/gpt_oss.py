@@ -623,9 +623,15 @@ class GptOssDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if hidden_states.shape[0] != 0:
@@ -735,22 +741,24 @@ class GptOssModel(nn.Module):
         # Capture hidden-state boundaries: boundary 0 is the embedding output,
         # and boundary i + 1 is the output after transformer block i.
         aux_hidden_states = []
-        if self.start_layer in self.layers_to_capture:
-            aux_hidden_states.append(
-                hidden_states + residual if residual is not None else hidden_states
-            )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in self.layers_to_capture else None
+                    ),
                 )
-                if i + 1 in self.layers_to_capture:
-                    aux_hidden_states.append(
-                        hidden_states + residual
-                        if residual is not None
-                        else hidden_states
-                    )
+        if self.end_layer in self.layers_to_capture:
+            aux_hidden_states.append(
+                hidden_states + residual
+                if residual is not None
+                else hidden_states.clone()
+            )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

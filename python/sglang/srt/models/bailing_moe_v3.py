@@ -1057,10 +1057,16 @@ class BailingMoELinearDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1274,16 +1280,25 @@ class BailingMoELinearModel(nn.Module):
                     forward_batch=forward_batch,
                     residual=residual,
                     zero_allocator=zero_allocator,
+                    captured_last_layer_outputs=(
+                        dspark_aux_hidden_states
+                        if capture_aux
+                        and i - 1 in self.layers_to_capture
+                        and hidden_states.shape[0] != 0
+                        else None
+                    ),
                 )
-                if (
-                    capture_aux
-                    and i in self.layers_to_capture
-                    and hidden_states.shape[0] != 0
-                ):
-                    if residual is None:
-                        dspark_aux_hidden_states.append(hidden_states)
-                    else:
-                        dspark_aux_hidden_states.append(hidden_states + residual)
+
+        if (
+            capture_aux
+            and self.end_layer - 1 in self.layers_to_capture
+            and hidden_states.shape[0] != 0
+        ):
+            dspark_aux_hidden_states.append(
+                hidden_states + residual
+                if residual is not None
+                else hidden_states.clone()
+            )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
