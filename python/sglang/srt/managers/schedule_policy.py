@@ -583,7 +583,6 @@ class PrefillAdder:
         self.log_device_hit_tokens = 0
         self.log_host_hit_tokens = 0
         self.log_storage_hit_tokens = 0
-        # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
 
@@ -906,6 +905,7 @@ class PrefillAdder:
         is_chunked_continuation: bool = False,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
+        raw_extend_input_len = extend_input_len
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
@@ -942,10 +942,10 @@ class PrefillAdder:
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
-        self.log_input_tokens += extend_input_len
+        self.log_input_tokens += raw_extend_input_len
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
-            self.reprocessed_log_input_tokens += extend_input_len
+            self.reprocessed_log_input_tokens += raw_extend_input_len
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if req.retracted_stain:
@@ -1439,7 +1439,7 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
-                    input_tokens,
+                    req.extend_range.length,
                     min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
