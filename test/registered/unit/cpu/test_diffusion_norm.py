@@ -14,6 +14,13 @@ torch.manual_seed(1234)
 
 eps = 1e-6
 
+DTYPE_PAIRS = [
+    (torch.bfloat16, torch.bfloat16),
+    (torch.bfloat16, torch.float32),
+    (torch.float16, torch.float16),
+    (torch.float16, torch.float32),
+]
+
 
 class TestDiffusionNorm:
     def rmsnorm_ref(
@@ -31,15 +38,7 @@ class TestDiffusionNorm:
 
         return out
 
-    @pytest.mark.parametrize(
-        "input_dtype,param_dtype",
-        [
-            (torch.bfloat16, torch.bfloat16),
-            (torch.bfloat16, torch.float32),
-            (torch.float16, torch.float16),
-            (torch.float16, torch.float32),
-        ],
-    )
+    @pytest.mark.parametrize("input_dtype,param_dtype", DTYPE_PAIRS)
     @pytest.mark.parametrize("broadcast_c", [False, True])
     def test_fused_scale_shift(
         self,
@@ -85,120 +84,21 @@ class TestDiffusionNorm:
             rtol=precision[input_dtype],
         )
 
+    @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize(
-        "input_dtype,param_dtype",
+        "gate_type,norm_dtype,param_type,norm_type",
         [
-            (torch.bfloat16, torch.bfloat16),
-            (torch.bfloat16, torch.float32),
-            (torch.float16, torch.float16),
-            (torch.float16, torch.float32),
-        ],
-    )
-    @pytest.mark.parametrize("norm_type", ["rms", "layer"])
-    def test_fused_norm_scale_shift(
-        self,
-        input_dtype,
-        param_dtype,
-        norm_type,
-    ):
-        B, S, D = 2, 4, 67
-
-        x = torch.randn(B, S, D, dtype=input_dtype)
-        weight = torch.randn(D, dtype=torch.float32)
-        bias = torch.randn(D, dtype=torch.float32) if norm_type == "layer" else None
-
-        scale = torch.randn(B, 1, D, dtype=param_dtype)
-        shift = torch.randn(B, S, D, dtype=param_dtype)
-
-        scale_expanded = scale.expand_as(x)
-        shift_expanded = shift.expand_as(x)
-
-        out = torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
-            x,
-            weight,
-            bias,
-            scale_expanded,
-            shift_expanded,
-            norm_type,
-            eps=eps,
-        )
-
-        if norm_type == "rms":
-            normalized = self.rmsnorm_ref(x, weight, eps)
-        else:
-            normalized = torch.nn.functional.layer_norm(
-                x.float(),
-                (D,),
-                weight,
-                bias,
-                eps,
-            )
-
-        # Match CUDA/CuTe activation-dtype boundary.
-        normalized = normalized.to(input_dtype).float()
-
-        ref = (normalized * (1.0 + scale.float()) + shift.float()).to(input_dtype)
-
-        torch.testing.assert_close(
-            out,
-            ref,
-            atol=precision[input_dtype],
-            rtol=precision[input_dtype],
-        )
-
-    @pytest.mark.parametrize(
-        "input_dtype,gate_dtype,norm_dtype,param_dtype,norm_type",
-        [
-            (
-                torch.bfloat16,
-                torch.bfloat16,
-                None,
-                torch.bfloat16,
-                "rms",
-            ),
-            (
-                torch.float16,
-                torch.float16,
-                None,
-                torch.float16,
-                "rms",
-            ),
-            (
-                torch.bfloat16,
-                torch.float32,
-                torch.float32,
-                torch.bfloat16,
-                "layer",
-            ),
-            (
-                torch.float16,
-                torch.float32,
-                torch.float32,
-                torch.float16,
-                "layer",
-            ),
-            (
-                torch.bfloat16,
-                None,
-                None,
-                torch.float32,
-                "layer",
-            ),
-            (
-                torch.float16,
-                None,
-                None,
-                torch.float32,
-                "layer",
-            ),
+            ("input", None, "input", "rms"),
+            ("fp32", torch.float32, "input", "layer"),
+            (None, None, "fp32", "layer"),
         ],
     )
     def test_fused_scale_residual_norm_scale_shift(
         self,
         input_dtype,
-        gate_dtype,
+        gate_type,
         norm_dtype,
-        param_dtype,
+        param_type,
         norm_type,
     ):
         B, S, D = 2, 4, 67
@@ -206,10 +106,17 @@ class TestDiffusionNorm:
         x = torch.randn(B, S, D, dtype=input_dtype)
         residual = torch.randn(B, S, D, dtype=input_dtype)
 
+        gate_dtype = (
+            input_dtype
+            if gate_type == "input"
+            else torch.float32
+            if gate_type == "fp32"
+            else None
+        )
+        param_dtype = input_dtype if param_type == "input" else torch.float32
+
         gate = torch.randn(D, dtype=gate_dtype) if gate_dtype is not None else None
-
         weight = torch.randn(D, dtype=norm_dtype) if norm_dtype is not None else None
-
         bias = (
             torch.randn(D, dtype=norm_dtype)
             if norm_dtype is not None and norm_type == "layer"
@@ -221,7 +128,6 @@ class TestDiffusionNorm:
 
         scale_expanded = scale.expand_as(x)
         shift_expanded = shift.expand_as(x)
-
         gate_expanded = gate.view(1, 1, D).expand_as(x) if gate is not None else None
 
         out, residual_out = (
