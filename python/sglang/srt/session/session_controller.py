@@ -18,6 +18,7 @@ import uuid
 from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -206,6 +207,7 @@ class Session:
         tokenizer,
         vocab_size: int,
         eos_token_ids=None,
+        disagg_mode: Optional[DisaggregationMode] = None,
     ):
         assert req.session_params is not None
         self.last_active_time = time.monotonic()
@@ -289,6 +291,12 @@ class Session:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
 
+        if not abort and len(input_ids) == 0:
+            abort = True
+            abort_message = (
+                "A session request must contain input tokens after restoring history."
+            )
+
         new_req = Req(
             rid=req.rid,
             origin_input_text=None,
@@ -309,6 +317,12 @@ class Session:
             return_hidden_states=req.return_hidden_states,
             return_routed_experts=req.return_routed_experts,
             routed_experts_start_len=req.routed_experts_start_len,
+            bootstrap_host=req.bootstrap_host,
+            bootstrap_port=req.bootstrap_port,
+            bootstrap_room=req.bootstrap_room,
+            disagg_mode=disagg_mode,
+            routed_dp_rank=req.routed_dp_rank,
+            disagg_prefill_dp_rank=req.disagg_prefill_dp_rank,
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
