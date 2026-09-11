@@ -1066,7 +1066,18 @@ class SWAComponent(TreeComponent):
                     # device exists, skip it
                     n_swa += len(cd.value)
                 else:
-                    # host only, collect it
+                    # Host only: load at most the missing tail of the sliding
+                    # window. A radix node can be much larger than the window;
+                    # split its prefix off before collecting so the component
+                    # and Full-KV node-length invariants remain intact.
+                    remaining = self.sliding_window_size - n_swa
+                    if len(cd.host_value) > remaining:
+                        _, action = self.tree_core._split_node(
+                            cur.key, cur, len(cd.host_value) - remaining
+                        )
+                        if action is not None:
+                            self.cache._apply_cache_actions([action])
+                        cd = cur.component_data[ct]
                     backed_up.append(cd.host_value)
                     nodes.append(cur)
                     n_swa += len(cd.host_value)

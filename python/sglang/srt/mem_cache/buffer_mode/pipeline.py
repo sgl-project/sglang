@@ -1114,6 +1114,19 @@ class BufferModePipeline:
             # (init_load_back's degrade contract).
             return _drop("device_capacity")
 
+        # Buffer-only restores directly from L3. Router experts are not an L3
+        # storage pool yet, so fail closed: invalidate the newly allocated KV
+        # slots instead of exposing rows belonging to their previous owners.
+        routed_experts_cache = cache._get_routed_experts_host_cache()
+        if routed_experts_cache is not None and not routed_experts_cache.restore_from_hicache(
+            f.host_indices, device_indices
+        ):
+            logger.error(
+                "HiCache buffer-only restored KV for request %s without "
+                "routed-expert sidecar; affected HostCache slots remain invalid",
+                f.req_id,
+            )
+
         swa_dev = next(
             (
                 t.device_indices

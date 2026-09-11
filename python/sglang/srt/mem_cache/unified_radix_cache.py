@@ -340,10 +340,24 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    @staticmethod
+    def _get_routed_experts_host_cache():
+        # Lazy import avoids coupling cache construction to model-runner setup.
+        from sglang.srt.state_capturer.routed_experts import (
+            get_global_experts_capturer,
+        )
+
+        capturer = get_global_experts_capturer()
+        return None if capturer is None else capturer.host_cache
+
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
         self._reset_full()
+
+        routed_experts_cache = self._get_routed_experts_host_cache()
+        if routed_experts_cache is not None:
+            routed_experts_cache.clear()
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
@@ -1433,6 +1447,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if host_indices is None:
                 return 0
+            routed_experts_cache = self._get_routed_experts_host_cache()
+            if routed_experts_cache is not None:
+                routed_experts_cache.backup_to_hicache(device_value, host_indices)
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
@@ -1622,6 +1639,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if device_indices is None:
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
+
+        routed_experts_cache = self._get_routed_experts_host_cache()
+        if routed_experts_cache is not None and not routed_experts_cache.restore_from_hicache(
+            kv_xfer.host_indices, device_indices
+        ):
+            logger.error(
+                "HiCache restored KV for node %d without routed-expert sidecar; "
+                "affected HostCache slots remain invalid",
+                node_id,
+            )
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
         self._apply_cache_actions(
@@ -2000,6 +2027,13 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = self.ongoing_prefetch[req_id]
+
+        # Storage owns these host slots now. Drop any L2 router-expert rows
+        # left by an earlier owner before the slots enter either cache mode or
+        # buffer-only staging.
+        routed_experts_cache = self._get_routed_experts_host_cache()
+        if routed_experts_cache is not None:
+            routed_experts_cache.invalidate_hicache(host_indices[:completed_tokens])
 
         # All PP/TP ranks will get the same `min_completed_tokens`, because `completed_tokens`
         # and `pool_hits` in their operations are same.  No need to sync cross-rank here.

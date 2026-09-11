@@ -797,6 +797,9 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
+        routed_experts_cache = self._get_routed_experts_host_cache()
+        if routed_experts_cache is not None:
+            routed_experts_cache.clear()
 
     def release_host_resources(self) -> None:
         if self.token_to_kv_pool_host is not None:
@@ -808,6 +811,16 @@ class HiRadixCache(RadixCache):
             node = node.parent
             height += 1
         return height
+
+    @staticmethod
+    def _get_routed_experts_host_cache():
+        # Lazy import avoids coupling cache construction to model-runner setup.
+        from sglang.srt.state_capturer.routed_experts import (
+            get_global_experts_capturer,
+        )
+
+        capturer = get_global_experts_capturer()
+        return None if capturer is None else capturer.host_cache
 
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
@@ -874,7 +887,11 @@ class HiRadixCache(RadixCache):
                 node_id=node.id,
                 **self._get_extra_pools(),
             )
+
         if host_indices is not None:
+            routed_experts_cache = self._get_routed_experts_host_cache()
+            if routed_experts_cache is not None:
+                routed_experts_cache.backup_to_hicache(node.value, host_indices)
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self._track_write_through_node(node, len(node.key))
@@ -1445,6 +1462,16 @@ class HiRadixCache(RadixCache):
             )
             return None
 
+        routed_experts_cache = self._get_routed_experts_host_cache()
+        if routed_experts_cache is not None and not routed_experts_cache.restore_from_hicache(
+            host_indices, device_indices
+        ):
+            logger.error(
+                "HiCache restored KV for node %d without routed-expert sidecar; "
+                "affected HostCache slots remain invalid",
+                last_hit_node.id,
+            )
+
         for n in nodes_to_load:
             n.release_host()
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
@@ -1670,6 +1697,9 @@ class HiRadixCache(RadixCache):
         host_indices = operation.host_indices
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
+        routed_experts_cache = self._get_routed_experts_host_cache()
+        if routed_experts_cache is not None:
+            routed_experts_cache.invalidate_hicache(written_indices)
         matched_length = self._insert_helper_host(
             last_host_node,
             fetched_key,
