@@ -110,6 +110,12 @@ impl ChatEncoder {
     /// Render a chat request with its tools and template kwargs.
     pub fn render(&self, request: &serde_json::Value) -> Result<String> {
         let mut kwargs = self.defaults.clone();
+        if let Some(effort) = request.get("reasoning_effort").filter(|v| !v.is_null()) {
+            kwargs.insert("reasoning_effort".into(), effort.clone());
+            let thinking = effort != "none";
+            kwargs.insert("thinking".into(), thinking.into());
+            kwargs.insert("enable_thinking".into(), thinking.into());
+        }
         if let Some(extra) = request
             .get("chat_template_kwargs")
             .and_then(|v| v.as_object())
@@ -128,6 +134,37 @@ struct ChatRequest<'a> {
     kwargs: ChatTemplateKwargs,
 }
 
+/// Message fields the engine's request schema keeps for non-user roles.
+const GENERIC_MESSAGE_KEYS: [&str; 7] = [
+    "role",
+    "content",
+    "tool_call_id",
+    "name",
+    "reasoning_content",
+    "tool_calls",
+    "tools",
+];
+
+/// Normalize messages as SGLang does before rendering.
+fn engine_message(message: &serde_json::Value) -> serde_json::Value {
+    let role = message["role"].as_str().unwrap_or_default().to_lowercase();
+    let mut out = serde_json::Map::new();
+    if role != "user" {
+        for key in GENERIC_MESSAGE_KEYS {
+            if let Some(v) = message.get(key).filter(|v| !v.is_null()) {
+                out.insert(key.into(), v.clone());
+            }
+        }
+    }
+    let content = match &message["content"] {
+        serde_json::Value::Null => "".into(),
+        content => content.clone(),
+    };
+    out.insert("role".into(), role.into());
+    out.insert("content".into(), content);
+    out.into()
+}
+
 impl OAIChatLikeRequest for ChatRequest<'_> {
     fn model(&self) -> String {
         self.request["model"]
@@ -136,7 +173,11 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
             .to_owned()
     }
     fn messages(&self) -> Value {
-        Value::from_serialize(&self.request["messages"])
+        let messages: Vec<_> = self.request["messages"]
+            .as_array()
+            .map(|m| m.iter().map(engine_message).collect())
+            .unwrap_or_default();
+        Value::from_serialize(&messages)
     }
     fn tools(&self) -> Option<Value> {
         may_be_fix_tool_schema(self.request.get("tools")?.clone())
@@ -191,6 +232,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(enc.render(&request(json!([]))).unwrap(), "FILE");
+    }
+
+    #[test]
+    fn messages_match_engine_schema() {
+        let enc = jinja(json!({"chat_template": "{{ messages | tojson }}"}));
+        let out = enc
+            .render(&request(json!([
+                {"role": "User", "content": "hi", "name": "bob", "extra": 1},
+                {"role": "assistant", "name": "a", "tool_calls": null, "tool_call_id": "c1"}
+            ])))
+            .unwrap();
+        let rendered: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            rendered,
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "name": "a", "tool_call_id": "c1"}
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_sets_thinking_defaults_with_explicit_kwargs_winning() {
+        let enc = jinja(json!({
+            "chat_template": "{{ reasoning_effort }}:{{ thinking }}:{{ enable_thinking }}"
+        }));
+        let mut req = request(json!([{"role": "user", "content": "hi"}]));
+        req["reasoning_effort"] = json!("none");
+        assert_eq!(enc.render(&req).unwrap(), "none:False:False");
+        req["reasoning_effort"] = json!("high");
+        assert_eq!(enc.render(&req).unwrap(), "high:True:True");
+        req["chat_template_kwargs"] = json!({"enable_thinking": false});
+        assert_eq!(enc.render(&req).unwrap(), "high:True:False");
     }
 
     #[test]
