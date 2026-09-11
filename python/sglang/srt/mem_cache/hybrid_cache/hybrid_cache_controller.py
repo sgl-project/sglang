@@ -808,8 +808,6 @@ class HybridCacheController(BaseHiCacheController):
             self.pp_prefetch_states[rid] = state
 
         self.pp_prefetch_command_queue.put(ticket)
-        # Ensure the ticket is broadcast before the normal request is sent to PP1.
-        self.pp_prefetch_command_queue.join()
         return operation
 
     def _allocate_pp_prefetch_buffers(
@@ -818,7 +816,12 @@ class HybridCacheController(BaseHiCacheController):
         allocated: list[tuple[PoolName, torch.Tensor]] = []
 
         def alloc(name: PoolName, size: int) -> Optional[torch.Tensor]:
-            indices = self.mem_pool_host.alloc(size, pool=name)
+            try:
+                indices = self.mem_pool_host.alloc(size, pool=name)
+            except Exception:
+                for pool, owned in reversed(allocated):
+                    self.mem_pool_host.free(owned, pool=pool)
+                raise
             if indices is not None:
                 allocated.append((name, indices))
             return indices
@@ -879,9 +882,12 @@ class HybridCacheController(BaseHiCacheController):
     def is_pp_prefetch_ready(self, rid: str) -> bool:
         with self.pp_prefetch_state_lock:
             state = self.pp_prefetch_states.get(rid)
-            return (
-                state is not None and not state.consumed and state.ready_event.is_set()
-            )
+            if state is None or state.consumed:
+                return False
+            thread = self.pp_prefetch_command_thread
+            if thread is not None and not thread.is_alive():
+                raise RuntimeError(f"PP HiCache ticket thread exited: req={rid}")
+            return state.ready_event.is_set()
 
     def take_ready_pp_prefetch(self, rid: str) -> Optional[PPPrefetchState]:
         with self.pp_prefetch_state_lock:
@@ -926,54 +932,78 @@ class HybridCacheController(BaseHiCacheController):
         group = self.pp_prefetch_command_group
         assert group is not None
         source = torch.distributed.get_process_group_ranks(group)[0]
+        is_source = self.pp_rank == 0
 
         while True:
-            is_source = self.pp_rank == 0
             command = self.pp_prefetch_command_queue.get() if is_source else None
-            objects = [command]
-            torch.distributed.broadcast_object_list(objects, src=source, group=group)
-            ticket = objects[0]
-            if ticket is None:
+            operation = None
+            try:
+                objects = [command]
+                torch.distributed.broadcast_object_list(
+                    objects, src=source, group=group
+                )
+                ticket = objects[0]
+                if ticket is None:
+                    return
+
+                with self.pp_prefetch_state_lock:
+                    state = self.pp_prefetch_states.get(ticket.rid)
+                    if state is None:
+                        operation = PrefetchOperation(
+                            ticket.rid,
+                            RadixKey(
+                                array("q", ticket.token_ids),
+                                is_bigram=ticket.is_bigram,
+                            ),
+                            ticket.last_hash,
+                            prefix_keys=ticket.prefix_keys,
+                            # Keep sidecar ACKs aligned even if allocation fails.
+                            pool_transfers=[
+                                PoolTransfer(
+                                    name=spec.name,
+                                    keys=spec.keys,
+                                    hit_policy=spec.hit_policy,
+                                    indices_from_pool=spec.indices_from_pool,
+                                )
+                                for spec in ticket.pool_specs
+                            ]
+                            or None,
+                        )
+                        operation.is_pp_broadcast = True
+                        state = PPPrefetchState(ticket=ticket, operation=operation)
+                        self.pp_prefetch_states[ticket.rid] = state
+                    decision = self.pp_prefetch_decisions.get(ticket.rid)
+                    if decision is PPPrefetchDecision.CANCELLED:
+                        state.release_requested = True
+                        self.pp_prefetch_decisions.pop(ticket.rid)
+                    operation = state.operation
+
+                operation.hash_value = self.get_hash_str(
+                    ticket.token_ids,
+                    ticket.last_hash,
+                    page_size=self.page_size,
+                )[: ticket.storage_hit_count // self.page_size]
+                operation.all_hash_values = list(operation.hash_value)
+                operation.storage_hit_count = ticket.storage_hit_count
+                operation.storage_start = len(ticket.matched_prefix_tokens)
+                operation.pool_storage_result = PoolTransferResult.empty()
+                if not self._allocate_pp_prefetch_buffers(ticket, operation):
+                    operation.host_indices = torch.empty(0, dtype=torch.int64)
+                    operation.mark_terminate()
+                self.prefetch_buffer.put(operation)
+            except Exception:
+                logger.exception("PP HiCache ticket processing failed.")
+                if operation is None or not operation.hash_value:
+                    # Without a received ticket/ACK schedule, continuing is unsafe.
+                    return
+                if operation.host_indices is None:
+                    operation.host_indices = torch.empty(0, dtype=torch.int64)
+                operation.mark_terminate()
+                # Preserve every KV/sidecar ACK even when local allocation fails.
+                self.prefetch_buffer.put(operation)
+            finally:
                 if is_source:
                     self.pp_prefetch_command_queue.task_done()
-                return
-
-            with self.pp_prefetch_state_lock:
-                state = self.pp_prefetch_states.get(ticket.rid)
-                if state is None:
-                    operation = PrefetchOperation(
-                        ticket.rid,
-                        RadixKey(
-                            array("q", ticket.token_ids),
-                            is_bigram=ticket.is_bigram,
-                        ),
-                        ticket.last_hash,
-                        prefix_keys=ticket.prefix_keys,
-                    )
-                    operation.is_pp_broadcast = True
-                    state = PPPrefetchState(ticket=ticket, operation=operation)
-                    self.pp_prefetch_states[ticket.rid] = state
-                decision = self.pp_prefetch_decisions.get(ticket.rid)
-                if decision is PPPrefetchDecision.CANCELLED:
-                    state.release_requested = True
-                    self.pp_prefetch_decisions.pop(ticket.rid)
-                operation = state.operation
-
-            operation.hash_value = self.get_hash_str(
-                ticket.token_ids,
-                ticket.last_hash,
-                page_size=self.page_size,
-            )[: ticket.storage_hit_count // self.page_size]
-            operation.all_hash_values = list(operation.hash_value)
-            operation.storage_hit_count = ticket.storage_hit_count
-            operation.storage_start = len(ticket.matched_prefix_tokens)
-            operation.pool_storage_result = PoolTransferResult.empty()
-            if not self._allocate_pp_prefetch_buffers(ticket, operation):
-                operation.host_indices = torch.empty(0, dtype=torch.int64)
-                operation.mark_terminate()
-            self.prefetch_buffer.put(operation)
-            if is_source:
-                self.pp_prefetch_command_queue.task_done()
 
     def write_storage(
         self,
