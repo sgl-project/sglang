@@ -231,6 +231,9 @@ jobs:
           # Fail fast on any command error, undefined variable, or pipe failure.
           set -euo pipefail
 
+          TEST_LOG_DIR="/tmp/test-logs"
+          mkdir -p "${TEST_LOG_DIR}"
+
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
@@ -388,10 +391,10 @@ jobs:
           fi
 
           # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log
-          # under the structured path; PR runs only tee to /tmp/test_output.log.
+          # under the structured path; PR runs tee to ${TEST_LOG_DIR}/${tc_name}.log.
           # Use an array so the extra target is omitted when empty: passing an empty
           # string arg makes GNU tee fail (exit code 1) and flips the pipeline exit code.
-          LOG_TEE_TARGETS=("/tmp/test_output.log")
+          LOG_TEE_TARGETS=("${TEST_LOG_DIR}/${tc_name}.log")
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             LOG_TEE_TARGETS+=("${log_path}/${tc_name}.log")
           fi
@@ -430,11 +433,11 @@ jobs:
           echo "## ${tc_name}  ${status_icon} ${test_status}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]; then
-            metric_count=$(grep -c '\[METRIC\]' /tmp/test_output.log 2>/dev/null || echo 0)
+            metric_count=$(grep -c '\[METRIC\]' "${TEST_LOG_DIR}/${tc_name}.log" 2>/dev/null || echo 0)
             if [ "${metric_count}" -gt 0 ]; then
               echo "| Metric | Value | Pass |" >> $GITHUB_STEP_SUMMARY
               echo "|--------|-------|------|" >> $GITHUB_STEP_SUMMARY
-              grep '\[METRIC\]' /tmp/test_output.log | while IFS= read -r line; do
+              grep '\[METRIC\]' "${TEST_LOG_DIR}/${tc_name}.log" | while IFS= read -r line; do
                 metric_name=$(echo "$line" | sed -E 's/.*\[METRIC\] ([^=]+)=.*/\1/')
                 metric_value=$(echo "$line" | sed -E 's/.*\[METRIC\] [^=]+=([^ ]+).*/\1/')
                 echo "| ${metric_name} | ${metric_value} | ${status_icon} |" >> $GITHUB_STEP_SUMMARY
@@ -445,3 +448,12 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
           exit ${test_exit_code}
+
+      - name: Upload test logs
+        if: always() && inputs.use_coverage_runner != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: selected-test-logs-${{ inputs.test_suite }}-part${{ matrix.partition }}
+          path: /tmp/test-logs/
+          if-no-files-found: ignore
+          retention-days: 14

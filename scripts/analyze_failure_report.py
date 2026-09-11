@@ -5,11 +5,13 @@ analyze_failure_report.py  (NEW FILE - add to .github/workflows/scripts/)
 Cross-reference CI test failures with test recommendations.
 
 Pipeline:
-  1. Scan each .txt log file for "short test summary info" block
-  2. Extract FAILED and ERROR lines from that block only (no full-file scan)
-  3. Read recommended_pytest_paths.txt
-  4. Match: exact match + file-level match
-  5. Generate a Markdown report
+  1. Scan each log file for failed tests using three methods:
+     a. TIMINGS JSON block (machine-readable, from ci_utils.py)
+     b. ci_utils.py "✗ FAILED:" summary section (structured text)
+     c. pytest "short test summary info" block (for pytest-style logs)
+  2. Read recommended_pytest_paths.txt
+  3. Match: exact match + file-level match
+  4. Generate a Markdown report
 
 Usage:
   python analyze_failure_report.py --log-dir LOG_DIR --recommendations-file RECOMMENDED.txt [--output report.md]
@@ -17,6 +19,7 @@ Usage:
 
 import argparse
 import contextlib
+import json
 import sys
 from pathlib import Path
 
@@ -48,20 +51,93 @@ def clean_line(line):
 # ============================================================
 
 
-FAILED_PATTERN = re.compile(r"^(?:FAILED|ERROR)\s+(tests/\S+?\.py(?:::\S+?)?)\s")
+# Match pytest-style FAILED/ERROR lines with either tests/ (vllm) or test/ (sglang) prefix.
+FAILED_PATTERN = re.compile(r"^(?:FAILED|ERROR)\s+((?:tests?)/\S+?\.py(?:::\S+?)?)\s")
 SUMMARY_SEPARATOR_PATTERN = re.compile(r"^=+\s")
 CPU_LOG_PATH_PATTERN = re.compile(r"(?:^|-)cpu-\d+card(?:-|$)", re.IGNORECASE)
 CPU_FAILURE_LABEL = "cpu-ut"
 
+# ci_utils.py summary: "✗ FAILED:" section lines like "  srt/test_xxx.py (exit code 1)".
+# Paths are relative to the test/ directory (no leading "test/" prefix).
+CI_UTILS_FAILED_PATTERN = re.compile(r"^[✗X]\s*FAILED:\s*$")
+CI_UTILS_FAILED_LINE_PATTERN = re.compile(r"^\s{2,}(\S+\.py)\s*\(")
+
+# TIMINGS block: machine-readable JSON lines with "passed": false.
+TIMINGS_BEGIN_PATTERN = re.compile(r"^=+\s*TIMINGS\s+BEGIN\s*=+")
+TIMINGS_END_PATTERN = re.compile(r"^=+\s*TIMINGS\s+END\s*=+")
+
+
+def _extract_from_timings(lines):
+    """Extract failed test file paths from the TIMINGS JSON block (ci_utils.py)."""
+    failed = []
+    in_timings = False
+    for line in lines:
+        text = clean_line(line)
+        if TIMINGS_BEGIN_PATTERN.search(text):
+            in_timings = True
+            continue
+        if not in_timings:
+            continue
+        if TIMINGS_END_PATTERN.search(text):
+            break
+        try:
+            entry = json.loads(text)
+            if not entry.get("passed", True) and entry.get("file"):
+                failed.append(entry["file"])
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return failed
+
+
+def _extract_from_ci_utils_summary(lines):
+    """Extract failed test file paths from ci_utils.py's '✗ FAILED:' summary section."""
+    failed = []
+    in_failed_section = False
+    for line in lines:
+        text = clean_line(line)
+        if CI_UTILS_FAILED_PATTERN.match(text):
+            in_failed_section = True
+            continue
+        if not in_failed_section:
+            continue
+        if SUMMARY_SEPARATOR_PATTERN.match(text):
+            break
+        match = CI_UTILS_FAILED_LINE_PATTERN.match(line)
+        if match:
+            # Paths in this section are relative to test/ (e.g. "srt/test_xxx.py").
+            # Normalize to "test/srt/test_xxx.py" for consistent matching.
+            path = match.group(1)
+            if not path.startswith("test/"):
+                path = "test/" + path
+            failed.append(path)
+    return failed
+
 
 def extract_failed_from_log(log_path):
-    """Extract pytest node IDs from one log's short test summary."""
+    """Extract failed test paths from one log file.
+
+    Tries three methods in order of reliability:
+      1. TIMINGS JSON block (machine-readable, ci_utils.py)
+      2. ci_utils.py '✗ FAILED:' summary section (human-readable but structured)
+      3. pytest 'short test summary info' block (for pytest-style logs)
+    """
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception as exc:
         print(f"::warning:: Cannot read {log_path}: {exc}")
         return []
 
+    # Method 1: TIMINGS block (most reliable, machine-readable).
+    failed = _extract_from_timings(lines)
+    if failed:
+        return failed
+
+    # Method 2: ci_utils.py summary section.
+    failed = _extract_from_ci_utils_summary(lines)
+    if failed:
+        return failed
+
+    # Method 3: pytest-style "short test summary info" block.
     failed = []
     in_summary = False
     for line in lines:
@@ -103,7 +179,7 @@ def extract_failed_from_logs(log_dir):
         print(f"::warning:: Log directory not found: {log_dir}")
         return []
 
-    # Scan both real .log files (from run_selected_tests.sh) and mock .txt files
+    # Scan .log files (from NPU test stages) and .txt files (legacy/mock).
     candidates = []
     candidates.extend(base.rglob("*.log"))
     candidates.extend(base.rglob("*.txt"))
