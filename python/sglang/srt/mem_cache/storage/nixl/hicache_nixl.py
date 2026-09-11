@@ -13,12 +13,14 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+)
+from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_transfer import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
 

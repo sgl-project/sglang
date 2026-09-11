@@ -51,10 +51,8 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
             "sys.modules",
             _fake_mooncake_modules(FakeMooncakeDistributedStore),
         ):
-            from sglang.srt.mem_cache.hicache_storage import (
-                HiCacheStorageConfig,
-                PoolName,
-            )
+            from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+            from sglang.srt.mem_cache.pool_transfer import PoolName
             from sglang.srt.mem_cache.storage.mooncake_store import (
                 mooncake_store as mc_mod,
             )

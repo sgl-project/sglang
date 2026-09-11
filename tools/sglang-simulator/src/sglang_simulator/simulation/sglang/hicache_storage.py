@@ -89,7 +89,7 @@ class MockHiCacheStorage:
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
         """Return Unified HiCache's per-pool longest-prefix result."""
-        from sglang.srt.mem_cache.hicache_storage import PoolTransferResult
+        from sglang.srt.mem_cache.pool_transfer import PoolTransferResult
 
         kv_hit_pages = self.batch_exists(keys, extra_info)
         extra_pool_hit_pages = {}
