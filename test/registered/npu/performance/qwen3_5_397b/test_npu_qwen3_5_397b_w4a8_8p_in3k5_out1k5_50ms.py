@@ -10,6 +10,9 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=3600, suite="base-c-test-perf-16-npu-a3")
 register_npu_ci(est_time=3600, suite="nightly-perf-16-npu-a3", nightly=True)
+# Temporarily register to a dedicated suite so the nightly pipeline runs
+# only this case.
+register_npu_ci(est_time=3600, suite="nightly-perf-16-npu-a3-qwen35", nightly=True)
 
 QWEN3_5_397B_A17B_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -125,8 +128,8 @@ class TestNPUQwen3_5_397B_A17B_3K5_1K5_50ms(TestNpuPerformanceTestCaseBase):
     tpot = 50
     output_token_throughput = 5415
     request_rate = float("inf")
-    temperature = 0.6
-    top_p = 0.95
+    # temperature = 0.6
+    # top_p = 0.95
 
     def test_npu_qwen3_5_397b_a17b_3k5_1k5(self):
         """Run NPU performance test for Qwen3.5-397B-A17B in3k5 out1k5"""

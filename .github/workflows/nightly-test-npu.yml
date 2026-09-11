@@ -124,7 +124,8 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -139,7 +140,8 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -155,7 +157,8 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -171,7 +174,8 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -186,7 +190,8 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -201,7 +206,8 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -217,7 +223,8 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -233,7 +240,8 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -248,10 +256,30 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       test_timeout_minutes: '180'
 
+  nightly-perf-16-npu-a3-qwen35:
+    name: nightly-perf-16-npu-a3-qwen35
+    # Enabled: run only the qwen3_5_397b w4a8 8p perf case (the only test
+    # registered to this suite).
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-800t-16
+      test_type: 'perf'
+      test_suite: nightly-perf-16-npu-a3-qwen35
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      test_timeout_minutes: '180'
+
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -268,7 +296,8 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -284,7 +313,8 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
@@ -332,7 +362,8 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() }}
+    # Disabled: temporarily run only the qwen3_5_397b perf-16 case.
+    if: ${{ false }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
@@ -396,7 +427,8 @@ jobs:
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            "${{ needs.nightly-acc-16-npu-a3.result }}" \
+            "${{ needs.nightly-perf-16-npu-a3-qwen35.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
             fi
