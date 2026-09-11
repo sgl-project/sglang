@@ -854,8 +854,9 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("image_only", [False, True])
 def test_sensenova_image_only_forward_preserves_outputs_and_prefix(device, image_only):
-    from transformers import Qwen3Config
-
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+        NEOLLMConfig,
+    )
     from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
         prepare_flash_kv_cache,
     )
@@ -867,7 +868,7 @@ def test_sensenova_image_only_forward_preserves_outputs_and_prefix(device, image
 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    config = Qwen3Config(
+    config = NEOLLMConfig(
         vocab_size=32,
         hidden_size=32,
         intermediate_size=64,
