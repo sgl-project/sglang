@@ -68,10 +68,26 @@ class ReasoningToggleConfig:
     default_enabled: Optional[bool] = None
     special_case: Optional[str] = None
     effort_kwarg: Optional[str] = None
+    effort_levels: Optional[Tuple[str, ...]] = None
+    effort_aliases: Optional[Tuple[Tuple[str, str], ...]] = None
 
     @property
     def always_on(self) -> bool:
         return self.special_case == "always"
+
+    @property
+    def has_toggle(self) -> bool:
+        return self.special_case is not None or self.toggle_param is not None
+
+
+def normalize_reasoning_effort(
+    effort: str, config: Optional[ReasoningToggleConfig]
+) -> str:
+    """Map an OpenAI/Anthropic-style effort name onto the levels the chat
+    template declares; returns the input unchanged when nothing applies."""
+    if config is None or not config.effort_levels or effort in config.effort_levels:
+        return effort
+    return dict(config.effort_aliases or ()).get(effort, effort)
 
 
 class _GenerationTagExtension(jinja2.ext.Extension):
@@ -263,6 +279,24 @@ REASONING_MODE_RULES = (
             or ctx.has_pattern(r"thinking\s+is\s+not\s+defined\s+or\s+thinking")
             or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true")
             or _has_toggle_default_assignment(ctx, "thinking", True)
+        ),
+    ),
+    # GLM-5.3 style: thinking is always on and the template only honors an
+    # effort allowlist (`in ['low', 'high'] else 'max'`). Kept last so it only
+    # claims templates no earlier rule recognizes.
+    DetectionRule(
+        name="glm53_reasoning_effort",
+        value=ReasoningToggleConfig(
+            effort_levels=("low", "high", "max"),
+            effort_aliases=(
+                ("none", "low"),
+                ("minimal", "low"),
+                ("medium", "high"),
+                ("xhigh", "max"),
+            ),
+        ),
+        predicate=lambda ctx: (
+            ctx.has_text("reasoning_effort") and ctx.has_text("Reasoning Effort:")
         ),
     ),
 )
