@@ -71,7 +71,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
-    select_candidate_block_indices,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -3465,10 +3464,7 @@ class DeepseekV4AttnBackend(
         ) and lmax >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
         positions = None
         score_lens = lens
-
-        def map_positions(logical_positions: torch.Tensor) -> torch.Tensor:
-            full_positions = logical_positions.clamp(0, lmax - 1) * ratio
-            return self.req_to_token[req[:, None], full_positions] // ratio
+        candidate_scores = candidate_lens = None
 
         if compact and indexer.uses_candidates and not indexer.is_candidate_source:
             candidates = self.forward_metadata.sm90_candidates
@@ -3482,7 +3478,7 @@ class DeepseekV4AttnBackend(
             )
         else:
             table = pool.get_index_k_with_scale_buffer(layer.layer_id)
-            s = fp4_index_logits_req_to_token(
+            score_result = fp4_index_logits_req_to_token(
                 q,
                 weights,
                 self.req_to_token,
@@ -3492,27 +3488,32 @@ class DeepseekV4AttnBackend(
                 table.shape[1] // 68,
                 ratio,
                 lmax,
+                candidate_block_size=(
+                    indexer.candidate_block_size
+                    if compact and indexer.is_candidate_source
+                    else 0
+                ),
             )
+            if compact and indexer.is_candidate_source:
+                s, candidate_scores, candidate_lens = score_result
+            else:
+                s = score_result
         if indexer.is_candidate_source:
             if compact:
-                block_size = indexer.candidate_block_size
-                blocks, reachable = select_candidate_block_indices(
-                    s, lens[:, None], indexer.candidate_topk_blocks, block_size
-                )
-                # Ascending blocks put the partial newest block and padding last.
-                blocks = blocks.masked_fill(~reachable, lmax).sort(dim=-1).values
-                candidate_positions = (
-                    blocks[:, :, None] * block_size
-                    + torch.arange(block_size, device=pos.device)
-                ).flatten(1)
-                valid = candidate_positions < lens[:, None]
-                candidate_slots = map_positions(candidate_positions).masked_fill(
-                    ~valid, 0
-                )
-                self.forward_metadata.sm90_candidates = (
-                    candidate_positions,
+                from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
                     candidate_slots,
-                    valid.sum(dim=-1),
+                )
+
+                self.forward_metadata.sm90_candidates = candidate_slots(
+                    s,
+                    lens,
+                    self.req_to_token,
+                    req,
+                    topk_blocks=indexer.candidate_topk_blocks,
+                    block_size=indexer.candidate_block_size,
+                    ratio=ratio,
+                    block_scores=candidate_scores,
+                    block_lens=candidate_lens,
                 )
             else:
                 self.candidate_masks = select_candidate_blocks(
@@ -3539,23 +3540,25 @@ class DeepseekV4AttnBackend(
                 1,
                 metadata.topk_metadata,
             )
-            idx = selected[:bs, :k].to(torch.int64)
+            idx = selected[:bs, :k]
         else:
             idx = s.topk(k, dim=-1, sorted=False).indices
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            idx = _mask_topk_scores(s, idx)
-            idx = idx.masked_fill(idx < 0, width)
-        idx = idx.sort(dim=-1).values
-        reach = idx < score_lens[:, None]
-        if positions is None:
-            logical_idx = idx
-            selected_slots = map_positions(logical_idx)
-        else:
-            logical_idx = positions.gather(1, idx.clamp_max(width - 1))
-            selected_slots = slots.gather(1, idx.clamp_max(width - 1))
-        page_indices[:bs, :k] = torch.where(reach, selected_slots, -1).to(torch.int32)
-        if raw_indices is not None:
-            raw_indices[:bs, :k] = torch.where(reach, logical_idx, -1).to(torch.int32)
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            finalize_candidate_topk,
+        )
+
+        finalize_candidate_topk(
+            idx,
+            s,
+            score_lens,
+            self.req_to_token,
+            req,
+            page_indices[:bs],
+            raw_indices[:bs] if raw_indices is not None else None,
+            ratio=ratio,
+            candidate_positions=positions,
+            candidate_slots=slots if positions is not None else None,
+        )
 
     def _low_ratio_index_topk_torch(self, layer, x, q_lora, req, pos) -> None:
         pool = self.token_to_kv_pool

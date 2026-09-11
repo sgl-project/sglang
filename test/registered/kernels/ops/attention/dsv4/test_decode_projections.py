@@ -80,6 +80,7 @@ class TestDecodeProjections(CustomTestCase):
                 expected = fp4_index_logits_decode(
                     q, weights, explicit_slots, lens, table, page_size
                 )
+                self.assertEqual(expected.stride(0) % 4, 0)
                 actual = fp4_index_logits_req_to_token(
                     q,
                     weights,
@@ -91,11 +92,43 @@ class TestDecodeProjections(CustomTestCase):
                     ratio,
                     width,
                 )
+                self.assertEqual(actual.shape, (rows, width))
+                self.assertEqual(actual.stride(0) % 4, 0)
                 torch.testing.assert_close(actual, expected, equal_nan=True)
+
+                fused_logits, block_scores, block_lens = fp4_index_logits_req_to_token(
+                    q,
+                    weights,
+                    req_to_token,
+                    req,
+                    lens,
+                    table,
+                    page_size,
+                    ratio,
+                    width,
+                    candidate_block_size=8,
+                )
+                torch.testing.assert_close(fused_logits, expected, equal_nan=True)
+                expected_blocks = (
+                    F.pad(expected, (0, -width % 8), value=-torch.inf)
+                    .unflatten(-1, (-1, 8))
+                    .amax(dim=-1)
+                )
+                last = (lens - 1) // 8
+                expected_blocks = expected_blocks.masked_fill(
+                    torch.arange(expected_blocks.shape[1], device="cuda")
+                    == last[:, None],
+                    torch.inf,
+                )
+                torch.testing.assert_close(block_scores, expected_blocks)
+                torch.testing.assert_close(
+                    block_lens, ((lens + 7) // 8).to(torch.int32)
+                )
 
     def test_candidate_block_indices_matches_torch(self):
         from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
             candidate_block_indices,
+            candidate_slots,
         )
 
         torch.manual_seed(29)
@@ -124,6 +157,35 @@ class TestDecodeProjections(CustomTestCase):
             expected.indices.sort(dim=-1).values,
         )
         torch.testing.assert_close(actual_valid, expected.values > -torch.inf)
+
+        req_to_token = torch.arange(
+            rows * width, device="cuda", dtype=torch.int32
+        ).view(rows, width)
+        req = torch.arange(rows, device="cuda", dtype=torch.int64)
+        positions, slots, counts = candidate_slots(
+            logits,
+            lens,
+            req_to_token,
+            req,
+            topk_blocks=topk_blocks,
+            block_size=block_size,
+            ratio=1,
+        )
+        blocks = (
+            expected.indices.masked_fill(expected.values == -torch.inf, scores.shape[1])
+            .sort(dim=-1)
+            .values
+        )
+        expected_positions = (
+            blocks[:, :, None] * block_size + torch.arange(block_size, device="cuda")
+        ).flatten(1)
+        valid = expected_positions < lens[:, None]
+        expected_slots = req_to_token[
+            req[:, None], expected_positions.clamp_max(width - 1)
+        ].masked_fill(~valid, 0)
+        torch.testing.assert_close(positions, expected_positions)
+        torch.testing.assert_close(slots, expected_slots)
+        torch.testing.assert_close(counts, valid.sum(dim=-1).to(torch.int32))
 
 
 if __name__ == "__main__":

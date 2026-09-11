@@ -800,15 +800,99 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             page_size,
             ratio,
             width,
+            candidate_block_size=0,
         ):
             logical = torch.arange(width)
             slots = req_to_token[req_rows[:, None], logical * ratio] // ratio
-            return score(q, weights, slots, lens, table, page_size)
+            logits = score(q, weights, slots, lens, table, page_size)
+            if not candidate_block_size:
+                return logits
+            block_scores = logits.unflatten(-1, (-1, candidate_block_size)).amax(dim=-1)
+            last = (lens - 1) // candidate_block_size
+            block_scores = block_scores.masked_fill(
+                torch.arange(block_scores.shape[1]) == last[:, None], torch.inf
+            )
+            block_lens = (lens + candidate_block_size - 1) // candidate_block_size
+            return logits, block_scores, block_lens
 
         def topk_v2(scores, lens, page_table, out, page_size, metadata):
             out.fill_(-1)
             k = min(out.shape[1], scores.shape[1])
             out[:, :k] = scores.topk(k, dim=-1, sorted=False).indices.to(torch.int32)
+
+        def publish_candidates(
+            scores,
+            lens,
+            req_to_token,
+            req_rows,
+            *,
+            topk_blocks,
+            block_size,
+            ratio,
+            block_scores=None,
+            block_lens=None,
+        ):
+            from sglang.srt.layers.attention.dsv4.indexer import (
+                select_candidate_block_indices,
+            )
+
+            blocks, reachable = select_candidate_block_indices(
+                scores, lens[:, None], topk_blocks, block_size
+            )
+            blocks = blocks.masked_fill(~reachable, width).sort(dim=-1).values
+            positions = (
+                blocks[:, :, None] * block_size + torch.arange(block_size)
+            ).flatten(1)
+            valid = positions < lens[:, None]
+            slots = (
+                req_to_token[req_rows[:, None], positions.clamp_max(width - 1) * ratio]
+                // ratio
+            ).masked_fill(~valid, 0)
+            return positions, slots, valid.sum(dim=-1)
+
+        def finalize_topk(
+            selected,
+            scores,
+            score_lens,
+            req_to_token,
+            req_rows,
+            page_out,
+            raw_out,
+            *,
+            ratio,
+            candidate_positions=None,
+            candidate_slots=None,
+        ):
+            selected = selected.to(torch.int64)
+            selected_scores = scores.gather(1, selected.clamp(0, scores.shape[1] - 1))
+            valid = (
+                (selected >= 0)
+                & (selected < score_lens[:, None])
+                & (selected_scores > -torch.inf)
+            )
+            selected = selected.masked_fill(~valid, scores.shape[1]).sort(1).values
+            valid = selected < score_lens[:, None]
+            if candidate_positions is None:
+                logical = selected
+                slots = (
+                    req_to_token[
+                        req_rows[:, None],
+                        logical.clamp_max(scores.shape[1] - 1) * ratio,
+                    ]
+                    // ratio
+                )
+            else:
+                logical = candidate_positions.gather(
+                    1, selected.clamp_max(scores.shape[1] - 1)
+                )
+                slots = candidate_slots.gather(
+                    1, selected.clamp_max(scores.shape[1] - 1)
+                )
+            page_out.fill_(-1)
+            page_out[:, : selected.shape[1]] = slots.masked_fill(~valid, -1)
+            if raw_out is not None:
+                raw_out.fill_(-1)
+                raw_out[:, : selected.shape[1]] = logical.masked_fill(~valid, -1)
 
         for lengths in length_steps:
             lens = torch.tensor(lengths)
@@ -833,6 +917,14 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 mock.patch.object(
                     module, "topk_transform_paged_v2", side_effect=topk_v2
                 ) as full_topk,
+                mock.patch(
+                    "sglang.kernels.ops.attention.dsv4.candidate_blocks.candidate_slots",
+                    side_effect=publish_candidates,
+                ),
+                mock.patch(
+                    "sglang.kernels.ops.attention.dsv4.candidate_blocks.finalize_candidate_topk",
+                    side_effect=finalize_topk,
+                ),
             ):
                 for i in range(5):
                     indexer.is_candidate_source = i == 0
