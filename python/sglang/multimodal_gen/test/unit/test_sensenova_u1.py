@@ -862,12 +862,18 @@ def test_sensenova_u1_pipeline_import_does_not_load_models():
                 import sys
                 from sglang.multimodal_gen.runtime.pipelines import sensenova_u1
                 from sglang.multimodal_gen.runtime.models.sensenova_u1 import register
+                from sglang.multimodal_gen.configs.sensenova_u1 import DEFAULT_CFG_NORM
                 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
                 prefix = "sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_"
                 assert not any(name.startswith(prefix) for name in sys.modules)
                 assert "neo_chat" not in CONFIG_MAPPING
                 assert "neo_vision" not in CONFIG_MAPPING
+                from sglang.multimodal_gen.runtime.models.sensenova_u1 import NEOChatModel
+                from sglang.multimodal_gen.runtime.models.sensenova_u1.modeling_neo_chat import (
+                    NEOChatModel as implementation,
+                )
+                assert NEOChatModel is implementation
                 """
             ),
         ],
@@ -900,3 +906,16 @@ def test_sensenova_u1_load_registers_before_loading(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="checkpoint loading reached"):
         SenseNovaU1Pipeline.load_modules(pipeline, args)
+
+
+def test_sensenova_u1_legacy_config_and_seed_imports():
+    from sglang.multimodal_gen.configs.sensenova_u1 import (
+        DEFAULT_CFG_NORM,
+        is_sensenova_u1_model,
+    )
+    from sglang.multimodal_gen.registry import is_sensenova_u1_model as detector
+    from sglang.multimodal_gen.runtime.entrypoints.utils import normalize_output_seeds
+
+    assert DEFAULT_CFG_NORM == "none"
+    assert is_sensenova_u1_model is detector
+    assert normalize_output_seeds(10, num_outputs_per_prompt=2) == [10, 11]
