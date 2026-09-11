@@ -36,6 +36,7 @@ from sglang.srt.models.glm4 import Glm4DecoderLayer
 from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +87,20 @@ class GlmOcrModelNextN(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+            input_embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                assert input_embeds is not None
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                input_embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
+            if input_embeds is None:
+                input_embeds = self.embed_tokens(input_ids)
+        hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
             hidden_states = self.eh_proj(
@@ -127,6 +139,8 @@ class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        _, rope_scaling = get_rope_config(config)
+        self.is_mrope_enabled = "mrope_section" in (rope_scaling or {})
         self.model = GlmOcrModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -148,6 +162,8 @@ class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
