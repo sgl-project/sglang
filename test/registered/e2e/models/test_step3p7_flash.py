@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval_once
+from sglang.test.server_fixtures.default_fixture import openai_api_env
 from sglang.test.simple_eval_common import make_report
 from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
 from sglang.test.test_utils import (
@@ -64,9 +65,12 @@ class TestStep3p7Flash(CustomTestCase):
                 + ["--max-running-requests", str(max_running_requests)],
             )
             try:
-                result, latency, _ = run_eval_once(
-                    args, self.base_url + "/v1", evaluator
-                )
+                # Unlike run_eval(), run_eval_once() does not initialize the
+                # SDK's required API key, even for an unauthenticated server.
+                with openai_api_env("EMPTY"):
+                    result, latency, _ = run_eval_once(
+                        args, self.base_url + "/v1", evaluator
+                    )
                 scores[mode] = result.score
                 (report_dir / f"{mode}.html").write_text(make_report(result))
                 (report_dir / f"{mode}.json").write_text(
