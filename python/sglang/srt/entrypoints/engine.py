@@ -208,9 +208,9 @@ def init_tokenizer_manager(
                 f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
             )
         else:
-            logger.warning(
-                f"--{attr.replace('_', '-')}=auto specified but could not detect "
-                f"{label} from chat template. Disabling {label}."
+            logger.info(
+                f"No {label} detected from chat template for "
+                f"--{attr.replace('_', '-')}=auto; {label} disabled."
             )
             tokenizer_manager.record_config_updates(
                 "template-detection", **{attr: None}

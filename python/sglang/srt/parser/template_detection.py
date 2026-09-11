@@ -169,6 +169,13 @@ REASONING_MODE_RULES = (
         ),
     ),
     DetectionRule(
+        name="glm53_always_think",
+        value=ReasoningToggleConfig(special_case="always"),
+        # The generation prompt opens <think> unconditionally, so output starts
+        # inside reasoning; lambda because _is_glm53 is defined below.
+        predicate=lambda ctx: _is_glm53(ctx),
+    ),
+    DetectionRule(
         name="mistral_reasoning_effort",
         value=ReasoningToggleConfig(special_case="mistral"),
         predicate=lambda ctx: (
@@ -738,9 +745,9 @@ def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[
 
 
 def _log_undetected_parser(attr: str, label: str) -> None:
-    logger.warning(
-        f"--{attr.replace('_', '-')}=auto specified but could not detect "
-        f"{label} from chat template. Disabling {label}."
+    logger.info(
+        f"No {label} detected from chat template for "
+        f"--{attr.replace('_', '-')}=auto; {label} disabled."
     )
 
 

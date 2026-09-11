@@ -190,7 +190,7 @@ class Serving(msgspec.Struct):
         bool,
         "Return sampled output token ids on the response-level sglext extension for every chat completion request, as if return_output_ids_in_sglext were set on the request.",
     ] = False
-    reasoning_parser: Optional[str] = None
+    reasoning_parser: Optional[str] = "auto"
     default_chat_template_kwargs: A[
         Optional[Dict[str, Any]],
         Arg(
@@ -209,7 +209,7 @@ class Serving(msgspec.Struct):
         bool,
         "Enable strict token filtering during the thinking phase. Blocks model-specific excluded tokens (e.g., tool call markers) during reasoning. Requires a grammar backend that supports token filtering.",
     ] = False
-    tool_call_parser: Optional[str] = None
+    tool_call_parser: Optional[str] = "auto"
     tool_server: A[
         Optional[str],
         "Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",
