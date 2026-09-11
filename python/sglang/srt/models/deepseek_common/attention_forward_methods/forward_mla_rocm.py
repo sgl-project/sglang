@@ -733,20 +733,13 @@ class DeepseekMLARocmForwardMixin:
                         "llama_4_scaling": llama_4_scaling,
                     }
                 if is_dcp_mla_decode_phase(forward_batch):
-                    # set return_lse=True to correct attn_output
-                    attn_output, lse = self.attn_mqa_for_dcp_decode(
-                        q_nope_out,
-                        k_nope,
-                        k_nope,
-                        forward_batch,
-                        q_rope=q_pe,
-                        k_rope=k_pe,
-                        **extra_args,
-                        **(
-                            dict(topk_indices=topk_indices)
-                            if topk_indices is not None
-                            else {}
-                        ),
+                    # aiter's decode kernels never return LSE, which DCP's
+                    # cross-rank merge below requires. sgl-project/sglang#38709.
+                    raise NotImplementedError(
+                        "DCP decode is not supported with the aiter MLA "
+                        "decode backend on ROCm: it does not return the "
+                        "log-sum-exp DCP's merge step needs "
+                        "(sgl-project/sglang#38709)."
                     )
                 else:
                     attn_output = self.attn_mqa(
