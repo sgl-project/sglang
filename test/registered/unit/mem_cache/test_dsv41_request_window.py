@@ -1,5 +1,6 @@
 import pytest
 import torch
+from msgspec.structs import astuple
 
 from sglang.srt.mem_cache.dsv41_request_window import (
     RequestWindow,
@@ -168,15 +169,13 @@ def test_layout_copy_preserves_captured_tensor_addresses():
     b = window_layout(
         torch.tensor([2] * 5), torch.arange(2, 7), window=3, capacity=12, num_groups=1
     )
-    addresses = {
-        name: getattr(a, name).data_ptr()
-        for name in a.__struct_fields__
-        if isinstance(getattr(a, name), torch.Tensor)
-    }
+    addresses = [t.data_ptr() for t in astuple(a) if isinstance(t, torch.Tensor)]
     a.copy_(b)
-    for name, addr in addresses.items():
-        assert getattr(a, name).data_ptr() == addr
-        assert torch.equal(getattr(a, name), getattr(b, name))
+    actual = [t for t in astuple(a) if isinstance(t, torch.Tensor)]
+    expected = [t for t in astuple(b) if isinstance(t, torch.Tensor)]
+    for tensor, other, addr in zip(actual, expected, addresses, strict=True):
+        assert tensor.data_ptr() == addr
+        assert torch.equal(tensor, other)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph regression")

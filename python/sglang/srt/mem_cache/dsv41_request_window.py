@@ -22,19 +22,16 @@ class WindowLayout(msgspec.Struct, frozen=True):
         # kernels read these tensors by address, so their contents move, not
         # the object.
         assert self.size == other.size, (self.size, other.size)
-        for name in (
-            "req",
-            "pos",
-            "write_loc",
-            "indices",
-            "lengths",
-            "history_req",
-            "history_pos",
-            "history_loc",
-            "history_valid",
-            "commit_mask",
-        ):
-            getattr(self, name).copy_(getattr(other, name))
+        self.req.copy_(other.req)
+        self.pos.copy_(other.pos)
+        self.write_loc.copy_(other.write_loc)
+        self.indices.copy_(other.indices)
+        self.lengths.copy_(other.lengths)
+        self.history_req.copy_(other.history_req)
+        self.history_pos.copy_(other.history_pos)
+        self.history_loc.copy_(other.history_loc)
+        self.history_valid.copy_(other.history_valid)
+        self.commit_mask.copy_(other.commit_mask)
 
 
 def _first_row_offsets(

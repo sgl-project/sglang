@@ -698,8 +698,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self.request_window = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
-        # DSpark shares the target allocator's full-to-SWA mapping, but keeps
-        # its own paged KV. The target needs the allocator even without SWA data.
+        # Keep DSpark's paged SWA cache: removing its history hurts speculative
+        # decoding acceptance length. The draft shares the target allocator's
+        # full-to-SWA mapping, so the target still needs that allocator.
         self.needs_paged_swa_allocator = (
             not encoder_replay
             or is_draft_worker

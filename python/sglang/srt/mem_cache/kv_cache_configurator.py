@@ -1930,7 +1930,10 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
             else:
-                if not getattr(token_to_kv_pool, "needs_paged_swa_allocator", True):
+                if (
+                    isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and not token_to_kv_pool.needs_paged_swa_allocator
+                ):
                     token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                         sizes.full_max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -2008,8 +2011,9 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
-            if self.is_hybrid_swa and getattr(
-                token_to_kv_pool, "needs_paged_swa_allocator", True
+            if self.is_hybrid_swa and (
+                not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                or token_to_kv_pool.needs_paged_swa_allocator
             ):
                 if isinstance(
                     token_to_kv_pool_allocator,
