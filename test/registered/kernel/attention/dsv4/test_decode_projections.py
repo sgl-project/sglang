@@ -38,6 +38,7 @@ class TestDecodeProjections(CustomTestCase):
 
     def test_fp4_indexer_direct_mapping_matches_explicit_slots(self):
         from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
+            fp4_index_logits_candidate_blocks,
             fp4_index_logits_decode,
             fp4_index_logits_req_to_token,
         )
@@ -124,11 +125,60 @@ class TestDecodeProjections(CustomTestCase):
                 torch.testing.assert_close(
                     block_lens, ((lens + 7) // 8).to(torch.int32)
                 )
+                block_only_scores, block_only_lens = fp4_index_logits_req_to_token(
+                    q,
+                    weights,
+                    req_to_token,
+                    req,
+                    lens,
+                    table,
+                    page_size,
+                    ratio,
+                    width,
+                    candidate_block_size=8,
+                    write_logits=False,
+                )
+                torch.testing.assert_close(block_only_scores, expected_blocks)
+                torch.testing.assert_close(block_only_lens, block_lens)
+
+                candidate_blocks = torch.tensor(
+                    [[0, 3], [1, 4], [0, 0]], device="cuda", dtype=torch.int32
+                )
+                candidate_lens = torch.tensor(
+                    [16, 16, 0], device="cuda", dtype=torch.int32
+                )
+                candidate_logits = fp4_index_logits_candidate_blocks(
+                    q,
+                    weights,
+                    req_to_token,
+                    req,
+                    candidate_blocks,
+                    candidate_lens,
+                    table,
+                    page_size,
+                    ratio,
+                    8,
+                )
+                logical = (
+                    candidate_blocks[:, :, None] * 8 + torch.arange(8, device="cuda")
+                ).flatten(1)
+                candidate_slots = req_to_token[req[:, None], logical * ratio] // ratio
+                expected_candidate_logits = fp4_index_logits_decode(
+                    q,
+                    weights,
+                    candidate_slots,
+                    candidate_lens,
+                    table,
+                    page_size,
+                )
+                torch.testing.assert_close(
+                    candidate_logits, expected_candidate_logits, equal_nan=True
+                )
 
     def test_candidate_block_indices_matches_torch(self):
         from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_block_state,
             candidate_block_indices,
-            candidate_slots,
         )
 
         torch.manual_seed(29)
@@ -158,18 +208,12 @@ class TestDecodeProjections(CustomTestCase):
         )
         torch.testing.assert_close(actual_valid, expected.values > -torch.inf)
 
-        req_to_token = torch.arange(
-            rows * width, device="cuda", dtype=torch.int32
-        ).view(rows, width)
-        req = torch.arange(rows, device="cuda", dtype=torch.int64)
-        positions, slots, counts, _ = candidate_slots(
-            logits,
+        sorted_blocks, counts, _ = candidate_block_state(
+            scores,
+            ((lens + block_size - 1) // block_size).to(torch.int32),
             lens,
-            req_to_token,
-            req,
             topk_blocks=topk_blocks,
             block_size=block_size,
-            ratio=1,
         )
         blocks = (
             expected.indices.masked_fill(expected.values == -torch.inf, scores.shape[1])
@@ -180,11 +224,7 @@ class TestDecodeProjections(CustomTestCase):
             blocks[:, :, None] * block_size + torch.arange(block_size, device="cuda")
         ).flatten(1)
         valid = expected_positions < lens[:, None]
-        expected_slots = req_to_token[
-            req[:, None], expected_positions.clamp_max(width - 1)
-        ].masked_fill(~valid, 0)
-        torch.testing.assert_close(positions, expected_positions)
-        torch.testing.assert_close(slots, expected_slots)
+        torch.testing.assert_close(sorted_blocks, blocks.to(torch.int32))
         torch.testing.assert_close(counts, valid.sum(dim=-1).to(torch.int32))
 
 
