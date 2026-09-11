@@ -154,16 +154,24 @@ def cgroup_memory_limit_bytes(
     return None
 
 
-def host_memory_available_bytes(*, physical: bool = False) -> int:
+def physical_host_memory_available_bytes() -> int:
+    """What the machine itself can still give: kernel available under any cgroup cap."""
+    available = int(psutil.virtual_memory().available)
+    capped = cgroup_memory_limit_bytes()
+    if capped is None:
+        return available
+    limit, usage = capped
+    return min(available, max(0, limit - usage))
+
+
+def host_memory_available_bytes() -> int:
     """Bytes this process can still commit without hitting a wall.
 
     The smaller of what the kernel reports free and what the cgroup still
     allows, so a container does not plan against the whole machine.
-    `physical` ignores the test-only forced host view: it sizes what the
-    kernel's page cache can hold, which the pretend host does not change.
     """
     forced_gib = envs.SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB
-    if forced_gib is not None and not physical:
+    if forced_gib is not None:
         # Behave like a machine of that size: what such a host would still
         # have free is the pretend total minus what this process has already
         # taken in anonymous memory.
@@ -177,13 +185,7 @@ def host_memory_available_bytes(*, physical: bool = False) -> int:
         except OSError:
             pass
         return max(0, int(forced_gib * GIB_BYTES) - own_anonymous)
-
-    available = int(psutil.virtual_memory().available)
-    capped = cgroup_memory_limit_bytes()
-    if capped is None:
-        return available
-    limit, usage = capped
-    return min(available, max(0, limit - usage))
+    return physical_host_memory_available_bytes()
 
 
 def shared_pool_available_bytes() -> int:
@@ -222,8 +224,7 @@ def page_cache_cannot_hold(mapped_bytes: int) -> bool:
     if mapped_bytes <= 0:
         return False
     return (
-        mapped_bytes
-        >= host_memory_available_bytes(physical=True) - HOST_COPY_RESERVE_BYTES
+        mapped_bytes >= physical_host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
     )
 
 
