@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.quantization import unquant
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, stage="stage-a")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestSm120BaDispatch(unittest.TestCase):
