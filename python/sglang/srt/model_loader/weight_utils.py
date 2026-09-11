@@ -879,7 +879,16 @@ def maybe_add_mtp_safetensors(
 
     # Check if mtp.safetensors exists and is not already in the file list
     mtp_path = os.path.join(hf_folder, "mtp.safetensors")
-    if not os.path.isfile(mtp_path) or mtp_path in hf_weights_files:
+    if mtp_path in hf_weights_files:
+        return hf_weights_files
+
+    from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+
+    if is_runai_obj_uri(hf_folder):
+        mtp_exists = mtp_path in list_safetensors(hf_folder)
+    else:
+        mtp_exists = os.path.isfile(mtp_path)
+    if not mtp_exists:
         return hf_weights_files
 
     # mtp.safetensors exists but not in index - this is a bug

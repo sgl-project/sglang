@@ -4,8 +4,14 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from sglang.srt.model_loader.weight_utils import filter_duplicate_safetensors_files
+from sglang.srt.model_loader.weight_utils import (
+    filter_duplicate_safetensors_files,
+    maybe_add_mtp_safetensors,
+)
+from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -147,6 +153,50 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
             index_file=INDEX_NAME,
         )
         self.assertEqual(result, [single])
+
+
+class TestMaybeAddMtpSafetensors(CustomTestCase):
+    def test_remote_mtp_guards(self):
+        folder = "s3://bucket/model"
+        model = f"{folder}/model.safetensors"
+        mtp = f"{folder}/mtp.safetensors"
+        cases = (
+            ("Glm4MoeForCausalLM", 1, [model, mtp], [model, mtp], False),
+            ("Glm4MoeForCausalLM", 1, [model], [model], True),
+            ("Glm4MoeForCausalLM", 0, [model], [model, mtp], False),
+            ("LlamaForCausalLM", 1, [model], [model, mtp], False),
+        )
+        for arch, nextn, selected, available, may_list in cases:
+            with (
+                self.subTest(arch=arch, nextn=nextn, selected=selected),
+                patch.object(
+                    runai_utils, "list_safetensors", return_value=available
+                ) as listing,
+            ):
+                config = SimpleNamespace(
+                    architectures=[arch], num_nextn_predict_layers=nextn
+                )
+                self.assertEqual(
+                    maybe_add_mtp_safetensors(selected, folder, INDEX_NAME, config),
+                    selected,
+                )
+                if not may_list:
+                    listing.assert_not_called()
+
+    def test_local_unindexed_mtp(self):
+        with tempfile.TemporaryDirectory() as folder:
+            model = _touch(folder, "model.safetensors")
+            mtp = _touch(folder, "mtp.safetensors")
+            config = SimpleNamespace(
+                architectures=["Glm4MoeLiteForCausalLMNextN"],
+                num_nextn_predict_layers=1,
+            )
+            with patch.object(runai_utils, "list_safetensors") as listing:
+                self.assertEqual(
+                    maybe_add_mtp_safetensors([model], folder, INDEX_NAME, config),
+                    [model, mtp],
+                )
+                listing.assert_not_called()
 
 
 if __name__ == "__main__":

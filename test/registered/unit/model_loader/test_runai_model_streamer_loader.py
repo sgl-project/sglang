@@ -47,6 +47,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                     shard = "model-00001-of-00001.safetensors"
                     files = [
                         f"{model_path}/{shard}",
+                        f"{model_path}/mtp.safetensors",
                         f"{model_path}/unused.safetensors",
                     ]
                     cache_root = (
@@ -62,6 +63,11 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                         patch.object(
                             runai_utils, "list_safetensors", return_value=files
                         ) as list_safetensors,
+                        patch.object(
+                            weight_utils,
+                            "runai_safetensors_weights_iterator",
+                            return_value=iter(()),
+                        ) as streamer,
                     ):
                         metadata = runai_utils.ObjectStorageModel.get_path(model_path)
                         os.makedirs(metadata, exist_ok=True)
@@ -83,7 +89,24 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                             (model_path, [files[0]]),
                         )
 
-                        list_safetensors.return_value = [files[1]]
+                        loader.target_device_str = "cpu"
+                        source = loader_mod.RunaiModelStreamerLoader.Source(
+                            model_or_path=model_path,
+                            revision=None,
+                            model_config=cast(
+                                ModelConfig,
+                                SimpleNamespace(
+                                    hf_config=SimpleNamespace(
+                                        architectures=["Glm4MoeForCausalLMNextN"],
+                                        num_nextn_predict_layers=1,
+                                    )
+                                ),
+                            ),
+                        )
+                        list(loader._get_weights_iterator(source))
+                        streamer.assert_called_once_with(files[:2], True, "cpu")
+
+                        list_safetensors.return_value = [files[-1]]
                         with self.assertRaisesRegex(RuntimeError, shard):
                             loader._prepare_weights(model_path, revision=None)
 
