@@ -52,6 +52,22 @@ class ResponsesRequestTestCase(CustomTestCase):
         self.assertEqual(request.tools[0].name, "lookup")
         self.assertTrue(request.tools[0].strict)
 
+    def test_function_tool_accepts_nullable_strict(self):
+        request = ResponsesRequest(
+            model="x",
+            input="call the tool",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "strict": None,
+                }
+            ],
+            store=False,
+        )
+
+        self.assertIsNone(request.tools[0].strict)
+
     def test_function_tool_requires_name(self):
         with self.assertRaises(ValueError):
             ResponsesRequest(
