@@ -343,34 +343,34 @@ def build_kv_cache(
     if get_memory().enable_sparda:
         cache_controller = getattr(tree_cache, "cache_controller", None)
         transfer_engine = getattr(cache_controller, "l2_transfer_engine", None)
-        if transfer_engine is not None:
-            from sglang.srt.mem_cache.sparda_prefetch import (
-                SparDAKVPrefetcher,
-                TreeCachePrefetchResolver,
-            )
+        from sglang.srt.mem_cache.sparda_prefetch import (
+            SparDAKVPrefetcher,
+            TreeCachePrefetchResolver,
+        )
 
-            # The resolver is deliberately a public cache hook.  Only attach
-            # the Phase2 coordinator when both prediction and resolution are
-            # implemented; otherwise --enable-sparda remains the Phase1
-            # selection path with no change to its behavior.
-            resolver = TreeCachePrefetchResolver(tree_cache)
-            if resolver.is_available():
-                prefetcher = SparDAKVPrefetcher(transfer_engine, resolver=resolver)
-                tp_worker.register_sparda_prefetcher(prefetcher)
-                register_cache_prefetcher = getattr(
-                    tree_cache, "register_sparda_prefetcher", None
-                )
-                if register_cache_prefetcher is not None:
-                    register_cache_prefetcher(prefetcher)
-            else:
-                logger.info(
-                    "SparDA KV prefetch resolver is unavailable; forecast "
-                    "selection remains enabled."
-                )
+        # A cache-side resolver may use a remote logical-key connector instead
+        # of HiCache's in-process transfer engine.  Keep the coordinator
+        # attach point common to both paths; the resolver owns the actual
+        # transfer contract.
+        resolver = TreeCachePrefetchResolver(tree_cache)
+        if resolver.is_available():
+            prefetcher = SparDAKVPrefetcher(
+                transfer_engine,
+                resolver=resolver,
+                submit_on_wait=(
+                    getattr(get_memory(), "sparda_prefetch_mode", "async") == "demand"
+                ),
+            )
+            tp_worker.register_sparda_prefetcher(prefetcher)
+            register_cache_prefetcher = getattr(
+                tree_cache, "register_sparda_prefetcher", None
+            )
+            if register_cache_prefetcher is not None:
+                register_cache_prefetcher(prefetcher)
         else:
             logger.info(
-                "SparDA KV prefetch is unavailable without a HiCache transfer "
-                "engine; forecast selection remains enabled."
+                "SparDA KV prefetch resolver is unavailable; forecast selection "
+                "remains enabled."
             )
 
     if (

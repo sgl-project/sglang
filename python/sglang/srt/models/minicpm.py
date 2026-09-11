@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -25,6 +26,8 @@ from torch import nn
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.lookahead import (
+    SpardaPrefetchContext,
+    clear_sparda_selection_cache,
     get_forecast_state,
     get_sparda_generation,
     get_sparda_prefetcher,
@@ -47,6 +50,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -161,8 +165,23 @@ class MiniCPMAttention(nn.Module):
                 params_dtype=torch.get_default_dtype(),
                 prefix=add_prefix("q_future_proj", prefix),
             )
+            # The first sparse layer has no previous-layer forecast.  SparDA
+            # trains a separate selector for that layer; later layers use the
+            # forecast published by their predecessor.
+            self.q_curr_proj = (
+                ReplicatedLinear(
+                    hidden_size,
+                    self.total_num_kv_heads * self.head_dim,
+                    bias=False,
+                    params_dtype=torch.get_default_dtype(),
+                    prefix=add_prefix("q_curr_proj", prefix),
+                )
+                if layer_id == 0
+                else None
+            )
         else:
             self.q_future_proj = None
+            self.q_curr_proj = None
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -198,30 +217,31 @@ class MiniCPMAttention(nn.Module):
                 prefix=add_prefix("o_gate", prefix),
             )
 
-    def _project_forecast(
+    def _project_indexer_query(
         self,
+        projection: Optional[nn.Module],
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        if self.q_future_proj is None:
+        if projection is None:
             return None
 
-        forecast, _ = self.q_future_proj(hidden_states)
+        query, _ = projection(hidden_states)
 
         # SparDA's indexer query is in the same positional space as the KV
-        # cache.  The official MiniCPM implementation applies RoPE to
-        # q_future independently of the regular grouped-query projections.
+        # cache. The official MiniCPM implementation applies RoPE to q_future
+        # and q_curr independently of the regular grouped-query projections.
         if self.attn_use_rope:
-            orig_dtype = forecast.dtype
-            forecast_fp32 = forecast.float()
-            forecast, _ = self.rotary_emb(
+            orig_dtype = query.dtype
+            query_fp32 = query.float()
+            query, _ = self.rotary_emb(
                 positions,
-                forecast_fp32,
-                forecast_fp32.clone(),
+                query_fp32,
+                query_fp32.clone(),
             )
-            forecast = forecast.to(orig_dtype)
+            query = query.to(orig_dtype)
 
-        forecast = forecast.view(-1, self.total_num_kv_heads, self.head_dim)
+        query = query.view(-1, self.total_num_kv_heads, self.head_dim)
 
         # Match QKVParallelLinear's GQA partitioning.  When there are fewer KV
         # heads than TP ranks, each rank owns a replica of one logical head.
@@ -231,43 +251,68 @@ class MiniCPMAttention(nn.Module):
             start = tp_rank * self.num_kv_heads
         else:
             start = tp_rank // self.qkv_proj.num_kv_head_replicas
-        return forecast[:, start : start + self.num_kv_heads, :].contiguous()
+        return query[:, start : start + self.num_kv_heads, :].contiguous()
+
+    def _project_forecast(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        return self._project_indexer_query(self.q_future_proj, positions, hidden_states)
+
+    def _project_current_selector(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        return self._project_indexer_query(self.q_curr_proj, positions, hidden_states)
 
     def _submit_forecast_prefetch(
         self,
         next_forecast: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        *,
+        target_layer: Optional[int] = None,
     ) -> None:
         """Submit this layer's one-step forecast to the optional cache adapter."""
         if next_forecast is None:
             return
-        target_layer = self.attn.layer_id + 1
+        if target_layer is None:
+            target_layer = self.attn.layer_id + 1
         if self.num_layers is not None and target_layer >= self.num_layers:
             return
         prefetcher = get_sparda_prefetcher(forward_batch)
         if prefetcher is None or not forward_batch.rids:
             return
 
-        if forward_batch.forward_mode.is_decode_or_idle():
-            query_spans = [(i, i + 1) for i in range(len(forward_batch.rids))]
-        else:
-            lengths = forward_batch.extend_seq_lens_cpu
-            if lengths is None or sum(lengths) != next_forecast.shape[0]:
-                return
-            query_spans = []
-            start = 0
-            for length in lengths:
-                query_spans.append((start, start + length))
-                start += length
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            # The current HiCache page resolver stages decode history.  Keep
+            # chunked prefill on the Forecast selection path, but do not
+            # submit a ticket that cannot describe its in-flight KV pages.
+            return
+
+        query_spans = [(i, i + 1) for i in range(len(forward_batch.rids))]
 
         request_contexts = get_sparda_request_context(forward_batch)
         for request_index, request_id in enumerate(forward_batch.rids):
             start, end = query_spans[request_index]
             if start == end:
                 continue
-            context = forward_batch
+            context = SpardaPrefetchContext(
+                request=forward_batch,
+                forward_batch=forward_batch,
+                request_index=request_index,
+                selector_backend=get_attn_backend(),
+                forecast_batch=next_forecast,
+            )
             if request_contexts is not None and request_index < len(request_contexts):
-                context = request_contexts[request_index]
+                context = SpardaPrefetchContext(
+                    request=request_contexts[request_index],
+                    forward_batch=forward_batch,
+                    request_index=request_index,
+                    selector_backend=get_attn_backend(),
+                    forecast_batch=next_forecast,
+                )
             prefetcher.prefetch_forecast_query(
                 request_id,
                 get_sparda_generation(forward_batch, request_index),
@@ -276,24 +321,50 @@ class MiniCPMAttention(nn.Module):
                 context=context,
             )
 
+    def _restore_sparda_requests(self, forward_batch: ForwardBatch) -> None:
+        """Restore host-backed rows before falling back to regular attention."""
+        prefetcher = get_sparda_prefetcher(forward_batch)
+        restore_request = getattr(prefetcher, "restore_request", None)
+        request_contexts = get_sparda_request_context(forward_batch)
+        if restore_request is None or request_contexts is None:
+            return
+        for request in request_contexts:
+            if not restore_request(request):
+                raise RuntimeError(
+                    "SparDA request restoration failed; refusing to run "
+                    "attention on host-backed KV"
+                )
+
     def _wait_for_forecast_prefetch(self, forward_batch: ForwardBatch) -> bool:
         """Make the next-layer attention stream observe completed H2D copies."""
         prefetcher = get_sparda_prefetcher(forward_batch)
         if prefetcher is None or not forward_batch.rids:
+            return True
+        if not forward_batch.forward_mode.is_decode_or_idle():
             return True
         wait_for_layer = getattr(prefetcher, "wait_for_layer", None)
         if wait_for_layer is None:
             return True
         ready = True
         for request_index, request_id in enumerate(forward_batch.rids):
-            ready = (
-                wait_for_layer(
+            try:
+                request_ready = wait_for_layer(
                     request_id,
                     get_sparda_generation(forward_batch, request_index),
                     self.attn.layer_id,
                 )
-                and ready
-            )
+            except Exception:
+                request_ready = False
+            ready = request_ready and ready
+        if not ready:
+            cancel_for_layer = getattr(prefetcher, "cancel_for_layer", None)
+            if cancel_for_layer is not None:
+                for request_index, request_id in enumerate(forward_batch.rids):
+                    cancel_for_layer(
+                        request_id,
+                        get_sparda_generation(forward_batch, request_index),
+                        self.attn.layer_id,
+                    )
         return ready
 
     def _consume_forecast_prefetch(self, forward_batch: ForwardBatch) -> None:
@@ -328,19 +399,33 @@ class MiniCPMAttention(nn.Module):
 
         forecast_state = None
         forecast_for_attention = None
+        current_selector = None
         next_forecast = None
         if self.sparda_enabled:
             forecast_state = get_forecast_state(forward_batch)
             forecast_for_attention = forecast_state.for_layer(self.attn.layer_id)
+            current_selector = self._project_current_selector(positions, hidden_states)
             next_forecast = self._project_forecast(positions, hidden_states)
+            if self.attn.layer_id == 0:
+                self._submit_forecast_prefetch(
+                    current_selector,
+                    forward_batch,
+                    target_layer=self.attn.layer_id,
+                )
             self._submit_forecast_prefetch(next_forecast, forward_batch)
             if not self._wait_for_forecast_prefetch(forward_batch):
                 # A cancelled or failed ticket must never make the attention
                 # kernel consume a page whose H2D event was not observed.
                 # Revert to the current-query/full loading path instead.
+                self._restore_sparda_requests(forward_batch)
                 forecast_for_attention = None
+                current_selector = None
 
-        if forecast_for_attention is None:
+        selector_query = forecast_for_attention
+        if selector_query is None and self.attn.layer_id == 0:
+            selector_query = current_selector
+
+        if selector_query is None:
             # Preserve the existing backend path for the first layer (and for
             # all requests when SparDA is disabled).  The extra kwarg would
             # otherwise force the tc-piecewise path through the eager adapter.
@@ -351,7 +436,7 @@ class MiniCPMAttention(nn.Module):
                 k,
                 v,
                 forward_batch,
-                forecast_query=forecast_for_attention,
+                forecast_query=selector_query,
             )
 
         if forecast_state is not None:
@@ -667,6 +752,7 @@ class MiniCPMModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if getattr(self.config, "sparda_enabled", False):
+            clear_sparda_selection_cache(forward_batch)
             get_forecast_state(forward_batch).reset()
 
         if input_embeds is None:
@@ -684,6 +770,22 @@ class MiniCPMModel(nn.Module):
                 residual,
             )
         hidden_states = self.norm(hidden_states)
+        if getattr(self.config, "sparda_enabled", False):
+            prefetcher = get_sparda_prefetcher(forward_batch)
+            offload_request = getattr(prefetcher, "offload_request_history", None)
+            request_contexts = get_sparda_request_context(forward_batch)
+            sparse_config = getattr(self.config, "sparse_config", None) or {}
+            if (
+                offload_request is not None
+                and request_contexts is not None
+                and forward_batch.forward_mode.is_decode_or_idle()
+            ):
+                for request in request_contexts:
+                    offload_request(
+                        request,
+                        keep_device_tokens=int(sparse_config.get("window_size", 0)),
+                        min_history_len=int(sparse_config.get("dense_len", 0)),
+                    )
         return hidden_states
 
 
@@ -814,7 +916,15 @@ class MiniCPMSALAForCausalLM(nn.Module):
         if not path.is_file():
             raise FileNotFoundError(f"SparDA indexer checkpoint does not exist: {path}")
 
-        checkpoint = torch.load(path, map_location="cpu")
+        numpy_reconstruct = np.core.multiarray._reconstruct
+        safe_numpy_globals = [
+            numpy_reconstruct,
+            np.ndarray,
+            np.dtype,
+            type(np.dtype(np.uint32)),
+        ]
+        with torch.serialization.safe_globals(safe_numpy_globals):
+            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(checkpoint, Mapping):
             raise ValueError(
                 f"SparDA indexer checkpoint must contain a state dict, got "
@@ -830,7 +940,7 @@ class MiniCPMSALAForCausalLM(nn.Module):
         params = {
             name: param
             for name, param in self.named_parameters()
-            if name.endswith("q_future_proj.weight")
+            if name.endswith(("q_future_proj.weight", "q_curr_proj.weight"))
         }
         if not params:
             raise RuntimeError(
@@ -843,6 +953,24 @@ class MiniCPMSALAForCausalLM(nn.Module):
             if not isinstance(value, torch.Tensor):
                 continue
             normalized_state[name.removeprefix("module.")] = value
+
+        expected_aliases = set()
+        for name in params:
+            expected_aliases.update(
+                (name, name.removeprefix("model."), f"model.{name}")
+            )
+        unexpected = sorted(
+            name
+            for name in normalized_state
+            if name.endswith(("q_future_proj.weight", "q_curr_proj.weight"))
+            and name not in expected_aliases
+        )
+        if unexpected:
+            raise ValueError(
+                "SparDA indexer checkpoint has unexpected Forecast weights: "
+                + ", ".join(unexpected[:4])
+                + (" ..." if len(unexpected) > 4 else "")
+            )
 
         missing = []
         for name, param in params.items():

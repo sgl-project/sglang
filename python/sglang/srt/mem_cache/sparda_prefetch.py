@@ -14,6 +14,7 @@ flight.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from enum import Enum, auto
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, TransferCompletion
+
+logger = logging.getLogger(__name__)
 
 
 class PrefetchTicketState(Enum):
@@ -36,6 +39,9 @@ class PrefetchTicketState(Enum):
 class PageLease(Protocol):
     """Lease held while a transfer may still write destination pages."""
 
+    def mark_consumed(self) -> None:
+        """Record that the attention consumer has finished using the pages."""
+
     def release(self) -> None:
         """Make the leased pages eligible for reuse."""
 
@@ -45,15 +51,52 @@ class CallbackPageLease:
     """Small adapter for allocators that expose acquire/release callbacks."""
 
     release_callback: Callable[[], None]
+    consumed_callback: Optional[Callable[[], None]] = None
     _released: bool = False
-    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _releasing: bool = False
+    _consumed: bool = False
+    _consuming: bool = False
+    _lock: threading.Condition = field(default_factory=threading.Condition, repr=False)
+
+    def mark_consumed(self) -> None:
+        with self._lock:
+            while self._releasing:
+                self._lock.wait()
+            if self._released or self._consumed or self._consuming:
+                return
+            self._consuming = True
+        try:
+            if self.consumed_callback is not None:
+                self.consumed_callback()
+        except BaseException:
+            with self._lock:
+                self._consuming = False
+                self._lock.notify_all()
+            raise
+        with self._lock:
+            self._consuming = False
+            if not self._released:
+                self._consumed = True
+            self._lock.notify_all()
 
     def release(self) -> None:
         with self._lock:
-            if self._released:
+            while self._consuming:
+                self._lock.wait()
+            if self._released or self._releasing:
                 return
+            self._releasing = True
+        try:
+            self.release_callback()
+        except BaseException:
+            with self._lock:
+                self._releasing = False
+                self._lock.notify_all()
+            raise
+        with self._lock:
+            self._releasing = False
             self._released = True
-        self.release_callback()
+            self._lock.notify_all()
 
 
 @dataclass(frozen=True)
@@ -69,6 +112,46 @@ class ResolvedPrefetch:
     layer_num: int
     lease: Optional[PageLease] = None
     start_event: Any = None
+    on_ready: Optional[Callable[[], Optional[bool]]] = None
+    submit_callback: Optional[Callable[[], Optional[Any]]] = None
+    safe_without_transfer: bool = False
+
+
+class RemoteTransferCompletion:
+    """Adapt a device-aware remote future to the local transfer contract."""
+
+    def __init__(
+        self,
+        future: Any,
+        on_result: Callable[[tuple[int, ...]], None],
+    ) -> None:
+        self.future = future
+        self.on_result = on_result
+        # SparDAKVPrefetcher waits on ``finish_event``.  The remote future
+        # already imports and synchronizes the server's device event, so this
+        # object is its event-like completion surface.
+        self.finish_event = self
+        self._lock = threading.Lock()
+        self._synchronized = False
+
+    def synchronize(self) -> None:
+        """Wait for the remote H2D event and publish its hit mapping once."""
+        with self._lock:
+            if self._synchronized:
+                return
+            result = self.future.result()
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise RuntimeError("remote sparse retrieve returned an invalid result")
+            success, found_indices = result
+            if not success:
+                # The server returns no completion event when it did not copy
+                # any destination page.  Publishing an empty hit set lets the
+                # resolver reject the overlay and release its lease; a
+                # transport exception remains fail-closed below.
+                self.on_result(())
+            else:
+                self.on_result(tuple(int(index) for index in found_indices))
+            self._synchronized = True
 
 
 @dataclass
@@ -81,9 +164,16 @@ class PrefetchTicket:
     predicted_block_ids: tuple[int, ...]
     completion: Optional[TransferCompletion] = None
     lease: Optional[PageLease] = None
+    pending_resolved: Optional[ResolvedPrefetch] = field(
+        default=None, repr=False, compare=False
+    )
     state: PrefetchTicketState = PrefetchTicketState.SUBMITTED
     error: Optional[BaseException] = None
     completion_synchronized: bool = False
+    ready_callback: Optional[Callable[[], Optional[bool]]] = field(
+        default=None, repr=False, compare=False
+    )
+    ready_callback_called: bool = False
     _runtime: Optional[SparDAKVPrefetcher] = field(
         default=None, repr=False, compare=False
     )
@@ -93,12 +183,13 @@ class PrefetchTicket:
     def done(self) -> bool:
         """Return whether the ticket has reached a terminal state."""
         with self._lock:
+            if self.state is PrefetchTicketState.READY:
+                return True
             if self.state in {
-                PrefetchTicketState.READY,
                 PrefetchTicketState.CONSUMED,
                 PrefetchTicketState.RELEASED,
             }:
-                return True
+                return self.lease is None
             # A failed cancellation keeps the lease and ticket reachable so
             # cleanup can retry the event synchronization.
             return self.state is PrefetchTicketState.CANCELLED and self.lease is None
@@ -179,11 +270,18 @@ class SparDAKVPrefetcher:
         self,
         transfer_engine: Any,
         resolver: Optional[PrefetchResolver] = None,
+        *,
+        submit_on_wait: bool = False,
     ) -> None:
         self._transfer_engine = transfer_engine
         self._resolver = resolver
+        self._submit_on_wait = submit_on_wait
         self._lock = threading.RLock()
         self._tickets: dict[tuple[str, int, int], PrefetchTicket] = {}
+        # A request/layer key can already be occupied by an older ticket when
+        # a duplicate submit races its cleanup. Keep a losing lease in this
+        # side table instead of dropping the only retry handle.
+        self._orphan_tickets: dict[int, PrefetchTicket] = {}
         self._latest_generation: dict[str, int] = {}
         # Keep a tombstone for generations retired by request cleanup.  A
         # resolver runs outside the runtime lock, so cleanup can race with a
@@ -237,13 +335,23 @@ class SparDAKVPrefetcher:
         if resolved is None:
             self._metrics["fallback"] += 1
             return None
-        if not resolved.transfers:
+        if (
+            not resolved.transfers
+            and resolved.submit_callback is None
+            and not resolved.safe_without_transfer
+        ):
             # The resolver may allocate a lease before discovering that the
             # selected blocks are already resident or otherwise unavailable.
             # There is no transfer completion to guard that lease, so release
             # it before taking the normal attention path.
             if resolved.lease is not None:
-                resolved.lease.release()
+                self._retain_cancelled_lease(
+                    request_id,
+                    generation,
+                    layer_id,
+                    block_ids,
+                    resolved,
+                )
             self._metrics["fallback"] += 1
             return None
         return self.submit(
@@ -252,6 +360,7 @@ class SparDAKVPrefetcher:
             layer_id,
             block_ids,
             resolved,
+            defer=self._submit_on_wait,
         )
 
     def begin_request(self, request_id: str) -> int:
@@ -294,14 +403,25 @@ class SparDAKVPrefetcher:
         )
         if predicted_block_ids is None:
             self._metrics["fallback"] += 1
+            logger.debug(
+                "SparDA forecast unavailable: layer=%d reason=selector", layer_id
+            )
             return None
-        return self.prefetch_forecast(
+        logger.debug(
+            "SparDA forecast selected: layer=%d blocks=%d",
+            layer_id,
+            len(predicted_block_ids),
+        )
+        ticket = self.prefetch_forecast(
             request_id,
             generation,
             layer_id,
             predicted_block_ids,
             context=context,
         )
+        if ticket is None:
+            logger.debug("SparDA forecast unresolved: layer=%d reason=cache", layer_id)
+        return ticket
 
     def submit(
         self,
@@ -310,6 +430,8 @@ class SparDAKVPrefetcher:
         layer_id: int,
         predicted_block_ids: Sequence[int],
         resolved: ResolvedPrefetch,
+        *,
+        defer: bool = False,
     ) -> PrefetchTicket:
         """Submit a resolved plan to the existing HiCache transfer engine."""
         if generation < 0:
@@ -323,29 +445,55 @@ class SparDAKVPrefetcher:
             latest = self._latest_generation.get(request_id)
             if self._is_stale_generation_locked(request_id, generation):
                 self._metrics["stale_prediction"] += 1
-                if resolved.lease is not None:
-                    resolved.lease.release()
-                return PrefetchTicket(
+                return self._retain_cancelled_lease(
                     request_id=request_id,
                     generation=generation,
                     layer_id=layer_id,
                     predicted_block_ids=tuple(predicted_block_ids),
-                    state=PrefetchTicketState.CANCELLED,
+                    resolved=resolved,
                 )
             self._latest_generation[request_id] = max(generation, latest or 0)
             previous = self._tickets.get(key)
             if previous is not None:
                 if not self._cancel_locked(previous):
-                    if resolved.lease is not None:
-                        resolved.lease.release()
                     self._metrics["fallback"] += 1
-                    return PrefetchTicket(
+                    return self._retain_cancelled_lease(
                         request_id=request_id,
                         generation=generation,
                         layer_id=layer_id,
                         predicted_block_ids=tuple(predicted_block_ids),
-                        state=PrefetchTicketState.CANCELLED,
+                        resolved=resolved,
                     )
+
+            if defer:
+                ticket = PrefetchTicket(
+                    request_id=request_id,
+                    generation=generation,
+                    layer_id=layer_id,
+                    predicted_block_ids=tuple(predicted_block_ids),
+                    lease=resolved.lease,
+                    pending_resolved=resolved,
+                    ready_callback=resolved.on_ready,
+                    _runtime=self,
+                )
+                self._tickets[key] = ticket
+                self._metrics["deferred"] += 1
+                return ticket
+
+            ticket = PrefetchTicket(
+                request_id=request_id,
+                generation=generation,
+                layer_id=layer_id,
+                predicted_block_ids=tuple(predicted_block_ids),
+                lease=resolved.lease,
+                ready_callback=resolved.on_ready,
+                _runtime=self,
+            )
+            # Install the ticket before invoking an external submit callback.
+            # The callback may have accepted a remote lease before reporting
+            # an error; keeping the ticket reachable lets request cleanup
+            # retry cancellation/release instead of losing that lease.
+            self._tickets[key] = ticket
 
             try:
                 # L2TransferEngine iterates from layer zero through
@@ -354,28 +502,89 @@ class SparDAKVPrefetcher:
                 # layers, even when the resolver returns a full-model layer
                 # mapper.
                 transfers = _restrict_transfers_to_layer(resolved.transfers, layer_id)
-                completion = self._transfer_engine.submit_host_to_device(
-                    transfers,
-                    layer_num=max(resolved.layer_num, layer_id + 1),
-                    start_event=resolved.start_event,
-                )
-            except BaseException:
-                if resolved.lease is not None:
-                    resolved.lease.release()
+                completion = None
+                if transfers:
+                    if self._transfer_engine is None:
+                        raise RuntimeError(
+                            "a transfer engine is required for resolved transfers"
+                        )
+                    completion = self._transfer_engine.submit_host_to_device(
+                        transfers,
+                        layer_num=max(resolved.layer_num, layer_id + 1),
+                        start_event=resolved.start_event,
+                    )
+                elif resolved.submit_callback is not None:
+                    completion = resolved.submit_callback()
+                    if completion is None:
+                        raise RuntimeError(
+                            "prefetch submit callback returned no completion"
+                        )
+            except BaseException as exc:
+                with ticket._lock:
+                    ticket.error = exc
+                    ticket.state = PrefetchTicketState.CANCELLED
+                if self._release_after_completion(ticket):
+                    self._remove_if_terminal(ticket)
                 raise
 
-            ticket = PrefetchTicket(
-                request_id=request_id,
-                generation=generation,
-                layer_id=layer_id,
-                predicted_block_ids=tuple(predicted_block_ids),
-                completion=completion,
-                lease=resolved.lease,
-                _runtime=self,
-            )
-            self._tickets[key] = ticket
+            with ticket._lock:
+                ticket.completion = completion
             self._metrics["submitted"] += 1
+            logger.debug(
+                "SparDA prefetch submitted: layer=%d blocks=%d",
+                layer_id,
+                len(ticket.predicted_block_ids),
+            )
             return ticket
+
+    def _start_deferred(self, ticket: PrefetchTicket) -> None:
+        """Submit a demand-mode ticket immediately before its layer runs."""
+        with self._lock:
+            with ticket._lock:
+                if ticket.state is not PrefetchTicketState.SUBMITTED:
+                    return
+                resolved = ticket.pending_resolved
+                ticket.pending_resolved = None
+            if resolved is None:
+                return
+
+            try:
+                transfers = _restrict_transfers_to_layer(
+                    resolved.transfers, ticket.layer_id
+                )
+                completion = None
+                if transfers:
+                    if self._transfer_engine is None:
+                        raise RuntimeError(
+                            "a transfer engine is required for resolved transfers"
+                        )
+                    completion = self._transfer_engine.submit_host_to_device(
+                        transfers,
+                        layer_num=max(resolved.layer_num, ticket.layer_id + 1),
+                        start_event=resolved.start_event,
+                    )
+                elif resolved.submit_callback is not None:
+                    completion = resolved.submit_callback()
+                    if completion is None:
+                        raise RuntimeError(
+                            "prefetch submit callback returned no completion"
+                        )
+            except BaseException as exc:
+                with ticket._lock:
+                    ticket.error = exc
+                    ticket.state = PrefetchTicketState.CANCELLED
+                if self._release_after_completion(ticket):
+                    self._remove_if_terminal(ticket)
+                raise
+
+            with ticket._lock:
+                ticket.completion = completion
+            self._metrics["submitted"] += 1
+            logger.debug(
+                "SparDA demand load submitted: layer=%d blocks=%d",
+                ticket.layer_id,
+                len(ticket.predicted_block_ids),
+            )
 
     def wait(self, ticket: PrefetchTicket) -> bool:
         """Synchronize the copy event and make the ticket ready.
@@ -393,6 +602,15 @@ class SparDAKVPrefetcher:
             completion = ticket.completion
             if ticket.state is PrefetchTicketState.CANCELLED and completion is None:
                 return False
+
+        with ticket._lock:
+            pending_resolved = ticket.pending_resolved
+        if pending_resolved is not None:
+            self._start_deferred(ticket)
+            with ticket._lock:
+                if ticket.state is PrefetchTicketState.CANCELLED:
+                    return False
+                completion = ticket.completion
 
         try:
             if completion is not None:
@@ -429,6 +647,30 @@ class SparDAKVPrefetcher:
             raise
 
         with ticket._lock:
+            should_activate = (
+                ticket.state is PrefetchTicketState.SUBMITTED
+                and ticket.ready_callback is not None
+                and not ticket.ready_callback_called
+            )
+            if should_activate:
+                ticket.ready_callback_called = True
+
+        if should_activate:
+            try:
+                ready_result = ticket.ready_callback()
+                if ready_result is False:
+                    with ticket._lock:
+                        ticket.state = PrefetchTicketState.CANCELLED
+                    if self._release_after_completion(ticket):
+                        self._remove_if_terminal(ticket)
+                    return False
+            except BaseException as exc:
+                with ticket._lock:
+                    ticket.ready_callback_called = False
+                    ticket.error = exc
+                raise
+
+        with ticket._lock:
             if ticket.state is PrefetchTicketState.SUBMITTED:
                 ticket.state = PrefetchTicketState.READY
                 self._metrics["completed"] += 1
@@ -442,12 +684,19 @@ class SparDAKVPrefetcher:
         if not self.wait(ticket):
             return False
         with ticket._lock:
+            lease = ticket.lease
+        if lease is not None:
+            mark_consumed = getattr(lease, "mark_consumed", None)
+            if mark_consumed is not None:
+                mark_consumed()
+        with ticket._lock:
             if ticket.state is PrefetchTicketState.READY:
                 ticket.state = PrefetchTicketState.CONSUMED
                 self._metrics["consumed"] += 1
-        self._release_after_completion(ticket)
-        self._remove_if_terminal(ticket)
-        return True
+        released = self._release_after_completion(ticket)
+        if released:
+            self._remove_if_terminal(ticket)
+        return released
 
     def wait_for_layer(
         self,
@@ -468,9 +717,12 @@ class SparDAKVPrefetcher:
             ticket = self._tickets.get(key)
         if ticket is None:
             self._metrics["miss"] += 1
+            logger.debug("SparDA prefetch miss: layer=%d", layer_id)
             return self._resolver is None
         self._metrics["wait"] += 1
-        return self.wait(ticket)
+        ready = self.wait(ticket)
+        logger.debug("SparDA prefetch wait: layer=%d ready=%s", layer_id, ready)
+        return ready
 
     def consume_for_layer(
         self,
@@ -484,7 +736,25 @@ class SparDAKVPrefetcher:
             ticket = self._tickets.get(key)
         if ticket is None:
             return True
-        return self.consume(ticket)
+        consumed = self.consume(ticket)
+        logger.debug(
+            "SparDA prefetch consume: layer=%d consumed=%s", layer_id, consumed
+        )
+        return consumed
+
+    def cancel_for_layer(
+        self,
+        request_id: str,
+        generation: int,
+        layer_id: int,
+    ) -> None:
+        """Cancel a staged layer before attention falls back for the batch."""
+        key = (request_id, generation, layer_id)
+        with self._lock:
+            ticket = self._tickets.get(key)
+            if ticket is None:
+                return
+            self._cancel_locked(ticket)
 
     def cancel(self, ticket: PrefetchTicket) -> None:
         """Cancel a ticket without releasing pages before copy completion."""
@@ -509,17 +779,19 @@ class SparDAKVPrefetcher:
         self,
         request_id: str,
         generation: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         """Cancel all matching tickets during finish/reorder/eviction."""
+        all_released = True
         with self._lock:
             tickets = [
                 ticket
-                for ticket in self._tickets.values()
+                for ticket in tuple(self._tickets.values())
+                + tuple(self._orphan_tickets.values())
                 if ticket.request_id == request_id
                 and (generation is None or ticket.generation == generation)
             ]
             for ticket in tickets:
-                self._cancel_locked(ticket)
+                all_released = self._cancel_locked(ticket) and all_released
             if generation is None:
                 latest = self._latest_generation.get(request_id)
                 if latest is not None:
@@ -536,17 +808,21 @@ class SparDAKVPrefetcher:
                 latest = self._latest_generation.get(request_id)
                 if latest is not None and latest <= generation:
                     self._latest_generation.pop(request_id, None)
+        return all_released
 
-    def cleanup_all(self) -> None:
+    def cleanup_all(self) -> bool:
         """Cancel every outstanding ticket before cache pools are reset."""
         with self._lock:
             request_ids = (
                 {ticket.request_id for ticket in self._tickets.values()}
+                | {ticket.request_id for ticket in self._orphan_tickets.values()}
                 | set(self._latest_generation)
                 | set(self._retired_generations)
             )
+        all_released = True
         for request_id in request_ids:
-            self.cleanup_request(request_id)
+            all_released = self.cleanup_request(request_id) and all_released
+        return all_released
 
     def invalidate_generation(self, request_id: str, generation: int) -> None:
         """Cancel older generations and make ``generation`` the newest one."""
@@ -561,7 +837,9 @@ class SparDAKVPrefetcher:
                 return
             self._retired_generations.pop(request_id, None)
             self._latest_generation[request_id] = generation
-            for ticket in list(self._tickets.values()):
+            for ticket in list(self._tickets.values()) + list(
+                self._orphan_tickets.values()
+            ):
                 if ticket.request_id == request_id and ticket.generation < generation:
                     self._cancel_locked(ticket)
 
@@ -573,7 +851,48 @@ class SparDAKVPrefetcher:
     def active_tickets(self) -> tuple[PrefetchTicket, ...]:
         """Return tickets retained for an unfinished request."""
         with self._lock:
-            return tuple(self._tickets.values())
+            return tuple(self._tickets.values()) + tuple(self._orphan_tickets.values())
+
+    def offload_request_history(
+        self,
+        request: Any,
+        *,
+        keep_device_tokens: int,
+        min_history_len: int = 0,
+    ) -> bool:
+        """Delegate active-request history placement to the cache resolver."""
+        callback = getattr(self._resolver, "offload_request_history", None)
+        if callback is None:
+            return False
+        return bool(
+            callback(
+                request,
+                keep_device_tokens=keep_device_tokens,
+                min_history_len=min_history_len,
+            )
+        )
+
+    def restore_request(self, request: Any) -> bool:
+        """Restore a request before scheduler/cache state is mutated."""
+        callback = getattr(self._resolver, "restore_request", None)
+        if callback is None:
+            return False
+        return bool(callback(request))
+
+    def publish_compressed_index(
+        self, request: Any, layer_id: int, levels: Sequence[Any]
+    ) -> None:
+        """Publish a cache-local compressed-key index for later host hits."""
+        callback = getattr(self._resolver, "publish_compressed_index", None)
+        if callback is not None:
+            callback(request, layer_id, levels)
+
+    def get_compressed_index(self, request: Any, layer_id: int):
+        """Return a cache-local compressed-key index, if one is available."""
+        callback = getattr(self._resolver, "get_compressed_index", None)
+        if callback is None:
+            return None
+        return callback(request, layer_id)
 
     def _is_stale_generation_locked(self, request_id: str, generation: int) -> bool:
         latest = self._latest_generation.get(request_id)
@@ -582,21 +901,67 @@ class SparDAKVPrefetcher:
         retired = self._retired_generations.get(request_id)
         return retired is not None and generation <= retired
 
+    def _retain_cancelled_lease(
+        self,
+        request_id: str,
+        generation: int,
+        layer_id: int,
+        predicted_block_ids: Sequence[int],
+        resolved: ResolvedPrefetch,
+    ) -> PrefetchTicket:
+        """Keep a failed cancellation/release reachable for request cleanup."""
+        ticket = PrefetchTicket(
+            request_id=request_id,
+            generation=generation,
+            layer_id=layer_id,
+            predicted_block_ids=tuple(predicted_block_ids),
+            lease=resolved.lease,
+            state=PrefetchTicketState.CANCELLED,
+            _runtime=self,
+        )
+        if ticket.lease is None:
+            return ticket
+        with self._lock:
+            self._orphan_tickets[id(ticket)] = ticket
+            if self._release_after_completion(ticket):
+                self._remove_if_terminal(ticket)
+            else:
+                self._metrics["lease_release_failed"] += 1
+        return ticket
+
     def _cancel_locked(self, ticket: PrefetchTicket) -> bool:
         with ticket._lock:
-            if ticket.state in {
-                PrefetchTicketState.RELEASED,
-                PrefetchTicketState.CONSUMED,
-            } or (
-                ticket.state is PrefetchTicketState.CANCELLED and ticket.lease is None
+            if (
+                ticket.state
+                in {
+                    PrefetchTicketState.RELEASED,
+                }
+                or (
+                    ticket.state is PrefetchTicketState.CONSUMED
+                    and ticket.lease is None
+                )
+                or (
+                    ticket.state is PrefetchTicketState.CANCELLED
+                    and ticket.lease is None
+                )
             ):
                 return True
+            was_cancelled = ticket.state is PrefetchTicketState.CANCELLED
             ticket.state = PrefetchTicketState.CANCELLED
-        self._metrics["cancelled"] += 1
+            has_completion = ticket.completion is not None
+        if not was_cancelled:
+            self._metrics["cancelled"] += 1
         # synchronize before releasing the lease; otherwise a destination
         # page may be reused while the copy stream still writes it.
         try:
-            self.wait(ticket)
+            if has_completion:
+                self.wait(ticket)
+            else:
+                # A ticket without a completion represents a synchronous
+                # transfer plan (or a safe resident page), so no device event
+                # remains that could write into the leased page.
+                with ticket._lock:
+                    ticket.completion_synchronized = True
         except BaseException:
             # Fail closed.  Keep the lease and ticket reachable so a later
             # cleanup attempt can retry the event synchronization.
@@ -611,23 +976,37 @@ class SparDAKVPrefetcher:
             if ticket.completion is not None and not ticket.completion_synchronized:
                 return False
             lease = ticket.lease
-            if lease is None:
-                return True
-            ticket.lease = None
-        lease.release()
+        if lease is None:
+            return True
+        try:
+            lease.release()
+        except BaseException as exc:
+            with ticket._lock:
+                ticket.error = exc
+            return False
+        with ticket._lock:
+            if ticket.lease is lease:
+                ticket.lease = None
         return True
 
     def _remove_if_terminal(self, ticket: PrefetchTicket) -> None:
-        if ticket.state not in {
-            PrefetchTicketState.CONSUMED,
-            PrefetchTicketState.CANCELLED,
-            PrefetchTicketState.RELEASED,
-        }:
-            return
+        with ticket._lock:
+            if (
+                ticket.state
+                not in {
+                    PrefetchTicketState.CONSUMED,
+                    PrefetchTicketState.CANCELLED,
+                    PrefetchTicketState.RELEASED,
+                }
+                or ticket.lease is not None
+            ):
+                return
         key = (ticket.request_id, ticket.generation, ticket.layer_id)
         with self._lock:
             if self._tickets.get(key) is ticket:
                 self._tickets.pop(key, None)
+            if self._orphan_tickets.get(id(ticket)) is ticket:
+                self._orphan_tickets.pop(id(ticket), None)
 
 
 class CallbackPrefetchResolver:
@@ -670,10 +1049,48 @@ class TreeCachePrefetchResolver:
         self._tree_cache = tree_cache
 
     def is_available(self) -> bool:
-        """Return whether the cache exposes both Phase2 resolver hooks."""
-        return callable(getattr(self._tree_cache, "predict_sparda_blocks", None)) and (
-            callable(getattr(self._tree_cache, "resolve_sparda_prefetch", None))
+        """Return whether the cache can resolve predicted pages safely."""
+        availability = getattr(self._tree_cache, "sparda_prefetch_available", None)
+        if availability is not None:
+            return bool(availability())
+        return callable(getattr(self._tree_cache, "resolve_sparda_prefetch", None))
+
+    def offload_request_history(
+        self,
+        request: Any,
+        *,
+        keep_device_tokens: int,
+        min_history_len: int = 0,
+    ) -> bool:
+        callback = getattr(self._tree_cache, "offload_sparda_request_history", None)
+        if callback is None:
+            return False
+        return bool(
+            callback(
+                request,
+                keep_device_tokens=keep_device_tokens,
+                min_history_len=min_history_len,
+            )
         )
+
+    def restore_request(self, request: Any) -> bool:
+        callback = getattr(self._tree_cache, "restore_sparda_request", None)
+        if callback is None:
+            return False
+        return bool(callback(request))
+
+    def publish_compressed_index(
+        self, request: Any, layer_id: int, levels: Sequence[Any]
+    ) -> None:
+        callback = getattr(self._tree_cache, "publish_sparda_compressed_index", None)
+        if callback is not None:
+            callback(request, layer_id, levels)
+
+    def get_compressed_index(self, request: Any, layer_id: int):
+        callback = getattr(self._tree_cache, "get_sparda_compressed_index", None)
+        if callback is None:
+            return None
+        return callback(request, layer_id)
 
     def predict(
         self,
@@ -684,14 +1101,29 @@ class TreeCachePrefetchResolver:
         context: Any = None,
     ) -> Optional[Sequence[int]]:
         callback = getattr(self._tree_cache, "predict_sparda_blocks", None)
-        if callback is None:
+        if callback is not None:
+            predicted = callback(
+                request_id,
+                generation,
+                layer_id,
+                forecast_query,
+                context,
+            )
+            if predicted is not None:
+                return predicted
+
+        selector_backend = getattr(context, "selector_backend", None)
+        predictor = getattr(selector_backend, "predict_sparda_blocks", None)
+        if predictor is None:
             return None
-        return callback(
-            request_id,
-            generation,
+        forecast_batch = getattr(context, "forecast_batch", None)
+        if forecast_batch is None:
+            forecast_batch = forecast_query
+        return predictor(
+            forecast_batch,
+            context.forward_batch,
+            context.request_index,
             layer_id,
-            forecast_query,
-            context,
         )
 
     def resolve(

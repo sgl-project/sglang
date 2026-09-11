@@ -4,7 +4,7 @@ import atexit
 import logging
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -148,6 +148,19 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+@dataclass
+class _ActiveSparDAResidency:
+    """Host copy held for one active request between decode steps."""
+
+    request_id: str
+    req_pool_idx: int
+    row_generation: int
+    end: int
+    owned_start: int
+    host_indices: torch.Tensor
+    device_indices: torch.Tensor
+
+
 class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -255,6 +268,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # the feature flag is enabled and is deliberately kept outside the
         # normal cache state machine.
         self.sparda_prefetcher = None
+        self._sparda_active_residency: dict[
+            tuple[int, int], _ActiveSparDAResidency
+        ] = {}
+        self._sparda_active_residency_lock = threading.RLock()
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
@@ -367,6 +384,612 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach the optional request-scoped SparDA prefetch coordinator."""
         self.sparda_prefetcher = prefetcher
 
+    def _sparda_request_key(self, request) -> Optional[tuple[int, int]]:
+        request_kv = getattr(request, "kv", None)
+        request_pool_idx = getattr(request_kv, "req_pool_idx", None)
+        if request_pool_idx is None:
+            return None
+        request_pool_idx = int(request_pool_idx)
+        generations = getattr(self.req_to_token_pool, "req_generation", None)
+        if generations is None:
+            row_generation = 0
+        else:
+            row_generation = int(generations[request_pool_idx].item())
+        return request_pool_idx, row_generation
+
+    def _get_active_sparda_residency(self, request) -> Optional[_ActiveSparDAResidency]:
+        key = self._sparda_request_key(request)
+        if key is None:
+            return None
+        with self._sparda_active_residency_lock:
+            state = self._sparda_active_residency.get(key)
+            if state is None or state.request_id != getattr(request, "rid", None):
+                return None
+            return state
+
+    def offload_sparda_request_history(
+        self,
+        request,
+        *,
+        keep_device_tokens: int,
+        min_history_len: int = 0,
+    ) -> bool:
+        """Keep an active request's old KV in HiCache for the next decode.
+
+        Shared radix-tree slots are copied to the host but never freed here.
+        Only request-owned slots are returned to the device allocator.  The
+        request row is zeroed for the host-backed span and the prefetch lease
+        temporarily overlays selected positions when a layer consumes them.
+        """
+
+        def unavailable(reason: str) -> bool:
+            logger.debug(
+                "SparDA active offload unavailable: reason=%s",
+                reason,
+            )
+            return False
+
+        controller = self.cache_controller
+        if controller is None or self.host_pool_group is None:
+            return unavailable("cache_resources")
+        allocator = self.token_to_kv_pool_allocator
+        if getattr(allocator, "page_size", 1) != 1:
+            return unavailable("page_size")
+        # Unified page-major allocators can compact physical pages when freeing
+        # a virtual id.  They need a dedicated virtual-id-aware implementation;
+        # retaining the generic path here would invalidate saved row indices.
+        if hasattr(allocator, "unified_buffer"):
+            return unavailable("unified_allocator")
+        kv_cache = allocator.get_kvcache()
+        if not isinstance(kv_cache, MHATokenToKVPool):
+            return unavailable("kv_pool_type")
+
+        key = self._sparda_request_key(request)
+        if key is None:
+            return unavailable("request_key")
+        request_pool_idx, row_generation = key
+        request_kv = getattr(request, "kv", None)
+        committed_len = int(getattr(request_kv, "kv_committed_len", 0) or 0)
+        allocated_len = int(getattr(request_kv, "kv_allocated_len", 0) or 0)
+        total_len = min(committed_len, allocated_len)
+        keep_device_tokens = max(0, int(keep_device_tokens))
+        min_history_len = max(0, int(min_history_len))
+        if total_len <= min_history_len + keep_device_tokens:
+            return unavailable("history_threshold")
+        offload_end = total_len - keep_device_tokens
+
+        with self._sparda_active_residency_lock:
+            state = self._sparda_active_residency.get(key)
+            if state is not None and state.request_id != getattr(request, "rid", None):
+                return unavailable("request_reuse")
+        old_end = state.end if state is not None else 0
+        if offload_end <= old_end:
+            return state is not None
+
+        row = self.req_to_token_pool.req_to_token[request_pool_idx]
+        new_device_indices = row[old_end:offload_end].to(dtype=torch.int64, copy=True)
+        if new_device_indices.numel() == 0 or bool(
+            (new_device_indices <= 0).any().item()
+        ):
+            return unavailable("row_indices")
+
+        owned_start = (
+            state.owned_start
+            if state is not None
+            else min(
+                max(int(getattr(request_kv, "cache_protected_len", 0) or 0), 0),
+                offload_end,
+            )
+        )
+        new_host_indices = self.host_pool_group.alloc(len(new_device_indices))
+        if new_host_indices is None:
+            return unavailable("host_capacity")
+
+        completion = None
+        try:
+            transfer_device_indices = allocator.translate_kv_indices_for_transfer(
+                new_device_indices
+            )
+            write_operation = CacheOperation(
+                new_host_indices, transfer_device_indices, node_id=-1
+            )
+            write_host, write_device, write_pools = controller._move_write_operation(
+                write_operation
+            )
+            transfers = controller._l2_transfers(write_host, write_device, write_pools)
+            if not transfers:
+                self.host_pool_group.free(new_host_indices)
+                return unavailable("empty_transfer")
+            completion = controller.l2_transfer_engine.submit_device_to_host(transfers)
+            completion.finish_event.synchronize()
+        except BaseException:
+            if completion is not None:
+                try:
+                    completion.finish_event.synchronize()
+                except BaseException:
+                    pass
+            self.host_pool_group.free(new_host_indices)
+            return unavailable("d2h_error")
+
+        free_start = max(old_end, owned_start)
+        if free_start < offload_end:
+            allocator.free(new_device_indices[free_start - old_end :])
+
+        row[old_end:offload_end].zero_()
+        if state is None:
+            active_state = _ActiveSparDAResidency(
+                request_id=request.rid,
+                req_pool_idx=request_pool_idx,
+                row_generation=row_generation,
+                end=offload_end,
+                owned_start=owned_start,
+                host_indices=new_host_indices,
+                device_indices=new_device_indices,
+            )
+        else:
+            active_state = _ActiveSparDAResidency(
+                request_id=state.request_id,
+                req_pool_idx=state.req_pool_idx,
+                row_generation=state.row_generation,
+                end=offload_end,
+                owned_start=state.owned_start,
+                host_indices=torch.cat((state.host_indices, new_host_indices)),
+                device_indices=torch.cat((state.device_indices, new_device_indices)),
+            )
+        with self._sparda_active_residency_lock:
+            self._sparda_active_residency[key] = active_state
+        logger.debug(
+            "SparDA active offload: tokens=%d owned_tokens=%d",
+            active_state.end,
+            max(0, active_state.end - active_state.owned_start),
+        )
+        return True
+
+    def restore_sparda_request(self, request) -> bool:
+        """Restore an active request's host-backed row before cache mutation."""
+        if self.sparda_prefetcher is not None:
+            if not self.sparda_prefetcher.cleanup_request(request.rid):
+                logger.warning(
+                    "SparDA active restore unavailable: reason=prefetch_cleanup"
+                )
+                return False
+        state = self._get_active_sparda_residency(request)
+        if state is None:
+            logger.debug("SparDA active restore skipped: reason=no_state")
+            return True
+
+        controller = self.cache_controller
+        allocator = self.token_to_kv_pool_allocator
+        if controller is None or self.host_pool_group is None:
+            logger.warning("SparDA active restore unavailable: reason=cache_resources")
+            return False
+        owned_len = max(0, state.end - state.owned_start)
+        new_device_indices = None
+        completion = None
+        if owned_len > 0:
+            new_device_indices = allocator.alloc(owned_len)
+            if new_device_indices is None:
+                logger.warning(
+                    "SparDA active restore unavailable: reason=device_capacity "
+                    "tokens=%d",
+                    owned_len,
+                )
+                return False
+            try:
+                host_indices = state.host_indices[state.owned_start : state.end]
+                transfer_device_indices = allocator.translate_kv_indices_for_transfer(
+                    new_device_indices
+                )
+                load_operation = CacheOperation(
+                    host_indices, transfer_device_indices, node_id=-1
+                )
+                load_host, load_device, load_pools = controller._move_op_indices(
+                    load_operation
+                )
+                logger.debug(
+                    "SparDA active restore transfer: source_device=%s "
+                    "target_device=%s layout=%s",
+                    load_host.device,
+                    load_device.device,
+                    self.host_pool_group.layout,
+                )
+                transfers = controller._l2_load_transfers(
+                    load_host, load_device, load_pools
+                )
+                if not transfers:
+                    allocator.free(new_device_indices)
+                    logger.warning(
+                        "SparDA active restore unavailable: reason=empty_transfer"
+                    )
+                    return False
+                completion = controller.l2_transfer_engine.submit_host_to_device(
+                    transfers,
+                    layer_num=controller.layer_num,
+                )
+                completion.finish_event.synchronize()
+            except BaseException as exc:
+                if completion is not None:
+                    try:
+                        completion.finish_event.synchronize()
+                    except BaseException:
+                        pass
+                allocator.free(new_device_indices)
+                logger.warning(
+                    "SparDA active restore unavailable: reason=h2d_error type=%s "
+                    "detail=%s",
+                    type(exc).__name__,
+                    str(exc)[:160],
+                )
+                return False
+
+        row = self.req_to_token_pool.req_to_token[state.req_pool_idx]
+        row[: state.owned_start] = state.device_indices[: state.owned_start].to(
+            dtype=row.dtype
+        )
+        if owned_len > 0:
+            row[state.owned_start : state.end] = new_device_indices.to(dtype=row.dtype)
+        prefix_len = len(getattr(request, "prefix_indices", ()))
+        if prefix_len > 0:
+            request.prefix_indices = row[:prefix_len].to(dtype=torch.int64, copy=True)
+
+        with self._sparda_active_residency_lock:
+            if (
+                self._sparda_active_residency.get(
+                    (state.req_pool_idx, state.row_generation)
+                )
+                is state
+            ):
+                self._sparda_active_residency.pop(
+                    (state.req_pool_idx, state.row_generation), None
+                )
+        self.host_pool_group.free(state.host_indices)
+        logger.debug("SparDA active restore: tokens=%d", state.end)
+        return True
+
+    def _drop_active_sparda_request(self, request_id: str) -> None:
+        with self._sparda_active_residency_lock:
+            states = [
+                state
+                for state in self._sparda_active_residency.values()
+                if state.request_id == request_id
+            ]
+            for state in states:
+                self._sparda_active_residency.pop(
+                    (state.req_pool_idx, state.row_generation), None
+                )
+        if self.host_pool_group is not None:
+            for state in states:
+                self.host_pool_group.free(state.host_indices)
+
+    def _drop_all_active_sparda_requests(self) -> None:
+        with self._sparda_active_residency_lock:
+            states = list(self._sparda_active_residency.values())
+            self._sparda_active_residency.clear()
+        if self.host_pool_group is not None:
+            for state in states:
+                self.host_pool_group.free(state.host_indices)
+
+    def sparda_prefetch_available(self) -> bool:
+        """Return whether this cache exposes the page metadata resolver."""
+        return isinstance(self.tree_core, UnifiedTreeCore)
+
+    def predict_sparda_blocks(
+        self,
+        request_id: str,
+        generation: int,
+        layer_id: int,
+        forecast_query,
+        context=None,
+    ):
+        """Delegate forecast selection to the active model attention backend."""
+        del request_id, generation
+        selector_backend = getattr(context, "selector_backend", None)
+        predictor = getattr(selector_backend, "predict_sparda_blocks", None)
+        if predictor is None:
+            return None
+        forecast_batch = getattr(context, "forecast_batch", None)
+        if forecast_batch is None:
+            forecast_batch = forecast_query
+        return predictor(
+            forecast_batch,
+            context.forward_batch,
+            context.request_index,
+            layer_id,
+        )
+
+    def resolve_sparda_prefetch(
+        self,
+        request_id: str,
+        generation: int,
+        layer_id: int,
+        predicted_block_ids: Sequence[int],
+        context=None,
+    ):
+        """Resolve forecast blocks into a target-layer HiCache transfer.
+
+        This path only stages host-backed pages for the current decode batch.
+        It never changes the radix tree's canonical device values; the page
+        table overlay is owned by the ticket lease and is restored before the
+        staging slots are released.
+        """
+        del request_id, generation
+        from sglang.srt.mem_cache.sparda_prefetch import (
+            CallbackPageLease,
+            ResolvedPrefetch,
+        )
+
+        request = getattr(context, "request", None)
+        forward_batch = getattr(context, "forward_batch", None)
+        backend = getattr(context, "selector_backend", None)
+        request_index = getattr(context, "request_index", None)
+        if request is None or forward_batch is None or backend is None:
+            return None
+        if request_index is None or not forward_batch.forward_mode.is_decode_or_idle():
+            return None
+        controller = self.cache_controller
+        if controller is None or self.host_pool_group is None:
+            return None
+        if getattr(self.token_to_kv_pool_allocator, "page_size", 1) != 1:
+            return None
+
+        metadata = getattr(backend, "forward_metadata", None)
+        base_metadata = getattr(metadata, "base", None)
+        page_table = getattr(base_metadata, "page_table", None)
+        if page_table is None or request_index >= page_table.shape[0]:
+            return None
+        if request_index >= len(forward_batch.seq_lens_cpu):
+            return None
+
+        block_size = getattr(backend, "block_size", None)
+        if not block_size or block_size <= 0:
+            return None
+        history_len = max(0, int(forward_batch.seq_lens_cpu[request_index]) - 1)
+        request_kv = getattr(request, "kv", None)
+        get_fill_ids = getattr(request, "get_fill_ids", None)
+        fill_len = len(get_fill_ids()) if callable(get_fill_ids) else -1
+        logger.debug(
+            "SparDA request state: prefix=%d host_hit=%d host_loaded=%d "
+            "protected=%d committed=%d allocated=%d fill=%d",
+            len(getattr(request, "prefix_indices", ())),
+            int(getattr(request, "host_hit_length", 0) or 0),
+            int(getattr(request, "host_loaded_length", 0) or 0),
+            int(getattr(request_kv, "cache_protected_len", 0) or 0),
+            int(getattr(request_kv, "kv_committed_len", 0) or 0),
+            int(getattr(request_kv, "kv_allocated_len", 0) or 0),
+            fill_len,
+        )
+        host_sources, device_positions = self._sparda_token_residency(request)
+        logger.debug(
+            "SparDA residency: layer=%d history=%d host_positions=%d "
+            "device_positions=%d",
+            layer_id,
+            history_len,
+            len(host_sources),
+            len(device_positions),
+        )
+        if not host_sources and not device_positions:
+            logger.debug(
+                "SparDA prefetch unavailable: layer=%d reason=residency", layer_id
+            )
+            return None
+
+        selected_positions = []
+        seen_positions = set()
+        valid_prediction = False
+        unresolved_position = False
+        for block_id in predicted_block_ids:
+            start = max(0, int(block_id) * block_size)
+            end = min(history_len, start + block_size)
+            for position in range(start, end):
+                valid_prediction = True
+                if position in seen_positions or position in device_positions:
+                    continue
+                source = host_sources.get(position)
+                if source is None:
+                    unresolved_position = True
+                    continue
+                seen_positions.add(position)
+                selected_positions.append((position, source[0], source[1]))
+        if not valid_prediction:
+            logger.debug(
+                "SparDA prefetch unavailable: layer=%d reason=empty_prediction",
+                layer_id,
+            )
+            return None
+        if unresolved_position:
+            # A selected logical position is neither device-resident nor
+            # backed by a host slot.  Do not let the sparse kernel read an
+            # old physical slot; the normal HiCache path owns this miss.
+            logger.debug(
+                "SparDA prefetch unavailable: layer=%d reason=unresolved_position",
+                layer_id,
+            )
+            return None
+        if not selected_positions:
+            logger.debug("SparDA prefetch resident: layer=%d", layer_id)
+            return ResolvedPrefetch(
+                transfers=(),
+                layer_num=getattr(controller, "layer_num", layer_id + 1),
+                safe_without_transfer=True,
+            )
+
+        selected_positions.sort(key=lambda item: item[0])
+        source_indices = [item[1] for item in selected_positions]
+        node_ids = sorted(
+            {item[2] for item in selected_positions if item[2] is not None}
+        )
+        allocator = self.token_to_kv_pool_allocator
+        device_indices = allocator.alloc(len(source_indices))
+        if device_indices is None:
+            return None
+
+        host_indices = torch.tensor(source_indices, dtype=torch.int64, device="cpu")
+        try:
+            load_operation = CacheOperation(host_indices, device_indices, node_id=-1)
+            load_host, load_device, load_pools = controller._move_op_indices(
+                load_operation
+            )
+            transfers = tuple(
+                controller._l2_load_transfers(load_host, load_device, load_pools)
+            )
+        except BaseException:
+            allocator.free(device_indices)
+            return None
+        if not transfers:
+            allocator.free(device_indices)
+            return None
+
+        host_locks = []
+        try:
+            for node_id in node_ids:
+                host_locks.append(
+                    (node_id, self.inc_host_lock_ref(node_id).to_dec_params())
+                )
+        except BaseException:
+            for node_id, params in reversed(host_locks):
+                self.dec_host_lock_ref(node_id, params)
+            allocator.free(device_indices)
+            return None
+
+        positions = torch.tensor(
+            [item[0] for item in selected_positions],
+            dtype=torch.long,
+            device=page_table.device,
+        )
+        original_values = page_table[request_index, positions].clone()
+        overlay_values = device_indices.to(dtype=page_table.dtype)
+        state = {"active": False, "consumer_event": None}
+
+        def install_overlay() -> None:
+            if state["active"]:
+                return
+            page_table[request_index, positions] = overlay_values
+            state["active"] = True
+
+        def mark_consumed() -> None:
+            if not state["active"] or not page_table.is_cuda:
+                return
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device=page_table.device))
+            state["consumer_event"] = event
+
+        def release_staging() -> None:
+            event = state["consumer_event"]
+            if event is not None:
+                event.synchronize()
+            elif state["active"] and page_table.is_cuda:
+                # Cleanup can race a request finish before the attention layer
+                # reaches consume_for_layer.  Fail closed in that rare case.
+                torch.cuda.synchronize(device=page_table.device)
+            if state["active"]:
+                page_table[request_index, positions] = original_values
+                state["active"] = False
+            allocator.free(device_indices)
+            for node_id, params in reversed(host_locks):
+                self.dec_host_lock_ref(node_id, params)
+
+        lease = CallbackPageLease(
+            release_callback=release_staging,
+            consumed_callback=mark_consumed,
+        )
+        return ResolvedPrefetch(
+            transfers=transfers,
+            layer_num=getattr(controller, "layer_num", layer_id + 1),
+            lease=lease,
+            on_ready=install_overlay,
+        )
+
+    def _sparda_token_residency(
+        self, request
+    ) -> tuple[dict[int, tuple[int, Optional[int]]], set[int]]:
+        """Return host sources and device-resident positions for a request."""
+        # ``last_host_node`` may extend beyond the device prefix after a
+        # HiCache match.  Walking it gives us both device-resident positions
+        # and host-backed positions; using only ``last_node`` would silently
+        # miss the latter and turn a valid forecast into a normal load.
+        node_id = getattr(request, "last_host_node", None)
+        if node_id is None:
+            node_id = getattr(request, "last_node", None)
+        if node_id is None:
+            return {}, set()
+        try:
+            node = self.tree_core.node_by_id(node_id)
+        except (KeyError, IndexError, TypeError, NotImplementedError):
+            return {}, set()
+
+        chain = []
+        while node is not None and node is not self.tree_core.root_node:
+            chain.append(node)
+            node = node.parent
+        chain.reverse()
+
+        sources: dict[int, tuple[int, Optional[int]]] = {}
+        device_positions: set[int] = set()
+        logical_position = 0
+        host_tokens = 0
+        device_tokens = 0
+        for node in chain:
+            key_len = len(node.key) if node.key is not None else 0
+            component_data = node.component_data[BASE_COMPONENT_TYPE]
+            host_value = component_data.host_value
+            device_value = component_data.value
+            if device_value is not None:
+                device_tokens += min(key_len, len(device_value))
+                for offset in range(min(key_len, len(device_value))):
+                    position = logical_position + offset
+                    device_positions.add(position)
+                    sources.pop(position, None)
+            if host_value is not None:
+                host_tokens += min(key_len, len(host_value))
+                host_value = host_value.detach().to(device="cpu")
+                for offset, host_index in enumerate(host_value[:key_len].tolist()):
+                    position = logical_position + offset
+                    if position not in device_positions:
+                        sources[position] = (int(host_index), node.id)
+            logical_position += key_len
+        logger.debug(
+            "SparDA residency chain: nodes=%d tokens=%d host_tokens=%d "
+            "device_tokens=%d",
+            len(chain),
+            logical_position,
+            host_tokens,
+            device_tokens,
+        )
+
+        # The active request owns the KV row after the cached prefix.  Its
+        # current row is intentionally not represented by a radix-tree node
+        # until the request is cached, so the tree walk above can under-report
+        # residency for an in-flight decode.  ``prefix_indices`` is the
+        # request's device prefix, while the committed part of its KV record
+        # covers the newly computed tail.  Include both spans so a forecast
+        # does not fall back merely because the request has not finished.
+        prefix_len = len(getattr(request, "prefix_indices", ()))
+        for position in range(prefix_len):
+            device_positions.add(position)
+            sources.pop(position, None)
+
+        request_kv = getattr(request, "kv", None)
+        protected_len = int(getattr(request_kv, "cache_protected_len", 0) or 0)
+        committed_len = int(getattr(request_kv, "kv_committed_len", 0) or 0)
+        allocated_len = int(getattr(request_kv, "kv_allocated_len", 0) or 0)
+        own_start = max(prefix_len, protected_len)
+        own_end = min(committed_len, allocated_len)
+        if own_end > own_start:
+            for position in range(own_start, own_end):
+                device_positions.add(position)
+                sources.pop(position, None)
+
+        active_state = self._get_active_sparda_residency(request)
+        if active_state is not None:
+            active_host_indices = active_state.host_indices.tolist()
+            for position, host_index in enumerate(active_host_indices):
+                if position >= active_state.end:
+                    break
+                device_positions.discard(position)
+                sources[position] = (int(host_index), None)
+
+        return sources, device_positions
+
     def _cleanup_sparda_request(self, request_id: str) -> None:
         """Release lookahead leases before a request's cache row is recycled."""
         if self.sparda_prefetcher is not None:
@@ -380,7 +1003,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         if self.sparda_prefetcher is not None:
-            self.sparda_prefetcher.cleanup_all()
+            if not self.sparda_prefetcher.cleanup_all():
+                raise RuntimeError("SparDA prefetch cleanup failed before cache reset")
+        self._drop_all_active_sparda_requests()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -543,6 +1168,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        if self.sparda_prefetcher is not None:
+            if not self.sparda_prefetcher.cleanup_all():
+                logger.error(
+                    "SparDA host resources retained: prefetch cleanup did not complete"
+                )
+                return
+        self._drop_all_active_sparda_requests()
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -952,6 +1584,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        if not self.restore_sparda_request(req):
+            raise RuntimeError(
+                "SparDA request restoration failed before cache finalization"
+            )
         self._cleanup_sparda_request(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
@@ -1050,6 +1686,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        if not self.restore_sparda_request(req):
+            raise RuntimeError(
+                "SparDA request restoration failed before cache insertion"
+            )
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
@@ -1374,6 +2014,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
+
+        if not self.restore_sparda_request(req):
+            raise RuntimeError(
+                "SparDA request restoration failed before retraction backup"
+            )
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
         host_indices = self.host_pool_group.alloc(len(device_indices))

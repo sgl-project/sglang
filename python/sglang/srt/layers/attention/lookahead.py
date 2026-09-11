@@ -21,6 +21,7 @@ _FORECAST_STATE_KEY = "lookahead_forecast_state"
 _SPARDA_PREFETCHER_KEY = "sparda_prefetcher"
 _SPARDA_GENERATIONS_KEY = "sparda_request_generations"
 _SPARDA_REQUESTS_KEY = "sparda_request_context"
+_SPARDA_SELECTION_CACHE_KEY = "sparda_selection_cache"
 
 
 @dataclass
@@ -45,6 +46,17 @@ class ForecastState:
         """Publish a forecast for the next layer in the current forward."""
         self.query = query
         self.producer_layer = layer_id
+
+
+@dataclass(frozen=True)
+class SpardaPrefetchContext:
+    """Request-local inputs used by a cache-side SparDA adapter."""
+
+    request: object
+    forward_batch: ForwardBatch
+    request_index: int
+    selector_backend: Optional[object] = None
+    forecast_batch: Optional[torch.Tensor] = None
 
 
 def get_forecast_state(forward_batch: ForwardBatch) -> ForecastState:
@@ -103,3 +115,25 @@ def get_sparda_request_context(
     if forward_batch.model_specific_states is None:
         return None
     return forward_batch.model_specific_states.get(_SPARDA_REQUESTS_KEY)
+
+
+def get_sparda_selection_cache(forward_batch: ForwardBatch) -> dict:
+    """Return the current-forward cache for forecast block selections."""
+    if forward_batch.model_specific_states is None:
+        forward_batch.model_specific_states = {}
+    cache = forward_batch.model_specific_states.get(_SPARDA_SELECTION_CACHE_KEY)
+    if cache is None:
+        cache = {}
+        forward_batch.model_specific_states[_SPARDA_SELECTION_CACHE_KEY] = cache
+    if not isinstance(cache, dict):
+        raise TypeError(
+            f"ForwardBatch state key {_SPARDA_SELECTION_CACHE_KEY!r} is already "
+            f"used by {type(cache).__name__}, expected dict"
+        )
+    return cache
+
+
+def clear_sparda_selection_cache(forward_batch: ForwardBatch) -> None:
+    """Drop forecast selections left on a reused forward batch."""
+    if forward_batch.model_specific_states is not None:
+        forward_batch.model_specific_states.pop(_SPARDA_SELECTION_CACHE_KEY, None)
