@@ -76,7 +76,6 @@ class _TokenToKVPool:
             extra_key_buffer if extra_key_buffer is not None else swa_key_buffer
         )
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
-        self.swa_window_size = page_size
         self.swa_page_size = page_size
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
@@ -85,7 +84,7 @@ class _TokenToKVPool:
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
         _ = layer_id
-        return self.swa_window_size
+        return self.swa_page_size
 
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor:
         _ = layer_id

@@ -16,7 +16,6 @@ on:
         options:
           - 'all'
           - 'cu130'
-          - 'rocm700'
           - 'rocm720'
           - 'rocm1000'
           - 'musa43'
@@ -169,7 +168,7 @@ jobs:
   build-rocm-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm700' || github.event.inputs.target == 'rocm720' || github.event.inputs.target == 'rocm1000')
+      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm720' || github.event.inputs.target == 'rocm1000')
     runs-on: amd-docker-scale
     strategy:
       matrix:
@@ -182,7 +181,7 @@ jobs:
         # leg is another image build on the shared AMD node, and its release job
         # appends the same wheel to the index a second time. `inputs` is empty
         # on push, which falls through to the full set.
-        rocm-version: ${{ fromJson(inputs.target == 'rocm700' && '["700"]' || inputs.target == 'rocm720' && '["720"]' || inputs.target == 'rocm1000' && '["1000"]' || '["700", "720", "1000"]') }}
+        rocm-version: ${{ fromJson(inputs.target == 'rocm720' && '["720"]' || inputs.target == 'rocm1000' && '["1000"]' || '["720", "1000"]') }}
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
       # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
@@ -215,59 +214,6 @@ jobs:
         with:
           name: wheel-python${{ matrix.python-version }}-rocm${{ matrix.rocm-version }}
           path: python/sglang/kernels/aot/dist/*
-
-  release-rocm700:
-    needs: build-rocm-matrix
-    # Only publish the flavors this run built; see build-rocm-matrix.
-    if: ${{ github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'rocm700' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: python/sglang/kernels/aot/dist/
-          merge-multiple: true
-          pattern: wheel-*-rocm700
-
-      - name: Set tag name
-        id: set_tag_name
-        run: |
-          if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            python/sglang/kernels/aot/dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --rocm 700
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update whl index"
-          git push
 
   release-rocm720:
     needs: build-rocm-matrix
