@@ -2833,18 +2833,69 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_logprobs_idx: List[int],
         decode_to_text: bool,
     ):
-        # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
-        # We should batch all top-k tokens in all positions.
-        ret = []
-        for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
-                ret.append(
-                    self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
-                    )
+        if not decode_to_text:
+            return [
+                self.detokenize_logprob_tokens(
+                    token_logprobs_val[i], token_logprobs_idx[i], False
                 )
-            else:
-                ret.append(None)
+                if token_logprobs_val[i]
+                else None
+                for i in range(len(token_logprobs_val))
+            ]
+
+        if len(token_logprobs_val) == 1:
+            return [
+                self.detokenize_logprob_tokens(
+                    token_logprobs_val[0], token_logprobs_idx[0], True
+                )
+                if token_logprobs_val[0]
+                else None
+            ]
+
+        # Cross-position batching helps the OpenAI-compatible top-logprob range,
+        # but large flattened tokenizer batches can cost more than the calls saved.
+        if any(
+            token_logprobs and len(token_logprobs_idx[i]) > 20
+            for i, token_logprobs in enumerate(token_logprobs_val)
+        ):
+            return [
+                self.detokenize_logprob_tokens(
+                    token_logprobs_val[i], token_logprobs_idx[i], True
+                )
+                if token_logprobs_val[i]
+                else None
+                for i in range(len(token_logprobs_val))
+            ]
+
+        non_empty_rows = [
+            i for i, token_logprobs in enumerate(token_logprobs_val) if token_logprobs
+        ]
+        ret = [None] * len(token_logprobs_val)
+        if not non_empty_rows:
+            return ret
+        if len(non_empty_rows) == 1:
+            i = non_empty_rows[0]
+            ret[i] = self.detokenize_logprob_tokens(
+                token_logprobs_val[i], token_logprobs_idx[i], True
+            )
+            return ret
+
+        assert self.tokenizer is not None
+        # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
+        # into one string. Wrap each ID in its own list so they decode separately.
+        token_texts = self.tokenizer.batch_decode(
+            [[token_id] for i in non_empty_rows for token_id in token_logprobs_idx[i]]
+        )
+        row_start = 0
+        for i in non_empty_rows:
+            token_ids = token_logprobs_idx[i]
+            ret[i] = [
+                (logprob, token_id, token_texts[row_start + j])
+                for j, (logprob, token_id) in enumerate(
+                    zip(token_logprobs_val[i], token_ids)
+                )
+            ]
+            row_start += len(token_ids)
         return ret
 
     def _calculate_spec_decoding_metrics(

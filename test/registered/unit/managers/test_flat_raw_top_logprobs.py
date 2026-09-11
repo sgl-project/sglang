@@ -63,6 +63,16 @@ class _TokenizerManagerStub:
     detokenize_top_logprobs_tokens = TokenizerManager.detokenize_top_logprobs_tokens
 
 
+class _RecordingTokenizer:
+    def __init__(self):
+        self.calls = []
+
+    def batch_decode(self, token_ids):
+        token_ids = [list(ids) for ids in token_ids]
+        self.calls.append(token_ids)
+        return [f"token-{ids[0]}" for ids in token_ids]
+
+
 def _make_state(**obj_kwargs) -> ReqState:
     obj = GenerateReqInput(text="hello", **obj_kwargs)
     obj.normalize_batch_and_arguments()
@@ -85,6 +95,114 @@ def _add_logprob_meta_info(state: ReqState, top_logprobs_num: int = 2) -> dict:
         return_text_in_logprobs=False,
     )
     return meta_info
+
+
+class TestTopLogprobDetokenization(CustomTestCase):
+    def test_batches_all_non_empty_positions(self):
+        tokenizer = _RecordingTokenizer()
+        manager = _TokenizerManagerStub()
+        manager.tokenizer = tokenizer
+
+        result = manager.detokenize_top_logprobs_tokens(
+            [None, [-0.1, -0.2], [], [-0.3]],
+            [None, [11, 12], [], [21]],
+            decode_to_text=True,
+        )
+
+        self.assertEqual(tokenizer.calls, [[[11], [12], [21]]])
+        self.assertEqual(
+            result,
+            [
+                None,
+                [(-0.1, 11, "token-11"), (-0.2, 12, "token-12")],
+                None,
+                [(-0.3, 21, "token-21")],
+            ],
+        )
+
+    def test_no_text_does_not_access_tokenizer(self):
+        manager = _TokenizerManagerStub()
+
+        result = manager.detokenize_top_logprobs_tokens(
+            [None, [-0.1, -0.2], []],
+            [None, [11, 12], []],
+            decode_to_text=False,
+        )
+
+        self.assertEqual(result, [None, [(-0.1, 11, None), (-0.2, 12, None)], None])
+
+    def test_all_empty_rows_do_not_access_tokenizer(self):
+        manager = _TokenizerManagerStub()
+
+        result = manager.detokenize_top_logprobs_tokens(
+            [None, [], None],
+            [None, [], None],
+            decode_to_text=True,
+        )
+
+        self.assertEqual(result, [None, None, None])
+
+    def test_single_non_empty_row_uses_one_decode(self):
+        tokenizer = _RecordingTokenizer()
+        manager = _TokenizerManagerStub()
+        manager.tokenizer = tokenizer
+
+        result = manager.detokenize_top_logprobs_tokens(
+            [None, [-0.1, -0.2], []],
+            [None, [11, 12], []],
+            decode_to_text=True,
+        )
+
+        self.assertEqual(tokenizer.calls, [[[11], [12]]])
+        self.assertEqual(
+            result, [None, [(-0.1, 11, "token-11"), (-0.2, 12, "token-12")], None]
+        )
+
+        tokenizer.calls.clear()
+        result = manager.detokenize_top_logprobs_tokens(
+            [[-0.3]], [[21]], decode_to_text=True
+        )
+        self.assertEqual(tokenizer.calls, [[[21]]])
+        self.assertEqual(result, [[(-0.3, 21, "token-21")]])
+
+    def test_ragged_rows_preserve_zip_truncation(self):
+        tokenizer = _RecordingTokenizer()
+        manager = _TokenizerManagerStub()
+        manager.tokenizer = tokenizer
+
+        result = manager.detokenize_top_logprobs_tokens(
+            [[-0.1], [-0.2, -0.3], None, [-0.4]],
+            [[11, 12], [21], None, []],
+            decode_to_text=True,
+        )
+
+        self.assertEqual(tokenizer.calls, [[[11], [12], [21]]])
+        self.assertEqual(
+            result,
+            [
+                [(-0.1, 11, "token-11")],
+                [(-0.2, 21, "token-21")],
+                None,
+                [],
+            ],
+        )
+
+    def test_large_rows_remain_position_batched(self):
+        tokenizer = _RecordingTokenizer()
+        manager = _TokenizerManagerStub()
+        manager.tokenizer = tokenizer
+        values = [[-float(i) for i in range(21)] for _ in range(2)]
+        indices = [list(range(21)), list(range(100, 121))]
+
+        result = manager.detokenize_top_logprobs_tokens(
+            values, indices, decode_to_text=True
+        )
+
+        self.assertEqual(len(tokenizer.calls), 2)
+        self.assertEqual(tokenizer.calls[0], [[i] for i in range(21)])
+        self.assertEqual(tokenizer.calls[1], [[i] for i in range(100, 121)])
+        self.assertEqual(len(result[0]), 21)
+        self.assertEqual(len(result[1]), 21)
 
 
 class TestFlatRawTopLogprobsValidation(CustomTestCase):
