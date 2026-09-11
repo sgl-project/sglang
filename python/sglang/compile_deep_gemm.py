@@ -80,6 +80,7 @@ async def warm_up_compile(
             sampling_params=sampling_params,
         )
         generate_req_input.bootstrap_host = [FAKE_BOOTSTRAP_HOST] * dp_size
+        generate_req_input.skip_cache_insert = True
         generate_req_input.bootstrap_room = [
             i * (2**63 // dp_size) + (i % get_parallel().tp_size)
             for i in range(dp_size)
@@ -143,6 +144,7 @@ def launch_server_process_and_send_one_request(
                     if cfg.disaggregation_mode != "null":
                         payload["input_ids"] = [list(base_ids) for _ in range(dp_size)]
                         payload["bootstrap_host"] = [FAKE_BOOTSTRAP_HOST] * dp_size
+                        payload["skip_cache_insert"] = True
                         payload["bootstrap_room"] = [
                             i * (2**63 // dp_size) + (i % cfg.tp_size)
                             for i in range(dp_size)

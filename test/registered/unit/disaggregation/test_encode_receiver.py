@@ -294,6 +294,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             priority=None,
             extra_key="classification",
             cache_salt="tenant-a",
+            skip_cache_insert=True,
             http_worker_ipc=None,
         )
 
@@ -301,6 +302,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
 
         self.assertEqual(req.extra_key, "classification")
         self.assertEqual(req.cache_salt, "tenant-a")
+        self.assertTrue(req.skip_radix_cache_insert)
 
     def test_rdma_worker_error_is_released_on_scheduler_thread(self):
         scheduler_thread = threading.get_ident()

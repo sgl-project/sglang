@@ -1998,6 +1998,7 @@ def run_benchmark(args_: argparse.Namespace):
     if getattr(args, "fake_prefill", False):
         extra_request_body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
         extra_request_body["bootstrap_room"] = 0
+        extra_request_body["skip_cache_insert"] = True
 
     if args.tokenize_prompt:
         assert args.backend == "sglang", (

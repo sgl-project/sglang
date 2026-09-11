@@ -273,6 +273,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             priority=10,
             extra_key=None,
             cache_salt=None,
+            skip_radix_cache_insert=True,
             routing_key=None,
             disagg_prefill_dp_rank=None,
         )
@@ -290,6 +291,8 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
         self.assertEqual(payload["bootstrap_room"], 7)
         self.assertIsNone(payload["cache_salt"])
+        # The recompute must stay out of the prefill's prefix cache too.
+        self.assertTrue(payload["skip_cache_insert"])
         # The prefill /generate URL is derived from bootstrap info on the decode
         # side, not sent in the payload; and the boundary token is replayed via
         # the decode-side override, so neither belongs in the payload.

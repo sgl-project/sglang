@@ -114,6 +114,16 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`int = 0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>If `return_routed_experts`, the absolute start position for returned routed-experts rows. `0` preserves the default full sequence; set it to an accumulated prefix length to return only `[routed_experts_start_len, seqlen - 1)`. For example, in multi-turn RL rollouts, routed experts for tokens from previous turns have already been collected, so setting this value avoids unnecessary transfer that cause bottlenecks. Must be in `[0, prompt_tokens]`.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>cache_salt</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[List[str], str]] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Prefix cache namespace. Requests only reuse cached prefixes that were inserted under the same salt, so tenants that set their own salt cannot hit each other's KV.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>skip_cache_insert</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[List[bool], bool]] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>If true, the request may still reuse existing cached prefixes, but none of the KV it computes is inserted into the prefix cache or any HiCache tier, and its KV is freed as soon as the request finishes. Use it for requests whose prompt must not be retained after the response.</td>
+    </tr>
   </tbody>
 </table>
 

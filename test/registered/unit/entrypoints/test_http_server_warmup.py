@@ -81,6 +81,7 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["json"]["input_ids"], [10, 11, 12, 13])
             self.assertEqual(kwargs["json"]["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
             self.assertEqual(kwargs["json"]["bootstrap_room"], dp_rank)
+            self.assertTrue(kwargs["json"]["skip_cache_insert"])
             self.assertFalse(kwargs["ssl"])
 
 

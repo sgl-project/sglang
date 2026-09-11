@@ -107,6 +107,13 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
 
+    def test_skip_cache_insert_passes_through(self):
+        req = CompletionRequest(
+            model="x", prompt=[1, 2, 3, 4], max_tokens=1, skip_cache_insert=True
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertTrue(internal.skip_cache_insert)
+
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(
             model="x",
