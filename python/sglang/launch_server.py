@@ -16,6 +16,22 @@ suppress_noisy_warnings()
 
 def run_server(server_args):
     """Run the server based on the gRPC flags and server_args.encoder_only."""
+    # smg-grpc-servicer (<= 0.9.1) builds its tokenizer from the raw
+    # `server_args.tokenizer_path` field. Resolution declares the default
+    # (tokenizer_path = model_path) into the stash and never writes the record,
+    # so unless --tokenizer-path was given the raw field stays None and
+    # `get_tokenizer(None)` crashes in the servicer. Seed the default as raw
+    # input while the record is still assembling (the only writable window) --
+    # indistinguishable from the operator passing --tokenizer-path equal to
+    # --model-path. Raw flags are read here because the resolved ones do not
+    # exist yet; resolution only folds `--grpc-mode` INTO `smg_grpc_mode`, so
+    # checking both covers it.
+    if (
+        (server_args.smg_grpc_mode or server_args.grpc_mode)
+        and server_args.tokenizer_path is None
+    ):
+        server_args.tokenizer_path = server_args.model_path
+
     # The flags dispatched on below are decided by resolution (`--grpc-mode`
     # folds into `smg_grpc_mode`), and `prepare_server_args` returns raw input.
     server_args.resolve_once()
