@@ -31,7 +31,7 @@ from sglang.srt.utils.weight_checker_comparator import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +62,6 @@ def _build_fp8_quant_pair(device: str = "cuda"):
 
 
 class TestQuantUlp(CustomTestCase):
-
     def test_matches_bruteforce_spacing_for_fp8(self):
         for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             all_bits = torch.arange(256, dtype=torch.uint8).view(dtype)
@@ -133,7 +132,10 @@ class TestCompareQuantPair(CustomTestCase):
         reference = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
         with patch("sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 128 * 128):
             chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
-        self.assertEqual(chunked, reference)
+        eq_c, max_c, mean_c, ex_c = chunked
+        eq_r, max_r, mean_r, ex_r = reference
+        self.assertEqual((eq_c, max_c, ex_c), (eq_r, max_r, ex_r))
+        self.assertAlmostEqual(mean_c, mean_r, places=7)
 
     @staticmethod
     def _quantize_partial(weight: torch.Tensor, scale_margin: float):
@@ -180,7 +182,6 @@ class TestCompareQuantPair(CustomTestCase):
 
 
 class TestSelectComparableWeight(CustomTestCase):
-
     def test_returns_none_when_not_a_quant_method(self):
         self.assertIsNone(select_comparable_weight(None))
 

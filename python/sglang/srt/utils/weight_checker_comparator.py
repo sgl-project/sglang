@@ -59,6 +59,8 @@ class Fp8BlockComparable(ComparableWeight):
     def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
         if w_s.dtype == torch.int32:
             w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+            # ue8m0 packing aligns k to a multiple of 4; drop the padding blocks.
+            w_s = w_s[..., : -(-w_q.shape[-1] // 128)]
         return w_s.to(torch.float32)
 
     @staticmethod
@@ -130,9 +132,9 @@ def compare_weights(
     for (expect_dq, expect_tol), (actual_dq, actual_tol) in zip(
         expect.iter_chunks(), actual.iter_chunks(), strict=True
     ):
-        assert (
-            expect_dq.shape == actual_dq.shape
-        ), f"{expect_dq.shape=} {actual_dq.shape=}"
+        assert expect_dq.shape == actual_dq.shape, (
+            f"{expect_dq.shape=} {actual_dq.shape=}"
+        )
         numel += expect_dq.numel()
         abs_diff = (actual_dq.float() - expect_dq.float()).abs()
         if torch.all(abs_diff == 0):
@@ -159,7 +161,13 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
-    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
+    if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
+        if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):
+            return None
+        raise NotImplementedError(
+            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
+        )
+    if isinstance(quant_method, ModelOptFp4LinearMethod):
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
         )

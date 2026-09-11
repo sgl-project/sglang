@@ -18,10 +18,20 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    # DSA kpool-compress tail: one per-request ring row. The indices encode
+    # only the live subrange of that row for the current open pool.
+    DSA_TAIL = "dsa_tail"
     MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
+    # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
+    DSV4_REQUEST_STATE = "c128_state"
+    # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
+    # K/V, one component per sub-pool so each carries the index payload of the
+    # KV it describes (whole sequence for full attention, window for SWA).
+    BLOCK_SCALE = "block_scale"
+    BLOCK_SCALE_SWA = "block_scale_swa"
 
 
 @dataclasses.dataclass
@@ -38,6 +48,8 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    kv_layer_ids: List[int]
+    kv_cache_dtype_str: str
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -45,16 +57,25 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    state_layer_ids: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Number of rows before the slice axis in each per-slot state tensor.
+    state_slice_outer_counts: List[List[int]]
+    is_hybrid_mla_backend: bool
+    # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
+    # scatter transfer can slice each independently head-sharded sub-block; None
+    # per tensor when the single contiguous slice already matches the layout.
+    state_conv_shard_groups: List[List[Optional[List[int]]]]
     ib_device: str
-    ib_traffic_class: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
     # for system dp
     system_dp_rank: int
+    # Local Rust /route registry port; None on scheduler ranks without a listener.
+    rust_http_port: Optional[int]
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
@@ -71,7 +92,9 @@ class KVArgs:
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
-    total_kv_layers: int
+    hidden_kv_layers: int
+    # Only used of npu, for decode total kv layers
+    draft_kv_layers: int
 
 
 class KVPoll:
@@ -84,6 +107,8 @@ class KVPoll:
 
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
+
+    enable_deferred_decode_kv_release: bool = False
 
     @abstractmethod
     def __init__(
@@ -109,6 +134,7 @@ class BaseKVSender(ABC):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
     @abstractmethod
@@ -123,6 +149,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
@@ -153,6 +180,18 @@ class BaseKVSender(ABC):
         Raise an exception if the kv cache transfer fails.
         """
         ...
+
+    def clear(self):
+        """
+        Clear any internal states.
+        """
+        pass
+
+    def abort(self):
+        """
+        Abort the current transfer.
+        """
+        pass
 
 
 class BaseKVReceiver(ABC):

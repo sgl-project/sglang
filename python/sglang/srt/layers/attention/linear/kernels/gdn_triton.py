@@ -6,14 +6,14 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
 if not is_cpu():
-    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-    from sglang.srt.layers.attention.fla.fused_recurrent import (
+    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_packed_decode,
     )
-    from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
+    from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_gdn_replayssm_decode,
     )
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 
@@ -177,13 +177,28 @@ class TritonGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        inplace_update: bool = True,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-        if is_npu():
+        inplace_update_args = {"inplace_update": inplace_update}
+        if is_cpu():
+            if not inplace_update:
+                raise NotImplementedError(
+                    "GDN multi-item scoring is not supported by the CPU chunk kernel"
+                )
+            inplace_update_args = {}
+        elif is_npu():
+            if not inplace_update:
+                raise NotImplementedError(
+                    "GDN multi-item scoring is not supported by the NPU chunk kernel"
+                )
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
+            # The external NPU kernel does not expose the optional write-back
+            # control. Its existing behavior is equivalent to True.
+            inplace_update_args = {}
 
         return chunk_gated_delta_rule(
             q=q,
@@ -196,6 +211,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             head_first=False,
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
+            **inplace_update_args,
         )
 
     def target_verify(

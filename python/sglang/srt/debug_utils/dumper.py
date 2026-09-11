@@ -23,6 +23,12 @@ import torch.distributed as dist
 import zmq
 
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_server_args,
+    get_serving,
+)
+from sglang.srt.utils import get_device
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -174,9 +180,9 @@ class DumperConfig(_BaseConfig):
                 f"grafter_role must be 'baseline' or 'target' when grafter_enable=True, "
                 f"got {self.grafter_role!r}"
             )
-            assert (
-                self.grafter_master_address
-            ), "grafter_master_address must be set when grafter_enable=True"
+            assert self.grafter_master_address, (
+                "grafter_master_address must be set when grafter_enable=True"
+            )
             assert self.grafter_master_port > 0, (
                 f"grafter_master_port must be a positive port when grafter_enable=True, "
                 f"got {self.grafter_master_port}"
@@ -315,6 +321,8 @@ class _Dumper:
         model: "torch.nn.Module",
         name_prefix: str = "param",
         save: bool = True,
+        get_grad: Optional[Callable] = None,
+        step: Optional[int] = None,
         **kwargs,
     ) -> None:
         for param_name, param in model.named_parameters():
@@ -332,6 +340,8 @@ class _Dumper:
                 enable_future_grad=False,
                 value_tag="Dumper.ParamValue",
                 grad_tag="Dumper.ParamGrad",
+                get_grad=get_grad,
+                step=step,
             )
 
     def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
@@ -469,6 +479,8 @@ class _Dumper:
         value_meta_only_fields: Optional[dict] = None,
         grad_meta_only_fields: Optional[dict] = None,
         grafter_extras: Optional[dict] = None,
+        get_grad: Optional[Callable] = None,
+        step: Optional[int] = None,
     ) -> None:
         self._http_manager  # noqa: B018
 
@@ -499,19 +511,22 @@ class _Dumper:
                 tags=tags,
                 value=value,
                 save=save,
+                step=step,
                 meta_only_fields={**(value_meta_only_fields or {}), **recompute_meta},
             )
 
-        if (
-            enable_curr_grad
-            and isinstance(value, torch.Tensor)
-            and (g := value.grad) is not None
-        ):
+        if enable_curr_grad and isinstance(value, torch.Tensor):
+            g = get_grad(value) if get_grad is not None else value.grad
+        else:
+            g = None
+
+        if g is not None:
             self._dump_single(
                 tag=grad_tag,
                 tags={**tags, "name": f"grad__{name}"},
                 value=g,
                 save=save,
+                step=step,
                 meta_only_fields={**(grad_meta_only_fields or {}), **recompute_meta},
             )
 
@@ -982,9 +997,9 @@ class _Grafter:
             return
 
         cfg = self._config
-        assert (
-            dist.is_initialized()
-        ), "[Grafter] default torch.distributed must be initialized"
+        assert dist.is_initialized(), (
+            "[Grafter] default torch.distributed must be initialized"
+        )
         role = _GraftRole(cfg.grafter_role)
         local_world = dist.get_world_size()
         local_rank = dist.get_rank()
@@ -1161,7 +1176,7 @@ def _get_default_exp_name(timeout_seconds: int = 60):
 
     if dist.is_initialized():
         _collective_with_timeout(
-            lambda: dist.broadcast_object_list(object_list, device="cuda"),
+            lambda: dist.broadcast_object_list(object_list, device=get_device()),
             operation_name="broadcast_object_list in _get_default_exp_name",
             timeout_seconds=timeout_seconds,
         )
@@ -1713,30 +1728,30 @@ class _SGLangPlugin(_FrameworkPlugin):
         info = {}
 
         try:
-            info["tp_rank"] = self._dist.get_tensor_model_parallel_rank()
-            info["tp_size"] = self._dist.get_tensor_model_parallel_world_size()
-            info["pp_rank"] = self._dist.get_pipeline_model_parallel_rank()
-            info["pp_size"] = self._dist.get_pipeline_model_parallel_world_size()
-            info["moe_ep_rank"] = self._dist.get_moe_expert_parallel_rank()
-            info["moe_ep_size"] = self._dist.get_moe_expert_parallel_world_size()
-            info["moe_tp_rank"] = self._dist.get_moe_tensor_parallel_rank()
-            info["moe_tp_size"] = self._dist.get_moe_tensor_parallel_world_size()
-            info["moe_dp_rank"] = self._dist.get_moe_data_parallel_rank()
-            info["moe_dp_size"] = self._dist.get_moe_data_parallel_world_size()
-        except (AttributeError, AssertionError):
+            parallel = get_parallel()
+            info["tp_rank"] = parallel.tp_rank
+            info["tp_size"] = parallel.tp_size
+            info["pp_rank"] = parallel.pp_rank
+            info["pp_size"] = parallel.pp_size
+            info["moe_ep_rank"] = parallel.moe_ep_rank
+            info["moe_ep_size"] = parallel.moe_ep_size
+            info["moe_tp_rank"] = parallel.moe_tp_rank
+            info["moe_tp_size"] = parallel.moe_tp_size
+            info["moe_dp_rank"] = parallel.moe_dp_rank
+            info["moe_dp_size"] = self._dp_attn.get_moe_cp_size()
+        except (AttributeError, AssertionError, ValueError):
             info["distributed_error"] = True
 
         try:
+            parallel = get_parallel()
             info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
-            info["attn_tp_rank"] = self._dp_attn.get_attention_tp_rank()
-            info["attn_tp_size"] = self._dp_attn.get_attention_tp_size()
+            info["attn_tp_rank"] = parallel.attn_tp_rank
+            info["attn_tp_size"] = parallel.attn_tp_size
             info["attn_dp_rank"] = self._dp_attn.get_attention_dp_rank()
             info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
-            info["local_attn_dp_rank"] = self._dp_attn.get_local_attention_dp_rank()
-            info["local_attn_dp_size"] = self._dp_attn.get_local_attention_dp_size()
-            info["attn_cp_rank"] = self._dp_attn.get_attention_cp_rank()
-            info["attn_cp_size"] = self._dp_attn.get_attention_cp_size()
-        except (AttributeError, AssertionError):
+            info["attn_cp_rank"] = parallel.attn_cp_rank
+            info["attn_cp_size"] = parallel.attn_cp_size
+        except (AttributeError, AssertionError, ValueError):
             info["dp_attention_error"] = True
 
         return info
@@ -1781,13 +1796,11 @@ class _SGLangPlugin(_FrameworkPlugin):
             return None
 
         try:
-            from sglang.srt.server_args import get_global_server_args
-
-            args = get_global_server_args()
+            args = get_server_args()
             if args is None:
                 return None
 
-            return args.tokenizer_path
+            return get_serving().tokenizer_path
         except Exception:
             return None
 

@@ -98,9 +98,7 @@ def construct_variable_block_sizes(
         t_sizes[:, None, None]  # [n_t, 1,   1]
         * h_sizes[None, :, None]  # [1,   n_h, 1]
         * w_sizes[None, None, :]  # [1,   1,   n_w]
-    ).reshape(
-        -1
-    )  # [n_t * n_h * n_w]
+    ).reshape(-1)  # [n_t * n_h * n_w]
 
     return block_sizes
 
@@ -124,7 +122,6 @@ def get_non_pad_index(
 
 
 class VideoSparseAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -170,8 +167,13 @@ class VideoSparseAttentionMetadata(AttentionMetadata):
     max_seqlen_k: int = 0
 
 
-class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
+def _compute_cur_topk(attn_metadata: VideoSparseAttentionMetadata) -> int:
+    num_kv_blocks = attn_metadata.variable_block_sizes.numel()
+    cur_topk = math.ceil((1 - attn_metadata.VSA_sparsity) * num_kv_blocks)
+    return max(1, min(cur_topk, num_kv_blocks))
 
+
+class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     def __init__(self):
         pass
 
@@ -230,7 +232,6 @@ class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class VideoSparseAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,
@@ -308,12 +309,7 @@ class VideoSparseAttentionImpl(AttentionImpl):
         value = value.transpose(1, 2).contiguous()
         gate_compress = gate_compress.transpose(1, 2).contiguous()
 
-        VSA_sparsity = attn_metadata.VSA_sparsity
-
-        cur_topk = math.ceil(
-            (1 - VSA_sparsity)
-            * (attn_metadata.total_seq_length / math.prod(VSA_TILE_SIZE))
-        )
+        cur_topk = _compute_cur_topk(attn_metadata)
 
         if video_sparse_attn is None:
             raise NotImplementedError("video_sparse_attn is not installed")

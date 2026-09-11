@@ -1,0 +1,271 @@
+{
+  "source": {
+    "code_commits": [
+      "c4ad2e84b",
+      "5bf69bd32"
+    ],
+    "date": "2026-07-25",
+    "device": "NVIDIA GB300",
+    "nodes": 1,
+    "gpus_per_node": 4,
+    "push_slot_bytes": 33554432,
+    "raw_results": [
+      "standalone-c4ad2e84b-run3.log",
+      "standalone-large-c4ad2e84b.json",
+      "standalone-8192-tiebreak-c4ad2e84b.json",
+      "fused-small-5bf69bd32.json",
+      "fused-medium-5bf69bd32.json",
+      "fused-8192-5bf69bd32.json"
+    ]
+  },
+  "selection": {
+    "rule": "nearest global-token bucket at or below the workload",
+    "fallback": "nccl",
+    "note": "Standalone RS push won through T=2048 and NVLS pull won at T=4096/8192. Fused pull RS+residual+attention-residual wins through T=256; the separate path wins from T=512. Fused attention-residual+direct AG wins every measured bucket T=4..8192. The T=8192 standalone and fused AG custom wins were repeated with higher iteration counts. T=9364 is the first world=4 shape whose per-rank shard exceeds the 32 MiB symmetric slot, so it introduces explicit NCCL/separate safety boundaries."
+  },
+  "configs": {
+    "reduce_scatter": {
+      "4": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "8": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 256
+      },
+      "16": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 512
+      },
+      "32": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 512
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 256
+      },
+      "128": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 512
+      },
+      "256": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 256
+      },
+      "512": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 256
+      },
+      "1024": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "2048": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "4096": {
+        "strategy": "pull",
+        "num_blocks": 96,
+        "block_size": 1024
+      },
+      "8192": {
+        "strategy": "pull",
+        "num_blocks": 96,
+        "block_size": 1024
+      },
+      "9364": {
+        "strategy": "nccl"
+      },
+      "16384": {
+        "strategy": "nccl"
+      }
+    },
+    "all_gather": {
+      "4": {
+        "strategy": "direct",
+        "num_blocks": 8,
+        "block_size": 1024
+      },
+      "8": {
+        "strategy": "push",
+        "num_blocks": 32,
+        "block_size": 128
+      },
+      "16": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 256
+      },
+      "32": {
+        "strategy": "direct",
+        "num_blocks": 64,
+        "block_size": 128
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 32,
+        "block_size": 128
+      },
+      "128": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 256
+      },
+      "256": {
+        "strategy": "direct",
+        "num_blocks": 64,
+        "block_size": 256
+      },
+      "512": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "1024": {
+        "strategy": "direct",
+        "num_blocks": 96,
+        "block_size": 1024
+      },
+      "2048": {
+        "strategy": "direct",
+        "num_blocks": 64,
+        "block_size": 512
+      },
+      "4096": {
+        "strategy": "direct",
+        "num_blocks": 64,
+        "block_size": 256
+      },
+      "8192": {
+        "strategy": "direct",
+        "num_blocks": 64,
+        "block_size": 1024
+      },
+      "9364": {
+        "strategy": "nccl"
+      },
+      "16384": {
+        "strategy": "nccl"
+      }
+    },
+    "reduce_scatter_attn_res": {
+      "4": {
+        "strategy": "fused_pull",
+        "max_blocks": 64
+      },
+      "8": {
+        "strategy": "fused_pull",
+        "max_blocks": 64
+      },
+      "16": {
+        "strategy": "fused_pull",
+        "max_blocks": 64
+      },
+      "32": {
+        "strategy": "fused_pull",
+        "max_blocks": 64
+      },
+      "64": {
+        "strategy": "fused_pull",
+        "max_blocks": 64
+      },
+      "128": {
+        "strategy": "fused_pull",
+        "max_blocks": 64
+      },
+      "256": {
+        "strategy": "fused_pull",
+        "max_blocks": 64
+      },
+      "512": {
+        "strategy": "separate"
+      },
+      "1024": {
+        "strategy": "separate"
+      },
+      "2048": {
+        "strategy": "separate"
+      },
+      "4096": {
+        "strategy": "separate"
+      },
+      "8192": {
+        "strategy": "separate"
+      },
+      "9364": {
+        "strategy": "separate"
+      },
+      "16384": {
+        "strategy": "separate"
+      }
+    },
+    "attn_res_all_gather": {
+      "4": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "8": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "16": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "32": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "64": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "128": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "256": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "512": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "1024": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "2048": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "4096": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "8192": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "9364": {
+        "strategy": "separate"
+      },
+      "16384": {
+        "strategy": "separate"
+      }
+    }
+  }
+}

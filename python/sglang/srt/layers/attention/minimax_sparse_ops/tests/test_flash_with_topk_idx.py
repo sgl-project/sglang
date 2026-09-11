@@ -3,10 +3,10 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
 )
+from sglang.srt.environ import envs
 
 DEVICE = "cuda"
 RTOL_VS_REF = 5e-3
@@ -266,9 +266,9 @@ def test_flash_decode_with_topk_idx(
             actual_k = min(tk, num_blocks)
             set_new = set(topk_new[h, b, :actual_k].tolist())
             set_ref = set(topk_ref[h, b, :actual_k].tolist())
-            assert (
-                set_new == set_ref
-            ), f"topk mismatch at h={h} b={b}: kernel={set_new} ref={set_ref}"
+            assert set_new == set_ref, (
+                f"topk mismatch at h={h} b={b}: kernel={set_new} ref={set_ref}"
+            )
 
     # --- topk sentinel: invalid positions must be -1 ---
     for b in range(bs):
@@ -277,9 +277,9 @@ def test_flash_decode_with_topk_idx(
         actual_k = min(tk, num_blocks)
         if actual_k < tk:
             invalid = topk_new[:, b, actual_k:]
-            assert (
-                invalid == -1
-            ).all(), f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
+            assert (invalid == -1).all(), (
+                f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
+            )
 
 
 @pytest.mark.parametrize("score_type", ["max", "lse"])
@@ -343,9 +343,9 @@ def test_flash_decode_score_only(
             actual_k = min(tk, num_blocks)
             set_new = set(topk_new[h, b, :actual_k].tolist())
             set_ref = set(topk_ref[h, b, :actual_k].tolist())
-            assert (
-                set_new == set_ref
-            ), f"topk mismatch at h={h} b={b}: kernel={set_new} ref={set_ref}"
+            assert set_new == set_ref, (
+                f"topk mismatch at h={h} b={b}: kernel={set_new} ref={set_ref}"
+            )
 
     for b in range(bs):
         sl = seq_lens[b]
@@ -353,9 +353,9 @@ def test_flash_decode_score_only(
         actual_k = min(tk, num_blocks)
         if actual_k < tk:
             invalid = topk_new[:, b, actual_k:]
-            assert (
-                invalid == -1
-            ).all(), f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
+            assert (invalid == -1).all(), (
+                f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
+            )
 
 
 def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():

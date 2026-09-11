@@ -8,6 +8,10 @@ on:
       - ".github/workflows/pr-test-rust.yml"
       - "scripts/ci/cuda/ci_install_dependency.sh"
       - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
+      # gateway-e2e resolves the SMG runtime deps (the smg-grpc-servicer
+      # floor) from here, via ci_install_dependency.sh's
+      # `pip install -e python[...]` — a bump there must re-run this workflow.
+      - "python/pyproject.toml"
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
@@ -16,6 +20,10 @@ on:
       - ".github/workflows/pr-test-rust.yml"
       - "scripts/ci/cuda/ci_install_dependency.sh"
       - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
+      # gateway-e2e resolves the SMG runtime deps (the smg-grpc-servicer
+      # floor) from here, via ci_install_dependency.sh's
+      # `pip install -e python[...]` — a bump there must re-run this workflow.
+      - "python/pyproject.toml"
   workflow_dispatch:
 
 concurrency:
@@ -64,7 +72,6 @@ jobs:
           shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: true
 
       - name: Build python binding
         run: |
@@ -154,7 +161,6 @@ jobs:
           shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: true
 
       - name: Run lint
         run: |

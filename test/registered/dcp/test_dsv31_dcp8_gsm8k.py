@@ -55,7 +55,7 @@ from sglang.test.test_utils import (
 # ---------------------------------------------------------------------------
 # CI registration — only TestDSV31DCP8TP8GSM8K runs in CI
 # ---------------------------------------------------------------------------
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=213, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
@@ -77,7 +77,7 @@ _COMMON_SERVER_ARGS = [
     "256",
     "--attention-backend",
     "flashinfer",
-    "--disable-piecewise-cuda-graph",
+    "--cuda-graph-backend-prefill=disabled",
     "--log-level",
     "info",
     "--log-requests",
@@ -126,7 +126,7 @@ class TestDSV31DCP8TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
 
     This test exercises the full DCP decode and extend paths:
       - Decode: query all-gather → attention on local KV shard → LSE
-        correction via cp_lse_ag_out_rs → reduce-scatter
+        correction via cp_lse_ag_out_rs_mla → reduce-scatter
       - Extend (prefill): all-gather prefix KV cache across DCP ranks,
         attend with full context
 
@@ -205,7 +205,7 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
            introduces small numerical differences)
 
     This catches subtle correctness bugs in the DCP LSE correction path
-    (cp_lse_ag_out_rs) that a coarse GSM8K accuracy gate cannot detect.
+    (cp_lse_ag_out_rs_mla) that a coarse GSM8K accuracy gate cannot detect.
     For example, if exp2/exp mismatch causes a systematic bias in the
     attention output, logprobs will diverge by more than the tolerance.
     """

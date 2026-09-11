@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.jit_kernel.dsv4 import fused_k_norm_rope_flashmla, fused_store_cache
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa import index_buf_accessor
-from sglang.srt.layers.attention.dsv4 import (
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsv4 import (
+    clear_unaccepted_c128_draft_states,
+    fused_k_norm_rope_flashmla,
+    fused_store_cache,
+)
+from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
-from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -27,13 +31,19 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool) -> int:
+    """Return payload and quant-scale bytes for one compressed indexer token."""
+    if use_fp4_indexer:
+        return index_head_dim // 2 + index_head_dim // 32
+    return index_head_dim + index_head_dim // 128 * 4
+
+
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
-    # Online c128 keeps a single (max, sum, kv) state per index instead of a
-    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
-    # is incompatible with speculative decode for now.
+    # Online C128 stores one (max, sum, kv) state per index;
+    # speculative decoding requires the experimental online C128 MTP path.
     if compress_ratio == 128 and ONLINE_C128:
         if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             raise AssertionError("online c128 does not support MTP")
@@ -42,6 +52,19 @@ def get_compress_state_ring_size(
         return 16 if compress_ratio == 4 else 256
     else:
         return 8 if compress_ratio == 4 else 128
+
+
+def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
+    # Draft-token capacity must match mtp_pad in c_plan.cuh;
+    # a non-speculative ring has no write padding.
+    window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+    return ring_size - window_size + 2 if ring_size > window_size else 0
+
+
+def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
+    # A verify batch writes its draft tokens ahead of the committed position.
+    spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
+    return sliding_window + spec_extra
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -162,8 +185,64 @@ class DeepSeekV4SingleKVPool(KVCache):
         raise NotImplementedError("Use get_key_buffer instead.")
 
 
-class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
+class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
+    """Uniform 512-dim FP8 (e4m3) variant of the DSv4 single-KV pool.
 
+    Each token is 448 NoPE + 64 RoPE contiguous e4m3 values without in-cache
+    scales or per-page padding. The backend supplies the dequant scale.
+    """
+
+    def get_bytes_per_token(self) -> int:
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    def create_buffer(self, *, num_pages: int):
+        bytes_per_token = self.get_bytes_per_token()
+        assert bytes_per_token == 512, (
+            "DSV4 uniform-FP8 KV layout: qk_nope_head_dim (448) + "
+            "qk_rope_head_dim (64), all e4m3 = 512 bytes/token"
+        )
+        self.kv_cache_total_dim = bytes_per_token
+        self.bytes_per_page_padded = self.page_size * bytes_per_token
+
+        return torch.zeros(
+            num_pages,
+            self.page_size * bytes_per_token,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        return self.kv_buffer[layer_id]
+
+    def set_key_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+    ):
+        raise NotImplementedError(
+            "The packed NopeFp8RopeBf16Pack store does not apply to the "
+            "uniform-FP8 pool; use set_key_buffer_fused."
+        )
+
+    def set_key_buffer_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        """Store normed/roped rows as e4m3 with the backend's fixed unit scale.
+
+        uint8 views work around index_put not supporting FP8 dtypes.
+        """
+
+        assert cache_k.dim() == 2 and cache_k.shape[1] == self.kv_cache_total_dim
+        self.kv_buffer[layer_id].view(torch.uint8).view(-1, self.kv_cache_total_dim)[
+            loc.long()
+        ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
+
+
+class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
     def __init__(
         self,
         size: int,
@@ -238,10 +317,12 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
 
 
@@ -272,26 +353,48 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        self.use_fp4_indexer = get_global_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        self.uses_aiter_fp4_layout = _is_hip and self.use_fp4_indexer
 
         self._create_buffer()
 
     def get_bytes_per_token(self) -> int:
-        if self.use_fp4_indexer:
-            return self.index_head_dim // 2 + 4
-        return self.index_head_dim + 4
+        return get_dsv4_indexer_bytes_per_token(
+            self.index_head_dim, self.use_fp4_indexer
+        )
 
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()
+        num_pages = (self.size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
+                if self.uses_aiter_fp4_layout:
+                    self.index_k_payload_buffer = [
+                        torch.zeros(
+                            (num_pages, 1, 4, self.page_size, 16),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        ).view(torch.float4_e2m1fn_x2)
+                        for _ in range(self.layer_num)
+                    ]
+                    self.index_k_scale_buffer = [
+                        torch.zeros(
+                            (num_pages, 1, 4, self.page_size),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.index_k_with_scale_buffer = None
+                    return
+
                 self.index_k_with_scale_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size + 1) // self.page_size,
+                        num_pages,
                         page_bytes,
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=self.device,
@@ -314,15 +417,41 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_k_with_scale_buffer[layer_id]
 
+    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
+        """Every indexer buffer as 2D page rows, for PD and HiCache transfer.
+
+        FP8 keeps key and scale fused in one buffer per layer; the FP4 layout
+        stores payload and scale separately, so it yields two buffers per layer.
+        """
+        if self.index_k_with_scale_buffer is not None:
+            return self.index_k_with_scale_buffer
+        return [
+            buf.view(torch.uint8).flatten(1)
+            for buf in (*self.index_k_payload_buffer, *self.index_k_scale_buffer)
+        ]
+
+    def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.index_k_payload_buffer[layer_id]
+
+    def get_index_k_fp4_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.index_k_scale_buffer[layer_id]
+
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.index_k_with_scale_buffer[layer_id]
         return index_buf_accessor.GetKAndS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
         )
 
     def set_index_k_scale_buffer(
@@ -357,7 +486,7 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        from sglang.srt.layers.attention.dsv4.fp4_indexer import (
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
         )
 
@@ -369,8 +498,15 @@ class DeepSeekV4IndexerPool(KVCache):
         )
 
 
+class _CompressedPoolConfig(NamedTuple):
+    kv_size: int
+    state_size: int
+    state_dtype: torch.dtype
+    indexer_size: Optional[int] = None
+
+
 class DeepSeekV4LayerItem(NamedTuple):
-    compress_ratio: Literal[0, 4, 128]
+    compress_ratio: int
     compress_layer_id: int
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
@@ -379,7 +515,7 @@ class DeepSeekV4LayerItem(NamedTuple):
 class DeepSeekV4UnifiedKVPool:
     """
     Layout:
-    unified_kv[L]: ``[swa_pages + compress_pages, head_dim]`` bf16
+    unified_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` bf16
     - rows ``[0, swa_pages)``   = SWA ring (``req_pool_indices * swa_window + pos % swa_window``)
     - rows ``[swa_pages, ...)`` = compressed (``swa_pages + page_index``)
     """
@@ -392,6 +528,7 @@ class DeepSeekV4UnifiedKVPool:
         stage_ratios: List[int],
         num_slots: int,
         num_blocks: int,
+        page_size: int,
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
         device: str,
@@ -404,6 +541,7 @@ class DeepSeekV4UnifiedKVPool:
         self.num_slots = num_slots
         self.swa_pages = num_slots * self.swa_ring_size
         self.num_blocks = num_blocks
+        self.page_size = page_size
         self.k_per_block = dict(self.K_PER_BLOCK)
 
         bufs = []
@@ -414,10 +552,14 @@ class DeepSeekV4UnifiedKVPool:
                 else nullcontext()
             ):
                 for ratio in stage_ratios:
-                    compress_pages = self.num_blocks * self.k_per_block[ratio]
+                    # Pad by one extra page. The KV pool reserves a null slot
+                    # (token indices run 1..size).
+                    compress_rows = self.num_blocks * self.k_per_block[ratio]
+                    rows_per_page = self.page_size // ratio if ratio else 0
+                    padded_compress_rows = compress_rows + rows_per_page
                     bufs.append(
                         torch.zeros(
-                            self.swa_pages + compress_pages,
+                            self.swa_pages + padded_compress_rows,
                             self.head_dim,
                             dtype=torch.bfloat16,
                             device=device,
@@ -436,7 +578,6 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
-
     def __init__(
         self,
         max_num_reqs: int,
@@ -484,25 +625,58 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self.max_num_reqs = max_num_reqs
-        # SWA ring needs one slot per addressable req_pool_idx. PD decode inflates
-        # req_to_token past max_num_reqs (pre-alloc), so the caller passes the real
-        # capacity; sizing as max_num_reqs+1 overflows ("length out of range").
+        # PD preallocation can exceed max_num_reqs;
+        # the SWA ring must cover every addressable req_pool_idx.
         self.num_req_slots = (
             num_req_slots if num_req_slots is not None else max_num_reqs + 1
         )
-        self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
-        self.c4_state_pool_size = c4_state_pool_size
-        self.c128_state_pool_size = c128_state_pool_size
-        self.c4_state_dtype = c4_state_dtype
-        self.c128_state_dtype = c128_state_dtype
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        # Resolve the unified-kv gate before any sizing so the two cannot drift.
+        self._unified_kv = is_unified_kv_triton()
+        # Uniform 512-dim e4m3 layout for the trtllm attention backend
+        self.uniform_fp8 = (
+            not self._unified_kv
+        ) and get_exec().kernel.dsv4_attn_backend == "trtllm"
+        c4_ring_size = self.get_ring_size(4)
+        if self._unified_kv:
+            # Unified C4 state is request-addressed: one ring per req slot,
+            # so the caller-supplied, SWA-scaled size does not apply here.
+            c4_state_pool_size = self.num_req_slots * c4_ring_size
+        # Non-unified (fp8) keeps the caller-supplied, SWA-addressed size.
+        c128_ring_size = self.get_ring_size(128)
+        if ONLINE_C128:
+            # Request-scoped C128 state must also cover PD preallocation slots.
+            c128_state_pool_size = max(c128_state_pool_size, self.num_req_slots)
+        else:
+            # Offline C128 keeps a per-request raw state ring.
+            c128_state_pool_size = max(
+                c128_state_pool_size, self.num_req_slots * c128_ring_size
+            )
+        self.compressed_pool_configs = {
+            4: _CompressedPoolConfig(
+                kv_size=c4_size,
+                state_size=c4_state_pool_size,
+                state_dtype=c4_state_dtype,
+                indexer_size=c4_logical_size,
+            ),
+            128: _CompressedPoolConfig(
+                kv_size=c128_size,
+                state_size=c128_state_pool_size,
+                state_dtype=c128_state_dtype,
+            ),
+        }
         self.compression_ratios = compression_ratios
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
+        self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
         if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             self.online_c128_mtp_pending_seq_lens = torch.empty(
-                max_num_reqs, dtype=torch.int64, device=device
+                self.online_c128_state_num_req_slots, dtype=torch.int64, device=device
             )
 
         # Determine this PP stage's absolute layer range
@@ -522,53 +696,45 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.sliding_window = sliding_window
 
         self.swa_size = swa_size
-        self.swa_window_size = swa_page_size
         self.swa_page_size = swa_page_size
-        self.scale_pad = 1
 
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
 
         stage_layer_num = len(stage_ratios)
-        c4_layer_num = sum(1 for r in stage_ratios if r == 4)
-        c128_layer_num = sum(1 for r in stage_ratios if r == 128)
-        c4_page_size = page_size // 4
-        c128_page_size = page_size // 128
-
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        self._unified_kv = is_unified_kv_triton()
+        kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         if self._unified_kv:
             self.swa_kv_pool = None
-            self.c4_kv_pool = None
-            self.c128_kv_pool = None
-            server_args = get_global_server_args()
-            spec_extra = (
-                (server_args.speculative_num_draft_tokens - 1)
-                if server_args.speculative_algorithm is not None
-                else 0
+            swa_ring_size = get_swa_ring_size(
+                self.sliding_window, get_spec().speculative_algorithm is not None
             )
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
                 stage_ratios=stage_ratios,
                 num_slots=self.num_req_slots,
                 num_blocks=self.c128_size,
+                page_size=page_size,
                 qk_nope_head_dim=qk_nope_head_dim,
                 qk_rope_head_dim=qk_rope_head_dim,
                 device=device,
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
-                swa_ring_size=self.sliding_window + spec_extra,
+                swa_ring_size=swa_ring_size,
             )
 
             self.unified_swa_window = self.sliding_window
-            self.unified_swa_ring_size = self.sliding_window + spec_extra
+            self.unified_swa_ring_size = swa_ring_size
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
+            self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
+            if self.uniform_fp8:
+                assert dtype == torch.float8_e4m3fn, (
+                    "--dsv4-attn-backend trtllm requires "
+                    f"kv_cache_dtype=fp8_e4m3, got {dtype}"
+                )
+                kv_pool_cls = DeepSeekV4UniformFP8KVPool
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
                 page_size=swa_page_size,
@@ -577,63 +743,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
+                cls=kv_pool_cls,
             )
 
-            c4_kv_pool_type = DeepSeekV4SingleKVPool
-            if enable_hisparse:
-                c4_kv_pool_type = HiSparseC4DevicePool
-            self.c4_kv_pool = self._make_kv_pool(
-                size=c4_size,
-                page_size=c4_page_size,
-                dtype=dtype,
-                layer_num=c4_layer_num,
-                device=device,
-                enable_memory_saver=enable_memory_saver,
-                global_page_size=page_size,
-                cls=c4_kv_pool_type,
-            )
-
-            self.c128_kv_pool = self._make_kv_pool(
-                size=c128_size,
-                page_size=c128_page_size,
-                dtype=dtype,
-                layer_num=c128_layer_num,
-                device=device,
-                enable_memory_saver=enable_memory_saver,
-                global_page_size=page_size,
-            )
-
-        indexer_size = (
-            self.c4_logical_size
-            if (not _is_hip or envs.SGLANG_OPT_USE_COMPRESSOR_V2.get())
-            else c4_size
-        )
-        self.c4_indexer_kv_pool = self._make_indexer_pool(
-            indexer_size,
-            c4_page_size,
-            dtype,
-            indexer_head_dim,
-            c4_layer_num,
-            device,
-            enable_memory_saver,
+        self._init_compressed_pools(
+            stage_ratios=stage_ratios,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            enable_hisparse=enable_hisparse,
+            kv_pool_cls=kv_pool_cls,
         )
 
         self._init_compressed_layer_mapping()
 
-        if _is_hip:
-            self._init_paged_compress_states(False)
-        else:
-            self._init_paged_compress_states(enable_memory_saver)
+        self._init_paged_compress_states(enable_memory_saver)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
+        # Under HiCache the compressed region is loaded H->D per layer; wait for this
+        # layer's transfer before attention reads it. No-op when HiCache is off.
+        self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
-        server_args = get_global_server_args()
-        is_speculative = server_args.speculative_algorithm is not None
+        is_speculative = get_spec().speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
@@ -645,59 +782,45 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self._unified_kv:
-            # Unified buffer per layer: [swa_pages + compress_pages, head_dim].
-            # Compressed region [swa_pages:] is page-contiguous (row swa_pages +
-            # loc//ratio), so reuse the page-block PD transfer by offsetting the ptr
-            # past the SWA ring and setting item_len = one page of rows. The SWA ring
-            # ships separately as StateType.SWA_RING. Order [c4, c4_indexer, c128]
-            # mirrors the non-unified kv_data layout (keeps PP ptr-slicing valid).
-            stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
-            swa_pages = self.unified_kv_pool.swa_pages
+        def append_page_buffer(buf: torch.Tensor) -> None:
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(buf[0].nbytes)
 
-            def _append_compressed_entry(local_layer_id: int, ratio: int) -> None:
-                buf = self.unified_kv_pool.kv_buffer[local_layer_id]
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                row_bytes = buf[0].nbytes
-                rows_per_page = self.page_size // ratio
-                compress_rows = buf.shape[0] - swa_pages
-                data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
-                data_lens.append(compress_rows * row_bytes)
-                item_lens.append(rows_per_page * row_bytes)
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        # Registration order defines the PD wire layout: C4 KV, C4 indexer, C128 KV.
+        # Keep each indexer immediately after the KV buffers of the same ratio.
+        for ratio, kv_pool in self.kv_pools.items():
+            if self._unified_kv:
+                # Unified buffers store token rows after the SWA ring. Transfer
+                # compressed pages from the offset; SWA ships as StateType.SWA_RING.
+                swa_pages = self.unified_kv_pool.swa_pages
+                for local_layer_id, layer_ratio in enumerate(stage_ratios):
+                    if layer_ratio != ratio:
+                        continue
+                    buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+                    assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+                    row_bytes = buf[0].nbytes
+                    rows_per_page = self.page_size // ratio
+                    compress_rows = buf.shape[0] - swa_pages
+                    data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
+                    data_lens.append(compress_rows * row_bytes)
+                    item_lens.append(rows_per_page * row_bytes)
+            else:
+                for buf in kv_pool.kv_buffer:
+                    append_page_buffer(buf)
 
-            c4_locals = [i for i, r in enumerate(stage_ratios) if r == 4]
-            c128_locals = [i for i, r in enumerate(stage_ratios) if r == 128]
-
-            for i in c4_locals:
-                _append_compressed_entry(i, 4)
-            for buf in self.c4_indexer_kv_pool.index_k_with_scale_buffer:
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
-            for i in c128_locals:
-                _append_compressed_entry(i, 128)
-
-            return data_ptrs, data_lens, item_lens
-
-        buf_groups = [
-            self.c4_kv_pool.kv_buffer,
-            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            self.c128_kv_pool.kv_buffer,
-        ]
-
-        for bufs in buf_groups:
-            for buf in bufs:
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
+            indexer_pool = self.index_pools.get(ratio)
+            if indexer_pool is not None:
+                for buf in indexer_pool.contiguous_page_row_buffers():
+                    append_page_buffer(buf)
 
         return data_ptrs, data_lens, item_lens
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """SWA-ring region [0, swa_pages) of every unified_kv layer, addressed
-        per-row by ring slot. Shipped as the StateType.SWA_RING PD component."""
+        # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;
+        # its indices address individual ring rows.
         # TODO(billishyahao): validate PP layer-slicing for SWA_RING.
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -712,6 +835,39 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(swa_pages * row_bytes)
             item_lens.append(row_bytes)
         return data_ptrs, data_lens, item_lens
+
+    def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
+        # HiCache expects byte rows containing whole pages;
+        # the unified pool stores individual token rows after its SWA region.
+        assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
+        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
+
+        swa_pages = self.unified_kv_pool.swa_pages
+        head_dim = self.unified_kv_pool.head_dim
+        rows_per_page = self.page_size // ratio
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        local_layer_ids = [i for i, r in enumerate(stage_ratios) if r == ratio]
+
+        views: List[torch.Tensor] = []
+        for local_layer_id in local_layer_ids:
+            buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+            compress_rows = buf.shape[0] - swa_pages
+            assert compress_rows % rows_per_page == 0, (
+                f"compressed rows {compress_rows} not a multiple of "
+                f"rows_per_page {rows_per_page} for ratio {ratio}"
+            )
+            num_pages = compress_rows // rows_per_page
+            page_view = (
+                buf.narrow(0, swa_pages, compress_rows)
+                .reshape(num_pages, rows_per_page * head_dim)
+                .view(torch.uint8)
+            )
+            views.append(page_view)
+
+        item_bytes = (
+            rows_per_page * head_dim * self.unified_kv_pool.kv_buffer[0].element_size()
+        )
+        return views, item_bytes
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
@@ -732,6 +888,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for pool in pools:
                 if pool is None:
                     continue
+                if pool.ratio == 128:
+                    continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
                 data_ptrs.append(t.data_ptr())
@@ -739,6 +897,78 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_request_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            t = pool.kv_score_buffer.kv_score
+            assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
+            data_ptrs.append(t.data_ptr())
+            data_lens.append(t.nbytes)
+            item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
+        return data_ptrs, data_lens, item_lens
+
+    def _init_compressed_pools(
+        self,
+        *,
+        stage_ratios: Sequence[int],
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+        enable_hisparse: bool,
+        kv_pool_cls: type,
+    ) -> None:
+        configs = self.compressed_pool_configs
+        layer_counts = {ratio: stage_ratios.count(ratio) for ratio in configs}
+        # Keep empty pools and allocation order for PP stages without a given ratio.
+        self.kv_pools: dict[int, Optional[DeepSeekV4SingleKVPool]] = {
+            ratio: None for ratio in configs
+        }
+
+        if not self._unified_kv:
+            for ratio, config in configs.items():
+                pool_cls = kv_pool_cls
+                if ratio == 4 and enable_hisparse:
+                    assert not self.uniform_fp8, (
+                        "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
+                    )
+                    pool_cls = HiSparseC4DevicePool
+                self.kv_pools[ratio] = self._make_kv_pool(
+                    size=config.kv_size,
+                    page_size=page_size // ratio,
+                    dtype=dtype,
+                    layer_num=layer_counts[ratio],
+                    device=device,
+                    enable_memory_saver=enable_memory_saver,
+                    global_page_size=page_size,
+                    cls=pool_cls,
+                )
+
+        self.index_pools: dict[int, DeepSeekV4IndexerPool] = {
+            ratio: self._make_indexer_pool(
+                config.indexer_size,
+                page_size // ratio,
+                dtype,
+                self.indexer_head_dim,
+                layer_counts[ratio],
+                device,
+                enable_memory_saver,
+            )
+            for ratio, config in configs.items()
+            if config.indexer_size is not None
+        }
+
+        # HiCache and hardware backends still access the per-ratio attributes.
+        self.c4_kv_pool = self.kv_pools[4]
+        self.c128_kv_pool = self.kv_pools[128]
+        self.c4_indexer_kv_pool = self.index_pools[4]
 
     def _make_kv_pool(
         self,
@@ -792,21 +1022,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
         )
 
-    def _state_pool_size(self, ratio: int) -> int:
-        return self.c4_state_pool_size if ratio == 4 else self.c128_state_pool_size
-
-    def _make_attn_state_pool(
-        self, ratio: int, enable_memory_saver: bool
+    def _make_compress_state_pool(
+        self, ratio: int, *, head_dim: int, enable_memory_saver: bool
     ) -> CompressStatePool:
-        """Build the per-layer attention compress-state pool for ``ratio``
-        (4 or 128). Overridden by :class:`DSV4NPUTokenToKVPool` to swap the
-        ring-buffered pool for the NPU paged one."""
+        """Build attention or indexer state; hardware backends override this factory."""
+        config = self.compressed_pool_configs[ratio]
         return CompressStatePool(
-            size=self._state_pool_size(ratio),
+            size=config.state_size,
             ring_size=self.get_ring_size(ratio),
             overlap=ratio == 4,
-            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-            dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
+            head_dim=head_dim,
+            dtype=config.state_dtype,
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
@@ -817,25 +1043,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             ),
         )
 
-    def _make_indexer_state_pool(
-        self, ratio: int, enable_memory_saver: bool
-    ) -> CompressStatePool:
-        """Build the per-layer indexer compress-state pool (c4 only)."""
-        return CompressStatePool(
-            size=self._state_pool_size(ratio),
-            ring_size=self.get_ring_size(ratio),
-            overlap=ratio == 4,
-            head_dim=self.indexer_head_dim,
-            device=self.device,
-            dtype=self.c4_state_dtype,
-            enable_memory_saver=enable_memory_saver,
-            ratio=ratio,
-            swa_page_size=self.swa_page_size,
-        )
-
     def _init_paged_compress_states(self, enable_memory_saver: bool):
-        c4_state_pool_size = self.c4_state_pool_size
-        c128_state_pool_size = self.c128_state_pool_size
         total_L = len(self.compression_ratios)
         self.compress_state_pools: List[Optional[CompressStatePool]] = [None] * total_L
         self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [
@@ -847,44 +1055,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio == 0:
                 continue
 
-            self.compress_state_pools[idx] = self._make_attn_state_pool(
-                ratio, enable_memory_saver
+            self.compress_state_pools[idx] = self._make_compress_state_pool(
+                ratio,
+                head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                enable_memory_saver=enable_memory_saver,
             )
 
-            if ratio == 4:
-                self.indexer_compress_state_pools[idx] = self._make_indexer_state_pool(
-                    ratio, enable_memory_saver
+            if ratio in self.index_pools:
+                self.indexer_compress_state_pools[idx] = self._make_compress_state_pool(
+                    ratio,
+                    head_dim=self.indexer_head_dim,
+                    enable_memory_saver=enable_memory_saver,
                 )
 
     def _init_compressed_layer_mapping(self):
-        c1_cnt = c4_cnt = c128_cnt = 0
+        layer_counts = {0: 0, **{ratio: 0 for ratio in self.kv_pools}}
         total_L = len(self.compression_ratios)
         self.layer_mapping: List[Optional[DeepSeekV4LayerItem]] = [None] * total_L
 
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
-            if ratio == 0:
-                self.layer_mapping[idx] = DeepSeekV4LayerItem(
-                    compress_ratio=0,
-                    compress_layer_id=c1_cnt,
-                )
-                c1_cnt += 1
-            elif ratio == 4:
-                self.layer_mapping[idx] = DeepSeekV4LayerItem(
-                    compress_ratio=4,
-                    compress_layer_id=c4_cnt,
-                    compress_kv_pool=self.c4_kv_pool,
-                )
-                c4_cnt += 1
-            elif ratio == 128:
-                self.layer_mapping[idx] = DeepSeekV4LayerItem(
-                    compress_ratio=128,
-                    compress_layer_id=c128_cnt,
-                    compress_kv_pool=self.c128_kv_pool,
-                )
-                c128_cnt += 1
-            else:
+            if ratio not in layer_counts:
                 raise ValueError(f"Unsupported compression ratio: {ratio}")
+            self.layer_mapping[idx] = DeepSeekV4LayerItem(
+                compress_ratio=ratio,
+                compress_layer_id=layer_counts[ratio],
+                compress_kv_pool=self.kv_pools.get(ratio),
+            )
+            layer_counts[ratio] += 1
 
     def wait_layer_transfer(self, layer_id: int) -> None:
         if self.layer_transfer_counter is not None:
@@ -893,9 +1091,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers have attention states."
+        assert compress_state_pool is not None, (
+            "Only c4/c128 layers have attention states."
+        )
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -910,16 +1108,90 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 return int(pool.online_mtp_max_draft_tokens)
         return 0
 
+    def get_online_c128_state_num_req_slots(self) -> int:
+        return self.online_c128_state_num_req_slots
+
     def get_online_c128_mtp_pending_seq_lens(self) -> torch.Tensor:
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
 
+    def clear_c4_req_states(self, req_pool_indices: Sequence[int]) -> None:
+        if not self._unified_kv or not req_pool_indices:
+            return
+
+        pools = [
+            pool
+            for pool in self.compress_state_pools + self.indexer_compress_state_pools
+            if pool is not None and pool.ratio == 4
+        ]
+        if not pools:
+            return
+
+        ring_size = self.get_ring_size(4)
+        device = pools[0].kv_score_buffer.kv_score.device
+        req_indices = torch.as_tensor(req_pool_indices, dtype=torch.long, device=device)
+        state_locs = (
+            req_indices[:, None] * ring_size
+            + torch.arange(ring_size, dtype=torch.long, device=device)
+        ).flatten()
+
+        for pool in pools:
+            state = pool.kv_score_buffer.kv_score
+            half = state.shape[-1] // 2
+            state[state_locs, :half] = 0
+            state[state_locs, half:] = float("-inf")
+
+    def clear_c128_req_state(self, req_pool_idx: int) -> None:
+        """Reset request-scoped C128 state for one req slot."""
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+
+            state = pool.kv_score_buffer.kv_score
+            if ONLINE_C128:
+                row = state[req_pool_idx]
+                head_dim = row.shape[-1] // 3
+                row[:head_dim].fill_(float("-inf"))
+                row[head_dim:].zero_()
+            else:
+                start = req_pool_idx * pool.ring_size
+                rows = state[start : start + pool.ring_size]
+                half = rows.shape[-1] // 2
+                rows[:, :half].zero_()
+                rows[:, half:].fill_(float("-inf"))
+
+    def clear_unaccepted_c128_draft_states(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        accept_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> None:
+        # C128 compression can read rejected draft slots at a boundary;
+        # C4 overwrites its draft slots before reading them.
+        if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
+            return
+
+        bs = req_pool_indices.numel()
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+
+            clear_unaccepted_c128_draft_states(
+                pool.kv_score_buffer.kv_score,
+                req_pool_indices,
+                seq_lens,
+                accept_lens,
+                ring_size=pool.ring_size,
+                num_draft_tokens=num_draft_tokens,
+            )
+
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
+        assert indexer_compress_state_pool is not None, (
+            "Only c4 layers have indexer states."
+        )
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
@@ -928,20 +1200,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_swa_raw_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
-
-    def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
-        self.wait_layer_transfer(layer_id)
-        return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
-
-    def set_swa_key_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
-    ) -> None:
-        self.swa_kv_pool.set_key_buffer(
-            self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
-        )
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
         _, _, compress_kv_pool = self.layer_mapping[layer_id]
@@ -966,26 +1224,53 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack
         )
 
-    def get_index_k_page_size(self) -> int:
-        return self.c4_indexer_kv_pool.page_size
+    def _indexer_pool(self, compress_ratio: int) -> DeepSeekV4IndexerPool:
+        pool = self.index_pools.get(compress_ratio)
+        assert pool is not None, (
+            f"No indexer pool for compression ratio {compress_ratio}"
+        )
+        return pool
+
+    def get_index_k_page_size(self, compress_ratio: int = 4) -> int:
+        return self._indexer_pool(compress_ratio).page_size
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
+        return self._indexer_pool(compress_ratio).get_index_k_with_scale_buffer(
+            compress_layer_id
+        )
+
+    def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).get_index_k_fp4_payload_buffer(
+            compress_layer_id
+        )
+
+    def get_index_k_fp4_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).get_index_k_fp4_scale_buffer(
+            compress_layer_id
+        )
 
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        return self.c4_indexer_kv_pool.get_index_k_scale_buffer(
-            compress_layer_id, seq_len, page_indices
+        return self._indexer_pool(compress_ratio).get_index_k_scale_buffer(
+            compress_layer_id,
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
         )
 
     def set_index_k_scale_buffer(
@@ -996,8 +1281,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         index_k_scale: torch.Tensor,
     ) -> None:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        self.c4_indexer_kv_pool.set_index_k_scale_buffer(
+        self._indexer_pool(compress_ratio).set_index_k_scale_buffer(
             compress_layer_id, loc, index_k, index_k_scale
         )
 
@@ -1047,6 +1331,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if self.uniform_fp8:
+            # Uniform-FP8 (trtllm-gen) layout: norm + RoPE with the existing
+            # Triton kernel (in-place on kv; safe -- kv is not read again),
+            # then a plain e4m3 cast + scatter in the pool setter (per-tensor
+            # scale 1.0). Fusing the store is deferred to the perf phase.
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                fused_norm_rope_inplace_triton,
+            )
+
+            fused_norm_rope_inplace_triton(
+                kv,
+                kv_weight,
+                eps,
+                freqs_cis,
+                positions=positions,
+            )
+            self.swa_kv_pool.set_key_buffer_fused(
+                self._swa_local_layer_id(layer_id), swa_loc, kv
+            )
+            return
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
@@ -1056,6 +1360,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             out_loc=swa_loc,
             kvcache=self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)],
             page_size=self.swa_kv_pool.page_size,
+        )
+
+    def set_unified_key_buffer_radix_fused_norm_rope(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """unified_kv counterpart of set_swa_key_buffer_radix_fused_norm_rope.
+
+        Under unified_kv the (fp8, paged) swa_kv_pool is None -- SWA K lives in
+        the shared bf16 unified_kv ring instead. Norm+RoPE the draft KV in place
+        (the same freqs_cis path the main model uses via _compute_kv_bf16) and
+        scatter it into ``unified_kv[swa_loc]``. Rows with swa_loc < 0
+        (uncommitted verify tokens) are skipped by the scatter.
+        """
+        from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+
+        fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
+        runtime.scatter_bf16_into_unified(
+            kv=kv,
+            loc=swa_loc,
+            unified_kv=self.get_unified_kv(layer_id),
         )
 
     def set_extra_key_buffer_fused(
@@ -1075,8 +1407,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
     ) -> None:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
+        return self._indexer_pool(compress_ratio).set_index_fused(
+            compress_layer_id, loc, cache_k
+        )
 
     def set_index_k_fp4(
         self,
@@ -1085,5 +1418,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
     ) -> None:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        return self.c4_indexer_kv_pool.set_index_fp4(compress_layer_id, loc, cache_k)
+        return self._indexer_pool(compress_ratio).set_index_fp4(
+            compress_layer_id, loc, cache_k
+        )

@@ -10,12 +10,13 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
-from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
+from sglang.srt.layers.attention.linear.utils import resolve_linear_attn_backends
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -29,9 +30,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-
-from ..mock_server_args import make_mock_server_args
+from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
@@ -56,6 +55,9 @@ class GDNAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
+    linear_attn_prefill_backend: str | None = None
+    mis_delimiter_indices: tuple[tuple[int, ...], ...] = ()
+    conv_history_weight: float = 0.0
 
     @property
     def batch_size(self) -> int:
@@ -178,16 +180,23 @@ class TinyGDNModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
         self.hf_config = SimpleNamespace(architectures=["TinyGDNForCausalLM"])
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
-        assert self.num_key_value_heads % tp_size == 0
-        return self.num_key_value_heads // tp_size
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
+        kv_tp_size = tp_size // dcp_size
+        assert self.num_key_value_heads % kv_tp_size == 0
+        return self.num_key_value_heads // kv_tp_size
 
 
 class MockGDNModelRunner(ModelRunner):
@@ -210,7 +219,14 @@ class MockGDNModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
+        self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
+        self.ps = ParallelState.trivial()
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
@@ -220,7 +236,7 @@ class MockGDNModelRunner(ModelRunner):
             or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -238,13 +254,11 @@ class MockGDNModelRunner(ModelRunner):
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
-            enable_mis=False,
+            enable_mis=bool(case.mis_delimiter_indices),
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
-            linear_attn_prefill_backend=None,
-            mamba_cache_chunk_size=64,
+            linear_attn_prefill_backend=case.linear_attn_prefill_backend,
             max_running_requests=None,
-            model_path=None,
             revision=None,
             speculative_algorithm=None,
             speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
@@ -252,7 +266,12 @@ class MockGDNModelRunner(ModelRunner):
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
+            # Pin the lazy mamba_cache_chunk_size property cache: production
+            # derives it from hf_config + page_size, which needs a real model.
+            _mamba_cache_chunk_size=64,
         )
+        self._server_args_override.install()
+        self.server_args = get_server_args()
         cache_shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=case.num_v_heads * head_v_dim,
@@ -262,10 +281,16 @@ class MockGDNModelRunner(ModelRunner):
             state_size=head_k_dim,
             conv_kernel=2,
         )
+        temporal_state_dtype = (
+            dtype
+            if case.linear_attn_prefill_backend == "flashinfer"
+            and torch.cuda.get_device_capability()[0] >= 10
+            else torch.float32
+        )
         cache_params = Mamba2CacheParams(
             shape=cache_shape,
             layers=[0],
-            dtype=Mamba2StateDType(conv=dtype, temporal=torch.float32),
+            dtype=Mamba2StateDType(conv=dtype, temporal=temporal_state_dtype),
         )
         self.req_to_token_pool = HybridReqToTokenPool(
             size=pool_batch_size,
@@ -296,6 +321,7 @@ class MockGDNModelRunner(ModelRunner):
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
         )
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -341,6 +367,7 @@ class ProjectedGDNAttention(nn.Module):
         head_v_dim: int,
         dtype: torch.dtype,
         device: str,
+        conv_history_weight: float = 0.0,
     ):
         super().__init__()
         self.num_k_heads = num_k_heads
@@ -349,6 +376,7 @@ class ProjectedGDNAttention(nn.Module):
         self.head_v_dim = head_v_dim
         mixed_qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
         conv_weights = torch.zeros(mixed_qkv_dim, 2, dtype=dtype, device=device)
+        conv_weights[:, 0] = conv_history_weight
         conv_weights[:, 1] = 1
         self.A_log = nn.Parameter(
             torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
@@ -524,6 +552,15 @@ def _make_forward_batch(
         out_cache_loc=torch.tensor(out_cache_locs, dtype=torch.int64, device=device),
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
+        is_prefill_only=bool(case.mis_delimiter_indices),
+        multi_item_delimiter_indices=(
+            [
+                torch.tensor(indices, dtype=torch.int64)
+                for indices in case.mis_delimiter_indices
+            ]
+            if case.mis_delimiter_indices
+            else None
+        ),
     )
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
@@ -583,8 +620,18 @@ def build_gdn_attention_fixture(
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
-    initialize_linear_attn_config(runner.server_args)
+    # Standing in for `attn_backend_wrapper`, which is what stamps this on a
+    # runner before building the backend that reads it.
+    runner.linear_attn_backends = resolve_linear_attn_backends()
     linear_backend = GDNAttnBackend(runner)
+    if case.linear_attn_prefill_backend == "flashinfer":
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        testcase.assertIsInstance(
+            linear_backend.kernel_dispatcher.extend_kernel, FlashInferGDNKernel
+        )
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
     actual_module = ProjectedGDNAttention(
         num_k_heads=case.num_k_heads,
@@ -593,6 +640,7 @@ def build_gdn_attention_fixture(
         head_v_dim=head_v_dim,
         dtype=dtype,
         device=device,
+        conv_history_weight=case.conv_history_weight,
     )
     reference_module = ReferenceGDNAttention(
         num_k_heads=case.num_k_heads,
@@ -603,6 +651,13 @@ def build_gdn_attention_fixture(
         device=device,
     )
     _copy_gdn_parameters(actual_module, reference_module)
+    if case.mis_delimiter_indices:
+        # Keep recurrent history strong so cross-item state leakage cannot hide
+        # behind the normal random gate decay in short focused test sequences.
+        with torch.no_grad():
+            actual_module.A_log.fill_(-4.0)
+            actual_module.dt_bias.fill_(-4.0)
+        _copy_gdn_parameters(actual_module, reference_module)
     from .dense_attention import make_loc_fn as _dense_make_loc_fn
 
     loc_fn = _dense_make_loc_fn(
@@ -752,7 +807,8 @@ def _pure_torch_gdn_reference(
     initial_ssm_states: torch.Tensor,
 ) -> GDNReferenceOutput:
     module = fixture.reference_module
-    q, k, v = module.split_qkv(fixture.mixed_qkv)
+    mixed_qkv = _pure_torch_mis_conv_reference(fixture)
+    q, k, v = module.split_qkv(mixed_qkv)
     cache_indices = _cache_indices(fixture)
     g, beta = _pure_torch_gdn_gating(module, fixture.a, fixture.b)
     q = q.float()
@@ -775,35 +831,97 @@ def _pure_torch_gdn_reference(
         state_idx = cache_indices[req_idx]
         state = initial_ssm_states[state_idx].float().clone()
 
-        for offset in range(input_len):
-            token_idx = start + offset
-            for v_head in range(fixture.case.num_v_heads):
-                k_head = v_head // q_head_ratio
-                q_vec = q[0, token_idx, k_head]
-                k_vec = k[0, token_idx, k_head]
-                v_vec = v[0, token_idx, v_head]
+        if fixture.case.mis_delimiter_indices:
+            delimiters = fixture.case.mis_delimiter_indices[req_idx]
+            segments = [(0, delimiters[0])]
+            segments.extend(zip(delimiters, tuple(delimiters[1:]) + (input_len,)))
+        else:
+            segments = [(0, input_len)]
 
-                q_norm = q_vec / torch.sqrt(torch.sum(q_vec * q_vec) + 1e-6)
-                k_norm = k_vec / torch.sqrt(torch.sum(k_vec * k_vec) + 1e-6)
-                q_norm = q_norm * (module.head_k_dim**-0.5)
+        query_final_state = state.clone()
+        for segment_idx, (segment_start, segment_end) in enumerate(segments):
+            state = (
+                query_final_state.clone()
+                if segment_idx > 0
+                else initial_ssm_states[state_idx].float().clone()
+            )
+            for offset in range(segment_start, segment_end):
+                token_idx = start + offset
+                for v_head in range(fixture.case.num_v_heads):
+                    k_head = v_head // q_head_ratio
+                    q_vec = q[0, token_idx, k_head]
+                    k_vec = k[0, token_idx, k_head]
+                    v_vec = v[0, token_idx, v_head]
 
-                head_state = state[v_head]
-                head_state = head_state * torch.exp(g[token_idx, v_head])
-                residual_v = v_vec - torch.sum(head_state * k_norm.unsqueeze(0), dim=1)
-                residual_v = residual_v * beta[token_idx, v_head]
-                head_state = head_state + residual_v.unsqueeze(1) * k_norm.unsqueeze(0)
-                state[v_head] = head_state
-                outputs[0, token_idx, v_head] = torch.sum(
-                    head_state * q_norm.unsqueeze(0), dim=1
-                )
+                    q_norm = q_vec / torch.sqrt(torch.sum(q_vec * q_vec) + 1e-6)
+                    k_norm = k_vec / torch.sqrt(torch.sum(k_vec * k_vec) + 1e-6)
+                    q_norm = q_norm * (module.head_k_dim**-0.5)
 
-        final_states[state_idx] = state.to(final_states.dtype)
+                    head_state = state[v_head]
+                    head_state = head_state * torch.exp(g[token_idx, v_head])
+                    residual_v = v_vec - torch.sum(
+                        head_state * k_norm.unsqueeze(0), dim=1
+                    )
+                    residual_v = residual_v * beta[token_idx, v_head]
+                    head_state = head_state + residual_v.unsqueeze(
+                        1
+                    ) * k_norm.unsqueeze(0)
+                    state[v_head] = head_state
+                    outputs[0, token_idx, v_head] = torch.sum(
+                        head_state * q_norm.unsqueeze(0), dim=1
+                    )
+
+            if segment_idx == 0:
+                query_final_state = state.clone()
+
+        final_states[state_idx] = (
+            query_final_state if fixture.case.mis_delimiter_indices else state
+        ).to(final_states.dtype)
         start += input_len
 
     return GDNReferenceOutput(
         output=outputs.to(fixture.mixed_qkv.dtype),
         final_states=final_states,
     )
+
+
+def _pure_torch_mis_conv_reference(fixture: GDNAttentionFixture) -> torch.Tensor:
+    """Token-by-token causal-conv reference with MIS query-state branching."""
+    if fixture.case.conv_history_weight == 0:
+        return fixture.mixed_qkv
+
+    weights = fixture.actual_module.attn.conv_weights.float()
+    width = weights.shape[1]
+    result = torch.empty_like(fixture.mixed_qkv)
+    request_start = 0
+    for request_idx, input_len in enumerate(fixture.case.input_lens):
+        request_input = fixture.mixed_qkv[
+            request_start : request_start + input_len
+        ].float()
+        delimiters = fixture.case.mis_delimiter_indices[request_idx]
+        segments = [(0, delimiters[0])]
+        segments.extend(zip(delimiters, tuple(delimiters[1:]) + (input_len,)))
+
+        query_state = torch.zeros(
+            width - 1,
+            request_input.shape[1],
+            dtype=torch.float32,
+            device=request_input.device,
+        )
+        for segment_idx, (segment_start, segment_end) in enumerate(segments):
+            state = query_state.clone()
+            for token_offset in range(segment_start, segment_end):
+                window = torch.cat(
+                    [state, request_input[token_offset : token_offset + 1]]
+                )
+                result[request_start + token_offset] = torch.sum(
+                    window.transpose(0, 1) * weights, dim=1
+                ).to(result.dtype)
+                state = window[1:]
+            if segment_idx == 0:
+                query_state = state
+        request_start += input_len
+    return result
 
 
 def make_gdn_case_with_prefix_lens(
@@ -831,6 +949,8 @@ def make_gdn_case_with_prefix_lens(
         page_size=case.page_size,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
+        mis_delimiter_indices=case.mis_delimiter_indices,
+        conv_history_weight=case.conv_history_weight,
     )
 
 
@@ -1084,7 +1204,7 @@ def run_gdn_attention_case(
     expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
 
     torch.testing.assert_close(actual, expected.output, atol=GDN_ATOL, rtol=GDN_RTOL)
-    if case.forward_mode.is_decode():
+    if case.forward_mode.is_decode() or case.mis_delimiter_indices:
         torch.testing.assert_close(
             _ssm_states(fixture)[_cache_indices(fixture)],
             expected.final_states[_cache_indices(fixture)],

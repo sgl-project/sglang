@@ -5,10 +5,13 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/pynccl.py
 
 # ===================== import region =====================
+from contextlib import contextmanager
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
+from sglang.multimodal_gen.runtime import platforms
 from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl_wrapper import (
     NCCLLibrary,
     buffer_type,
@@ -20,13 +23,43 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl_wrapp
 )
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import current_stream
 
 logger = init_logger(__name__)
 
 
-class PyNcclCommunicator:
+_previous_set_stream = torch.cuda.set_stream
 
+_current_stream = None
+
+
+def _patched_set_stream(stream: torch.cuda.Stream | None) -> None:
+    global _current_stream
+    _current_stream = stream
+    if stream is not None:
+        _previous_set_stream(stream)
+
+
+torch.cuda.set_stream = _patched_set_stream
+
+
+def _get_current_stream() -> torch.cuda.Stream | None:
+    # cache the stream object to avoid constructing it for every collective;
+    # callers must change streams through torch.cuda.set_stream
+    if not platforms.current_platform.is_cuda_alike():
+        return None
+
+    global _current_stream
+    if _current_stream is None:
+        # RCCL performs better on a dedicated stream than the default stream
+        _current_stream = (
+            torch.cuda.Stream()
+            if platforms.current_platform.is_rocm()
+            else torch.cuda.current_stream()
+        )
+    return _current_stream
+
+
+class PyNcclCommunicator:
     def __init__(
         self,
         group: ProcessGroup | StatelessProcessGroup,
@@ -46,9 +79,9 @@ class PyNcclCommunicator:
         """
         if not isinstance(group, StatelessProcessGroup):
             assert dist.is_initialized()
-            assert (
-                dist.get_backend(group) != dist.Backend.NCCL
-            ), "PyNcclCommunicator should be attached to a non-NCCL group."
+            assert dist.get_backend(group) != dist.Backend.NCCL, (
+                "PyNcclCommunicator should be attached to a non-NCCL group."
+            )
             # note: this rank is the rank in the group
             self.rank = dist.get_rank(group)
             self.world_size = dist.get_world_size(group)
@@ -109,7 +142,7 @@ class PyNcclCommunicator:
                 self.world_size, self.unique_id, self.rank
             )
 
-            stream = current_stream()
+            stream = _get_current_stream()
             # A small all_reduce for warmup.
             data = torch.zeros(1, device=device)
             self.all_reduce(data)
@@ -133,7 +166,7 @@ class PyNcclCommunicator:
         out_tensor = torch.empty_like(in_tensor)
 
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclAllReduce(
             buffer_type(in_tensor.data_ptr()),
             buffer_type(out_tensor.data_ptr()),
@@ -158,7 +191,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclAllGather(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -185,7 +218,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclReduceScatter(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -204,7 +237,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -222,7 +255,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -232,6 +265,106 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def group_start(self):
+        self.nccl.ncclGroupStart()
+
+    def group_end(self):
+        self.nccl.ncclGroupEnd()
+
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
+        stream=None,
+    ) -> None:
+        """Equal-split all-to-all, the dist.all_to_all_single equivalent.
+
+        Exists because ProcessGroupNCCL's collectives cannot be recorded into a
+        CUDA graph: their host-side per-op bookkeeping advances once at capture,
+        so replays leave the ranks disagreeing about which collective is in
+        flight and they hang. Raw ncclSend/ncclRecv inside a group carries no
+        such state, so a captured region can hold the exchange.
+        """
+        if self.disabled:
+            raise RuntimeError(
+                "pynccl all_to_all_single called while the communicator is "
+                "disabled; wrap it in change_state(enable=True)"
+            )
+        assert output.dtype == input_.dtype, (output.dtype, input_.dtype)
+        assert input_.is_contiguous() and output.is_contiguous()
+        if input_split_sizes is None and output_split_sizes is None:
+            assert output.numel() == input_.numel(), (
+                output.numel(),
+                input_.numel(),
+            )
+            assert input_.numel() % self.world_size == 0, (
+                f"all_to_all_single without split sizes needs an equal split, "
+                f"got {input_.numel()} elements over {self.world_size} ranks"
+            )
+        if stream is None:
+            stream = _get_current_stream()
+        # dist.all_to_all_single defines split sizes along dim 0; convert rows
+        # to element counts so n-D tensors split identically to torch
+        in_row = input_.numel() // input_.size(0) if input_.dim() else 1
+        out_row = output.numel() // output.size(0) if output.dim() else 1
+        chunk = input_.numel() // self.world_size
+        if input_split_sizes is None:
+            send_counts = [chunk] * self.world_size
+        else:
+            assert sum(input_split_sizes) == input_.size(0)
+            send_counts = [n * in_row for n in input_split_sizes]
+        if output_split_sizes is None:
+            recv_counts = [chunk] * self.world_size
+        else:
+            assert sum(output_split_sizes) == output.size(0)
+            recv_counts = [n * out_row for n in output_split_sizes]
+        assert len(send_counts) == len(recv_counts) == self.world_size
+        send = input_.view(-1)
+        recv = output.view(-1)
+        dtype = ncclDataTypeEnum.from_torch(input_.dtype)
+        itemsize = input_.element_size()
+        send_off = recv_off = 0
+        self.nccl.ncclGroupStart()
+        for peer in range(self.world_size):
+            self.nccl.ncclSend(
+                buffer_type(send.data_ptr() + send_off * itemsize),
+                send_counts[peer],
+                dtype,
+                peer,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+            self.nccl.ncclRecv(
+                buffer_type(recv.data_ptr() + recv_off * itemsize),
+                recv_counts[peer],
+                dtype,
+                peer,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+            send_off += send_counts[peer]
+            recv_off += recv_counts[peer]
+        self.nccl.ncclGroupEnd()
+
+    @contextmanager
+    def change_state(self, enable: bool | None = None):
+        """Enable the communicator for the duration of the block.
+
+        The graph-capture path is the only caller that needs it, so ordinary
+        traffic keeps going through the process group and this stays a scoped
+        override rather than a mode switch.
+        """
+        if enable is None:
+            enable = self.available
+        old_disabled = self.disabled
+        self.disabled = not enable
+        try:
+            yield
+        finally:
+            self.disabled = old_disabled
+
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
             return
@@ -240,7 +373,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())
             # NCCL requires the sender also to have a receive buffer

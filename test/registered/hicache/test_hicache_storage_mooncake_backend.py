@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
-register_cuda_ci(est_time=236, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=391, stage="base-b", runner_config="2-gpu-large")
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
@@ -279,7 +279,8 @@ class TestMooncakeBackendQwen330BCP2(
                 "--tp-size": 2,
                 "--moe-dp-size": 2,
                 "--attn-cp-size": 2,
-                "--enable-prefill-context-parallel": True,
+                "--enable-prefill-cp": True,
+                "--cp-strategy": "zigzag",
                 "--trust-remote-code": True,
                 "--cuda-graph-max-bs-decode": 32,
                 "--max-running-requests": 32,

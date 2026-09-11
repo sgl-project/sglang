@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
 from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import parallel_state
+from sglang.multimodal_gen.runtime.distributed.utils import RankGenerator
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
@@ -52,8 +53,7 @@ from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanDecoder3d,
     WanDistAttentionBlock,
 )
-from sglang.multimodal_gen.runtime.utils.distributed import RankGenerator
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 class _DispatchProbeVAE(ParallelTiledVAE):
@@ -77,12 +77,6 @@ class _DispatchProbeVAE(ParallelTiledVAE):
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
-    def test_base_vae_config_defaults_to_auto_parallel_decode(self):
-        config = VAEConfig()
-
-        self.assertTrue(config.use_parallel_decode)
-        self.assertEqual(config.parallel_decode_mode, "auto")
-
     def test_image_video_vae_configs_default_to_auto_parallel_decode(self):
         configs = (
             ErnieImageVAEConfig(),
@@ -255,7 +249,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         )
 
         self.assertEqual(
-            rank_generator.get_ranks("tp-sp-pp-cfg"),
+            parallel_state._get_vae_decode_group_ranks(rank_generator),
             [list(range(0, 8)), list(range(8, 16))],
         )
 

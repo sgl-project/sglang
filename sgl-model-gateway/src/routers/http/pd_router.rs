@@ -694,16 +694,83 @@ impl PDRouter {
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Run both in this handler task (not a detached tokio::spawn) so a client
+        // disconnect cancels the pending decode request too, keeping the
+        // upstream-cancel behavior from #19524.
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        let prefill_fut = prefill_request.send();
+        let decode_fut = decode_request.send();
+        tokio::pin!(prefill_fut);
+        tokio::pin!(decode_fut);
+
+        // Poll both until prefill resolves; decode normally resolves later, but
+        // may resolve first if it rejects the request outright.
+        let prefill_result;
+        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
+        loop {
+            tokio::select! {
+                biased;
+                pr = &mut prefill_fut => {
+                    prefill_result = pr;
+                    break;
+                }
+                dr = &mut decode_fut, if decode_early.is_none() => {
+                    decode_early = Some(dr);
+                }
+            }
+        }
+
+        // Decode can't generate without prefill's KV, so any prefill failure
+        // (non-2xx / transport error) dooms the paired decode request, which would
+        // otherwise block in WaitingForInput until the 300s disaggregation
+        // timeout. Drop the decode future to close its connection; the decode
+        // engine then detects the disconnect and aborts the request in ~4-8s.
+        let prefill_failed = match &prefill_result {
+            Ok(resp) => !resp.status().is_success(),
+            Err(_) => true,
+        };
+
+        if prefill_failed {
+            warn!(
+                "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
+                decode.url(),
+                prefill.url()
+            );
+
+            // Tick prefill by its real status (4xx = client fault). Don't record
+            // decode: it was cancelled due to a prefill fault, not its own, so a
+            // prefill error storm can't trip healthy decode breakers.
+            let prefill_ok = match &prefill_result {
+                Ok(r) => r.status().is_client_error(),
+                Err(_) => false,
+            };
+            prefill.record_outcome(prefill_ok);
+
+            // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
+            let mut response = match self
+                .process_prefill_response(prefill_result, prefill.url(), false)
+                .await
+            {
+                Err(error_response) => error_response,
+                Ok(_) => error::bad_gateway(
+                    "prefill_server_error",
+                    "Prefill reported failure but returned a success response".to_string(),
+                ),
+            };
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
+        }
+
+        // Prefill ok: take decode's result, awaiting it if still pending.
+        let decode_result = match decode_early {
+            Some(dr) => dr,
+            None => (&mut decode_fut).await,
+        };
 
         events::RequestReceivedEvent {}.emit();
 

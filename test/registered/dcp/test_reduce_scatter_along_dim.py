@@ -29,7 +29,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=120,
-    suite="base-b-kernel-unit-8-gpu-h200",
+    stage="extra-b",
+    runner_config="8-gpu-h200",
 )
 
 # ---------------------------------------------------------------------------
@@ -84,8 +85,7 @@ def multiprocess_test(file: str, nproc: int, timeout: int = 120) -> None:
         ) from e
 
     assert result.returncode == 0, (
-        f"torchrun (nproc={nproc}) failed with rc={result.returncode}\n"
-        f"{result.stdout}"
+        f"torchrun (nproc={nproc}) failed with rc={result.returncode}\n{result.stdout}"
     )
 
 

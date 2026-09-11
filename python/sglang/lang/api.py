@@ -3,9 +3,9 @@
 import re
 from typing import Callable, List, Optional, Union
 
-from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.choices import ChoicesSamplingMethod, token_length_normalized
+from sglang.lang.global_config import global_config
 from sglang.lang.ir import (
     SglExpr,
     SglExprList,
@@ -97,7 +97,7 @@ def gen(
     regex: Optional[str] = None,
     json_schema: Optional[str] = None,
 ):
-    """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
+    """Call the model to generate. See the meaning of the arguments in docs/docs/basic_usage/sampling_params.mdx"""
 
     if choices:
         return SglSelect(

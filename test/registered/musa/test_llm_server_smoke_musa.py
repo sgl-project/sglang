@@ -18,7 +18,7 @@ _REQUEST_TIMEOUT = 60
     "MUSA device not available",
 )
 class TestMusaDeepSeekV2LiteChatServerSmoke(DefaultServerBase):
-    """MUSA LLM server smoke test: launch, health check, and non-empty generation."""
+    """MUSA LLM server sanity check: launch, health check, and non-empty generation."""
 
     model = os.getenv("SGLANG_MUSA_LLM_MODEL", "deepseek-ai/DeepSeek-V2-Lite-Chat")
     served_model_name = "deepseek-v2-lite-chat"
@@ -34,7 +34,7 @@ class TestMusaDeepSeekV2LiteChatServerSmoke(DefaultServerBase):
         "1",
         "--chunked-prefill-size",
         "-1",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
         "--context-length",
         "4096",
         "--max-total-tokens",

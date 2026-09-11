@@ -12,13 +12,34 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+    from deep_gemm.utils.layout import (
+        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+    )
+
+    def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
+        """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+
+        When ``sf`` is already in that layout, sgl-deep-gemm's fast path
+        (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
+        ``sf`` across the TVM-FFI boundary. Callers rebind the result over
+        their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
+        which frees the storage while the GEMM still reads through the alias
+        -- a use-after-free that surfaces as NaN logits or "pointer resides
+        on host memory" during CUDA graph capture once the allocator reuses
+        the block. Hand back ``sf`` itself in that case so ownership is
+        preserved.
+        """
+        out = _get_mn_major_tma_aligned_tensor(sf)
+        if out.data_ptr() == sf.data_ptr():
+            assert out.shape == sf.shape and out.stride() == sf.stride()
+            return sf
+        return out
+
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
@@ -51,7 +72,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
         ):
-
             fp4_kwargs = {}
             if recipe_a is not None:
                 fp4_kwargs["recipe_a"] = recipe_a
@@ -150,6 +170,52 @@ def grouped_gemm_nt_bf16_contig(
         deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
 
 
+def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
+    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    if isinstance(alignment, tuple):
+        alignment = alignment[0]
+
+    theoretical_alignment = getattr(
+        deep_gemm, "get_theoretical_mk_alignment_for_contiguous_layout", None
+    )
+    if theoretical_alignment is None:
+        return alignment
+
+    per_group_m = (expected_m + num_groups - 1) // num_groups
+    try:
+        try:
+            candidate = theoretical_alignment(per_group_m)
+        except TypeError:
+            candidate = theoretical_alignment(
+                expected_m=expected_m, num_groups=num_groups
+            )
+    except Exception:
+        return alignment
+    return candidate if 0 < candidate <= alignment else alignment
+
+
+@contextmanager
+def contiguous_layout_alignment_scope(alignment: Optional[int]):
+    if alignment is None:
+        yield
+        return
+
+    getter = getattr(deep_gemm, "get_mk_alignment_for_contiguous_layout", None)
+    setter = getattr(deep_gemm, "set_mk_alignment_for_contiguous_layout", None)
+    if getter is None or setter is None:
+        yield
+        return
+
+    previous = getter()
+    if isinstance(previous, tuple):
+        previous = previous[0]
+    setter(alignment)
+    try:
+        yield
+    finally:
+        setter(previous)
+
+
 def gemm_nt_f8f8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -168,6 +234,32 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
+        )
+
+
+def gemm_nt_mxfp8_f8f8bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+):
+    m, k = lhs[0].shape
+    n, _ = rhs[0].shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    disable_cast = lhs[1].dtype == torch.int and rhs[1].dtype == torch.int
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.fp8_fp4_gemm_nt(
+            lhs,
+            rhs,
+            out,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
+            disable_ue8m0_cast=disable_cast,
         )
 
 
@@ -197,13 +289,13 @@ def tf32_hc_prenorm_gemm(
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+def update_deep_gemm_config(gpu_id: int):
     # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
     # scheduler/TP worker has been forked and assigned a GPU.
     if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
         deep_gemm.set_pdl(True)
 
-    compile_utils.update_deep_gemm_config(gpu_id, server_args)
+    compile_utils.update_deep_gemm_config(gpu_id)
 
 
 @contextmanager
@@ -226,6 +318,8 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
     x, x_scale = x_fp8
 
     if x_scale.dtype == torch.int:
+        return
+    if not DEEPGEMM_SCALE_UE8M0:
         return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0

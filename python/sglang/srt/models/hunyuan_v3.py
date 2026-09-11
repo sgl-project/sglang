@@ -42,9 +42,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -313,6 +314,35 @@ class HYV3Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, rms_norm_eps)
 
+        # HPC-Ops FP8 attention path: the fused QKNorm+RoPE+FP8-quant+StoreKV
+        # op replaces the norm/rope/KV-write below and produces the
+        # per-token-per-head Q scales the FP8 attention kernels require.
+        # Resolved lazily on first forward (None = undecided) because the
+        # attention backend does not exist yet at layer-construction time.
+        self.use_hpc_ops_fp8_attn: Optional[bool] = (
+            None
+            if is_cuda()
+            and self.head_dim == 128
+            and (self.num_heads, self.num_kv_heads) in ((8, 1), (64, 8))
+            else False
+        )
+        self._hpc_cos_sin_fp32: Optional[torch.Tensor] = None
+        self._hpc_q_norm_w_fp32: Optional[torch.Tensor] = None
+        self._hpc_k_norm_w_fp32: Optional[torch.Tensor] = None
+
+    def _resolve_hpc_ops_fp8_attn(self) -> bool:
+        from sglang.srt.layers.attention.hpc_ops_backend import HPCOpsAttnBackend
+
+        backend = get_attn_backend()
+        use_fp8_path = isinstance(backend, HPCOpsAttnBackend) and backend.use_fp8
+        if use_fp8_path:
+            # The fused kernel wants a fp32 cos/sin table and fp32 norm weights.
+            self._hpc_cos_sin_fp32 = self.rotary_emb.cos_sin_cache.float()
+            if self.use_qk_norm:
+                self._hpc_q_norm_w_fp32 = self.q_norm.weight.detach().float()
+                self._hpc_k_norm_w_fp32 = self.k_norm.weight.detach().float()
+        return use_fp8_path
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -320,6 +350,32 @@ class HYV3Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.use_hpc_ops_fp8_attn is None:
+            self.use_hpc_ops_fp8_attn = self._resolve_hpc_ops_fp8_attn()
+        if self.use_hpc_ops_fp8_attn and not forward_batch.forward_mode.is_idle():
+            # HunYuan V3 applies QK-Norm before RoPE -> qk_norm_policy=2.
+            q = get_attn_backend().fused_qk_rope_store_kv_fp8(
+                layer=self.attn,
+                forward_batch=forward_batch,
+                qkv=qkv,
+                cos_sin_cache=self._hpc_cos_sin_fp32,
+                q_norm_weight=self._hpc_q_norm_w_fp32,
+                k_norm_weight=self._hpc_k_norm_w_fp32,
+                qk_norm_policy=2 if self.use_qk_norm else 0,
+            )
+            # q is FP8; RadixAttention.forward sizes the output buffer as
+            # bf16 for fp8 queries.
+            attn_output = self.attn(
+                q.view(-1, self.q_size),
+                None,
+                None,
+                forward_batch,
+                save_kv_cache=False,
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.use_qk_norm:
@@ -423,7 +479,7 @@ class HYV3Model(nn.Module):
             prefix=f"{prefix}.embed_tokens",
         )
 
-        self.alt_stream = torch.cuda.Stream() if is_cuda() else None
+        self.alt_stream = get_stream("alt") if is_cuda() else None
 
         self.layers = nn.ModuleList(
             [
