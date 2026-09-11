@@ -8,12 +8,20 @@ Runtime objects therefore cannot cross this boundary directly: merely passing
 bootstrap began. ``ServerArgsPayload`` keeps that object graph opaque until the
 child reaches the explicit runtime-activation phase.
 
+``spawn`` re-executes the launching script's module scope earlier still, before
+any argument is unpickled, so an offline script may bind only the
+``DiffGenerator`` proxy and ``_PRE_ACTIVATION_MODULES`` at module scope; every
+other diffusion import belongs inside its ``if __name__ == "__main__":`` guard.
+A violation is reported rather than silently tolerated.
+
 Keep module scope limited to the standard library and import-neutral types.
 """
 
 from __future__ import annotations
 
+import logging
 import pickle
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -21,6 +29,52 @@ if TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+_DIFFUSION_PREFIX = "sglang.multimodal_gen."
+_RUNTIME_NAMESPACE = "sglang.multimodal_gen.runtime"
+# What may legitimately be imported this early: bootstrap's own imports, and the
+# platform and plugin modules that every plugin loads and the contract keeps
+# import-safe. Listing these rather than their complement keeps the check
+# complete as subpackages are added.
+_PRE_ACTIVATION_MODULES = (
+    "sglang.multimodal_gen.envs",
+    "sglang.multimodal_gen.plugins",
+    "sglang.multimodal_gen.runtime.platforms",
+    "sglang.multimodal_gen.runtime.utils",
+    "sglang.multimodal_gen.runtime.worker_bootstrap",
+    "sglang.multimodal_gen.utils",
+)
+_MAX_REPORTED_MODULES = 5
+
+
+def _warn_if_runtime_imported_early() -> None:
+    """Name the modules that this child imported ahead of its own lifecycle."""
+    early = sorted(
+        name
+        for name in list(sys.modules)
+        if name.startswith(_DIFFUSION_PREFIX)
+        and name != _RUNTIME_NAMESPACE
+        and not name.startswith(_PRE_ACTIVATION_MODULES)
+    )
+    if not early:
+        return
+
+    listed = ", ".join(early[:_MAX_REPORTED_MODULES])
+    if len(early) > _MAX_REPORTED_MODULES:
+        listed += f" (+{len(early) - _MAX_REPORTED_MODULES} more)"
+    # In a spawned child __main__ is the re-executed launching script, which is
+    # the file whose imports have to move.
+    script = vars(sys.modules["__main__"]).get("__file__", "the launching script")
+    logging.getLogger(__name__).warning(
+        "Diffusion runtime modules were imported before this worker initialized "
+        "its platform: %s. spawn re-executes %s at module scope in every child, "
+        "so these were built ahead of platform initialization and hook "
+        "application, and the classes and registrations they created are "
+        'already past reach. Move the import inside if __name__ == "__main__": '
+        "or into the function that uses it.",
+        listed,
+        script,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +121,10 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
 
     kill_itself_when_parent_died()
 
+    # Every rank re-executes the same script, so one rank reporting is enough.
+    if spec.rank == 0:
+        _warn_if_runtime_imported_early()
+
     # Platform initialization is the first extensible runtime action. In
     # particular it precedes plugin callbacks and hook target resolution, both
     # of which may import arbitrary runtime modules.
@@ -102,6 +160,8 @@ def bootstrap_http_server_process(server_args: ServerArgsPayload) -> None:
     from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 
     kill_itself_when_parent_died()
+
+    _warn_if_runtime_imported_early()
 
     # No initialize_current_platform() here: this child serves HTTP and never
     # touches the device, so it has no reason to bring up a vendor backend.

@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import json
 import multiprocessing as mp
+import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,10 +27,17 @@ fake = sgl_fake_plugin:register
 """
 
 
-# Real module rather than an embedded source string, so it is formatted, linted
-# and parsed like any other file. It stays a top-level module with no diffusion
-# imports of its own, which is what keeps the import-order measurement honest.
-FAKE_PLUGIN_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "sgl_fake_plugin.py"
+# Real modules, not embedded source strings, so they are linted like any other
+# file. The plugin imports no diffusion module of its own, which is what keeps
+# the import-order measurement honest.
+FIXTURES_DIR = pathlib.Path(__file__).parent / "fixtures"
+FAKE_PLUGIN_FIXTURE = FIXTURES_DIR / "sgl_fake_plugin.py"
+FACADE_IMPORT_SCRIPT = FIXTURES_DIR / "offline_script_facade_import.py"
+RUNTIME_IMPORT_SCRIPT = FIXTURES_DIR / "offline_script_runtime_import.py"
+
+PYTHON_ROOT = pathlib.Path(worker_bootstrap.__file__).parents[3]
+EARLY_IMPORT_WARNING = "imported before this worker initialized its platform"
+SCRIPT_TIMEOUT_S = 300
 
 
 def _install_fake_plugin_dist(root: pathlib.Path) -> None:
@@ -225,6 +235,78 @@ class TestSpawnedWorkerReceivesPluginOverride(unittest.TestCase):
                 "http_server_imported_when_hooks_applied": False,
                 "server_args_imported_when_hooks_applied": False,
             },
+        )
+
+
+class TestOfflineScriptImportContract(unittest.TestCase):
+    """Real scripts in a real interpreter, because spawn re-executes the
+    launching script's module scope before it unpickles anything."""
+
+    def _run_offline_script(self, script: pathlib.Path):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            dist_root = root / "site"
+            dist_root.mkdir()
+            _install_fake_plugin_dist(dist_root)
+            result_path = root / "observed.json"
+
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(
+                path
+                for path in (
+                    str(dist_root),
+                    str(FIXTURES_DIR),
+                    str(PYTHON_ROOT),
+                    env.get("PYTHONPATH", ""),
+                )
+                if path
+            )
+            completed = subprocess.run(
+                [sys.executable, str(script), str(result_path)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=SCRIPT_TIMEOUT_S,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(result_path.read_text())
+
+        self.assertIsNotNone(
+            payload["observed"],
+            f"child sent nothing back (exit code {payload['exitcode']})",
+        )
+        return payload["observed"], completed.stderr
+
+    def test_a_module_scope_facade_import_leaves_the_child_lifecycle_intact(self):
+        observed, stderr = self._run_offline_script(FACADE_IMPORT_SCRIPT)
+
+        self.assertTrue(observed["override_ran"], "plugin override did not run")
+        self.assertIs(
+            observed["generator_imported_when_plugin_ran"],
+            False,
+            "re-executing the script imported the generator before plugins loaded",
+        )
+        self.assertNotIn(EARLY_IMPORT_WARNING, stderr)
+
+    def test_a_module_scope_runtime_import_is_reported_by_the_child(self):
+        observed, stderr = self._run_offline_script(RUNTIME_IMPORT_SCRIPT)
+
+        self.assertTrue(observed["override_ran"], "plugin override did not run")
+        self.assertIs(
+            observed["generator_imported_when_plugin_ran"],
+            True,
+            "the script layout under test no longer imports the runtime early",
+        )
+        self.assertIn(
+            EARLY_IMPORT_WARNING,
+            stderr,
+            "the child accepted a mis-ordered import without reporting it",
+        )
+        self.assertIn(
+            RUNTIME_IMPORT_SCRIPT.name,
+            stderr,
+            "the report did not name the script whose imports have to move",
         )
 
 
