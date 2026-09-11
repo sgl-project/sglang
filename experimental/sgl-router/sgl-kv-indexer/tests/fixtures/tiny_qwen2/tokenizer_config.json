@@ -1,0 +1,8 @@
+{
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "bos_token": "<|endoftext|>",
+  "eos_token": "<|endoftext|>",
+  "unk_token": "<|endoftext|>",
+  "model_max_length": 512,
+  "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+}

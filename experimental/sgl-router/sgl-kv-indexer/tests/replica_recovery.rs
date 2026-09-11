@@ -287,3 +287,45 @@ async fn component_recovery_preserves_boundary_rules() {
     live(&s, &a, "e1", 11, vec![revoke(2, 2)]).await;
     assert!(query(&s, vec![key("a", 0)]).await.matches.is_empty());
 }
+
+#[tokio::test]
+async fn expired_stream_gc_removes_sessions_without_touching_current_owner() {
+    let s = ReplicaService::new(Duration::from_millis(20), 4);
+    let old = begin(&s, cut("old", 0, "e1", 1), "").await;
+    chunk(&s, &old, vec![block(1, 1)]).await;
+    confirm(&s, &old, "e1", 11).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let current = begin(&s, cut("current", 0, "e2", 1), "").await;
+    chunk(&s, &current, vec![block(1, 1)]).await;
+    confirm(&s, &current, "e2", 11).await;
+    assert_eq!(s.reap_expired().unwrap(), 1);
+    assert!(query(&s, vec![key("current", 0)]).await.complete);
+    assert!(s.invalidate_stream(Request::new(old)).await.is_err());
+    assert_eq!(s.reap_expired().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn unsupported_snapshot_schemas_cannot_replace_visible_state() {
+    let s = ReplicaService::new(Duration::from_secs(10), 4);
+    let owner = begin(&s, cut("a", 0, "e1", 1), "").await;
+    chunk(&s, &owner, vec![block(1, 1)]).await;
+    confirm(&s, &owner, "e1", 11).await;
+    for version in [0, 2, 99] {
+        let mut bad = cut("a", 0, "e2", 0);
+        bad.stream.as_mut().unwrap().cache_spec = Some(WorkerCacheSpec {
+            version,
+            components: 5,
+            ..Default::default()
+        });
+        assert!(s
+            .begin_snapshot(Request::new(BeginSnapshotRequest {
+                cut: Some(bad),
+                session: owner.session.clone(),
+            }))
+            .await
+            .is_err());
+        let visible = query(&s, vec![key("a", 0)]).await;
+        assert!(visible.complete);
+        assert_eq!(visible.coverage[0].worker_epoch, "e1");
+    }
+}
