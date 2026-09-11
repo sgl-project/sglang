@@ -30,7 +30,9 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_model,
+    get_schedule,
     get_spec,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
 
@@ -275,11 +277,15 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        with _autotune_process_group(sync_group), autotune(
-            True,
-            cache=str(autotune_cache),
-            skip_ops=skip_ops,
-        ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
+        with (
+            _autotune_process_group(sync_group),
+            autotune(
+                True,
+                cache=str(autotune_cache),
+                skip_ops=skip_ops,
+            ),
+            autotune_dummy_run_mode(run_lm_head=run_lm_head),
+        ):
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
@@ -342,9 +348,7 @@ def maybe_flashinfer_autotune_extend(
     mr = runner.model_runner
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
     # when chunked prefill is disabled.
-    num_tokens = (
-        mr.server_args.max_prefill_buffer_tokens() or mr.server_args.max_prefill_tokens
-    )
+    num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
     is_pd_prefill_target = (

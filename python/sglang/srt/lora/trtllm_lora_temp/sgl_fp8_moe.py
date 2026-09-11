@@ -111,9 +111,9 @@ def fused_experts_fp8_sgl(
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
         if use_routed_topk:
-            assert (
-                runner_config.top_k is not None
-            ), "runner_config.top_k is required for flashinfer_trtllm_routed."
+            assert runner_config.top_k is not None, (
+                "runner_config.top_k is required for flashinfer_trtllm_routed."
+            )
             assert TopKOutputChecker.format_is_standard(topk_output)
             packed_topk_ids = fused_pack_topk(
                 topk_ids=topk_output.topk_ids,

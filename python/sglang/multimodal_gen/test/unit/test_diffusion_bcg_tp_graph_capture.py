@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     BaseBreakableCudaGraphRunner,
 )
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
+    _DIFFUSION_CUSTOM_AR_MAX_SIZE,
     GraphCaptureContext,
     GroupCoordinator,
 )
@@ -52,16 +53,88 @@ def _recording_context(events: list, name: str):
 
 
 class TestBCGTPGraphCapture(CustomTestCase):
+    def test_cuda_custom_allreduce_uses_v2_dispatch_and_diffusion_workspace(self):
+        expected = object()
+        custom_allreduce_cls = MagicMock(return_value=expected)
+        group = SimpleNamespace(cpu_group=object(), device=torch.device("cuda:0"))
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.group_coordinator.current_platform.is_cuda",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.distributed.device_communicators.custom_all_reduce.dispatch_custom_allreduce",
+                return_value=custom_allreduce_cls,
+            ) as dispatch,
+            patch(
+                "sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2",
+                custom_allreduce_cls,
+            ),
+        ):
+            GroupCoordinator._init_srt_custom_allreduce(group)
+
+        dispatch.assert_called_once_with(group=group.cpu_group, device=group.device)
+        custom_allreduce_cls.assert_called_once_with(
+            group=group.cpu_group,
+            device=group.device,
+            max_size=_DIFFUSION_CUSTOM_AR_MAX_SIZE,
+        )
+        self.assertIs(group.srt_custom_allreduce, expected)
+
+    def test_non_cuda_custom_allreduce_preserves_default_workspace(self):
+        expected = object()
+        custom_allreduce_cls = MagicMock(return_value=expected)
+        group = SimpleNamespace(cpu_group=object(), device=object())
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.group_coordinator.current_platform.is_cuda",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.distributed.device_communicators.custom_all_reduce.CustomAllreduce",
+                custom_allreduce_cls,
+            ),
+        ):
+            GroupCoordinator._init_srt_custom_allreduce(group)
+
+        custom_allreduce_cls.assert_called_once_with(
+            group=group.cpu_group,
+            device=group.device,
+        )
+        self.assertIs(group.srt_custom_allreduce, expected)
+
+    def test_all_reduce_uses_public_custom_allreduce_api(self):
+        output = object()
+        custom_ar = SimpleNamespace(
+            disabled=False,
+            should_custom_ar=MagicMock(return_value=True),
+            custom_all_reduce=MagicMock(return_value=output),
+        )
+        group = SimpleNamespace(world_size=2, srt_custom_allreduce=custom_ar)
+        input_ = SimpleNamespace(is_cpu=False)
+
+        result = GroupCoordinator.all_reduce(group, input_)
+
+        custom_ar.should_custom_ar.assert_called_once_with(input_)
+        custom_ar.custom_all_reduce.assert_called_once_with(input_)
+        self.assertIs(result, output)
+
     # --- GroupCoordinator.graph_capture -> CustomAllreduce.capture ---------- #
 
     def _run_graph_capture(self, custom_ar, events):
         """Drive the CUDA branch of graph_capture() with a fake custom AR."""
         group = SimpleNamespace(srt_custom_allreduce=custom_ar)
         ctx = GraphCaptureContext(MagicMock())
-        with patch(
-            "sglang.multimodal_gen.runtime.distributed.group_coordinator.current_platform.is_cuda_alike",
-            return_value=True,
-        ), patch("torch.cuda.stream"), patch("torch.cuda.current_stream"):
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.group_coordinator.current_platform.is_cuda_alike",
+                return_value=True,
+            ),
+            patch("torch.cuda.stream"),
+            patch("torch.cuda.current_stream"),
+        ):
             with GroupCoordinator.graph_capture(group, ctx) as yielded:
                 events.append("body")
         return yielded, ctx
@@ -95,12 +168,15 @@ class TestBCGTPGraphCapture(CustomTestCase):
         tp_group.graph_capture = _recording_context(events, "tp")
         runner = SimpleNamespace(_capture_stream=capture_stream)
 
-        with patch(
-            "sglang.multimodal_gen.runtime.distributed.parallel_state.model_parallel_is_initialized",
-            return_value=initialized,
-        ), patch(
-            "sglang.multimodal_gen.runtime.distributed.parallel_state.get_tp_group",
-            return_value=tp_group,
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.model_parallel_is_initialized",
+                return_value=initialized,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.get_tp_group",
+                return_value=tp_group,
+            ),
         ):
             with BaseBreakableCudaGraphRunner._tp_graph_capture(runner):
                 events.append("body")
@@ -128,12 +204,15 @@ class TestBCGTPGraphCapture(CustomTestCase):
         tp_group.graph_capture = _graph_capture
         runner = SimpleNamespace(_capture_stream=capture_stream)
 
-        with patch(
-            "sglang.multimodal_gen.runtime.distributed.parallel_state.model_parallel_is_initialized",
-            return_value=True,
-        ), patch(
-            "sglang.multimodal_gen.runtime.distributed.parallel_state.get_tp_group",
-            return_value=tp_group,
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.get_tp_group",
+                return_value=tp_group,
+            ),
         ):
             with BaseBreakableCudaGraphRunner._tp_graph_capture(runner):
                 pass
@@ -170,20 +249,23 @@ class TestBCGTPGraphCapture(CustomTestCase):
         graph._segments = []
         kwargs = {"hidden_states": torch.zeros(1)}
 
-        with patch.object(
-            BaseBreakableCudaGraphRunner,
-            "_tp_graph_capture",
-            _recording_context(events, "tp"),
-        ), patch.object(
-            runner_mod, "BreakableCUDAGraph", return_value=graph
-        ), patch.object(
-            runner_mod,
-            "enable_breakable_cuda_graph",
-            _recording_context(events, "bcg_enable"),
-        ), patch.object(
-            runner_mod,
-            "BreakableCUDAGraphCapture",
-            _recording_context(events, "bcg_capture"),
+        with (
+            patch.object(
+                BaseBreakableCudaGraphRunner,
+                "_tp_graph_capture",
+                _recording_context(events, "tp"),
+            ),
+            patch.object(runner_mod, "BreakableCUDAGraph", return_value=graph),
+            patch.object(
+                runner_mod,
+                "enable_breakable_cuda_graph",
+                _recording_context(events, "bcg_enable"),
+            ),
+            patch.object(
+                runner_mod,
+                "BreakableCUDAGraphCapture",
+                _recording_context(events, "bcg_capture"),
+            ),
         ):
             runner._capture(kwargs, key=runner_mod._signature_kwargs(kwargs))
 
