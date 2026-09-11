@@ -38,7 +38,10 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
+    fp4_index_logits_decode,
+    fp4_index_logits_req_to_token,
+)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -3462,24 +3465,34 @@ class DeepseekV4AttnBackend(
         ) and lmax >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
         positions = None
         score_lens = lens
+
+        def map_positions(logical_positions: torch.Tensor) -> torch.Tensor:
+            full_positions = logical_positions.clamp(0, lmax - 1) * ratio
+            return self.req_to_token[req[:, None], full_positions] // ratio
+
         if compact and indexer.uses_candidates and not indexer.is_candidate_source:
             candidates = self.forward_metadata.sm90_candidates
             assert candidates is not None and candidates[0].shape[0] == bs, (
                 "candidate slots missing for SM90 indexer"
             )
             positions, slots, score_lens = candidates
-        else:
-            j = torch.arange(lmax, device=pos.device)
-            valid = j[None, :] < lens[:, None]
-            slots = (
-                self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
-                // ratio
+            table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+            s = fp4_index_logits_decode(
+                q, weights, slots, score_lens, table, table.shape[1] // 68
             )
-            slots = slots.masked_fill(~valid, 0)
-        table = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        s = fp4_index_logits_decode(
-            q, weights, slots, score_lens, table, table.shape[1] // 68
-        )
+        else:
+            table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+            s = fp4_index_logits_req_to_token(
+                q,
+                weights,
+                self.req_to_token,
+                req,
+                lens,
+                table,
+                table.shape[1] // 68,
+                ratio,
+                lmax,
+            )
         if indexer.is_candidate_source:
             if compact:
                 block_size = indexer.candidate_block_size
@@ -3493,9 +3506,9 @@ class DeepseekV4AttnBackend(
                     + torch.arange(block_size, device=pos.device)
                 ).flatten(1)
                 valid = candidate_positions < lens[:, None]
-                candidate_slots = slots.gather(
-                    1, candidate_positions.clamp_max(lmax - 1)
-                ).masked_fill(~valid, 0)
+                candidate_slots = map_positions(candidate_positions).masked_fill(
+                    ~valid, 0
+                )
                 self.forward_metadata.sm90_candidates = (
                     candidate_positions,
                     candidate_slots,
@@ -3516,19 +3529,33 @@ class DeepseekV4AttnBackend(
             s = s.masked_fill(~consume[:, :lmax], -torch.inf)
         width = s.shape[1]
         k = min(indexer.index_topk, width)
-        idx = s.topk(k, dim=-1, sorted=False).indices
+        if positions is None and metadata.use_topk_v2:
+            selected = torch.empty_like(page_indices)
+            topk_transform_paged_v2(
+                s,
+                metadata.c4_seq_lens,
+                None,
+                selected,
+                1,
+                metadata.topk_metadata,
+            )
+            idx = selected[:bs, :k].to(torch.int64)
+        else:
+            idx = s.topk(k, dim=-1, sorted=False).indices
         if indexer.uses_candidates and not indexer.is_candidate_source:
             idx = _mask_topk_scores(s, idx)
             idx = idx.masked_fill(idx < 0, width)
         idx = idx.sort(dim=-1).values
         reach = idx < score_lens[:, None]
-        page_indices[:bs, :k] = torch.where(
-            reach, slots.gather(1, idx.clamp_max(width - 1)), -1
-        ).to(torch.int32)
+        if positions is None:
+            logical_idx = idx
+            selected_slots = map_positions(logical_idx)
+        else:
+            logical_idx = positions.gather(1, idx.clamp_max(width - 1))
+            selected_slots = slots.gather(1, idx.clamp_max(width - 1))
+        page_indices[:bs, :k] = torch.where(reach, selected_slots, -1).to(torch.int32)
         if raw_indices is not None:
-            if positions is not None:
-                idx = positions.gather(1, idx.clamp_max(width - 1))
-            raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
+            raw_indices[:bs, :k] = torch.where(reach, logical_idx, -1).to(torch.int32)
 
     def _low_ratio_index_topk_torch(self, layer, x, q_lora, req, pos) -> None:
         pool = self.token_to_kv_pool

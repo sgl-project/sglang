@@ -736,7 +736,9 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             metadata.low_ratio_pos_i64, positions.to(torch.int64)
         )
 
-    def _run_candidate_case(self, forward_mode, req, length_steps):
+    def _run_candidate_case(
+        self, forward_mode, req, length_steps, *, use_topk_v2=False
+    ):
         from sglang.srt.layers.attention import deepseek_v4_backend as module
 
         width, ratio, topk = 384, 2, 3
@@ -753,7 +755,12 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
         backend.forward_metadata = module.DSV4Metadata(
             core_attn_metadata=core,
             indexer_metadata=None,
-            c2_indexer_metadata=SimpleNamespace(max_c4_seq_len=width),
+            c2_indexer_metadata=SimpleNamespace(
+                max_c4_seq_len=width,
+                use_topk_v2=use_topk_v2,
+                c4_seq_lens=torch.full((len(req),), width, dtype=torch.int32),
+                topk_metadata=torch.empty(0),
+            ),
         )
         backend.req_to_token = mapping
         backend.candidate_masks = None
@@ -783,6 +790,26 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 torch.arange(slots.shape[1]) >= lens[:, None], -torch.inf
             )
 
+        def score_mapping(
+            q,
+            weights,
+            req_to_token,
+            req_rows,
+            lens,
+            table,
+            page_size,
+            ratio,
+            width,
+        ):
+            logical = torch.arange(width)
+            slots = req_to_token[req_rows[:, None], logical * ratio] // ratio
+            return score(q, weights, slots, lens, table, page_size)
+
+        def topk_v2(scores, lens, page_table, out, page_size, metadata):
+            out.fill_(-1)
+            k = min(out.shape[1], scores.shape[1])
+            out[:, :k] = scores.topk(k, dim=-1, sorted=False).indices.to(torch.int32)
+
         for lengths in length_steps:
             lens = torch.tensor(lengths)
             pos = (lens * ratio - 1).clamp_min(0)
@@ -794,9 +821,19 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             candidates = module.select_candidate_blocks(
                 source_scores, lens[:, None], 2, 4
             )
-            with mock.patch.object(
-                module, "fp4_index_logits_decode", side_effect=score
-            ) as logits:
+            with (
+                mock.patch.object(
+                    module, "fp4_index_logits_decode", side_effect=score
+                ) as compact_logits,
+                mock.patch.object(
+                    module,
+                    "fp4_index_logits_req_to_token",
+                    side_effect=score_mapping,
+                ) as full_logits,
+                mock.patch.object(
+                    module, "topk_transform_paged_v2", side_effect=topk_v2
+                ) as full_topk,
+            ):
                 for i in range(5):
                     indexer.is_candidate_source = i == 0
                     indexer.uses_candidates = i > 0
@@ -829,7 +866,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                             backend.forward_metadata.sm90_candidates, published
                         )
                         positions, slots, counts = published
-                        self.assertIs(logits.call_args.args[2], slots)
+                        self.assertIs(compact_logits.call_args.args[2], slots)
                         torch.testing.assert_close(
                             positions < lens[:, None],
                             torch.arange(slots.shape[1]) < counts[:, None],
@@ -840,9 +877,11 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                                 1, positions.clamp_max(width - 1)
                             ).masked_fill(positions >= lens[:, None], 0),
                         )
+                self.assertEqual(full_logits.call_args.args[-1], width)
+                self.assertEqual(full_topk.call_count, int(use_topk_v2))
                 self.assertEqual(
-                    [call.args[2].shape[1] for call in logits.call_args_list],
-                    [width, 8, 8, 8, 8],
+                    [call.args[2].shape[1] for call in compact_logits.call_args_list],
+                    [8, 8, 8, 8],
                 )
 
     def test_decode_candidates_preserve_slots_across_layers_and_steps(self):
@@ -857,6 +896,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             ForwardMode.TARGET_VERIFY,
             torch.tensor([2, 2, 0, 0, 1, 1]),
             ([261, 262, 7, 8, 130, 131], [132, 133, 260, 261, 3, 4]),
+            use_topk_v2=True,
         )
 
     def test_ragged_verify_candidates_preserve_per_token_rows(self):

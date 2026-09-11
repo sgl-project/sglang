@@ -22,6 +22,7 @@ def _candidate_scores_kernel(
     GROUP: tl.constexpr,
     GROUP_PAD: tl.constexpr,
     TILE: tl.constexpr,
+    WRITE_OUTPUT: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
@@ -32,7 +33,8 @@ def _candidate_scores_kernel(
     values = tl.load(
         X + row * STRIDE + cols, in_bounds & (cols < length), other=-float("inf")
     ).to(tl.float32)
-    tl.store(OUT + row * WIDTH + cols, values, in_bounds)
+    if WRITE_OUTPUT:
+        tl.store(OUT + row * WIDTH + cols, values, in_bounds)
     scores = tl.reduce(values, axis=1, combine_fn=_maximum_with_nan)
     scores = tl.where(
         (length > 0) & (blocks == (length - 1) // GROUP), float("inf"), scores
@@ -107,9 +109,40 @@ def candidate_block_logits(
         block_size,
         group_pad,
         tile,
+        True,
     )
     top = scores.topk(min(topk_blocks, blocks), dim=-1)
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
     )
     return output, keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def candidate_block_indices(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    topk_blocks: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select candidate blocks without copying or masking the full logits tensor."""
+    rows, width = logits.shape
+    blocks = triton.cdiv(width, block_size)
+    scores = torch.empty((rows, blocks), dtype=torch.float32, device=logits.device)
+    group_pad = triton.next_power_of_2(block_size)
+    tile = max(1, 1024 // group_pad)
+    _candidate_scores_kernel[(rows, triton.cdiv(blocks, tile))](
+        logits,
+        seq_lens,
+        logits,
+        scores,
+        width,
+        logits.stride(0),
+        blocks,
+        block_size,
+        group_pad,
+        tile,
+        False,
+    )
+    top = scores.topk(min(topk_blocks, blocks), dim=-1)
+    return top.indices, top.values > -torch.inf

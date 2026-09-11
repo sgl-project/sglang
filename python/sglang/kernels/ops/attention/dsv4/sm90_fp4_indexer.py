@@ -35,7 +35,9 @@ def _e2m1_decode(code):
 def _fp4_index_logits_kernel(
     q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
     w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
-    slots_ptr,  # [B, L] int64 pool slots per (request, compressed position)
+    slots_ptr,  # [B, L] pool slots per (request, compressed position)
+    req_to_token_ptr,  # [num_reqs, max_context_len] full-token pool slots
+    req_ptr,  # [B] request-pool row for each query
     lens_ptr,  # [B] int64 visible compressed positions per request
     table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
     out_ptr,  # [B, L] fp32 logits, -inf beyond lens
@@ -45,9 +47,12 @@ def _fp4_index_logits_kernel(
     stride_qb,
     stride_qh,
     stride_wb,
+    stride_req,
     H: tl.constexpr,
     HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
     BLOCK_L: tl.constexpr,
+    RATIO: tl.constexpr,
+    USE_REQ_TO_TOKEN: tl.constexpr,
 ):
     b = tl.program_id(0)
     lb = tl.program_id(1)
@@ -59,7 +64,18 @@ def _fp4_index_logits_kernel(
 
     n_vis = tl.load(lens_ptr + b)
     valid = offs_l < tl.minimum(n_vis, L)
-    slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(tl.int64)
+    if USE_REQ_TO_TOKEN:
+        req = tl.load(req_ptr + b).to(tl.int64)
+        slot = tl.load(
+            req_to_token_ptr + req * stride_req + offs_l * RATIO,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        slot = slot // RATIO
+    else:
+        slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(
+            tl.int64
+        )
     page = slot // page_size
     off = slot % page_size
     row_base = page * row_stride
@@ -115,7 +131,7 @@ def fp4_index_logits_decode(
     table: torch.Tensor,
     page_size: int,
 ) -> torch.Tensor:
-    """q [B, H, 128] bf16, weights [B, H], slots [B, L] int64, lens [B] int64,
+    """q [B, H, 128] bf16, weights [B, H], slots [B, L], lens [B] int64,
     table = the layer's fp4 index-K page buffer (uint8, 2D). Returns [B, L] fp32
     logits with -inf at positions >= lens."""
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
@@ -134,6 +150,8 @@ def fp4_index_logits_decode(
         q,
         weights,
         slots,
+        slots,
+        lens,
         lens.to(torch.int64).contiguous(),
         table,
         out,
@@ -143,9 +161,65 @@ def fp4_index_logits_decode(
         q.stride(0),
         q.stride(1),
         weights.stride(0),
+        slots.stride(0),
         H=H,
         HALF_D=INDEX_HEAD_DIM // 2,
         BLOCK_L=BLOCK_L,
+        RATIO=1,
+        USE_REQ_TO_TOKEN=False,
+        num_warps=4,
+    )
+    return out
+
+
+def fp4_index_logits_req_to_token(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+    ratio: int,
+    width: int,
+) -> torch.Tensor:
+    """Score logical compressed positions without materializing their pool slots."""
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    B, H, _ = q.shape
+    assert req.shape == lens.shape == (B,)
+    assert req_to_token.dim() == 2
+    assert table.dtype == torch.uint8 and table.dim() == 2
+    assert ratio in (1, 2)
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    req = req.to(torch.int64).contiguous()
+    lens = lens.to(torch.int64).contiguous()
+    out = torch.empty((B, width), dtype=torch.float32, device=q.device)
+    if width == 0:
+        return out
+    block_l = 64
+    grid = (B, triton.cdiv(width, block_l))
+    _fp4_index_logits_kernel[grid](
+        q,
+        weights,
+        req_to_token,
+        req_to_token,
+        req,
+        lens,
+        table,
+        out,
+        width,
+        page_size,
+        table.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        req_to_token.stride(0),
+        H=H,
+        HALF_D=INDEX_HEAD_DIM // 2,
+        BLOCK_L=block_l,
+        RATIO=ratio,
+        USE_REQ_TO_TOKEN=True,
         num_warps=4,
     )
     return out

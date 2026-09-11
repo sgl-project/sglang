@@ -1135,8 +1135,32 @@ def select_candidate_block_indices(
     block_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return selected block indices and their reachability, including the newest block."""
+    if (
+        logits.is_cuda
+        and torch.version.cuda is not None
+        and logits.ndim == 2
+        and logits.stride(1) == 1
+        and torch.is_tensor(compress_lens)
+        and compress_lens.device == logits.device
+        and compress_lens.dtype in (torch.int32, torch.int64)
+        and compress_lens.numel() == logits.shape[0]
+        and logits.numel() > 0
+        and 0 < block_size <= 1024
+    ):
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_block_indices,
+        )
+
+        return candidate_block_indices(
+            logits,
+            compress_lens.reshape(-1).contiguous(),
+            topk_blocks=topk_blocks,
+            block_size=block_size,
+        )
+
     width = logits.size(-1)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    padding = -width % block_size
+    scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
 
