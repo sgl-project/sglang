@@ -264,6 +264,12 @@ class MooncakeBaseStore:
     def __init__(self):
         self.store = None
         self.config = None
+        # Replica counts for KV put operations, configurable via
+        # MOONCAKE_REPLICA_NUM / MOONCAKE_NOF_REPLICA_NUM. Defaults match
+        # Mooncake's default ReplicateConfig (1 memory replica, no NoF
+        # replica) so existing deployments are unchanged unless set.
+        self._replica_num = envs.MOONCAKE_REPLICA_NUM.get()
+        self._nof_replica_num = envs.MOONCAKE_NOF_REPLICA_NUM.get()
 
     def _import_mooncake_store(self):
         try:
@@ -1326,6 +1332,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+
+        # Apply replica counts from MOONCAKE_REPLICA_NUM / MOONCAKE_NOF_REPLICA_NUM
+        # when either is non-default (default: 1 memory replica, no NoF replica).
+        # The default keeps the plain batch_put_from path (no custom config);
+        # any custom replica setting is forwarded via ReplicateConfig.
+        if self._replica_num != 1 or self._nof_replica_num != 0:
+            if self._replicate_config_cls is not None:
+                if config is None:
+                    config = self._replicate_config_cls()
+                if hasattr(config, "replica_num"):
+                    config.replica_num = self._replica_num
+                if hasattr(config, "nof_replica_num"):
+                    config.nof_replica_num = self._nof_replica_num
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
