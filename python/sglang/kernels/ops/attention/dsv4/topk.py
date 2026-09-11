@@ -136,6 +136,7 @@ def topk_transform_paged_v2(
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
+    enable_cluster: bool = True,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -147,6 +148,10 @@ def topk_transform_paged_v2(
       indices and no page table is read.
     * ``page_tables`` given -- ``out_page_indices`` receives the page-table
       transform of them.
+
+    ``enable_cluster=False`` keeps the v2 transform on its streaming kernel.
+    This is required for CUDA Green Context streams whose SM partition cannot
+    satisfy the kernel's fixed eight-block cluster launch.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
@@ -175,4 +180,5 @@ def topk_transform_paged_v2(
         out_page_indices,
         page_size,
         metadata,
+        enable_cluster,
     )

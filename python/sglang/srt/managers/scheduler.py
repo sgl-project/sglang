@@ -1165,6 +1165,19 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.pdmux_max_prefill_plan_tokens = (
+            model_runner.attn_backend.max_prefill_plan_tokens
+            if self.enable_pdmux
+            else None
+        )
+        if self.pdmux_max_prefill_plan_tokens is not None:
+            logger.info(
+                "PDMux prefill planner hard limit: %s tokens",
+                self.pdmux_max_prefill_plan_tokens,
+            )
+        # Keep accepted requests within any hard PDMux backend limit. PDMux
+        # cannot fall back to chunked prefill for an oversized first request.
+        self.max_req_input_len = self._get_max_req_input_len(self.max_req_input_len)
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -3151,6 +3164,28 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        if self.enable_pdmux and req.is_retracted:
+            limit = self._get_pdmux_prefill_token_limit(self.max_prefill_tokens)
+            replay_tokens = len(req.origin_input_ids) + len(req.output_ids)
+            if limit is not None and replay_tokens > limit:
+                # Generated history must also fit if retraction discards the
+                # prefix. Do not rely on an evictable cache hit to make progress.
+                reason = {
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": (
+                        f"Retracted request requires {replay_tokens} prefill tokens, "
+                        f"exceeding the PDMux planner limit of {limit}. "
+                        "PDMux cannot chunk this replay."
+                    ),
+                }
+                self._release_aborted_request(req.rid)
+                self.beam_coordinator.retire_group(req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req, finished_reason=reason), req
+                )
+                req.time_stats.trace_ctx.abort(abort_info=reason)
+                return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
@@ -3785,19 +3820,28 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        # DeepSeek V4 compressor plans encode ragged token ids as uint16. PDMux
+        # cannot use chunked prefill, so admission must keep the complete batch
+        # within that hard planner limit instead of treating max_prefill_tokens
+        # as a soft budget for the first request.
+        max_prefill_tokens, enforce_max_prefill_tokens = (
+            self._get_prefill_admission_config(self.max_prefill_tokens)
+        )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
             prefill_max_requests=get_schedule().prefill_max_requests,
+            enforce_max_prefill_tokens=enforce_max_prefill_tokens,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
