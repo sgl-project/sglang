@@ -162,7 +162,38 @@ class TRTLLMMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
+    # Per-row extend lengths, on the host so the wrapper needs no device readback;
+    # a padding row reads 0 here while seq_lens carries the backend fill value.
+    seq_lens_cpu: torch.Tensor
+    # Whether every query row is non-empty;
+    # MLP-sync (DP) padding appends zero-length extend rows in _pad_inputs_to_size.
+    all_query_rows_active: bool
     fallback_to_flashinfer_impl: bool = False
+
+
+def trim_ragged_rows_to_mirrors(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    q_seq_lens_cpu: torch.Tensor,
+    kv_seq_lens_cpu: torch.Tensor,
+):
+    # The ragged wrapper requires the host mirrors to sum to the packed rows,
+    # but token padding can leave the buffers longer than that span.
+    num_q_tokens = int(q_seq_lens_cpu.sum())
+    num_kv_tokens = int(kv_seq_lens_cpu.sum())
+    # Last element is the untrimmed out buffer, or None when nothing was trimmed.
+    if num_q_tokens == q.shape[0] and num_kv_tokens == k.shape[0]:
+        return q, k, v, out, None
+    return (
+        q[:num_q_tokens],
+        k[:num_kv_tokens],
+        v[:num_kv_tokens],
+        out[:num_q_tokens],
+        out,
+    )
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -836,10 +867,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             ).int()
             max_seq_len = max(forward_batch.extend_seq_lens_cpu)
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
-                max_seq_len,
-                cum_seq_lens_q,
-                seq_lens,
-                fallback_to_flashinfer_impl,
+                max_seq_len=max_seq_len,
+                cum_seq_lens=cum_seq_lens_q,
+                seq_lens=seq_lens,
+                seq_lens_cpu=torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+                ),
+                all_query_rows_active=all(
+                    length > 0 for length in forward_batch.extend_seq_lens_cpu
+                ),
+                fallback_to_flashinfer_impl=fallback_to_flashinfer_impl,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -1097,6 +1134,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_causal: bool,
         return_lse: bool,
         out_buffer: torch.Tensor,
+        q_seq_lens_cpu: torch.Tensor,
+        kv_seq_lens_cpu: torch.Tensor,
+        all_rows_active: bool,
         o_sf_scale: float = 1.0,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
@@ -1105,7 +1145,33 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        # The wrapper otherwise derives the row lengths from cum_seq_lens,
+        # reading them back with .item() and stalling the host once per call.
+        padded_out = padded_lse = None
+        if all_rows_active:
+            row_check_kwargs = {"skip_all_rows_active_check": True}
+        else:
+            row_check_kwargs = {
+                "q_seq_lens_cpu": q_seq_lens_cpu,
+                "kv_seq_lens_cpu": kv_seq_lens_cpu,
+            }
+            q, k, v, out_buffer, padded_out = trim_ragged_rows_to_mirrors(
+                q=q,
+                k=k,
+                v=v,
+                out=out_buffer,
+                q_seq_lens_cpu=q_seq_lens_cpu,
+                kv_seq_lens_cpu=kv_seq_lens_cpu,
+            )
+            if padded_out is not None and return_lse:
+                padded_lse = torch.empty(
+                    padded_out.shape[0],
+                    padded_out.shape[1],
+                    dtype=torch.float32,
+                    device=padded_out.device,
+                )
+                row_check_kwargs["lse"] = padded_lse[: out_buffer.shape[0]]
+        result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
             value=v,
@@ -1125,7 +1191,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             o_sf_scale=o_sf_scale,
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            **row_check_kwargs,
         )
+        if padded_out is None:
+            return result
+        # Callers size and index their buffers by the padded query rows;
+        # rows past the cumsum span are never attended and stay uninitialized.
+        return (padded_out, padded_lse) if return_lse else padded_out
 
     def _set_kv_and_concat_q_fused(
         self,
@@ -1740,6 +1812,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 is_causal=False,
                 return_lse=True,
                 out_buffer=out,
+                q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                kv_seq_lens_cpu=forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx],
+                all_rows_active=(
+                    self.forward_prefill_metadata.all_query_rows_active
+                    and not forward_batch.prefix_chunk_has_zero_kv[chunk_idx]
+                ),
                 o_sf_scale=-1.0,
             )
 
@@ -1783,6 +1861,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 is_causal=True,
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
+                q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                kv_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                all_rows_active=self.forward_prefill_metadata.all_query_rows_active,
                 o_sf_scale=1.0,
             )
 

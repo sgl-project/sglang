@@ -84,6 +84,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
+    trim_ragged_rows_to_mirrors,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -264,6 +265,12 @@ class DSAMetadata:
     pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
+
+    # Host mirrors of the MHA one-shot q/kv row lengths, so the ragged wrapper
+    # can find empty rows without a per-call device readback.
+    mha_q_seq_lens_cpu: Optional[torch.Tensor] = None
+    mha_kv_seq_lens_cpu: Optional[torch.Tensor] = None
+    mha_all_rows_active: bool = False
 
 
 @torch.compile
@@ -842,6 +849,13 @@ class DeepseekSparseAttnBackend(
             draft_token_num = 0
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+        cache_seqlens_cpu = (
+            (forward_batch.seq_lens_cpu + draft_token_num).to(torch.int32)
+            if forward_batch.seq_lens_cpu is not None
+            else None
+        )
+        mha_q_seq_lens_cpu = None
+        mha_all_rows_active = False
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         if forward_batch.seq_lens_cpu is not None:
             max_seqlen_k = int(
@@ -976,6 +990,9 @@ class DeepseekSparseAttnBackend(
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None
             extend_seq_lens = forward_batch.extend_seq_lens
+            # seqlens_expanded below reads the host mirror unconditionally,
+            # so the MHA one-shot row lengths always have a host side here.
+            assert cache_seqlens_cpu is not None
 
             seqlens_expanded = torch.cat(
                 [
@@ -1007,6 +1024,7 @@ class DeepseekSparseAttnBackend(
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
+                cache_seqlens_cpu = cache_seqlens_cpu[bs_idx_cpu]
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_k = (
                     int(indexer_seq_lens_cpu.max().item() + draft_token_num)
@@ -1020,9 +1038,18 @@ class DeepseekSparseAttnBackend(
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
                 )
                 cu_seqlens_q = compute_cu_seqlens(extend_seq_lens.to(torch.int32))
+                mha_q_seq_lens_cpu = torch.tensor(
+                    extend_seq_lens_cpu, dtype=torch.int32
+                )
             else:
                 max_seqlen_q = max_seqlen_k
                 cu_seqlens_q = cu_seqlens_k
+                mha_q_seq_lens_cpu = cache_seqlens_cpu
+            # kv is the whole sequence and never shorter than the query,
+            # so a positive query length settles both sides of the test.
+            mha_all_rows_active = (
+                bool(mha_q_seq_lens_cpu.numel()) and int(mha_q_seq_lens_cpu.min()) > 0
+            )
 
             # Check if MHA FP8 dequantization is needed
             mha_dequantize_needed = (
@@ -1136,6 +1163,9 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            mha_q_seq_lens_cpu=mha_q_seq_lens_cpu,
+            mha_kv_seq_lens_cpu=cache_seqlens_cpu,
+            mha_all_rows_active=mha_all_rows_active,
         )
         metadata = self._init_kpool_metadata(
             metadata,
@@ -3039,7 +3069,36 @@ class DeepseekSparseAttnBackend(
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
-            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            # use_mha is only set on a non-speculative extend,
+            # where init_forward_metadata always fills both host mirrors.
+            assert metadata.mha_q_seq_lens_cpu is not None
+            assert metadata.mha_kv_seq_lens_cpu is not None
+            # The wrapper otherwise derives the row lengths from cu_seqlens and
+            # reads them back with .item(), stalling the host once per call.
+            out = padded_out = None
+            if metadata.mha_all_rows_active:
+                row_check_kwargs = {"skip_all_rows_active_check": True}
+            else:
+                row_check_kwargs = {
+                    "q_seq_lens_cpu": metadata.mha_q_seq_lens_cpu,
+                    "kv_seq_lens_cpu": metadata.mha_kv_seq_lens_cpu,
+                }
+                out = torch.empty(
+                    q.shape[0],
+                    layer.tp_q_head_num,
+                    layer.v_head_dim,
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                q, k, v, out, padded_out = trim_ragged_rows_to_mirrors(
+                    q=q,
+                    k=k,
+                    v=v,
+                    out=out,
+                    q_seq_lens_cpu=metadata.mha_q_seq_lens_cpu,
+                    kv_seq_lens_cpu=metadata.mha_kv_seq_lens_cpu,
+                )
+            result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
                 value=v,
@@ -3057,8 +3116,12 @@ class DeepseekSparseAttnBackend(
                 enable_pdl=False,
                 is_causal=causal,
                 return_lse=False,
+                out=out,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                **row_check_kwargs,
             )
+            # Callers index the output by the padded query rows.
+            return result if padded_out is None else padded_out
 
         # Use FA3 for SM90 (Hopper/H200)
         return flash_attn_varlen_func(
