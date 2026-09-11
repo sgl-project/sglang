@@ -165,7 +165,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertFalse(info.is_dummy())
+        self.assertFalse(info.is_dummy)
 
     def test_empty_indices_without_decode_prefix_is_dummy(self):
         info = TransferInfo.from_zmq(
@@ -182,7 +182,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertTrue(info.is_dummy())
+        self.assertTrue(info.is_dummy)
 
     def test_explicit_dummy_frame_true_is_dummy(self):
         # msg[9] is the explicit is_dummy frame the sender writes
@@ -202,7 +202,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertTrue(info.is_dummy())
+        self.assertTrue(info.is_dummy)
 
     def test_explicit_dummy_frame_true_with_prefix_hit_stays_dummy(self):
         # A dummy rank whose request also has a decode-side prefix hit: the
@@ -223,7 +223,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertTrue(info.is_dummy())
+        self.assertTrue(info.is_dummy)
 
     def test_explicit_dummy_frame_false_with_empty_indices_is_real(self):
         # Full prefix hit as the sender encodes it: empty kv indices,
@@ -243,7 +243,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertFalse(info.is_dummy())
+        self.assertFalse(info.is_dummy)
 
     def test_explicit_dummy_frame_false_for_real_transfer(self):
         info = TransferInfo.from_zmq(
@@ -261,7 +261,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertFalse(info.is_dummy())
+        self.assertFalse(info.is_dummy)
 
     def test_fallback_without_dummy_frame_reads_prefix_hit_dummy_as_real(self):
         # Old-peer fallback: without msg[9], a dummy rank with a decode-side
@@ -281,7 +281,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertFalse(info.is_dummy())
+        self.assertFalse(info.is_dummy)
 
 
 class TestNixlKVArgsRegisterInfo(CustomTestCase):
