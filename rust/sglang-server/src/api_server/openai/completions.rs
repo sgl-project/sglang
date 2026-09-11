@@ -19,6 +19,7 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -58,6 +59,61 @@ pub(super) struct ChoiceExtensions {
     /// Dynamo's enum covers the standard values. Python additionally exposes
     /// `abort`, and native unknown finish types are preserved rather than lost.
     finish_reason_override: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CompletionFinishReasonWire<'a> {
+    Standard(CompletionFinishReason),
+    Override(&'a str),
+}
+
+struct NegativeOneOffsets(usize);
+
+impl Serialize for NegativeOneOffsets {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq; // codespell:ignore ser
+
+        let mut seq = serializer.serialize_seq(Some(self.0))?;
+        for _ in 0..self.0 {
+            seq.serialize_element(&-1i8)?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+struct CompletionLogprobsWire<'a> {
+    tokens: &'a [String],
+    token_logprobs: &'a [Option<f32>],
+    top_logprobs: &'a [serde_json::Value],
+    text_offset: NegativeOneOffsets,
+}
+
+#[derive(Serialize)]
+struct CompletionChoiceWire<'a> {
+    text: &'a str,
+    index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<CompletionLogprobsWire<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<CompletionFinishReasonWire<'a>>,
+    matched_stop: Option<&'a serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct CompletionResponseWire<'a> {
+    id: &'a str,
+    choices: Vec<CompletionChoiceWire<'a>>,
+    created: u32,
+    model: &'a str,
+    // Keep `usage` before `object`: removing `system_fingerprint` from the old
+    // Value representation swap-removed `object` to the final map position.
+    usage: Option<&'a CompletionUsage>,
+    object: &'a str,
 }
 
 async fn completions(
@@ -510,6 +566,56 @@ pub(super) fn completion_response_value(
     value
 }
 
+/// Serialize the streaming wire shape directly instead of allocating and
+/// traversing a complete intermediate `serde_json::Value` tree.
+fn completion_response_string(
+    response: CreateCompletionResponse,
+    extensions: &[ChoiceExtensions],
+) -> String {
+    // Preserve the old helper's permissive behavior for unexpected internal
+    // callers rather than dropping choices when the parallel slices diverge.
+    if response.choices.len() != extensions.len() {
+        return completion_response_value(response, extensions).to_string();
+    }
+
+    let choices = response
+        .choices
+        .iter()
+        .zip(extensions)
+        .map(|(choice, extension)| CompletionChoiceWire {
+            text: &choice.text,
+            index: choice.index,
+            logprobs: choice
+                .logprobs
+                .as_ref()
+                .map(|logprobs| CompletionLogprobsWire {
+                    tokens: &logprobs.tokens,
+                    token_logprobs: &logprobs.token_logprobs,
+                    top_logprobs: &logprobs.top_logprobs,
+                    text_offset: NegativeOneOffsets(logprobs.tokens.len()),
+                }),
+            finish_reason: extension.finish_reason_override.as_deref().map_or_else(
+                || {
+                    choice
+                        .finish_reason
+                        .map(CompletionFinishReasonWire::Standard)
+                },
+                |reason| Some(CompletionFinishReasonWire::Override(reason)),
+            ),
+            matched_stop: extension.matched_stop.as_ref(),
+        })
+        .collect();
+    serde_json::to_string(&CompletionResponseWire {
+        id: &response.id,
+        choices,
+        created: response.created,
+        model: &response.model,
+        usage: response.usage.as_ref(),
+        object: &response.object,
+    })
+    .expect("OpenAI response must serialize")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn completion_event_stream(
     submitted: Vec<SubmittedChoice>,
@@ -602,7 +708,7 @@ pub(super) fn completion_event_stream(
                 object: "text_completion".into(),
                 usage: chunk_usage,
             };
-            yield completion_response_value(chunk, &[extension]).to_string();
+            yield completion_response_string(chunk, &[extension]);
         }
 
         if include_usage {
@@ -625,7 +731,7 @@ pub(super) fn completion_event_stream(
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
                 )),
             };
-            yield completion_response_value(final_chunk, &[]).to_string();
+            yield completion_response_string(final_chunk, &[]);
         }
         yield "[DONE]".to_string();
     }
@@ -735,13 +841,15 @@ mod tests {
     use super::super::test_utils::{chunk, senders, submitted};
     use super::{
         ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
-        completion_prompt_specs, completion_response_value, unary_completion,
+        completion_prompt_specs, completion_response_string, completion_response_value,
+        unary_completion,
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
-        Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
+        Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
+        CreateCompletionResponse, Logprobs, Prompt,
     };
     use futures::StreamExt;
 
@@ -814,6 +922,119 @@ mod tests {
         assert_eq!(
             value["choices"][0]["logprobs"]["text_offset"],
             serde_json::json!([-1])
+        );
+    }
+
+    #[test]
+    fn direct_stream_serializer_matches_value_path() {
+        fn response(
+            choices: Vec<Choice>,
+            usage: Option<CompletionUsage>,
+        ) -> CreateCompletionResponse {
+            CreateCompletionResponse {
+                id: "cmpl-\"escaped\"".into(),
+                choices,
+                created: 7,
+                model: "模型\\name".into(),
+                system_fingerprint: Some("must-be-removed".into()),
+                object: "text_completion".into(),
+                usage,
+            }
+        }
+
+        fn assert_matches(response: CreateCompletionResponse, extensions: Vec<ChoiceExtensions>) {
+            let expected = completion_response_value(response.clone(), &extensions).to_string();
+            let actual = completion_response_string(response, &extensions);
+            assert_eq!(actual, expected);
+        }
+
+        assert_matches(
+            response(
+                vec![Choice {
+                    text: "plain\n\"文本\"".into(),
+                    index: 0,
+                    logprobs: None,
+                    finish_reason: None,
+                }],
+                None,
+            ),
+            vec![ChoiceExtensions::default()],
+        );
+        assert_matches(
+            response(
+                vec![Choice {
+                    text: "token".into(),
+                    index: 3,
+                    logprobs: Some(Logprobs {
+                        tokens: vec!["a".into(), "b\\c".into()],
+                        token_logprobs: vec![Some(-0.25), None],
+                        top_logprobs: vec![
+                            serde_json::json!({"a": -0.25, "á": -1.5}),
+                            serde_json::Value::Null,
+                        ],
+                        text_offset: vec![41, 42],
+                    }),
+                    finish_reason: Some(CompletionFinishReason::Stop),
+                }],
+                None,
+            ),
+            vec![ChoiceExtensions {
+                matched_stop: Some(serde_json::json!("</s>")),
+                finish_reason_override: None,
+            }],
+        );
+        assert_matches(
+            response(
+                vec![Choice {
+                    text: String::new(),
+                    index: 1,
+                    logprobs: None,
+                    finish_reason: Some(CompletionFinishReason::Length),
+                }],
+                None,
+            ),
+            vec![ChoiceExtensions {
+                matched_stop: Some(serde_json::json!([1, 2, 3])),
+                finish_reason_override: Some("abort".into()),
+            }],
+        );
+        assert_matches(
+            response(
+                vec![
+                    Choice {
+                        text: "first".into(),
+                        index: 0,
+                        logprobs: None,
+                        finish_reason: Some(CompletionFinishReason::ContentFilter),
+                    },
+                    Choice {
+                        text: "second".into(),
+                        index: 1,
+                        logprobs: None,
+                        finish_reason: None,
+                    },
+                ],
+                None,
+            ),
+            vec![
+                ChoiceExtensions {
+                    matched_stop: Some(serde_json::json!(17)),
+                    finish_reason_override: None,
+                },
+                ChoiceExtensions::default(),
+            ],
+        );
+        assert_matches(
+            response(
+                vec![],
+                Some(CompletionUsage {
+                    prompt_tokens: 11,
+                    completion_tokens: 13,
+                    total_tokens: 24,
+                    ..Default::default()
+                }),
+            ),
+            vec![],
         );
     }
 
