@@ -440,6 +440,57 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(dcp4_allocator.page_size, 256)
         self.assertEqual(dcp4_allocator.num_pages, 16)
 
+    def test_dsa_draft_pool_preserves_physical_page_and_backs_virtual_tail(self):
+        physical_page_size = 64
+        max_total_num_tokens = 4096
+        self._sa_override = rc.get_context().override_server_args(
+            page_size=physical_page_size
+        )
+        self._sa_override.install()
+        self.addCleanup(self._sa_override.restore)
+
+        dcp1 = SimpleNamespace(pool_page_size=physical_page_size)
+        dcp4_draft = SimpleNamespace(pool_page_size=physical_page_size * 4)
+
+        self.assertEqual(
+            KVCacheConfigurator._dsa_pool_geometry(dcp1, max_total_num_tokens),
+            (max_total_num_tokens, physical_page_size),
+        )
+        self.assertEqual(
+            KVCacheConfigurator._dsa_pool_geometry(dcp4_draft, max_total_num_tokens),
+            (
+                max_total_num_tokens + physical_page_size * 3,
+                physical_page_size,
+            ),
+        )
+
+    def test_dsa_index_cache_backs_entire_virtual_space(self):
+        physical_page_size = 64
+        per_rank_tokens = 1024
+        with rc.get_context().override_server_args(page_size=physical_page_size):
+            for dcp_size in (1, 2, 4, 8):
+                with rc.get_parallel().override(attn_dcp_size=dcp_size):
+                    for is_draft in (False, True):
+                        scale = dcp_size if is_draft else 1
+                        kvc = SimpleNamespace(
+                            loc_space_scale=scale,
+                            pool_page_size=physical_page_size * scale,
+                        )
+                        index_size = KVCacheConfigurator._dsa_index_buf_size(
+                            kvc, per_rank_tokens * scale
+                        )
+                        # The last usable virtual page follows a whole widened
+                        # reserved page, not just one physical page.
+                        last_virtual_loc = (
+                            per_rank_tokens + physical_page_size
+                        ) * dcp_size - 1
+                        self.assertLess(
+                            last_virtual_loc, index_size + physical_page_size
+                        )
+                        self.assertEqual(
+                            index_size + physical_page_size, last_virtual_loc + 1
+                        )
+
     def test_live_cell_and_page_ownership_formulas(self):
         dcp_size = 4
         physical_page_size = 64
