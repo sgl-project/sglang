@@ -9,8 +9,9 @@ which is useful to implement an online-like generation with batched inference.
 
 import argparse
 import asyncio
-import dataclasses
 import time
+
+import msgspec
 
 import sglang as sgl
 from sglang.srt.server_args import ServerArgs
@@ -26,7 +27,7 @@ class InferenceEngine:
 
 
 async def run_server(server_args):
-    inference = InferenceEngine(**dataclasses.asdict(server_args))
+    inference = InferenceEngine(**msgspec.structs.asdict(server_args))
 
     # Sample prompts.
     prompts = [
