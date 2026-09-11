@@ -1116,6 +1116,35 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(path.name.endswith(".pkl"))
         self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
 
+    def test_gsp_cache_respects_ordering(self):
+        shuffled_rows = self._run_gsp(ordered=False)
+        rows = self._run_gsp(ordered=True)
+
+        with patch(
+            "sglang.benchmark.datasets.generated_shared_prefix.Path.home",
+            return_value=self.tmpdir_path / "fresh",
+        ):
+            expected = self._run_gsp(ordered=True)
+
+        self.assertEqual(self._row_fields(rows), self._row_fields(expected))
+
+        # Pre-upgrade ordered caches must not contaminate shuffled runs either.
+        legacy_path = get_gen_prefix_cache_path(
+            seed=42,
+            num_groups=4,
+            prompts_per_group=5,
+            system_prompt_len=4,
+            question_len=3,
+            output_len=2,
+            tokenizer=self.tokenizer,
+        )
+        with open(legacy_path, "wb") as f:
+            pickle.dump(expected, f)
+        self.assertEqual(
+            self._row_fields(self._run_gsp(ordered=False)),
+            self._row_fields(shuffled_rows),
+        )
+
     def test_zipf_group_probs_helper(self):
         # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,
         # normalized to sum to 1, with rank starting at 1.
@@ -1275,6 +1304,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 question_len=common["question_len"],
                 output_len=common["output_len"],
                 tokenizer=self.tokenizer,
+                ordered=common["ordered"],
             )
             zipf_path_a = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1286,6 +1316,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=1.5,
+                ordered=common["ordered"],
             )
             zipf_path_b = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1297,6 +1328,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=2.0,
+                ordered=common["ordered"],
             )
             self.assertNotEqual(uniform_path, zipf_path_a)
             self.assertNotEqual(zipf_path_a, zipf_path_b)
