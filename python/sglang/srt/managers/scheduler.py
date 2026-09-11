@@ -200,6 +200,14 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.prefill_lookahead import (
+    HEADLOCK_SYNC_DENIED_CAPACITY,
+    HEADLOCK_SYNC_IDLE,
+    HEADLOCK_SYNC_PINNED,
+    HeadPrefixLock,
+    PrefillLookaheadState,
+    normalize_headlock_reserve_tokens,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -212,6 +220,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    full_pool_available_and_evictable,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -458,6 +467,15 @@ class Scheduler(
         # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
         self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
+        # Admission NO_TOKEN lookahead (off unless the env is set); the head
+        # prefix lock behind it is built in init_running_status once the tree
+        # cache exists.
+        self.prefill_lookahead = PrefillLookaheadState(
+            max_candidates=envs.SGLANG_PREFILL_NO_TOKEN_LOOKAHEAD.get(),
+            aging_passes=envs.SGLANG_PREFILL_LOOKAHEAD_AGING_PASSES.get(),
+        )
+        self.head_prefix_lock: Optional[HeadPrefixLock] = None
+        self.head_prefix_lock_reserve: int = 0
         self.init_soft_watchdog()
 
         # Parse args
@@ -1278,6 +1296,27 @@ class Scheduler(
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
+        # Head-prefix pinning for the NO_TOKEN lookahead. Built only when the
+        # lookahead is enabled, so env=0 keeps a None slot and never touches
+        # the tree cache.
+        if self.prefill_lookahead.uses_head_lock:
+            self.head_prefix_lock_reserve = normalize_headlock_reserve_tokens(
+                envs.SGLANG_PREFILL_HEADLOCK_RESERVE_TOKENS.get(),
+                self.max_prefill_tokens,
+            )
+            self.head_prefix_lock = HeadPrefixLock(
+                self.tree_cache,
+                logger=logger,
+                headroom_fn=self._kv_pool_headroom,
+                reserve_tokens=self.head_prefix_lock_reserve,
+            )
+            logger.info(
+                "Prefill NO_TOKEN lookahead: candidates=%d aging_passes=%d "
+                "headlock_reserve_tokens=%d",
+                self.prefill_lookahead.max_candidates,
+                self.prefill_lookahead.aging_passes,
+                self.head_prefix_lock_reserve,
+            )
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -3700,11 +3739,100 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    @property
+    def _prefill_lookahead_applicable(self) -> bool:
+        """Opt-in, and never under priority scheduling: that mode owns the queue
+        order itself (calc_priority / preempt_to_schedule), so an out-of-order
+        admission would contradict it."""
+        return self.prefill_lookahead.enabled and not self.enable_priority_scheduling
+
+    def _kv_pool_headroom(self) -> Tuple[int, int]:
+        """(allocator-free, tree-evictable) tokens of the pool an extend
+        allocates from. The head prefix lock's capacity gate reads exactly the
+        pair `evict_from_tree_cache` weighs a chunk's allocation against, so the
+        gate and the allocator cannot disagree about what "room" means."""
+        return full_pool_available_and_evictable(
+            self.token_to_kv_pool_allocator, self.tree_cache
+        )
+
+    def _mark_prefill_batch_full_no_token(
+        self, running_batch: ScheduleBatch, adder: PrefillAdder
+    ) -> None:
+        """batch_is_full bookkeeping for an admission scan stopped by NO_TOKEN.
+        Extracted so every lookahead exit publishes the identical state."""
+        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
+            # Set batch_is_full after making sure there are requests that can be served
+            running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                not running_batch.is_empty()
+            )
+        else:
+            running_batch.batch_is_full = True
+
+    def _reconcile_head_prefix_lock(self) -> None:
+        """Pass-start reconciliation of the head prefix lock.
+
+        The lock is held across passes on purpose (a lookahead admission does
+        not allocate its KV until the batch actually runs), so it cannot be
+        unwound by a try/finally around one pass. Instead of hooking every way a
+        request can leave the queue (abort, timeout, cancellation, flush,
+        retract), the invariant is checked here: a lock whose request is no
+        longer in ``waiting_queue`` is dropped immediately, so any leak lives at
+        most one pass. Identity against *this* pass's head is checked later, at
+        the point the head is actually determined (the effective head is the
+        first request offered to the adder, which prefetch-wait and LoRA skips
+        can move past ``waiting_queue[0]``).
+
+        This is also where a pin that has become unaffordable is given up: the
+        pin-time gate only sees the headroom of the pass that took the lock, and
+        an in-flight chunked request can eat the rest of it one chunk at a time
+        over the passes that follow (see ``HeadPrefixLock.reconcile``).
+        """
+        if self.head_prefix_lock is None or not self.head_prefix_lock.held:
+            return
+        self.head_prefix_lock.reconcile({req.rid for req in self.waiting_queue})
+
+    def _sync_head_prefix_lock(
+        self, req: Req, rejected_no_token: bool, adder: PrefillAdder
+    ) -> str:
+        """Fold this pass's head verdict into the head prefix lock and report the
+        outcome (a ``HEADLOCK_SYNC_*`` constant).
+
+        Called right after the head's ``add_one_req`` and before any lookahead
+        candidate is offered, so the pin is in place before an intruder can reach
+        the allocator. Aging is deliberately not a release condition: while
+        lookahead is withheld for starvation, this lock is exactly what keeps the
+        head's prefix from decaying under it, so a lock held into an aged-out
+        stretch stays held.
+
+        A pin taken here shrinks the KV the rest of the pass may promise, so it
+        is charged to the adder immediately; ``charge_head_prefix_pin`` takes
+        only the part the tree's own accounting missed.
+        """
+        if self.head_prefix_lock is None:
+            return HEADLOCK_SYNC_IDLE
+        outcome = self.head_prefix_lock.sync_head(
+            rid=req.rid,
+            node=req.last_node,
+            tokens=len(req.prefix_indices),
+            # Pin only a head that is genuinely KV-blocked. An admitted head has
+            # add_one_req's own lock on the same chain, and a head rejected for a
+            # non-KV reason is not waiting on eviction, so neither needs ours.
+            should_hold=(
+                rejected_no_token
+                and self._prefill_lookahead_applicable
+                and req.last_node is not None
+            ),
+        )
+        if outcome == HEADLOCK_SYNC_PINNED:
+            adder.charge_head_prefix_pin(self.head_prefix_lock.last_pin_unaccounted)
+        return outcome
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        self._reconcile_head_prefix_lock()
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -3824,6 +3952,22 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # NO_TOKEN lookahead, per-pass state. `lookahead_on` latches at the
+        # first NO_TOKEN of the pass; a candidate then clears add_one_req's
+        # ordinary budget (free + evictable) while the head's own matched prefix
+        # is pinned by self.head_prefix_lock, so the only KV an intruder can
+        # take is cache the LRU would have taken anyway.
+        lookahead_on = False
+        lookahead_budget = 0
+        lookahead_admitted = 0
+        lookahead_denied = 0
+        head_offered = False
+        head_age = 0
+        # Latched by the head's sync when the capacity gate refused the pin. No
+        # pin means no protection for the head's prefix, so this pass must not
+        # let anyone interlope; it degrades to the stock break-on-NO_TOKEN. Stays
+        # False for env=0, which never builds a lock to gate.
+        head_lock_denied_capacity = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3850,6 +3994,12 @@ class Scheduler(
                     req
                 ):
                     break
+
+            if lookahead_on and lookahead_budget <= 0:
+                # Candidate budget spent. Stop before touching this request so
+                # it carries no per-pass side effect into the next pass.
+                self._mark_prefill_batch_full_no_token(running_batch, adder)
+                break
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -3895,32 +4045,75 @@ class Scheduler(
                     req.storage_hit_length = 0
                     req.storage_hit_start = None
                     req.host_hit_is_storage = False
+            # `lookahead_on` can only be set by an earlier iteration's NO_TOKEN,
+            # so this is exactly "req is a candidate jumping the blocked head",
+            # never the head itself.
+            is_lookahead_candidate = lookahead_on
+            if is_lookahead_candidate:
+                lookahead_budget -= 1
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
 
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
+            if is_lookahead_candidate and added:
+                lookahead_admitted += 1
+
+            if not head_offered:
+                head_offered = True
+                head_rejected_no_token = res == AddReqResult.NO_TOKEN and not added
+                head_age = self.prefill_lookahead.observe_head(
+                    req.rid, rejected_no_token=head_rejected_no_token
+                )
+                # Before any candidate reaches add_one_req below: this pins the
+                # head's matched prefix so an intruder's eviction cannot take
+                # it; with lookahead off it is a no-op (head_prefix_lock is
+                # None).
+                head_lock_denied_capacity = (
+                    self._sync_head_prefix_lock(req, head_rejected_no_token, adder)
+                    == HEADLOCK_SYNC_DENIED_CAPACITY
+                )
+
             if res != AddReqResult.CONTINUE:
+                keep_scanning = False
                 if res == AddReqResult.NO_TOKEN:
-                    if (
-                        self.enable_hierarchical_cache
-                        or self.enable_unified_cache_external_linker
-                    ):
-                        # Set batch_is_full after making sure there are requests that can be served
-                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                            not running_batch.is_empty()
+                    if is_lookahead_candidate:
+                        # There is no pre-gate, so a denial is exactly
+                        # "add_one_req said NO_TOKEN" and is counted here.
+                        lookahead_denied += 1
+                    if not lookahead_on:
+                        # One decision per pass, taken at its first NO_TOKEN.
+                        # aged_out is read AFTER observe_head so a head that
+                        # ages out on this very pass already stops lookahead
+                        # here, not only on the next pass. Priority scheduling
+                        # owns the queue order through calc_priority /
+                        # preempt_to_schedule; letting a lower-priority request
+                        # jump the head would contradict it, so that mode keeps
+                        # the baseline break. A pin the capacity gate refused
+                        # keeps it too: without the pin an intruder could evict
+                        # the head's own prefix, which is worse than not
+                        # interloping at all.
+                        lookahead_on = (
+                            self._prefill_lookahead_applicable
+                            and not self.prefill_lookahead.aged_out
+                            and not head_lock_denied_capacity
                         )
-                    else:
-                        running_batch.batch_is_full = True
+                        if lookahead_on:
+                            lookahead_budget = self.prefill_lookahead.max_candidates
+                    keep_scanning = lookahead_on and lookahead_budget > 0
+                    if not keep_scanning:
+                        self._mark_prefill_batch_full_no_token(running_batch, adder)
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -3931,10 +4124,26 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+                if keep_scanning:
+                    continue
                 break
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        if self.prefill_lookahead.enabled and self.metrics_reporter.enable_metrics:
+            self.metrics_collector.increment_admission_lookahead(
+                admitted=lookahead_admitted,
+                denied=lookahead_denied,
+                # aging_hold is per pass: the head had already been starved past
+                # the bound when this pass began, so lookahead was withheld to
+                # let it catch up.
+                aging_hold=(
+                    self._prefill_lookahead_applicable
+                    and head_age > self.prefill_lookahead.aging_passes
+                ),
+                denied_capacity=head_lock_denied_capacity,
+            )
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4947,6 +5156,8 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None
+            if self.head_prefix_lock is not None:
+                self.head_prefix_lock.release(reason="flush_cache")
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()

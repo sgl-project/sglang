@@ -590,6 +590,27 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # NO_TOKEN admission lookahead: when the waiting-queue head is rejected
+    # with NO_TOKEN, keep scanning up to this many further requests in the
+    # same pass instead of breaking. A candidate clears add_one_req's normal
+    # KV budget gate (free + evictable) while the blocked head's matched
+    # prefix is pinned with a tree lock for as long as it stays the blocked
+    # head, so an intruder may evict cold cache (the LRU would have taken it
+    # anyway) but never the head's own prefix. 0 keeps the baseline break.
+    SGLANG_PREFILL_NO_TOKEN_LOOKAHEAD = EnvInt(0)
+    # Starvation bound for the above: once the same head request has been
+    # NO_TOKEN-rejected in more than this many consecutive admission passes,
+    # lookahead is suppressed from that pass on until the head changes or is
+    # admitted.
+    SGLANG_PREFILL_LOOKAHEAD_AGING_PASSES = EnvInt(20)
+    # Allocator headroom the head-prefix pin must leave behind, in full-KV
+    # tokens. An in-flight chunked request allocates its next chunk from
+    # (available + evictable) at batch-run time without passing through the
+    # admission budget, so a pin that swallows the evictable pool leaves it
+    # nothing to evict and crashes the scheduler with "Prefill out of memory".
+    # Unset or 0 reserves max_prefill_tokens (one whole extend); a negative
+    # value raises at scheduler startup rather than silently disabling the gate.
+    SGLANG_PREFILL_HEADLOCK_RESERVE_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
