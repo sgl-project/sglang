@@ -1374,10 +1374,9 @@ class _DeepSeekV4Strategy(StackStrategy):
 
         if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
             return False
-        expected = {ComponentType.FULL}
-        if kvcache.swa_kv_pool is not None:
-            expected.add(ComponentType.SWA)
-        return components == expected
+        return components == {ComponentType.FULL, ComponentType.SWA} or (
+            components == {ComponentType.FULL} and kvcache.swa_kv_pool is None
+        )
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
