@@ -10,10 +10,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+DSA_DENSE = "dense"
+DSA_SPARSE = "sparse"
+
 
 class AttentionGraphVariants(Protocol):
     # Capture order is significant when variants share a graph memory pool.
-    capture_labels: tuple[str, ...]
+    capture_labels: ClassVar[tuple[str, ...]]
 
     def select(self, forward_batch: ForwardBatch) -> str:
         """Select one of capture_labels for the batch."""
@@ -24,15 +27,7 @@ class AttentionGraphVariants(Protocol):
 class DsaGraphVariants:
     index_topk: int
     # Dense comes first: the sparse capture peak subsumes its shared-pool storage.
-    capture_labels: ClassVar[tuple[str, ...]] = ("dense", "sparse")
-
-    def __post_init__(self):
-        logger.info(
-            "[dense-decode] DSA dual-graph enabled: capturing "
-            "dense (k-only) + sparse (full indexer) decode graphs; "
-            "dispatch on max_kv_len vs index_topk=%d.",
-            self.index_topk,
-        )
+    capture_labels: ClassVar[tuple[str, ...]] = (DSA_DENSE, DSA_SPARSE)
 
     def select(self, forward_batch: ForwardBatch) -> str:
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -44,8 +39,8 @@ class DsaGraphVariants:
             max_kv_len = int(forward_batch.seq_lens.max().item())
         else:
             # No length info: be safe and use the correct-for-all sparse graph.
-            return "sparse"
-        return "dense" if max_kv_len <= self.index_topk else "sparse"
+            return DSA_SPARSE
+        return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
@@ -53,5 +48,12 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
     from sglang.srt.utils import is_hip
 
     if is_hip() and is_deepseek_dsa(hf_config):
-        return DsaGraphVariants(get_dsa_index_topk(hf_config))
+        index_topk = get_dsa_index_topk(hf_config)
+        logger.info(
+            "[dense-decode] DSA dual-graph enabled: capturing "
+            "dense (k-only) + sparse (full indexer) decode graphs; "
+            "dispatch on max_kv_len vs index_topk=%d.",
+            index_topk,
+        )
+        return DsaGraphVariants(index_topk)
     return None

@@ -248,8 +248,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
-        del forward, stream_idx, variant_label
+        del forward, stream_idx, variant_label, attention_variant
         buffers = self.buffers
         request_bs = size
         expanded_bs = request_bs * self.captured_req_width

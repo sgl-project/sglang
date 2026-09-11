@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_graph_dsa_split_op_surface,
 )
+from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -410,9 +411,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Decode/idle.
         if fb.forward_mode.is_decode_or_idle():
-            # Match the HIP-only gate in create_attention_graph_variants.
-            if not _is_hip:
-                return False
             if get_is_capture_mode():
                 # Graph replay freezes this branch; use the capture variant,
                 # not capture-time sequence lengths.
@@ -420,13 +418,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     get_capture_attention_variant,
                 )
 
-                variant = get_capture_attention_variant()
-                if variant == "dense":
-                    return True
-                if variant == "sparse":
-                    return False
-
                 # No variant means the full indexer path for any context length.
+                return get_capture_attention_variant() == DSA_DENSE
+            if not _is_hip:
                 return False
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
                 max_kv_len = int(fb.seq_lens_cpu.max().item())

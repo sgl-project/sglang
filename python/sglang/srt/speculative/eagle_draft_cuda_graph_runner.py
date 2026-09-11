@@ -344,6 +344,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers

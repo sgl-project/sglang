@@ -1099,18 +1099,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         num_tokens=bs * self.captured_req_width,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
-                        if attention_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
-                        else:
-                            self.capture_one_shape(
-                                bs,
-                                forward,
-                                stream_idx,
-                                variant_label,
-                                attention_variant,
-                            )
+                        self.capture_one_shape(
+                            bs,
+                            forward,
+                            stream_idx,
+                            variant_label,
+                            attention_variant,
+                        )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
