@@ -402,8 +402,8 @@ class Qwen3RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+# Temporal positions use `rotary_emb`; height and width use `rotary_emb_hw`.
 def _build_neo_unify_rope_tables(rotary_emb, rotary_emb_hw, indexes, x):
-    """Temporal positions use ``rotary_emb``; height and width use ``rotary_emb_hw``."""
     return (
         rotary_emb(x, indexes[0].unsqueeze(0)),
         rotary_emb_hw(x, indexes[1].unsqueeze(0)),
@@ -526,6 +526,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[tuple] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert self.config._attn_implementation == "eager"
@@ -547,7 +548,7 @@ class Qwen3Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
-            hidden_states, indexes, kwargs.pop("rope_tables", None)
+            hidden_states, indexes, rope_tables
         )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
@@ -688,6 +689,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[tuple] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
@@ -720,7 +722,7 @@ class Qwen3Attention(nn.Module):
 
         # RoPE
         (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
-            hidden_states, indexes, kwargs.pop("rope_tables", None)
+            hidden_states, indexes, rope_tables
         )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
@@ -872,6 +874,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[tuple] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
@@ -881,6 +884,7 @@ class Qwen3Attention(nn.Module):
                 attention_mask,
                 past_key_values,
                 cache_position,
+                rope_tables=rope_tables,
                 **kwargs,
             )
         if not exist_non_image_gen_tokens and exist_image_gen_tokens:
@@ -890,6 +894,7 @@ class Qwen3Attention(nn.Module):
                 attention_mask,
                 past_key_values,
                 cache_position,
+                rope_tables=rope_tables,
                 **kwargs,
             )
 
@@ -995,7 +1000,7 @@ class Qwen3Attention(nn.Module):
         value_states = value_states.view(hidden_shape).transpose(1, 2)
 
         (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
-            hidden_states, indexes, kwargs.pop("rope_tables", None)
+            hidden_states, indexes, rope_tables
         )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
@@ -1099,6 +1104,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[tuple] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -1115,6 +1121,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            rope_tables=rope_tables,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1138,6 +1145,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[tuple] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -1154,6 +1162,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            rope_tables=rope_tables,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1178,6 +1187,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[tuple] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
@@ -1192,6 +1202,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
                 past_key_values,
                 use_cache,
                 cache_position,
+                rope_tables=rope_tables,
                 **kwargs,
             )
         if not exist_non_image_gen_tokens and exist_image_gen_tokens:
@@ -1206,6 +1217,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
                 past_key_values,
                 use_cache,
                 cache_position,
+                rope_tables=rope_tables,
                 **kwargs,
             )
 
@@ -1240,6 +1252,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            rope_tables=rope_tables,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1320,6 +1333,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[tuple] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
 
@@ -1398,16 +1412,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # RoPE depends only on `indexes`, which is fixed for every layer of this
-        # forward, so build the tables once instead of once per layer.
+        # RoPE depends only on `indexes`, so one build serves every layer of this
+        # forward.
         layers = self.layers[: self.config.num_hidden_layers]
-        first_attn = layers[0].self_attn
-        rope_tables = _build_neo_unify_rope_tables(
-            first_attn.rotary_emb,
-            first_attn.rotary_emb_hw,
-            indexes,
-            hidden_states,
-        )
+        if rope_tables is None:
+            first_attn = layers[0].self_attn
+            rope_tables = _build_neo_unify_rope_tables(
+                first_attn.rotary_emb,
+                first_attn.rotary_emb_hw,
+                indexes,
+                hidden_states,
+            )
 
         for decoder_layer in layers:
             hidden_states = decoder_layer(

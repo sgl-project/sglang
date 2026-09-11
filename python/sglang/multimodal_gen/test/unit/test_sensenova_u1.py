@@ -944,36 +944,50 @@ def test_sensenova_u1_attention_reuses_passed_rope_tables(monkeypatch):
     assert attn._resolve_rope_tables(x, indexes, shared) is shared
 
 
-def test_sensenova_u1_model_shares_rope_tables_with_every_layer(monkeypatch):
-    """Guards the wiring from the model loop down to attention.
+@pytest.mark.parametrize("image_gen", [True, False], ids=["gen", "und"])
+def test_sensenova_u1_model_builds_once_and_shares_with_every_layer(
+    monkeypatch, image_gen
+):
+    """One build per forward, reaching every layer on both dispatch paths.
 
-    A dropped kwarg anywhere in that chain leaves every output correct, so
-    without this case the sharing could stop happening unnoticed.
+    Guards the optimization itself: a dropped link, or a build moved back inside
+    the layer loop, leaves every output correct, so only the call count notices.
     """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+        modeling_qwen3,
+    )
     from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
         Qwen3Attention,
         Qwen3Model,
     )
 
     model = Qwen3Model(_tiny_dense_config()).eval()
-    seen = []
-    original = Qwen3Attention._resolve_rope_tables
+    received = []
+    builds = []
+    original_build = modeling_qwen3._build_neo_unify_rope_tables
+    original_resolve = Qwen3Attention._resolve_rope_tables
+
+    def counting_build(*args, **kwargs):
+        builds.append(1)
+        return original_build(*args, **kwargs)
 
     def spy(self, hidden_states, indexes, rope_tables):
-        seen.append(rope_tables is not None)
-        return original(self, hidden_states, indexes, rope_tables)
+        received.append(rope_tables is not None)
+        return original_resolve(self, hidden_states, indexes, rope_tables)
 
+    monkeypatch.setattr(modeling_qwen3, "_build_neo_unify_rope_tables", counting_build)
     monkeypatch.setattr(Qwen3Attention, "_resolve_rope_tables", spy)
     with torch.no_grad():
         model(
             inputs_embeds=torch.randn(1, 5, _HIDDEN_DIM),
-            image_gen_indicators=torch.ones(1, 5, dtype=torch.bool),
+            image_gen_indicators=torch.full((1, 5), image_gen, dtype=torch.bool),
             indexes=torch.zeros(3, 5, dtype=torch.long),
             attention_mask={"full_attention": None},
         )
 
-    assert len(seen) == _LAYERS, f"attention ran {len(seen)} times, want {_LAYERS}"
-    assert all(seen), f"layers that had to rebuild their own tables: {seen}"
+    assert builds == [1], f"rope tables built {len(builds)} times, want 1"
+    assert len(received) == _LAYERS, f"attention ran {len(received)} times"
+    assert all(received), f"layers that had to rebuild: {received}"
 
 
 def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
@@ -1015,34 +1029,3 @@ def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
     per_layer = run()
 
     assert torch.equal(shared, per_layer)
-
-
-def test_sensenova_u1_rope_tables_reach_the_understanding_path(monkeypatch):
-    """`forward_und` has its own pop site, so the gen-path cases do not cover it.
-
-    All-zeros indicators select the understanding path used by the text prefix.
-    """
-    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
-        Qwen3Attention,
-        Qwen3Model,
-    )
-
-    model = Qwen3Model(_tiny_dense_config()).eval()
-    seen = []
-    original = Qwen3Attention._resolve_rope_tables
-
-    def spy(self, hidden_states, indexes, rope_tables):
-        seen.append(rope_tables is not None)
-        return original(self, hidden_states, indexes, rope_tables)
-
-    monkeypatch.setattr(Qwen3Attention, "_resolve_rope_tables", spy)
-    with torch.no_grad():
-        model(
-            inputs_embeds=torch.randn(1, 5, _HIDDEN_DIM),
-            image_gen_indicators=torch.zeros(1, 5, dtype=torch.bool),
-            indexes=torch.zeros(3, 5, dtype=torch.long),
-            attention_mask={"full_attention": None},
-        )
-
-    assert len(seen) == _LAYERS, f"attention ran {len(seen)} times, want {_LAYERS}"
-    assert all(seen), f"layers that had to rebuild their own tables: {seen}"
