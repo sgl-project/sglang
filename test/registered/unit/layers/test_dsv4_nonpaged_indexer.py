@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import mqa_logits_row_bytes
 from sglang.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     C4IndexerBackendMixin,
@@ -279,7 +280,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
         )
-        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
+        metadata = SimpleNamespace(
+            nonpaged_plan=None, compressed_page_size=64, mqa_logits_budget_bytes=None
+        )
         page_table = torch.tensor([[3, 1]], dtype=torch.int32).repeat(query_rows, 1)
         c4_seq_lens = torch.tensor([62, 63, 64, 65], dtype=torch.int32)
 
@@ -314,6 +317,50 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         with threshold.override(0):
             self.assertIsNone(build_plan())
 
+    def test_plan_row_chunking_follows_the_forward_budget(self):
+        backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
+        backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=512)
+        query_rows = 8192
+        seq_len = 372_000
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+            seq_lens_cpu=[seq_len],
+            extend_seq_lens_cpu=[query_rows],
+            extend_seq_lens=torch.tensor([query_rows], dtype=torch.int32),
+            extend_start_loc=torch.tensor([0], dtype=torch.int32),
+            extend_num_tokens=query_rows,
+        )
+        c4_seq_lens = torch.full((query_rows,), seq_len // 4, dtype=torch.int32)
+        page_table = torch.zeros((query_rows, 1), dtype=torch.int32)
+
+        def build_plan(budget):
+            metadata = SimpleNamespace(
+                nonpaged_plan=None,
+                compressed_page_size=64,
+                mqa_logits_budget_bytes=budget,
+            )
+            return C4IndexerBackendMixin._get_nonpaged_indexer_plan(
+                backend,
+                c4_indexer=c4_indexer,
+                forward_batch=batch,
+                indexer_metadata=metadata,
+                page_table=page_table,
+                c4_seq_lens=c4_seq_lens,
+                query_rows=query_rows,
+            )
+
+        # No budget measured this forward (small batch or graph): one call.
+        self.assertIsNone(build_plan(None).rows_per_chunk)
+        budget = 512 << 20
+        plan = build_plan(budget)
+        # 8192 rows x align256(93056) cols x 4 B is far over 512 MiB.
+        self.assertIsNotNone(plan.rows_per_chunk)
+        self.assertLess(plan.rows_per_chunk, query_rows)
+        self.assertLessEqual(
+            plan.rows_per_chunk * mqa_logits_row_bytes(plan.max_seqlen_k), budget
+        )
+
     def test_extreme_plan_metadata_is_bounded_and_fail_closed(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
         backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
@@ -327,7 +374,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             extend_start_loc=torch.tensor([0], dtype=torch.int32),
             extend_num_tokens=query_rows,
         )
-        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
+        metadata = SimpleNamespace(
+            nonpaged_plan=None, compressed_page_size=64, mqa_logits_budget_bytes=None
+        )
         page_table = torch.zeros((query_rows, 1), dtype=torch.int32)
         c4_seq_lens = torch.tensor(
             [124_997, 124_998, 124_999, 125_000], dtype=torch.int32
@@ -365,7 +414,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=can_use_nonpaged_indexer)
         backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
         c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=512)
-        metadata = SimpleNamespace(nonpaged_plan=None, compressed_page_size=64)
+        metadata = SimpleNamespace(
+            nonpaged_plan=None, compressed_page_size=64, mqa_logits_budget_bytes=None
+        )
 
         def build_plan(query_rows):
             batch = SimpleNamespace(
@@ -429,12 +480,17 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         deep_gemm = SimpleNamespace(fp8_mqa_logits=MagicMock(return_value=expected))
 
         with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
-            actual = C4IndexerBackendMixin._forward_nonpaged_indexer(
-                q_indexer=q_indexer,
-                weights=weights,
+            kv = C4IndexerBackendMixin._gather_nonpaged_index_k(
                 c4_indexer=c4_indexer,
                 token_to_kv_pool=token_to_kv_pool,
                 plan=plan,
+            )
+            actual = C4IndexerBackendMixin._nonpaged_mqa_logits(
+                q_indexer=q_indexer,
+                weights=weights,
+                kv=kv,
+                plan=plan,
+                rows=slice(0, plan.query_rows),
             )
 
         self.assertIs(actual, expected)
