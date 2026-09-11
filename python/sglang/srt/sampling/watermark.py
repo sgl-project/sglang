@@ -908,6 +908,23 @@ class WatermarkState:
         self._record_contexts(req_pool_indices, context_hashes, selected)
 
     def append(self, req_pool_indices: torch.Tensor, token_ids: torch.Tensor) -> None:
+        if self.token_ids.is_cuda:
+            try:
+                from sglang.kernels.ops.sampling.textseal_selector import (
+                    append_watermark_tokens_triton,
+                )
+            except ImportError:
+                pass
+            else:
+                append_watermark_tokens_triton(
+                    self.token_ids,
+                    self.lengths,
+                    self.write_positions,
+                    req_pool_indices,
+                    token_ids,
+                )
+                return
+
         pool_indices = req_pool_indices.to(torch.int64)
         write_positions = self.write_positions[pool_indices]
         self.token_ids[pool_indices, write_positions] = token_ids.to(torch.int32)

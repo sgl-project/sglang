@@ -148,6 +148,31 @@ def _prepare_watermark_contexts_kernel(
 
 
 @triton.jit
+def _append_watermark_tokens_kernel(
+    token_history,
+    lengths,
+    write_positions,
+    req_pool_indices,
+    next_token_ids,
+    context_window: tl.constexpr,
+):
+    row = tl.program_id(0)
+    pool_index = tl.load(req_pool_indices + row).to(tl.int64)
+    write_position = tl.load(write_positions + pool_index)
+    next_token_id = tl.load(next_token_ids + row)
+    tl.store(
+        token_history + pool_index * context_window + write_position,
+        next_token_id.to(tl.int32),
+    )
+    tl.store(
+        write_positions + pool_index,
+        (write_position + 1) % context_window,
+    )
+    length = tl.load(lengths + pool_index)
+    tl.store(lengths + pool_index, tl.minimum(length + 1, context_window))
+
+
+@triton.jit
 def _watermark_force_partial_argmax_kernel(
     logits,
     sorted_probabilities,
@@ -340,6 +365,27 @@ def prepare_watermark_contexts_triton(
         max_contexts_per_req=max_contexts_per_req,
         HISTORY_BLOCK_SIZE=_HISTORY_BLOCK_SIZE,
         num_warps=8,
+    )
+
+
+def append_watermark_tokens_triton(
+    token_history: torch.Tensor,
+    lengths: torch.Tensor,
+    write_positions: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    next_token_ids: torch.Tensor,
+) -> None:
+    batch_size = req_pool_indices.shape[0]
+    if batch_size == 0:
+        return
+    _append_watermark_tokens_kernel[(batch_size,)](
+        token_history,
+        lengths,
+        write_positions,
+        req_pool_indices,
+        next_token_ids,
+        context_window=token_history.shape[1],
+        num_warps=1,
     )
 
 
