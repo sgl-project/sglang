@@ -273,34 +273,65 @@ pub async fn chat_completions(
     let request_tokens = request_value
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
-    let external_prefix = match (
-        ctx.prefix_index.as_ref(),
-        request_tokens.as_ref(),
-        ctx.block_size_oracle.get(),
-    ) {
-        (Some(index), Some(tokens), Some(block_size)) => {
+    let monitored_load = ctx.load_monitor.as_ref().map(|monitor| monitor.capture());
+    let external_prefix =
+        if let (Some(fleet), Some(tokens), Some(block_size), Some((_, generations))) = (
+            ctx.replica_fleet.as_ref(),
+            request_tokens.as_ref(),
+            ctx.block_size_oracle.get(),
+            monitored_load.as_ref(),
+        ) {
             let hashes = if ctx.block_size_oracle.is_bigram() {
                 compute_block_hashes_bigram(&tokens.ids, block_size as usize)
             } else {
                 compute_block_hashes(&tokens.ids, block_size as usize)
             };
             let query_blocks = hashes.len();
-            let outcome = if hashes.is_empty() {
-                sgl_kv_indexer::PrefixOutcome::Empty
-            } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
-            };
+            let urls: Vec<_> = workers.iter().map(|worker| worker.url.clone()).collect();
+            let outcome = fleet
+                .query(
+                    hashes,
+                    &model_str,
+                    block_size,
+                    ctx.block_size_oracle.is_bigram(),
+                    &urls,
+                    generations,
+                )
+                .await;
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
             })
-        }
-        _ => ctx
-            .radix_tree_prefix_provider
-            .as_ref()
-            .zip(request_tokens.as_ref())
-            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
-    };
+        } else {
+            match (
+                ctx.prefix_index.as_ref(),
+                request_tokens.as_ref(),
+                ctx.block_size_oracle.get(),
+            ) {
+                (Some(index), Some(tokens), Some(block_size)) => {
+                    let hashes = if ctx.block_size_oracle.is_bigram() {
+                        compute_block_hashes_bigram(&tokens.ids, block_size as usize)
+                    } else {
+                        compute_block_hashes(&tokens.ids, block_size as usize)
+                    };
+                    let query_blocks = hashes.len();
+                    let outcome = if hashes.is_empty() {
+                        sgl_kv_indexer::PrefixOutcome::Empty
+                    } else {
+                        resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+                    };
+                    Some(ExternalPrefixSignal {
+                        outcome,
+                        query_blocks,
+                    })
+                }
+                _ => ctx
+                    .radix_tree_prefix_provider
+                    .as_ref()
+                    .zip(request_tokens.as_ref())
+                    .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
+            }
+        };
 
     // Prefer exact ingress tokens; otherwise use the conservative estimate.
     let prefill_load = request_tokens
@@ -312,8 +343,9 @@ pub async fn chat_completions(
         || workers
             .iter()
             .any(|worker| worker.mode() == WorkerMode::Prefill);
-    let load_snapshot =
-        needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(std::time::Instant::now()));
+    let load_snapshot = monitored_load.map(|(snapshot, _)| snapshot).or_else(|| {
+        needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(std::time::Instant::now()))
+    });
     let needs_dispatch_timestamps = policy.needs_dispatch_timestamps();
     let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
         (

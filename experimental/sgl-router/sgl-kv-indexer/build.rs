@@ -14,6 +14,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .build_client(true)
         .build_server(true)
-        .compile_with_config(config, &["proto/kv_indexer.proto"], &["proto"])?;
+        .compile_with_config(
+            config,
+            &["proto/kv_indexer.proto", "proto/load_report.proto"],
+            &["proto"],
+        )?;
     Ok(())
 }

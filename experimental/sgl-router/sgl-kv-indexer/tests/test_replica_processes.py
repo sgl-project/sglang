@@ -5,6 +5,8 @@ PYTHONPATH=python .venv/bin/python -m pytest experimental/sgl-router/sgl-kv-inde
 """
 
 import importlib
+import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,8 @@ import socket
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
+from urllib.request import Request, urlopen
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -24,6 +28,7 @@ from sglang.srt.disaggregation.kv_events import (
     KVEventBatch,
     ZmqEventPublisher,
 )
+from sglang.srt.disaggregation.load_reporter import register_worker_reporting
 
 ROOT = Path(__file__).resolve().parents[4]
 CRATE = ROOT / "experimental/sgl-router/sgl-kv-indexer"
@@ -54,14 +59,33 @@ class Worker:
     def __init__(self, worker_id):
         self.worker_id = worker_id
         self.live, self.snapshot, self.replay = port(), port(), port()
+        self.load = SimpleNamespace(num_running_reqs=0, num_waiting_reqs=0,
+            num_used_tokens=0, max_total_num_tokens=100000, max_running_requests=100,
+            num_total_tokens=0, num_waiting_uncached_tokens=0)
+        self.load_stop = threading.Event()
         descriptor = self.descriptor()
+        worker = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"kv_events": descriptor}).encode())
+                self.wfile.write(json.dumps({"kv_events": descriptor, "served_model_name": "model", "model_path": "model", "dp_size": 1}).encode())
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+                if self.path == "/v1/start_reporting":
+                    args = SimpleNamespace(resolved_dict=lambda: {"kv_events_config": json.dumps({
+                        "publisher": "zmq", "worker_id": worker.worker_id,
+                        "snapshot_endpoint": f"tcp://*:{worker.snapshot}"}), "dp_size": 1})
+                    response = asyncio.run(register_worker_reporting(args, body))
+                else:
+                    response = {"id": worker.worker_id, "object": "chat.completion", "choices": [{"index": 0, "message": {"role": "assistant", "content": worker.worker_id}, "finish_reason": "stop"}]}
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(response).encode())
 
             def log_message(self, *args):
                 pass
@@ -71,6 +95,12 @@ class Worker:
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
         self.thread.start()
         self.start()
+        self.load_thread = threading.Thread(target=self.report_load, daemon=True)
+        self.load_thread.start()
+
+    def report_load(self):
+        while not self.load_stop.wait(0.1):
+            self.publisher.load_reporter.update(self.load)
 
     def descriptor(self):
         return {
@@ -101,6 +131,8 @@ class Worker:
         self.publisher._event_queue.join()
 
     def close(self):
+        self.load_stop.set()
+        self.load_thread.join()
         self.publisher.shutdown()
         self.http.shutdown()
         self.http.server_close()
@@ -191,6 +223,96 @@ def test_two_pairs_recover_restart_worker_and_scale_membership(tmp_path, pb):
         wait_for(lambda: not query(pairs[0], pb, workers).complete)
         assert query(pairs[1], pb, workers).complete
     finally:
+        for pair in pairs:
+            pair.close()
+        for worker in workers:
+            worker.close()
+
+
+def http_json(url, data=None):
+    request = Request(url, data=None if data is None else json.dumps(data).encode(),
+                      headers={"Content-Type": "application/json"})
+    with urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+
+def test_router_random_failover_all_down_restart_and_membership(tmp_path, pb):
+    workers = [Worker("cached"), Worker("idle")]
+    workers[0].load.num_running_reqs = 5
+    pairs = []
+    router = None
+    router_log = open(tmp_path / "router.log", "w+")
+    try:
+        from tokenizers import Tokenizer
+        tokenizer_path = ROOT / "experimental/sgl-router/tests/fixtures/tiny_tokenizer.json"
+        prompt = "hello world " * 128
+        ids = Tokenizer.from_file(str(tokenizer_path)).encode(prompt).ids
+        hashes = []
+        previous = ""
+        for start in range(0, len(ids) - 3, 4):
+            # Worker hash parity is covered by the existing fixture suite.
+            digest = hashlib.sha256()
+            if previous:
+                digest.update(bytes.fromhex(previous))
+            for token in ids[start:start + 4]:
+                digest.update(int(token).to_bytes(4, "little", signed=False))
+            previous = digest.hexdigest()
+            hashes.append(int.from_bytes(bytes.fromhex(previous)[:8], "big", signed=True))
+        workers[0].store(hashes)
+        pairs = [Pair(tmp_path, workers, pb, f"routing-{i}") for i in range(2)]
+        endpoints = tmp_path / "indexers.json"
+        endpoints.write_text(json.dumps([f"http://{pair.endpoint}" for pair in pairs]))
+        router_port, load_port = port(), port()
+        url = f"http://127.0.0.1:{router_port}"
+        router = subprocess.Popen([BIN / "sgl-router", "--model-id", "model", "--tokenizer-path", str(tokenizer_path),
+            "--worker-urls", *[w.url for w in workers], "--policy", "cache_aware", "--cache-prefix-provider", "indexer",
+            "--kv-indexer-endpoint", f"@{endpoints}", "--port", str(router_port),
+            "--cache-affinity-min-matched-tokens", "0", "--cache-candidate-min-workers", "1", "--cache-candidate-max-workers", "1"],
+            env={**os.environ, "SGL_ROUTER_LOAD_LISTEN_ADDR": f"127.0.0.1:{load_port}",
+                 "RUST_LOG": "info,sgl_kv_indexer::fleet=debug"}, stdout=router_log, stderr=router_log)
+        body = {"model": "model", "prompt": prompt, "max_tokens": 1}
+        def request():
+            assert router.poll() is None, (tmp_path / "router.log").read_text()
+            return http_json(url + "/v1/chat/completions", body)
+        def ready_request():
+            result = request()
+            with urlopen(url + "/metrics", timeout=5) as response:
+                metrics = response.read().decode()
+            count = next((int(line.split()[1]) for line in metrics.splitlines()
+                          if line.startswith("sgl_router_indexer_complete_queries_total ")), 0)
+            return count > 0 and result["id"] == "cached"
+        wait_for(ready_request)
+        assert all(request()["id"] == "cached" for _ in range(30))
+        router_log.flush()
+        log = (tmp_path / "router.log").read_text()
+        for pair in pairs:
+            assert pair.endpoint in log, "both randomly selected replicas must be exercised"
+        pairs[0].server.kill()
+        pairs[0].server.wait(timeout=5)
+        assert all(request()["id"] == "cached" for _ in range(10))
+        pairs[1].server.kill()
+        pairs[1].server.wait(timeout=5)
+        assert all(request()["id"] == "idle" for _ in range(5)), "all down must use fresh minimum load"
+        pairs[0].start_server()
+        wait_for(lambda: request()["id"] == "cached")
+        pairs.append(Pair(tmp_path, workers, pb, "routing-scale-out"))
+        endpoints.write_text(json.dumps([f"http://{pairs[2].endpoint}"]))
+        wait_for(lambda: request()["id"] == "cached")
+        time.sleep(2.5)
+        pairs[0].server.kill()
+        pairs[0].server.wait(timeout=5)
+        assert all(request()["id"] == "cached" for _ in range(10))
+        endpoints.write_text("[]")
+        wait_for(lambda: request()["id"] == "idle")
+        # An invalid discovery update preserves the last valid (empty) fleet.
+        endpoints.write_text("invalid-json")
+        time.sleep(2.1)
+        assert request()["id"] == "idle"
+    finally:
+        if router and router.poll() is None:
+            router.terminate()
+            router.wait(timeout=10)
+        router_log.close()
         for pair in pairs:
             pair.close()
         for worker in workers:

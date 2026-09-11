@@ -73,6 +73,24 @@ impl ReplicaService {
             .max_encoding_message_size(MAX_GRPC_DECODING_MESSAGE_SIZE)
     }
 
+    /// Lease-expired streams are hidden immediately by queries; reclaim their
+    /// soft state after a further lease so removed Workers do not accumulate.
+    pub fn reap_expired(&self) -> Result<usize, Status> {
+        let mut state = self.lock()?;
+        let expired: Vec<_> = state
+            .streams
+            .iter()
+            .filter(|(_, stream)| stream.touched.elapsed() >= self.lease.saturating_mul(2))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &expired {
+            if let Some(stream) = state.streams.remove(key) {
+                remove_flat(&mut state.flat, key, &stream.holdings);
+            }
+        }
+        Ok(expired.len())
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, State>, Status> {
         self.state
             .lock()
@@ -513,10 +531,11 @@ impl KvReplica for ReplicaService {
                 scanner.push((!block.tier_masks.is_empty()).then_some(&block));
             }
             if scanner.prefix() > 0 {
-                response.matches.push(ExternalKvPrefixMatch {
+                response.matches.push(ReplicaPrefixMatch {
                     worker_address: descriptor.worker_address.clone(),
                     matched_prefix_blocks: scanner.prefix(),
                     worker_id: eligible.worker_id.clone(),
+                    dp_rank: eligible.dp_rank,
                 });
             }
         }

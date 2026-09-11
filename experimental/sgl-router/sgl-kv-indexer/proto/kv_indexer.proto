@@ -285,8 +285,15 @@ message ReplicaPrefixRequest {
   uint32 max_blocks = 8;
 }
 
+message ReplicaPrefixMatch {
+  string worker_address = 1;
+  uint32 matched_prefix_blocks = 2;
+  string worker_id = 3;
+  uint32 dp_rank = 4;
+}
+
 message ReplicaPrefixResponse {
-  repeated ExternalKvPrefixMatch matches = 1;
+  repeated ReplicaPrefixMatch matches = 1;
   repeated StreamCoverage coverage = 2;
   bool complete = 3;
 }

@@ -20,6 +20,7 @@ KV caching events
 import atexit
 import enum
 import logging
+import json
 import queue
 import threading
 import time
@@ -542,6 +543,11 @@ class ZmqEventPublisher(EventPublisher):
         self._page_size = page_size
         self._is_bigram = is_bigram
         self._cache_spec = cache_spec
+        self.load_reporter = None
+        if worker_id and snapshot_endpoint:
+            from sglang.srt.disaggregation.load_reporter import LoadReporter
+
+            self.load_reporter = LoadReporter(namespace, worker_id, self._dp_rank, self._epoch)
         self._topic_bytes = topic.encode("utf-8")
         # Preserve the exact legacy topic when snapshots are disabled. A
         # snapshot-capable publisher appends backward-compatible metadata to
@@ -612,6 +618,8 @@ class ZmqEventPublisher(EventPublisher):
         if not self._running:
             return
         self._running = False
+        if self.load_reporter is not None:
+            self.load_reporter.close()
         try:
             self._event_queue.put_nowait(None)
         except queue.Full:
@@ -681,7 +689,7 @@ class ZmqEventPublisher(EventPublisher):
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
             # A slow replica must never indefinitely stall the publisher.
-            self._replay.setsockopt(zmq.SNDTIMEO, 100)
+            self._replay.setsockopt(zmq.SNDTIMEO, 0)
             self._replay.setsockopt(zmq.SNDHWM, 64)
             logger.debug(
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
@@ -869,6 +877,15 @@ class ZmqEventPublisher(EventPublisher):
                 if not sock.poll(100):
                     continue
                 frames = sock.recv_multipart()
+                if len(frames) == 4 and frames[1] == b"" and frames[2] == b"start-reporting-v1":
+                    try:
+                        if self.load_reporter is None:
+                            raise ValueError("load reporting requires worker_id")
+                        identity = self.load_reporter.register(**json.loads(frames[3]))
+                        sock.send_multipart((frames[0], b"", b"registered", encoder.encode(identity)))
+                    except Exception as exc:
+                        self._send_snapshot_error(sock, frames[0], str(exc).encode())
+                    continue
                 if len(frames) != 3:
                     logger.warning("Invalid snapshot request: %s", frames)
                     continue

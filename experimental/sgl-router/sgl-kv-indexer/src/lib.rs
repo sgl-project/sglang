@@ -7,11 +7,15 @@
 
 pub mod bridge;
 pub mod client;
+pub mod fleet;
 pub mod replica;
 pub mod replica_bridge;
 
 pub mod pb {
     tonic::include_proto!("kv_indexer.v1");
+}
+pub mod load_pb {
+    tonic::include_proto!("kv_load.v1");
 }
 
 mod admission;

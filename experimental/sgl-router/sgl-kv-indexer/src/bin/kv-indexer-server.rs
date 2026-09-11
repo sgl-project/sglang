@@ -48,6 +48,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::time::Duration::from_millis(lease_ms),
         prefix_query_max_inflight,
     );
+    let collector = replica.clone();
+    let collector_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(lease_ms));
+        loop {
+            interval.tick().await;
+            if let Err(error) = collector.reap_expired() {
+                tracing::error!(%error, "stream reclamation failed");
+            }
+        }
+    });
 
     info!(
         %addr,
@@ -60,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .add_service(replica.into_server())
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
+    collector_task.abort();
 
     Ok(())
 }

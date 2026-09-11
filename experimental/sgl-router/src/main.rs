@@ -105,17 +105,25 @@ async fn main() -> Result<()> {
             .cache_aware
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::Indexer);
-    let prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>> = cache_aware_uses_indexer
+    let indexer_config = cache_aware_uses_indexer
         .then_some(cfg.model.cache_aware.as_ref())
         .flatten()
-        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
-        .map(|indexer| {
+        .and_then(|cache| cache.kv_indexer_endpoint.as_ref());
+    let replica_fleet = match indexer_config {
+        Some(indexer) => {
             let config = prefix_index_config(indexer);
-            sgl_kv_indexer::GrpcPrefixIndex::new(config)
-                .map(|index| Arc::new(index) as Arc<dyn sgl_kv_indexer::PrefixIndex>)
-                .context("configure KV Indexer client")
-        })
-        .transpose()?;
+            Some(Arc::new(
+                sgl_kv_indexer::fleet::ReplicaFleet::new(
+                    config.endpoint,
+                    config.query_deadline,
+                    config.max_inflight,
+                )
+                .await
+                .context("configure KV Indexer fleet")?,
+            ))
+        }
+        None => None,
+    };
 
     // Build the local prefix index and block metadata used by the Radix Tree
     // provider. An external Indexer only needs hash metadata, so it does not
@@ -125,7 +133,7 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .expect("default http client builds");
-    let kv_index = if prefix_index.is_some() {
+    let kv_index = if replica_fleet.is_some() {
         sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
             kv_event_http,
             Arc::clone(&block_size_oracle),
@@ -171,7 +179,7 @@ async fn main() -> Result<()> {
         .await
         .context("spawn discovery")?;
     let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> =
-        Some(Arc::clone(&kv_index));
+        replica_fleet.is_none().then(|| Arc::clone(&kv_index));
     let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
         event_rx,
         registry.clone(),
@@ -195,7 +203,37 @@ async fn main() -> Result<()> {
         policies,
         active_load,
     );
-    app_ctx.prefix_index = prefix_index;
+    let mut replica_tasks = Vec::new();
+    if let Some(fleet) = &replica_fleet {
+        let monitor = sgl_router::replica_control::RouterLoadMonitor::default();
+        let address = std::env::var("SGL_ROUTER_LOAD_LISTEN_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:50061".into());
+        let target = std::env::var("SGL_ROUTER_LOAD_ADVERTISE_URL")
+            .unwrap_or_else(|_| format!("http://{address}"));
+        let listener = tokio::net::TcpListener::bind(&address)
+            .await
+            .context("bind Router Load Monitor")?;
+        let service = monitor.clone().into_server();
+        replica_tasks.push(tokio::spawn(async move {
+            if let Err(error) = tonic::transport::Server::builder()
+                .max_concurrent_streams(4096)
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+            {
+                tracing::error!(%error, "Router Load Monitor stopped");
+            }
+        }));
+        replica_tasks.push(tokio::spawn(sgl_router::replica_control::run_control(
+            app_ctx.registry.clone(),
+            block_size_oracle.clone(),
+            fleet.clone(),
+            monitor.clone(),
+            target,
+        )));
+        app_ctx.load_monitor = Some(monitor);
+    }
+    app_ctx.replica_fleet = replica_fleet;
     app_ctx.radix_tree_prefix_provider = (cfg.model.policy == PolicyKind::CacheAware
         && cfg
             .model
@@ -232,6 +270,9 @@ async fn main() -> Result<()> {
     // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
+    for task in replica_tasks {
+        task.abort();
+    }
     janitor_handle.shutdown().await;
     server_result
 }

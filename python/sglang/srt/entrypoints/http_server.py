@@ -843,6 +843,21 @@ async def server_info():
     )
 
 
+@app.post("/v1/start_reporting")
+async def start_reporting(request: Request):
+    """Register or renew this Router's independent Worker load streams."""
+    from sglang.srt.disaggregation.load_reporter import register_worker_reporting
+
+    try:
+        return await register_worker_reporting(
+            _global_state.tokenizer_manager.server_args, await request.json()
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).
