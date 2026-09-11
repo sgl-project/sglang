@@ -2458,7 +2458,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-cache-mode`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Save captured CUDA graphs to <code>--cuda-graph-cache-dir</code> after capture (<code>save</code>), rebuild them from a matching artifact instead of capturing (<code>load</code>), or do whichever applies (<code>auto</code>). Default <code>off</code>. Draft: interfaces only; <code>save</code>/<code>load</code> fail loudly in this build. Resolved back to <code>off</code> with a logged reason for tc_piecewise phases, speculative decoding, pdmux, DP attention, DCP, DeepEP low-latency dispatch, LoRA, two-batch overlap and memory saver.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Save captured CUDA graphs to <code>--cuda-graph-cache-dir</code> after capture (<code>save</code>), rebuild them from a matching artifact instead of capturing (<code>load</code>), or whichever applies (<code>auto</code>). Default <code>off</code>. Draft: interfaces only; <code>save</code>/<code>load</code> fail loudly in this build.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`off`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>off</code>, <code>save</code>, <code>load</code>, <code>auto</code></td>
     </tr>
@@ -2467,18 +2467,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Directory for CUDA graph artifacts. Defaults to <code>$SGLANG_CACHE_DIR/cuda_graphs</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-cache-placement`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How saved device pointers are bound at load: patch every pointer word by region delta (<code>relocate</code>) or pin SGLang-owned regions at fixed virtual addresses with VMM arenas (<code>fixed_va</code>).</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`relocate`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>relocate</code>, <code>fixed_va</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-cache-verify`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Recapture one or every loaded shape and diff it node by node against the loaded graph.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`none`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>shadow-one</code>, <code>shadow-all</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-cudagraph-gc`</td>

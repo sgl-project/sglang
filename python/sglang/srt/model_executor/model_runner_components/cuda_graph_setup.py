@@ -29,12 +29,9 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
+from sglang.srt.model_executor.graph_serialization.loadstore import finish_graph_caches
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.model_runner_components.cuda_graph_serialization import (
-    finalize_graph_serialization,
-    plan_graph_serialization,
-)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )
@@ -56,28 +53,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.graph_serialization.plan import (
-        GraphSerializationPlan,
-    )
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
-
-
-def _runner_kwargs(plan: Optional[GraphSerializationPlan]) -> dict:
-    """Constructor keywords that carry an enabled graph-serialization plan to
-    a CUDA graph runner (design section 6.8: the materializer is set from the
-    plan, never from a second config read).
-
-    A disabled or absent plan passes nothing, so platform, custom and
-    out-of-tree runner classes with a bare ``(model_runner)`` constructor keep
-    working and resolve to capture-only. ``plan_graph_serialization`` enables
-    a plan only on a CUDA target worker, whose runners accept the keyword.
-    """
-    if plan is not None and plan.enabled:
-        return {"graph_serialization_plan": plan}
-    return {}
 
 
 def _align_pipeline_layers(layers: list, layer_model) -> list:
@@ -201,9 +180,6 @@ def capture_cuda_graphs(
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
     eager_runner = EagerRunner(model_runner)
-    plan = plan_graph_serialization(
-        device=model_runner.device, is_draft_worker=model_runner.is_draft_worker
-    )
 
     if model_runner.is_draft_worker:
         moe_runner_backend = (
@@ -259,9 +235,7 @@ def capture_cuda_graphs(
     # eager buffer allocated above. (capture_prefill_graph routes prefill
     # to the eager runner when the prefill graph is disabled.)
     prefill = capture_prefill_graph(
-        model_runner=model_runner,
-        eager_runner=eager_runner,
-        graph_serialization_plan=plan,
+        model_runner=model_runner, eager_runner=eager_runner
     )
 
     decode_phase = "draft_decode" if model_runner.is_draft_worker else "decode"
@@ -273,15 +247,11 @@ def capture_cuda_graphs(
     )
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(
-                model_runner=model_runner, graph_serialization_plan=plan
-            )
+            decode = capture_decode_graph(model_runner=model_runner)
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
-            decode = capture_decode_graph(
-                model_runner=model_runner, graph_serialization_plan=plan
-            )
+            decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -290,9 +260,8 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
-    finalize_graph_serialization(
-        plan, prefill_runner=prefill.runner, decode_runner=decode.runner
-    )
+    # save or restore CUDA graph artifacts; a no-op with --cuda-graph-cache-mode off
+    finish_graph_caches(prefill.runner, decode.runner)
 
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
@@ -321,13 +290,8 @@ def capture_prefill_graph(
     model_runner: ModelRunner,
     eager_runner: EagerRunner,
     force_for_draft_worker: bool = False,
-    graph_serialization_plan: Optional[GraphSerializationPlan] = None,
 ) -> GraphCapture:
-    """Initialize a prefill graph and return its startup resource usage.
-
-    ``graph_serialization_plan`` is the plan ``capture_cuda_graphs`` resolved;
-    an enabled one reaches the runner's constructor (see ``_runner_kwargs``).
-    """
+    """Initialize a prefill graph and return its startup resource usage."""
 
     memory_phase = "draft_prefill" if model_runner.is_draft_worker else "prefill"
 
@@ -518,9 +482,7 @@ def capture_prefill_graph(
         f"avail mem={before_mem:.2f} GB"
     )
 
-    prefill_runner = PrefillCudaGraphRunner(
-        model_runner, **_runner_kwargs(graph_serialization_plan)
-    )
+    prefill_runner = PrefillCudaGraphRunner(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     mem_usage = before_mem - after_mem
@@ -533,16 +495,8 @@ def capture_prefill_graph(
     return result(prefill_runner, mem_usage, capture_time)
 
 
-def capture_decode_graph(
-    *,
-    model_runner: ModelRunner,
-    graph_serialization_plan: Optional[GraphSerializationPlan] = None,
-) -> GraphCapture:
-    """Capture device graphs.
-
-    ``graph_serialization_plan`` is the plan ``capture_cuda_graphs`` resolved;
-    an enabled one reaches the runner's constructor (see ``_runner_kwargs``).
-    """
+def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
+    """Capture device graphs."""
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
     elif model_runner.spec_algorithm.is_speculative():
@@ -603,10 +557,9 @@ def capture_decode_graph(
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
-    runner_kwargs = _runner_kwargs(graph_serialization_plan)
     if current_platform.is_out_of_tree():
         GraphRunnerCls = current_platform.get_graph_runner_cls()
-        runner = GraphRunnerCls(model_runner, **runner_kwargs)
+        runner = GraphRunnerCls(model_runner)
     else:
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
@@ -616,7 +569,7 @@ def capture_decode_graph(
                 "xpu": XPUGraphRunner,
             },
         )
-        runner = graph_runners[model_runner.device](model_runner, **runner_kwargs)
+        runner = graph_runners[model_runner.device](model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem

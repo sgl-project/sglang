@@ -22,11 +22,6 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from sglang.srt.model_executor.graph_serialization.materializer import (
-    CaptureOnlyMaterializer,
-    GraphMaterializer,
-    ShapePlan,
-)
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -38,6 +33,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.graph_serialization.loadstore import GraphCache
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
@@ -123,12 +119,8 @@ class BaseCudaGraphRunner(BaseRunner):
         capture_one_shape for each.
       - capture_one_shape(size, ...) — drive one model forward at this
         shape into the backend's captured artifact.
-      - materialize_shape(shape_key, forward_fn, ...) — the one seam
-        between capture_one_shape and the backend: packs a ShapePlan and
-        hands it to the materializer (design section 6.8).
-      - materializer_or_capture_only() — the materializer capture() drives:
-        plan(self) before the shape loop and session(stream) around it; a
-        runner that never resolved one is capture-only.
+      - materialize_shape(shape_key, forward_fn, ...) — the one seam between
+        capture_one_shape and the backend: capture, or load a saved graph.
       - _pad_to_bucket(...) — round a raw shape up to the nearest captured
         bucket.
 
@@ -136,17 +128,15 @@ class BaseCudaGraphRunner(BaseRunner):
     can_run_graph / load_batch / execute.
 
     Notes:
-      - buffers, backend and materializer are populated by the subclass
+      - buffers, backend and graph_cache are populated by the subclass
         before capture(); the base only declares them.
     """
 
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
-    # Resolved right after ``backend`` from the plan cuda_graph_setup threads
-    # through the constructor (design section 6.8); a None or disabled plan
-    # gives a CaptureOnlyMaterializer.
-    materializer: GraphMaterializer
+    # The capture-or-load seam over ``backend`` (design section 6.8).
+    graph_cache: GraphCache
 
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
@@ -172,44 +162,17 @@ class BaseCudaGraphRunner(BaseRunner):
         *,
         capture_inputs: Any = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
-        event_roles: Optional[Dict[str, Any]] = None,
+        events: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """The one seam between per-shape preparation and the backend
-        (design section 6.1 decision 5, section 6.8).
-
-        Packs what ``capture_one_shape`` prepared into a ``ShapePlan`` and
-        hands it to the materializer, which captures (``off``, the default,
-        is exactly ``backend.capture_one``) or imports / exports per its
-        verdict. ``event_roles`` maps a role such as ``metadata_prep_done``
-        to the live external event the graph records (facts 15 and 18);
-        ``None`` means the graph records no external event.
-        """
-        self.materializer.materialize(
-            ShapePlan(
-                shape_key=shape_key,
-                forward_fn=forward_fn,
-                capture_inputs=capture_inputs,
-                post_warmup_hook=post_warmup_hook,
-                event_roles=event_roles or {},
-            )
+        """The one seam between capture_one_shape and the backend (design
+        section 6.8): capture, or load when a saved graph exists."""
+        self.graph_cache.materialize(
+            shape_key,
+            forward_fn,
+            capture_inputs=capture_inputs,
+            post_warmup_hook=post_warmup_hook,
+            events=events,
         )
-
-    def materializer_or_capture_only(self) -> GraphMaterializer:
-        """``self.materializer``, or a :class:`CaptureOnlyMaterializer` over
-        ``self.backend`` installed on first use for a runner that never
-        resolved one.
-
-        ``capture`` drives the materializer through this: ``plan(self)``
-        before the shape loop, ``session(stream)`` around it (design section
-        6.8). The speculative runners reuse ``DecodeCudaGraphRunner.capture``
-        without its ``__init__`` and stay capture-only in v1 (design section
-        9.3), so their path is unchanged.
-        """
-        materializer = getattr(self, "materializer", None)
-        if materializer is None:
-            materializer = CaptureOnlyMaterializer(self.backend)
-            self.materializer = materializer
-        return materializer
 
     @abstractmethod
     def capture_prepare(self, size: int, *args, **kwargs) -> Any: ...

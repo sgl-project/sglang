@@ -88,9 +88,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     prefill_graph_tolerates_sum_len,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.graph_serialization.materializer import (
-    keeps_raw_graphs,
-    resolve_materializer,
+from sglang.srt.model_executor.graph_serialization.loadstore import (
+    GraphCache,
+    graph_cache_dir,
+    graph_cache_mode,
 )
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
@@ -145,9 +146,6 @@ from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.model_executor.graph_serialization.plan import (
-        GraphSerializationPlan,
-    )
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -286,12 +284,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
-    def __init__(
-        self,
-        model_runner: ModelRunner,
-        *,
-        graph_serialization_plan: Optional[GraphSerializationPlan] = None,
-    ):
+    def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
             backend = get_exec().graph.cuda_graph_config.prefill.backend
             assert backend == Backend.BREAKABLE, (
@@ -299,10 +292,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"graph backend; got '{backend}'."
             )
         super().__init__(model_runner)
-        # The graph-serialization plan cuda_graph_setup resolved (design
-        # section 13); None for a runner built outside that lifecycle, which
-        # is capture-only.
-        self.graph_serialization_plan = graph_serialization_plan
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -431,13 +420,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_v2_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        mode = graph_cache_mode(self.model_runner)
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
-            # keep_graph exactly when the plan is enabled (design section 6.7).
-            self.backend = resolve_prefill_backend(
-                self, keep_graph=keeps_raw_graphs(graph_serialization_plan)
-            )
+            self.backend = resolve_prefill_backend(self, keep_graph=mode != "off")
         except RuntimeError as e:
             if self.prefill_backend_name != Backend.TC_PIECEWISE:
                 raise
@@ -445,9 +432,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"Capture prefill CUDA graph failed: {e}\n"
                 f"{prefill_failure_msg(self.prefill_backend_name)}"
             ) from e
-        # Per-shape capture-versus-import seam (design section 6.8); a None or
-        # disabled plan resolves to CaptureOnlyMaterializer.
-        self.materializer = resolve_materializer(self, graph_serialization_plan)
+        self.graph_cache = GraphCache(
+            self.backend,
+            mode=mode,
+            cache_dir=graph_cache_dir() if mode != "off" else None,
+            runner_name="prefill",
+        )
 
         self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
         if self._is_full_backend:
@@ -1424,40 +1414,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
-    def planned_shape_keys(self) -> list[ShapeKey]:
-        """Every ``ShapeKey`` ``capture`` will hand to ``materialize_shape``, in
-        capture order (design section 6.8): the token buckets largest first,
-        each followed by its chunked-prefix variants exactly as
-        ``_capture_one_stream`` iterates them. Forward-free, so the
-        materializer can agree per-shape verdicts across ranks before the
-        shape loop (design section 6.1 decision 4).
-        """
-        keys: list[ShapeKey] = []
-        for num_tokens in reversed(self.capture_num_tokens):
-            keys.append(ShapeKey(size=num_tokens))
-            if self._capture_chunked_prefix:
-                keys.extend(
-                    ShapeKey(size=num_tokens, variant_label=_chunked_prefix_variant(n))
-                    for n in self._prefix_capture_variants
-                )
-        return keys
-
     def capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        # Agree per-shape verdicts across ranks before any shape runs (design
-        # section 6.1 decision 4, section 6.8). For the default path's
-        # CaptureOnlyMaterializer plan() is a no-op and session() is exactly
-        # backend.capture_session.
-        materializer = self.materializer_or_capture_only()
-        materializer.plan(self)
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture(
                 stream=get_or_create_global_graph_capture_stream()
             ) as graph_capture_context:
                 self.stream = graph_capture_context.stream
-                with materializer.session(self.stream):
+                with self.backend.capture_session(self.stream):
                     self._capture_one_stream()
 
     def _capture_one_stream(self) -> None:

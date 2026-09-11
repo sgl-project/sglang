@@ -62,10 +62,10 @@ def resolve_decode_backend(
     NPU device returns NPUCudaGraphBackend regardless of mode (only
     the Full-style backend is wired for NPU today).
 
-    ``keep_graph`` is ``keeps_raw_graphs(plan)`` from the runner's
-    graph-serialization plan: the Full backend then keeps every captured
-    ``CUgraph`` so ``export_shape`` can encode it (design section 6.7). The
-    other backends do not serialize in this draft and ignore it.
+    ``keep_graph``: the runner passes ``True`` when its ``GraphCache`` is
+    enabled; the Full backend then keeps every captured ``CUgraph`` so
+    ``export_shape`` can encode it (design section 6.7). The other backends
+    do not serialize in this draft and ignore it.
     """
     model_runner = cuda_graph_runner.model_runner
     cfg = get_exec().graph.cuda_graph_config
@@ -120,9 +120,7 @@ def resolve_prefill_backend(
 ) -> BaseCudaGraphBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend'].
 
-    ``keep_graph`` is ``keeps_raw_graphs(plan)`` from the runner's
-    graph-serialization plan; only the Full backend acts on it (design
-    section 6.7).
+    ``keep_graph``: see :func:`resolve_decode_backend`.
     """
     model_runner = cuda_graph_runner.model_runner
     cfg = get_exec().graph.cuda_graph_config

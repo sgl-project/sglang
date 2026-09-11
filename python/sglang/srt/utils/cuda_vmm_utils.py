@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from functools import cache
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -1227,251 +1227,60 @@ class VmmGraphInputManager:
 
 
 # --------------------------------------------------------------------------
-# Fixed-address arenas for CUDA graph serialization
-# (DESIGN_cuda_graph_serialization.md sections 6.4, 7.2 and 10; facts 7, 13).
+# Fixed-address arena for CUDA graph serialization
+# (DESIGN_cuda_graph_serialization.md sections 6.4 and 7.2; facts 7, 13).
 # --------------------------------------------------------------------------
-
-# Physical backing is committed in chunks of this size (design section 6.4:
-# "commits 2 MiB chunks on demand"), rounded up to the device granularity.
-_FIXED_ARENA_DEFAULT_CHUNK_BYTES = 2 << 20
 
 
 class FixedArenaCollision(RuntimeError):
     """``cuMemAddressReserve`` honoured the size but not the requested base.
 
     A collision returns ``CUDA_SUCCESS`` with a different address (fact 7), so
-    :class:`FixedArena` compares ``base == requested_address`` itself and
-    raises this after freeing the misplaced reservation. The caller (the
-    ``fixed_va`` placement policy) degrades the affected kind to ``RELOCATE``.
+    :class:`FixedArena` compares ``base == requested_address`` itself. The
+    ``FIXED_VA`` placement degrades the affected kind to ``RELOCATE``.
     """
 
 
 class FixedArena:
-    """VA reservation at a REQUESTED base (facts 7, 13). Asserts base == request.
+    """VA reservation at a REQUESTED base for ``Placement.FIXED_VA``.
 
-    ``cuMemAddressReserve`` at a requested address in
-    ``0x6000_0000_0000..0x7f00_0000_0000`` is deterministic in fresh processes
-    and after torch has initialized (fact 7); this arena owns one such
-    reservation, commits physical chunks lazily through ``VmmReservation.map``
-    and exposes the committed extents as a ``torch.cuda.MemPool`` built from a
-    ``BumpArenaStub`` with ``no_split=True`` -- the configuration that produced
-    byte-identical addresses across processes (fact 13).
+    Owns one ``cuMemAddressReserve`` at ``requested_address`` (deterministic in
+    ``0x6000_0000_0000..0x7f00_0000_0000`` in a fresh process, fact 7), commits
+    physical chunks lazily and exposes the committed extents as a
+    ``torch.cuda.MemPool`` over a ``BumpArenaStub`` with ``no_split=True``, the
+    configuration that produced byte-identical addresses across processes
+    (fact 13). Commit is never eager: a pre-mapped arena would silently shrink
+    the KV budget the memory profiler sees (design section 6.4).
 
-    Commit is never eager: a pre-mapped arena would silently shrink the KV
-    budget the memory profiler sees (design section 6.4). ``export_chunks`` and
-    ``map_existing_chunks`` are the seams for the ``vmm_fd`` weight transport
-    (design section 10): the daemon exports chunk handles, the client maps them
-    at the saved base.
+    Interface only in this draft; constructed by
+    ``graph_serialization.memory.reserve_fixed_arenas`` once ``FIXED_VA`` lands.
     """
 
     def __init__(
-        self,
-        *,
-        device_id: int,
-        size: int,
-        requested_address: int,
-        name: str = "",
-        chunk_bytes: Optional[int] = None,
+        self, *, device_id: int, size: int, requested_address: int, name: str = ""
     ) -> None:
-        self.device_id = int(device_id)
-        self.requested_address = int(requested_address)
-        self.name = name or f"fixed_arena@{self.requested_address:#x}"
-        if int(size) <= 0:
-            raise ValueError(
-                f"FixedArena[{self.name}]: size must be positive, got {size}"
-            )
-        if self.requested_address <= 0:
-            raise ValueError(
-                f"FixedArena[{self.name}]: requested_address must be a positive "
-                "address; 0 lets the driver choose and defeats pinning"
-            )
-        prop = make_device_allocation_prop(self.device_id)
-        self.granularity = int(get_device_granularity(self.device_id))
-        chunk = (
-            _FIXED_ARENA_DEFAULT_CHUNK_BYTES
-            if chunk_bytes is None
-            else int(chunk_bytes)
+        raise NotImplementedError(
+            "FixedArena: cuMemAddressReserve at a requested base is not implemented "
+            "in this draft; see DESIGN_cuda_graph_serialization.md section 7.2"
         )
-        if chunk <= 0:
-            raise ValueError(
-                f"FixedArena[{self.name}]: chunk_bytes must be positive, got {chunk}"
-            )
-        self.chunk_bytes = align_up(chunk, self.granularity)
-        if self.requested_address % self.granularity != 0:
-            raise ValueError(
-                f"FixedArena[{self.name}]: requested_address "
-                f"{self.requested_address:#x} is not aligned to the allocation "
-                f"granularity ({self.granularity} bytes)"
-            )
-        self.size = align_up(int(size), self.chunk_bytes)
-
-        reservation = VmmReservation(
-            self.size,
-            prop,
-            self.device_id,
-            alignment=self.granularity,
-            requested_address=self.requested_address,
-        )
-        if int(reservation.base) != self.requested_address:
-            got = int(reservation.base)
-            # Free the misplaced VA before reporting: the caller will fall back
-            # to relocation and must not leak a reservation per attempt.
-            reservation.close()
-            raise FixedArenaCollision(
-                f"FixedArena[{self.name}]: requested {self.requested_address:#x} "
-                f"but cuMemAddressReserve returned {got:#x} ({self.size} bytes on "
-                f"device {self.device_id})"
-            )
-        self._reservation = reservation
-        self.base = self.requested_address
-        # chunk offset -> allocation handle (retained; None for caller-owned
-        # handles mapped through map_existing_chunks).
-        self._committed: dict[int, Any] = {}
-        # (offset, size) of every commit request, for diagnostics.
-        self.commit_log: List[tuple[int, int]] = []
-        self._stub: Optional[BumpArenaStub] = None
-        self._pool = None
-        self._pool_extents: Optional[List[tuple[int, int]]] = None
-        self._closed = False
-
-    @property
-    def committed_bytes(self) -> int:
-        """Physically backed bytes (whole chunks)."""
-        return len(self._committed) * self.chunk_bytes
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
-    def _check_open(self, what: str) -> None:
-        if self._closed:
-            raise RuntimeError(f"FixedArena[{self.name}].{what} after close")
-
-    def _check_range(self, offset: int, size: int, what: str) -> tuple[int, int]:
-        offset, size = int(offset), int(size)
-        if offset < 0 or size <= 0 or offset + size > self.size:
-            raise ValueError(
-                f"FixedArena[{self.name}].{what}: [{offset}, {offset + size}) is "
-                f"outside the arena [0, {self.size})"
-            )
-        return offset, size
 
     def commit(self, offset: int, size: int) -> None:
-        """Back ``[offset, offset + size)`` with physical memory, chunk by chunk.
-
-        Lazy and idempotent per chunk: a chunk already committed (or mapped
-        through :meth:`map_existing_chunks`) is skipped, a new chunk is one
-        ``cuMemCreate`` + ``cuMemMap`` through ``VmmReservation.map`` with the
-        handle retained so :meth:`export_chunks` can hand it to the ``vmm_fd``
-        transport later (design section 10).
-        """
-        self._check_open("commit")
-        offset, size = self._check_range(offset, size, "commit")
-        self.commit_log.append((offset, size))
-        first = align_down(offset, self.chunk_bytes)
-        last = align_up(offset + size, self.chunk_bytes)
-        for chunk_offset in range(first, last, self.chunk_bytes):
-            if chunk_offset in self._committed:
-                continue
-            handle = self._reservation.map(
-                chunk_offset, self.chunk_bytes, retain_handle=True
-            )
-            self._committed[chunk_offset] = handle
-
-    def committed_extents(self) -> List[tuple[int, int]]:
-        """Merged ``(address, nbytes)`` runs of committed chunks, ascending."""
-        extents: List[tuple[int, int]] = []
-        for chunk_offset in sorted(self._committed):
-            address = self.base + chunk_offset
-            if extents and extents[-1][0] + extents[-1][1] == address:
-                prev_address, prev_size = extents[-1]
-                extents[-1] = (prev_address, prev_size + self.chunk_bytes)
-            else:
-                extents.append((address, self.chunk_bytes))
-        return extents
-
-    def mem_pool(self):
-        """``torch.cuda.MemPool`` over the committed extents, ``no_split=True``
-        (fact 13), so the caching allocator hands the bump pointers back
-        verbatim and every tensor placed in it lands at a fixed address.
-
-        Built once, *after* the arena's commits: ``BumpArenaStub.set_extents``
-        resets every bump cursor, so re-pointing a live pool at a grown extent
-        set would hand out addresses that are already in use. Calling this
-        after further commits therefore raises instead of rebuilding.
-        """
-        self._check_open("mem_pool")
-        extents = self.committed_extents()
-        if not extents:
-            raise RuntimeError(
-                f"FixedArena[{self.name}].mem_pool: commit() the extents the pool "
-                "should serve before building it; the pool is bounded by the "
-                "committed chunks, not by the reservation"
-            )
-        if self._pool is not None:
-            if extents != self._pool_extents:
-                raise RuntimeError(
-                    f"FixedArena[{self.name}].mem_pool: committed extents changed "
-                    "after the pool was built; BumpArenaStub.set_extents resets the "
-                    "bump cursors, so the pool cannot be re-pointed safely"
-                )
-            return self._pool
-
-        import torch
-
-        stub = BumpArenaStub()
-        stub.set_extents(extents)
-        stub.set_align(self.granularity)
-        self._stub = stub
-        self._pool_extents = extents
-        self._pool = torch.cuda.MemPool(stub.allocator, no_split=True)
-        return self._pool
-
-    def export_chunks(self) -> List[tuple[int, int, Any]]:
-        """``(offset, size, allocation handle)`` per committed chunk, for
-        ``cuMemExportToShareableHandle`` by the ``vmm_fd`` weight transport."""
+        """Back ``[offset, offset + size)`` with physical chunks; idempotent per chunk."""
         raise NotImplementedError(
-            "FixedArena.export_chunks: exporting committed chunk handles for the "
-            "vmm_fd weight transport is not implemented in this draft; see "
-            "DESIGN_cuda_graph_serialization.md sections 6.4 and 10"
+            "FixedArena.commit: lazy chunk commit is not implemented in this draft; "
+            "see DESIGN_cuda_graph_serialization.md section 6.4"
         )
 
-    def map_existing_chunks(self, chunks: Sequence[tuple[int, int, Any]]) -> None:
-        """Map caller-owned physical allocations at their saved offsets through
-        ``VmmReservation.map_existing`` (the ``vmm_fd`` import side; POSIX-fd
-        import at a requested address was identical across importers, fact 13).
-
-        Each ``(offset, size, handle)`` must be chunk aligned and must not
-        cover a chunk that is already backed. The handles stay caller-owned:
-        :meth:`close` unmaps them but never releases them.
-        """
-        self._check_open("map_existing_chunks")
-        for offset, size, handle in chunks:
-            offset, size = self._check_range(offset, size, "map_existing_chunks")
-            if offset % self.chunk_bytes or size % self.chunk_bytes:
-                raise ValueError(
-                    f"FixedArena[{self.name}].map_existing_chunks: [{offset}, "
-                    f"{offset + size}) is not aligned to chunk_bytes "
-                    f"({self.chunk_bytes})"
-                )
-            covered = range(offset, offset + size, self.chunk_bytes)
-            already = [c for c in covered if c in self._committed]
-            if already:
-                raise ValueError(
-                    f"FixedArena[{self.name}].map_existing_chunks: chunk(s) at "
-                    f"offsets {already[:4]} are already backed"
-                )
-            self._reservation.map_existing(offset, size, handle)
-            for chunk_offset in covered:
-                self._committed[chunk_offset] = None
+    def mem_pool(self):
+        """``torch.cuda.MemPool`` over the committed extents, ``no_split=True`` (fact 13)."""
+        raise NotImplementedError(
+            "FixedArena.mem_pool: the BumpArenaStub-backed MemPool is not implemented "
+            "in this draft; see DESIGN_cuda_graph_serialization.md section 6.4"
+        )
 
     def close(self) -> None:
-        """Unmap every chunk, release the retained handles and free the VA."""
-        if self._closed:
-            return
-        self._closed = True
-        self._pool = None
-        self._stub = None
-        self._pool_extents = None
-        self._committed.clear()
-        self._reservation.close()
+        """Unmap every chunk, release the handles and free the VA."""
+        raise NotImplementedError(
+            "FixedArena.close is not implemented in this draft; see "
+            "DESIGN_cuda_graph_serialization.md section 6.4"
+        )

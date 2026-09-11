@@ -30,19 +30,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class NcclCommDescriptor:
-    """Identity of a ``PyNcclCommunicator`` for the CUDA-graph checkpoint.
-
-    ``nccl_version`` is ``None`` when no NCCL communicator was created (world
-    size 1, or the NCCL library is missing). ``symmetric_memory`` records
-    whether the comm was created with ``graphUsageMode`` for symmetric-memory
-    windows (DESIGN_cuda_graph_serialization.md sections 6.10 and 9.4).
-    """
+    """Identity of a ``PyNcclCommunicator`` for the CUDA-graph communicator
+    checkpoint (DESIGN_cuda_graph_serialization.md section 6.10): exactly the
+    fields ``graph_serialization.comm.PyNcclState.export`` reads."""
 
     rank: int
     world_size: int
-    nccl_version: Optional[int]
-    symmetric_memory: bool
-    available: bool
 
 
 class PyNcclCommunicator:
@@ -66,8 +59,6 @@ class PyNcclCommunicator:
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
-        # recorded before any early return so ``describe()`` always works
-        self.is_symmetric_memory_enabled = bool(is_symmetric_memory_enabled)
         if not isinstance(group, StatelessProcessGroup):
             assert dist.is_initialized()
             assert (
@@ -422,19 +413,9 @@ class PyNcclCommunicator:
         return self.nccl.ncclCommWindowDeregister(self.comm, window)
 
     def describe(self) -> NcclCommDescriptor:
-        """Identity record for the CUDA-graph communicator checkpoint.
-
-        Safe on every construction path: ``nccl_version`` is read with a
-        default because the world-size-1 and missing-library early returns
-        never set it.
-        """
-        return NcclCommDescriptor(
-            rank=int(self.rank),
-            world_size=int(self.world_size),
-            nccl_version=getattr(self, "nccl_version", None),
-            symmetric_memory=self.is_symmetric_memory_enabled,
-            available=bool(getattr(self, "available", False)),
-        )
+        """Identity record for the CUDA-graph communicator checkpoint; valid on
+        every construction path, including the world-size-1 early return."""
+        return NcclCommDescriptor(rank=int(self.rank), world_size=int(self.world_size))
 
     def group_start(self):
         self.nccl.ncclGroupStart()

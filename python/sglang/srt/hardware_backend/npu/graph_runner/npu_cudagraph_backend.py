@@ -24,12 +24,6 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.model_executor.graph_serialization.format import (
-    unsupported_shape_artifact,
-)
-from sglang.srt.model_executor.graph_serialization.materializer import (
-    GraphImportError,
-)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -39,11 +33,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.graph_serialization.format import ShapeArtifact
-    from sglang.srt.model_executor.graph_serialization.materializer import (
-        GraphLoadContext,
-        GraphSaveContext,
-    )
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
@@ -192,21 +181,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs.clear()
         self._pool = None
 
-    # -- serialization seam (design sections 6.7, 9.3) ----------------------
+    # -- serialization seam (design section 9.3) -----------------------------
 
     _SERIALIZATION_REASON = (
         "npu: torch.npu.NPUGraph capture is out of scope for v1 (design section 9.3)"
     )
-
-    def export_shape(self, shape_key: ShapeKey, ctx: GraphSaveContext) -> ShapeArtifact:
-        """Always ``needs_recapture`` (design section 9.3)."""
-        return unsupported_shape_artifact(shape_key, "npu", self._SERIALIZATION_REASON)
-
-    def import_shape(
-        self,
-        shape_key: ShapeKey,
-        artifact: ShapeArtifact,
-        ctx: GraphLoadContext,
-    ) -> None:
-        """Never installs anything (design section 9.3)."""
-        raise GraphImportError(f"{shape_key}: {self._SERIALIZATION_REASON}")

@@ -479,11 +479,6 @@ class CustomAllReduceV2:
         """
         return tuple(self._graph_row_log)
 
-    @property
-    def graph_row_count(self) -> int:
-        """Next free ``graph_params`` row (``== _graph_counter``)."""
-        return self._graph_counter
-
     def pre_advance_graph_counter(self, next_row: int) -> None:
         """Move the row counter to ``next_row`` before a graph load.
 

@@ -20,20 +20,25 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import torch
 
+from sglang.srt.model_executor.graph_serialization.loadstore import (
+    GraphImportError,
+    unsupported_shape,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.graph_serialization.format import ShapeArtifact
-    from sglang.srt.model_executor.graph_serialization.materializer import (
-        GraphLoadContext,
-        GraphSaveContext,
+    from sglang.srt.model_executor.graph_serialization.loadstore import (
+        GraphCache,
+        ShapeArtifact,
     )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
 class BaseCudaGraphBackend(ABC):
-    """Pure ABC: no state, no defaults. Each implementation owns its
-    per-backend state and binds the handles it needs from the
-    cuda_graph_runner passed to its __init__.
+    """ABC with no state. Each implementation owns its per-backend state and
+    binds the handles it needs from the cuda_graph_runner passed to its
+    __init__. The only defaults are the serialization pair, which report
+    that the backend does not serialize.
 
     Methods:
       - capture_session(stream) — context wrapping the runner's outer
@@ -50,22 +55,18 @@ class BaseCudaGraphBackend(ABC):
       - replay(shape_key, static_forward_batch, **kwargs) — invoke
         the captured artifact.
       - cleanup() — release pool and drop captured artifacts.
-      - export_shape(shape_key, ctx) — serialize the artifact recorded by
-        capture_one(shape_key) into a pointer-free ShapeArtifact
-        (design section 6.7).
-      - import_shape(shape_key, artifact, ctx) — install a replayable
-        artifact without running forward_fn; all-or-nothing (design
-        section 6.7).
+      - export_shape(shape_key, cache) — pointer-free ShapeArtifact of the
+        shape recorded by capture_one (design section 6.7). Default:
+        unsupported_shape(...) carrying _SERIALIZATION_REASON.
+      - import_shape(shape_key, artifact, cache) — install a replayable
+        artifact without running forward_fn; all-or-nothing. Default:
+        raise GraphImportError.
 
     Notes:
       - The outer capture loop is runner-specific; it lives on the
         runner, not here.
       - capture_inputs optionally carries capture-time input owners that a
         backend must retain when its graph records their tensor addresses.
-      - export_shape / import_shape are reached only through a
-        GraphMaterializer other than CaptureOnlyMaterializer, so the
-        default server path (``--cuda-graph-cache-mode off``) never calls
-        them.
     """
 
     @abstractmethod
@@ -97,24 +98,19 @@ class BaseCudaGraphBackend(ABC):
     @abstractmethod
     def cleanup(self) -> None: ...
 
-    @abstractmethod
-    def export_shape(self, shape_key: ShapeKey, ctx: GraphSaveContext) -> ShapeArtifact:
-        """Serialize the artifact recorded by capture_one(shape_key).
+    # Backends that do not serialize inherit the two defaults below and only
+    # override this reason (design section 9.3).
+    _SERIALIZATION_REASON = "backend does not serialize"
 
-        Backends that cannot (tc_piecewise, NPU, XPU) return a ShapeArtifact
-        whose graphs carry verdict='needs_recapture' (design section 6.7).
-        """
+    def export_shape(self, shape_key: ShapeKey, cache: GraphCache) -> ShapeArtifact:
+        """Pointer-free artifact of the shape recorded by capture_one(shape_key)."""
+        return unsupported_shape(
+            shape_key, type(self).__name__, self._SERIALIZATION_REASON
+        )
 
-    @abstractmethod
     def import_shape(
-        self,
-        shape_key: ShapeKey,
-        artifact: ShapeArtifact,
-        ctx: GraphLoadContext,
+        self, shape_key: ShapeKey, artifact: ShapeArtifact, cache: GraphCache
     ) -> None:
-        """Install a replayable artifact WITHOUT running forward_fn.
-
-        All-or-nothing: raise GraphImportError leaving no partial state;
-        can_run/replay must then behave exactly as after capture_one
-        (design section 6.7).
-        """
+        """Install a replayable artifact without running forward_fn. All-or-nothing:
+        raise GraphImportError leaving no partial state."""
+        raise GraphImportError(f"{shape_key}: {self._SERIALIZATION_REASON}")

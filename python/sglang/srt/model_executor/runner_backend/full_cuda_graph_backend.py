@@ -17,6 +17,7 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -27,12 +28,11 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.model_executor.graph_serialization.format import (
-    ShapeArtifact,
-    ShapeKeyRecord,
-)
-from sglang.srt.model_executor.graph_serialization.materializer import (
+from sglang.srt.model_executor.graph_serialization.loadstore import (
     GraphImportError,
+    ShapeArtifact,
+    load_graph,
+    save_graph,
 )
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -47,14 +47,11 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.graph_serialization.format import (
-        KernelIdentity,
-        OutputSchema,
+    from sglang.srt.model_executor.graph_serialization.loadstore import (
+        GraphCache,
+        TensorRef,
     )
-    from sglang.srt.model_executor.graph_serialization.materializer import (
-        GraphLoadContext,
-        GraphSaveContext,
-    )
+    from sglang.srt.model_executor.graph_serialization.memory import Relocation
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
@@ -66,17 +63,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     captured inside the graph. Memory-saver-aware.
 
     ``keep_graph`` makes ``capture_one`` build
-    ``torch.cuda.CUDAGraph(keep_graph=True)`` and instantiate explicitly, so
-    the captured ``CUgraph`` survives and ``export_shape`` can encode
-    ``raw_cuda_graph()`` (design section 6.7). ``resolve_decode_backend`` /
-    ``resolve_prefill_backend`` set it from ``keeps_raw_graphs(plan)``, i.e.
-    exactly when the runner's graph-serialization plan is enabled; the
-    default server path constructs ``CUDAGraph()`` exactly as before.
+    ``torch.cuda.CUDAGraph(keep_graph=True)`` and instantiate explicitly so
+    the captured ``CUgraph`` survives for ``export_shape`` (design section
+    6.7); the resolvers pass it when the runner's ``GraphCache`` is enabled.
+    The default path constructs ``CUDAGraph()`` exactly as before.
     """
 
-    # Class-level default so an instance built without __init__ (tests) reads
-    # the same default the constructor installs.
-    _keep_graph: bool = False
+    # Class default so ``capture_one`` takes the plain path on an instance
+    # built without ``__init__``; ``__init__`` sets it per instance.
+    _keep_graph = False
 
     def __init__(
         self,
@@ -142,8 +137,6 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        # keep_graph=True only when serialization asked for it (design section
-        # 6.7); the default path constructs CUDAGraph() with no arguments.
         if self._keep_graph:
             graph = torch.cuda.CUDAGraph(keep_graph=True)
         else:
@@ -172,8 +165,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         if self._keep_graph:
             # keep_graph=True defers instantiation past capture_end; do it now
-            # so the first replay pays nothing extra and raw_cuda_graph() stays
-            # valid for export_shape (design section 6.7).
+            # so raw_cuda_graph() stays valid for export_shape.
             graph.instantiate()
 
         self._graphs[shape_key] = graph
@@ -201,107 +193,67 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs.clear()
         self._pool = None
 
-    # -- serialization seam (design sections 6.7, 9.1) ----------------------
+    # -- serialization seam (design section 6.7) -----------------------------
 
-    def export_shape(self, shape_key: ShapeKey, ctx: GraphSaveContext) -> ShapeArtifact:
-        """One ``SerializedGraph`` plus the output schema for ``shape_key``.
-
-        ``KeyError`` for a shape ``capture_one`` never recorded. The graph
-        must expose ``raw_cuda_graph()``: a capture made with
-        ``keep_graph=True`` (what the backend resolvers request whenever the
-        plan is enabled) or a loaded graph (design section 6.7).
-        """
+    def export_shape(self, shape_key: ShapeKey, cache: GraphCache) -> ShapeArtifact:
+        """``KeyError`` for a shape ``capture_one`` never recorded; the graph
+        must have been captured with ``keep_graph=True``."""
         graph = self._graphs[shape_key]
-        raw = graph.raw_cuda_graph()
-        serialized = ctx.codec.encode(
-            raw,
-            registry=ctx.registry,
-            resolver=ctx.resolver,
-            policy=ctx.policy,
-            event_roles=ctx.event_roles,
+        g = save_graph(
+            graph.raw_cuda_graph(),
+            memory=cache.memory,
+            kernels=cache.kernels,
+            events=cache.events,
         )
-        output = self._describe_output(self._outputs[shape_key])
         return ShapeArtifact(
-            shape_key=ShapeKeyRecord.from_shape_key(shape_key),
+            shape_key=dataclasses.asdict(shape_key),
             backend="full",
-            graphs=(serialized,),
-            output=output,
-            kernels=self._kernel_table(ctx),
+            graphs=(g,),
+            outputs=self._describe_outputs(self._outputs[shape_key]),
         )
 
     def import_shape(
-        self,
-        shape_key: ShapeKey,
-        artifact: ShapeArtifact,
-        ctx: GraphLoadContext,
+        self, shape_key: ShapeKey, artifact: ShapeArtifact, cache: GraphCache
     ) -> None:
-        """Install ``artifact`` for ``shape_key`` without a forward.
-
-        All-or-nothing (design section 6.7): the graph is materialized and
-        the output rebuilt into locals first; ``_graphs`` / ``_outputs`` are
-        written only after both succeeded, and any failure is raised as
-        ``GraphImportError`` chained to its cause with the tables untouched.
-        """
+        """All-or-nothing: ``_graphs`` / ``_outputs`` are written only after
+        both the graph and the outputs were rebuilt."""
         try:
             if artifact.backend != "full":
-                raise ValueError(
-                    f"artifact was exported by backend {artifact.backend!r}, not 'full'"
-                )
+                raise ValueError(f"backend {artifact.backend!r} is not 'full'")
             if len(artifact.graphs) != 1:
-                raise ValueError(
-                    "the full backend expects exactly one graph per shape, "
-                    f"the artifact has {len(artifact.graphs)}"
-                )
-            loaded = ctx.codec.materialize(
+                raise ValueError(f"expected one graph, got {len(artifact.graphs)}")
+            loaded = load_graph(
                 artifact.graphs[0],
-                kernels=artifact.kernels,
-                reloc=ctx.reloc,
-                resolver=ctx.resolver,
-                events=ctx.events,
-                device_ctx=ctx.device_ctx,
+                reloc=cache.reloc,
+                kernels=cache.kernels,
+                events=cache.events,
             )
-            output = self._rebuild_output(artifact.output, ctx.reloc)
+            out = self._rebuild_outputs(artifact.outputs, cache.reloc)
+        except NotImplementedError:
+            raise  # a mechanism missing from the draft is not a load failure
         except Exception as exc:
             raise GraphImportError(
                 f"FullCudaGraphBackend.import_shape({shape_key}): {exc}"
             ) from exc
         self._graphs[shape_key] = loaded
-        self._outputs[shape_key] = output
+        self._outputs[shape_key] = out
 
     @staticmethod
-    def _describe_output(out: Any) -> OutputSchema:
-        """Describe the object ``replay`` returns as an ``OutputSchema``:
-        ``LogitsProcessorOutput`` fields, ``PPProxyTensors`` entries and bare
-        tensors become region references with explicit shape, stride and
-        dtype (design section 6.7, fact 13)."""
+    def _describe_outputs(out: Any) -> tuple[TensorRef, ...]:
+        """``LogitsProcessorOutput`` fields, ``PPProxyTensors`` entries and bare
+        tensors as ``TensorRef`` by path (design section 6.7)."""
         raise NotImplementedError(
-            "FullCudaGraphBackend._describe_output: describing the replay "
-            "output (LogitsProcessorOutput / PPProxyTensors / tensor views as "
-            "region references) is not implemented in this draft; see "
+            "FullCudaGraphBackend._describe_outputs: describing the replay output "
+            "as TensorRefs is not implemented in this draft; see "
             "DESIGN_cuda_graph_serialization.md section 6.7"
         )
 
     @staticmethod
-    def _rebuild_output(schema: OutputSchema, reloc: Any) -> Any:
-        """Rebuild the replay output from its schema: every tensor is a
-        ``tensor_from_pointer`` view at ``reloc.rebase(ref)`` with the saved
-        shape, stride and dtype passed explicitly (design section 6.7,
-        fact 13)."""
+    def _rebuild_outputs(outputs: tuple[TensorRef, ...], reloc: Relocation) -> Any:
+        """Every ``TensorRef`` becomes a ``tensor_from_pointer`` view at
+        ``reloc.rebase(ref)`` with explicit shape, stride and dtype (fact 13)."""
         raise NotImplementedError(
-            "FullCudaGraphBackend._rebuild_output: rebuilding the replay output "
-            "from tensor_from_pointer views over relocated regions is not "
-            "implemented in this draft; see DESIGN_cuda_graph_serialization.md "
-            "section 6.7 (fact 13)"
-        )
-
-    @staticmethod
-    def _kernel_table(ctx: GraphSaveContext) -> tuple[KernelIdentity, ...]:
-        """The identity table ``KernelNode.identity`` indexes into. The
-        encoder assigns the indices while it walks the nodes (design sections
-        6.5 and 6.6); a full build hands the table back through the codec."""
-        raise NotImplementedError(
-            "FullCudaGraphBackend._kernel_table: collecting the encoder's "
-            "kernel identity table for the artifact is not implemented in this "
-            "draft; see DESIGN_cuda_graph_serialization.md section 6.5 and "
-            "section 6.6"
+            "FullCudaGraphBackend._rebuild_outputs: rebuilding the replay output "
+            "from tensor_from_pointer views is not implemented in this draft; see "
+            "DESIGN_cuda_graph_serialization.md section 6.7"
         )

@@ -459,18 +459,8 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
 
 
 def apply_cuda_graph_cache_compatibility(server_args: Any):
-    """Turn CUDA graph serialization off for configurations v1 does not cover.
-
-    Design section 13 names the gates; design sections 9.3 and 9.4 explain
-    them: tc_piecewise phases (torch.compile owns those graphs), speculative
-    decoding (the one-graph EAGLE path samples inside the graph, fact 16),
-    pdmux (green-context streams), DP attention (in-graph NCCL gather), DCP
-    (pynccl a2a inside the graph), DeepEP low-latency dispatch (in-graph
-    low-latency kernels), LoRA and two-batch overlap (no region providers
-    yet) and memory-saver graph mode. The first applicable reason is logged
-    and declared; every rule declares the same value, so a second match
-    would only append a duplicate entry.
-    """
+    """Resolve --cuda-graph-cache-mode back to off for configurations the draft does
+    not cover (design section 13); the first applicable reason is logged."""
     cfg = resolving_view(server_args)
     if cfg.cuda_graph_cache_mode == "off":
         return
