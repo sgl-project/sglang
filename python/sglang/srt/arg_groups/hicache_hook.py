@@ -23,6 +23,11 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_mla_hicache_host_dedup and cfg.enable_dsa_cache_layer_split:
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup cannot be used with "
+            "--enable-dsa-cache-layer-split."
+        )
     if cfg.enable_unified_cache_external_linker:
         if cfg.enable_hierarchical_cache:
             raise ValueError(
