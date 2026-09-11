@@ -82,11 +82,11 @@ fn dials_cleartext(worker_url: &str) -> Option<bool> {
 /// that risk.
 ///
 /// [`WireProtocol::Http1`] is the fallback for everything else, and it does
-/// mean HTTP/1.1 on the wire: reqwest is built here without its `http2`
-/// feature, so the forwarding client advertises only `http/1.1` even on TLS.
-/// An `https://` worker running `--enable-http2` therefore stays on HTTP/1.1
-/// — correct, because h2c cannot be sent to a TLS endpoint either way, but
-/// not the ALPN upgrade the flag might suggest. See [`WireProtocol`].
+/// not mean "HTTP/1.1 on the wire". It selects the negotiating client, which
+/// advertises ALPN `h2, http/1.1`, so an `https://` worker running
+/// `--enable-http2` reaches HTTP/2 over TLS on its own — the correct outcome,
+/// arrived at by negotiation rather than by assumption. Only cleartext workers
+/// need prior-knowledge h2c. See [`WireProtocol`].
 fn resolve_protocol(enable_http2: Option<bool>, cleartext: Option<bool>) -> WireProtocol {
     match (enable_http2, cleartext) {
         (Some(true), Some(true)) => WireProtocol::H2c,
@@ -449,12 +449,12 @@ fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, clearte
             worker_url = %worker_url,
             "/server_info reports --enable-http2 on a cleartext worker; forwarding over h2c",
         ),
-        // A TLS worker. h2c is unsendable there and the client does not
-        // negotiate, so this worker stays on HTTP/1.1.
+        // A TLS worker. h2c is unsendable there, but the negotiating client
+        // advertises ALPN h2, so a TLS engine still reaches HTTP/2 on its own.
         (Some(true), Some(false)) => tracing::info!(
             worker_url = %worker_url,
-            "/server_info reports --enable-http2 on a TLS worker; \
-             forwarding over HTTP/1.1",
+            "/server_info reports --enable-http2 on a TLS worker; using the \
+             negotiating client, which reaches HTTP/2 over TLS via ALPN",
         ),
         // `dials_cleartext` could not parse the URL. Reaching this at all means
         // `/server_info` answered over a URL the scheme check then rejected, so
@@ -473,7 +473,8 @@ fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, clearte
         // revisiting it, so this reading is the only one it will ever get.
         (None, _) => tracing::info!(
             worker_url = %worker_url,
-            "no --enable-http2 reading from /server_info; forwarding over HTTP/1.1",
+            "no --enable-http2 reading from /server_info; using the negotiating \
+             client (HTTP/1.1 in cleartext)",
         ),
         // The engine explicitly disabled it. Nothing to explain.
         (Some(false), _) => {}
