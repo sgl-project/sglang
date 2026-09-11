@@ -136,7 +136,9 @@ class TestDraftBindingDispatch(CustomTestCase):
             enable_memory_saver=False,
             page_size=_PS,
             fused_draft=(
-                FusedDraftPlacement(region=region, runner_lane_counts=(1,))
+                FusedDraftPlacement.from_counts(
+                    counts={"full": [1]}, regions={"full": region}
+                )
                 if region is not None
                 else None
             ),

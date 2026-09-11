@@ -1229,7 +1229,9 @@ class TestTriFactorySizing(unittest.TestCase):
         region = DenseDraftRegion(
             lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
         )
-        placement = FusedDraftPlacement(region=region, runner_lane_counts=(1,))
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
         bundle = init_unified_mamba_swa_pools(
             **self._factory_kwargs(fused_draft=placement)
         )

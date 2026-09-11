@@ -1,12 +1,22 @@
 """KV pools a DRAFT runner binds over the draft lanes fused into the target's
 unified pool: same pages, same slot ids, same v2p table as the target -- one
-allocation, one free, one relocation."""
+allocation, one free, one relocation.
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+`DRAFT_BINDERS` maps a `HostKind.family` to the binder that builds the
+runner's pool over every host of that family; registering a binder is how a
+new host kind reaches the draft worker.
+"""
 
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+import msgspec
 import torch
 
-from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
+from sglang.srt.mem_cache.layout.fused_draft import (
+    HOST_KINDS,
+    FusedDraftPlacement,
+    draft_swa_layer_ids,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 
@@ -137,37 +147,118 @@ def draft_state_layer_classes(model) -> List[str]:
     )
 
 
+class FusedDraftBinding(msgspec.Struct, frozen=True, kw_only=True):
+    """What a draft runner binds: its KV pool over the fused lanes and the
+    request table it reads."""
+
+    token_to_kv_pool: Any = None
+    req_to_token_pool: Any = None
+
+
+class BindContext(msgspec.Struct, frozen=True, kw_only=True):
+    """One runner's inputs to every binder."""
+
+    placement: FusedDraftPlacement
+    runner: int
+    unified_buffer: Any
+    host_allocator: Any
+    model: Any
+    model_config: Any
+    page_size: int
+
+    def hosts_of(self, family: str) -> Tuple[str, ...]:
+        """This runner's hosts of ``family`` that hold lanes for it."""
+        return tuple(
+            host
+            for host in self.placement.hosts()
+            if HOST_KINDS[host].family == family
+            and len(self.placement.lanes_for(self.runner, host)) > 0
+        )
+
+
+Binder = Callable[[BindContext, FusedDraftBinding], FusedDraftBinding]
+
+DRAFT_BINDERS: Dict[str, Binder] = {}
+
+
+def register_draft_binder(family: str, binder: Binder) -> Binder:
+    assert family not in DRAFT_BINDERS, (
+        f"a draft binder is already registered for host family {family!r}"
+    )
+    DRAFT_BINDERS[family] = binder
+    return binder
+
+
 def bind_fused_draft(
     *,
-    unified_buffer: UnifiedKVPool,
-    host_allocator,
     placement: FusedDraftPlacement,
     runner: int,
-    kv_layer_ids: Sequence[int],
-    swa_layer_ids: Sequence[int],
+    unified_buffer: UnifiedKVPool,
+    host_allocator,
+    model,
+    model_config,
+    req_to_token_pool,
     page_size: int,
-) -> UnifiedDraftKVPool:
-    """The KV pool draft runner ``runner`` binds over its fused slots.
+) -> FusedDraftBinding:
+    """Bind draft runner ``runner`` to its fused lanes: one binder per host
+    family that holds lanes for it, in registry order, each refining the
+    binding the previous one returned."""
+    ctx = BindContext(
+        placement=placement,
+        runner=runner,
+        unified_buffer=unified_buffer,
+        host_allocator=host_allocator,
+        model=model,
+        model_config=model_config,
+        page_size=page_size,
+    )
+    families: List[str] = []
+    for host in placement.hosts():
+        family = HOST_KINDS[host].family
+        if family not in families and len(placement.lanes_for(runner, host)) > 0:
+            families.append(family)
+    assert families, f"draft runner {runner} holds no lane in any host"
+    binding = FusedDraftBinding(req_to_token_pool=req_to_token_pool)
+    for family in families:
+        assert family in DRAFT_BINDERS, (
+            f"no draft binder is registered for host family {family!r}"
+        )
+        binding = DRAFT_BINDERS[family](ctx, binding)
+    assert binding.token_to_kv_pool is not None, (
+        f"draft runner {runner}: no binder produced a KV pool"
+    )
+    return binding
 
-    The placement sized the lanes from the draft config; the model's real
-    layer ids fill them in layer order, so a count mismatch is a loud boot
-    failure, never a silent alias.
-    """
-    swa = set(swa_layer_ids)
+
+def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBinding:
+    """This runner's attention layers, in layer order, over its lanes in the
+    full host. The placement sized the lanes from the draft config; the
+    model's real layer ids fill them, so a count mismatch is a loud boot
+    failure, never a silent alias."""
+    hosts = ctx.hosts_of("dense")
+    assert hosts == ("full",), (
+        f"the dense binder serves the 'full' host alone; got {hosts}"
+    )
+    kv_layer_ids = draft_kv_layer_ids(ctx.model)
+    swa = set(draft_swa_layer_ids(ctx.model_config))
     full_ids = [layer_id for layer_id in kv_layer_ids if layer_id not in swa]
     assert len(full_ids) == len(kv_layer_ids), (
         f"draft layers {sorted(swa & set(kv_layer_ids))} are SWA-kind; fused "
         "SWA KV is not supported yet"
     )
-    full_lanes = placement.lanes_for(runner)
+    full_lanes = ctx.placement.lanes_for(ctx.runner, "full")
     assert len(full_ids) == len(full_lanes), (
-        f"draft runner {runner}: {len(full_ids)} full-attention layer(s) "
+        f"draft runner {ctx.runner}: {len(full_ids)} full-attention layer(s) "
         f"{full_ids} vs {len(full_lanes)} placed lane(s) {list(full_lanes)}"
     )
-    return UnifiedDraftKVPool(
-        unified_buffer=unified_buffer,
+    pool = UnifiedDraftKVPool(
+        unified_buffer=ctx.unified_buffer,
         host_sub_pool_name="full",
-        host_allocator=host_allocator,
+        host_allocator=ctx.host_allocator,
         layer_lanes=dict(zip(full_ids, full_lanes)),
-        page_size=page_size,
+        page_size=ctx.page_size,
     )
+    return msgspec.structs.replace(binding, token_to_kv_pool=pool)
+
+
+register_draft_binder("dense", _bind_dense)

@@ -607,7 +607,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
-            "fused inside the full-attention page envelope."
+            "fused inside the target's sub-pool entries."
         )
         # The target verifies on its own pages: the MLA family on an MLA host.
         eagle_allowed = (

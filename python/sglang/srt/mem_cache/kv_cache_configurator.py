@@ -595,12 +595,8 @@ class KVCacheConfigurator:
                 alloc = token_to_kv_pool_allocator
                 placement = self._fused_draft_from_target_buffer(alloc)
                 if placement is not None:
-                    from sglang.srt.mem_cache.layout.fused_draft import (
-                        draft_swa_layer_ids,
-                    )
                     from sglang.srt.mem_cache.unified_draft_pool import (
                         bind_fused_draft,
-                        draft_kv_layer_ids,
                         draft_state_layer_classes,
                     )
 
@@ -617,18 +613,19 @@ class KVCacheConfigurator:
                             f"linear-attention layers ({', '.join(state_layers)}) "
                             "that the fused region gives no state pool."
                         )
-                    draft_pool = bind_fused_draft(
-                        unified_buffer=alloc.unified_buffer,
-                        host_allocator=alloc,
+                    binding = bind_fused_draft(
                         placement=placement,
                         runner=self.draft_model_idx or 0,
-                        kv_layer_ids=draft_kv_layer_ids(self.model),
-                        swa_layer_ids=draft_swa_layer_ids(self.model_config),
+                        unified_buffer=alloc.unified_buffer,
+                        host_allocator=alloc,
+                        model=self.model,
+                        model_config=self.model_config,
+                        req_to_token_pool=req_to_token_pool,
                         page_size=self.page_size,
                     )
                     return _InitializedPools(
-                        req_to_token_pool=req_to_token_pool,
-                        token_to_kv_pool=draft_pool,
+                        req_to_token_pool=binding.req_to_token_pool,
+                        token_to_kv_pool=binding.token_to_kv_pool,
                         token_to_kv_pool_allocator=alloc,
                         unified_memory_pool=None,
                     )
@@ -761,7 +758,7 @@ class KVCacheConfigurator:
         # The region holds rows in the target's KV dtype; a draft that resolved
         # its own would read and write them as something else. Compare the KV
         # dtypes, not their storage: every fp8 flavor is stored as uint8.
-        region_kv_dtype = placement.region.resolved_kv_dtype()
+        region_kv_dtype = placement.region("full").resolved_kv_dtype()
         if self.kv_cache_dtype != region_kv_dtype:
             raise ValueError(
                 f"Fused draft KV: the draft resolved its KV cache dtype to "
@@ -976,6 +973,15 @@ class KVCacheConfigurator:
             swa_v_head_dim=mc.swa_v_head_dim,
         )
 
+    def _unified_host_names(self) -> tuple:
+        """The sub-pools the unified factory for this model builds, by name."""
+        names = ["full"]
+        if self.is_hybrid_swa:
+            names.append("swa")
+        if self.mambaish_config is not None:
+            names.append("mamba")
+        return tuple(names)
+
     def _fused_draft_decision(self):
         """Whether, and where, the draft's layers fuse into the target's
         sub-pools. An empty decision means fusion does not apply (unified
@@ -1104,7 +1110,9 @@ class KVCacheConfigurator:
         return place_fused_draft(
             profile=profile,
             num_runners=num_runners,
+            host_names=self._unified_host_names(),
             asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
+            target_window=self.model_config.sliding_window_size,
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
             kv_dtype=self.kv_cache_dtype,
         )
@@ -1125,10 +1133,22 @@ class KVCacheConfigurator:
         pad), built from the same spec as the pool factory's so the priced and
         allocated entries agree; None when the draft does not fuse into that
         sub-pool."""
+        from sglang.srt.mem_cache.layout.fused_draft import HOST_KINDS
+
         placement = self._fused_draft_decision().placement
-        if placement is None or sub_pool_name != "full":
+        if placement is None:
             return None
-        return self._full_host_spec(placement.region).entry_bytes()
+        region = placement.region(sub_pool_name)
+        if region is None:
+            return None
+        builders = {"full": self._full_host_spec}
+        assert sub_pool_name in HOST_KINDS, (
+            f"sub-pool {sub_pool_name!r} is not a registered host kind"
+        )
+        assert sub_pool_name in builders, (
+            f"no fused host spec builder for sub-pool {sub_pool_name!r}"
+        )
+        return builders[sub_pool_name](region).entry_bytes()
 
     def _full_host_spec(self, region):
         from sglang.srt.mem_cache.unified_memory_pool import (
@@ -1230,31 +1250,28 @@ class KVCacheConfigurator:
     def _fused_draft_for_pool_factory(self, decision):
         """The placement a pool factory is handed. It logs the decision it
         returns, so the boot log shows whether fusion engaged or why not."""
+        from sglang.srt.mem_cache.layout.fused_draft import HOST_KINDS
+
         if decision.placement is None:
             if decision.declined is not None:
                 logger.warning("fused draft KV disabled: %s", decision.declined)
             return None
         placement = decision.placement
-        region = placement.region
-        kv_dtype = region.resolved_kv_dtype()
-        logger.info(
-            "[unified-memory-pool] fused draft region in 'full': %d lane(s) x %d "
-            "kv head(s) x %d/%d k/v head_dim @ %s = %d B/token; runner lanes %s",
-            region.lane_num,
-            region.head_num,
-            region.head_dim,
-            region.resolved_v_head_dim(),
-            (
-                kv_dtype
-                if kv_dtype == region.store_dtype
-                else f"{kv_dtype} (stored as {region.store_dtype})"
-            ),
-            region.entry_bytes(),
-            [
-                tuple(placement.lanes_for(r))
-                for r in range(len(placement.runner_lane_counts))
-            ],
-        )
+        if decision.note is not None:
+            logger.info(
+                "[unified-memory-pool] fused draft placement: %s", decision.note
+            )
+        for host in placement.hosts():
+            logger.info(
+                "[unified-memory-pool] %s",
+                HOST_KINDS[host].describe(
+                    region=placement.region(host),
+                    lanes=[
+                        tuple(placement.lanes_for(r, host))
+                        for r in range(len(placement.runners))
+                    ],
+                ),
+            )
         return placement
 
     def _init_unified_swa_pools(

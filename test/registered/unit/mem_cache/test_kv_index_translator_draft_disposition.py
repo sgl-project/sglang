@@ -100,8 +100,8 @@ def _build(n_full=32, n_swa=16):
         device=_DEV,
         enable_memory_saver=False,
         page_size=_PS,
-        fused_draft=FusedDraftPlacement(
-            region=full_spec.draft_region, runner_lane_counts=(1,)
+        fused_draft=FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": full_spec.draft_region}
         ),
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
