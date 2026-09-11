@@ -414,7 +414,6 @@ POSITIONAL_FIELD_ORDER = (
     "offload_prefetch_step",
     "offload_mode",
     "enable_lmcache",
-    "enable_unified_lmcache",
     "lmcache_config_file",
     "enable_flexkv",
     "flexkv_config_file",

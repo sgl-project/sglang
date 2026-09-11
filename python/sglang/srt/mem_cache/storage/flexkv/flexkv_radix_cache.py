@@ -3,8 +3,8 @@
 This module exposes :class:`FlexKVRadixCache`, a subclass of
 :class:`sglang.srt.mem_cache.radix_cache.RadixCache` that delegates
 host-side prefix storage to a FlexKV ``KVManager``. The design mirrors
-``LMCRadixCache`` (the LMCache integration) so the scheduler-side
-contract is identical:
+the two-phase external-cache integration pattern, so the scheduler-side
+contract is:
 
 * MP (synchronous) mode — the default.
   ``match_prefix`` fires only a FlexKV LOOKUP and returns ``host_hit_length``;
@@ -117,7 +117,7 @@ class FlexKVRadixCache(RadixCache):
             # forward layer blocks on its own eventfd.
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
 
-        # CUDA streams (mirroring LMCRadixCache).
+        # CUDA streams.
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
@@ -395,7 +395,7 @@ class FlexKVRadixCache(RadixCache):
             self._load_markers.pop(req.rid, None)
             return
 
-        # Compute the committed prefix mirroring LMCRadixCache's logic.
+        # Compute the committed prefix.
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
