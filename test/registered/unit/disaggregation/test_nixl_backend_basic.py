@@ -11,10 +11,11 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
+from sglang.srt.disaggregation.nixl import conn
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
@@ -24,6 +25,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
     TransferStatus,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,6 +106,60 @@ def _fake_staging_buffer_module(mock_gather=None):
     module.resolve_total_kv_heads = lambda kv_args, attn_tp_size: 2
     module.gather_all_layers_to_staging = mock_gather or MagicMock()
     return module
+
+
+class TestNixlBackendInitialization(CustomTestCase):
+    def test_backend_initialization_selects_worker_device(self):
+        device_state = threading.local()
+        device_state.index = 3
+        parent_thread = threading.get_ident()
+        observed = []
+
+        def set_device(index):
+            device_state.index = index
+
+        def create_backend(_backend, _params):
+            observed.append((threading.get_ident(), getattr(device_state, "index", 0)))
+
+        args = KVArgs()
+        args.gpu_id = 3
+        args.pp_rank = 0
+        args.engine_rank = 0
+        args.kv_data_ptrs = []
+        agent = MagicMock()
+        agent.create_backend.side_effect = create_backend
+        agent.get_plugin_list.return_value = ["UCX"]
+        nixl_api = MagicMock()
+        nixl_api.nixl_agent.return_value = agent
+        manager = NixlKVManager.__new__(NixlKVManager)
+        manager.kv_args = args
+        manager.disaggregation_mode = DisaggregationMode.DECODE
+        manager.enable_deferred_decode_kv_release = False
+
+        with (
+            patch.object(CommonKVManager, "__init__", return_value=None),
+            patch.object(conn, "get_parallel", return_value=SimpleNamespace(tp_size=4)),
+            patch.object(
+                conn,
+                "get_device_module",
+                return_value=SimpleNamespace(set_device=set_device),
+            ),
+            patch.dict(sys.modules, {"nixl._api": nixl_api}),
+            patch.object(NixlKVManager, "register_buffer_to_engine"),
+            patch.object(NixlKVManager, "_start_heartbeat_checker_thread"),
+            patch.object(
+                conn.envs.SGLANG_DISAGGREGATION_NIXL_BACKEND, "get", return_value="UCX"
+            ),
+            patch.object(
+                conn.envs.SGLANG_DISAGG_STAGING_BUFFER, "get", return_value=False
+            ),
+        ):
+            manager.__init__(args, DisaggregationMode.DECODE, MagicMock())
+
+        self.assertEqual(len(observed), 1)
+        self.assertNotEqual(observed[0][0], parent_thread)
+        self.assertEqual(observed[0][1], 3)
+        self.assertEqual(device_state.index, 3)
 
 
 class TestNixlTransferInfo(CustomTestCase):
