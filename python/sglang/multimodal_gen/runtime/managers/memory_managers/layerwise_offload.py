@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
+    page_cache_cannot_hold,
     pin_benefit_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
@@ -738,6 +739,8 @@ class MappedLayerCourier:
             "direct_read_s": 0.0,
             "direct_read_bytes": 0,
             "cached_layers": 0,
+            "probes": 0,
+            "probe_fraction_sum": 0.0,
         }
         # Blocks until a populator thread has faulted the layer in; True if one
         # did, so the courier does not fault the same range a second time.
@@ -904,6 +907,8 @@ class MappedLayerCourier:
                         # keeps the memcpy path; only pages known to be cold go
                         # to the drive
                         fraction = _resident_fraction(cpu_tensor.data_ptr(), nbytes)
+                        stats["probes"] += 1
+                        stats["probe_fraction_sum"] += max(fraction, 0.0)
                         if fraction < 0 or fraction >= 0.5:
                             located = None
                             stats["cached_layers"] += 1
@@ -1712,6 +1717,40 @@ class LayerwiseOffloadManager:
                 continue
             populator.submit(ahead, self._mapped_cpu_weights.get(ahead, {}).values())
 
+    def _log_direct_read_summary(self) -> None:
+        """One line per pass that went to the drive: how much, and what the probe saw."""
+        courier = self._mapped_courier
+        if courier is None:
+            return
+        stats = courier.stats
+        seen = getattr(
+            self,
+            "_direct_read_seen",
+            {"bytes": 0, "cached": 0, "probes": 0, "fraction_sum": 0.0},
+        )
+        direct_bytes = stats["direct_read_bytes"] - seen["bytes"]
+        cached = stats["cached_layers"] - seen["cached"]
+        probes = stats["probes"] - seen["probes"]
+        fraction_sum = stats["probe_fraction_sum"] - seen["fraction_sum"]
+        self._direct_read_seen = {
+            "bytes": stats["direct_read_bytes"],
+            "cached": stats["cached_layers"],
+            "probes": stats["probes"],
+            "fraction_sum": stats["probe_fraction_sum"],
+        }
+        if direct_bytes <= 0:
+            return
+        logger.info(
+            "Layerwise offload: %s read %.1f GiB straight from the drive this pass "
+            "(%d tensors served from the page cache; mean sampled residency %.2f "
+            "over %d probes).",
+            self.layers_attr_str,
+            direct_bytes / 1024**3,
+            cached,
+            fraction_sum / probes if probes else -1.0,
+            probes,
+        )
+
     def _log_debug_timing(self) -> None:
         """Debug: where this stage's layer traffic spent its time."""
         if not envs.SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING:
@@ -1976,7 +2015,7 @@ class LayerwiseOffloadManager:
                 direct_read=(
                     (
                         host_copies_are_redundant()
-                        or host_copies_would_not_fit(self._mapped_bytes)
+                        or page_cache_cannot_hold(self._mapped_bytes)
                     )
                     and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ
                     # the size floor guards components re-streamed many times
@@ -2086,6 +2125,7 @@ class LayerwiseOffloadManager:
     def release_all(self) -> None:
         """Release every layer, including the resident ones: this ends the
         denoise stage that the resident set is scoped to."""
+        self._log_direct_read_summary()
         self._log_debug_timing()
         if self._mapped_populator is not None:
             self._mapped_populator.reset()
