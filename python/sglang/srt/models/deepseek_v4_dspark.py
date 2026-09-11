@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    DSparkDraftConfig,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
@@ -501,19 +502,14 @@ class DSparkV4MarkovHead(nn.Module):
 
 
 def build_dspark_v4_confidence_head(
-    *, config: DeepSeekV4Config, markov_rank: int
+    *, config: DeepSeekV4Config, dspark_config: DSparkDraftConfig
 ) -> Optional[DSparkConfidenceHead]:
     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
-    with_markov_cfg = getattr(config, "confidence_head_with_markov", None)
-    with_markov = (
-        (markov_rank > 0) if with_markov_cfg is None else bool(with_markov_cfg)
-    )
+    if not dspark_config.enable_confidence_head:
+        return None
+    markov_rank = dspark_config.markov_rank
+    with_markov = dspark_config.confidence_head_with_markov
     if with_markov and markov_rank <= 0:
         raise ValueError(
             "DSpark V4 confidence_head_with_markov requires markov_rank > 0, "
@@ -740,7 +736,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_rank=int(dspark_config.markov_rank),
         )
         self.confidence_head = build_dspark_v4_confidence_head(
-            config=config, markov_rank=int(dspark_config.markov_rank)
+            config=config,
+            dspark_config=dspark_config,
         )
         self.hc_mult = int(config.hc_mult)
         self.norm_eps = float(config.rms_norm_eps)
