@@ -370,6 +370,15 @@ class NixlFileManager:
                 logger.error(f"Failed to clear base directory {base}: {e}")
         logger.debug(f"Cleared all files in base directories: {self.base_dirs}")
 
+    def remove_files(self, file_paths: "list[str]") -> None:
+        for file_path in file_paths:
+            try:
+                os.unlink(file_path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning(f"Failed to remove file {file_path}: {e}")
+
     def ensure_all_bucket_dirs(self) -> None:
         """Pre-create every possible bucket directory under each base dir.
 
