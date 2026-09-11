@@ -16,6 +16,11 @@ use std::sync::Arc;
 /// status_code}` on exit (incl. early-exit 400/413/503). Their difference =
 /// received-but-not-answered, invisible to post-dispatch `worker_requests_total`.
 /// `route` is the matched template (not raw URI) to bound label cardinality.
+///
+/// Also the only place that sees every HTTP exchange on every route, so it is
+/// where `inflight_http` is taken — the count the termination drain reports on.
+/// The guard rides the response body rather than being dropped here: a
+/// streaming completion has barely started when this function returns.
 async fn count_requests(State(ctx): State<Arc<AppContext>>, req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_owned();
     let route = req
@@ -24,10 +29,11 @@ async fn count_requests(State(ctx): State<Arc<AppContext>>, req: Request, next: 
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".to_owned());
     ctx.metrics.record_ingress(&route, &method);
+    let inflight = ctx.inflight_http.enter();
     let resp = next.run(req).await;
     ctx.metrics
         .record_response(&route, &method, resp.status().as_u16());
-    resp
+    resp.map(|body| crate::server::inflight::track_body(body, inflight))
 }
 
 /// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method
