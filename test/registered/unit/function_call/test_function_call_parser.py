@@ -3349,6 +3349,93 @@ class TestGlm47MoeDetector(unittest.TestCase):
         )
         self.assertEqual(result.normal_text, "")
 
+    def test_repeated_calls_get_sequential_tool_index(self):
+        """Regression: `detect_and_parse` assigns `tool_index` as the position
+        of the call inside the response, not the position of the function in
+        the `tools` list.
+
+        When the same function is called more than once in one response, the
+        non-streaming path previously collapsed every call onto the same index
+        (the function's position in `tools`), so OpenAI-compatible clients
+        merged the argument deltas of repeated calls into the first one. The
+        streaming path already used `current_tool_id` (0, 1, 2, ...); the
+        non-streaming path must match so both paths agree for the same input.
+        """
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "</tool_call>"
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
+            "</tool_call>"
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Tokyo</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(
+            [c.tool_index for c in result.calls],
+            [0, 1, 2],
+            "repeated calls to the same function must get distinct sequential indices",
+        )
+
+    def test_streaming_matches_detect_and_parse_tool_index(self):
+        """Regression: the streaming and non-streaming paths assign the same
+        `tool_index` for the same input.
+
+        A mixed call sequence (get_weather then search then get_weather) used
+        to produce `[0, 1, 0]` non-streaming (the third call's index wrapped
+        back to the function's position in `tools`) while streaming produced
+        `[0, 1, 2]`, so a client would merge the third call's arguments into
+        the first call.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                ),
+            ),
+        ]
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "</tool_call>"
+            "<tool_call>search"
+            "<arg_key>query</arg_key><arg_value>hotels</arg_value>"
+            "</tool_call>"
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Tokyo</arg_value>"
+            "</tool_call>"
+        )
+        one_shot = self.detector.detect_and_parse(text, tools)
+        one_shot_idx = [c.tool_index for c in one_shot.calls]
+        self.assertEqual(one_shot_idx, [0, 1, 2])
+
+        detector = Glm47MoeDetector()
+        stream_idx = []
+        for i in range(0, len(text), 3):
+            for c in detector.parse_streaming_increment(text[i : i + 3], tools).calls:
+                if c.name:
+                    stream_idx.append(c.tool_index)
+        self.assertEqual(stream_idx, [0, 1, 2])
+        self.assertEqual(one_shot_idx, stream_idx)
+
     def test_streaming_multiple_tool_calls(self):
         """Test streaming incremental parsing of multiple tool calls."""
         chunks = [

@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
     StructuralTag,
@@ -250,22 +251,36 @@ class Glm47MoeDetector(BaseFormatDetector):
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
         try:
-            for match_result in match_result_list:
+            tool_indices = self._get_tool_indices(tools)
+            for call_idx, match_result in enumerate(match_result_list):
                 # Get function name
                 func_detail = self.func_detail_regex.search(match_result)
                 if func_detail is None:
                     continue
                 func_name = func_detail.group(1) if func_detail.group(1) else ""
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
+                if func_name not in tool_indices:
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue
                 arguments = {}
                 if func_args:
                     pairs = self.func_arg_regex.findall(func_args)
                     # Parse arguments using shared method
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
 
-                # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": arguments}
-                calls.extend(self.parse_base_json(match_result, tools))
+                # tool_index is the position of the call in the response, not the
+                # position of the function in the tools list (matches the
+                # streaming path, which uses current_tool_id).
+                calls.append(
+                    ToolCallItem(
+                        tool_index=call_idx,
+                        name=func_name,
+                        parameters=json.dumps(arguments, ensure_ascii=False),
+                    )
+                )
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
