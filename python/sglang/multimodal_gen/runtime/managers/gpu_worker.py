@@ -81,6 +81,10 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
     GPUWorkerPostTrainingMixin,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
+from sglang.multimodal_gen.runtime.realtime.video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
+)
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -91,17 +95,13 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.process import kill_itself_when_parent_died
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
-    build_raw_rgb_frame_batches,
-)
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     DiffStage,
     init_diffusion_tracing,
     trace_slice,
 )
-from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
