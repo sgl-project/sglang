@@ -944,10 +944,8 @@ class DSV4Metadata:
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
 
-    # Source-produced logical positions, physical slots and valid lengths for decode.
-    sm90_decode_candidates: Optional[
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None
+    # Source-produced logical positions, physical slots and valid lengths.
+    sm90_candidates: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1918,6 +1916,8 @@ class DeepseekV4AttnBackend(
             ),
             c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
             c128_compress_metadata=c128_compress_metadata,
+            low_ratio_req_indices=req_pool_indices_repeated.to(torch.int64),
+            low_ratio_pos_i64=core_attn_metadata.positions_casual.to(torch.int64),
         )
 
     def make_forward_metadata_from_raw_decode(
@@ -3088,9 +3088,7 @@ class DeepseekV4AttnBackend(
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
         elif is_decode_or_verify:
-            self._low_ratio_index_topk_sm90_decode(
-                layer, x, q_lora, req, pos, forward_batch
-            )
+            self._low_ratio_index_topk_sm90(layer, x, q_lora, req, pos, forward_batch)
         else:
             self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
 
@@ -3424,7 +3422,7 @@ class DeepseekV4AttnBackend(
             if raw_indices is not None:
                 raw_indices.copy_(selected)
 
-    def _low_ratio_index_topk_sm90_decode(
+    def _low_ratio_index_topk_sm90(
         self, layer, x, q_lora, req, pos, forward_batch
     ) -> None:
         """Score visible FP4 positions and retain global order in sparse attention slots."""
@@ -3439,7 +3437,8 @@ class DeepseekV4AttnBackend(
             raw_indices.fill_(-1)
         bs = req.shape[0]
         assert pos.shape[0] == bs, (
-            f"decode expects one token per request, {pos.shape=} {bs=}"
+            f"SM90 indexer requires aligned request and position rows, "
+            f"{req.shape=} {pos.shape=}"
         )
         if bs == 0:
             return
@@ -3457,18 +3456,16 @@ class DeepseekV4AttnBackend(
             return
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
-        # H100 timings support amortizing candidate construction at this capacity.
+        logical_forward_mode = _get_logical_forward_mode(forward_batch)
         compact = (
-            forward_batch.forward_mode.is_decode()
-            and lmax
-            >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
-        )
+            logical_forward_mode.is_decode() or logical_forward_mode.is_target_verify()
+        ) and lmax >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
         positions = None
         score_lens = lens
         if compact and indexer.uses_candidates and not indexer.is_candidate_source:
-            candidates = self.forward_metadata.sm90_decode_candidates
+            candidates = self.forward_metadata.sm90_candidates
             assert candidates is not None and candidates[0].shape[0] == bs, (
-                "candidate slots missing for decode"
+                "candidate slots missing for SM90 indexer"
             )
             positions, slots, score_lens = candidates
         else:
@@ -3499,7 +3496,7 @@ class DeepseekV4AttnBackend(
                 candidate_slots = slots.gather(
                     1, candidate_positions.clamp_max(lmax - 1)
                 ).masked_fill(~valid, 0)
-                self.forward_metadata.sm90_decode_candidates = (
+                self.forward_metadata.sm90_candidates = (
                     candidate_positions,
                     candidate_slots,
                     valid.sum(dim=-1),
@@ -3514,7 +3511,7 @@ class DeepseekV4AttnBackend(
         elif indexer.uses_candidates and not compact:
             consume = self.candidate_masks
             assert torch.is_tensor(consume) and consume.shape[0] == bs, (
-                "candidate mask missing for decode"
+                "candidate mask missing for SM90 indexer"
             )
             s = s.masked_fill(~consume[:, :lmax], -torch.inf)
         width = s.shape[1]
