@@ -374,10 +374,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """Main PD buffers addressed by the full KV page id."""
+        indexer_pool = self._indexer_pool(4)
         buffers = (
             self.c4_kv_pool.kv_buffer
-            + self.c4_indexer_kv_pool.index_k_buffer
-            + self.c4_indexer_kv_pool.index_scale_buffer
+            + indexer_pool.index_k_buffer
+            + indexer_pool.index_scale_buffer
         )
         return (
             [buf.data_ptr() for buf in buffers],
@@ -510,16 +511,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
         """
         item = self.layer_mapping[layer_id]
-        if item.compress_ratio == 4:
-            if from_indexer:
-                kv = self.c4_indexer_kv_pool.get_index_k(item.compress_layer_id)
-            else:
-                kv = self.c4_kv_pool.kv_buffer[item.compress_layer_id]
-        elif item.compress_ratio == 128:
-            assert not from_indexer, "c128 has no indexer pool"
-            kv = self.c128_kv_pool.kv_buffer[item.compress_layer_id]
-        else:
+        if item.compress_kv_pool is None:
             return None
+        if from_indexer:
+            indexer_pool = self._indexer_pool(item.compress_ratio)
+            kv = indexer_pool.get_index_k(item.compress_layer_id)
+        else:
+            kv = item.compress_kv_pool.kv_buffer[item.compress_layer_id]
         if loc is not None:
             kv = kv.flatten(0, 1)[loc]
         return kv
@@ -631,21 +629,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         device_type = kv.device.type
         if from_indexer:
-            assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
+            indexer_pool = self._indexer_pool(ratio)
             if device_type == "npu":
-                assert self.c4_indexer_kv_pool.has_npu_storage, (
+                assert indexer_pool.has_npu_storage, (
                     "NPU index buffers not allocated — pool was init'd on CUDA?"
                 )
-                self.c4_indexer_kv_pool.set_index_k_scale(
-                    compress_layer_id, loc, kv, kv_scale
-                )
+                indexer_pool.set_index_k_scale(compress_layer_id, loc, kv, kv_scale)
                 return
             if kv_scale is None:
-                self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, kv)
+                indexer_pool.set_index_fused(compress_layer_id, loc, kv)
                 return
-            self.c4_indexer_kv_pool.set_index_k_scale_buffer(
-                compress_layer_id, loc, kv, kv_scale
-            )
+            indexer_pool.set_index_k_scale_buffer(compress_layer_id, loc, kv, kv_scale)
             return
         compress_pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
         if device_type == "npu":
@@ -670,5 +664,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     ) -> torch.Tensor:
         # The indexer scale is fp16 on pre-A5 parts and fp32 on A5.
         assert from_indexer, "only indexer compress pool has dequant scale"
-        compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
-        return self.c4_indexer_kv_pool.get_index_scale(compress_layer_id)
+        item = self.layer_mapping[layer_id]
+        indexer_pool = self._indexer_pool(item.compress_ratio)
+        return indexer_pool.get_index_scale(item.compress_layer_id)

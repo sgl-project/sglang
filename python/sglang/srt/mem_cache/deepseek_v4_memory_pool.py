@@ -931,7 +931,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.kv_pools: dict[int, Optional[DeepSeekV4SingleKVPool]] = {
             ratio: None for ratio in configs
         }
-        self.index_pools: dict[int, DeepSeekV4IndexerPool] = {}
 
         if not self._unified_kv:
             for ratio, config in configs.items():
@@ -952,10 +951,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     cls=pool_cls,
                 )
 
-        for ratio, config in configs.items():
-            if config.indexer_size is None:
-                continue
-            self.index_pools[ratio] = self._make_indexer_pool(
+        self.index_pools: dict[int, DeepSeekV4IndexerPool] = {
+            ratio: self._make_indexer_pool(
                 config.indexer_size,
                 page_size // ratio,
                 dtype,
@@ -964,6 +961,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device,
                 enable_memory_saver,
             )
+            for ratio, config in configs.items()
+            if config.indexer_size is not None
+        }
 
         # HiCache and hardware backends still access the per-ratio attributes.
         self.c4_kv_pool = self.kv_pools[4]
