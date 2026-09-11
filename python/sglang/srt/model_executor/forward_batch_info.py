@@ -64,6 +64,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -83,6 +84,7 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -987,10 +989,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        # Triton-MHA DCP consumes this mask for the masked per-rank KV write.
+        # The MLA pools derive their own mask from `loc`, so this stays scoped to
+        # the platforms whose Triton MHA DCP path is wired up (HIP, XPU).
         if (
             model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
-            and is_hip()
+            and (is_hip() or _is_xpu)
         ):
             ret.dcp_kv_mask = (
                 ret.positions % model_runner.ps.attn_dcp_size

@@ -206,6 +206,20 @@ def handle_attention_backend_compatibility(server_args: Any):
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
     # XPU platforms backends
+    # DCP merges each rank's partial attention by log-sum-exp, so the decode
+    # kernel must return a populated LSE. The intel_xpu kernels do not:
+    # flash_attn_with_kvcache leaves softmax_lse zero-filled and flash_mla_decode
+    # has no LSE output, so the merge would silently return unnormalized results.
+    if cfg.dcp_size > 1 and "intel_xpu" in attention_backends_of(
+        resolved_view(server_args)
+    ):
+        raise ValueError(
+            "--dcp-size > 1 is not supported with the intel_xpu attention "
+            "backend: its decode kernels do not return the softmax LSE that "
+            "the DCP cross-rank merge requires. Use --attention-backend "
+            "triton for decode context parallelism on Intel XPU."
+        )
+
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 
 

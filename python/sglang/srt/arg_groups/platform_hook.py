@@ -153,6 +153,27 @@ def handle_xpu_backends(server_args: Any):
                 ),
             )
 
+        # DCP decode issues per-layer all-gather / reduce-scatter over xccl,
+        # which is not validated inside an XPUGraph capture. Only reachable when
+        # the operator asked for decode capture explicitly; the default is off.
+        if (
+            cfg.dcp_size > 1
+            and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
+            logger.warning(
+                "Disabling XPU decode graph capture: decode context "
+                "parallelism (--dcp-size %d) issues per-layer collectives "
+                "that are not supported inside an XPU graph.",
+                cfg.dcp_size,
+            )
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+
 
 def handle_cpu_backends(server_args: Any):
     cfg = resolving_view(server_args)
