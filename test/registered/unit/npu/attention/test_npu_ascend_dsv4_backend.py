@@ -55,6 +55,7 @@ _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
 sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     C4IndexerAscendBackendMixin,
     CompressorAscendBackendMixin,
@@ -67,7 +68,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
 )
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     dsv4_state_payloads,
 )
