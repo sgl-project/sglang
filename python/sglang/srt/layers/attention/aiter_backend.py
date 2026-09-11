@@ -2285,6 +2285,23 @@ class AiterAttnBackend(AttentionBackend):
         )[:2]
         return output, lse.transpose(0, 1).contiguous()
 
+    @staticmethod
+    def _reject_target_verify_cross_layer_kv(k, v):
+        """Reject cross-layer KV sharing on the legacy ragged target-verify path.
+
+        Cross-layer KV sharing (e.g. Gemma4) passes ``k=v=None`` so the kernel
+        reads K/V from the pool. The legacy ``extend_attention_fwd`` path takes
+        ragged K/V and has no pool-reading fallback, so it would raise an opaque
+        ``AttributeError`` on ``.contiguous``. Fail loudly instead. Inert when
+        real K/V is passed.
+        """
+        if k is None or v is None:
+            raise ValueError(
+                "aiter target_verify does not support cross-layer KV "
+                "sharing (k/v are None). Use the unified verify path "
+                "(speculative_eagle_topk=1 and SGLANG_AITER_UNIFIED_VERIFY=1)."
+            )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2796,6 +2813,8 @@ class AiterAttnBackend(AttentionBackend):
                         sinks=sinks,
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+                self._reject_target_verify_cross_layer_kv(k, v)
 
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
