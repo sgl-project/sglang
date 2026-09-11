@@ -384,7 +384,7 @@ jobs:
             --retry 3 \
             --retry-delay 5 \
             --retry-all-errors \
-            "https://sglang.obs.cn-north-4.myhuaweicloud.com/ci/precision-test/test_case_map.json" \
+            "https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/test_case_map.json" \
             -o test_case_map.json
           test -s test_case_map.json
           echo "Downloaded test_case_map.json"
@@ -397,7 +397,7 @@ jobs:
             --retry 3 \
             --retry-delay 5 \
             --retry-all-errors \
-            "https://sglang.obs.cn-north-4.myhuaweicloud.com/ci/precision-test/outputs.tar.gz" \
+            "https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/outputs.tar.gz" \
             -o outputs.tar.gz
           test -s outputs.tar.gz
           echo "Downloaded outputs.tar.gz"
@@ -417,18 +417,20 @@ jobs:
             python3 -m pip install --break-system-packages regex
           fi
           python3 -c "import regex; print('regex ok:', regex.__file__)"
-          PR_SPEC="sgl-project/sglang#${{ github.event.pull_request.number }}"
+          PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
           echo "Selecting tests for PR: ${PR_SPEC}"
+          # test_selector.py resolves relative paths against the scripts/ dir,
+          # so pass absolute paths for files downloaded to the workspace root.
           python3 scripts/test_selector.py \
             --github-pr "${PR_SPEC}" \
-            --source-dir ./outputs/covstub \
-            --map-file test_case_map.json
+            --source-dir "$PWD/outputs/covstub" \
+            --map-file "$PWD/test_case_map.json"
 
       - name: Export coverage paths output
         id: export-paths
         if: always()
         run: |
-          FILE="recommended_pytest_paths.txt"
+          FILE="scripts/recommended_pytest_paths.txt"
           if [ -f "$FILE" ]; then
             {
               echo "coverage_paths<<EOF"
