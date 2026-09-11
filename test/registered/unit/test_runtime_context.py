@@ -11,7 +11,11 @@ import pathlib as _pathlib
 import shutil
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
+
+import msgspec
+import msgspec.structs
 
 import sglang as _sglang
 import sglang.srt.server_args as server_args_module
@@ -246,9 +250,32 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         # Identity, not equality: the slot holds the very object published.
         sentinel = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(sentinel)
-        self.assertIs(server_args_module.get_global_server_args(), sentinel)
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
+
+    def test_the_retired_accessor_raises_and_names_the_replacement(self):
+        """`get_global_server_args` is retired: it answered with the record,
+        so a caller reading a field resolution had decided got a stale value
+        and no error at all.
+
+        `RuntimeError` unconditionally, not a warning first: a
+        `DeprecationWarning` is filtered by default outside `__main__`, so no
+        production caller would have seen it, and under
+        `-W error::DeprecationWarning` it would have changed the exception a
+        caller catches. The message has to name where to read instead, since
+        the answer differs by what the caller wanted.
+        """
+        with self.assertRaises(RuntimeError) as cm:
+            server_args_module.get_global_server_args()
+        message = str(cm.exception)
+        self.assertIn("runtime_context", message)
+        self.assertIn("get_server_args()", message)
+
+        # And the type does not change when warnings are errors.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with self.assertRaises(RuntimeError):
+                server_args_module.get_global_server_args()
 
     def test_tokenizer_alias_is_distinct_role_shim(self):
         # Deliberately NOT an alias: the two legacy setters publish with
@@ -260,10 +287,9 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
 
     def test_pre_publish_error_verbatim(self):
         reset_context()
-        for accessor in (get_server_args, server_args_module.get_global_server_args):
-            with self.assertRaises(ValueError) as cm:
-                accessor()
-            self.assertEqual(str(cm.exception), "Global server args is not set yet!")
+        with self.assertRaises(ValueError) as cm:
+            get_server_args()
+        self.assertEqual(str(cm.exception), "Global server args is not set yet!")
 
     def test_republish_overwrite_allowed(self):
         first = ServerArgs(model_path="dummy")
@@ -415,7 +441,7 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         from sglang.srt.runtime_context import get_spec
 
         name = "_speculative_draft_quantization_explicitly_set"
-        self.assertIn(name, ServerArgs.__dataclass_fields__)
+        self.assertIn(name, ServerArgs.__struct_fields__)
 
         published = get_context().override_server_args(**{name: True}).install()
         # The record keeps the operator's input, as it does for every other
@@ -450,7 +476,6 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
             override.install()
 
 
-@dataclasses.dataclass
 class _FakeCaptureGroup(_FlagGroupBase):
     gamma: int = 0
 
@@ -1616,13 +1641,12 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
     def test_a_declared_quotient_is_not_a_record_field(self):
         """It has no operator input to preserve, and the record is what crosses
         a process boundary."""
-        import dataclasses
 
         from sglang.srt.arg_groups.arg_utils import Derived
         from sglang.srt.arg_groups.fields.parallel import Parallel
         from sglang.srt.server_args import ServerArgs
 
-        fields = {f.name for f in dataclasses.fields(ServerArgs)}
+        fields = {f.name for f in msgspec.structs.fields(ServerArgs)}
         for name, value in vars(Parallel).items():
             if isinstance(value, Derived):
                 self.assertNotIn(name, fields)

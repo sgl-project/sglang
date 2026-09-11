@@ -14,6 +14,7 @@ the cap is read directly from whichever cgroup version is mounted.
 """
 
 import os
+import weakref
 from collections.abc import Iterable
 
 import psutil
@@ -258,7 +259,13 @@ class HostPinBudget:
         reserve_bytes: int | None = None,
     ) -> None:
         if available_bytes is None:
-            available_bytes = host_memory_available_bytes()
+            if host_copies_are_redundant():
+                # Nothing to pin for: on one pool the copy duplicates
+                # page-cache bytes the device can already read, and the mapped
+                # courier overlaps its transfers anyway.
+                available_bytes = 0
+            else:
+                available_bytes = host_memory_available_bytes()
         self.available_bytes = available_bytes
         self.reserve_bytes = (
             host_pin_reserve_bytes(available_bytes)
@@ -335,7 +342,7 @@ class HostPinBudget:
         return False
 
     def release(self, weight_bytes: int) -> None:
-        """Return a previously committed allowance after buffers are unpinned."""
+        """Return an allowance when its pinned storage is no longer owned."""
         if weight_bytes <= 0:
             return
         if weight_bytes > self.committed_bytes:
@@ -343,6 +350,10 @@ class HostPinBudget:
                 "cannot release more pinned-host memory than was committed"
             )
         self.committed_bytes -= weight_bytes
+
+    def track_storage(self, storage: torch.UntypedStorage) -> None:
+        """Tie an already booked allowance to the storage's last owner."""
+        weakref.finalize(storage, self.release, storage.nbytes())
 
 
 def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:

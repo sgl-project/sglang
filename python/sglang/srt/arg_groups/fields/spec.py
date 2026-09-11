@@ -9,11 +9,12 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import (
     Literal,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -26,8 +27,7 @@ from sglang.srt.arg_groups.choices import (
 )
 
 
-@dataclasses.dataclass
-class Spec:
+class Spec(msgspec.Struct):
     """Namespace ``spec``."""
 
     _NS_PATH = "spec"
@@ -73,6 +73,10 @@ class Spec:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_domino_candidate_pool_size: A[
+        int,
+        "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",
+    ] = 2048
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
