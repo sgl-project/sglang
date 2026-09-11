@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unit tests for sglang.srt.hardware_backend.npu.quantization.gptq_kernels.
 
 The gptq_kernels module reaches NPU only through ``torch.ops.npu.*`` ops

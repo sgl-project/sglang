@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unit tests for sglang.srt.hardware_backend.npu.quantization.online_moe_methods.
 
 ``online_moe_methods.py`` is the ``--quantization mxfp8`` online entry point:

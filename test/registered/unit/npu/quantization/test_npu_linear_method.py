@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unit tests for sglang.srt.hardware_backend.npu.quantization.linear_method_npu.
 
 The module reaches NPU only through ``torch.ops.npu.*`` ops and the
@@ -1360,8 +1360,8 @@ class TestDualLevelMXFP4Apply(unittest.TestCase):
             torch.zeros(rows, self.in_ // 8, dtype=torch.float8_e4m3fn),
             torch.zeros(rows, dtype=torch.float8_e4m3fn),
         )
-        _DUAL_MATMUL_MOCK.side_effect = (
-            lambda qx, w, al0, wl0, al1, wl1, **k: torch.randn(rows, out)
+        _DUAL_MATMUL_MOCK.side_effect = lambda qx, w, al0, wl0, al1, wl1, **k: (
+            torch.randn(rows, out)
         )
 
     def test_calls_dual_mx_quant_then_dual_matmul(self):

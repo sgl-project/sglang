@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unit tests for sglang.srt.hardware_backend.npu.quantization.awq_kernels.
 
 The awq_kernels module depends on torch_npu (only available on Ascend NPU

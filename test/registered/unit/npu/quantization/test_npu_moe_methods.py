@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unit tests for sglang.srt.hardware_backend.npu.quantization.moe_methods.
 
 The module reaches NPU only through ``torch.ops.npu.*`` ops, ``npu_format_cast``,
