@@ -14,6 +14,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.llada_image import (
 from sglang.multimodal_gen.configs.sample.llada_image import LLaDAImageSamplingParams
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.llada_image import (
+    LLaDAImageQueryFormerModel,
+    LLaDAImageSigVQModel,
+    LLaDAImageTextProjectionModel,
     LLaDAImageTransformerBlock,
     _LLaDAImageTransformer2DModel,
 )
@@ -61,6 +64,41 @@ class TestLLaDAImage(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         set_global_server_args(cls.previous_server_args)
+
+    def test_serving_models_reject_gradient_checkpointing(self):
+        small_config = dict(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+        )
+        models = [
+            _LLaDAImageTransformer2DModel(
+                in_channels=4,
+                dim=128,
+                n_layers=0,
+                n_refiner_layers=0,
+                n_heads=1,
+                cap_feat_dim=8,
+                semantic_feat_dim=8,
+            ),
+            LLaDAImageQueryFormerModel(num_queries=2, **small_config),
+            LLaDAImageTextProjectionModel(projection_dim=4, **small_config),
+            LLaDAImageSigVQModel(
+                image_size=4,
+                patch_size=2,
+                codebook_size=8,
+                codebook_embed_dim=4,
+                semantic_embed_dim=4,
+                **small_config,
+            ),
+        ]
+        for model in models:
+            with self.subTest(model=type(model).__name__):
+                with self.assertRaisesRegex(
+                    ValueError, "does not support gradient checkpointing"
+                ):
+                    model.enable_gradient_checkpointing()
 
     def test_dit_supports_sglang_flash_attention_and_sdpa(self):
         backends = LLaDAImagePipelineConfig().dit_config.arch_config._supported_attention_backends

@@ -607,6 +607,44 @@ def _load_selected_tensors(
     return tensors
 
 
+def _get_modelopt_activation_scheme(
+    quant_config: Mapping, *, allow_mixed: bool = False
+) -> str | None:
+    schemes = set()
+    declared = quant_config.get("activation_scheme")
+    if declared is not None:
+        if declared not in ("static", "dynamic"):
+            raise ValueError(f"Invalid ModelOpt activation_scheme {declared!r}.")
+        schemes.add(declared)
+    groups = quant_config.get("config_groups", {})
+    if not isinstance(groups, dict):
+        raise ValueError("ModelOpt activation config_groups must be a dictionary.")
+    for group in groups.values():
+        if not isinstance(group, dict):
+            raise ValueError(
+                "Each ModelOpt activation config group must be a dictionary."
+            )
+        activations = group.get("input_activations")
+        if activations is None:
+            continue
+        if not isinstance(activations, dict):
+            raise ValueError("ModelOpt input_activations must be a dictionary.")
+        if "dynamic" not in activations:
+            continue
+        dynamic = activations["dynamic"]
+        if not isinstance(dynamic, bool):
+            raise ValueError("ModelOpt input activation dynamic must be a boolean.")
+        schemes.add("dynamic" if dynamic else "static")
+    if len(schemes) > 1:
+        if allow_mixed:
+            return None
+        raise ValueError(
+            "Conflicting ModelOpt activation schemes. "
+            "Set activation_scheme explicitly to choose the converted output."
+        )
+    return next(iter(schemes), None)
+
+
 def build_modelopt_fp8_transformer(
     *,
     modelopt_hf_dir: str,
@@ -648,8 +686,13 @@ def build_modelopt_fp8_transformer(
     is_llada_image = (
         model_type == "llada-image" or class_name == "LLaDAImageTransformer2DModel"
     )
+    source_activation_scheme = _get_modelopt_activation_scheme(
+        quant_config, allow_mixed=activation_scheme != "auto"
+    )
     if activation_scheme == "auto":
-        activation_scheme = "dynamic" if is_llada_image else "static"
+        activation_scheme = source_activation_scheme or (
+            "dynamic" if is_llada_image else "static"
+        )
     if activation_scheme not in {"static", "dynamic"}:
         raise ValueError(
             "activation_scheme must be one of 'auto', 'static', or 'dynamic', "
@@ -658,7 +701,7 @@ def build_modelopt_fp8_transformer(
     if is_llada_image and activation_scheme != "dynamic":
         raise ValueError(
             "LLaDA-Image FP8 conversion currently supports only dynamic activation "
-            "quantization; set activation_scheme='dynamic' or leave it as 'auto'."
+            "quantization. To convert this checkpoint, set activation_scheme='dynamic'."
         )
     dynamic_activation = activation_scheme == "dynamic"
 
@@ -779,6 +822,12 @@ def build_modelopt_fp8_transformer(
         }
     else:
         effective_quant_config["ignore"] = ignore_patterns
+        if "activation_scheme" in effective_quant_config:
+            effective_quant_config["activation_scheme"] = "static"
+        for group in effective_quant_config.get("config_groups", {}).values():
+            activations = group.get("input_activations")
+            if activations is not None:
+                activations["dynamic"] = False
     serialized_quant_config = json.dumps(effective_quant_config, sort_keys=True)
     output_config = _build_output_config(
         source_config=config,
@@ -975,8 +1024,9 @@ def _parse_args() -> argparse.Namespace:
         default="auto",
         help=(
             "Activation quantization scheme in the converted checkpoint. 'auto' "
-            "uses dynamic activation quantization for LLaDA-Image and preserves "
-            "the legacy static ModelOpt format for other model families."
+            "reads ModelOpt input activation metadata, falling back to dynamic "
+            "for LLaDA-Image and static for other families when metadata is absent. "
+            "Use 'dynamic' explicitly to convert a static LLaDA-Image export."
         ),
     )
     parser.add_argument(

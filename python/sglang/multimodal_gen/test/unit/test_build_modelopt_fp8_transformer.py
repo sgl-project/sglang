@@ -4,6 +4,7 @@ import json
 
 import pytest
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.tools.build_modelopt_fp8_transformer import (
@@ -12,15 +13,23 @@ from sglang.multimodal_gen.tools.build_modelopt_fp8_transformer import (
 )
 
 
-def _write_llada_modelopt_export(tmp_path, source_tensors, backbone_state):
+def _write_llada_modelopt_export(
+    tmp_path,
+    source_tensors,
+    backbone_state,
+    *,
+    quantization_config=None,
+    class_name="LLaDAImageTransformer2DModel",
+):
     source_dir = tmp_path / "source"
     output_dir = tmp_path / "output"
     source_dir.mkdir()
     source_config = {
-        "_class_name": "LLaDAImageTransformer2DModel",
+        "_class_name": class_name,
         "quantization_config": {
             "quant_method": "modelopt",
             "quant_algo": "FP8",
+            **(quantization_config or {}),
         },
     }
     (source_dir / "config.json").write_text(json.dumps(source_config))
@@ -167,3 +176,184 @@ def test_llada_conversion_rejects_static_activation_quantization(tmp_path):
             model_type="llada-image",
             activation_scheme="static",
         )
+
+
+@pytest.mark.parametrize(
+    ("metadata", "requested", "expected"),
+    [
+        ({}, "auto", "static"),
+        ({"activation_scheme": "dynamic"}, "auto", "dynamic"),
+        ({"activation_scheme": "static"}, "auto", "static"),
+        (
+            {"config_groups": {"group_0": {"input_activations": {"dynamic": True}}}},
+            "auto",
+            "dynamic",
+        ),
+        (
+            {"config_groups": {"group_0": {"input_activations": {"dynamic": False}}}},
+            "auto",
+            "static",
+        ),
+        (
+            {"config_groups": {"group_0": {"weights": {"dynamic": True}}}},
+            "auto",
+            "static",
+        ),
+        (
+            {
+                "config_groups": {
+                    "group_0": {"input_activations": {"dynamic": False}},
+                    "group_1": {"input_activations": {"dynamic": True}},
+                }
+            },
+            "dynamic",
+            "dynamic",
+        ),
+        (
+            {
+                "config_groups": {
+                    "group_0": {"input_activations": {"dynamic": False}},
+                    "group_1": {"input_activations": {"dynamic": True}},
+                }
+            },
+            "static",
+            "static",
+        ),
+        ({"activation_scheme": "static"}, "dynamic", "dynamic"),
+        ({"activation_scheme": "dynamic"}, "static", "static"),
+        (
+            {"config_groups": {"group_0": {"input_activations": {"dynamic": True}}}},
+            "static",
+            "static",
+        ),
+    ],
+)
+def test_conversion_resolves_activation_metadata(
+    tmp_path, metadata, requested, expected
+):
+    source_dir, output_dir, backbone_path = _write_llada_modelopt_export(
+        tmp_path,
+        {"layers.0.attention.to_q.weight": torch.ones(2, 2)},
+        {
+            "layers.0.attention.to_q.weight_quantizer._amax": torch.tensor(224.0),
+            "layers.0.attention.to_q.input_quantizer._amax": torch.tensor(112.0),
+        },
+        quantization_config=metadata,
+        class_name="ExampleTransformer2DModel",
+    )
+    source_config = (source_dir / "config.json").read_bytes()
+    build_modelopt_fp8_transformer(
+        modelopt_hf_dir=str(source_dir),
+        modelopt_backbone_ckpt=str(backbone_path),
+        output_dir=str(output_dir),
+        model_type="none",
+        activation_scheme=requested,
+    )
+    quant_config = json.loads((output_dir / "config.json").read_text())[
+        "quantization_config"
+    ]
+    assert quant_config.get("activation_scheme", "static") == expected
+    for group in quant_config.get("config_groups", {}).values():
+        if group.get("input_activations") is not None:
+            assert group["input_activations"]["dynamic"] is (expected == "dynamic")
+    tensors = load_file(output_dir / "model.safetensors")
+    assert ("layers.0.attention.to_q.input_scale" in tensors) is (expected == "static")
+    with safe_open(output_dir / "model.safetensors", framework="pt") as checkpoint:
+        assert json.loads(checkpoint.metadata()["quantization_config"]) == quant_config
+    assert (source_dir / "config.json").read_bytes() == source_config
+
+
+@pytest.mark.parametrize("requested", ["auto", "dynamic"])
+def test_llada_static_source_requires_explicit_dynamic_output(tmp_path, requested):
+    source_dir, output_dir, backbone_path = _write_llada_modelopt_export(
+        tmp_path,
+        {"layers.0.attention.to_q.weight": torch.ones(2, 2)},
+        {"layers.0.attention.to_qkv.weight_quantizer._amax": torch.tensor(224.0)},
+        quantization_config={
+            "config_groups": {"group_0": {"input_activations": {"dynamic": False}}}
+        },
+    )
+    kwargs = dict(
+        modelopt_hf_dir=str(source_dir),
+        modelopt_backbone_ckpt=str(backbone_path),
+        output_dir=str(output_dir),
+        model_type="llada-image",
+        activation_scheme=requested,
+    )
+    if requested == "auto":
+        with pytest.raises(ValueError, match="set activation_scheme='dynamic'"):
+            build_modelopt_fp8_transformer(**kwargs)
+        assert not output_dir.exists()
+    else:
+        build_modelopt_fp8_transformer(**kwargs)
+        quant_config = json.loads((output_dir / "config.json").read_text())[
+            "quantization_config"
+        ]
+        assert quant_config["activation_scheme"] == "dynamic"
+        assert "layers.0.attention.to_q.input_scale" not in load_file(
+            output_dir / "model.safetensors"
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"activation_scheme": "invalid"},
+        {"config_groups": {"group_0": {"input_activations": {"dynamic": "false"}}}},
+        {
+            "config_groups": {
+                "group_0": {"input_activations": {"dynamic": False}},
+                "group_1": {"input_activations": {"dynamic": True}},
+            }
+        },
+        {
+            "activation_scheme": "dynamic",
+            "config_groups": {"group_0": {"input_activations": {"dynamic": False}}},
+        },
+    ],
+)
+def test_auto_rejects_invalid_or_conflicting_activation_metadata(tmp_path, metadata):
+    source_dir, output_dir, backbone_path = _write_llada_modelopt_export(
+        tmp_path,
+        {"layers.0.attention.to_q.weight": torch.ones(2, 2)},
+        {"layers.0.attention.to_qkv.weight_quantizer._amax": torch.tensor(224.0)},
+        quantization_config=metadata,
+    )
+    with pytest.raises(ValueError, match="activation"):
+        build_modelopt_fp8_transformer(
+            modelopt_hf_dir=str(source_dir),
+            modelopt_backbone_ckpt=str(backbone_path),
+            output_dir=str(output_dir),
+            model_type="llada-image",
+        )
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("requested", ["static", "dynamic"])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"config_groups": None},
+        {"config_groups": {"group_0": None}},
+        {"config_groups": {"group_0": {"input_activations": "invalid"}}},
+    ],
+)
+def test_explicit_output_rejects_malformed_metadata_before_writing(
+    tmp_path, requested, metadata
+):
+    source_dir, output_dir, backbone_path = _write_llada_modelopt_export(
+        tmp_path,
+        {"layers.0.attention.to_q.weight": torch.ones(2, 2)},
+        {"layers.0.attention.to_q.weight_quantizer._amax": torch.tensor(224.0)},
+        quantization_config=metadata,
+        class_name="ExampleTransformer2DModel",
+    )
+    with pytest.raises(ValueError, match="ModelOpt.*dictionary"):
+        build_modelopt_fp8_transformer(
+            modelopt_hf_dir=str(source_dir),
+            modelopt_backbone_ckpt=str(backbone_path),
+            output_dir=str(output_dir),
+            model_type="none",
+            activation_scheme=requested,
+        )
+    assert not output_dir.exists()

@@ -548,7 +548,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
             Maximum RoPE positions for sequence, height, and width axes.
     """
 
-    _supports_gradient_checkpointing = True
     _no_split_modules: ClassVar[list[str]] = ["LLaDAImageTransformerBlock"]
     _repeated_blocks: ClassVar[list[str]] = ["LLaDAImageTransformerBlock"]
     _skip_layerwise_casting_patterns: ClassVar[list[str]] = [
@@ -597,7 +596,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         self.all_patch_size = all_patch_size
         self.all_f_patch_size = all_f_patch_size
         self.t_scale = t_scale
-        self.gradient_checkpointing = False
 
         self.all_x_embedder = nn.ModuleDict()
         self.all_final_layer = nn.ModuleDict()
@@ -1258,27 +1256,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         )
 
         for layer in self.noise_refiner:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                if is_editing:
-                    image_features = self._gradient_checkpointing_func(
-                        layer,
-                        image_features,
-                        image_attention_mask,
-                        image_frequencies,
-                        None,
-                        image_noise_mask,
-                        noisy_embedding,
-                        clean_embedding,
-                    )
-                else:
-                    image_features = self._gradient_checkpointing_func(
-                        layer,
-                        image_features,
-                        image_attention_mask,
-                        image_frequencies,
-                        adaln_input,
-                    )
-            elif is_editing:
+            if is_editing:
                 image_features = layer(
                     image_features,
                     image_attention_mask,
@@ -1319,26 +1297,12 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
             )
 
             for layer in self.context_refiner:
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    cap_features = self._gradient_checkpointing_func(
-                        layer,
-                        cap_features,
-                        cap_attention_mask,
-                        cap_frequencies,
-                        None,
-                        None,
-                        None,
-                        None,
-                        0,
-                        True,
-                    )
-                else:
-                    cap_features = layer(
-                        cap_features,
-                        cap_attention_mask,
-                        cap_frequencies,
-                        skip_sequence_parallel_override=True,
-                    )
+                cap_features = layer(
+                    cap_features,
+                    cap_attention_mask,
+                    cap_frequencies,
+                    skip_sequence_parallel_override=True,
+                )
 
             sigvq_lengths = [len(features) for features in sigvq_sequence.features]
             sigvq_features = self.sigvq_embedder(
@@ -1366,26 +1330,12 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
 
             if any(sigvq_lengths):
                 for layer in self.sigvq_refiner:
-                    if torch.is_grad_enabled() and self.gradient_checkpointing:
-                        sigvq_features = self._gradient_checkpointing_func(
-                            layer,
-                            sigvq_features,
-                            sigvq_attention_mask,
-                            sigvq_frequencies,
-                            None,
-                            None,
-                            None,
-                            None,
-                            0,
-                            True,
-                        )
-                    else:
-                        sigvq_features = layer(
-                            sigvq_features,
-                            sigvq_attention_mask,
-                            sigvq_frequencies,
-                            skip_sequence_parallel_override=True,
-                        )
+                    sigvq_features = layer(
+                        sigvq_features,
+                        sigvq_attention_mask,
+                        sigvq_frequencies,
+                        skip_sequence_parallel_override=True,
+                    )
 
             if get_sp_world_size() > 1:
                 if batch_size != 1:
@@ -1528,26 +1478,12 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
             )
 
             for layer in self.context_refiner:
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    condition_features = self._gradient_checkpointing_func(
-                        layer,
-                        condition_features,
-                        condition_attention_mask,
-                        condition_frequencies,
-                        None,
-                        None,
-                        None,
-                        None,
-                        0,
-                        True,
-                    )
-                else:
-                    condition_features = layer(
-                        condition_features,
-                        condition_attention_mask,
-                        condition_frequencies,
-                        skip_sequence_parallel_override=True,
-                    )
+                condition_features = layer(
+                    condition_features,
+                    condition_attention_mask,
+                    condition_frequencies,
+                    skip_sequence_parallel_override=True,
+                )
 
             (
                 unified_features,
@@ -1568,32 +1504,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                 num_replicated_suffix = condition_lengths[0]
 
         for layer in self.layers:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                if is_editing:
-                    unified_features = self._gradient_checkpointing_func(
-                        layer,
-                        unified_features,
-                        unified_attention_mask,
-                        unified_frequencies,
-                        None,
-                        unified_noise_mask,
-                        noisy_embedding,
-                        clean_embedding,
-                        num_replicated_suffix,
-                    )
-                else:
-                    unified_features = self._gradient_checkpointing_func(
-                        layer,
-                        unified_features,
-                        unified_attention_mask,
-                        unified_frequencies,
-                        adaln_input,
-                        None,
-                        None,
-                        None,
-                        num_replicated_suffix,
-                    )
-            elif is_editing:
+            if is_editing:
                 unified_features = layer(
                     unified_features,
                     unified_attention_mask,
@@ -1784,7 +1695,6 @@ class LLaDAImageQueryFormerModel(ModelMixin, ConfigMixin, AttentionMixin):
             Epsilon used by parameter-free layer normalization.
     """
 
-    _supports_gradient_checkpointing = True
     _no_split_modules: ClassVar[list[str]] = ["LLaDAImageQueryFormerBlock"]
     _repeated_blocks: ClassVar[list[str]] = ["LLaDAImageQueryFormerBlock"]
     _skip_layerwise_casting_patterns: ClassVar[list[str]] = ["norm"]
@@ -1820,7 +1730,6 @@ class LLaDAImageQueryFormerModel(ModelMixin, ConfigMixin, AttentionMixin):
                 for _ in range(num_hidden_layers)
             ]
         )
-        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -1846,15 +1755,7 @@ class LLaDAImageQueryFormerModel(ModelMixin, ConfigMixin, AttentionMixin):
         attention_mask = attention_mask.bool()
 
         for query_block in self.query_blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                query_embeds = self._gradient_checkpointing_func(
-                    query_block,
-                    query_embeds,
-                    inputs_embeds,
-                    attention_mask,
-                )
-            else:
-                query_embeds = query_block(query_embeds, inputs_embeds, attention_mask)
+            query_embeds = query_block(query_embeds, inputs_embeds, attention_mask)
 
         if not return_dict:
             return (query_embeds,)
@@ -1987,7 +1888,6 @@ class LLaDAImageTextProjectionModel(ModelMixin, ConfigMixin, AttentionMixin):
             Epsilon used by parameter-free RMS normalization.
     """
 
-    _supports_gradient_checkpointing = True
     _no_split_modules: ClassVar[list[str]] = ["LLaDAImageTextProjectionBlock"]
     _repeated_blocks: ClassVar[list[str]] = ["LLaDAImageTextProjectionBlock"]
     _skip_layerwise_casting_patterns: ClassVar[list[str]] = [
@@ -2026,7 +1926,6 @@ class LLaDAImageTextProjectionModel(ModelMixin, ConfigMixin, AttentionMixin):
             ]
         )
         self.projector = nn.Linear(hidden_size, projection_dim, bias=True)
-        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -2045,10 +1944,7 @@ class LLaDAImageTextProjectionModel(ModelMixin, ConfigMixin, AttentionMixin):
                 Hidden states projected to the denoiser caption dimension.
         """
         for layer in self.layers:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(layer, hidden_states)
-            else:
-                hidden_states = layer(hidden_states)
+            hidden_states = layer(hidden_states)
 
         hidden_states = self.projector(hidden_states)
         if not return_dict:
@@ -2258,7 +2154,6 @@ class LLaDAImageSigVQModel(ModelMixin, ConfigMixin, AttentionMixin):
     `patch_size`.
     """
 
-    _supports_gradient_checkpointing = True
     _no_split_modules: ClassVar[list[str]] = ["LLaDAImageSigVQVisionBlock"]
     _repeated_blocks: ClassVar[list[str]] = ["LLaDAImageSigVQVisionBlock"]
     _skip_layerwise_casting_patterns: ClassVar[list[str]] = [
@@ -2327,7 +2222,6 @@ class LLaDAImageSigVQModel(ModelMixin, ConfigMixin, AttentionMixin):
             inner_dim=semantic_embed_dim,
             activation_fn="linear-silu",
         )
-        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -2373,12 +2267,7 @@ class LLaDAImageSigVQModel(ModelMixin, ConfigMixin, AttentionMixin):
             )
 
             for block in self.visual.blocks:
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    hidden_states = self._gradient_checkpointing_func(
-                        block, hidden_states
-                    )
-                else:
-                    hidden_states = block(hidden_states)
+                hidden_states = block(hidden_states)
 
             hidden_states = hidden_states.transpose(1, 2).reshape(
                 pixel_values.shape[0],
