@@ -1,0 +1,122 @@
+name: Nightly Benchmark (AMD)
+
+# Serving benchmarks that report numbers rather than gate anything.
+#
+# They are deliberately not jobs in nightly-test-amd-rocm720.yml: a benchmark
+# holds the one 8-GPU MI35x runner for half an hour, its result is a throughput
+# number rather than a pass/fail, and inside the nightly test workflow a slow or
+# failed replay would either turn the whole nightly red or have to be pinned
+# behind continue-on-error, which hides real breakage. Here the job's own status
+# is the signal, and the workload can be tuned without touching the gate.
+on:
+  schedule:
+    # Clear of the AMD nightly test sweep (17:30 UTC) so the two do not queue
+    # behind each other on linux-mi35x-gpu-8.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to benchmark. Defaults to the default branch.'
+        required: false
+        type: string
+        default: ''
+      rocm_version:
+        description: 'ROCm image version ("all" runs rocm10, rocm724, and rocm720)'
+        required: false
+        type: choice
+        default: 'rocm10'
+        options:
+          - rocm10
+          - rocm724
+          - rocm720
+          - 'all'
+      benchmark_select:
+        description: 'Select a benchmark to run from dropdown (choose "all" to run all benchmarks)'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - qwen35-mxfp4-agentic-mtp-mi35x
+      workload_env:
+        description: 'Optional workload overrides, space separated (e.g. "AGENTIC_CONCURRENCY=64 AGENTIC_NUM_CONVERSATIONS=128")'
+        required: false
+        type: string
+        default: ''
+      continue_on_error:
+        description: 'Keep running the remaining benchmarks after one fails'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  # One benchmark run at a time, and never cancel one in flight: a cancelled
+  # replay leaves no number behind, which is the only thing this workflow
+  # produces.
+  group: nightly-benchmark-amd-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ==============================================================================
+  # Qwen3.5-397B-A17B MXFP4 + EAGLE MTP, AgentX coding-agent replay (MI35x, tp4)
+  # ==============================================================================
+  qwen35-mxfp4-agentic-mtp-mi35x:
+    name: ${{ format('qwen35-mxfp4-agentic-mtp-mi35x ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
+    if: github.repository == 'sgl-project/sglang' && (!inputs.benchmark_select || inputs.benchmark_select == 'all' || inputs.benchmark_select == 'qwen35-mxfp4-agentic-mtp-mi35x')
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Check model cache space
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            bash scripts/ci/amd/check_hf_cache_space.sh \
+            amd/Qwen3.5-397B-A17B-MXFP4 240
+
+      # The replay converts the published AgentX corpus on first use and caches
+      # it under the persistent /sgl-data mount alongside the weights, so only
+      # the first run on a fresh runner pays for the download.
+      - name: Qwen3.5-MXFP4 agentic MTP replay (4-GPU MI35x)
+        timeout-minutes: 240
+        env:
+          WORKLOAD_ENV: ${{ inputs.workload_env }}
+        run: |
+          > github_summary.md  # Clear summary file
+          ENV_ARGS=()
+          for override in $WORKLOAD_ENV; do
+            ENV_ARGS+=(-e "$override")
+          done
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            "${ENV_ARGS[@]}" \
+            python3 run_suite.py --hw amd --suite nightly-perf-4-gpu-mi35x-qwen35-mxfp4-agentic-mtp --nightly --timeout-per-file 12600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
