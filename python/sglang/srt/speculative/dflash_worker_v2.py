@@ -208,6 +208,14 @@ def _is_all_greedy(sampling_info) -> bool:
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
+    if num_pred == 0:
+        # A one-token verify window contains only the anchor. FlashInfer top-k
+        # cannot process the resulting zero-row logits tensor.
+        k = draft_model.candidate_selector.top_k
+        return (
+            torch.empty((bs, 0, k), dtype=torch.int64, device=pred_hidden.device),
+            torch.empty((bs, 0, k, k), dtype=torch.float32, device=pred_hidden.device),
+        )
     candidate_ids, unary_logits = draft_model.compute_candidates(
         pred_hidden.reshape(-1, pred_hidden.shape[-1])
     )

@@ -1074,6 +1074,11 @@ class CandidateSelector(nn.Module):
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
         serves greedy and sampling batches alike."""
+        if candidate_ids.shape[1] == 0:
+            return (
+                candidate_ids.new_empty(candidate_ids.shape[:2]),
+                scores.new_empty(candidate_ids.shape, dtype=torch.float32),
+            )
         if scores.is_cuda:
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
