@@ -2198,7 +2198,9 @@ class LayerwiseOffloadManager:
         total = 0
         for layer_meta in self._weight_metadata.values():
             for meta in layer_meta.values():
-                if meta.get("preserve_strides", False):
+                # strided copies and weights left on their checkpoint mapping
+                # carry a shape, not a slot in a consolidated buffer
+                if meta.get("preserve_strides", False) or meta.get("mapped", False):
                     numel = math.prod(meta["shape"])
                 else:
                     numel = meta["numel"]

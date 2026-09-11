@@ -2323,3 +2323,27 @@ def test_residency_layout_switches_policy_without_rebuilding_host_stores(monkeyp
         policy=RESIDENCY_POLICY_STRIDED,
     )
     assert manager._consolidated_cpu_weights is host_stores
+
+
+def test_offloaded_weight_bytes_counts_mapped_and_strided_entries():
+    # a mapped weight (left on the checkpoint) and a strided copy have no
+    # consolidated-buffer slot, so their bytes come from the shape
+    manager = SimpleNamespace(
+        _weight_metadata={
+            0: {
+                "blocks.0.a": {"dtype": torch.bfloat16, "numel": 8, "offset": 0},
+                "blocks.0.b": {
+                    "dtype": torch.bfloat16,
+                    "shape": (2, 3),
+                    "mapped": True,
+                },
+                "blocks.0.c": {
+                    "dtype": torch.float32,
+                    "shape": (4,),
+                    "preserve_strides": True,
+                },
+            }
+        }
+    )
+    total = LayerwiseOffloadManager.offloaded_weight_bytes(manager)
+    assert total == 8 * 2 + 6 * 2 + 4 * 4
