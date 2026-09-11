@@ -2,6 +2,7 @@
 
 import unittest
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -63,6 +64,25 @@ def _image_item(thumbnails, num_patches, patches=None):
 
 
 class TestStep3p7ImageFeatureBatching(CustomTestCase):
+    def test_accepts_numpy_patch_counts(self):
+        for dtype in (np.int32, np.int64):
+            with self.subTest(dtype=dtype):
+                item = _image_item(
+                    torch.tensor([[100.0], [200.0]]),
+                    np.array([2, 0], dtype=dtype),
+                    torch.tensor([[1.0], [2.0]]),
+                )
+                output = _bare_model().get_image_feature([item])
+                self.assertTrue(
+                    torch.equal(output, torch.tensor([[1.0], [2.0], [100.0], [200.0]]))
+                )
+
+        for counts in (np.array([0]), np.array(0), np.int64(0)):
+            with self.subTest(counts=repr(counts)):
+                item = _image_item(torch.tensor([[100.0]]), counts)
+                output = _bare_model().get_image_feature([item])
+                self.assertTrue(torch.equal(output, torch.tensor([[100.0]])))
+
     def test_batches_items_and_restores_image_order(self):
         model = _bare_model()
         items = [

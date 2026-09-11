@@ -1,5 +1,6 @@
 from typing import Iterable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
@@ -106,6 +107,8 @@ class Step3p7ForConditionalGeneration(nn.Module):
                 raise ValueError("Step3.7 image item is missing num_patches.")
             if isinstance(num_patches, torch.Tensor):
                 num_patches = [int(x) for x in num_patches.flatten().cpu().tolist()]
+            elif isinstance(num_patches, np.ndarray):
+                num_patches = [int(x) for x in num_patches.flatten().tolist()]
             elif isinstance(num_patches, (list, tuple)):
                 num_patches = [
                     int(x.item()) if isinstance(x, torch.Tensor) else int(x)
