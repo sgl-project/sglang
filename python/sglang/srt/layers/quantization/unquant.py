@@ -72,11 +72,13 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def _glm53_kda_ptpc_enabled(layer: torch.nn.Module) -> bool:
     module_name = getattr(layer, "_glm53_kda_ptpc_module", None)
+    allowed_k = getattr(layer, "_fp8_ptpc_allowed_k", None)
     return (
         module_name is not None
         and module_name in envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get()
         and _use_aiter
         and is_gfx95_supported()
+        and (allowed_k is None or layer.weight.shape[1] in allowed_k)
     )
 
 

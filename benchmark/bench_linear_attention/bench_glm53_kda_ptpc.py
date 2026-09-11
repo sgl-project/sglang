@@ -13,8 +13,28 @@ import torch
 from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
 
 TP_SHAPES = {
-    4: {"qkv_proj": (6144, 4096), "o_proj": (4096, 2048)},
-    8: {"qkv_proj": (3072, 4096), "o_proj": (4096, 1024)},
+    4: {
+        "qkv_proj": (6144, 4096),
+        "b_proj": (16, 4096),
+        "f_a_proj": (128, 4096),
+        "g_a_proj": (128, 4096),
+        "f_b_proj": (2048, 128),
+        "g_b_proj": (2048, 128),
+        "o_proj": (4096, 2048),
+        "shared_qkvfg": (6400, 4096),
+        "packed_qkvfg": (6400, 4096),
+    },
+    8: {
+        "qkv_proj": (3072, 4096),
+        "b_proj": (8, 4096),
+        "f_a_proj": (128, 4096),
+        "g_a_proj": (128, 4096),
+        "f_b_proj": (1024, 128),
+        "g_b_proj": (1024, 128),
+        "o_proj": (4096, 1024),
+        "shared_qkvfg": (3328, 4096),
+        "packed_qkvfg": (3328, 4096),
+    },
 }
 
 
@@ -24,7 +44,7 @@ def parse_args():
     parser.add_argument(
         "--modules",
         nargs="+",
-        choices=("qkv_proj", "o_proj"),
+        choices=tuple(TP_SHAPES[4]),
         default=("qkv_proj",),
     )
     parser.add_argument(
@@ -119,9 +139,14 @@ def load_checkpoint_weight(
             shards.append(weight.narrow(0, tp_rank * shard_size, shard_size))
         return torch.cat(shards).contiguous()
 
-    weight = load(f"{prefix}.o_proj.weight")
-    shard_size = weight.shape[1] // tp
-    return weight.narrow(1, tp_rank * shard_size, shard_size).contiguous()
+    weight = load(f"{prefix}.{module_name}.weight")
+    if module_name == "o_proj":
+        shard_size = weight.shape[1] // tp
+        return weight.narrow(1, tp_rank * shard_size, shard_size).contiguous()
+    if module_name in {"b_proj", "f_b_proj", "g_b_proj"}:
+        shard_size = weight.shape[0] // tp
+        return weight.narrow(0, tp_rank * shard_size, shard_size).contiguous()
+    return weight.contiguous()
 
 
 @torch.inference_mode()
@@ -149,24 +174,129 @@ def run_case(tp: int, module_name: str, m: int, args) -> dict:
                 f"{weight.dtype} {tuple(weight.shape)}"
             )
         weight_source = str(args.checkpoint)
-    fp8_weight, weight_scale = aiter.pertoken_quant(
-        weight, quant_dtype=aiter.dtypes.fp8
-    )
-    fp8_weight = shuffle_weight(fp8_weight, (16, 16)).contiguous()
 
     def bf16():
         return tgemm.mm(x, weight, otype=torch.bfloat16)
 
+    iters = args.large_iters if m >= 131072 else args.iters
+    bf16_samples = measure_samples(bf16, args.warmup, iters, args.inner_iters)
+    bf16_summary = summarize(bf16_samples)
+    unsupported_reason = None
+    try:
+        fp8_weight, weight_scale = aiter.pertoken_quant(
+            weight, quant_dtype=aiter.dtypes.fp8
+        )
+        fp8_weight = shuffle_weight(fp8_weight, (16, 16)).contiguous()
+
+        def ptpc():
+            q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
+            return apply_fp8_ptpc_linear(q_input, fp8_weight, weight_scale)
+
+        ptpc_samples = measure_samples(ptpc, args.warmup, iters, args.inner_iters)
+        ptpc_summary = summarize(ptpc_samples)
+        delta = ptpc_summary["median_ms"] / bf16_summary["median_ms"] - 1
+    except RuntimeError as error:
+        ptpc_samples = []
+        ptpc_summary = None
+        delta = None
+        unsupported_reason = str(error)
+    result = {
+        "tp": tp,
+        "module": module_name,
+        "m": m,
+        "n": n,
+        "k": k,
+        "warmup": args.warmup,
+        "iters": iters,
+        "inner_iters": args.inner_iters,
+        "seed": args.seed,
+        "weight_source": weight_source,
+        "bf16": {**bf16_summary, "samples_ms": bf16_samples},
+        "ptpc": (
+            {**ptpc_summary, "samples_ms": ptpc_samples}
+            if ptpc_summary is not None
+            else None
+        ),
+        "median_delta": delta,
+        "unsupported_reason": unsupported_reason,
+    }
+    torch.cuda.empty_cache()
+    return result
+
+
+@torch.inference_mode()
+def run_first_stage_case(tp: int, module_name: str, m: int, args) -> dict:
+    import aiter
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.tuned_gemm import tgemm
+
+    n, k = TP_SHAPES[tp][module_name]
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(args.seed + tp + m + n + k)
+    x = torch.randn(m, k, generator=generator, device="cuda", dtype=torch.bfloat16)
+    source_modules = ("qkv_proj", "f_a_proj", "g_a_proj")
+    if args.checkpoint is None:
+        weights = [
+            torch.randn(
+                TP_SHAPES[tp][name][0],
+                k,
+                generator=generator,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            for name in source_modules
+        ]
+        weight_source = "synthetic"
+    else:
+        weights = [
+            load_checkpoint_weight(
+                args.checkpoint, args.layer, name, tp, args.tp_rank
+            ).to(device="cuda")
+            for name in source_modules
+        ]
+        expected_shapes = [TP_SHAPES[tp][name] for name in source_modules]
+        actual_shapes = [(weight.shape[0], weight.shape[1]) for weight in weights]
+        if any(weight.dtype != torch.bfloat16 for weight in weights) or (
+            actual_shapes != expected_shapes
+        ):
+            raise ValueError(
+                f"Expected BF16 {expected_shapes} first-stage weights, got "
+                f"{[weight.dtype for weight in weights]} {actual_shapes}"
+            )
+        weight_source = str(args.checkpoint)
+
+    def prepare(weight):
+        fp8_weight, weight_scale = aiter.pertoken_quant(
+            weight, quant_dtype=aiter.dtypes.fp8
+        )
+        return (
+            shuffle_weight(fp8_weight, (16, 16)).contiguous(),
+            weight_scale.contiguous(),
+        )
+
+    if module_name == "shared_qkvfg":
+        ptpc_weights = [prepare(weight) for weight in weights]
+    else:
+        ptpc_weights = [prepare(torch.cat(weights))]
+
+    def bf16():
+        result = None
+        for weight in weights:
+            result = tgemm.mm(x, weight, otype=torch.bfloat16)
+        return result
+
     def ptpc():
         q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
-        return apply_fp8_ptpc_linear(q_input, fp8_weight, weight_scale)
+        result = None
+        for fp8_weight, weight_scale in ptpc_weights:
+            result = apply_fp8_ptpc_linear(q_input, fp8_weight, weight_scale)
+        return result
 
     iters = args.large_iters if m >= 131072 else args.iters
     bf16_samples = measure_samples(bf16, args.warmup, iters, args.inner_iters)
     ptpc_samples = measure_samples(ptpc, args.warmup, iters, args.inner_iters)
     bf16_summary = summarize(bf16_samples)
     ptpc_summary = summarize(ptpc_samples)
-    delta = ptpc_summary["median_ms"] / bf16_summary["median_ms"] - 1
     result = {
         "tp": tp,
         "module": module_name,
@@ -180,7 +310,8 @@ def run_case(tp: int, module_name: str, m: int, args) -> dict:
         "weight_source": weight_source,
         "bf16": {**bf16_summary, "samples_ms": bf16_samples},
         "ptpc": {**ptpc_summary, "samples_ms": ptpc_samples},
-        "median_delta": delta,
+        "median_delta": (ptpc_summary["median_ms"] / bf16_summary["median_ms"] - 1),
+        "unsupported_reason": None,
     }
     torch.cuda.empty_cache()
     return result
@@ -209,6 +340,7 @@ def write_outputs(results: list[dict], output: Path) -> None:
                 "ptpc_p95_ms",
                 "ptpc_cv",
                 "median_delta",
+                "unsupported_reason",
             ),
         )
         writer.writeheader()
@@ -226,11 +358,16 @@ def write_outputs(results: list[dict], output: Path) -> None:
                     "bf16_p5_ms": result["bf16"]["p5_ms"],
                     "bf16_p95_ms": result["bf16"]["p95_ms"],
                     "bf16_cv": result["bf16"]["cv"],
-                    "ptpc_median_ms": result["ptpc"]["median_ms"],
-                    "ptpc_p5_ms": result["ptpc"]["p5_ms"],
-                    "ptpc_p95_ms": result["ptpc"]["p95_ms"],
-                    "ptpc_cv": result["ptpc"]["cv"],
+                    "ptpc_median_ms": (
+                        result["ptpc"]["median_ms"] if result["ptpc"] else None
+                    ),
+                    "ptpc_p5_ms": (result["ptpc"]["p5_ms"] if result["ptpc"] else None),
+                    "ptpc_p95_ms": (
+                        result["ptpc"]["p95_ms"] if result["ptpc"] else None
+                    ),
+                    "ptpc_cv": result["ptpc"]["cv"] if result["ptpc"] else None,
                     "median_delta": result["median_delta"],
+                    "unsupported_reason": result["unsupported_reason"],
                 }
             )
 
@@ -240,18 +377,27 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("A gfx950 GPU is required")
     results = [
-        run_case(args.tp, module_name, m, args)
+        (
+            run_first_stage_case(args.tp, module_name, m, args)
+            if module_name in {"shared_qkvfg", "packed_qkvfg"}
+            else run_case(args.tp, module_name, m, args)
+        )
         for module_name in args.modules
         for m in args.m
     ]
     write_outputs(results, args.output)
     for result in results:
-        print(
+        prefix = (
             f"TP{result['tp']} {result['module']} M={result['m']}: "
-            f"BF16={result['bf16']['median_ms']:.4f} ms "
-            f"PTPC={result['ptpc']['median_ms']:.4f} ms "
-            f"delta={result['median_delta']:+.2%}"
+            f"BF16={result['bf16']['median_ms']:.4f} ms"
         )
+        if result["ptpc"] is None:
+            print(f"{prefix} PTPC=unsupported ({result['unsupported_reason']})")
+        else:
+            print(
+                f"{prefix} PTPC={result['ptpc']['median_ms']:.4f} ms "
+                f"delta={result['median_delta']:+.2%}"
+            )
 
 
 if __name__ == "__main__":
