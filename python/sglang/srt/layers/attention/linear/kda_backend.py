@@ -1167,6 +1167,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
+            dense_verify=ragged_layout is None,
             **ring_kwargs,
             **(
                 dict(

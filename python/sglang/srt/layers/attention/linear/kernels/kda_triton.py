@@ -2,10 +2,11 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -174,6 +175,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_steps: int,
         retrieve_parent_token: Optional[torch.Tensor],
         lower_bound: Optional[float] = None,
+        dense_verify: bool = False,
         # fused ReplaySSM ring-write (dense verify only; off elsewhere).
         cache_ring: bool = False,
         replayssm_rawv: Optional[torch.Tensor] = None,
@@ -188,6 +190,30 @@ class TritonKDAKernel(LinearAttnKernelBase):
         # the committed pool (disable_state_update=True), and handles chain + tree
         # (retrieve_parent_token). The verify kernel for the Triton / CuTe DSL KDA
         # decode backends, and the reference the KDA correctness tests assert against.
+        num_warps = 1
+        if (
+            dense_verify
+            and lower_bound == -5
+            and cache_steps == 6
+            and retrieve_parent_token is None
+            and not cache_ring
+            and q.is_cuda
+            and not is_hip()
+            and q.shape[-2:] == k.shape[-2:] == v.shape[-2:] == (16, 128)
+            and all(t.dtype == torch.bfloat16 for t in (q, k, v, a, b))
+            and A_log.dtype == dt_bias.dtype == torch.float32
+            and cache_indices.dtype
+            == intermediate_state_indices.dtype
+            == query_start_loc.dtype
+            == torch.int32
+            and ssm_states.dtype == torch.float32
+            and ssm_states.is_contiguous()
+            and intermediate_states_buffer is not None
+            and intermediate_states_buffer.dtype == torch.float32
+            and intermediate_states_buffer.is_contiguous()
+            and get_jit_cuda_arch().major == 10
+        ):
+            num_warps = 4
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -214,6 +240,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
+            num_warps=num_warps,
         )
 
     def extend(
