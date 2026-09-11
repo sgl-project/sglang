@@ -156,10 +156,10 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
-            if rc != 0:
+            rc = cudart.cudaHostRegister(ptr, size, 0)
+            if int(rc) != 0:
                 raise RuntimeError(
-                    f"cudaHostRegister failed (rc={rc}, "
+                    f"cudaHostRegister failed (rc={int(rc)}, "
                     f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
                     f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
                     f"pinned and device transfers may silently return stale data."
@@ -185,13 +185,13 @@ def _cuda_host_unregister_ranges(
 ) -> list[tuple[int, int]]:
     failed_ranges = []
     for ptr, size in reversed(registered_ranges):
-        rc = int(cudart.cudaHostUnregister(ptr))
-        if rc != 0:
+        rc = cudart.cudaHostUnregister(ptr)
+        if int(rc) != 0:
             failed_ranges.append((ptr, size))
             logger.warning(
                 "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
-                rc,
+                int(rc),
                 cudart.cudaGetErrorString(rc),
                 ptr,
                 size,
