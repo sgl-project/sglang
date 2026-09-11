@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
-from fastapi import Request
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
 
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
@@ -3920,6 +3921,164 @@ class ServingChatTestCase(unittest.TestCase):
         message = response.choices[0].message
         self.assertEqual(message.reasoning_content, "\nLet me think\n")
         self.assertEqual(message.content, "\n\nThe answer is 42.\n")
+
+    def test_step_tool_calls_through_http_and_sse(self):
+        """Use real serving/parsing/serialization with deterministic model text."""
+        self.tm.server_args.reasoning_parser = "step3p5"
+        self.tm.server_args.tool_call_parser = "step3p5"
+        self.tm.create_abort_task.return_value = None
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        app = FastAPI()
+
+        @app.post("/v1/chat/completions")
+        async def completions(request: ChatCompletionRequest, raw_request: Request):
+            return await self.chat.handle_request(request, raw_request)
+
+        tool = (
+            "<tool_call><function bash><parameter=command>pwd</parameter>"
+            "</function></tool_call>"
+        )
+        for suffix in ("", "</think>late close"):
+            source = "inspect the repo" + tool + suffix
+            # Whole output, character increments, and a split inside both
+            # boundary markers exercise the HTTP handler's buffering/flush.
+            chunkings = [
+                [source],
+                list(source),
+                [source[:20], source[20:40], source[40:]],
+            ]
+            for stream in (False, True):
+                for chunks in chunkings if stream else [[source]]:
+                    with self.subTest(suffix=suffix, stream=stream, chunks=len(chunks)):
+
+                        async def generate(*args, **kwargs):
+                            cumulative = ""
+                            for i, chunk in enumerate(chunks):
+                                cumulative += chunk
+                                yield {
+                                    "text": cumulative,
+                                    "index": 0,
+                                    "meta_info": {
+                                        "id": "chatcmpl-step-regression",
+                                        "prompt_tokens": 10,
+                                        "completion_tokens": i + 1,
+                                        "cached_tokens": 0,
+                                        "weight_version": "test",
+                                        "finish_reason": (
+                                            {"type": "stop"}
+                                            if i == len(chunks) - 1
+                                            else None
+                                        ),
+                                    },
+                                }
+
+                        self.tm.generate_request.side_effect = generate
+                        with patch(
+                            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+                        ) as conv_mock:
+                            conv_mock.return_value.get_prompt.return_value = (
+                                "Test prompt"
+                            )
+                            with TestClient(app) as client:
+                                response = client.post(
+                                    "/v1/chat/completions",
+                                    json={
+                                        "model": "test-model",
+                                        "messages": [
+                                            {
+                                                "role": "user",
+                                                "content": "Inspect the repo",
+                                            }
+                                        ],
+                                        "tools": [
+                                            {
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "bash",
+                                                    "parameters": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "command": {
+                                                                "type": "string"
+                                                            }
+                                                        },
+                                                    },
+                                                },
+                                            }
+                                        ],
+                                        "tool_choice": "auto",
+                                        "separate_reasoning": True,
+                                        "stream": stream,
+                                    },
+                                )
+                        self.assertEqual(response.status_code, 200, response.text)
+                        if not stream:
+                            choice = response.json()["choices"][0]
+                            message = choice["message"]
+                            self.assertEqual(choice["finish_reason"], "tool_calls")
+                            self.assertEqual(
+                                message["reasoning_content"], "inspect the repo"
+                            )
+                            self.assertEqual(message["content"] or "", suffix)
+                            calls = message["tool_calls"]
+                            self.assertEqual(len(calls), 1)
+                            self.assertTrue(calls[0]["id"])
+                            self.assertEqual(calls[0]["function"]["name"], "bash")
+                            self.assertEqual(
+                                json.loads(calls[0]["function"]["arguments"]),
+                                {"command": "pwd"},
+                            )
+                        else:
+                            self.assertIn(
+                                "text/event-stream", response.headers["content-type"]
+                            )
+                            self.assertTrue(
+                                response.text.rstrip().endswith("data: [DONE]")
+                            )
+                            events = [
+                                json.loads(line[6:])
+                                for line in response.text.splitlines()
+                                if line.startswith("data: ") and line != "data: [DONE]"
+                            ]
+                            choices = [c for e in events for c in e.get("choices", [])]
+                            deltas = [c["delta"] for c in choices]
+                            self.assertEqual(
+                                "".join(
+                                    d.get("reasoning_content") or "" for d in deltas
+                                ),
+                                "inspect the repo",
+                            )
+                            self.assertEqual(
+                                "".join(d.get("content") or "" for d in deltas), suffix
+                            )
+                            calls = [
+                                tc for d in deltas for tc in d.get("tool_calls") or []
+                            ]
+                            self.assertTrue(calls)
+                            self.assertEqual({c["index"] for c in calls}, {0})
+                            self.assertEqual(
+                                [
+                                    c["function"]["name"]
+                                    for c in calls
+                                    if c["function"].get("name")
+                                ],
+                                ["bash"],
+                            )
+                            self.assertEqual(
+                                len({c["id"] for c in calls if c.get("id")}), 1
+                            )
+                            arguments = "".join(
+                                c["function"].get("arguments") or "" for c in calls
+                            )
+                            self.assertEqual(json.loads(arguments), {"command": "pwd"})
+                            self.assertEqual(
+                                [
+                                    c["finish_reason"]
+                                    for c in choices
+                                    if c.get("finish_reason")
+                                ],
+                                ["tool_calls"],
+                            )
 
     # ------------- reasoning config tests -------------
     def test_get_reasoning_from_request_default_true_toggle(self):
