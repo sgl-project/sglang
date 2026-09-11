@@ -2976,7 +2976,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 _deepseek_family_overrides(_args(), None),
                                 {"attention_backend": "dsa", "page_size": 1},
                             )
-        # DSA CP (zigzag): the coupled parallel-field declaration
+        # DSA CP derives attention CP size without overriding DP/MoE settings.
         with patch(
             "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
         ):
@@ -2986,10 +2986,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         result = _deepseek_family_overrides(
                             _args(
                                 enable_prefill_cp=True,
-                                cp_strategy="zigzag",
+                                cp_strategy="interleave",
                                 tp_size=8,
                                 dp_size=1,
-                                ep_size=1,
+                                enable_dp_attention=False,
+                                moe_dense_tp_size=2,
+                                ep_size=2,
                                 moe_a2a_backend="none",
                                 kv_cache_dtype="auto",
                             ),
@@ -3000,10 +3002,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             {
                                 "attention_backend": "dsa",
                                 "page_size": 64,
-                                "enable_dp_attention": True,
-                                "moe_dense_tp_size": 1,
-                                "moe_a2a_backend": "deepep",
-                                "ep_size": 8,
                                 "attn_cp_size": 8,
                             },
                         )
