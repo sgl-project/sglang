@@ -3,6 +3,11 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.disaggregation.layerwise_hooks import (
+    layerwise_save_kv_layer,
+    layerwise_wait_transfer_done,
+)
+
 
 class BaseMatmul(ABC):
     @abstractmethod
@@ -38,7 +43,7 @@ class GroupedMatmul(BaseMatmul):
             raise AttributeError(
                 f"Weight attribute '{weight_prefix}_weight' not found in layer"
             )
-        return torch.ops.npu.npu_grouped_matmul(
+        result = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[weight] if transposed else [weight.transpose(1, 2)],
             **scale_args,
@@ -48,6 +53,14 @@ class GroupedMatmul(BaseMatmul):
             group_list=expert_tokens,
             output_dtype=output_dtype,
         )[0]
+
+        # gmm2 (down projection) is the last compute op before EP combine
+        # (all-reduce).  Wait for the transfer-stream RDMA writes to drain
+        # so that KV transfer and HCCL combine do not contend for network
+        # resources.
+        layerwise_wait_transfer_done()
+
+        return result
 
 
 class GroupedMatmulSwigluQuant(BaseMatmul):
@@ -72,6 +85,8 @@ class GroupedMatmulSwigluQuant(BaseMatmul):
         transposed: bool = True,
         **scale_args,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        layerwise_save_kv_layer(layer.layer_id)
+
         weight = getattr(layer, f"{weight_prefix}_weight", None)
         if weight is None:
             raise AttributeError(
