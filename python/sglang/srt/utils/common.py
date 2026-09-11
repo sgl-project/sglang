@@ -220,13 +220,17 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
+try:
+    import torchada  # noqa: F401
+except ImportError:
+    _IS_MUSA = False
+else:
+    _IS_MUSA = hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
-    try:
-        import torchada  # noqa: F401
-    except ImportError:
-        return False
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return _IS_MUSA
 
 
 @lru_cache(maxsize=1)

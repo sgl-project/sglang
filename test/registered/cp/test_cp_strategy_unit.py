@@ -121,6 +121,24 @@ class TestCPStrategyUnit(CustomTestCase):
         ):
             self.assertFalse(is_dsa_enable_prefill_cp())
 
+    def test_disabled_dsa_cp_skips_platform_probes(self):
+        parallel = SimpleNamespace(attn_cp_size=1)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.get_parallel",
+                return_value=parallel,
+            ),
+            patch("sglang.srt.layers.attention.dsa.utils.is_hip") as mock_is_hip,
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu") as mock_is_npu,
+            patch("sglang.srt.layers.attention.dsa.utils.is_musa") as mock_is_musa,
+        ):
+            self.assertFalse(is_dsa_enable_prefill_cp())
+
+        mock_is_hip.assert_not_called()
+        mock_is_npu.assert_not_called()
+        mock_is_musa.assert_not_called()
+
 
 class TestPrefillCPBCGReplay(CustomTestCase):
     def tearDown(self):
