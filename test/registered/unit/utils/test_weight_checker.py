@@ -511,6 +511,15 @@ class TestSnapshot(_WeightCheckerTestBase):
             self.model.w.data.fill_(99.0)
         torch.testing.assert_close(self.checker._snapshot_tensors["w"], original_w)
 
+    def test_failed_snapshot_holds_no_arena(self):
+        """A copy that raises mid-snapshot must not leave the model-sized arena
+        reachable from the checker, or the retry allocates a second one."""
+        with patch.object(torch.Tensor, "copy_", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.checker._snapshot()
+        self.assertIsNone(self.checker._snapshot_arena)
+        self.assertIsNone(self.checker._snapshot_tensors)
+
 
 class TestResetTensors(_WeightCheckerTestBase):
     def test_changes_normal_params_in_place(self):
@@ -547,6 +556,21 @@ class TestCompare(_WeightCheckerTestBase):
     def test_passes_when_unchanged(self):
         self.checker._snapshot()
         self.checker._compare()  # no exception
+
+    def test_success_releases_snapshot(self):
+        self.checker._snapshot()
+        self.checker._compare()
+        self.assertIsNone(self.checker._snapshot_tensors)
+        self.assertIsNone(self.checker._snapshot_arena)
+        with self.assertRaises(AssertionError):
+            self.checker._compare()
+
+    def test_failure_keeps_snapshot(self):
+        self.checker._snapshot()
+        self.checker._reset_tensors()
+        with self.assertRaises(Exception):
+            self.checker._compare()
+        self.assertIsNotNone(self.checker._snapshot_tensors)
 
     def test_fails_after_reset_on_normal_param(self):
         self.checker._snapshot()
