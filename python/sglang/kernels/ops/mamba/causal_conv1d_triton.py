@@ -507,9 +507,9 @@ def causal_conv1d_fn(
             assert padded_batch == cache_indices.size(0)
         if has_initial_state is not None:
             assert has_initial_state.size() == (padded_batch,)
-            assert conv_states is not None, (
-                "ERROR: `has_initial_state` is used, which needs also `conv_states`"
-            )
+            assert (
+                conv_states is not None
+            ), "ERROR: `has_initial_state` is used, which needs also `conv_states`"
         assert weight.stride(1) == 1
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
@@ -1058,9 +1058,9 @@ def causal_conv1d_update(
 
     if validate_data:
         assert dim == weight.size(0)
-        assert conv_state.stride(-2) == 1, (
-            f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
-        )
+        assert (
+            conv_state.stride(-2) == 1
+        ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
         assert state_len >= width - 1
         # when above happens, we don't shift-left to keep any records in conv_state
         assert dim == conv_state.size(1)
@@ -1207,4 +1207,250 @@ def causal_conv1d_update(
     )
     if unsqueeze:
         out = out.squeeze(-1)
+    return out
+
+
+@triton.jit()
+def _causal_conv1d_update_varlen_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    conv_state_ptr,
+    conv_state_indices_ptr,
+    intermediate_conv_window_ptr,
+    intermediate_state_indices_ptr,
+    query_start_loc_ptr,
+    out_ptr,
+    dim: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_x_dim: tl.constexpr,
+    stride_weight_dim: tl.constexpr,
+    stride_weight_width: tl.constexpr,
+    stride_state_seq: tl.constexpr,
+    stride_state_dim: tl.constexpr,
+    stride_state_token: tl.constexpr,
+    stride_state_indices: tl.constexpr,
+    stride_inter_seq: tl.constexpr,
+    stride_inter_step: tl.constexpr,
+    stride_inter_dim: tl.constexpr,
+    stride_inter_win: tl.constexpr,
+    stride_inter_indices: tl.constexpr,
+    stride_out_token: tl.constexpr,
+    stride_out_dim: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    MAX_SEQLEN: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    row = tl.program_id(0)
+    feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    feat_mask = feats < dim
+
+    start = tl.load(query_start_loc_ptr + row).to(tl.int64)
+    end = tl.load(query_start_loc_ptr + row + 1).to(tl.int64)
+    seq_len = end - start
+    state_row = tl.load(conv_state_indices_ptr + row * stride_state_indices).to(
+        tl.int64
+    )
+    valid_state = (
+        (state_row != pad_slot_id) & (state_row >= 0) & (state_row < num_cache_lines)
+    )
+    safe_state_row = tl.where(valid_state, state_row, 0)
+    state_base = (
+        conv_state_ptr + safe_state_row * stride_state_seq + feats * stride_state_dim
+    )
+
+    if KERNEL_WIDTH >= 2:
+        col0 = tl.load(
+            state_base,
+            mask=feat_mask & valid_state,
+            other=0.0,
+        )
+        weight0 = tl.load(
+            weight_ptr + feats * stride_weight_dim,
+            mask=feat_mask,
+            other=0.0,
+        )
+    if KERNEL_WIDTH >= 3:
+        col1 = tl.load(
+            state_base + stride_state_token,
+            mask=feat_mask & valid_state,
+            other=0.0,
+        )
+        weight1 = tl.load(
+            weight_ptr + feats * stride_weight_dim + stride_weight_width,
+            mask=feat_mask,
+            other=0.0,
+        )
+    if KERNEL_WIDTH >= 4:
+        col2 = tl.load(
+            state_base + 2 * stride_state_token,
+            mask=feat_mask & valid_state,
+            other=0.0,
+        )
+        weight2 = tl.load(
+            weight_ptr + feats * stride_weight_dim + 2 * stride_weight_width,
+            mask=feat_mask,
+            other=0.0,
+        )
+    current_weight = tl.load(
+        weight_ptr
+        + feats * stride_weight_dim
+        + (KERNEL_WIDTH - 1) * stride_weight_width,
+        mask=feat_mask,
+        other=0.0,
+    )
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + feats, mask=feat_mask, other=0.0).to(tl.float32)
+    else:
+        bias = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    inter_row = tl.load(intermediate_state_indices_ptr + row * stride_inter_indices).to(
+        tl.int64
+    )
+    for step in tl.static_range(MAX_SEQLEN):
+        token_active = step < seq_len
+        active = token_active & valid_state
+        x = tl.load(
+            x_ptr + (start + step) * stride_x_token + feats * stride_x_dim,
+            mask=feat_mask & active,
+            other=0.0,
+        )
+        acc = bias
+        if KERNEL_WIDTH == 2:
+            acc += col0 * weight0 + x * current_weight
+            next_col0 = x
+        elif KERNEL_WIDTH == 3:
+            acc += col0 * weight0 + col1 * weight1 + x * current_weight
+            next_col0 = col1
+            next_col1 = x
+        elif KERNEL_WIDTH == 4:
+            acc += col0 * weight0 + col1 * weight1 + col2 * weight2 + x * current_weight
+            next_col0 = col1
+            next_col1 = col2
+            next_col2 = x
+        if SILU_ACTIVATION:
+            acc = acc / (1 + tl.exp(-acc))
+        tl.store(
+            out_ptr + (start + step) * stride_out_token + feats * stride_out_dim,
+            tl.where(valid_state, acc, 0.0),
+            mask=feat_mask & token_active,
+        )
+
+        inter_base = (
+            intermediate_conv_window_ptr
+            + inter_row * stride_inter_seq
+            + step * stride_inter_step
+            + feats * stride_inter_dim
+        )
+        if KERNEL_WIDTH >= 2:
+            tl.store(
+                inter_base,
+                next_col0,
+                mask=feat_mask & active,
+            )
+            col0 = tl.where(active, next_col0, col0)
+        if KERNEL_WIDTH >= 3:
+            tl.store(
+                inter_base + stride_inter_win,
+                next_col1,
+                mask=feat_mask & active,
+            )
+            col1 = tl.where(active, next_col1, col1)
+        if KERNEL_WIDTH >= 4:
+            tl.store(
+                inter_base + 2 * stride_inter_win,
+                next_col2,
+                mask=feat_mask & active,
+            )
+            col2 = tl.where(active, next_col2, col2)
+    if KERNEL_WIDTH >= 2:
+        tl.store(
+            state_base,
+            col0,
+            mask=feat_mask & valid_state,
+        )
+    if KERNEL_WIDTH >= 3:
+        tl.store(
+            state_base + stride_state_token,
+            col1,
+            mask=feat_mask & valid_state,
+        )
+    if KERNEL_WIDTH >= 4:
+        tl.store(
+            state_base + 2 * stride_state_token,
+            col2,
+            mask=feat_mask & valid_state,
+        )
+
+
+def causal_conv1d_update_varlen(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    activation: Union[bool, str, None],
+    *,
+    query_start_loc: torch.Tensor,
+    conv_state_indices: torch.Tensor,
+    intermediate_conv_window: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+    max_seqlen: int,
+    pad_slot_id: int = PAD_SLOT_ID,
+) -> torch.Tensor:
+    """Causal-conv update over packed linear verify rows."""
+    assert x.dim() == 2
+    assert 2 <= weight.shape[1] <= 4
+    assert query_start_loc.shape[0] == conv_state_indices.shape[0] + 1
+    assert intermediate_state_indices.shape == conv_state_indices.shape
+    assert intermediate_conv_window.dim() == 4
+
+    out = torch.empty_like(x)
+    dim = x.shape[1]
+    width = weight.shape[1]
+    grid = (conv_state_indices.shape[0], triton.cdiv(dim, 256))
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    _causal_conv1d_update_varlen_kernel[grid](
+        x,
+        weight,
+        bias,
+        conv_state,
+        conv_state_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        query_start_loc,
+        out,
+        dim,
+        conv_state.shape[0],
+        x.stride(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        conv_state_indices.stride(0),
+        intermediate_conv_window.stride(0),
+        intermediate_conv_window.stride(1),
+        intermediate_conv_window.stride(2),
+        intermediate_conv_window.stride(3),
+        intermediate_state_indices.stride(0),
+        out.stride(0),
+        out.stride(1),
+        pad_slot_id,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        MAX_SEQLEN=max_seqlen,
+        SILU_ACTIVATION=activation is True or activation in ["silu", "swish"],
+        BLOCK_N=256,
+        **pdl_kwargs,
+    )
     return out

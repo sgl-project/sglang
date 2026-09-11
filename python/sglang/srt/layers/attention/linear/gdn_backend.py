@@ -7,6 +7,7 @@ from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
+    causal_conv1d_update_varlen,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
@@ -887,48 +888,68 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             draft_token_num = forward_batch.spec_info.draft_token_num
             ragged_layout = forward_batch.spec_info.ragged_verify_layout
-            if ragged_layout is None:
-                batch_size = seq_len // draft_token_num
-                dense_token_indices = None
-                mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
-            else:
-                # Conv requires dense rows; compact verify stores packed rows.
+            use_varlen_conv = (
+                ragged_layout is not None
+                and is_cuda()
+                and retrieve_next_token is None
+                and retrieve_next_sibling is None
+                and retrieve_parent_token is None
+            )
+            if use_varlen_conv:
                 batch_size = query_start_loc.shape[0] - 1
-                num_dense_tokens = batch_size * draft_token_num
-                dense_token_indices = forward_metadata.ragged_verify_dense_indices
-                assert dense_token_indices is not None
-                # Only real packed positions are gathered back and committed.
-                dense = mixed_qkv.new_empty(num_dense_tokens + 1, mixed_qkv.shape[-1])
-                dense.index_copy_(0, dense_token_indices, mixed_qkv)
-                mixed_qkv_dense = dense[:num_dense_tokens].view(
-                    batch_size, draft_token_num, -1
+                mixed_qkv = causal_conv1d_update_varlen(
+                    mixed_qkv,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    query_start_loc=query_start_loc,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    max_seqlen=draft_token_num,
                 )
-
-            mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-            mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
-                batch_size * draft_token_num, -1
-            )
-            if dense_token_indices is None:
-                mixed_qkv = mixed_qkv_flat
             else:
-                gather_indices = (
-                    forward_metadata.ragged_verify_dense_gather_indices
+                if ragged_layout is None:
+                    batch_size = seq_len // draft_token_num
+                    dense_token_indices = None
+                    mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+                else:
+                    batch_size = query_start_loc.shape[0] - 1
+                    num_dense_tokens = batch_size * draft_token_num
+                    dense_token_indices = forward_metadata.ragged_verify_dense_indices
+                    assert dense_token_indices is not None
+                    dense = mixed_qkv.new_empty(
+                        num_dense_tokens + 1, mixed_qkv.shape[-1]
+                    )
+                    dense.index_copy_(0, dense_token_indices, mixed_qkv)
+                    mixed_qkv_dense = dense[:num_dense_tokens].view(
+                        batch_size, draft_token_num, -1
+                    )
+
+                mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
                 )
-                assert gather_indices is not None
-                mixed_qkv = mixed_qkv_flat[gather_indices]
+                mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+                    batch_size * draft_token_num, -1
+                )
+                if dense_token_indices is None:
+                    mixed_qkv = mixed_qkv_flat
+                else:
+                    gather_indices = forward_metadata.ragged_verify_dense_gather_indices
+                    assert gather_indices is not None
+                    mixed_qkv = mixed_qkv_flat[gather_indices]
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
