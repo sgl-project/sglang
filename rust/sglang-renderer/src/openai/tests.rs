@@ -319,3 +319,111 @@ fn token_id_completion_lowering_attaches_batched_metadata() {
     assert_eq!(requests[2].metadata.bootstrap_port, Some(8999));
     assert_eq!(requests[3].metadata.bootstrap_room, Some(52));
 }
+
+#[tokio::test]
+async fn route_operations_decode_tokens_without_http() {
+    use super::{OpenAIService, OperationResponse};
+    use crate::engine::{
+        GenerateTransport, GenerationService, TokenDecoder, TokenDelta, TokenStream,
+    };
+    use crate::{
+        DynamoTokenizer, GenerateRequest, GenerationFinishReason, RendererService, ResponseError,
+    };
+    use futures::{StreamExt, future::BoxFuture};
+    use std::sync::{Arc, Mutex};
+
+    struct MemoryTransport(Mutex<Vec<GenerateRequest>>);
+    impl GenerateTransport for MemoryTransport {
+        fn generate(
+            &self,
+            request: GenerateRequest,
+        ) -> BoxFuture<'_, Result<TokenStream, ResponseError>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(request);
+                Ok(futures::stream::iter([Ok(TokenDelta {
+                    token_ids: vec![104],
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                    finish_reason: Some(GenerationFinishReason::Length),
+                    ..Default::default()
+                })])
+                .boxed())
+            })
+        }
+    }
+    async fn values<U: serde::Serialize, C: serde::Serialize>(
+        result: OperationResponse<U, C>,
+    ) -> Vec<serde_json::Value> {
+        match result {
+            OperationResponse::Unary(value) => vec![serde_json::to_value(value).unwrap()],
+            OperationResponse::Stream(stream) => {
+                stream
+                    .map(|value| serde_json::to_value(value.unwrap()).unwrap())
+                    .collect()
+                    .await
+            }
+        }
+    }
+
+    let tokenizer = crate::engine::test_utils::tiny_tokenizer();
+    let prompt_ids = tokenizer.encode("hello").unwrap().token_ids().to_vec();
+    let transport = Arc::new(MemoryTransport(Mutex::new(Vec::new())));
+    let renderer = Arc::new(RendererService::with_tokenizer(
+        renderer_config(),
+        Arc::new(DynamoTokenizer::new(tokenizer.clone(), tokenizer.clone())),
+        1,
+        1,
+    ));
+    let service = OpenAIService::new(
+        renderer,
+        GenerationService::new(transport.clone(), TokenDecoder::new(tokenizer)),
+    );
+    for chat in [false, true] {
+        for stream in [false, true] {
+            let mut body =
+                serde_json::json!({"model": "model", "n": 2, "max_tokens": 4, "stream": stream});
+            let responses = if chat {
+                body["messages"] = serde_json::json!([{"role": "user", "content": "hello"}]);
+                values(
+                    service
+                        .chat(serde_json::from_value(body).unwrap())
+                        .await
+                        .unwrap(),
+                )
+                .await
+            } else {
+                body["prompt"] = serde_json::json!(prompt_ids);
+                body["echo"] = serde_json::json!(true);
+                values(
+                    service
+                        .complete(serde_json::from_value(body).unwrap())
+                        .await
+                        .unwrap(),
+                )
+                .await
+            };
+            let mut texts = [String::new(), String::new()];
+            let mut finished = [false; 2];
+            for response in responses {
+                for choice in response["choices"].as_array().unwrap() {
+                    let index = choice["index"].as_u64().unwrap() as usize;
+                    let text = if chat {
+                        &choice[if stream { "delta" } else { "message" }]["content"]
+                    } else {
+                        &choice["text"]
+                    };
+                    texts[index].push_str(text.as_str().unwrap_or_default());
+                    if let Some(reason) = choice["finish_reason"].as_str() {
+                        assert_eq!(reason, "length");
+                        finished[index] = true;
+                    }
+                }
+            }
+            assert_eq!(texts, [if chat { "h" } else { "helloh" }; 2]);
+            assert_eq!(finished, [true; 2]);
+        }
+    }
+    let requests = transport.0.lock().unwrap();
+    assert_eq!(requests.len(), 8);
+    assert!(requests.iter().all(|request| !request.input_ids.is_empty()));
+}

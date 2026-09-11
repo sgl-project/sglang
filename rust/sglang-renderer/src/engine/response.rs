@@ -1,32 +1,9 @@
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+//! Generation stream merging and aggregation.
 
-use crate::{GenerateRequest, GenerationOutput, GenerationStream, ResponseError};
+use crate::{GenerationOutput, GenerationStream, ResponseError};
+use futures::{StreamExt, stream::BoxStream};
 
-use crate::engine::HttpGenerateClient;
-
-// Bound one OpenAI request's pending HTTP handshakes without duplicating the
-// engine scheduler's aggregate admission policy.
-const CONCURRENT_ENGINE_SUBMISSIONS: usize = 32;
-
-/// Submit prepared token-only requests in input order.
-///
-/// All streams are established before either endpoint starts collecting them,
-/// preserving concurrent engine execution.
-pub(crate) async fn submit_generate_requests(
-    client: &HttpGenerateClient,
-    inputs: Vec<GenerateRequest>,
-) -> Result<Vec<GenerationStream>, ResponseError> {
-    futures::stream::iter(
-        inputs
-            .into_iter()
-            .map(|input| async move { client.generate(input).await }),
-    )
-    .buffered(CONCURRENT_ENGINE_SUBMISSIONS)
-    .try_collect()
-    .await
-}
-
-pub(super) fn merge_indexed(
+pub(crate) fn merge_indexed(
     streams: Vec<GenerationStream>,
 ) -> BoxStream<'static, (usize, Result<GenerationOutput, ResponseError>)> {
     let streams = streams
@@ -36,7 +13,7 @@ pub(super) fn merge_indexed(
     futures::stream::select_all(streams).boxed()
 }
 
-pub(super) async fn collect_output(
+pub(crate) async fn collect_output(
     mut events: GenerationStream,
 ) -> Result<GenerationOutput, ResponseError> {
     let mut collected = GenerationOutput::default();
@@ -49,7 +26,7 @@ pub(super) async fn collect_output(
         }
     }
     Err(ResponseError {
-        status_code: 500,
+        kind: crate::ResponseErrorKind::Internal,
         message: "response truncated before completion".into(),
     })
 }

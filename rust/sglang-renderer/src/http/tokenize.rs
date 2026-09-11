@@ -29,7 +29,7 @@ async fn tokenize(
     tokenize_request(&renderer, request)
         .await
         .map(Json)
-        .map_err(|error| response_error(error, false))
+        .map_err(response_error)
 }
 
 #[cfg(test)]

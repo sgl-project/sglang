@@ -2,12 +2,9 @@
 
 use super::error::error_payload;
 use crate::ResponseError;
-use axum::{
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+use axum::response::{
+    IntoResponse, Response,
+    sse::{Event, Sse},
 };
 use futures::{Stream, StreamExt};
 use std::convert::Infallible;
@@ -24,7 +21,7 @@ where
             let data = match chunk {
                 Ok(chunk) => serialize(chunk),
                 Err(error) => {
-                    let status = StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let status = super::error::response_status(&error);
                     error_payload(status, error.message).to_string()
                 }
             };

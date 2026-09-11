@@ -2,38 +2,13 @@ use axum::{
     Json,
     extract::rejection::JsonRejection,
     http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response},
 };
 
 use crate::ResponseError;
 
-pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> serde_json::Value {
-    let error_type = if code.is_server_error() {
-        "InternalServerError"
-    } else {
-        "BadRequestError"
-    };
-    serde_json::json!({
-        "error": {
-            "object": "error", "message": message.into(), "type": error_type,
-            "param": null, "code": code.as_u16(),
-        }
-    })
-}
-
-pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
-    let payload = error_payload(code, message);
-    if !stream {
-        return (code, Json(payload)).into_response();
-    }
-    let frames = [payload.to_string(), "[DONE]".to_owned()];
-    Sse::new(futures::stream::iter(frames.map(|data| {
-        Ok::<_, std::convert::Infallible>(Event::default().data(data))
-    })))
-    .into_response()
+fn openai_error(code: StatusCode, message: impl Into<String>) -> Response {
+    (code, Json(error_payload(code, message))).into_response()
 }
 
 pub(super) fn json_rejection_response(rejection: JsonRejection) -> Response {
@@ -42,11 +17,31 @@ pub(super) fn json_rejection_response(rejection: JsonRejection) -> Response {
     } else {
         StatusCode::BAD_REQUEST
     };
-    openai_error(status, rejection.body_text(), false)
+    openai_error(status, rejection.body_text())
 }
 
-pub(super) fn response_error(error: ResponseError, stream: bool) -> Response {
-    let status =
-        StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    openai_error(status, error.message, stream)
+pub(super) fn response_error(error: ResponseError) -> Response {
+    let status = response_status(&error);
+    openai_error(status, error.message)
+}
+
+pub(super) fn response_status(error: &ResponseError) -> StatusCode {
+    use crate::{ResponseErrorKind, UpstreamErrorCode};
+    match error.kind {
+        ResponseErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+        ResponseErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ResponseErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        ResponseErrorKind::Upstream(UpstreamErrorCode::Http(code)) => {
+            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+pub(super) fn error_payload(status: StatusCode, message: impl Into<String>) -> serde_json::Value {
+    let error_type = if status.is_server_error() {
+        "InternalServerError"
+    } else {
+        "BadRequestError"
+    };
+    crate::openai::response::error_payload(status.as_u16(), message, error_type)
 }

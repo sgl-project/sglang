@@ -1,5 +1,6 @@
 //! OpenAI completion preparation, response aggregation, and typed chunks.
 
+use crate::engine::response::{collect_output, merge_indexed};
 use std::collections::BTreeMap;
 
 use super::{
@@ -7,13 +8,11 @@ use super::{
     protocol::{
         CompletionRequest, lower_text_completion_request, lower_token_ids_completion_request,
     },
-    renderer_error,
-    submission::{collect_output, merge_indexed},
     unix_seconds_u32,
 };
 use crate::{
     GenerateRequest, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
-    GenerationStream, MatchedStop, RendererService, ResponseError, engine::HttpGenerateClient,
+    GenerationStream, MatchedStop, RendererService, ResponseError, engine::TokenDecoder,
 };
 use dynamo_protocols::types::{CompletionUsage, Prompt};
 use futures::StreamExt;
@@ -92,7 +91,7 @@ pub(crate) struct PreparedCompletion {
 
 pub(crate) async fn prepare_request(
     renderer: &RendererService,
-    client: &HttpGenerateClient,
+    tokenizer: &TokenDecoder,
     request: CompletionRequest,
 ) -> Result<PreparedCompletion, ResponseError> {
     let echo = request.echo.unwrap_or(false);
@@ -112,7 +111,8 @@ pub(crate) async fn prepare_request(
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     let (response_id, requests, metadata) = if text_prompt {
         let (response_id, completion_requests) =
-            lower_text_completion_request(renderer.config(), &request).map_err(renderer_error)?;
+            lower_text_completion_request(renderer.config(), &request)
+                .map_err(ResponseError::from)?;
         let metadata = completion_requests
             .iter()
             .enumerate()
@@ -133,19 +133,19 @@ pub(crate) async fn prepare_request(
         let requests = renderer
             .prepare_text_request_groups(completion_requests)
             .await
-            .map_err(renderer_error)?;
+            .map_err(ResponseError::from)?;
         (response_id, requests, metadata)
     } else {
         let (response_id, token_requests) =
             lower_token_ids_completion_request(renderer.config(), &request)
-                .map_err(renderer_error)?;
+                .map_err(ResponseError::from)?;
         let mut metadata = Vec::with_capacity(token_requests.len());
         let mut prompt_echo = String::new();
         for (index, request) in token_requests.iter().enumerate() {
             let prompt_index = index / n;
             if index % n == 0 {
                 prompt_echo = if echo {
-                    client.detokenize(request.input_ids.clone())?
+                    tokenizer.detokenize_prompt(request.input_ids.clone())?
                 } else {
                     String::new()
                 };
@@ -154,7 +154,7 @@ pub(crate) async fn prepare_request(
         }
         let requests = renderer
             .prepare_token_ids_requests(token_requests)
-            .map_err(renderer_error)?;
+            .map_err(ResponseError::from)?;
         (response_id, requests, metadata)
     };
     Ok(PreparedCompletion {
@@ -411,13 +411,130 @@ fn append_logprobs(result: &mut CompletionLogprobsWire, positions: &[crate::Posi
     }
 }
 
+impl super::OpenAIService {
+    pub(crate) async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<
+        super::OperationResponse<CompletionResponseWire, CompletionResponseWire>,
+        ResponseError,
+    > {
+        use super::OperationResponse;
+        let stream = request.stream.unwrap_or(false);
+        let prepared = prepare_request(&self.renderer, &self.generation.decoder, request).await?;
+        let streams = match self.generation.generate_many(prepared.requests).await {
+            Ok(streams) => streams,
+            Err(error) if stream => {
+                return Ok(OperationResponse::Stream(
+                    futures::stream::once(async { Err(error) }).boxed(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let submitted = attach_streams(prepared.metadata, streams);
+        if stream {
+            Ok(OperationResponse::Stream(
+                completion_event_stream(
+                    submitted,
+                    prepared.response_id,
+                    prepared.model,
+                    prepared.created,
+                    prepared.echo,
+                    prepared.want_logprobs,
+                    prepared.include_usage,
+                    prepared.continuous_usage,
+                )
+                .boxed(),
+            ))
+        } else {
+            unary_completion(
+                submitted,
+                prepared.response_id,
+                prepared.model,
+                prepared.created,
+                prepared.echo,
+                prepared.want_logprobs,
+            )
+            .await
+            .map(OperationResponse::Unary)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{completion_event_stream, completion_logprobs, unary_completion};
+    use super::{completion_event_stream, completion_logprobs, prepare_request, unary_completion};
     use crate::GenerationOutputExtras;
-    use crate::openai::test_utils::{chunk, submitted};
-    use crate::{PositionLogprobs, ResponseError, TokenLogprob};
+    use crate::engine::{TokenDecoder, test_utils::tiny_tokenizer};
+    use crate::openai::test_utils::{chunk, renderer_config, submitted};
+    use crate::{DynamoTokenizer, PositionLogprobs, RendererService, ResponseError, TokenLogprob};
     use futures::StreamExt;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn completion_preparation_preserves_batched_echo_without_an_engine_client() {
+        let tokenizer = tiny_tokenizer();
+        let renderer = RendererService::with_tokenizer(
+            renderer_config(),
+            Arc::new(DynamoTokenizer::new(tokenizer.clone(), tokenizer.clone())),
+            1,
+            1,
+        );
+        let prompts = ["hello", "world"];
+        let token_ids =
+            prompts.map(|prompt| tokenizer.encode(prompt).unwrap().token_ids().to_vec());
+        for tokenized in [false, true] {
+            for echo in [false, true] {
+                let prompt = if tokenized {
+                    serde_json::json!(token_ids)
+                } else {
+                    serde_json::json!(prompts)
+                };
+                let request = serde_json::from_value(serde_json::json!({
+                    "model": "model", "prompt": prompt, "n": 2, "echo": echo,
+                    "rid": ["prompt-a", "prompt-b"], "max_tokens": 4
+                }))
+                .unwrap();
+
+                let prepared =
+                    prepare_request(&renderer, &TokenDecoder::new(tokenizer.clone()), request)
+                        .await
+                        .unwrap();
+
+                assert_eq!(prepared.requests.len(), 4);
+                assert_eq!(prepared.metadata.len(), 4);
+                assert_eq!(prepared.echo, echo);
+                for (index, (request, metadata)) in
+                    prepared.requests.iter().zip(&prepared.metadata).enumerate()
+                {
+                    let prompt_index = index / 2;
+                    let expected_echo = if !echo {
+                        String::new()
+                    } else if tokenized {
+                        String::from(tokenizer.decode(&token_ids[prompt_index], true).unwrap())
+                    } else {
+                        prompts[prompt_index].to_owned()
+                    };
+                    assert_eq!(metadata, &(index, prompt_index, expected_echo));
+                    assert_eq!(
+                        request.input_ids,
+                        token_ids[prompt_index]
+                            .iter()
+                            .map(|&id| id as i32)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        request.rid,
+                        format!(
+                            "prompt-{}-{}",
+                            if prompt_index == 0 { "a" } else { "b" },
+                            index % 2
+                        )
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn serialized_logprobs_preserve_python_float_values() {
@@ -548,13 +665,13 @@ mod tests {
         futures::pin_mut!(stream);
 
         tx0.send(Err(ResponseError {
-            status_code: 503,
+            kind: crate::ResponseErrorKind::Unavailable,
             message: "out of memory".into(),
         }))
         .await
         .unwrap();
         let error = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(error.status_code, 503);
+        assert_eq!(error.kind, crate::ResponseErrorKind::Unavailable);
 
         tx1.send(chunk("late", true)).await.unwrap();
         let remaining = stream.collect::<Vec<_>>().await;

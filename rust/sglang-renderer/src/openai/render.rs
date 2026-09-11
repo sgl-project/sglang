@@ -1,11 +1,8 @@
 //! OpenAI render-only operations, without model execution or HTTP framing.
 
-use super::{
-    protocol::{
-        ChatCompletionRequest, CompletionRequest, lower_chat_request,
-        lower_text_completion_request, lower_token_ids_completion_request,
-    },
-    renderer_error,
+use super::protocol::{
+    ChatCompletionRequest, CompletionRequest, lower_chat_request, lower_text_completion_request,
+    lower_token_ids_completion_request,
 };
 use crate::{GenerateRequest, RendererService, ResponseError};
 use dynamo_protocols::types::Prompt;
@@ -16,15 +13,16 @@ pub(crate) async fn render_chat(
 ) -> Result<GenerateRequest, ResponseError> {
     if request.n.is_some_and(|n| n > 1) {
         return Err(ResponseError {
-            status_code: 400,
+            kind: crate::ResponseErrorKind::InvalidRequest,
             message: "the standalone chat renderer currently requires n=1".into(),
         });
     }
-    let (_, request) = lower_chat_request(renderer.config(), request).map_err(renderer_error)?;
+    let (_, request) =
+        lower_chat_request(renderer.config(), request).map_err(ResponseError::from)?;
     let mut chat = renderer
         .prepare_chat(request)
         .await
-        .map_err(renderer_error)?;
+        .map_err(ResponseError::from)?;
     Ok(chat
         .requests
         .pop()
@@ -37,17 +35,17 @@ pub(crate) async fn render_completions(
 ) -> Result<Vec<GenerateRequest>, ResponseError> {
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     if text_prompt {
-        let (_, requests) =
-            lower_text_completion_request(renderer.config(), &request).map_err(renderer_error)?;
+        let (_, requests) = lower_text_completion_request(renderer.config(), &request)
+            .map_err(ResponseError::from)?;
         renderer
             .prepare_text_request_groups(requests)
             .await
-            .map_err(renderer_error)
+            .map_err(ResponseError::from)
     } else {
         let (_, requests) = lower_token_ids_completion_request(renderer.config(), &request)
-            .map_err(renderer_error)?;
+            .map_err(ResponseError::from)?;
         renderer
             .prepare_token_ids_requests(requests)
-            .map_err(renderer_error)
+            .map_err(ResponseError::from)
     }
 }

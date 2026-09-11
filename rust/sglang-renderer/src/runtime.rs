@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use crate::{DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer};
 
-use crate::engine::HttpGenerateClient;
-use crate::http::{OpenAIHttpFrontend, hosted_routes, render_only_routes, standalone_routes};
+use crate::engine::{GenerationService, HttpGenerateClient, TokenDecoder};
+use crate::http::{hosted_routes, render_only_routes, standalone_routes};
+use crate::openai::OpenAIService;
 
 #[derive(Clone, Debug)]
 pub struct RendererRuntimeConfig {
@@ -53,13 +54,28 @@ pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
     let app = match (config.engine_url, config.proxy_unhandled_routes) {
         (None, false) => render_only_routes(renderer),
         (Some(engine_url), false) => {
-            let generate_client = HttpGenerateClient::new(engine_url, tokenizer_without_specials)?;
-            standalone_routes(OpenAIHttpFrontend::new(renderer, generate_client))
+            let generate_client = HttpGenerateClient::new(engine_url)?;
+            standalone_routes(
+                OpenAIService::new(
+                    renderer,
+                    GenerationService::new(
+                        Arc::new(generate_client.clone()),
+                        TokenDecoder::new(tokenizer_without_specials),
+                    ),
+                ),
+                generate_client,
+            )
         }
         (Some(engine_url), true) => {
-            let generate_client = HttpGenerateClient::new(&engine_url, tokenizer_without_specials)?;
+            let generate_client = HttpGenerateClient::new(&engine_url)?;
             hosted_routes(
-                OpenAIHttpFrontend::new(renderer, generate_client),
+                OpenAIService::new(
+                    renderer,
+                    GenerationService::new(
+                        Arc::new(generate_client),
+                        TokenDecoder::new(tokenizer_without_specials),
+                    ),
+                ),
                 engine_url,
             )?
         }

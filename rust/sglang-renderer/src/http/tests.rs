@@ -21,8 +21,11 @@ mod suite {
     use tokio::sync::Barrier;
     use tower::ServiceExt;
 
+    use crate::engine::test_utils::tiny_tokenizer;
+    use crate::engine::{GenerationService, TokenDecoder};
+
     use super::super::{
-        DEFAULT_REQUEST_BODY_LIMIT_BYTES, HttpGenerateClient, OpenAIHttpFrontend, hosted_routes,
+        DEFAULT_REQUEST_BODY_LIMIT_BYTES, HttpGenerateClient, OpenAIService, hosted_routes,
         render_only_routes, standalone_routes,
     };
     use crate::openai::test_utils::renderer_config;
@@ -108,9 +111,15 @@ mod suite {
             2,
             2,
         ));
-        let client =
-            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
-        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+        let tokenizer = tiny_tokenizer();
+        let client = HttpGenerateClient::new(format!("http://{address}")).unwrap();
+        let app = standalone_routes(
+            OpenAIService::new(
+                renderer,
+                GenerationService::new(Arc::new(client.clone()), TokenDecoder::new(tokenizer)),
+            ),
+            client,
+        );
 
         for chat in [false, true] {
             let path = if chat {
@@ -253,9 +262,15 @@ mod suite {
             2,
             2,
         ));
-        let client =
-            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
-        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+        let tokenizer = tiny_tokenizer();
+        let client = HttpGenerateClient::new(format!("http://{address}")).unwrap();
+        let app = standalone_routes(
+            OpenAIService::new(
+                renderer,
+                GenerationService::new(Arc::new(client.clone()), TokenDecoder::new(tokenizer)),
+            ),
+            client,
+        );
         for chat in [false, true] {
             let (path, mut request) = if chat {
                 (
@@ -323,18 +338,6 @@ mod suite {
         ]))
     }
 
-    fn tiny_tokenizer() -> dynamo_tokenizers::Tokenizer {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../experimental/sgl-router/tests/fixtures/tiny_tokenizer.json");
-        dynamo_tokenizers::Tokenizer::from_file_with_options(
-            path.to_str().unwrap(),
-            dynamo_tokenizers::TokenizerOptions {
-                add_special_tokens: false,
-            },
-        )
-        .unwrap()
-    }
-
     async fn post_request(
         app: Router<()>,
         uri: &str,
@@ -364,6 +367,39 @@ mod suite {
             2,
         ));
         render_only_routes(renderer)
+    }
+
+    fn renderer_test_apps() -> [Router<()>; 3] {
+        let renderer = Arc::new(RendererService::with_tokenizer(
+            renderer_config(),
+            Arc::new(WordTokenizer),
+            2,
+            2,
+        ));
+        let tokenizer = tiny_tokenizer();
+        let upstream_url = "http://127.0.0.1:1";
+        let client = HttpGenerateClient::new(upstream_url).unwrap();
+        [
+            render_only_routes(renderer.clone()),
+            standalone_routes(
+                OpenAIService::new(
+                    renderer.clone(),
+                    GenerationService::new(
+                        Arc::new(client.clone()),
+                        TokenDecoder::new(tokenizer.clone()),
+                    ),
+                ),
+                client.clone(),
+            ),
+            hosted_routes(
+                OpenAIService::new(
+                    renderer,
+                    GenerationService::new(Arc::new(client), TokenDecoder::new(tokenizer)),
+                ),
+                upstream_url.into(),
+            )
+            .unwrap(),
+        ]
     }
 
     #[tokio::test]
@@ -422,10 +458,17 @@ mod suite {
             2,
             2,
         ));
-        let client = HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer())
+        let tokenizer = tiny_tokenizer();
+        let client = HttpGenerateClient::new(format!("http://{address}"))
             .unwrap()
             .with_health_timeout(Duration::from_millis(50));
-        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+        let app = standalone_routes(
+            OpenAIService::new(
+                renderer,
+                GenerationService::new(Arc::new(client.clone()), TokenDecoder::new(tokenizer)),
+            ),
+            client,
+        );
 
         let health = app
             .clone()
@@ -453,7 +496,7 @@ mod suite {
     }
 
     #[tokio::test]
-    async fn render_only_routes_accept_bodies_above_axum_default() {
+    async fn renderer_routes_accept_bodies_above_axum_default_in_every_mode() {
         let body = serde_json::json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hello"}],
@@ -463,13 +506,14 @@ mod suite {
         assert!(body.len() > 2 * 1024 * 1024);
         assert!(body.len() < DEFAULT_REQUEST_BODY_LIMIT_BYTES);
 
-        let response = post_json(render_only_test_app(), "/v1/chat/completions/render", body).await;
-
-        assert_eq!(response.status(), StatusCode::OK);
+        for app in renderer_test_apps() {
+            let response = post_json(app, "/v1/chat/completions/render", body.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]
-    async fn render_only_routes_reject_bodies_above_configured_limit() {
+    async fn renderer_routes_reject_bodies_above_configured_limit_in_every_mode() {
         let body = serde_json::json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hello"}],
@@ -478,17 +522,28 @@ mod suite {
         .to_string();
         assert!(body.len() > DEFAULT_REQUEST_BODY_LIMIT_BYTES);
 
-        let response = post_json(render_only_test_app(), "/v1/chat/completions/render", body).await;
-
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        for app in renderer_test_apps() {
+            let response = post_json(app, "/v1/chat/completions/render", body.clone()).await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
     }
 
     #[tokio::test]
     async fn hosted_routes_leave_rust_server_routes_authoritative() {
         async fn native(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+            for name in ["x-request-hop", "keep-alive", "proxy-authorization"] {
+                assert!(!headers.contains_key(name), "forwarded {name}");
+            }
             (
                 StatusCode::ACCEPTED,
-                [("x-rust-server", "native")],
+                [
+                    ("x-rust-server", "native"),
+                    ("x-upstream-host", headers["host"].to_str().unwrap()),
+                    ("connection", "x-response-hop"),
+                    ("x-response-hop", "private"),
+                    ("keep-alive", "timeout=5"),
+                    ("proxy-authenticate", "Basic"),
+                ],
                 format!(
                     "{}:{}",
                     headers
@@ -498,6 +553,7 @@ mod suite {
                     String::from_utf8_lossy(&body)
                 ),
             )
+                .into_response()
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -541,10 +597,13 @@ mod suite {
             2,
             2,
         ));
-        let client =
-            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
+        let tokenizer = tiny_tokenizer();
+        let client = HttpGenerateClient::new(format!("http://{address}")).unwrap();
         let app = hosted_routes(
-            OpenAIHttpFrontend::new(renderer, client),
+            OpenAIService::new(
+                renderer,
+                GenerationService::new(Arc::new(client), TokenDecoder::new(tokenizer)),
+            ),
             format!("http://{address}"),
         )
         .unwrap();
@@ -577,6 +636,11 @@ mod suite {
             .clone()
             .oneshot(
                 Request::post("/native?room=7")
+                    .header("host", "renderer.example")
+                    .header("connection", "x-request-hop")
+                    .header("x-request-hop", "private")
+                    .header("keep-alive", "timeout=5")
+                    .header("proxy-authorization", "Basic ignored")
                     .header("x-request-marker", "forwarded")
                     .body(Body::from("payload"))
                     .unwrap(),
@@ -585,6 +649,15 @@ mod suite {
             .unwrap();
         assert_eq!(native.status(), StatusCode::ACCEPTED);
         assert_eq!(native.headers()["x-rust-server"], "native");
+        assert_eq!(native.headers()["x-upstream-host"], address.to_string());
+        for name in [
+            "connection",
+            "x-response-hop",
+            "keep-alive",
+            "proxy-authenticate",
+        ] {
+            assert!(!native.headers().contains_key(name), "forwarded {name}");
+        }
         assert_eq!(
             to_bytes(native.into_body(), 1024).await.unwrap(),
             "forwarded:payload"
@@ -609,6 +682,90 @@ mod suite {
             to_bytes(missing.into_body(), 1024).await.unwrap(),
             "rust missing"
         );
+    }
+
+    #[tokio::test]
+    async fn hosted_proxy_streams_bodies_above_the_renderer_limit() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/echo",
+                    post(|request: Request<Body>| async { request.into_body() }),
+                ),
+            )
+            .into_future(),
+        );
+        let renderer = Arc::new(RendererService::with_tokenizer(
+            renderer_config(),
+            Arc::new(WordTokenizer),
+            1,
+            1,
+        ));
+        let tokenizer = tiny_tokenizer();
+        let client = HttpGenerateClient::new(&upstream_url).unwrap();
+        let app = hosted_routes(
+            OpenAIService::new(
+                renderer,
+                GenerationService::new(Arc::new(client), TokenDecoder::new(tokenizer)),
+            ),
+            upstream_url,
+        )
+        .unwrap();
+        let (send, receive) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(1);
+        let body = Body::from_stream(futures::stream::unfold(receive, |mut receive| async {
+            receive.recv().await.map(|chunk| (chunk, receive))
+        }));
+        send.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(Request::post("/echo").body(body).unwrap()),
+        )
+        .await
+        .expect("proxy waited for the complete request body")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut response = response.into_body().into_data_stream();
+        let mut first = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while first.len() < 5 {
+                first.extend_from_slice(&response.next().await.unwrap().unwrap());
+            }
+        })
+        .await
+        .expect("proxy buffered the response body");
+        assert_eq!(first, b"first");
+
+        let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let chunks = DEFAULT_REQUEST_BODY_LIMIT_BYTES / chunk.len() + 1;
+        let expected_bytes = chunks * chunk.len();
+        let (_, received_bytes) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                async move {
+                    for _ in 0..chunks {
+                        send.send(Ok(chunk.clone())).await.unwrap();
+                    }
+                    drop(send);
+                },
+                async {
+                    let mut bytes = 0;
+                    while let Some(chunk) = response.next().await {
+                        let chunk = chunk.unwrap();
+                        assert!(chunk.iter().all(|&byte| byte == b'x'));
+                        bytes += chunk.len();
+                    }
+                    bytes
+                },
+            )
+        })
+        .await
+        .expect("proxy did not finish streaming the body");
+        upstream.abort();
+        assert_eq!(received_bytes, expected_bytes);
     }
 
     #[tokio::test]
@@ -656,8 +813,14 @@ mod suite {
         ));
         let tokenizer = tiny_tokenizer();
         let expected_text = String::from(tokenizer.decode(&[104, 104], true).unwrap());
-        let client = HttpGenerateClient::new(format!("http://{address}"), tokenizer).unwrap();
-        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+        let client = HttpGenerateClient::new(format!("http://{address}")).unwrap();
+        let app = standalone_routes(
+            OpenAIService::new(
+                renderer,
+                GenerationService::new(Arc::new(client.clone()), TokenDecoder::new(tokenizer)),
+            ),
+            client,
+        );
 
         for stream in [false, true] {
             let response = post_request(
@@ -728,9 +891,15 @@ mod suite {
             2,
             2,
         ));
-        let client =
-            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
-        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+        let tokenizer = tiny_tokenizer();
+        let client = HttpGenerateClient::new(format!("http://{address}")).unwrap();
+        let app = standalone_routes(
+            OpenAIService::new(
+                renderer,
+                GenerationService::new(Arc::new(client.clone()), TokenDecoder::new(tokenizer)),
+            ),
+            client,
+        );
         let body = serde_json::json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hello world"}],
@@ -845,9 +1014,15 @@ mod suite {
             2,
             2,
         ));
-        let client =
-            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
-        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+        let tokenizer = tiny_tokenizer();
+        let client = HttpGenerateClient::new(format!("http://{address}")).unwrap();
+        let app = standalone_routes(
+            OpenAIService::new(
+                renderer,
+                GenerationService::new(Arc::new(client.clone()), TokenDecoder::new(tokenizer)),
+            ),
+            client,
+        );
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             post_request(

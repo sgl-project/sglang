@@ -2,9 +2,10 @@
 //!
 //! The core renders normalized chat requests, lowers textual completions,
 //! tokenizes prompts, and produces the token-in contract consumed by SGLang.
-//! The optional `http` feature owns OpenAI wire lowering, an engine-free
-//! rendering frontend, and optional inference backed by SGLang's `/generate`
-//! endpoint.
+//! OpenAI operations and generation decoding are independent of transport.
+//! The optional `http` feature adds HTTP adapters, the SGLang HTTP engine client,
+//! and the process runtime. Protocol adapters own middleware and framing;
+//! shared services own request preparation, submission policy, and decoding.
 
 mod config;
 #[cfg(feature = "http")]
@@ -45,7 +46,7 @@ pub use preprocessing::{
 };
 pub use response::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    ResponseError,
+    ResponseError, ResponseErrorKind, UpstreamErrorCode,
 };
 #[cfg(feature = "http")]
 pub use runtime::{RendererRuntimeConfig, serve};

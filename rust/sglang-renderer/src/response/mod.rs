@@ -46,8 +46,40 @@ pub struct DecodedChatEvent {
 /// A host error carried through semantic processing without interpreting it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseError {
-    pub status_code: u16,
+    pub kind: ResponseErrorKind,
     pub message: String,
+}
+
+impl From<crate::RendererError> for ResponseError {
+    fn from(error: crate::RendererError) -> Self {
+        use crate::RendererErrorKind;
+        let kind = match error.kind() {
+            RendererErrorKind::InvalidRequest => crate::ResponseErrorKind::InvalidRequest,
+            RendererErrorKind::Unavailable => crate::ResponseErrorKind::Unavailable,
+            RendererErrorKind::Tokenize | RendererErrorKind::Internal => {
+                crate::ResponseErrorKind::Internal
+            }
+        };
+        ResponseError {
+            kind,
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Failure category interpreted by the receiving transport adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResponseErrorKind {
+    InvalidRequest,
+    Unavailable,
+    Internal,
+    Upstream(UpstreamErrorCode),
+}
+
+/// Original upstream code, preserved without imposing response transport policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpstreamErrorCode {
+    Http(u16),
 }
 
 /// One semantic tool-call delta, independent of HTTP or gRPC framing.
@@ -185,7 +217,7 @@ impl ChatResponseProcessor {
                         event: None,
                         comment: None,
                         error: serde_json::to_string(&ResponseError {
-                            status_code: 500,
+                            kind: crate::ResponseErrorKind::Internal,
                             message: format!("output choice {} is out of range", decoded.choice),
                         }).ok(),
                     };
@@ -340,7 +372,7 @@ impl ChatResponseProcessor {
                     }
                 } else if let Some(error) = item.error {
                     let error = serde_json::from_str(&error).unwrap_or(ResponseError {
-                        status_code: 500,
+                        kind: crate::ResponseErrorKind::Internal,
                         message: error,
                     });
                     yield Err(error);

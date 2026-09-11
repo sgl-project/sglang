@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{ChatRequest, OneOrMany, ReasoningEffort, RendererService, ResponseError};
 
-use super::{protocol::normalize_reasoning_inputs, renderer_error};
+use super::protocol::normalize_reasoning_inputs;
 
 pub(crate) async fn tokenize(
     renderer: &RendererService,
@@ -19,7 +19,7 @@ pub(crate) async fn tokenize(
     let has_messages = request.messages.is_some();
     if has_prompt == has_messages {
         return Err(ResponseError {
-            status_code: 400,
+            kind: crate::ResponseErrorKind::InvalidRequest,
             message: "Exactly one of 'prompt' or 'messages' must be provided.".into(),
         });
     }
@@ -31,7 +31,7 @@ pub(crate) async fn tokenize(
                     let tokens = renderer
                         .tokenize_prompt(text, add_special_tokens)
                         .await
-                        .map_err(renderer_error)?;
+                        .map_err(ResponseError::from)?;
                     (json!(tokens), json!(tokens.len()))
                 }
                 OneOrMany::Many(texts) => {
@@ -41,7 +41,7 @@ pub(crate) async fn tokenize(
                             .map(|text| renderer.tokenize_prompt(text, add_special_tokens)),
                     )
                     .await
-                    .map_err(renderer_error)?;
+                    .map_err(ResponseError::from)?;
                     let count = tokens.iter().map(Vec::len).collect::<Vec<_>>();
                     (json!(tokens), json!(count))
                 }
@@ -50,11 +50,11 @@ pub(crate) async fn tokenize(
         None => {
             let request = request
                 .into_chat(&renderer.config().served_model_name)
-                .map_err(renderer_error)?;
+                .map_err(ResponseError::from)?;
             let tokens = renderer
                 .tokenize_chat(request)
                 .await
-                .map_err(renderer_error)?;
+                .map_err(ResponseError::from)?;
             (json!(tokens), json!(tokens.len()))
         }
     };
