@@ -1302,9 +1302,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
 
-    def get_indexer_metadata(self, layer_id, forward_batch):
-        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
-
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
