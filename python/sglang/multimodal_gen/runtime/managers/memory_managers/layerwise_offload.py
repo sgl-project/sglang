@@ -479,6 +479,32 @@ class _DirectReader:
         self._fds.clear()
 
 
+def _resident_fraction(data_ptr: int, nbytes: int, *, samples: int = 8) -> float:
+    """Share of a mapping's pages the page cache holds, sampled in 4 MiB windows.
+
+    -1.0 when it cannot be asked (no libc, mincore failed).
+    """
+    if _libc is None or nbytes <= 0:
+        return -1.0
+    page = mmap.PAGESIZE
+    window = 4 << 20
+    start = data_ptr & ~(page - 1)
+    total = data_ptr + nbytes - start
+    step = max(total // samples, window)
+    resident = checked = 0
+    offset = 0
+    while offset < total:
+        length = min(window, total - offset)
+        pages = (length + page - 1) // page
+        vec = (ctypes.c_ubyte * pages)()
+        if _libc.mincore(ctypes.c_void_p(start + offset), ctypes.c_size_t(length), vec):
+            return -1.0
+        resident += sum(byte & 1 for byte in bytes(vec))
+        checked += pages
+        offset += step
+    return resident / checked if checked else -1.0
+
+
 def _aligned_span(file_offset: int, nbytes: int) -> tuple[int, int]:
     """(aligned start, span) covering [file_offset, file_offset + nbytes) at 4 KiB granularity."""
     start = file_offset & ~(_DIRECT_ALIGN - 1)
@@ -592,11 +618,15 @@ class MappedLayerCourier:
         await_populated: Optional[Callable[[int], bool]] = None,
         direct_copy: bool = False,
         direct_read: bool = False,
+        direct_read_always: bool = False,
     ) -> None:
         self._mapped_cpu_weights = mapped_cpu_weights
         # Read each layer's bytes from the checkpoint file with O_DIRECT into the
         # pinned slot instead of copying them out of the page cache.
         self.direct_read = bool(direct_read) and hasattr(os, "O_DIRECT")
+        # On a shared pool every read goes to the drive anyway; elsewhere a
+        # layer the page cache already holds is a memcpy, not a re-read.
+        self._direct_read_always = bool(direct_read_always)
         self._reader: Optional[_DirectReader] = (
             _DirectReader() if self.direct_read else None
         )
@@ -615,6 +645,7 @@ class MappedLayerCourier:
             "h2d_issue_s": 0.0,
             "direct_read_s": 0.0,
             "direct_read_bytes": 0,
+            "cached_layers": 0,
         }
         # Blocks until a populator thread has faulted the layer in; True if one
         # did, so the courier does not fault the same range a second time.
@@ -772,6 +803,13 @@ class MappedLayerCourier:
                     located = (
                         self._reader.locate(cpu_tensor) if self.direct_read else None
                     )
+                    if (
+                        located is not None
+                        and not self._direct_read_always
+                        and _resident_fraction(cpu_tensor.data_ptr(), nbytes) >= 0.5
+                    ):
+                        located = None
+                        stats["cached_layers"] += 1
                     if located is not None:
                         path, file_offset, _ = located
                         aligned_start, span = _aligned_span(file_offset, nbytes)
@@ -1819,6 +1857,7 @@ class LayerwiseOffloadManager:
                     and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ
                     and self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
                 ),
+                direct_read_always=host_copies_are_redundant(),
                 cold_source=self._mapped_source_is_cold,
                 populate_source=self._mapped_source_may_be_cold,
                 await_populated=self._await_mapped_populated,

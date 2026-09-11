@@ -2291,3 +2291,39 @@ def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
     )
     manager._mapped_courier = None
     assert not manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_sees_the_pages_the_cache_holds(tmp_path):
+    path = tmp_path / "cached.bin"
+    path.write_bytes(b"\x01" * (16 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=16 << 20, dtype=torch.uint8)
+    mapped.sum()  # touch every page
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr(), mapped.numel()
+    )
+    assert fraction >= 0.9
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_cached_mapped_layers_are_copied_rather_than_re_read(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    # the page cache holds the layer: shipping it is a memcpy, not a drive read
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 1.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers
+    assert courier.stats["cached_layers"] >= 1
+    assert courier.stats["direct_read_bytes"] == 0
