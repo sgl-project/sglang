@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -186,6 +186,28 @@ def _maybe_compile_deep_gemm_one_type_all(
             )
 
 
+def _select_max_m_within_budget(
+    kernel_type: DeepGemmKernelType,
+    m_list: List[int],
+    n: int,
+    k: int,
+    num_groups: int,
+    memory_budget: float,
+) -> Optional[int]:
+    # Reduce geometrically because the estimate is monotonic in max_m.
+    min_m, max_m = min(m_list), max(m_list)
+    while (
+        _BaseWarmupExecutor.get_memory_requirement(
+            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+        )
+        > memory_budget
+    ):
+        if max_m <= min_m:
+            return None
+        max_m = max(max_m // 2, min_m)
+    return max_m
+
+
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
 def _compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
@@ -219,15 +241,20 @@ def _compile_deep_gemm_one_type_all(
             f"Required memory for warmup: {required_memory}GB, Available memory: {memory_budget}GB"
         )
         if memory_budget < required_memory:
-            # TODO: Maybe compute the max_m based on the memory budget
-            while (
-                _BaseWarmupExecutor.get_memory_requirement(
-                    kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+            max_m = _select_max_m_within_budget(
+                kernel_type,
+                m_list=m_list,
+                n=n,
+                k=k,
+                num_groups=num_groups,
+                memory_budget=memory_budget,
+            )
+            if max_m is None:
+                logger.warning(
+                    f"Available memory {memory_budget}GB is not enough for warmup even at M={min(m_list)}, "
+                    f"skipping warmup for <{kernel_type.name}> N={n}, K={k}, num_groups={num_groups}"
                 )
-                > memory_budget
-                and max_m > 2048
-            ):
-                max_m = max_m // 2
+                return
             logger.warning(
                 f"Available memory {memory_budget}GB is less than required memory {required_memory}GB for warmup, reducing max_m to {max_m} to avoid out of memory"
             )
