@@ -50,6 +50,10 @@ class BaseFormatDetector(ABC):
         # Critical for serving layer to calculate remaining content when streaming ends.
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
         self.streamed_args_for_tool: List[str] = []
+        # Set once a call is dropped for naming an unknown tool. The calls
+        # behind it still arrive separator-first, so the separator branches
+        # have to stay reachable even though no tool has completed yet.
+        self._dropped_tool_call: bool = False
 
         # Token configuration (override in subclasses)
         self.bot_token = ""
@@ -122,6 +126,14 @@ class BaseFormatDetector(ABC):
                 return i
         return 0
 
+    def _in_tool_call_sequence(self) -> bool:
+        """Whether the buffer may legitimately open with a tool call separator.
+
+        True once anything has been consumed from the batch -- a completed tool
+        or a call dropped for naming an unknown tool.
+        """
+        return self.current_tool_id > 0 or self._dropped_tool_call
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
@@ -149,7 +161,7 @@ class BaseFormatDetector(ABC):
         if not (
             self.has_tool_call(current_text)
             or (
-                self.current_tool_id > 0
+                self._in_tool_call_sequence()
                 and current_text.startswith(self.tool_call_separator)
             )
         ):
@@ -178,7 +190,7 @@ class BaseFormatDetector(ABC):
                 # appear inside array parameters of the current tool, and we must not
                 # mistakenly identify that as the start of a new tool.
                 used_separator_branch = False
-                if self.current_tool_id > 0 and current_text.startswith(
+                if self._in_tool_call_sequence() and current_text.startswith(
                     self.tool_call_separator
                 ):
                     start_idx = len(self.tool_call_separator)
@@ -217,12 +229,17 @@ class BaseFormatDetector(ABC):
 
                 # Validate tool name if present
                 if "name" in obj and obj["name"] not in self._tool_indices:
-                    # Invalid tool name - reset state
-                    self._buffer = ""
-                    self.current_tool_id = -1
+                    # Drop this call, but only this call. Clearing the whole
+                    # buffer would also discard the calls batched behind it,
+                    # and popping streamed_args_for_tool would delete the
+                    # record of the previous, already-streamed tool.
                     self.current_tool_name_sent = False
-                    if self.streamed_args_for_tool:
-                        self.streamed_args_for_tool.pop()
+                    if is_current_complete:
+                        logger.warning(
+                            f"Model attempted to call undefined function: {obj['name']}"
+                        )
+                        self._buffer = current_text[start_idx + end_idx :]
+                        self._dropped_tool_call = True
                     return StreamingParseResult()
 
                 # Handle parameters/arguments consistency
