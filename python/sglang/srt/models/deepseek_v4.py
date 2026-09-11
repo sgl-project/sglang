@@ -4614,14 +4614,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.determine_num_fused_shared_experts()
         self.vision = None
         if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_pp_group().world_size != 1
-                or not get_moe_a2a_backend().is_none()
-            ):
-                raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
-                )
+            if get_pp_group().world_size != 1 or not get_moe_a2a_backend().is_none():
+                raise ValueError("V4.1 vision currently does not support PP or MoE A2A")
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
             self.vision = ViT(args)
@@ -4847,6 +4841,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             and forward_batch.mm_inputs is not None
             and any(x is not None for x in forward_batch.mm_inputs)
         ):
+            if get_parallel().attn_cp_size != 1:
+                raise ValueError(
+                    "DeepSeek-V4.1 multimodal requests do not support context "
+                    "parallelism yet"
+                )
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
@@ -4897,7 +4896,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = tail.token_indices
+            output.hidden_states_token_indices = tail.output_token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
