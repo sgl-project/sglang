@@ -222,6 +222,11 @@ class ModelSlimConfig(QuantizationConfig):
             else:
                 candidates.append(f"language_model.{candidate}")
 
+            if candidate.startswith("model.visual."):
+                candidates.append(candidate.removeprefix("model."))
+            elif candidate.startswith("visual."):
+                candidates.append(f"model.{candidate}")
+
         return list(dict.fromkeys(candidates))
 
     def _resolve_quant_prefix(self, prefix: str) -> str:
@@ -276,9 +281,20 @@ class ModelSlimConfig(QuantizationConfig):
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             if proj_name in packed_modules_mapping_subset:
-                prefix_in_quant_config = prefix.replace(
+                component = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
+                # Redirect to the unfused component name only when the
+                # checkpoint actually stores it that way (e.g. Qwen3.8-27B,
+                # whose fused in_proj_qkvz Linear must read the unfused
+                # in_proj_qkv / in_proj_z scheme entries).  Qwen3-Next-80B
+                # instead stores the fused name directly, so keep the original
+                # prefix and let it resolve against the fused entry -- a
+                # blanket redirect here would miss it and silently fall back
+                # to an unquantized Linear (then KeyError on weight_offset).
+                resolved_component = self._resolve_quant_prefix(component)
+                if (resolved_component + ".weight") in self.quant_description:
+                    prefix_in_quant_config = resolved_component
             prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset
