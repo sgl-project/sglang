@@ -38,15 +38,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .into_server(),
         stamp_arrival,
     );
+    let lease_ms: u64 = std::env::var("KV_INDEXER_STREAM_LEASE_MS")
+        .unwrap_or_else(|_| "5000".into())
+        .parse()?;
+    if lease_ms == 0 {
+        return Err("KV_INDEXER_STREAM_LEASE_MS must be positive".into());
+    }
+    let replica = sgl_kv_indexer::replica::ReplicaService::new(
+        std::time::Duration::from_millis(lease_ms),
+        prefix_query_max_inflight,
+    );
 
     info!(
         %addr,
         prefix_query_max_inflight,
         max_concurrent_streams,
-        "starting single-server in-memory SGLang KV Indexer"
+        "starting recoverable full KV Indexer replica"
     );
     server_builder_with_max_concurrent_streams(max_concurrent_streams)
         .add_service(service)
+        .add_service(replica.into_server())
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 

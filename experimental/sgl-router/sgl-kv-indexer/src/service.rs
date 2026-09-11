@@ -293,7 +293,7 @@ fn validate_tier(tier: i32) -> Result<(), Status> {
     }
 }
 
-fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
+pub(crate) fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
     // An empty actions list is a no-op that only refreshes the worker's recorded
     // address. Non-empty batches still have every action validated below.
     if actions.len() > MAX_ACTIONS_PER_BATCH {
