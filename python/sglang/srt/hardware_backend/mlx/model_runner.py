@@ -1356,9 +1356,7 @@ class MlxModelRunner:
         return apply_token_penalties(logits, token_counts, params), token_counts
 
     @staticmethod
-    def _build_penalty_counts(
-        vocab_size: int, output_ids: list[int]
-    ) -> mx.array:
+    def _build_penalty_counts(vocab_size: int, output_ids: list[int]) -> mx.array:
         """Build output-only counts from already accepted host token ids."""
         counts = mx.zeros((1, vocab_size), dtype=mx.uint32)
         for token_id in output_ids:
@@ -1392,9 +1390,7 @@ class MlxModelRunner:
                 base_counts[None, :], tokens[row : row + 1]
             )[0]
 
-    def _pending_penalty_states(
-        self, req_ids: list[str]
-    ) -> tuple[mx.array, ...]:
+    def _pending_penalty_states(self, req_ids: list[str]) -> tuple[mx.array, ...]:
         """Return pending lazy next-count rows in request order."""
         penalty_counts = getattr(self, "_req_penalty_counts", None)
         if not penalty_counts:
@@ -1883,9 +1879,9 @@ class MlxModelRunner:
         """Check if a request has active state."""
         return req_id in self._req_caches
 
-    def remove_request(self, req_id: str):
-        """Sync remaining decode KV to pool, then release request state."""
-        if not self.disable_radix_cache:
+    def remove_request(self, req_id: str, *, sync_to_pool: bool = True):
+        """Release request state, optionally syncing live decode KV first."""
+        if sync_to_pool and not self.disable_radix_cache:
             self._sync_decode_kv_to_pool(req_id)
 
         self._req_token_ids.pop(req_id, None)

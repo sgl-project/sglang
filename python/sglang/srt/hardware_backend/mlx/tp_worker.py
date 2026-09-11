@@ -119,6 +119,10 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         self._mlx_active_rids: set[str] = set()
+        # Scheduler request identity plus its current request-pool registration.
+        # Either changing means a same-RID request must start from fresh runner
+        # state; live requests may otherwise sit outside an extend/mixed batch.
+        self._mlx_active_reqs: dict[str, tuple[object, Optional[int]]] = {}
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -156,15 +160,64 @@ class MlxTpModelWorker(TpModelWorker):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
-        """Remove MLX state for decode-mode requests that dropped out of the batch."""
+    @staticmethod
+    def _req_pool_idx(req) -> Optional[int]:
+        return getattr(getattr(req, "kv", None), "req_pool_idx", None)
+
+    @staticmethod
+    def _req_is_retired(req) -> bool:
+        finished = getattr(req, "finished", None)
+        return bool(getattr(req, "is_retracted", False)) or (
+            callable(finished) and finished()
+        )
+
+    def _forget_request(self, rid: str, *, sync_to_pool: bool = False) -> None:
+        self._mlx_runner.remove_request(rid, sync_to_pool=sync_to_pool)
+        self._mlx_active_rids.discard(rid)
+        self._mlx_active_reqs.pop(rid, None)
+
+    def cleanup_idle_request_state(self) -> None:
+        """Release all tracked request state at a confirmed fully-idle boundary."""
+        for rid in tuple(self._mlx_active_rids):
+            self._forget_request(rid)
+
+    def _cleanup_stale_rids(self, forward_mode, reqs: list) -> None:
+        """Retire runner state from authoritative scheduler transitions.
+
+        Decode composition is authoritative after filtering/retraction.  Extend
+        and mixed batches are not: a live decode request can legitimately be
+        absent while a prefill is launched, so those modes only retire requests
+        marked finished/retracted by the scheduler or whose request identity or
+        request-pool registration changed.  The latter two cases distinguish a
+        same-RID reuse or re-prefill from a chunked-prefill continuation.
+        """
+        if not hasattr(self, "_mlx_active_reqs"):
+            self._mlx_active_reqs = {}
+
+        if forward_mode.is_idle():
+            self.cleanup_idle_request_state()
+            return
+
+        current_reqs = {req.rid: req for req in reqs}
+        stale_rids = set()
+        for rid, (tracked_req, tracked_pool_idx) in self._mlx_active_reqs.items():
+            current_req = current_reqs.get(rid)
+            registration_changed = current_req is not None and (
+                current_req is not tracked_req
+                or self._req_pool_idx(current_req) != tracked_pool_idx
+            )
+            if self._req_is_retired(tracked_req) or registration_changed:
+                stale_rids.add(rid)
+
         if forward_mode.is_decode():
-            stale_rids = self._mlx_active_rids - current_rids
-            for rid in stale_rids:
-                self._mlx_runner.remove_request(rid)
-            self._mlx_active_rids = current_rids
-        else:
-            self._mlx_active_rids |= current_rids
+            stale_rids.update(self._mlx_active_rids - current_reqs.keys())
+
+        for rid in stale_rids:
+            self._forget_request(rid)
+
+        for rid, req in current_reqs.items():
+            self._mlx_active_rids.add(rid)
+            self._mlx_active_reqs[rid] = (req, self._req_pool_idx(req))
 
     def prepare_for_kv_cache_release(self, req) -> None:
         """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
@@ -173,6 +226,10 @@ class MlxTpModelWorker(TpModelWorker):
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.kv.mamba_last_track_seqlen = None
+            self._forget_request(req.rid, sync_to_pool=True)
+        else:
+            self._mlx_active_rids.discard(req.rid)
+            self._mlx_active_reqs.pop(req.rid, None)
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
@@ -413,12 +470,12 @@ class MlxTpModelWorker(TpModelWorker):
         forward_mode = batch.forward_mode
         reqs = batch.reqs
 
+        self._cleanup_stale_rids(forward_mode, reqs)
+
         if forward_mode.is_idle():
             return MlxLaunch(
                 lazy_tokens=None, prefills=[], extends=[], decode=None, mode="idle"
             )
-
-        self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
 
         if forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]
@@ -432,6 +489,7 @@ class MlxTpModelWorker(TpModelWorker):
             )
             mx.async_eval(
                 pending_decode.lazy_tokens,
+                *pending_decode.penalty_states,
                 *lazy_logprob_arrays(pending_decode.lazy_logprobs),
             )
             return MlxLaunch(
@@ -534,10 +592,12 @@ class MlxTpModelWorker(TpModelWorker):
             lazy_stacked = None
 
         for pending in (*pending_prefills, *pending_extends):
+            async_args.extend(pending.penalty_states)
             async_args.extend(self._mlx_runner.cache_state_arrays([pending.cache]))
             async_args.extend(lazy_logprob_arrays(pending.lazy_logprobs))
         if pending_mixed_decode is not None:
             async_args.append(pending_mixed_decode.lazy_tokens)
+            async_args.extend(pending_mixed_decode.penalty_states)
             async_args.extend(lazy_logprob_arrays(pending_mixed_decode.lazy_logprobs))
             async_args.extend(
                 self._mlx_runner.cache_state_arrays(pending_mixed_decode.caches)
@@ -580,7 +640,7 @@ class MlxTpModelWorker(TpModelWorker):
         and extend lists are always empty for a chained decode.
         """
         pending = self._mlx_runner.decode_batch_start_chained(prev_pending)
-        mx.async_eval(pending.lazy_tokens)
+        mx.async_eval(pending.lazy_tokens, *pending.penalty_states)
         return MlxLaunch(
             lazy_tokens=pending.lazy_tokens,
             prefills=[],

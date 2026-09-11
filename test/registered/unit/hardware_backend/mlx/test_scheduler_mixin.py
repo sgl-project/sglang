@@ -114,6 +114,9 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         scheduler._prepare_mlx_launch.side_effect = lambda batch: (
             SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, batch)
         )
+        scheduler._cleanup_mlx_state_if_fully_idle.side_effect = lambda: (
+            SchedulerMlxOverlapMixin._cleanup_mlx_state_if_fully_idle(scheduler)
+        )
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
@@ -244,6 +247,28 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         # the next fresh launch; per-step timing consumes the batch copy.
         self.assertEqual(batch.forward_iter, 2)
         self.assertEqual(batch.launch_ts, 1.0)
+
+    def test_no_batch_cleans_worker_only_after_scheduler_is_fully_idle(self):
+        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+            SchedulerMlxOverlapMixin,
+        )
+
+        scheduler = self._make_scheduler(recv_side_effect=[[], [], _StopLoop()])
+        plan = MagicMock()
+        plan.batch_to_run = None
+        scheduler.get_next_batch_to_run.return_value = plan
+        scheduler.is_fully_idle.side_effect = [False, True]
+        events = []
+        scheduler.on_idle.side_effect = lambda: events.append("idle")
+        scheduler.tp_worker.cleanup_idle_request_state.side_effect = lambda: (
+            events.append("cleanup")
+        )
+
+        with self.assertRaises(_StopLoop):
+            SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+
+        self.assertEqual(events, ["idle", "cleanup", "idle"])
+        scheduler.tp_worker.cleanup_idle_request_state.assert_called_once_with()
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)

@@ -35,6 +35,7 @@ import importlib.util
 import platform
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -65,6 +66,10 @@ class _FakeRunner:
         # chunk-finality derivation reaching the runner intact.
         self.logits_flags: dict[tuple[str, str], bool] = {}
         self._req_caches: dict[str, list] = {}
+        self._req_penalty_counts = {rid: object() for rid in known_rids}
+        self._req_penalty_seed_ids = {rid: [7] for rid in known_rids}
+        self.penalty_states: dict[tuple[str, str], object] = {}
+        self.remove_sync_flags: dict[str, bool] = {}
         self._counter = 0
 
     # --- shared ---
@@ -73,6 +78,17 @@ class _FakeRunner:
 
     def flush_all_decode_kv(self):
         pass
+
+    def remove_request(self, rid, *, sync_to_pool=True):
+        self.calls.append(("remove_request", rid))
+        self.remove_sync_flags[rid] = sync_to_pool
+        self._known.discard(rid)
+        self._req_caches.pop(rid, None)
+        self._req_penalty_counts.pop(rid, None)
+        self._req_penalty_seed_ids.pop(rid, None)
+
+    def store_auxiliary_state_for_request(self, rid):
+        self.calls.append(("store_auxiliary_state", rid))
 
     def ops_for(self, rid):
         return [op for op, r in self.calls if r == rid]
@@ -98,11 +114,14 @@ class _FakeRunner:
         self.calls.append(("extend_start", req_id))
         self.logits_flags[("extend_start", req_id)] = needs_logits
         self._req_caches[req_id] = [self._fake_cache_layer()]
+        penalty_state = mx.array([10 + self._counter], dtype=mx.uint32)
+        self.penalty_states[("extend_start", req_id)] = penalty_state
         return SimpleNamespace(
             lazy_token=mx.array([0], dtype=mx.int32),
             cache=self._req_caches[req_id],
             req_id=req_id,
             lazy_logprobs=None,
+            penalty_states=(penalty_state,),
         )
 
     def prefill_start(
@@ -122,11 +141,15 @@ class _FakeRunner:
 
         self.calls.append(("prefill_start", req_id))
         self.logits_flags[("prefill_start", req_id)] = needs_logits
+        self._known.add(req_id)
+        penalty_state = mx.array([20 + self._counter], dtype=mx.uint32)
+        self.penalty_states[("prefill_start", req_id)] = penalty_state
         return SimpleNamespace(
             lazy_token=mx.array([0], dtype=mx.int32),
             cache=[self._fake_cache_layer()],
             req_id=req_id,
             lazy_logprobs=None,
+            penalty_states=(penalty_state,),
         )
 
     def decode_batch_start(
@@ -136,11 +159,31 @@ class _FakeRunner:
 
         for rid in rids:
             self.calls.append(("decode_start", rid))
+        states = tuple(mx.array([30 + i], dtype=mx.uint32) for i in range(len(rids)))
+        for rid, state in zip(rids, states):
+            self.penalty_states[("decode_start", rid)] = state
         return SimpleNamespace(
             lazy_tokens=mx.array([0] * len(rids), dtype=mx.int32),
             caches=[[self._fake_cache_layer()] for _ in rids],
             req_ids=list(rids),
             lazy_logprobs=None,
+            penalty_states=states,
+        )
+
+    def decode_batch_start_chained(self, prev):
+        import mlx.core as mx
+
+        states = tuple(
+            mx.array([40 + i], dtype=mx.uint32) for i in range(len(prev.req_ids))
+        )
+        for rid, state in zip(prev.req_ids, states):
+            self.penalty_states[("chained_decode", rid)] = state
+        return SimpleNamespace(
+            lazy_tokens=mx.array([0] * len(prev.req_ids), dtype=mx.int32),
+            caches=prev.caches,
+            req_ids=list(prev.req_ids),
+            lazy_logprobs=None,
+            penalty_states=states,
         )
 
     def prefill_finalize(self, pending):
@@ -175,9 +218,14 @@ class _FakeReq:
         # "not truncated" (final chunk / plain prefill).
         self.extend_range = None
         self.full_untruncated_fill_ids = self.fill_ids
+        self.is_retracted = False
+        self._finished = False
 
     def get_fill_ids(self):
         return self.fill_ids
+
+    def finished(self):
+        return self._finished
 
 
 class _FakeBatch:
@@ -214,11 +262,15 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
+        worker._mlx_active_reqs = {}
         # The sync entry point delegates to the async launch, which guards
         # pool creation behind this flag; forward_batch_generation has
         # already run it for real by the time either path is reached.
         worker._mlx_pool_initialized = True
         return worker
+
+    def assertAsyncEvaluated(self, state, evaluated):
+        self.assertTrue(any(arg is state for arg in evaluated))
 
     def test_startup_weight_overlap_is_rejected_before_mlx_model_load(self):
         from sglang.srt.hardware_backend.mlx.model_runner_stub import (
@@ -325,6 +377,185 @@ class TestMlxExtendRouting(CustomTestCase):
         self.assertEqual(runner.ops_for("p1"), ["prefill_start"])
         self.assertEqual(runner.ops_for("d1"), ["decode_start"])
         self.assertIsNotNone(launch.decode)  # pending mixed decode present
+
+    def test_async_eval_receives_fresh_decode_penalty_states(self):
+        """Dropping the sibling count output would leave the next decode stale."""
+        req = _FakeReq("d1")
+        worker = self._worker({"d1"})
+        batch = _FakeBatch(ForwardMode.DECODE, [req], [1])
+
+        with patch("mlx.core.async_eval") as async_eval:
+            launch = worker.async_forward_batch_generation_mlx(batch)
+
+        self.assertAsyncEvaluated(
+            launch.decode.penalty_states[0], async_eval.call_args.args
+        )
+
+    def test_async_eval_receives_prefill_extend_and_mixed_penalty_states(self):
+        """Every pending row in an extend/mixed launch is scheduled explicitly."""
+        prefill = _FakeReq("p1", req_pool_idx=11)
+        extend = _FakeReq("e1", req_pool_idx=12)
+        decode = _FakeReq("d1", req_pool_idx=13)
+        worker = self._worker({"e1", "d1"})
+        batch = _FakeBatch(
+            ForwardMode.MIXED,
+            [prefill, extend, decode],
+            [2, 2, 1],
+            decoding_reqs=[decode],
+        )
+
+        with patch("mlx.core.async_eval") as async_eval:
+            launch = worker.async_forward_batch_generation_mlx(batch)
+
+        evaluated = async_eval.call_args.args
+        pending_states = [
+            *(state for pending in launch.prefills for state in pending.penalty_states),
+            *(state for pending in launch.extends for state in pending.penalty_states),
+            *(launch.decode.penalty_states if launch.decode is not None else ()),
+        ]
+        self.assertEqual(len(pending_states), 3)
+        for state in pending_states:
+            self.assertAsyncEvaluated(state, evaluated)
+
+    def test_async_eval_receives_chained_decode_penalty_states(self):
+        """A chained token does not itself evaluate its downstream count row."""
+        worker = self._worker({"d1"})
+        previous = worker._mlx_runner.decode_batch_start(["d1"])
+
+        with patch("mlx.core.async_eval") as async_eval:
+            launch = worker.async_chained_decode_mlx(previous)
+
+        self.assertAsyncEvaluated(
+            launch.decode.penalty_states[0], async_eval.call_args.args
+        )
+
+    def test_idle_boundary_clears_counts_and_deferred_seeds(self):
+        req = _FakeReq("old", req_pool_idx=21)
+        worker = self._worker({"old"})
+        worker._mlx_active_rids = {"old"}
+        worker._mlx_active_reqs = {"old": (req, 21)}
+
+        worker.cleanup_idle_request_state()
+
+        self.assertEqual(worker._mlx_active_rids, set())
+        self.assertEqual(worker._mlx_runner._req_penalty_counts, {})
+        self.assertEqual(worker._mlx_runner._req_penalty_seed_ids, {})
+
+    def test_finished_prefill_is_retired_without_dropping_live_extend(self):
+        finished = _FakeReq("finished", req_pool_idx=31)
+        live = _FakeReq("live", req_pool_idx=32)
+        worker = self._worker({"finished", "live"})
+        worker._mlx_active_rids = {"finished", "live"}
+        worker._mlx_active_reqs = {
+            "finished": (finished, 31),
+            "live": (live, 32),
+        }
+        finished._finished = True
+
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [live], [1])
+        )
+
+        self.assertNotIn("finished", worker._mlx_runner._req_penalty_counts)
+        self.assertNotIn("finished", worker._mlx_runner._req_penalty_seed_ids)
+        self.assertIn("live", worker._mlx_runner._req_penalty_counts)
+        self.assertEqual(worker._mlx_runner.ops_for("live"), ["extend_start"])
+
+    def test_finished_decode_release_immediately_retires_worker_state(self):
+        req = _FakeReq("finished", req_pool_idx=33)
+        worker = self._worker({"finished"})
+        worker._mlx_active_rids = {"finished"}
+        worker._mlx_active_reqs = {"finished": (req, 33)}
+
+        worker.prepare_for_kv_cache_release(req)
+
+        self.assertEqual(
+            worker._mlx_runner.ops_for("finished"),
+            ["store_auxiliary_state", "remove_request"],
+        )
+        self.assertNotIn("finished", worker._mlx_active_rids)
+        self.assertNotIn("finished", worker._mlx_active_reqs)
+        self.assertTrue(worker._mlx_runner.remove_sync_flags["finished"])
+
+    def test_aborted_or_retracted_request_is_retired_on_next_boundary(self):
+        aborted = _FakeReq("aborted", req_pool_idx=34)
+        live = _FakeReq("live", req_pool_idx=35)
+        worker = self._worker({"aborted", "live"})
+        worker._mlx_active_rids = {"aborted", "live"}
+        worker._mlx_active_reqs = {
+            "aborted": (aborted, 34),
+            "live": (live, 35),
+        }
+        aborted.is_retracted = True
+
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [live], [1])
+        )
+
+        self.assertNotIn("aborted", worker._mlx_runner._req_penalty_counts)
+        self.assertIn("live", worker._mlx_runner._req_penalty_counts)
+        self.assertFalse(worker._mlx_runner.remove_sync_flags["aborted"])
+
+    def test_extend_boundary_preserves_absent_but_live_request(self):
+        current = _FakeReq("current", req_pool_idx=36)
+        parked = _FakeReq("parked", req_pool_idx=37)
+        worker = self._worker({"current", "parked"})
+        worker._mlx_active_rids = {"current", "parked"}
+        worker._mlx_active_reqs = {
+            "current": (current, 36),
+            "parked": (parked, 37),
+        }
+
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [current], [1])
+        )
+
+        self.assertIn("parked", worker._mlx_runner._req_penalty_counts)
+        self.assertNotIn(("remove_request", "parked"), worker._mlx_runner.calls)
+
+    def test_retracted_request_reprefills_with_accepted_output_seed(self):
+        req = _FakeReq("same", req_pool_idx=41)
+        worker = self._worker({"same"})
+        worker._mlx_active_rids = {"same"}
+        worker._mlx_active_reqs = {"same": (req, 41)}
+        old_count = worker._mlx_runner._req_penalty_counts["same"]
+        old_seed = worker._mlx_runner._req_penalty_seed_ids["same"]
+
+        # release_kv_cache + the next prefill allocation changes the scheduler
+        # pool registration while retaining the same Req/output_ids.
+        req.kv.req_pool_idx = 42
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [req], [1])
+        )
+
+        self.assertEqual(
+            worker._mlx_runner.ops_for("same"),
+            ["remove_request", "prefill_start"],
+        )
+        self.assertNotIn(old_count, worker._mlx_runner._req_penalty_counts.values())
+        self.assertNotIn(old_seed, worker._mlx_runner._req_penalty_seed_ids.values())
+        self.assertFalse(worker._mlx_runner.remove_sync_flags["same"])
+
+    def test_same_rid_reuse_drops_old_counts_and_seed_before_prefill(self):
+        old_req = _FakeReq("same", req_pool_idx=51)
+        new_req = _FakeReq("same", req_pool_idx=51)
+        worker = self._worker({"same"})
+        worker._mlx_active_rids = {"same"}
+        worker._mlx_active_reqs = {"same": (old_req, 51)}
+        old_count = worker._mlx_runner._req_penalty_counts["same"]
+        old_seed = worker._mlx_runner._req_penalty_seed_ids["same"]
+
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [new_req], [1])
+        )
+
+        self.assertEqual(
+            worker._mlx_runner.ops_for("same"),
+            ["remove_request", "prefill_start"],
+        )
+        self.assertNotIn(old_count, worker._mlx_runner._req_penalty_counts.values())
+        self.assertNotIn(old_seed, worker._mlx_runner._req_penalty_seed_ids.values())
+        self.assertFalse(worker._mlx_runner.remove_sync_flags["same"])
 
 
 if __name__ == "__main__":

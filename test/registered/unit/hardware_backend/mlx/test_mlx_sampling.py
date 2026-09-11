@@ -174,9 +174,7 @@ class TestTokenPenalties(CustomTestCase):
         self.assertLess(float(adjusted[0, 2]), 0.0)
         expected = torch.where(
             seen,
-            torch.where(
-                adjusted < 0, adjusted * repetition, adjusted / repetition
-            ),
+            torch.where(adjusted < 0, adjusted * repetition, adjusted / repetition),
             adjusted,
         )
         torch.testing.assert_close(
@@ -193,12 +191,8 @@ class TestTokenPenalties(CustomTestCase):
 
     def test_increment_token_counts_updates_each_row_once(self):
         counts = mx.zeros((2, 8), dtype=mx.uint32)
-        counts = increment_token_counts(
-            counts, mx.array([3, 5], dtype=mx.uint32)
-        )
-        counts = increment_token_counts(
-            counts, mx.array([3, 1], dtype=mx.uint32)
-        )
+        counts = increment_token_counts(counts, mx.array([3, 5], dtype=mx.uint32))
+        counts = increment_token_counts(counts, mx.array([3, 1], dtype=mx.uint32))
         mx.eval(counts)
 
         self.assertEqual(counts.dtype, mx.uint32)
@@ -665,9 +659,7 @@ class TestRunnerSelectTokens(CustomTestCase):
         runner.disable_radix_cache = True
         runner._acquire_cache = lambda: [self._FakeCache(0)]
         runner._store_auxiliary_state = lambda req_pool_idx, cache: None
-        runner.model = lambda input_ids, cache=None: mx.array(
-            [[[0.0, 5.0, 4.0]]]
-        )
+        runner.model = lambda input_ids, cache=None: mx.array([[[0.0, 5.0, 4.0]]])
         req = SimpleNamespace(
             kv=SimpleNamespace(mamba_last_track_seqlen=None),
             output_ids=[1],
@@ -719,9 +711,7 @@ class TestRunnerSelectTokens(CustomTestCase):
         }
         runner._acquire_cache = lambda: [self._FakeCache(0)]
         runner._store_auxiliary_state = lambda req_pool_idx, cache: None
-        runner.model = lambda input_ids, cache=None: mx.array(
-            [[[0.0, 5.0, 4.0]]]
-        )
+        runner.model = lambda input_ids, cache=None: mx.array([[[0.0, 5.0, 4.0]]])
         req = SimpleNamespace(
             kv=SimpleNamespace(mamba_last_track_seqlen=None),
             output_ids=[1],
@@ -771,9 +761,7 @@ class TestRunnerSelectTokens(CustomTestCase):
             "a": mx.array([0, 1, 0], dtype=mx.uint32),
         }
         caches = [[self._FakeCache(4)], [self._FakeCache(4)]]
-        tokens = runner._select_tokens_with_logprobs(
-            logits, ["a", "b"], caches
-        )[0]
+        tokens = runner._select_tokens_with_logprobs(logits, ["a", "b"], caches)[0]
         mx.eval(tokens)
         self.assertEqual(tokens.tolist(), [2, 1])
 
@@ -810,9 +798,7 @@ class TestRunnerSelectTokens(CustomTestCase):
             "increment_token_counts",
             wraps=increment_token_counts,
         ) as increment:
-            runner._advance_penalty_counts(
-                ["a", "b"], params, counts, tokens
-            )
+            runner._advance_penalty_counts(["a", "b"], params, counts, tokens)
 
         self.assertEqual(
             [call.args[0].shape for call in increment.call_args_list],
@@ -951,6 +937,7 @@ class TestRunnerSelectTokens(CustomTestCase):
         }
         runner._req_caches = {"a": [self._FakeCache(3)]}
         runner._req_token_ids = {"a": [7]}
+
         def fake_decode(caches, inputs, req_ids):
             return mx.array([[0.0, 5.0, 4.0]])
 
@@ -961,16 +948,15 @@ class TestRunnerSelectTokens(CustomTestCase):
             runner.eval_pending(pending)
 
         self.assertTrue(
-            any(
-                arg is pending.penalty_states[0]
-                for arg in eval_mock.call_args.args
-            )
+            any(arg is pending.penalty_states[0] for arg in eval_mock.call_args.args)
         )
 
     def test_remove_and_clear_release_penalty_state(self):
         """Request removal and runner clear drop all persistent count rows."""
+        from unittest.mock import patch
+
         runner = self._runner(enable_sampling=True)
-        runner.disable_radix_cache = True
+        runner.disable_radix_cache = False
         runner._req_caches = {}
         runner._req_token_ids = {}
         runner._req_sampling = {}
@@ -983,7 +969,9 @@ class TestRunnerSelectTokens(CustomTestCase):
         }
         runner._req_penalty_seed_ids = {"a": [1], "b": [2]}
 
-        runner.remove_request("a")
+        with patch.object(runner, "_sync_decode_kv_to_pool") as sync_kv:
+            runner.remove_request("a", sync_to_pool=False)
+        sync_kv.assert_not_called()
         self.assertEqual(set(runner._req_penalty_counts), {"b"})
         self.assertEqual(set(runner._req_penalty_seed_ids), {"b"})
         runner.clear()
