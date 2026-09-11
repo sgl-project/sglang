@@ -1906,8 +1906,15 @@ class LayerwiseOffloadManager:
                 # page) and the process's anonymous memory grew past 100 GiB;
                 # the pinned slots stay even on a shared pool.
                 direct_copy=False,
+                # A host that cannot cache the mapping re-reads it from the
+                # drive every pass anyway, through 4 KiB faults at the mercy
+                # of readahead; O_DIRECT into the slots reads at the drive's
+                # sequential rate (9.4 vs ~1.1 GiB/s on a GB10 NVMe).
                 direct_read=(
-                    host_copies_are_redundant()
+                    (
+                        host_copies_are_redundant()
+                        or host_copies_would_not_fit(self._mapped_bytes)
+                    )
                     and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ
                     and self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
                 ),
