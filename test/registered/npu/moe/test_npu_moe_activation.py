@@ -19,7 +19,7 @@ if "triton" not in sys.modules:
     except ImportError:
         _triton = type(sys)("triton")
         _triton.jit = MagicMock(return_value=lambda f: f)
-        _triton.autotune = lambda *a, **kw: (lambda f: f)
+        _triton.autotune = lambda *a, **kw: lambda f: f
         sys.modules["triton"] = _triton
         sys.modules.setdefault("triton.language", MagicMock())
         sys.modules.setdefault("triton.backends", MagicMock())
