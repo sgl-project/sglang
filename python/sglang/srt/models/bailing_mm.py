@@ -57,8 +57,13 @@ class BailingMMNativeForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        text_config = config.llm_config
+        self.requires_mm_token_modalities = bool(
+            getattr(text_config, "multi_gate", False)
+            or getattr(text_config, "router_type", "topN") == "MultiRouter"
+        )
         self.model = BailingMoeV2ForCausalLM(
-            config.llm_config,
+            text_config,
             quant_config,
             prefix=add_prefix("model", prefix),
         )

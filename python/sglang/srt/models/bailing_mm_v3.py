@@ -83,6 +83,7 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
         text_config = config.text_config
         self.multi_gate_enabled = is_bailing_multi_gate_enabled(text_config)
+        self.requires_mm_token_modalities = self.multi_gate_enabled
         self.model = BailingMoeV3ForCausalLM(
             config=text_config,
             quant_config=quant_config,

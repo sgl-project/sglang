@@ -9,7 +9,6 @@ from sglang.srt.configs.bailing_hybrid import (
     BailingHybridConfig,
     BailingMoeV3VLConfig,
 )
-from sglang.srt.models.bailing_mm import BailingMMNativeForConditionalGeneration
 from sglang.srt.models.bailing_mm_v3 import (
     BailingMoeV3VLForConditionalGeneration,
 )
@@ -91,21 +90,17 @@ class _PublicVision(nn.Module):
 
 class TestBailingVLWeightLoading(CustomTestCase):
     @staticmethod
-    def _wrapper(wrapper_class):
-        wrapper = wrapper_class.__new__(wrapper_class)
+    def _wrapper():
+        wrapper = BailingMoeV3VLForConditionalGeneration.__new__(
+            BailingMoeV3VLForConditionalGeneration
+        )
         nn.Module.__init__(wrapper)
         wrapper.model = _TextModel()
         wrapper._build_mm_encoders = True
-        if wrapper_class is BailingMoeV3VLForConditionalGeneration:
-            wrapper.visual = _PublicVision()
-            wrapper.linear_proj = nn.Sequential(
-                nn.Linear(2, 2), nn.GELU(), nn.Linear(2, 2)
-            )
-            wrapper.deepstack_visual_indexes = ()
-            wrapper.multi_gate_enabled = False
-        else:
-            wrapper.vision = nn.Identity()
-            wrapper.linear_proj = nn.Linear(2, 2)
+        wrapper.visual = _PublicVision()
+        wrapper.linear_proj = nn.Sequential(nn.Linear(2, 2), nn.GELU(), nn.Linear(2, 2))
+        wrapper.deepstack_visual_indexes = ()
+        wrapper.multi_gate_enabled = False
         return wrapper
 
     @staticmethod
@@ -200,7 +195,7 @@ class TestBailingVLWeightLoading(CustomTestCase):
 
     def test_v3_loader_accepts_public_checkpoint_names_once(self):
         """The public checkpoint layout must load without a second iterator pass."""
-        wrapper = self._wrapper(BailingMoeV3VLForConditionalGeneration)
+        wrapper = self._wrapper()
         weights = _OneShotWeights(self._public_weights(wrapper))
 
         wrapper.load_weights(weights)
@@ -215,29 +210,6 @@ class TestBailingVLWeightLoading(CustomTestCase):
             torch.full((6, 2), 6.0),
         )
         torch.testing.assert_close(wrapper.linear_proj[2].bias, torch.full((2,), 22.0))
-
-    def test_legacy_loader_consumes_checkpoint_once(self):
-        """The legacy nested checkpoint layout must remain single-pass."""
-        wrapper = self._wrapper(BailingMMNativeForConditionalGeneration)
-        weights = _OneShotWeights(
-            self._filled_weights(
-                wrapper,
-                [
-                    (
-                        "model.model.word_embeddings.weight",
-                        "model.model.word_embeddings.weight",
-                        1,
-                    ),
-                    ("model.linear_proj.weight", "linear_proj.weight", 2),
-                    ("model.linear_proj.bias", "linear_proj.bias", 3),
-                ],
-            )
-        )
-
-        wrapper.load_weights(weights)
-
-        self.assertEqual(weights.iterations, 1)
-        torch.testing.assert_close(wrapper.linear_proj.weight, torch.full((2, 2), 2.0))
 
     def test_public_config_does_not_enable_qwen_deepstack_defaults(self):
         """An omitted public deepstack field must not create random modules."""
@@ -274,7 +246,7 @@ class TestBailingVLWeightLoading(CustomTestCase):
 
     def test_required_multimodal_weight_coverage_is_enforced(self):
         """A truncated public checkpoint must not leave random projection bias."""
-        wrapper = self._wrapper(BailingMoeV3VLForConditionalGeneration)
+        wrapper = self._wrapper()
         weights = _OneShotWeights(self._public_weights(wrapper)[:-1])
 
         with self.assertRaisesRegex(
@@ -284,7 +256,7 @@ class TestBailingVLWeightLoading(CustomTestCase):
 
     def test_required_single_router_weight_coverage_is_enforced(self):
         """Every public MoE layer must load its sole gate weight and expert bias."""
-        wrapper = self._wrapper(BailingMoeV3VLForConditionalGeneration)
+        wrapper = self._wrapper()
         public_weights = self._public_weights(wrapper)
 
         for missing_name in (

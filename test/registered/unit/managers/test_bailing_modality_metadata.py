@@ -88,12 +88,39 @@ class TestBailingModalityMetadata(CustomTestCase):
                 extend_seq_lens=[3, 2],
                 num_tokens=5,
                 device=torch.device("cpu"),
+                required=True,
             )
             for _ in range(2)
         ]
 
         for stage_map in stage_maps:
             torch.testing.assert_close(stage_map, expected)
+
+    def test_unrelated_model_skips_mismatched_metadata(self):
+        """Only an explicitly opted-in MultiRouter model enforces the token map."""
+        mm_inputs = [
+            MultimodalInputs(mm_items=[], token_modalities=[Modality.IMAGE.value])
+        ]
+
+        result = _build_forward_token_modalities(
+            mm_inputs,
+            extend_prefix_lens=[0],
+            extend_seq_lens=[1],
+            num_tokens=6,
+            device=torch.device("cpu"),
+            required=False,
+        )
+
+        self.assertIsNone(result)
+        with self.assertRaisesRegex(ValueError, "does not match the forward batch"):
+            _build_forward_token_modalities(
+                mm_inputs,
+                extend_prefix_lens=[0],
+                extend_seq_lens=[1],
+                num_tokens=6,
+                device=torch.device("cpu"),
+                required=True,
+            )
 
     def test_mixed_modalities_select_reference_experts(self):
         """Per-token bias must select image/audio experts after modality grouping."""

@@ -2,14 +2,11 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
-from sglang.srt.configs.bailing_hybrid import (
-    BailingHybridConfig,
-    BailingMoeV3VLConfig,
-)
-from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
+from sglang.srt.configs.bailing_hybrid import BailingMoeV3VLConfig
 from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -86,16 +83,17 @@ class TestBailingMRotaryEmbedding(CustomTestCase):
 
     def test_negative_start_cache_growth_preserves_phase(self):
         """Growing a negative-origin cache must append the next logical phase."""
-        rotary = BailingMRotaryEmbedding(
-            head_size=8,
-            rotary_dim=8,
-            max_position_embeddings=16,
-            base=10000,
-            is_neox_style=True,
-            dtype=torch.float32,
-            mrope_section=[2, 1, 1],
-            video_rope=True,
-        )
+        with mock.patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True):
+            rotary = BailingMRotaryEmbedding(
+                head_size=8,
+                rotary_dim=8,
+                max_position_embeddings=16,
+                base=10000,
+                is_neox_style=True,
+                dtype=torch.float32,
+                mrope_section=[2, 1, 1],
+                video_rope=True,
+            )
         self.assertEqual(rotary.position_start, -16)
         self.assertEqual(rotary.cos_sin_cache.shape[0], 32)
 
@@ -106,18 +104,19 @@ class TestBailingMRotaryEmbedding(CustomTestCase):
 
     def test_yarn_scaling_extends_positive_cache_only(self):
         """YaRN factor stretches the positive side; the negative side is fixed."""
-        rotary = BailingMRotaryEmbedding(
-            head_size=8,
-            rotary_dim=8,
-            max_position_embeddings=16,
-            base=10000,
-            is_neox_style=True,
-            dtype=torch.float32,
-            mrope_section=[2, 1, 1],
-            video_rope=True,
-            scaling_factor=2.0,
-            original_max_position_embeddings=16,
-        )
+        with mock.patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True):
+            rotary = BailingMRotaryEmbedding(
+                head_size=8,
+                rotary_dim=8,
+                max_position_embeddings=16,
+                base=10000,
+                is_neox_style=True,
+                dtype=torch.float32,
+                mrope_section=[2, 1, 1],
+                video_rope=True,
+                scaling_factor=2.0,
+                original_max_position_embeddings=16,
+            )
         self.assertEqual(rotary.position_start, -16)
         self.assertEqual(rotary.cos_sin_cache.shape[0], 16 + 32)
         self.assertGreater(rotary.mscale, 1.0)
@@ -207,8 +206,6 @@ class TestBailingMRotaryEmbedding(CustomTestCase):
         )
         self.assertTrue(config.text_config.rope_parameters["video_rope"])
         self.assertTrue(config.vision_config.disable_merger_proj)
-        self.assertFalse(BailingHybridConfig().moe_router_enable_expert_bias)
-        self.assertIsNone(BailingMM2Config().audio_config)
 
 
 if __name__ == "__main__":

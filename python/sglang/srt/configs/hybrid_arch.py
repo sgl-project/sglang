@@ -107,7 +107,7 @@ def kimi_linear_config(model_config: ModelConfig):
         return config
     if isinstance(config, BailingHybridConfig) and config.use_kda:
         return config
-    text_config = model_config.hf_text_config
+    text_config = getattr(model_config, "hf_text_config", None) or config
     if isinstance(text_config, BailingHybridConfig) and text_config.use_kda:
         return text_config
     text_config = getattr(config, "text_config", None)

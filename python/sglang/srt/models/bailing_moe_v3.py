@@ -102,17 +102,23 @@ from sglang.srt.utils import (
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
-if _is_cuda:
-    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    from sglang.kernels.ops.quantization.awq_triton import (
-        awq_dequantize_triton as awq_dequantize,
-    )
 
-elif not (_is_cpu and _is_cpu_amx_available):
-    from vllm._custom_ops import awq_dequantize
+def _get_awq_dequantize():
+    """Load the platform AWQ kernel only when an AWQ tensor needs it."""
+    if _is_cuda:
+        from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
+
+        return awq_dequantize
+    if _is_hip:
+        from sglang.kernels.ops.quantization.awq_triton import awq_dequantize_triton
+
+        return awq_dequantize_triton
+    if not (_is_cpu and _is_cpu_amx_available):
+        from vllm._custom_ops import awq_dequantize
+
+        return awq_dequantize
+    return None
+
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and get_platform().is_sm100
@@ -1618,6 +1624,11 @@ class BailingMoeV3ForCausalLM(nn.Module):
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
             if hasattr(self_attn.kv_b_proj, "qweight"):
+                awq_dequantize = _get_awq_dequantize()
+                if awq_dequantize is None:
+                    raise RuntimeError(
+                        "AWQ dequantization is unavailable on this CPU platform"
+                    )
                 if _is_cuda or _is_hip:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,

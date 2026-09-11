@@ -91,7 +91,11 @@ def _build_forward_token_modalities(
     extend_seq_lens: Optional[List[int]],
     num_tokens: int,
     device: torch.device,
+    *,
+    required: bool,
 ) -> Optional[torch.Tensor]:
+    if not required:
+        return None
     if not mm_inputs or extend_prefix_lens is None or extend_seq_lens is None:
         return None
     if not (len(mm_inputs) == len(extend_prefix_lens) == len(extend_seq_lens)):
@@ -921,6 +925,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             extend_seq_lens if isinstance(extend_seq_lens, list) else None,
             len(batch.input_ids) if batch.input_ids is not None else 0,
             device,
+            required=(
+                getattr(
+                    getattr(model_runner, "model", None),
+                    "requires_mm_token_modalities",
+                    False,
+                )
+                is True
+            ),
         )
 
         model_runner.kv_index_translator.rebind_write_loc(ret)
