@@ -285,8 +285,7 @@ def local_crop_size(config) -> int:
     """Local-crop pixel size for a checkpoint.
 
     Kept next to :func:`is_ocr2_config` so that the crop size and the per-tile
-    token budget it implies stay defined in one place; see the ``IMAGE_SIZE`` /
-    ``OCR2_IMAGE_SIZE`` comments above.
+    token budget it implies stay defined in one place.
     """
     return OCR2_IMAGE_SIZE if is_ocr2_config(config) else IMAGE_SIZE
 
