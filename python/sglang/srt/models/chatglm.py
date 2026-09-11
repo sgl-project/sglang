@@ -20,6 +20,7 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import LayerNorm
 
 from sglang.srt.configs import ChatGLMConfig
@@ -41,7 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
 
 LoraConfig = None
 
@@ -122,16 +123,130 @@ class GLMAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
+        is_last_layer: bool = False,
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
-        context_layer = self.attn(
-            q,
-            k,
-            v,
-            forward_batch,
+
+        can_optimize = (
+            is_last_layer
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_seq_lens is not None
+            and q.shape[0] >= 2048
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
         )
+
+        if can_optimize:
+            # 1. Save KV cache into SGLang memory pool for subsequent decode steps
+            try:
+                self.attn.save_kv_cache_only(k, v, forward_batch)
+            except Exception:
+                _ = self.attn(q, k, v, forward_batch, save_kv_cache=True)
+
+            # 2. Compute Single-Query Attention on terminal token(s)
+            num_groups = self.num_heads // self.num_kv_heads
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                # Optimized fast path for single sequence (B=1)
+                q_b = q[-1:].view(1, 1, self.num_heads, self.head_dim).transpose(1, 2)
+                k_b = k.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                v_b = v.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                try:
+                    context_layer = (
+                        F.scaled_dot_product_attention(
+                            q_b,
+                            k_b,
+                            v_b,
+                            is_causal=False,
+                            scale=self.scaling,
+                            enable_gqa=(num_groups > 1),
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
+                except TypeError:
+                    if num_groups > 1:
+                        k_b = k_b.repeat_interleave(num_groups, dim=1)
+                        v_b = v_b.repeat_interleave(num_groups, dim=1)
+                    context_layer = (
+                        F.scaled_dot_product_attention(
+                            q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                start_indices = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.long, device=q.device),
+                        last_token_indices[:-1] + 1,
+                    ]
+                )
+                outs = []
+                for start_idx, end_idx in zip(start_indices, last_token_indices + 1):
+                    q_b = (
+                        q[end_idx - 1 : end_idx]
+                        .view(1, 1, self.num_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    k_b = (
+                        k[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    v_b = (
+                        v[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    try:
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b,
+                                k_b,
+                                v_b,
+                                is_causal=False,
+                                scale=self.scaling,
+                                enable_gqa=(num_groups > 1),
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
+                    except TypeError:
+                        if num_groups > 1:
+                            k_b = k_b.repeat_interleave(num_groups, dim=1)
+                            v_b = v_b.repeat_interleave(num_groups, dim=1)
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
+                    outs.append(out_b)
+                context_layer = torch.cat(outs, dim=0)
+        else:
+            context_layer = self.attn(
+                q,
+                k,
+                v,
+                forward_batch,
+            )
         attn_output, _ = self.dense(context_layer)
         return attn_output
 
@@ -229,6 +344,7 @@ class GLMBlock(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
+        is_last_layer: bool = False,
     ) -> torch.Tensor:
         # hidden_states: [num_tokens, h]
         # Layer norm at the beginning of the transformer layer.
@@ -238,6 +354,7 @@ class GLMBlock(nn.Module):
             hidden_states=layernorm_output,
             position_ids=position_ids,
             forward_batch=forward_batch,
+            is_last_layer=is_last_layer,
         )
 
         # Residual connection.
@@ -245,6 +362,16 @@ class GLMBlock(nn.Module):
             residual = layernorm_output
         else:
             residual = hidden_states
+
+        # Slice residual to terminal tokens if final-layer prefill optimization was applied
+        if is_last_layer and attention_output.shape[0] != residual.shape[0]:
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                residual = residual[-1:]
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                residual = residual[last_token_indices]
 
         layernorm_input = residual + attention_output
 
@@ -305,10 +432,12 @@ class GLMTransformer(nn.Module):
     ) -> torch.Tensor:
         for i in range(self.num_layers):
             layer = self.layers[i]
+            is_last_layer = i == self.num_layers - 1
             hidden_states = layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 forward_batch=forward_batch,
+                is_last_layer=is_last_layer,
             )
         # Final layer norm.
         if self.post_layer_norm:
