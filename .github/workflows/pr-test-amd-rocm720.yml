@@ -567,6 +567,154 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+  # Image-cache concurrency probe. Not part of any stage: it only runs when
+  # named explicitly via the free-form `target_stage` input.
+  #
+  # The test stages all cap their matrices with `max-parallel` (4 above), so no
+  # amount of dispatching drives more than 4 simultaneous image acquisitions,
+  # and the cache's behaviour under real fan-out cannot be observed from them.
+  # These two jobs seed the tarball once and then acquire it from 24 runners at
+  # once, stopping as soon as the container is up so a job costs one image
+  # acquisition instead of a full test shard.
+  #
+  # Grep a run for `[amd-ci-setup]` and pair each line with its `Start CI
+  # container` step window to get the per-job concurrency.
+  amd-image-cache-probe-seed-rocm720:
+    name: ${{ format('amd-image-cache-probe-seed ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300') }}
+    needs: [check-changes]
+    if: always() && contains(format(',{0},', inputs.target_stage), ',amd-image-cache-probe-rocm720,')
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Release the container
+        if: always()
+        run: |
+          docker stop ci_sglang 2>/dev/null || true
+          docker rm -f ci_sglang 2>/dev/null || true
+
+  amd-image-cache-probe-rocm720:
+    name: ${{ format('amd-image-cache-probe ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300', matrix.idx) }}
+    needs: [check-changes, amd-image-cache-probe-seed-rocm720]
+    if: always() && contains(format(',{0},', inputs.target_stage), ',amd-image-cache-probe-rocm720,')
+    strategy:
+      # Deliberately no max-parallel: simultaneous acquisition is the measurement.
+      fail-fast: false
+      matrix:
+        idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      # Splits a cache hit into the part that streams bytes off the volume and
+      # the part `docker load` spends importing them, which is what decides
+      # whether a no-tar scheme (loose layer files, or a persistent data-root)
+      # could be meaningfully faster. O_DIRECT so the page cache cannot flatter
+      # the read, and only a slice is read so the probe stays cheap.
+      - name: Measure raw volume read and local write throughput
+        if: always()
+        run: |
+          set -u
+          cache=/home/runner/sglang-data/docker-images
+          tarball=$(ls -S "${cache}"/*.tar 2>/dev/null | head -n 1 || true)
+          if [[ -n "${tarball}" ]]; then
+            bytes=$(stat -c %s "${tarball}")
+            echo "[probe-io] tarball=${tarball} size=$(( bytes / 1024 / 1024 / 1024 ))G"
+            for flag in direct ""; do
+              out=$(dd if="${tarball}" of=/dev/null bs=16M count=512 ${flag:+iflag=$flag} 2>&1 | tail -n 1) || true
+              echo "[probe-io] volume-read${flag:+ ($flag)}: ${out}"
+            done
+          else
+            echo "[probe-io] no tarball in ${cache}"
+          fi
+          out=$(dd if=/dev/zero of=/tmp/probe-io.bin bs=16M count=256 oflag=direct conv=fsync 2>&1 | tail -n 1) || true
+          echo "[probe-io] local-write (direct): ${out}"
+          rm -f /tmp/probe-io.bin
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Report the cache state this job saw
+        if: always()
+        run: |
+          echo "probe idx=${{ matrix.idx }} runner=${RUNNER_NAME:-unknown}"
+          df -h /home/runner/sglang-data 2>/dev/null | tail -n 1 || true
+          # How many inodes the image occupies once unpacked. A scheme that
+          # copied loose layer files instead of one tar would pay per-file
+          # metadata cost on the shared volume for every one of these.
+          root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+          echo "[probe-io] data-root=${root}"
+          timeout 300 find "${root}/overlay2" -xdev -printf '.' 2>/dev/null | wc -c \
+            | sed 's/^/[probe-io] overlay2 inodes: /' || echo "[probe-io] inode count timed out"
+          du -sh "${root}/overlay2" 2>/dev/null | sed 's/^/[probe-io] overlay2 size: /' || true
+
+      - name: Release the container
+        if: always()
+        run: |
+          docker stop ci_sglang 2>/dev/null || true
+          docker rm -f ci_sglang 2>/dev/null || true
+
+  # Control group for the probe above: same 24-way fan-out, same no-max-parallel
+  # matrix, but with the tarball cache switched off so every job pulls from
+  # Docker Hub. Without this the cache is only ever compared against pulls
+  # measured at low concurrency, which is not the same regime.
+  #
+  # The in-network registry is deliberately not measured: #36171 removed that
+  # path from main precisely because concurrent CI pulls saturate it, so there
+  # is no code left to exercise and pointing 24 simultaneous 64 GB pulls at a
+  # host that is already known to be overloaded would disrupt other jobs.
+  amd-image-cache-probe-nocache-rocm720:
+    name: ${{ format('amd-image-cache-probe-nocache ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300', matrix.idx) }}
+    needs: [check-changes]
+    if: always() && contains(format(',{0},', inputs.target_stage), ',amd-image-cache-probe-nocache-rocm720,')
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container without the tarball cache
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          AMD_CI_IMAGE_TARBALL_CACHE: "0"
+
+      - name: Release the container
+        if: always()
+        run: |
+          docker stop ci_sglang 2>/dev/null || true
+          docker rm -f ci_sglang 2>/dev/null || true
+
   stage-b-test-1-gpu-small-amd-nondeterministic-rocm720:
     name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
     strategy:
