@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.layers.attention.dsa.indexer_capture import DsaGraphVariants
+from sglang.srt.layers.attention.dsa.graph_variants import DsaGraphVariants
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
