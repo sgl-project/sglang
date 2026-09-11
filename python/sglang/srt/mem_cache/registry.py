@@ -87,25 +87,19 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     server_args = ctx.server_args
     params = ctx.params
 
-    if get_memory().enable_unified_lmcache:
-        if get_memory().enable_lmcache:
-            raise ValueError(
-                "--enable-lmcache and --enable-unified-lmcache are mutually exclusive"
-            )
+    if get_memory().enable_lmcache:
         if ctx.enable_hierarchical_cache:
             raise ValueError(
-                "--enable-unified-lmcache and --enable-hierarchical-cache are "
+                "--enable-lmcache and --enable-hierarchical-cache are "
                 "mutually exclusive"
             )
         if ctx.server_args.enable_unified_cache_external_linker:
             raise ValueError(
-                "--enable-unified-lmcache and "
-                "--enable-unified-cache-external-linker are mutually exclusive"
+                "--enable-lmcache and --enable-unified-cache-external-linker "
+                "are mutually exclusive"
             )
         if ctx.disable_radix_cache:
-            raise ValueError(
-                "--enable-unified-lmcache requires radix cache to be enabled"
-            )
+            raise ValueError("--enable-lmcache requires radix cache to be enabled")
         if params.is_eagle:
             raise NotImplementedError(
                 "LMCacheUnifiedRadixCache does not yet support EAGLE bigram keys"
@@ -120,7 +114,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             )
         if get_parallel().dcp_size > 1:
             raise NotImplementedError(
-                "--enable-unified-lmcache with --dcp-size > 1 is not supported: "
+                "--enable-lmcache with --dcp-size > 1 is not supported: "
                 "LMCache has no DCP-aware index translation"
             )
         if ctx.server_args.enable_streaming_session:
@@ -164,8 +158,8 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
-    if get_memory().enable_unified_lmcache:
-        from sglang.srt.mem_cache.lmcache_unified_radix_cache import (
+    if get_memory().enable_lmcache:
+        from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
             LMCacheUnifiedRadixCache,
         )
         from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -199,19 +193,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
         return PureSWARadixCache(params=params)
-
-    if get_memory().enable_lmcache:
-        from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-            LMCRadixCache,
-        )
-
-        return LMCRadixCache(
-            params=params,
-            model_config=ctx.model_config,
-            tp_size=ctx.tp_size,
-            rank=ctx.tp_rank,
-            tp_group=ctx.tp_group,
-        )
 
     if get_memory().enable_flexkv:
         # Importing the package side-effect registers the explicit
