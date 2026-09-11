@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
@@ -49,9 +50,28 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-            "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-        )
+        if get_platform().is_npu:
+            # NPU: allow PP + EAGLE speculative decoding
+            assert cfg.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            if cfg.speculative_algorithm is not None:
+                assert (
+                    cfg.speculative_algorithm.upper() == "EAGLE"
+                    and not cfg.enable_multi_layer_eagle
+                ), (
+                    "Pipeline parallelism currently only supports EAGLE "
+                    "(non-multi-layer) speculative decoding"
+                )
+                assert cfg.disaggregation_mode == "prefill", (
+                    "NPU PP + speculative decoding (MTP) is only supported "
+                    "on prefill nodes (disaggregation-mode=prefill)"
+                )
+        else:
+            # Non-NPU: PP + speculative decoding is not supported
+            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
+                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
             "parallelism: allocatable slots per microbatch are bounded by "
@@ -417,6 +437,22 @@ def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+
+
+def validate_sampling_mask_max_tokens(server_args: Any):
+    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
+            "Unset it. To enable sampling masks for disaggregated serving, set "
+            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
+            "--sampling-mask-max-tokens value on both prefill and decode servers."
+        )
+    cfg = resolving_view(server_args)
+    if cfg.sampling_mask_max_tokens <= 0:
+        raise ValueError(
+            "--sampling-mask-max-tokens must be positive "
+            f"(got {cfg.sampling_mask_max_tokens})."
+        )
 
 
 def check_two_batch_overlap(server_args: Any):
