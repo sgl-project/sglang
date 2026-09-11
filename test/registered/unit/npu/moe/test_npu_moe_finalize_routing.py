@@ -215,9 +215,7 @@ class TestNPUMoETokenUnpermute(unittest.TestCase):
         )
 
         _, kwargs = mock_ops.npu.npu_moe_token_unpermute.call_args
-        self.assertTrue(torch.equal(
-            kwargs["sorted_indices"], expanded_row_idx.abs()
-        ))
+        self.assertTrue(torch.equal(kwargs["sorted_indices"], expanded_row_idx.abs()))
 
     @patch("torch.ops")
     def test_sorted_indices_all_positive(self, mock_ops):
@@ -285,9 +283,7 @@ class TestAllGatherFinalizeRoutingWrapperInit(unittest.TestCase):
 
 
 class TestAllGatherFinalizeRoutingWrapperApply(unittest.TestCase):
-    _GET_PARALLEL = (
-        "sglang.srt.hardware_backend.npu.moe.finalize_routing.get_parallel"
-    )
+    _GET_PARALLEL = "sglang.srt.hardware_backend.npu.moe.finalize_routing.get_parallel"
     _ALL_GATHER = (
         "sglang.srt.hardware_backend.npu.moe.finalize_routing."
         "tensor_model_parallel_all_gather"
@@ -386,9 +382,7 @@ class TestAllGatherFinalizeRoutingWrapperApply(unittest.TestCase):
         expanded_row_idx = torch.tensor([0, 1, 2, 3])
         topk_ids = torch.tensor([[0, 1], [0, 1], [0, 1], [0, 1]])
 
-        wrapper._finalize_routing(
-            hidden, topk_weights, expanded_row_idx, topk_ids
-        )
+        wrapper._finalize_routing(hidden, topk_weights, expanded_row_idx, topk_ids)
 
         inner._finalize_routing.assert_called_once_with(
             hidden, topk_weights, expanded_row_idx, topk_ids

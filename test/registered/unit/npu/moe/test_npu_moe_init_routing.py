@@ -114,10 +114,7 @@ class TestNPUMoEInitRoutingV1(unittest.TestCase):
         _, kwargs = mock_ops.npu.npu_moe_init_routing.call_args
         row_idx = kwargs["row_idx"]
         expected = (
-            torch.arange(0, 8, dtype=torch.int32)
-            .view(2, -1)
-            .permute(1, 0)
-            .contiguous()
+            torch.arange(0, 8, dtype=torch.int32).view(2, -1).permute(1, 0).contiguous()
         )
         self.assertTrue(torch.equal(row_idx, expected))
 

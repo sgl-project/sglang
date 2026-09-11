@@ -42,9 +42,7 @@ _MODULE = "sglang.srt.hardware_backend.npu.moe.matmul"
 
 def _make_layer(weight_shape=(4, 8, 16)):
     """Layer with a real weight tensor."""
-    return SimpleNamespace(
-        **{f"{_PREFIX}_weight": torch.randn(*weight_shape)}
-    )
+    return SimpleNamespace(**{f"{_PREFIX}_weight": torch.randn(*weight_shape)})
 
 
 # =============================================================================
@@ -84,9 +82,7 @@ class TestGroupedMatmul(unittest.TestCase):
     def test_weight_not_found_raises(self, mock_ops):
         layer = SimpleNamespace()  # no weight attr
         with self.assertRaises(AttributeError):
-            GroupedMatmul().forward(
-                **{**self._common_args(), "layer": layer}
-            )
+            GroupedMatmul().forward(**{**self._common_args(), "layer": layer})
 
     @patch("torch.ops")
     def test_x_passed_as_list(self, mock_ops):
@@ -114,9 +110,7 @@ class TestGroupedMatmul(unittest.TestCase):
         GroupedMatmul().forward(**args)
         kwargs = mock_ops.npu.npu_grouped_matmul.call_args.kwargs
         weight = getattr(args["layer"], f"{_PREFIX}_weight")
-        self.assertTrue(torch.equal(
-            kwargs["weight"][0], weight.transpose(1, 2)
-        ))
+        self.assertTrue(torch.equal(kwargs["weight"][0], weight.transpose(1, 2)))
 
     @patch("torch.ops")
     def test_fixed_kwargs(self, mock_ops):
@@ -216,9 +210,7 @@ class TestGroupedMatmulSwigluQuant(unittest.TestCase):
         GroupedMatmulSwigluQuant().forward(**args, transposed=False)
         kwargs = mock_ops.npu.npu_grouped_matmul_swiglu_quant_v2.call_args.kwargs
         weight = getattr(args["layer"], f"{_PREFIX}_weight")
-        self.assertTrue(torch.equal(
-            kwargs["weight"][0], weight.transpose(1, 2)
-        ))
+        self.assertTrue(torch.equal(kwargs["weight"][0], weight.transpose(1, 2)))
 
     @patch("torch.ops")
     def test_cumsum_when_group_list_type_1(self, mock_ops):
@@ -230,9 +222,7 @@ class TestGroupedMatmulSwigluQuant(unittest.TestCase):
         args = {**self._common_args(), "expert_tokens": expert_tokens}
         GroupedMatmulSwigluQuant().forward(**args, group_list_type=1)
         kwargs = mock_ops.npu.npu_grouped_matmul_swiglu_quant_v2.call_args.kwargs
-        self.assertTrue(torch.equal(
-            kwargs["group_list"], expert_tokens.cumsum(0)
-        ))
+        self.assertTrue(torch.equal(kwargs["group_list"], expert_tokens.cumsum(0)))
 
     @patch("torch.ops")
     def test_no_cumsum_when_group_list_type_not_1(self, mock_ops):
@@ -275,9 +265,7 @@ class TestGroupedMatmulSwigluQuant(unittest.TestCase):
         kwargs = mock_ops.npu.npu_grouped_matmul_swiglu_quant_v2.call_args.kwargs
         # default group_list_type=1 → cumsum applied
         expert_tokens = self._common_args()["expert_tokens"]
-        self.assertTrue(torch.equal(
-            kwargs["group_list"], expert_tokens.cumsum(0)
-        ))
+        self.assertTrue(torch.equal(kwargs["group_list"], expert_tokens.cumsum(0)))
 
 
 if __name__ == "__main__":

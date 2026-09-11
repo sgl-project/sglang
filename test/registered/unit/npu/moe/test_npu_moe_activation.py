@@ -23,7 +23,14 @@ if "triton" not in sys.modules:
         sys.modules["triton"] = _triton
         sys.modules.setdefault("triton.language", MagicMock())
         sys.modules.setdefault("triton.backends", MagicMock())
-for _mod in ("IPython", "IPython.display", "aiohttp", "zmq", "fcntl", "sglang.srt.layers.activation"):
+for _mod in (
+    "IPython",
+    "IPython.display",
+    "aiohttp",
+    "zmq",
+    "fcntl",
+    "sglang.srt.layers.activation",
+):
     if _mod not in sys.modules:
         try:
             __import__(_mod)
@@ -231,8 +238,14 @@ class TestNPUSwigluQuantWithScales(unittest.TestCase):
 
         _, kwargs = mock_ops.npu.npu_dequant_swiglu_quant.call_args
         self.assertIs(kwargs["x"], inputs["hidden_states"])
-        for key in ("weight_scale", "activation_scale", "group_index",
-                     "bias", "quant_scale", "quant_offset"):
+        for key in (
+            "weight_scale",
+            "activation_scale",
+            "group_index",
+            "bias",
+            "quant_scale",
+            "quant_offset",
+        ):
             self.assertIn(key, kwargs)
             self.assertIs(kwargs[key], inputs[key])
 
@@ -324,12 +337,8 @@ class TestNPUSwigluDeepEPKernelInit(unittest.TestCase):
 
 class TestNPUSwigluDeepEPKernelApply(unittest.TestCase):
     def _make_kernel(self, need_quant=True, alpha=None, limit=None):
-        act = NPUSwigluDeepEPKernel(
-            need_quant=need_quant, alpha=alpha, limit=limit
-        )
-        act._kernel = MagicMock(
-            return_value=(torch.randn(4, 8), torch.tensor(0.5))
-        )
+        act = NPUSwigluDeepEPKernel(need_quant=need_quant, alpha=alpha, limit=limit)
+        act._kernel = MagicMock(return_value=(torch.randn(4, 8), torch.tensor(0.5)))
         return act
 
     def test_non_oai_call_args(self):
@@ -366,43 +375,31 @@ class TestNPUSwigluDeepEPKernelApply(unittest.TestCase):
     def test_return_with_quant(self):
         """need_quant=True returns (hidden_states, per_token_scale)."""
         act = self._make_kernel(need_quant=True)
-        out, scale = act._apply_activation(
-            torch.randn(4, 16), torch.tensor([0, 2]), 0
-        )
+        out, scale = act._apply_activation(torch.randn(4, 16), torch.tensor([0, 2]), 0)
         self.assertIsNotNone(scale)
 
     def test_return_without_quant(self):
         """need_quant=False returns (hidden_states, None)."""
         act = self._make_kernel(need_quant=False)
-        out, scale = act._apply_activation(
-            torch.randn(4, 16), torch.tensor([0, 2]), 0
-        )
+        out, scale = act._apply_activation(torch.randn(4, 16), torch.tensor([0, 2]), 0)
         self.assertIsNone(scale)
 
     def test_oai_return_with_quant(self):
         act = self._make_kernel(need_quant=True, alpha=0.5, limit=7.0)
-        out, scale = act._apply_activation(
-            torch.randn(4, 16), torch.tensor([0, 2]), 0
-        )
+        out, scale = act._apply_activation(torch.randn(4, 16), torch.tensor([0, 2]), 0)
         self.assertIsNotNone(scale)
 
     def test_oai_return_without_quant(self):
         act = self._make_kernel(need_quant=False, alpha=1.0, limit=5.0)
-        out, scale = act._apply_activation(
-            torch.randn(4, 16), torch.tensor([0, 2]), 0
-        )
+        out, scale = act._apply_activation(torch.randn(4, 16), torch.tensor([0, 2]), 0)
         self.assertIsNone(scale)
 
     def test_kernel_output_returned(self):
         """The first element of the kernel tuple is returned as out."""
         expected_out = torch.randn(4, 8)
         act = NPUSwigluDeepEPKernel(need_quant=True)
-        act._kernel = MagicMock(
-            return_value=(expected_out, torch.tensor(0.5))
-        )
-        out, _ = act._apply_activation(
-            torch.randn(4, 16), torch.tensor([0, 2]), 0
-        )
+        act._kernel = MagicMock(return_value=(expected_out, torch.tensor(0.5)))
+        out, _ = act._apply_activation(torch.randn(4, 16), torch.tensor([0, 2]), 0)
         self.assertIs(out, expected_out)
 
 
@@ -443,12 +440,8 @@ class TestNPUSituInit(unittest.TestCase):
 
 class TestNPUSituApply(unittest.TestCase):
     def _make_act(self, need_quant=True, beta=4.0, linear_beta=25.0):
-        act = NPUSitu(
-            need_quant=need_quant, beta=beta, linear_beta=linear_beta
-        )
-        act.situ = MagicMock(
-            return_value=(torch.randn(4, 8), torch.tensor(0.5))
-        )
+        act = NPUSitu(need_quant=need_quant, beta=beta, linear_beta=linear_beta)
+        act.situ = MagicMock(return_value=(torch.randn(4, 8), torch.tensor(0.5)))
         return act
 
     def test_calls_situ(self):
@@ -476,9 +469,7 @@ class TestNPUSituApply(unittest.TestCase):
 
     def test_kwargs_forwarded(self):
         act = self._make_act(need_quant=True, beta=2.0, linear_beta=10.0)
-        act._apply_activation(
-            torch.randn(4, 16), torch.tensor([0, 2]), 0
-        )
+        act._apply_activation(torch.randn(4, 16), torch.tensor([0, 2]), 0)
 
         _, kwargs = act.situ.call_args
         self.assertEqual(kwargs["need_quant"], True)
@@ -487,9 +478,7 @@ class TestNPUSituApply(unittest.TestCase):
 
     def test_linear_beta_none_forwarded(self):
         act = self._make_act(need_quant=True, linear_beta=None)
-        act._apply_activation(
-            torch.randn(4, 16), torch.tensor([0, 2]), 0
-        )
+        act._apply_activation(torch.randn(4, 16), torch.tensor([0, 2]), 0)
 
         _, kwargs = act.situ.call_args
         self.assertIsNone(kwargs["linear_beta"])
@@ -498,9 +487,7 @@ class TestNPUSituApply(unittest.TestCase):
         expected = (torch.randn(4, 8), torch.tensor(0.5))
         act = NPUSitu(need_quant=True)
         act.situ = MagicMock(return_value=expected)
-        result = act._apply_activation(
-            torch.randn(4, 16), torch.tensor([0, 2]), 0
-        )
+        result = act._apply_activation(torch.randn(4, 16), torch.tensor([0, 2]), 0)
         self.assertIs(result, expected)
 
 
@@ -741,9 +728,7 @@ class TestAllGatherActivationWrapperInit(unittest.TestCase):
 
 
 class TestAllGatherActivationWrapperApply(unittest.TestCase):
-    _GET_PARALLEL = (
-        "sglang.srt.hardware_backend.npu.moe.activation.get_parallel"
-    )
+    _GET_PARALLEL = "sglang.srt.hardware_backend.npu.moe.activation.get_parallel"
     _ALL_GATHER = (
         "sglang.srt.hardware_backend.npu.moe.activation."
         "tensor_model_parallel_all_gather"
@@ -810,9 +795,7 @@ class TestAllGatherActivationWrapperApply(unittest.TestCase):
         hidden = torch.randn(4, 16)
         wrapper._apply_activation(hidden, extra="kwarg")
 
-        inner._apply_activation.assert_called_once_with(
-            hidden, extra="kwarg"
-        )
+        inner._apply_activation.assert_called_once_with(hidden, extra="kwarg")
 
     @patch(_ALL_GATHER)
     @patch(_GET_PARALLEL)
@@ -926,9 +909,7 @@ class TestGetSwigluVariant(unittest.TestCase):
 
     def test_swiglustep_and_mul_extra_kwargs_ignored(self):
         """Extra kwargs other than clamp_limit are silently ignored."""
-        act = get_swiglu_variant(
-            "swiglustep_and_mul", clamp_limit=5.0, extra="ignored"
-        )
+        act = get_swiglu_variant("swiglustep_and_mul", clamp_limit=5.0, extra="ignored")
         self.assertEqual(act._clamp_limit, 5.0)
 
 

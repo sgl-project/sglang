@@ -126,9 +126,15 @@ class TestFusedTopkNpuBranches(unittest.TestCase):
     @patch(f"{_MODULE}.capture_routed_experts_if_allowed")
     @patch(f"{_MODULE}.get_global_expert_distribution_recorder")
     @patch("torch.ops")
-    def test_sqrtsoftplus_branch(self, mock_ops, mock_recorder, mock_capture, mock_output):
+    def test_sqrtsoftplus_branch(
+        self, mock_ops, mock_recorder, mock_capture, mock_output
+    ):
         mock_ops.custom.npu_moe_gating_top_k.return_value = _op_return()
-        config = _make_config(scoring_func="sqrtsoftplus", apply_routed_scaling_factor_on_output=True, routed_scaling_factor=2.0)
+        config = _make_config(
+            scoring_func="sqrtsoftplus",
+            apply_routed_scaling_factor_on_output=True,
+            routed_scaling_factor=2.0,
+        )
         fused_topk_npu(torch.randn(4, 8), torch.randn(4, 6), config)
         mock_ops.custom.npu_moe_gating_top_k.assert_called_once()
 
@@ -143,7 +149,10 @@ class TestFusedTopkNpuBranches(unittest.TestCase):
         mock_ops.npu.npu_moe_gating_top_k_softmax.return_value = _op_return()
         mock_l1.side_effect = lambda x: x
         config = _make_config(
-            scoring_func="softmax", use_grouped_topk=False, correction_bias=None, renormalize=True
+            scoring_func="softmax",
+            use_grouped_topk=False,
+            correction_bias=None,
+            renormalize=True,
         )
         fused_topk_npu(torch.randn(4, 8), torch.randn(4, 6), config)
         mock_l1.assert_called_once()
@@ -158,7 +167,10 @@ class TestFusedTopkNpuBranches(unittest.TestCase):
     ):
         mock_ops.npu.npu_moe_gating_top_k_softmax.return_value = _op_return()
         config = _make_config(
-            scoring_func="softmax", use_grouped_topk=False, correction_bias=None, renormalize=False
+            scoring_func="softmax",
+            use_grouped_topk=False,
+            correction_bias=None,
+            renormalize=False,
         )
         fused_topk_npu(torch.randn(4, 8), torch.randn(4, 6), config)
         mock_l1.assert_not_called()
@@ -174,8 +186,11 @@ class TestFusedTopkNpuBranches(unittest.TestCase):
         mock_ops.npu.npu_moe_gating_top_k_softmax.return_value = _op_return()
         mock_l1.side_effect = lambda x: x
         config = _make_config(
-            scoring_func="softmax", use_grouped_topk=False, correction_bias=None,
-            renormalize=True, num_fused_shared_experts=1,
+            scoring_func="softmax",
+            use_grouped_topk=False,
+            correction_bias=None,
+            renormalize=True,
+            num_fused_shared_experts=1,
         )
         weights = _op_return()[0]
         fused_topk_npu(torch.randn(4, 8), torch.randn(4, 6), config)
@@ -213,8 +228,10 @@ class TestFusedTopkNpuBranches(unittest.TestCase):
     def test_fallback_branch_calls_select_experts(self, mock_select):
         mock_select.return_value = MagicMock()
         config = _make_config(
-            use_grouped_topk=True, correction_bias=None,
-            scoring_func="softmax", renormalize=False,
+            use_grouped_topk=True,
+            correction_bias=None,
+            scoring_func="softmax",
+            renormalize=False,
         )
         hidden = torch.randn(4, 8)
         logits = torch.randn(4, 6)
@@ -239,7 +256,9 @@ class TestFusedTopkNpuPostProcessing(unittest.TestCase):
         dispatch_info = MagicMock()
         config = _make_config(scoring_func="softmax")
         fused_topk_npu(
-            torch.randn(4, 8), torch.randn(4, 6), config,
+            torch.randn(4, 8),
+            torch.randn(4, 6),
+            config,
             expert_location_dispatch_info=dispatch_info,
         )
         mock_l2p.assert_called_once()
@@ -261,9 +280,7 @@ class TestFusedTopkNpuPostProcessing(unittest.TestCase):
     @patch(f"{_MODULE}.capture_routed_experts_if_allowed")
     @patch(f"{_MODULE}.get_global_expert_distribution_recorder")
     @patch("torch.ops")
-    def test_recorder_called(
-        self, mock_ops, mock_recorder, mock_capture, mock_output
-    ):
+    def test_recorder_called(self, mock_ops, mock_recorder, mock_capture, mock_output):
         mock_ops.npu.npu_moe_gating_top_k_softmax.return_value = _op_return()
         recorder_mock = MagicMock()
         mock_recorder.return_value = recorder_mock
@@ -275,15 +292,11 @@ class TestFusedTopkNpuPostProcessing(unittest.TestCase):
     @patch(f"{_MODULE}.capture_routed_experts_if_allowed")
     @patch(f"{_MODULE}.get_global_expert_distribution_recorder")
     @patch("torch.ops")
-    def test_capture_called(
-        self, mock_ops, mock_recorder, mock_capture, mock_output
-    ):
+    def test_capture_called(self, mock_ops, mock_recorder, mock_capture, mock_output):
         mock_ops.npu.npu_moe_gating_top_k_softmax.return_value = _op_return()
         config = _make_config(scoring_func="softmax")
         layer_id = 5
-        fused_topk_npu(
-            torch.randn(4, 8), torch.randn(4, 6), config, layer_id=layer_id
-        )
+        fused_topk_npu(torch.randn(4, 8), torch.randn(4, 6), config, layer_id=layer_id)
         mock_capture.assert_called_once()
         call_args = mock_capture.call_args.args
         self.assertEqual(call_args[1], layer_id)

@@ -90,9 +90,7 @@ class TestHiddenStatesDynamicQuantInit(unittest.TestCase):
 class TestHiddenStatesDynamicQuantCall(unittest.TestCase):
     def _make_quant(self, dtype=torch.int8):
         quant = HiddenStatesDynamicQuant(dtype)
-        quant._op = MagicMock(
-            return_value=(torch.randn(4, 8), torch.tensor(0.5))
-        )
+        quant._op = MagicMock(return_value=(torch.randn(4, 8), torch.tensor(0.5)))
         return quant
 
     @patch("torch.ops")
@@ -114,9 +112,7 @@ class TestHiddenStatesDynamicQuantCall(unittest.TestCase):
         expected_q = torch.randn(4, 8)
         expected_s = torch.tensor(0.5)
         quant = self._make_quant()
-        quant._op = MagicMock(
-            return_value=(expected_q, expected_s)
-        )
+        quant._op = MagicMock(return_value=(expected_q, expected_s))
         out, scale = quant(torch.randn(4, 8))
         self.assertIs(out, expected_q)
         self.assertIs(scale, expected_s)
@@ -181,9 +177,7 @@ class TestHiddenStatesStaticQuant(unittest.TestCase):
     @patch("torch.ops")
     def test_missing_offset_raises(self, mock_ops):
         quant = HiddenStatesStaticQuant(torch.int8)
-        layer = SimpleNamespace(
-            aclnn_input_scale_reciprocal=torch.tensor(0.1)
-        )
+        layer = SimpleNamespace(aclnn_input_scale_reciprocal=torch.tensor(0.1))
         with self.assertRaises(AttributeError):
             quant(torch.randn(4, 8), layer)
 

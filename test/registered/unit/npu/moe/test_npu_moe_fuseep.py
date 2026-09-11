@@ -110,9 +110,7 @@ class TestReshapeW13Weight(unittest.TestCase):
         out = _reshape_w13_weight(w, dim=1, chunk_size=2)
 
         # reshape(4, 2, 2, 2).transpose(1, 2).contiguous().view(4, 8)
-        expected = (
-            w.view(4, 2, 2, 2).transpose(1, 2).contiguous().view(4, 8)
-        )
+        expected = w.view(4, 2, 2, 2).transpose(1, 2).contiguous().view(4, 8)
         self.assertTrue(torch.equal(out, expected))
 
     def test_not_divisible_raises(self):
@@ -188,9 +186,9 @@ class TestScaleFromFloatToInt64(unittest.TestCase):
         # Reinterpret float32 bytes as int32, cast to int64
         import numpy as np
 
-        expected = np.frombuffer(
-            scale.numpy().tobytes(), dtype=np.int32
-        ).astype(np.int64)
+        expected = np.frombuffer(scale.numpy().tobytes(), dtype=np.int32).astype(
+            np.int64
+        )
         self.assertTrue(torch.equal(out, torch.from_numpy(expected)))
 
 
@@ -229,9 +227,7 @@ class TestGetFuseepBuffer(unittest.TestCase):
         self, mock_buf, mock_ep_group, mock_mode, mock_envs
     ):
         mock_envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get.return_value = 128
-        mock_ep_group.return_value = SimpleNamespace(
-            device_group="device_group_obj"
-        )
+        mock_ep_group.return_value = SimpleNamespace(device_group="device_group_obj")
         layer = SimpleNamespace(hidden_size=256, num_experts=8)
         _get_fuseep_buffer(layer)
 
@@ -247,9 +243,7 @@ class TestGetFuseepBuffer(unittest.TestCase):
     @patch(f"{_MODULE}.DeepEPMode")
     @patch(f"{_MODULE}.get_moe_ep_group")
     @patch(f"{_MODULE}.DeepEPBuffer")
-    def test_returns_buffer(
-        self, mock_buf, mock_ep_group, mock_mode, mock_envs
-    ):
+    def test_returns_buffer(self, mock_buf, mock_ep_group, mock_mode, mock_envs):
         expected = MagicMock(name="buffer")
         mock_buf.get_deepep_buffer.return_value = expected
         layer = SimpleNamespace(hidden_size=128, num_experts=4)
@@ -281,13 +275,9 @@ class TestForwardFuseep(unittest.TestCase):
     @patch(f"{_MODULE}.get_exec")
     @patch(f"{_MODULE}.envs")
     @patch(f"{_MODULE}._get_fuseep_buffer")
-    def test_calls_fused_deep_moe(
-        self, mock_get_buf, mock_envs, mock_get_exec
-    ):
+    def test_calls_fused_deep_moe(self, mock_get_buf, mock_envs, mock_get_exec):
         mock_envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get.return_value = 128
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         buf = MagicMock()
         buf.fused_deep_moe.return_value = (torch.randn(2, 128), None)
         mock_get_buf.return_value = buf
@@ -301,13 +291,9 @@ class TestForwardFuseep(unittest.TestCase):
     @patch(f"{_MODULE}.get_exec")
     @patch(f"{_MODULE}.envs")
     @patch(f"{_MODULE}._get_fuseep_buffer")
-    def test_fused_deep_moe_kwargs(
-        self, mock_get_buf, mock_envs, mock_get_exec
-    ):
+    def test_fused_deep_moe_kwargs(self, mock_get_buf, mock_envs, mock_get_exec):
         mock_envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get.return_value = 128
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         buf = MagicMock()
         buf.fused_deep_moe.return_value = (torch.randn(2, 128), None)
         mock_get_buf.return_value = buf
@@ -332,13 +318,9 @@ class TestForwardFuseep(unittest.TestCase):
     @patch(f"{_MODULE}.get_exec")
     @patch(f"{_MODULE}.envs")
     @patch(f"{_MODULE}._get_fuseep_buffer")
-    def test_returns_first_element(
-        self, mock_get_buf, mock_envs, mock_get_exec
-    ):
+    def test_returns_first_element(self, mock_get_buf, mock_envs, mock_get_exec):
         mock_envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get.return_value = 128
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         expected = torch.randn(2, 128)
         buf = MagicMock()
         buf.fused_deep_moe.return_value = (expected, "discarded")
@@ -357,34 +339,22 @@ def _make_real_layer(prefix="w13", with_offset=False):
     layer = SimpleNamespace()
     if prefix == "w13":
         layer.w13_weight = torch.nn.Parameter(torch.randn(4, 128, 8))
-        layer.w13_weight_scale = torch.nn.Parameter(
-            torch.randn(4, 128, 1)
-        )
+        layer.w13_weight_scale = torch.nn.Parameter(torch.randn(4, 128, 1))
         if with_offset:
-            layer.w13_weight_offset = torch.nn.Parameter(
-                torch.randn(4, 128, 1)
-            )
+            layer.w13_weight_offset = torch.nn.Parameter(torch.randn(4, 128, 1))
     else:
         layer.w2_weight = torch.nn.Parameter(torch.randn(4, 8, 128))
-        layer.w2_weight_scale = torch.nn.Parameter(
-            torch.randn(4, 128, 1)
-        )
+        layer.w2_weight_scale = torch.nn.Parameter(torch.randn(4, 128, 1))
         if with_offset:
-            layer.w2_weight_offset = torch.nn.Parameter(
-                torch.randn(4, 128, 1)
-            )
+            layer.w2_weight_offset = torch.nn.Parameter(torch.randn(4, 128, 1))
     return layer
 
 
 class TestProcessFuseepWeightsMode1(unittest.TestCase):
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
-    def test_w13_calls_npu_format_cast(
-        self, mock_get_exec, mock_cast
-    ):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+    def test_w13_calls_npu_format_cast(self, mock_get_exec, mock_cast):
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w13")
         process_fuseep_weights(layer, "w13")
@@ -392,12 +362,8 @@ class TestProcessFuseepWeightsMode1(unittest.TestCase):
 
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
-    def test_w13_scale_becomes_float32_parameter(
-        self, mock_get_exec, mock_cast
-    ):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+    def test_w13_scale_becomes_float32_parameter(self, mock_get_exec, mock_cast):
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w13")
         process_fuseep_weights(layer, "w13")
@@ -407,9 +373,7 @@ class TestProcessFuseepWeightsMode1(unittest.TestCase):
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
     def test_w13_weight_data_set(self, mock_get_exec, mock_cast):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w13")
         process_fuseep_weights(layer, "w13")
@@ -418,9 +382,7 @@ class TestProcessFuseepWeightsMode1(unittest.TestCase):
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
     def test_w2_calls_npu_format_cast(self, mock_get_exec, mock_cast):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w2")
         process_fuseep_weights(layer, "w2")
@@ -428,12 +390,8 @@ class TestProcessFuseepWeightsMode1(unittest.TestCase):
 
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
-    def test_w2_scale_becomes_float32_parameter(
-        self, mock_get_exec, mock_cast
-    ):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+    def test_w2_scale_becomes_float32_parameter(self, mock_get_exec, mock_cast):
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w2")
         process_fuseep_weights(layer, "w2")
@@ -446,9 +404,7 @@ class TestProcessFuseepWeightsMode2(unittest.TestCase):
     @patch(f"{_MODULE}.get_exec")
     def test_w13_weight_transposed(self, mock_get_exec, mock_cast):
         """_release_weight_cache transposes dims 1 and 2."""
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=2)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=2))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w13")  # shape (4, 128, 8)
         process_fuseep_weights(layer, "w13")
@@ -459,9 +415,7 @@ class TestProcessFuseepWeightsMode2(unittest.TestCase):
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
     def test_w13_scale_becomes_int64(self, mock_get_exec, mock_cast):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=2)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=2))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w13")
         process_fuseep_weights(layer, "w13")
@@ -471,9 +425,7 @@ class TestProcessFuseepWeightsMode2(unittest.TestCase):
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
     def test_w2_weight_transposed(self, mock_get_exec, mock_cast):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=2)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=2))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w2")  # shape (4, 8, 128)
         process_fuseep_weights(layer, "w2")
@@ -484,9 +436,7 @@ class TestProcessFuseepWeightsMode2(unittest.TestCase):
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
     def test_w2_scale_becomes_int64(self, mock_get_exec, mock_cast):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=2)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=2))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w2")
         process_fuseep_weights(layer, "w2")
@@ -498,9 +448,7 @@ class TestProcessFuseepWeightsOffset(unittest.TestCase):
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
     def test_offset_squeezed_when_present(self, mock_get_exec, mock_cast):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w13", with_offset=True)
         process_fuseep_weights(layer, "w13")
@@ -512,9 +460,7 @@ class TestProcessFuseepWeightsOffset(unittest.TestCase):
     @patch(f"{_MODULE}.npu_format_cast")
     @patch(f"{_MODULE}.get_exec")
     def test_no_offset_attr_skips(self, mock_get_exec, mock_cast):
-        mock_get_exec.return_value = SimpleNamespace(
-            moe=SimpleNamespace(fuseep_mode=1)
-        )
+        mock_get_exec.return_value = SimpleNamespace(moe=SimpleNamespace(fuseep_mode=1))
         mock_cast.side_effect = lambda x: x
         layer = _make_real_layer("w13", with_offset=False)
         process_fuseep_weights(layer, "w13")
