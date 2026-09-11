@@ -1217,13 +1217,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         cache.take_events()  # Clear reset / init events.
 
         tokens = [1, 2, 7, 8]
-        hash_values = []
-        running_hash = None
-        for start in range(0, len(tokens), cache.page_size):
-            running_hash = get_hash_str(
-                array("q", tokens[start : start + cache.page_size]), running_hash
-            )
-            hash_values.append(running_hash)
+        hash_values = get_hash_str(array("q", tokens), None, page_size=cache.page_size)
         result = cache.tree_core.insert_host(
             cache.root_node_handle(),
             RadixKey(array("q", tokens)),
