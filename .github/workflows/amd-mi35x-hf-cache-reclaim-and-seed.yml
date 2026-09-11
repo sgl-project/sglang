@@ -1,0 +1,131 @@
+name: AMD MI35x HF cache reclaim and seed
+
+# Frees space on the MI35x HuggingFace cache PVC and downloads a large
+# checkpoint into it, in that order, in one job. See the rationale in
+# scripts/ci/amd/reclaim_and_seed_hf_cache.sh: on this volume the two halves
+# cannot be separate jobs, because the fleet absorbs anything released before
+# the job that needs it gets a runner.
+#
+# What it reclaims and what it seeds are set by RECLAIM_DIRS and SEED_MODEL
+# below, so reusing this means editing them and dispatching from the branch
+# carrying that edit. RECLAIM_DIRS empty is an audit: the job reports the cache
+# and uploads a listing, and deletes nothing. Run it that way first -- the
+# allowlist should come from what is on the volume, not from memory of it.
+#
+# Dispatch-only: reclaiming and seeding is not a per-PR activity, and this takes
+# a scarce MI35x runner for as long as the download lasts.
+#
+# It ran on pull_request while it was being brought up, because a workflow file
+# that is not yet on the default branch cannot be dispatched at all, and the
+# cache was blocking the very PR that added it. That is worth knowing before
+# reaching for the same trick: a `paths` filter does not limit a pull_request
+# trigger to pushes that touch those paths. The filter matches the whole PR
+# diff, so once the PR contains this file every subsequent push re-runs the job,
+# whatever it changed. Runs 34548293873 (audit), 34549258956 and 34549982464
+# (reclaim and seed) were the useful ones; the rest were pushes to unrelated
+# files.
+#
+# The values below are left as the record of what that seeding did. Reusing this
+# means editing them and dispatching from the branch carrying that edit.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  # Never cancel in flight: a cancelled seed leaves a partial checkpoint behind,
+  # which is the state this job exists to get out of.
+  group: amd-mi35x-hf-cache-reclaim-and-seed
+  cancel-in-progress: false
+
+jobs:
+  reclaim-and-seed:
+    if: github.repository == 'sgl-project/sglang'
+    name: reclaim-and-seed (mi35x)
+    # The 1-GPU and 8-GPU MI35x pools mount the same cache PVC, so the cheap
+    # pool can seed for the expensive one.
+    runs-on: linux-mi35x-gpu-1
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      # The weights are owned by root because the CI container downloads them,
+      # so the unprivileged runner user can neither unlink nor replace them.
+      # Both halves have to happen inside the container that mounts the PVC.
+      - name: Setup docker
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      # So the seed runs the checkout's downloader rather than the image's, and
+      # therefore the same code the consumer job will use to decide the
+      # checkpoint is already cached.
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+
+      # Run 34548293873 audited the volume: 15 TB, 775 MB free, 50 checkpoints.
+      # amd/GLM-5.2-MXFP4 sits there half-downloaded at 212 GiB of 408 GiB, so
+      # 196 GiB has to be fetched and the partial is worth keeping -- HF resumes
+      # against the blobs already present.
+      #
+      # The two entries below are what that audit plus the reachability join in
+      # #36114 found dead on the MI35x cache, and they are dead for reasons that
+      # do not depend on the join being complete:
+      #
+      #   amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 (216 GiB) appears nowhere in
+      #     the tree -- no test, no doc, no config, and nothing in git history.
+      #   deepseek-ai/DeepSeek-V4-Flash-0731 (156 GiB) is named only by
+      #     test_deepseek_v4_flash_fp4_b200.py and its megamoe variant, both
+      #     register_cuda_ci on 4-gpu-b200, so no AMD job can want it.
+      #
+      # 372 GiB against 196 GiB needed. The margin is deliberate: the fleet eats
+      # into anything released while the download runs.
+      #
+      # /sgl-data/agentic-traces is 172 MB that nothing in this repo creates or
+      # reads, so something staged it out of band. The GLM-5.2 agentic benchmark
+      # synthesizes its corpus for want of a real one and takes a real one from
+      # SGLANG_AGENTIC_TRACE_PATH, so it is worth knowing what is in there.
+      #
+      # Not on the list, though the join reports them unreferenced:
+      # amd/Qwen3.5-397B-A17B-MXFP4, because the MI35x Qwen3.5 nightly does load
+      # that checkpoint and only reads as unreferenced because it names a local
+      # /data path rather than the repo id; and zai-org/GLM-5.3-Flash, which has
+      # no test but is new enough that someone is plausibly mid-bring-up on it.
+      - name: Reclaim and seed
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e RECLAIM_DIRS="models--amd--Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 models--deepseek-ai--DeepSeek-V4-Flash-0731" \
+            -e SEED_MODEL="amd/GLM-5.2-MXFP4" \
+            -e SEED_MIN_GIB="408" \
+            -e AUDIT_DIRS="/sgl-data/agentic-traces" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            bash scripts/ci/amd/reclaim_and_seed_hf_cache.sh || EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${EXIT_CODE:-0}
+
+      # The reachability join that says which of these checkpoints any AMD suite
+      # still names runs off-runner, against this listing.
+      - name: Upload cache listing
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi35x-hf-cache-listing
+          path: |
+            hf-cache-sizes.txt
+            hf-cache-listing.txt
+          if-no-files-found: warn
+          retention-days: 7
