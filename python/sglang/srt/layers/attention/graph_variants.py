@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ class AttentionGraphVariants(Protocol):
     capture_labels: tuple[str, ...]
 
     def select(self, forward_batch: ForwardBatch) -> str:
-        """Select one of capture_labels from host-side batch metadata."""
+        """Select one of capture_labels for the batch."""
         ...
 
 
@@ -48,9 +48,7 @@ class DsaGraphVariants:
         return "dense" if max_kv_len <= self.index_topk else "sparse"
 
 
-def create_attention_graph_variants(
-    hf_config, forward_mode: ForwardMode
-) -> Optional[AttentionGraphVariants]:
+def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
     from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
     from sglang.srt.utils import is_hip
 

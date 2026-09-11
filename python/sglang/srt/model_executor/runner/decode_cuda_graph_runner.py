@@ -302,9 +302,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
-            create_attention_graph_variants(
-                model_runner.model_config.hf_config, self.capture_forward_mode
-            )
+            create_attention_graph_variants(model_runner.model_config.hf_config)
         )
 
         # --- bucket sizes ---------------------------------------------

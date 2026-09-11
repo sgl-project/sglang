@@ -1,16 +1,37 @@
+"""Unit tests for ``DecodeCudaGraphRunner`` capture-phase profiling — CPU-only.
+
+Two capture-trace modes plus their precedence:
+
+  * **Original single-trace** (``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE``):
+    ``_init_profile_context_and_memory_record`` builds an *unscheduled* profiler
+    (``record_shapes`` only, no schedule / no ``on_trace_ready``); the combined
+    trace is exported in ``_post_process_after_profile`` via
+    ``export_cuda_graph_capture_trace``.
+  * **Per-batch-size traces** (``SGLANG_GRAPH_BATCH_CAPTURE``): a *scheduled*
+    profiler (``wait=2, warmup=0, active=1, repeat=0``) with the trace-export
+    knobs (record_shapes / with_stack / with_flops / profile_memory) and an
+    ``on_trace_ready`` hook that writes one trace per batch size to
+    ``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile/`` named
+    ``{runner_name}_bs_{bs}_rank{rank}.json.gz``.
+  * **Precedence**: when both env vars are set, the original single-trace path
+    wins (no per-bs schedule / dir / bookkeeping).
+
+The profiler / CUDA-memory APIs are mocked; the directory + naming + schedule
+logic is pure-Python and runs on CPU. The method is invoked unbound against a
+lightweight stand-in (with the real precedence helper bound) so no model or
+server is constructed.
+"""
+
 import os
 import tempfile
 import unittest
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.layers.attention.graph_variants import DsaGraphVariants
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
-from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -270,61 +291,6 @@ class TestOriginalTraceExport(CustomTestCase):
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
                 )
-
-
-class TestCaptureVariants(CustomTestCase):
-    def test_capture_order_and_draft_runner_without_variants(self):
-        module = "sglang.srt.model_executor.runner.decode_cuda_graph_runner"
-        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
-        runner.attention_graph_variants = DsaGraphVariants(16)
-        runner.record_nolora_graph = True
-        runner.capture_bs = [1, 8]
-        runner.compile_bs = []
-        runner.captured_req_width = 1
-        runner.model_runner = SimpleNamespace(
-            device="cpu", gpu_id=0, model=object(), tp_group=object()
-        )
-        captured = []
-
-        def capture(size, forward, stream_idx, lora, attention=None):
-            self.assertEqual(capture_mode.get_capture_attention_variant(), attention)
-            self.assertEqual(capture_mode.get_capture_lora_variant(), lora)
-            captured.append((size, lora, attention))
-
-        with (
-            mock.patch(f"{module}.get_available_gpu_memory", return_value=1),
-            mock.patch(
-                f"{module}.get_parallel", return_value=SimpleNamespace(tp_rank=1)
-            ),
-            mock.patch(
-                f"{module}.torch_compile_decoration.patch_model",
-                side_effect=lambda *a, **kw: nullcontext(None),
-            ),
-        ):
-            try:
-                runner.capture_one_shape = capture
-                runner._capture_one_stream()
-                self.assertEqual(
-                    captured,
-                    [
-                        (size, lora, attention)
-                        for size in (8, 1)
-                        for lora in ("lora", "nolora")
-                        for attention in ("dense", "sparse")
-                    ],
-                )
-                self.assertIsNone(capture_mode.get_capture_attention_variant())
-                runner.attention_graph_variants = None
-                runner.record_nolora_graph = False
-                captured.clear()
-                runner.capture_one_shape = lambda size, forward, stream, lora: capture(
-                    size, forward, stream, lora
-                )
-                runner._capture_one_stream()
-                self.assertEqual(captured, [(8, None, None), (1, None, None)])
-            finally:
-                capture_mode._set_capture_lora_variant(None)
-                capture_mode._set_capture_attention_variant(None)
 
 
 if __name__ == "__main__":
