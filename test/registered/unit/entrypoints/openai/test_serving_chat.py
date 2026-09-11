@@ -1,3 +1,15 @@
+from utils import input_processor, prepared_chat, sync_serving
+
+from sglang.srt.entrypoints.chat_input.config import (
+    get_inkling_default_reasoning_effort,
+)
+from sglang.srt.entrypoints.chat_input.renderers import (
+    ChatRenderer,
+    normalize_tool_content,
+)
+from sglang.srt.entrypoints.chat_input.types import RenderedPrompt, TokenPrompt
+from sglang.srt.entrypoints.openai.chat_input_adapter import from_chat_request
+
 """
 Unit-tests for OpenAIServingChat -- rewritten to use only the std-lib 'unittest'.
 Run with either:
@@ -28,13 +40,11 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
-    MessageProcessingResult,
     ToolChoice,
     ToolChoiceFuncName,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
-    normalize_tool_content,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
@@ -292,7 +302,9 @@ class ServingChatTestCase(unittest.TestCase):
             ["call-a", "call-b"], ["call-b", "call-a"]
         ) + self._tool_round(["call-c", "call-d"], ["call-d", "call-c"], "video_url")
 
-        canonical = self.chat._canonicalize_tool_message_order(messages)
+        canonical = input_processor(
+            self.chat
+        ).renderer._canonicalize_tool_message_order(messages)
 
         self.assertEqual(
             [
@@ -312,7 +324,9 @@ class ServingChatTestCase(unittest.TestCase):
         for name, (call_ids, result_ids) in cases.items():
             with self.subTest(name=name):
                 messages = self._tool_round(call_ids, result_ids)
-                canonical = self.chat._canonicalize_tool_message_order(messages)
+                canonical = input_processor(
+                    self.chat
+                ).renderer._canonicalize_tool_message_order(messages)
                 self.assertEqual(canonical, messages)
 
     def test_canonicalize_tool_message_order_keeps_text_only_runs(self):
@@ -320,7 +334,9 @@ class ServingChatTestCase(unittest.TestCase):
         for message in messages[1:]:
             message["content"] = [{"type": "text", "text": "done"}]
 
-        canonical = self.chat._canonicalize_tool_message_order(messages)
+        canonical = input_processor(
+            self.chat
+        ).renderer._canonicalize_tool_message_order(messages)
 
         self.assertEqual(canonical, messages)
 
@@ -367,7 +383,9 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+        result = input_processor(self.chat).renderer._apply_jinja_template(
+            request, None, is_multimodal=True
+        )
 
         self.assertEqual(
             [item.url for item in result.image_data], ["image-a", "image-b"]
@@ -385,14 +403,18 @@ class ServingChatTestCase(unittest.TestCase):
             messages=request.messages[:2] + request.messages[2:][::-1],
         )
         self.tm.tokenizer.apply_chat_template.reset_mock()
-        self.chat._apply_jinja_template(ordered_request, None, is_multimodal=True)
+        input_processor(self.chat).renderer._apply_jinja_template(
+            ordered_request, None, is_multimodal=True
+        )
         self.assertEqual(
             rendered_messages, self.tm.tokenizer.apply_chat_template.call_args[0][0]
         )
 
         self.template_manager.jinja_template_may_reorder_tool_results = False
         self.tm.tokenizer.apply_chat_template.reset_mock()
-        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+        result = input_processor(self.chat).renderer._apply_jinja_template(
+            request, None, is_multimodal=True
+        )
         self.assertEqual(
             [item.url for item in result.image_data], ["image-b", "image-a"]
         )
@@ -494,9 +516,9 @@ class ServingChatTestCase(unittest.TestCase):
     def test_convert_to_internal_request_single(self):
         with (
             patch(
-                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+                "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
             ) as conv_mock,
-            patch.object(self.chat, "_process_messages") as proc_mock,
+            patch.object(input_processor(self.chat), "prepare") as proc_mock,
         ):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
@@ -505,19 +527,20 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.stop_str = ["</s>"]
             conv_mock.return_value = conv_ins
 
-            proc_mock.return_value = MessageProcessingResult(
-                "Test prompt",
+            proc_mock.return_value = prepared_chat(
                 [1, 2, 3],
-                None,
-                None,
-                [],
-                ["</s>"],
-                None,
+                image_data=None,
+                audio_data=None,
+                video_data=[],
+                modalities=["</s>"],
+                stop=None,
             )
 
             self.basic_req.return_sampling_mask = True
             self.basic_req.return_meta_info = True
-            adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
+            adapted, processed = sync_serving(self.chat)._convert_to_internal_request(
+                self.basic_req
+            )
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertTrue(adapted.return_sampling_mask)
@@ -545,13 +568,18 @@ class ServingChatTestCase(unittest.TestCase):
         }
         body = request.model_dump()
 
-        processed_messages = MessageProcessingResult(
-            "Test prompt", [1, 2, 3], None, None, [], [], None
+        processed_messages = prepared_chat(
+            [1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=[],
+            modalities=[],
+            stop=None,
         )
         with (
             envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.override(True),
             patch.object(
-                self.chat, "_process_messages", return_value=processed_messages
+                input_processor(self.chat), "prepare", return_value=processed_messages
             ),
         ):
             response = get_or_create_event_loop().run_until_complete(
@@ -580,7 +608,9 @@ class ServingChatTestCase(unittest.TestCase):
                 **{field: True},
             )
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
-                self.chat._convert_to_internal_request(req, self.fastapi_request)
+                sync_serving(self.chat)._convert_to_internal_request(
+                    req, self.fastapi_request
+                )
 
     def test_validate_request_rejects_sampling_mask_without_meta_info(self):
         req = ChatCompletionRequest(
@@ -605,7 +635,9 @@ class ServingChatTestCase(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "return_meta_info is not supported with streaming"
         ):
-            self.chat._convert_to_internal_request(req, self.fastapi_request)
+            sync_serving(self.chat)._convert_to_internal_request(
+                req, self.fastapi_request
+            )
 
     def test_convert_to_internal_request_input_ids_bypasses_template(self):
         self.tm.tokenizer = None
@@ -620,9 +652,9 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
-            adapted, processed = self.chat._convert_to_internal_request(
+            adapted, processed = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -684,23 +716,22 @@ class ServingChatTestCase(unittest.TestCase):
             tool_choice="required",
         )
 
-        with patch.object(self.chat, "_process_messages") as proc_mock:
-            proc_mock.return_value = MessageProcessingResult(
-                "",
+        with patch.object(input_processor(self.chat), "prepare") as proc_mock:
+            proc_mock.return_value = prepared_chat(
                 [1, 2, 3],
-                None,
-                None,
-                [],
-                [],
-                None,
+                image_data=None,
+                audio_data=None,
+                video_data=[],
+                modalities=[],
+                stop=None,
                 require_reasoning=True,
             )
 
-            adapted, _ = self.chat._convert_to_internal_request(req)
+            adapted, _ = sync_serving(self.chat)._convert_to_internal_request(req)
 
         self.assertTrue(adapted.require_reasoning)
 
-    def test_process_messages_records_template_reasoning_state(self):
+    def testprepare_records_template_reasoning_state(self):
         self.chat.default_chat_template_kwargs = {"thinking": True}
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=False
@@ -710,20 +741,16 @@ class ServingChatTestCase(unittest.TestCase):
             model="x",
             messages=[{"role": "user", "content": "What is 2+2?"}],
         )
-        rendered = MessageProcessingResult(
-            prompt="prompt",
-            prompt_ids=[1, 2, 3],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        )
+        rendered = RenderedPrompt(prompt=TokenPrompt([1, 2, 3]), template_stop=[])
 
         with patch.object(
-            self.chat, "_apply_conversation_template", return_value=rendered
+            input_processor(self.chat).renderer,
+            "_apply_conversation_template",
+            return_value=rendered,
         ):
-            processed = self.chat._process_messages(request, is_multimodal=False)
+            processed = input_processor(self.chat, is_multimodal=False).prepare(
+                from_chat_request(request)
+            )
 
         self.assertTrue(processed.require_reasoning)
 
@@ -755,18 +782,17 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": False},
         )
 
-        with patch.object(self.chat, "_process_messages") as proc_mock:
-            proc_mock.return_value = MessageProcessingResult(
-                "",
+        with patch.object(input_processor(self.chat), "prepare") as proc_mock:
+            proc_mock.return_value = prepared_chat(
                 [1, 2, 3],
-                None,
-                None,
-                [],
-                [],
-                None,
+                image_data=None,
+                audio_data=None,
+                video_data=[],
+                modalities=[],
+                stop=None,
             )
 
-            adapted, _ = self.chat._convert_to_internal_request(req)
+            adapted, _ = sync_serving(self.chat)._convert_to_internal_request(req)
 
         self.assertFalse(adapted.require_reasoning)
 
@@ -781,7 +807,7 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "What is 2+2?"}],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(from_chat_request(req))
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertIs(kwargs["enable_thinking"], False)
@@ -798,7 +824,7 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"enable_thinking": True},
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(from_chat_request(req))
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertIs(kwargs["enable_thinking"], True)
@@ -814,9 +840,11 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "What is 2+2?"}],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        prepared = input_processor(self.chat, is_multimodal=False).prepare(
+            from_chat_request(req)
+        )
 
-        self.assertEqual(req.reasoning_effort, "high")
+        self.assertEqual(prepared.reasoning_effort, "high")
 
     def test_hunyuan_default_reasoning_effort_is_normalized_for_template(self):
         self.template_manager.chat_template_name = None
@@ -844,12 +872,16 @@ class ServingChatTestCase(unittest.TestCase):
                     reasoning_effort=request_effort,
                 )
 
-                self.chat._process_messages(req, is_multimodal=False)
+                prepared = input_processor(self.chat, is_multimodal=False).prepare(
+                    from_chat_request(req)
+                )
 
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-                self.assertEqual(req.reasoning_effort, normalized_effort)
+                self.assertEqual(prepared.reasoning_effort, normalized_effort)
                 self.assertEqual(kwargs["reasoning_effort"], normalized_effort)
-                self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+                self.assertNotIn(
+                    "reasoning_effort", prepared.chat_template_kwargs or {}
+                )
 
     def test_hunyuan_reasoning_effort_precedence_survives_conversion(self):
         self.template_manager.chat_template_name = None
@@ -875,12 +907,14 @@ class ServingChatTestCase(unittest.TestCase):
                     chat_template_kwargs={"reasoning_effort": template_effort},
                 )
 
-                self.chat._convert_to_internal_request(req)
+                _, effective = sync_serving(self.chat)._convert_to_internal_request(req)
 
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-                self.assertEqual(req.reasoning_effort, normalized_effort)
+                self.assertEqual(effective.reasoning_effort, normalized_effort)
                 self.assertEqual(kwargs["reasoning_effort"], normalized_effort)
-                self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+                self.assertNotIn(
+                    "reasoning_effort", effective.chat_template_kwargs or {}
+                )
 
     def test_non_hunyuan_default_reasoning_effort_is_unchanged(self):
         self.template_manager.chat_template_name = None
@@ -892,12 +926,14 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "What is 2+2?"}],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        prepared = input_processor(self.chat, is_multimodal=False).prepare(
+            from_chat_request(req)
+        )
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-        self.assertEqual(req.reasoning_effort, "medium")
+        self.assertEqual(prepared.reasoning_effort, "medium")
         self.assertEqual(kwargs["reasoning_effort"], "medium")
-        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
+        self.assertEqual(prepared.chat_template_kwargs["reasoning_effort"], "medium")
 
     def test_k2_selected_terminator_reaches_sampling_params(self):
         self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
@@ -914,11 +950,15 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"reasoning_effort": "medium"},
         )
 
-        processed = self.chat._process_messages(req, is_multimodal=False)
+        processed = input_processor(self.chat, is_multimodal=False).prepare(
+            from_chat_request(req)
+        )
         self.assertEqual(processed.reasoning_end_token_ids, [8, 9])
 
-        with patch.object(self.chat, "_process_messages", return_value=processed):
-            adapted, _ = self.chat._convert_to_internal_request(req)
+        with patch.object(
+            input_processor(self.chat), "prepare", return_value=processed
+        ):
+            adapted, _ = sync_serving(self.chat)._convert_to_internal_request(req)
         self.assertEqual(
             adapted.sampling_params["custom_params"][
                 REQUEST_REASONING_END_TOKEN_IDS_KEY
@@ -956,7 +996,7 @@ class ServingChatTestCase(unittest.TestCase):
             tool_choice="required",
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(from_chat_request(req))
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertNotIn("thinking", kwargs)
@@ -992,7 +1032,7 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": True},
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(from_chat_request(req))
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertTrue(kwargs["thinking"])
@@ -1028,7 +1068,7 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": False},
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(from_chat_request(req))
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertFalse(kwargs["thinking"])
@@ -1060,7 +1100,7 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(from_chat_request(req))
 
         expected_tools = [tool.model_dump() for tool in req.tools]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
@@ -1098,7 +1138,7 @@ class ServingChatTestCase(unittest.TestCase):
             [1, 2, 3],
         ]
 
-        self.chat._process_messages(req, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(from_chat_request(req))
 
         first_tools = self.tm.tokenizer.apply_chat_template.call_args_list[0].kwargs[
             "tools"
@@ -1148,12 +1188,14 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+            "sglang.srt.entrypoints.chat_input.processor.FunctionCallParser"
         ) as parser_cls:
             parser = parser_cls.return_value
             parser.get_structure_constraint.return_value = ("structural_tag", "tag")
 
-            self.chat._process_messages(req, is_multimodal=False)
+            input_processor(self.chat, is_multimodal=False).prepare(
+                from_chat_request(req)
+            )
 
             parser.get_structure_constraint.assert_called_once()
             self.assertFalse(
@@ -1189,7 +1231,7 @@ class ServingChatTestCase(unittest.TestCase):
             with (
                 self.subTest(request_stop=request_stop),
                 patch(
-                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                    "sglang.srt.entrypoints.chat_input.processor.FunctionCallParser"
                 ) as parser_cls,
             ):
                 parser = parser_cls.return_value
@@ -1209,7 +1251,9 @@ class ServingChatTestCase(unittest.TestCase):
                     else request.stop
                 )
 
-                result = self.chat._process_messages(request, is_multimodal=False)
+                result = input_processor(self.chat, is_multimodal=False).prepare(
+                    from_chat_request(request)
+                )
 
                 self.assertEqual(result.stop, expected)
                 self.assertEqual(request.stop, original_stop)
@@ -1236,7 +1280,9 @@ class ServingChatTestCase(unittest.TestCase):
             tool_choice="none",
         )
 
-        result = self.chat._process_messages(request, is_multimodal=False)
+        result = input_processor(self.chat, is_multimodal=False).prepare(
+            from_chat_request(request)
+        )
 
         self.assertIsNone(result.stop)
 
@@ -1301,7 +1347,9 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
-        result = self.chat._process_messages(request, is_multimodal=True)
+        result = input_processor(self.chat, is_multimodal=True).renderer.render(
+            from_chat_request(request), None, False
+        )
 
         call = self.tm.tokenizer.apply_chat_template.call_args
         rendered_messages = call.args[0]
@@ -1333,7 +1381,7 @@ class ServingChatTestCase(unittest.TestCase):
             {"type": "object"},
         )
         self.assertNotIn("schema_", call.kwargs["response_format"]["json_schema"])
-        self.assertEqual(result.prompt_ids, [7, 8, 9])
+        self.assertEqual(result.prompt.token_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
 
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
@@ -1362,7 +1410,9 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        self.chat._process_messages(request, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(
+            from_chat_request(request)
+        )
 
         messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
@@ -1449,7 +1499,9 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                    self.chat._process_messages(req, is_multimodal=False)
+                    input_processor(self.chat, is_multimodal=False).prepare(
+                        from_chat_request(req)
+                    )
 
                 self.tm.tokenizer.apply_chat_template.assert_not_called()
 
@@ -1484,7 +1536,7 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        input_processor(self.chat, is_multimodal=False).prepare(from_chat_request(req))
 
         messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
         self.assertEqual(
@@ -1528,7 +1580,9 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                    self.chat._process_messages(req, is_multimodal=False)
+                    input_processor(self.chat, is_multimodal=False).prepare(
+                        from_chat_request(req)
+                    )
 
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
@@ -1565,7 +1619,9 @@ class ServingChatTestCase(unittest.TestCase):
                     ],
                 )
 
-                self.chat._process_messages(req, is_multimodal=False)
+                input_processor(self.chat, is_multimodal=False).prepare(
+                    from_chat_request(req)
+                )
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -1577,7 +1633,7 @@ class ServingChatTestCase(unittest.TestCase):
         initial_stop_str = ["\n"]
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             # Create a mock conversation object that will be returned by generate_chat_conv
             conv_ins = Mock()
@@ -1598,7 +1654,9 @@ class ServingChatTestCase(unittest.TestCase):
             )
 
             # Call the actual _apply_conversation_template method (not mocked)
-            result1 = self.chat._apply_conversation_template(req1, is_multimodal=False)
+            result1 = input_processor(self.chat, is_multimodal=False).prepare(
+                from_chat_request(req1)
+            )
 
             # Verify first request has both stop strings
             expected_stop1 = initial_stop_str + ["CUSTOM_STOP"]
@@ -1613,7 +1671,9 @@ class ServingChatTestCase(unittest.TestCase):
                 messages=[{"role": "user", "content": "Second request"}],
                 # No custom stop strings
             )
-            result2 = self.chat._apply_conversation_template(req2, is_multimodal=False)
+            result2 = input_processor(self.chat, is_multimodal=False).prepare(
+                from_chat_request(req2)
+            )
 
             # Verify second request only has original stop strings (no CUSTOM_STOP from req1)
             self.assertEqual(result2.stop, initial_stop_str)
@@ -2341,7 +2401,7 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
         messages = [m.model_dump() for m in req.messages]
-        # Mirror the boundary normalization _process_messages does for any
+        # Mirror the boundary normalization prepare does for any
         # non-None chat_encoding_spec.
         for i, msg in enumerate(messages):
             if isinstance(msg.get("content"), list):
@@ -2515,7 +2575,9 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "Hello"}],
             reasoning_effort="max",
         )
-        serving_chat._process_messages(request, is_multimodal=False)
+        input_processor(serving_chat, is_multimodal=False).prepare(
+            from_chat_request(request)
+        )
         prompt = tm.tokenizer.encode.call_args.args[0]
         self.assertIn("Reasoning Effort: Beyond maximum", prompt)
 
@@ -2534,7 +2596,9 @@ class ServingChatTestCase(unittest.TestCase):
             reasoning_effort="max",
         )
 
-        serving_chat._process_messages(request, is_multimodal=False)
+        input_processor(serving_chat, is_multimodal=False).prepare(
+            from_chat_request(request)
+        )
 
         prompt = tm.tokenizer.encode.call_args.args[0]
         self.assertIn("Reasoning Effort: Beyond maximum", prompt)
@@ -2585,14 +2649,14 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             # Create a mock conversation object
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -2666,13 +2730,13 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -2757,13 +2821,13 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
             chunks = self._run_chat_stream(adapted_request, req)
@@ -2955,12 +3019,12 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
             chunks = self._run_chat_stream(adapted_request, req)
@@ -3225,13 +3289,13 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -3345,20 +3409,19 @@ class ServingChatTestCase(unittest.TestCase):
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
         )
-        processed_messages = MessageProcessingResult(
-            "Test prompt",
+        processed_messages = prepared_chat(
             [1, 2, 3],
-            None,
-            None,
-            [],
-            ["</s>"],
-            None,
+            image_data=None,
+            audio_data=None,
+            video_data=[],
+            modalities=["</s>"],
+            stop=None,
         )
 
         with patch.object(
-            self.chat, "_process_messages", return_value=processed_messages
+            input_processor(self.chat), "prepare", return_value=processed_messages
         ):
-            _, processed_request = self.chat._convert_to_internal_request(
+            _, processed_request = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -3419,13 +3482,13 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
             chunks = self._run_chat_stream(adapted_request, req)
@@ -3557,13 +3620,13 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
             chunks = self._run_chat_stream(adapted_request, req)
@@ -3742,13 +3805,13 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = sync_serving(self.chat)._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -3827,7 +3890,9 @@ class ServingChatTestCase(unittest.TestCase):
         for effort, expected in cases:
             with self.subTest(effort=effort):
                 req.reasoning_effort = effort
-                self.assertEqual(chat._get_reasoning_from_request(req), expected)
+                self.assertEqual(
+                    input_processor(chat)._get_reasoning_from_request(req), expected
+                )
 
     def _setup_nemotron_super(self):
         """Drive _apply_jinja_template (chat_template_name=None) with a
@@ -3852,14 +3917,20 @@ class ServingChatTestCase(unittest.TestCase):
             reasoning_effort=effort,
         )
         with (
-            patch.object(self.chat, "_encode_messages", return_value=None),
             patch.object(
-                self.chat,
+                input_processor(self.chat).renderer,
+                "_encode_messages",
+                return_value=None,
+            ),
+            patch.object(
+                input_processor(self.chat).renderer,
                 "_handle_last_assistant_message",
                 return_value=([{"role": "user", "content": "hi"}], None),
             ),
         ):
-            self.chat._process_messages(req, False)
+            input_processor(self.chat, is_multimodal=False).prepare(
+                from_chat_request(req)
+            )
         _, kwargs = self.tm.tokenizer.apply_chat_template.call_args
         return kwargs
 
@@ -3871,7 +3942,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_nemotron_super_high_effort_warns_without_kwarg(self):
         self._setup_nemotron_super()
         with self.assertLogs(
-            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+            "sglang.srt.entrypoints.chat_input.renderers", level="WARNING"
         ) as logs:
             kwargs = self._run_jinja_with_effort("high")
         self.assertNotIn("low_effort", kwargs)
@@ -3938,8 +4009,12 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"enable_thinking": False},
         )
 
-        self.assertTrue(self.chat._get_reasoning_from_request(enabled_by_default))
-        self.assertFalse(self.chat._get_reasoning_from_request(disabled_explicitly))
+        self.assertTrue(
+            input_processor(self.chat)._get_reasoning_from_request(enabled_by_default)
+        )
+        self.assertFalse(
+            input_processor(self.chat)._get_reasoning_from_request(disabled_explicitly)
+        )
 
     def test_get_reasoning_from_request_default_false_toggle(self):
         self.tm.server_args.reasoning_parser = "deepseek-v3"
@@ -3957,8 +4032,12 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": True},
         )
 
-        self.assertFalse(self.chat._get_reasoning_from_request(disabled_by_default))
-        self.assertTrue(self.chat._get_reasoning_from_request(enabled_explicitly))
+        self.assertFalse(
+            input_processor(self.chat)._get_reasoning_from_request(disabled_by_default)
+        )
+        self.assertTrue(
+            input_processor(self.chat)._get_reasoning_from_request(enabled_explicitly)
+        )
 
     def test_get_reasoning_from_request_special_cases(self):
         self.tm.server_args.reasoning_parser = "mistral"
@@ -3970,14 +4049,14 @@ class ServingChatTestCase(unittest.TestCase):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             special_case="always"
         )
-        self.assertTrue(self.chat._get_reasoning_from_request(req))
+        self.assertTrue(input_processor(self.chat)._get_reasoning_from_request(req))
 
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             special_case="mistral"
         )
-        self.assertFalse(self.chat._get_reasoning_from_request(req))
+        self.assertFalse(input_processor(self.chat)._get_reasoning_from_request(req))
         req.reasoning_effort = "medium"
-        self.assertTrue(self.chat._get_reasoning_from_request(req))
+        self.assertTrue(input_processor(self.chat)._get_reasoning_from_request(req))
 
     # --- fallback path tests (config=None, uses reasoning_default) ---
 
@@ -3993,63 +4072,79 @@ class ServingChatTestCase(unittest.TestCase):
         req = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
-        self.assertTrue(self.chat._get_reasoning_from_request(req))
+        self.assertTrue(input_processor(self.chat)._get_reasoning_from_request(req))
 
     def test_fallback_mistral_mode(self):
         self._setup_fallback("mistral")
         req_no_effort = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
-        self.assertFalse(self.chat._get_reasoning_from_request(req_no_effort))
+        self.assertFalse(
+            input_processor(self.chat)._get_reasoning_from_request(req_no_effort)
+        )
 
         req_with_effort = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             reasoning_effort="high",
         )
-        self.assertTrue(self.chat._get_reasoning_from_request(req_with_effort))
+        self.assertTrue(
+            input_processor(self.chat)._get_reasoning_from_request(req_with_effort)
+        )
 
     def test_fallback_enable_thinking_mode_default_on(self):
         self._setup_fallback("qwen3")
         req_default = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
-        self.assertTrue(self.chat._get_reasoning_from_request(req_default))
+        self.assertTrue(
+            input_processor(self.chat)._get_reasoning_from_request(req_default)
+        )
 
         req_disabled = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             chat_template_kwargs={"enable_thinking": False},
         )
-        self.assertFalse(self.chat._get_reasoning_from_request(req_disabled))
+        self.assertFalse(
+            input_processor(self.chat)._get_reasoning_from_request(req_disabled)
+        )
 
     def test_fallback_explicit_thinking_mode_default_off(self):
         self._setup_fallback("deepseek-v3")
         req_default = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
-        self.assertFalse(self.chat._get_reasoning_from_request(req_default))
+        self.assertFalse(
+            input_processor(self.chat)._get_reasoning_from_request(req_default)
+        )
 
         req_enabled = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             chat_template_kwargs={"thinking": True},
         )
-        self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+        self.assertTrue(
+            input_processor(self.chat)._get_reasoning_from_request(req_enabled)
+        )
 
     def test_fallback_explicit_enable_thinking_mode_default_off(self):
         self._setup_fallback("mimo")
         req_default = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
-        self.assertFalse(self.chat._get_reasoning_from_request(req_default))
+        self.assertFalse(
+            input_processor(self.chat)._get_reasoning_from_request(req_default)
+        )
 
         req_enabled = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             chat_template_kwargs={"enable_thinking": True},
         )
-        self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+        self.assertTrue(
+            input_processor(self.chat)._get_reasoning_from_request(req_enabled)
+        )
 
     def test_fallback_ling3_default_on(self):
         """Ling3 public checkpoints default `thinking_option='on'` in the chat
@@ -4072,7 +4167,10 @@ class ServingChatTestCase(unittest.TestCase):
         for kwargs, expected in cases:
             with self.subTest(kwargs=kwargs):
                 req.chat_template_kwargs = kwargs
-                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
+                self.assertEqual(
+                    input_processor(self.chat)._get_reasoning_from_request(req),
+                    expected,
+                )
 
     def test_fallback_no_detector_returns_false(self):
         self.chat.reasoning_parser = "qwen3"
@@ -4081,7 +4179,7 @@ class ServingChatTestCase(unittest.TestCase):
         req = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
-        self.assertFalse(self.chat._get_reasoning_from_request(req))
+        self.assertFalse(input_processor(self.chat)._get_reasoning_from_request(req))
 
     def test_build_chat_response_qwen3_thinking_forces_reasoning(self):
         self.tm.server_args.reasoning_parser = "qwen3-thinking"
@@ -4133,7 +4231,10 @@ class ServingChatTestCase(unittest.TestCase):
         for kwargs, expected in cases:
             with self.subTest(kwargs=kwargs):
                 req.chat_template_kwargs = kwargs
-                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
+                self.assertEqual(
+                    input_processor(self.chat)._get_reasoning_from_request(req),
+                    expected,
+                )
 
     def test_poolside_v1_does_not_double_prepend_think(self):
         """When `enable_thinking=True` for poolside_v1, the HF chat template
@@ -4148,7 +4249,7 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"enable_thinking": True},
         )
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "sglang.srt.entrypoints.chat_input.renderers.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "BASE_PROMPT"
@@ -4156,13 +4257,15 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.modalities = []
             conv_ins.stop_str = []
             conv_mock.return_value = conv_ins
-            result = self.chat._apply_conversation_template(req, is_multimodal=False)
-        self.assertEqual(result.prompt, "BASE_PROMPT")
+            result = input_processor(self.chat).renderer._apply_conversation_template(
+                req, is_multimodal=False, require_reasoning=False
+            )
+        self.assertEqual(self.tm.tokenizer.encode.call_args.args[0], "BASE_PROMPT")
 
     # ------------- hook method tests -------------
     def test_encode_messages_returns_none_by_default(self):
         """Default _encode_messages returns None (use standard encoding)."""
-        result = self.chat._encode_messages([], Mock(), False)
+        result = input_processor(self.chat).renderer._encode_messages([], Mock(), False)
         self.assertIsNone(result)
 
     def test_decode_response_returns_text(self):
@@ -4315,7 +4418,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     """Inkling reasoning-effort mapping and validation."""
 
     def test_named_levels(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = ChatRenderer._parse_inkling_reasoning_effort
         self.assertEqual(parse("none"), 0.0)
         self.assertEqual(parse("minimal"), 0.1)
         self.assertEqual(parse("low"), 0.2)
@@ -4327,7 +4430,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         self.assertEqual(parse("max"), parse("xhigh"))
 
     def test_scalar_range_is_validated(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = ChatRenderer._parse_inkling_reasoning_effort
         self.assertEqual(parse(0.5), 0.5)
         self.assertEqual(parse(0.99), 0.99)
         for value in (1.0, "1.0", 2.0, "1.5", -1.0, float("nan"), True):
@@ -4335,7 +4438,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
                 parse(value)
 
     def test_invalid_and_none(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = ChatRenderer._parse_inkling_reasoning_effort
         self.assertIsNone(parse(None))
         with self.assertRaises(ValueError):
             parse("garbage")
@@ -4343,7 +4446,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_env_default(self):
         from sglang.srt.environ import envs
 
-        get = OpenAIServingChat._get_inkling_default_reasoning_effort
+        get = get_inkling_default_reasoning_effort
         env = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT
         try:
             env.clear()  # unset -> EnvStr default "0.9"
@@ -4394,7 +4497,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
             messages=[{"role": "user", "content": "hello"}],
             reasoning_effort=0.5,
         )
-        prompt_ids = serving._encode_messages(
+        prompt_ids = input_processor(serving).renderer._encode_messages(
             [message.model_dump() for message in request.messages],
             request,
             thinking_mode=None,
@@ -4425,7 +4528,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
             reasoning_effort=0.5,
             continue_final_message=True,
         )
-        prompt_ids = serving._encode_messages(
+        prompt_ids = input_processor(serving).renderer._encode_messages(
             [message.model_dump() for message in request.messages],
             request,
             thinking_mode=None,
@@ -4471,7 +4574,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
             reasoning_effort=0.5,
             continue_final_message=True,
         )
-        prompt_ids = serving._encode_messages(
+        prompt_ids = input_processor(serving).renderer._encode_messages(
             [message.model_dump() for message in request.messages],
             request,
             thinking_mode=None,

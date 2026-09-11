@@ -133,7 +133,7 @@ def resolve_chat_encoding_spec(
 
     # Inkling has no Jinja chat_template and uses a tiktoken base + a special-token
     # overlay + negative MM placeholders, so it can't go through apply_chat_template;
-    # render input_ids directly via the Inkling renderer (serving_chat._encode_messages).
+    # render input_ids directly via the shared chat input renderer.
     if "InklingForConditionalGeneration" in arch:
         return "inkling"
 
@@ -155,15 +155,6 @@ def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
     the safe default: worst case is dropped history, not a leak.
     """
     return spec is not None
-
-
-def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
-    """Whether the encoder for ``spec`` returns pre-tokenized prompt ids.
-
-    Token-first encoders leave the text prompt empty; the MM processor
-    expands their single placeholder ids rather than re-tokenizing text.
-    """
-    return spec in ("inkling", "kimi_k3")
 
 
 def encode_simple_chat(

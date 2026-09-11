@@ -18,9 +18,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from dataclasses import dataclass
 from typing import (
-    Annotated,
     Any,
     Dict,
     List,
@@ -31,7 +29,6 @@ from typing import (
     Tuple,
     TypeAlias,
     Union,
-    get_args,
     runtime_checkable,
 )
 
@@ -50,11 +47,9 @@ from openai.types.responses.response_format_text_json_schema_config import (
 )
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
-    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
-    StrictBool,
     field_serializer,
     field_validator,
     model_serializer,
@@ -67,11 +62,58 @@ try:
 except:
     StructuralTag = Any
 
+from sglang.srt.entrypoints.chat_input.normalization import (
+    normalize_reasoning_inputs,
+    set_json_schema,
+    set_tool_choice_default,
+    validate_reasoning_effort_type,
+)
+
+# Preserve the existing import path for shared input schemas.
+from sglang.srt.entrypoints.chat_input.schema import (  # noqa: F401
+    _AUDIO_FORMAT_TO_MIME_TYPE,
+    _GENERIC_MESSAGE_ROLES,
+    ChatCompletionMessageContentAudioInlinePart,
+    ChatCompletionMessageContentAudioPart,
+    ChatCompletionMessageContentAudioURL,
+    ChatCompletionMessageContentAudioURLPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentImageURL,
+    ChatCompletionMessageContentInputAudio,
+    ChatCompletionMessageContentPart,
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentThinkingPart,
+    ChatCompletionMessageContentToolReferenceBlock,
+    ChatCompletionMessageContentVideoPart,
+    ChatCompletionMessageContentVideoURL,
+    ChatCompletionMessageGenericParam,
+    ChatCompletionMessageParam,
+    ChatCompletionMessageUserParam,
+    Function,
+    FunctionResponse,
+    JsonSchemaResponseFormat,
+    LegacyStructuralTagResponseFormat,
+    ReasoningEffortTier,
+    ReasoningEffortType,
+    ResponseFormat,
+    StructuralTagResponseFormat,
+    StructuresResponseFormat,
+    Tool,
+    ToolCall,
+    ToolCallConstraint,
+    ToolChoice,
+    ToolChoiceFuncName,
+    _GenericMessageRole,
+    _to_audio_url_part,
+)
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
+
+# The Responses event schema accepts fewer effort tiers than request inputs.
+ECHOABLE_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 
 
 class ModelCard(BaseModel):
@@ -214,46 +256,6 @@ class UsageInfo(BaseModel):
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
-
-
-class JsonSchemaResponseFormat(BaseModel):
-    name: str
-    description: Optional[str] = None
-    # use alias to workaround pydantic conflict
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    # The OpenAI wire contract accepts JSON booleans only; StrictBool rejects
-    # the values lax pydantic would coerce ("yes", "on", 0, 1, ...), matching
-    # OpenAI's 422 behavior. Omitted (None) keeps its meaning.
-    strict: Optional[StrictBool] = None
-
-
-class ResponseFormat(BaseModel):
-    type: Literal["text", "json_object", "json_schema"]
-    json_schema: Optional[JsonSchemaResponseFormat] = None
-
-
-class StructuresResponseFormat(BaseModel):
-    begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    end: str
-
-
-# NOTE(dark): keep this for backward compatibility
-class LegacyStructuralTagResponseFormat(BaseModel):
-    type: Literal["structural_tag"]
-    structures: List[StructuresResponseFormat]
-    triggers: List[str]
-    at_least_one: bool = False
-
-
-StructuralTagResponseFormat: TypeAlias = Union[
-    LegacyStructuralTagResponseFormat, StructuralTag
-]
-
-ToolCallConstraint: TypeAlias = Union[
-    Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
-    Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
-]
 
 
 class FileRequest(BaseModel):
@@ -544,136 +546,6 @@ class CompletionStreamResponse(BaseModel):
         return data
 
 
-class ChatCompletionMessageContentTextPart(BaseModel):
-    type: Literal["text"]
-    text: str
-
-
-class ChatCompletionMessageContentThinkingPart(BaseModel):
-    type: Literal["thinking", "reasoning"]
-    thinking: Optional[str] = None
-    text: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_payload(self):
-        if (self.thinking is None) == (self.text is None):
-            raise ValueError(
-                "thinking parts require exactly one of 'thinking' or 'text'"
-            )
-        return self
-
-
-class ChatCompletionMessageContentImageURL(BaseModel):
-    url: str
-    detail: Optional[Literal["auto", "low", "high"]] = "auto"
-    max_dynamic_patch: Optional[int] = None
-    min_dynamic_patch: Optional[int] = None
-    content_hash: Optional[str] = None
-
-    @field_validator("content_hash")
-    @classmethod
-    def validate_content_hash(cls, value: Optional[str]) -> Optional[str]:
-        from sglang.srt.multimodal.cache import parse_content_hash
-
-        return parse_content_hash(value)
-
-
-class ChatCompletionMessageContentVideoURL(BaseModel):
-    url: str
-    max_dynamic_patch: Optional[int] = None
-    min_dynamic_patch: Optional[int] = None
-    fps: Optional[float] = None
-    max_frames: Optional[int] = None
-    max_tokens_per_frame: Optional[int] = None
-    max_image_tokens: Optional[int] = None
-
-
-class ChatCompletionMessageContentAudioURL(BaseModel):
-    url: str
-
-
-class ChatCompletionMessageContentImagePart(BaseModel):
-    type: Literal["image_url"]
-    image_url: ChatCompletionMessageContentImageURL
-    modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
-
-
-class ChatCompletionMessageContentVideoPart(BaseModel):
-    type: Literal["video_url"]
-    video_url: ChatCompletionMessageContentVideoURL
-
-
-class ChatCompletionMessageContentInputAudio(BaseModel):
-    data: str
-    format: Literal["wav", "mp3"]
-
-
-_AUDIO_FORMAT_TO_MIME_TYPE = {
-    "wav": "audio/wav",
-    "mp3": "audio/mpeg",
-}
-
-
-class ChatCompletionMessageContentAudioURLPart(BaseModel):
-    type: Literal["audio_url"]
-    audio_url: ChatCompletionMessageContentAudioURL
-
-
-class ChatCompletionMessageContentAudioInlinePart(BaseModel):
-    type: Literal["input_audio"]
-    input_audio: ChatCompletionMessageContentInputAudio
-
-
-def _to_audio_url_part(
-    part: Union[
-        ChatCompletionMessageContentAudioURLPart,
-        ChatCompletionMessageContentAudioInlinePart,
-    ],
-) -> ChatCompletionMessageContentAudioURLPart:
-    if isinstance(part, ChatCompletionMessageContentAudioURLPart):
-        return part
-
-    audio = part.input_audio
-    return ChatCompletionMessageContentAudioURLPart(
-        type="audio_url",
-        audio_url=ChatCompletionMessageContentAudioURL(
-            url=f"data:{_AUDIO_FORMAT_TO_MIME_TYPE[audio.format]};base64,{audio.data}"
-        ),
-    )
-
-
-# Audio arrives by reference as `audio_url`, holding a URL or a data URI, or
-# inline as OpenAI's `input_audio`, holding base64. Inline audio is converted to
-# the equivalent data URI as it validates.
-ChatCompletionMessageContentAudioPart = Annotated[
-    Union[
-        ChatCompletionMessageContentAudioURLPart,
-        ChatCompletionMessageContentAudioInlinePart,
-    ],
-    AfterValidator(_to_audio_url_part),
-]
-
-
-class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
-    # GLM-specific extension used alongside `defer_loading` tools. The chat
-    # template looks up `tools[*].function.name == tr.name` and renders the
-    # referenced tool schemas inline for the current turn. Not part of any
-    # OpenAI API; included here so Pydantic accepts the content through the
-    # Chat Completions path (the Anthropic endpoint translates its
-    # `tool_name` field to `name` before forwarding).
-    type: Literal["tool_reference"]
-    name: str
-
-
-ChatCompletionMessageContentPart = Union[
-    ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageContentThinkingPart,
-    ChatCompletionMessageContentImagePart,
-    ChatCompletionMessageContentVideoPart,
-    ChatCompletionMessageContentAudioPart,
-    ChatCompletionMessageContentToolReferenceBlock,
-]
-
 # Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
 # Can be a simple string (text-only) or a list of multimodal content parts
 RerankContentPart = Union[
@@ -682,162 +554,6 @@ RerankContentPart = Union[
     ChatCompletionMessageContentVideoPart,
 ]
 RerankContent = Union[str, List[RerankContentPart]]
-
-
-class FunctionResponse(BaseModel):
-    """Function response."""
-
-    name: Optional[str] = None
-    arguments: Optional[str | Dict[str, Any]] = None
-
-
-class ToolCall(BaseModel):
-    """Tool call response."""
-
-    id: Optional[str] = None
-    index: Optional[int] = None
-    type: Literal["function"] = "function"
-    function: FunctionResponse
-
-
-_GenericMessageRole = Literal[
-    "system", "assistant", "tool", "function", "developer", "latest_reminder"
-]
-_GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
-
-
-class ChatCompletionMessageGenericParam(BaseModel):
-    role: _GenericMessageRole
-    content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
-        default=None
-    )
-    tool_call_id: Optional[str] = None
-    name: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
-
-    @field_validator("role", mode="before")
-    @classmethod
-    def _normalize_role(cls, v):
-        if isinstance(v, str):
-            v_lower = v.lower()
-            if v_lower not in _GENERIC_MESSAGE_ROLES:
-                allowed = ", ".join(repr(r) for r in _GENERIC_MESSAGE_ROLES)
-                raise ValueError(f"'role' must be one of {allowed} (case-insensitive).")
-            return v_lower
-        raise ValueError("'role' must be a string")
-
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if self.role != "assistant" and isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
-
-
-class ChatCompletionMessageUserParam(BaseModel):
-    role: Literal["user"]
-    content: Union[str, List[ChatCompletionMessageContentPart]]
-
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
-
-
-ChatCompletionMessageParam = Union[
-    ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
-]
-
-
-class Function(BaseModel):
-    """Function descriptions."""
-
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: str
-    parameters: Optional[object] = None
-    strict: bool = False
-    defer_loading: Optional[bool] = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        if self.defer_loading is None:
-            data.pop("defer_loading", None)
-        return data
-
-
-class Tool(BaseModel):
-    """Function wrapper."""
-
-    type: str = Field(default="function", examples=["function"])
-    function: Function
-    defer_loading: Optional[bool] = None
-
-    @model_validator(mode="after")
-    def _propagate_defer_loading(self) -> Tool:
-        if self.defer_loading is not None and self.function.defer_loading is None:
-            self.function.defer_loading = self.defer_loading
-        return self
-
-
-# Tool is defined after the message params that reference it, so the forward
-# reference has to be resolved explicitly.
-ChatCompletionMessageGenericParam.model_rebuild()
-
-
-class ToolChoiceFuncName(BaseModel):
-    """The name of tool choice function."""
-
-    name: Optional[str] = None
-
-
-class ToolChoice(BaseModel):
-    """The tool choice definition."""
-
-    function: ToolChoiceFuncName
-    type: Literal["function"] = Field(default="function", examples=["function"])
-
-
-# OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
-# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
-ReasoningEffortTier = Literal[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max"
-]
-# The typed /v1/responses stream events validate against OpenAI's narrower
-# ``Reasoning.effort``; echoing a tier outside this set kills the stream.
-ECHOABLE_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
-# Chat Completions and /v1/tokenize additionally accept a fine-grained float in
-# [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
-# /v1/responses surface deliberately keeps the string tiers only). Single-sourced
-# so these surfaces cannot drift apart.
-ReasoningEffortType = Optional[
-    Union[
-        ReasoningEffortTier,
-        Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
-    ]
-]
-
-
-def _has_message_level_tools(messages: Any) -> bool:
-    if not isinstance(messages, list):
-        return False
-    return any(
-        isinstance(message, dict)
-        and isinstance(message.get("role"), str)
-        and message["role"].lower() in ("system", "developer")
-        and bool(message.get("tools"))
-        for message in messages
-    )
 
 
 class ChatCompletionRequest(BaseModel):
@@ -986,111 +702,22 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
-            if values.get("tools") is None and not _has_message_level_tools(
-                values.get("messages")
-            ):
-                values["tool_choice"] = "none"
-            else:
-                values["tool_choice"] = "auto"
-        return values
+        return set_tool_choice_default(values)
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
     def validate_reasoning_effort_type(cls, value):
-        if isinstance(value, bool):
-            raise ValueError("reasoning_effort must not be a boolean")
-        return value
+        return validate_reasoning_effort_type(value)
 
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
-        r = values.get("reasoning")
-        thinking = None
-
-        if r is not None and isinstance(r, dict):
-            effort = r.get("effort")
-            if effort is None:
-                effort = r.get("reasoning_effort")
-            if isinstance(effort, str) and effort in {
-                "none",
-                "minimal",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-            }:
-                values["reasoning_effort"] = effort
-            elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
-                values["reasoning_effort"] = float(effort)
-            elif isinstance(effort, str):
-                # Keep parity with the top-level reasoning_effort field, whose
-                # lax union coerces numeric strings; range checks then apply.
-                try:
-                    values["reasoning_effort"] = float(effort)
-                except ValueError as exc:
-                    raise ValueError(f"invalid reasoning effort: {effort!r}") from exc
-            elif effort is not None:
-                raise ValueError(f"invalid reasoning effort: {effort!r}")
-
-            enabled = (
-                r.get("enabled")
-                if r.get("enabled") is not None
-                else r.get("enable", False)
-            )
-            if isinstance(enabled, str):
-                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
-            if enabled:
-                thinking = True
-
-        effort = values.get("reasoning_effort")
-        if effort is not None:
-            thinking = effort != "none"
-
-        if thinking is not None:
-            ctk = values.get("chat_template_kwargs")
-            if not isinstance(ctk, dict):
-                ctk = {}
-            # different models check different keys:
-            # - "thinking" for deepseek-v3, kimi_k2
-            # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
-            ctk.setdefault("thinking", thinking)
-            ctk.setdefault("enable_thinking", thinking)
-            values["chat_template_kwargs"] = ctk
-
-        return values
+        return normalize_reasoning_inputs(values)
 
     @model_validator(mode="before")
     @classmethod
     def set_json_schema(cls, values):
-        response_format = values.get("response_format")
-        if not response_format:
-            return values
-
-        if response_format.get("type") != "json_schema":
-            return values
-
-        schema = response_format.pop("schema", None)
-        json_schema = response_format.get("json_schema")
-
-        if json_schema:
-            return values
-
-        if schema:
-            name_ = schema.get("title", "Schema")
-            strict_ = None
-            if "properties" in schema and "strict" in schema["properties"]:
-                item = schema["properties"].pop("strict", None)
-                strict_ = bool(item and item.get("default", False))
-
-            response_format["json_schema"] = {
-                "name": name_,
-                "schema": schema,
-                "strict": strict_,
-            }
-
-        return values
+        return set_json_schema(values)
 
     def to_sampling_params(
         self,
@@ -2033,21 +1660,6 @@ class RequestResponseMetadata(BaseModel):
 
     request_id: str
     final_usage_info: Optional[UsageInfo] = None
-
-
-@dataclass
-class MessageProcessingResult:
-    prompt: str
-    prompt_ids: Union[str, List[int]]
-    image_data: Optional[Any]
-    audio_data: Optional[Any]
-    video_data: Optional[Any]
-    modalities: List[str]
-    stop: List[str]
-    tool_call_constraint: Optional[ToolCallConstraint] = None
-    skip_special_tokens: bool = True
-    require_reasoning: bool = False
-    reasoning_end_token_ids: Optional[List[int]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

@@ -8,14 +8,28 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import make_serving
+from utils import (
+    input_processor,
+    make_serving,
+    prepared_chat,
+    prompt_value,
+    sync_serving,
+)
 
+from sglang.srt.entrypoints.chat_input.types import (
+    RenderedPrompt,
+    TokenPrompt,
+)
 from sglang.srt.entrypoints.context import SimpleContext
+from sglang.srt.entrypoints.openai.chat_input_adapter import (
+    with_prepared_options,
+)
 from sglang.srt.entrypoints.openai.protocol import (
-    MessageProcessingResult,
+    ChatCompletionRequest,
     RequestResponseMetadata,
     ResponsesRequest,
 )
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
@@ -161,13 +175,12 @@ class ChatToolForwardingTestCase(CustomTestCase):
         serving = make_serving()
         seen = {}
 
-        def fake_process(chat_request, is_multimodal):
+        def fake_process(chat_request):
             seen["tools"] = chat_request.tools
             seen["tool_choice"] = chat_request.tool_choice
             seen["parallel_tool_calls"] = chat_request.parallel_tool_calls
-            return MessageProcessingResult(
-                prompt="prompt",
-                prompt_ids=[1, 2, 3],
+            return prepared_chat(
+                [1, 2, 3],
                 image_data=None,
                 audio_data=None,
                 video_data=None,
@@ -176,7 +189,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
                 tool_call_constraint=("json_schema", {"type": "object"}),
             )
 
-        serving._process_messages = Mock(side_effect=fake_process)
+        input_processor(serving).prepare = Mock(side_effect=fake_process)
         request = ResponsesRequest(
             model="x",
             input="call the tool",
@@ -192,13 +205,14 @@ class ChatToolForwardingTestCase(CustomTestCase):
             store=False,
         )
 
-        messages, request_prompts, engine_prompts, processed = asyncio.run(
-            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        messages, processed = asyncio.run(
+            sync_serving(serving)._make_request(
+                request, None, serving.tokenizer_manager.tokenizer
+            )
         )
 
         self.assertEqual(messages, [{"role": "user", "content": "call the tool"}])
-        self.assertEqual(request_prompts, [[1, 2, 3]])
-        self.assertEqual(engine_prompts, [[1, 2, 3]])
+        self.assertEqual([prompt_value(processed)], [[1, 2, 3]])
         self.assertEqual(seen["tools"][0].function.name, "lookup")
         self.assertEqual(seen["tool_choice"], "required")
         self.assertFalse(seen["parallel_tool_calls"])
@@ -213,7 +227,9 @@ class ChatToolForwardingTestCase(CustomTestCase):
             tools=[{"type": "web_search"}, {"type": "mcp"}],
             store=False,
         )
-        result = asyncio.run(serving.create_responses(request, raw_request=None))
+        result = asyncio.run(
+            sync_serving(serving).create_responses(request, raw_request=None)
+        )
         self.assertEqual(getattr(result, "status_code", None), 400)
 
     def test_kimi_k3_request_uses_chat_encoder_fields(self):
@@ -237,8 +253,10 @@ class ChatToolForwardingTestCase(CustomTestCase):
             store=False,
         )
 
-        _, request_prompts, engine_prompts, _ = asyncio.run(
-            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        _, processed = asyncio.run(
+            sync_serving(serving)._make_request(
+                request, None, serving.tokenizer_manager.tokenizer
+            )
         )
 
         call = serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
@@ -248,8 +266,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(call.kwargs["thinking_effort"], "high")
         self.assertEqual(call.kwargs["tool_choice"], "required")
         self.assertEqual(call.kwargs["tools"][0]["function"]["name"], "lookup")
-        self.assertEqual(request_prompts, [[4, 5, 6]])
-        self.assertEqual(engine_prompts, [[4, 5, 6]])
+        self.assertEqual([prompt_value(processed)], [[4, 5, 6]])
 
     def test_k2_output_parser_reuses_effective_template_default(self):
         serving = make_serving()
@@ -266,10 +283,13 @@ class ChatToolForwardingTestCase(CustomTestCase):
             store=False,
         )
 
-        asyncio.run(
-            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        _, prepared = asyncio.run(
+            sync_serving(serving)._make_request(
+                request, None, serving.tokenizer_manager.tokenizer
+            )
         )
 
+        request = with_prepared_options(request, prepared)
         render_call = serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
         self.assertEqual(render_call.kwargs["reasoning_effort"], "low")
         self.assertEqual(request.chat_template_kwargs["reasoning_effort"], "low")
@@ -292,21 +312,11 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
         serving.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True
         )
-        rendered = MessageProcessingResult(
-            prompt="prompt",
-            prompt_ids=[1, 2, 3],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-            reasoning_end_token_ids=[41, 42],
-        )
+        rendered = RenderedPrompt(prompt=TokenPrompt([1, 2, 3]), template_stop=[])
         captured = {}
 
         async def fake_generate(
             request_id,
-            request_prompt,
             adapted_request,
             sampling_params,
             context,
@@ -335,14 +345,21 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
 
         with (
             patch.object(
-                serving, "_apply_conversation_template", return_value=rendered
+                input_processor(serving),
+                "_reasoning_end_token_ids",
+                return_value=[41, 42],
+            ),
+            patch.object(
+                input_processor(serving).renderer,
+                "_apply_conversation_template",
+                return_value=rendered,
             ),
             patch(
                 "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
             ) as parser_cls,
         ):
             parser_cls.return_value.parse_non_stream.return_value = (None, "done")
-            response = asyncio.run(serving.create_responses(request))
+            response = asyncio.run(sync_serving(serving).create_responses(request))
 
         self.assertEqual(response.status, "completed")
         self.assertFalse(captured["adapted_request"].require_reasoning)
@@ -356,25 +373,16 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
 
 
 class SkipSpecialTokensForwardingTestCase(CustomTestCase):
-    """The skip_special_tokens override from _process_messages must reach the
+    """The skip_special_tokens override from prepare must reach the
     engine sampling params; muse's channel markers die in detok otherwise."""
 
     def _create_responses_sampling_params(self, serving):
         serving.default_chat_template_kwargs = None
-        rendered = MessageProcessingResult(
-            prompt="prompt",
-            prompt_ids=[1, 2, 3],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        )
+        rendered = RenderedPrompt(prompt=TokenPrompt([1, 2, 3]), template_stop=[])
         captured = {}
 
         async def fake_generate(
             request_id,
-            request_prompt,
             adapted_request,
             sampling_params,
             context,
@@ -403,14 +411,16 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
 
         with (
             patch.object(
-                serving, "_apply_conversation_template", return_value=rendered
+                input_processor(serving).renderer,
+                "_apply_conversation_template",
+                return_value=rendered,
             ),
             patch(
                 "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
             ) as parser_cls,
         ):
             parser_cls.return_value.parse_non_stream.return_value = (None, "done")
-            response = asyncio.run(serving.create_responses(request))
+            response = asyncio.run(sync_serving(serving).create_responses(request))
 
         self.assertEqual(response.status, "completed")
         return captured["sampling_params"]
@@ -529,7 +539,7 @@ class FullResponseUsageTestCase(CustomTestCase):
 class MultimodalRequestTestCase(CustomTestCase):
     def test_text_only_create_responses_rejects_media_before_generation(self):
         serving = make_serving()
-        serving._process_messages = Mock()
+        input_processor(serving).renderer.render = Mock()
         request = ResponsesRequest(
             model="x",
             input=[
@@ -547,21 +557,20 @@ class MultimodalRequestTestCase(CustomTestCase):
             store=False,
         )
 
-        response = asyncio.run(serving.create_responses(request))
+        response = asyncio.run(sync_serving(serving).create_responses(request))
 
         self.assertEqual(response.status_code, 400)
         self.assertIn(b"received unsupported content type 'image_url'", response.body)
-        serving._process_messages.assert_not_called()
+        input_processor(serving).renderer.render.assert_not_called()
         serving.tokenizer_manager.generate_request.assert_not_called()
 
     def test_multimodal_create_responses_sends_text_and_media_to_engine(self):
         serving = make_serving(is_multimodal=True)
         captured = {}
 
-        serving._process_messages = Mock(
-            return_value=MessageProcessingResult(
-                prompt="rendered multimodal prompt",
-                prompt_ids=[9, 9, 9],
+        input_processor(serving).prepare = Mock(
+            return_value=prepared_chat(
+                "rendered multimodal prompt",
                 image_data=["http://example.com/cat.png"],
                 audio_data=None,
                 video_data=None,
@@ -572,13 +581,11 @@ class MultimodalRequestTestCase(CustomTestCase):
 
         async def fake_generate(
             request_id,
-            request_prompt,
             adapted_request,
             sampling_params,
             context,
             **kwargs,
         ):
-            captured["request_prompt"] = request_prompt
             captured["adapted_request"] = adapted_request
             context.append_output(
                 {
@@ -611,10 +618,9 @@ class MultimodalRequestTestCase(CustomTestCase):
             store=False,
         )
 
-        response = asyncio.run(serving.create_responses(request))
+        response = asyncio.run(sync_serving(serving).create_responses(request))
 
         self.assertEqual(response.status, "completed")
-        self.assertEqual(captured["request_prompt"], "rendered multimodal prompt")
         self.assertEqual(captured["adapted_request"].text, "rendered multimodal prompt")
         self.assertIsNone(captured["adapted_request"].input_ids)
         self.assertEqual(
@@ -623,34 +629,95 @@ class MultimodalRequestTestCase(CustomTestCase):
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
     def test_multimodal_token_first_specs_route_through_prompt_ids(self):
-        """Bug regression: token-first encoders leave prompt == "" with
-        non-empty prompt_ids; forwarding the empty text 400s in
-        _tokenize_texts, so the multimodal branch must forward prompt_ids."""
-        for spec in ("inkling", "kimi_k3"):
+        """Multimodal requests must preserve custom-encoder token IDs;
+        an empty text prompt must not replace them."""
+        for spec in ("inkling", "kimi_k3", "custom_encoder"):
             with self.subTest(spec=spec):
                 serving = make_serving(is_multimodal=True)
                 serving.chat_encoding_spec = spec
-                serving._process_messages = Mock(
-                    return_value=MessageProcessingResult(
-                        prompt="",
-                        prompt_ids=[4, 5, 6],
-                        image_data=None,
-                        audio_data=None,
-                        video_data=None,
-                        modalities=[],
-                        stop=[],
-                    )
+                serving.template_manager.chat_template_name = None
+                input_processor(serving).renderer._encode_messages = Mock(
+                    return_value=[4, 5, 6]
                 )
                 request = ResponsesRequest(model="x", input="hi", store=False)
 
-                _, request_prompts, engine_prompts, _ = asyncio.run(
-                    serving._make_request(
+                _, processed = asyncio.run(
+                    sync_serving(serving)._make_request(
                         request, None, serving.tokenizer_manager.tokenizer
                     )
                 )
 
-                self.assertEqual(engine_prompts, [[4, 5, 6]])
-                self.assertEqual(request_prompts, [[4, 5, 6]])
+                self.assertEqual([prompt_value(processed)], [[4, 5, 6]])
+
+
+class EnginePromptTestCase(CustomTestCase):
+    def test_renderers_select_the_same_input_for_both_endpoints(self):
+        for template_name in (None, "chatml"):
+            for is_multimodal in (False, True):
+                with self.subTest(
+                    template_name=template_name, is_multimodal=is_multimodal
+                ):
+                    serving = make_serving(is_multimodal=is_multimodal)
+                    serving.template_manager.chat_template_name = template_name
+                    tokenizer = serving.tokenizer_manager.tokenizer
+                    tokenizer.apply_chat_template.return_value = "rendered prompt"
+                    tokenizer.decode.return_value = "decoded prompt"
+                    request = ResponsesRequest(model="x", input="hi", store=False)
+
+                    _, processed = asyncio.run(
+                        sync_serving(serving)._make_request(request, None, tokenizer)
+                    )
+                    expected = prompt_value(processed) if is_multimodal else [1, 2, 3]
+                    self.assertEqual(prompt_value(processed), expected)
+                    self.assertEqual([prompt_value(processed)], [expected])
+
+                    chat_request = ChatCompletionRequest(
+                        model="x", messages=[{"role": "user", "content": "hi"}]
+                    )
+                    adapted, _ = OpenAIServingChat._convert_to_internal_request(
+                        serving, chat_request
+                    )
+                    self.assertEqual(adapted.text, expected if is_multimodal else None)
+                    self.assertEqual(
+                        adapted.input_ids, None if is_multimodal else expected
+                    )
+
+    def test_endpoints_use_the_explicit_prompt_without_model_routing(self):
+        for engine_prompt in ("chosen text", [4, -1, 6]):
+            with self.subTest(engine_prompt=engine_prompt):
+                serving = make_serving(is_multimodal=True)
+                serving.chat_encoding_spec = "custom_encoder"
+                input_processor(serving).prepare = Mock(
+                    return_value=prepared_chat(
+                        engine_prompt,
+                        image_data=["image-data"],
+                        audio_data=None,
+                        video_data=None,
+                        modalities=["image"],
+                        stop=[],
+                    )
+                )
+                request = ResponsesRequest(model="x", input="hi", store=False)
+                _, processed = asyncio.run(
+                    sync_serving(serving)._make_request(
+                        request, None, serving.tokenizer_manager.tokenizer
+                    )
+                )
+                self.assertEqual([prompt_value(processed)], [engine_prompt])
+
+                chat_request = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "hi"}]
+                )
+                adapted, _ = OpenAIServingChat._convert_to_internal_request(
+                    serving, chat_request
+                )
+                if isinstance(engine_prompt, str):
+                    self.assertEqual(adapted.text, engine_prompt)
+                    self.assertIsNone(adapted.input_ids)
+                else:
+                    self.assertEqual(adapted.input_ids, engine_prompt)
+                    self.assertIsNone(adapted.text)
+                self.assertEqual(adapted.image_data, ["image-data"])
 
 
 class OutputItemsTestCase(CustomTestCase):
@@ -923,7 +990,7 @@ class EnginePassthroughTestCase(CustomTestCase):
     silently."""
 
     def _capture(self, serving, request):
-        # Let the real _process_messages run: it is the hop that turns
+        # Let the real prepare run: it is the hop that turns
         # skip_special_tokens off, so mocking it would make that assertion vacuous.
         # chat_template_name=None routes it through the tokenizer's template
         # (mocked) instead of the conversation registry, which has no fixture entry.
@@ -933,7 +1000,6 @@ class EnginePassthroughTestCase(CustomTestCase):
 
         async def fake_generate(
             request_id,
-            request_prompt,
             adapted_request,
             sampling_params,
             context,
@@ -954,7 +1020,7 @@ class EnginePassthroughTestCase(CustomTestCase):
             yield context
 
         serving._generate_with_builtin_tools = fake_generate
-        asyncio.run(serving.create_responses(request))
+        asyncio.run(sync_serving(serving).create_responses(request))
         return captured
 
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
@@ -1001,7 +1067,7 @@ class EnginePassthroughTestCase(CustomTestCase):
         self.assertFalse(captured["adapted_request"].require_reasoning)
 
     def test_skip_special_tokens_disabled_for_tool_requests(self):
-        # _process_messages turns it off so tool-call markers survive detokenize;
+        # prepare turns it off so tool-call markers survive detokenize;
         # create_responses must re-apply it to the engine sampling dict.
         serving = make_serving()
         serving.tool_call_parser = "qwen25"
@@ -1060,7 +1126,7 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
             stream=True,
             include=["message.output_text.logprobs"],
         )
-        result = asyncio.run(serving.create_responses(request))
+        result = asyncio.run(sync_serving(serving).create_responses(request))
         self.assertEqual(result.status_code, 400)
         body = orjson.loads(result.body)
         self.assertIn("streaming mode", body["error"]["message"])
