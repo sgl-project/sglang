@@ -67,6 +67,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     dsv4_state_payloads,
 )
@@ -378,6 +379,154 @@ class TestC4IndexerInitialization(unittest.TestCase):
         backend._ensure_npu_c4_indexer(indexer, torch.device("cpu"))
 
         self.assertEqual(indexer.compressor.li_kv_dtype, "float8")
+
+
+class TestC4IndexerCompatibility(unittest.TestCase):
+    @staticmethod
+    def _indexer(li_kv_dtype="int8"):
+        return SimpleNamespace(
+            n_heads=1,
+            head_dim=2,
+            layer_id=0,
+            compressor=SimpleNamespace(ratio=4, li_kv_dtype=li_kv_dtype),
+        )
+
+    def test_qli_fallback_dispatch_bypasses_fused_indexer(self):
+        backend = C4IndexerAscendBackendMixin.__new__(C4IndexerAscendBackendMixin)
+        backend.graph_mode = False
+        backend._dsv4_index_topk = 2
+        backend.token_to_kv_pool = MagicMock()
+        expected = torch.tensor([[1, 0]], dtype=torch.int32)
+        backend._forward_npu_int8_fallback = MagicMock(return_value=expected)
+        backend._forward_npu_fused = MagicMock()
+        forward_mode = MagicMock()
+        forward_mode.is_extend.return_value = False
+        forward_mode.is_target_verify.return_value = False
+        forward_mode.is_idle.return_value = False
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+
+        with envs.SGLANG_NPU_USE_QLI_FALLBACK.override(True):
+            result = backend._forward_indexer(
+                self._indexer(),
+                torch.zeros((1, 2)),
+                torch.zeros((1, 1, 2)),
+                torch.ones((1, 1)),
+                forward_batch,
+            )
+
+        self.assertIs(result, expected)
+        backend._forward_npu_int8_fallback.assert_called_once()
+        backend._forward_npu_fused.assert_not_called()
+
+    def test_qli_fallback_rejects_non_int8_cache(self):
+        backend = C4IndexerAscendBackendMixin.__new__(C4IndexerAscendBackendMixin)
+        backend.graph_mode = False
+        backend.token_to_kv_pool = MagicMock()
+        backend._forward_npu_fused = MagicMock()
+        forward_mode = MagicMock()
+        forward_mode.is_idle.return_value = False
+
+        with (
+            envs.SGLANG_NPU_USE_QLI_FALLBACK.override(True),
+            self.assertRaisesRegex(RuntimeError, "requires an INT8 KV cache"),
+        ):
+            backend._forward_indexer(
+                self._indexer("float8"),
+                torch.zeros((1, 2)),
+                torch.zeros((1, 1, 2)),
+                torch.ones((1, 1)),
+                SimpleNamespace(forward_mode=forward_mode),
+            )
+
+        backend._forward_npu_fused.assert_not_called()
+
+    def test_qli_fallback_uses_logical_pages_and_masks_partial_tail(self):
+        backend = C4IndexerAscendBackendMixin.__new__(C4IndexerAscendBackendMixin)
+        backend._dsv4_index_topk = 4
+        backend.forward_metadata = SimpleNamespace(
+            actual_seq_lengths_q_pa_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            actual_seq_lengths_kv=torch.tensor([15], dtype=torch.int32),
+            c4_page_table=torch.tensor([[1, 0]], dtype=torch.int32),
+        )
+        # Logical C4 order is physical page 1 followed by physical page 0.
+        # Logical index 3 has the highest raw score but belongs to the
+        # incomplete 4-token tail and must not be selected.
+        k = torch.tensor(
+            [
+                [[[3, 0]], [[100, 0]]],
+                [[[1, 0]], [[2, 0]]],
+            ],
+            dtype=torch.int8,
+        )
+        scale = torch.ones((2, 2, 1, 1), dtype=torch.float32)
+        q = torch.tensor([[[1.0, 0.0]]])
+        weights = torch.ones((1, 1))
+        forward_batch = SimpleNamespace(positions=torch.tensor([14]))
+
+        result = backend._forward_npu_int8_fallback(
+            self._indexer(), q, k, scale, weights, forward_batch
+        )
+
+        self.assertEqual(result.tolist(), [[2, 1, 0, -1]])
+        self.assertEqual(result.dtype, torch.int32)
+
+    def test_qli_fallback_graph_dispatch_bypasses_fused_indexer(self):
+        backend = C4IndexerAscendBackendMixin.__new__(C4IndexerAscendBackendMixin)
+        backend.graph_mode = True
+        backend._dsv4_index_topk = 2
+        backend.token_to_kv_pool = MagicMock()
+        expected = torch.tensor([[1, 0]], dtype=torch.int32)
+        backend._forward_npu_int8_fallback_graph = MagicMock(return_value=expected)
+        backend._forward_npu_int8_fallback = MagicMock()
+        backend._forward_npu_fused = MagicMock()
+        forward_mode = MagicMock()
+        forward_mode.is_extend.return_value = False
+        forward_mode.is_target_verify.return_value = False
+        forward_mode.is_idle.return_value = False
+
+        with envs.SGLANG_NPU_USE_QLI_FALLBACK.override(True):
+            result = backend._forward_indexer(
+                self._indexer(),
+                torch.zeros((1, 2)),
+                torch.zeros((1, 1, 2)),
+                torch.ones((1, 1)),
+                SimpleNamespace(forward_mode=forward_mode),
+            )
+
+        self.assertIs(result, expected)
+        backend._forward_npu_int8_fallback_graph.assert_called_once()
+        backend._forward_npu_int8_fallback.assert_not_called()
+        backend._forward_npu_fused.assert_not_called()
+
+    def test_qli_graph_fallback_uses_device_metadata(self):
+        backend = C4IndexerAscendBackendMixin.__new__(C4IndexerAscendBackendMixin)
+        backend._dsv4_index_topk = 4
+        backend.forward_metadata = SimpleNamespace(
+            actual_seq_lengths_kv=torch.tensor([15, 8], dtype=torch.int32),
+            c4_page_table=torch.tensor([[1, 0], [2, -1]], dtype=torch.int32),
+        )
+        k = torch.tensor(
+            [
+                [[[3, 0]], [[100, 0]]],
+                [[[1, 0]], [[2, 0]]],
+                [[[4, 0]], [[5, 0]]],
+            ],
+            dtype=torch.int8,
+        )
+        scale = torch.ones((3, 2, 1, 1), dtype=torch.float32)
+        q = torch.tensor([[[1.0, 0.0]]] * 4)
+        weights = torch.ones((4, 1))
+        forward_batch = SimpleNamespace(positions=torch.tensor([7, 14, 3, 7]))
+
+        result = backend._forward_npu_int8_fallback_graph(
+            self._indexer(), q, k, scale, weights, forward_batch
+        )
+
+        self.assertEqual(
+            result.tolist(),
+            [[1, 0, -1, -1], [2, 1, 0, -1], [0, -1, -1, -1], [1, 0, -1, -1]],
+        )
+        self.assertEqual(result.dtype, torch.int32)
 
 
 class TestWalshHadamardMatrix(unittest.TestCase):
@@ -732,6 +881,7 @@ class TestSparseAttentionMetadata(unittest.TestCase):
             with (
                 self.subTest(is_arch35=is_arch35),
                 patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
+                envs.SGLANG_NPU_USE_QLI_FALLBACK.override(False),
                 patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
                 patch("torch.ops.npu", MagicMock(), create=True),
             ):

@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # stored unquantized, so the kernels need both dimensions spelled out.
 _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
+_NPU_QLI_FALLBACK_MAX_SCORE_ELEMENTS = 16 * 1024 * 1024
 
 
 def _sparse_attn_ops():
@@ -713,6 +714,31 @@ class C4IndexerAscendBackendMixin:
             li_kv_scale = self.token_to_kv_pool.get_compress_dequant_scale_buffer(
                 c4_indexer.layer_id, True
             )
+            if envs.SGLANG_NPU_USE_QLI_FALLBACK.get():
+                if li_kv_dtype != "int8":
+                    raise RuntimeError(
+                        "The NPU QLI fallback requires an INT8 KV cache, "
+                        f"but got {li_kv_dtype}."
+                    )
+                if not getattr(self, "_npu_qli_fallback_logged", False):
+                    logger.warning(
+                        "Using the NPU QuantLightningIndexer fallback; "
+                        "the fused QLI operator is disabled."
+                    )
+                    self._npu_qli_fallback_logged = True
+                fallback_forward = (
+                    self._forward_npu_int8_fallback_graph
+                    if self.graph_mode
+                    else self._forward_npu_int8_fallback
+                )
+                return fallback_forward(
+                    c4_indexer,
+                    q,
+                    li_cmp_kv,
+                    li_kv_scale,
+                    weights,
+                    forward_batch,
+                )
             return self._forward_npu_fused(
                 c4_indexer, q, li_cmp_kv, li_kv_scale, weights, forward_batch
             )
@@ -782,6 +808,186 @@ class C4IndexerAscendBackendMixin:
             )
             topk_idxs.append(topk_idx)
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
+
+    def _forward_npu_int8_fallback(
+        self,
+        c4_indexer,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Eager fallback for runtimes that cannot use the fused QLI operator."""
+        fm = self.forward_metadata
+        cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
+        if isinstance(cu_q_cpu, torch.Tensor):
+            cu_q_cpu = cu_q_cpu.tolist()
+        if cu_q_cpu is None or int(cu_q_cpu[-1]) != q.shape[0]:
+            raise RuntimeError(
+                "Invalid query offsets for the NPU QLI fallback: "
+                f"offsets={cu_q_cpu}, query_tokens={q.shape[0]}"
+            )
+
+        kv_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
+        if kv_lens_cpu is None:
+            kv_lens_cpu = fm.actual_seq_lengths_kv.cpu().tolist()
+        elif isinstance(kv_lens_cpu, torch.Tensor):
+            kv_lens_cpu = kv_lens_cpu.tolist()
+        request_count = len(cu_q_cpu) - 1
+        if len(kv_lens_cpu) < request_count:
+            raise RuntimeError(
+                "Invalid KV lengths for the NPU QLI fallback: "
+                f"kv_lengths={kv_lens_cpu}, request_count={request_count}"
+            )
+
+        ratio = c4_indexer.compressor.ratio
+        page_table = fm.c4_page_table
+        page_size = k.shape[1]
+        flat_k = k.flatten(0, 1)
+        flat_scale = k_scale.flatten(0, 1)
+        output = torch.full(
+            (q.shape[0], self._dsv4_index_topk),
+            -1,
+            dtype=torch.int32,
+            device=q.device,
+        )
+
+        for request_idx in range(request_count):
+            query_start = int(cu_q_cpu[request_idx])
+            query_end = int(cu_q_cpu[request_idx + 1])
+            query_count = query_end - query_start
+            compressed_len = int(kv_lens_cpu[request_idx]) // ratio
+            if compressed_len == 0:
+                continue
+
+            kv_indices = _get_kv_indices(
+                forward_batch,
+                compressed_len,
+                page_table,
+                request_idx,
+                compressed_len,
+                page_size=page_size,
+            ).to(torch.int64)
+            kv = flat_k.index_select(0, kv_indices).squeeze(1).to(q.dtype)
+            scale = (
+                flat_scale.index_select(0, kv_indices)
+                .reshape(compressed_len, 1)
+                .to(q.dtype)
+            )
+            kv = kv * scale
+
+            score_elements_per_query = c4_indexer.n_heads * compressed_len
+            query_chunk_size = max(
+                1,
+                min(
+                    query_count,
+                    _NPU_QLI_FALLBACK_MAX_SCORE_ELEMENTS // score_elements_per_query,
+                ),
+            )
+            logical_k = torch.arange(compressed_len, device=q.device)
+            for chunk_start in range(query_start, query_end, query_chunk_size):
+                chunk_end = min(query_end, chunk_start + query_chunk_size)
+                index_score = torch.einsum("qhd,kd->qhk", q[chunk_start:chunk_end], kv)
+                index_score = (
+                    index_score.relu_() * weights[chunk_start:chunk_end].unsqueeze(-1)
+                ).sum(dim=1)
+                if getattr(c4_indexer, "enable_indexer_tp", False):
+                    parallel = get_parallel()
+                    if parallel.attn_tp_size > 1:
+                        parallel.attn_tp_group.all_reduce(index_score)
+
+                valid_len = torch.div(
+                    forward_batch.positions[chunk_start:chunk_end] + 1,
+                    ratio,
+                    rounding_mode="floor",
+                ).clamp(max=compressed_len)
+                valid_mask = logical_k.unsqueeze(0) < valid_len.unsqueeze(1)
+                index_score.masked_fill_(~valid_mask, float("-inf"))
+                selected_count = min(self._dsv4_index_topk, compressed_len)
+                topk_idx = index_score.topk(selected_count, dim=-1).indices
+                topk_idx = torch.where(topk_idx < valid_len.unsqueeze(1), topk_idx, -1)
+                topk_idx = F.pad(
+                    topk_idx,
+                    (0, self._dsv4_index_topk - selected_count),
+                    value=-1,
+                )
+                output[chunk_start:chunk_end].copy_(topk_idx.to(torch.int32))
+
+        return output
+
+    def _forward_npu_int8_fallback_graph(
+        self,
+        c4_indexer,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Fixed-shape indexer fallback for NPU graph capture and replay."""
+        fm = self.forward_metadata
+        page_table = fm.c4_page_table
+        batch_size, page_count = page_table.shape
+        if q.shape[0] % batch_size != 0:
+            raise RuntimeError(
+                "Invalid graph query layout for the NPU QLI fallback: "
+                f"tokens={q.shape[0]}, batch_size={batch_size}"
+            )
+
+        queries_per_request = q.shape[0] // batch_size
+        page_size = k.shape[1]
+        max_compressed_len = page_count * page_size
+        safe_pages = page_table.clamp_min(0).to(torch.int64).flatten()
+        kv = (
+            k.index_select(0, safe_pages)
+            .reshape(batch_size, max_compressed_len, k.shape[-1])
+            .to(q.dtype)
+        )
+        scale = (
+            k_scale.index_select(0, safe_pages)
+            .reshape(batch_size, max_compressed_len)
+            .to(q.dtype)
+        )
+
+        q = q.reshape(batch_size, queries_per_request, c4_indexer.n_heads, q.shape[-1])
+        weights = weights.reshape(batch_size, queries_per_request, c4_indexer.n_heads)
+        index_score = torch.bmm(q.flatten(1, 2), kv.transpose(1, 2)).reshape(
+            batch_size,
+            queries_per_request,
+            c4_indexer.n_heads,
+            max_compressed_len,
+        )
+        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        index_score = index_score * scale.unsqueeze(1)
+        if getattr(c4_indexer, "enable_indexer_tp", False):
+            parallel = get_parallel()
+            if parallel.attn_tp_size > 1:
+                parallel.attn_tp_group.all_reduce(index_score)
+
+        ratio = c4_indexer.compressor.ratio
+        compressed_lens = torch.div(
+            fm.actual_seq_lengths_kv, ratio, rounding_mode="floor"
+        ).clamp(max=max_compressed_len)
+        valid_lens = torch.div(
+            forward_batch.positions.reshape(batch_size, queries_per_request) + 1,
+            ratio,
+            rounding_mode="floor",
+        )
+        valid_lens = torch.minimum(valid_lens, compressed_lens.unsqueeze(1))
+        logical_k = torch.arange(max_compressed_len, device=q.device)
+        valid_mask = logical_k < valid_lens.unsqueeze(-1)
+        index_score.masked_fill_(~valid_mask, float("-inf"))
+
+        selected_count = min(self._dsv4_index_topk, max_compressed_len)
+        topk_idx = index_score.topk(selected_count, dim=-1).indices
+        topk_idx = torch.where(topk_idx < valid_lens.unsqueeze(-1), topk_idx, -1)
+        topk_idx = topk_idx.reshape(q.shape[0] * q.shape[1], selected_count)
+        return F.pad(
+            topk_idx,
+            (0, self._dsv4_index_topk - selected_count),
+            value=-1,
+        ).to(torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
         # A5's lightning indexer consumes FP8 K + fp32 scales; pre-A5 stays int8.
