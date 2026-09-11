@@ -3134,8 +3134,8 @@ class DeepseekSparseAttnBackend(
         metadata = forward_batch.attn_dcp_metadata
         assert metadata is not None, "DCP sparse extend requires prefix metadata"
         kv_a = k.view(k.shape[0], -1)
-        # NoPE get_mla_kv_buffer returns None for the positional component.
-        k_pe = kv_a.new_empty((kv_a.shape[0], 1, 0))
+        # NoPE has an empty positional key component.
+        k_pe = kv_a[:, None, :0]
         kv_full, _ = all_gather_kv_cache_for_mha_extend(
             self.token_to_kv_pool,
             layer,

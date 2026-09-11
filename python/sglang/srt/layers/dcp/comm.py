@@ -207,6 +207,9 @@ def all_gather_kv_cache_for_mha_extend(
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
         attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
+    # NoPE pools return None for the positional key component.
+    if prefix_k_pe is None:
+        prefix_k_pe = prefix_kv_a[..., :0]
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
@@ -280,6 +283,8 @@ def all_gather_kv_cache_for_mla_extend(
         attn_mqa,
         dcp_local_prefix_kv_indices,
     )
+    if cache_k_rope is None:
+        cache_k_rope = cache_k_nope[..., :0]
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
     gathered_kv = all_gather_kv_cache_for_dcp(
@@ -306,16 +311,13 @@ def all_gather_kv_cache_for_mla_extend(
 # all gather kv cache and re-org to query orders
 def all_gather_kv_cache_for_dcp(
     prefix_kv_a: torch.Tensor,
-    prefix_k_pe: Optional[torch.Tensor],
+    prefix_k_pe: torch.Tensor,
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
 ):
     """
     prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
     """
-    if prefix_k_pe is None:
-        prefix_k_pe = prefix_kv_a.new_empty((*prefix_kv_a.shape[:-1], 0))
-
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
