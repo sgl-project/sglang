@@ -340,16 +340,18 @@ void apply_rotary_embedding_single_kernel_impl(
 at::Tensor apply_rotary_embedding_cpu(const at::Tensor& input, const at::Tensor& cos, const at::Tensor& sin) {
   const int64_t input_dim = input.dim();
 
-  TORCH_CHECK(input_dim == 3 || input_dim == 4, "expects input to be [S, H, D] or [B, S, H, D]")
+  TORCH_CHECK(input_dim == 3 || input_dim == 4, "expects input to be [S, H, D] or [B, S, H, D]");
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
 
-  CHECK_DIM(2, cos);
-  CHECK_DIM(2, sin);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(cos);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(sin);
-
+  const int64_t seqlen = input_dim == 3 ? input.size(0) : input.size(1);
   const int64_t head_size = input.size(-1);
-  const int64_t num_tokens = input_dim == 3 ? input.size(0) : input.size(1);
+
+  TORCH_CHECK(head_size % 2 == 0, "head_size must be even");
+
+  CHECK_INPUT_SHAPE_DTYPE<false>(cos, {seqlen, head_size / 2}, cos.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<false>(sin, {seqlen, head_size / 2}, sin.scalar_type());
+  CHECK_EQ(cos.scalar_type(), sin.scalar_type());
+
   const auto input_dtype = input.scalar_type();
   const auto param_dtype = cos.scalar_type();
 
