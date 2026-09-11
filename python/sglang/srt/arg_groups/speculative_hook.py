@@ -874,6 +874,13 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "HYV4ForCausalLM",
         # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
         "Qwen4ExpForConditionalGeneration",
+        # So does Qwen3.5: all four of these target loaders skip `mtp` weights,
+        # which are in the checkpoint only for the draft worker to pick up via
+        # the Qwen3_5ForCausalLMMTP rewrite in ModelConfig._config_draft_model.
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(
@@ -892,7 +899,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "PixtralForConditionalGeneration",
             ]:
                 logger.warning(
-                    "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    "%s bundles its MTP draft in the target checkpoint, so "
+                    "--speculative-draft-model-path is not required.",
+                    model_arch,
                 )
 
     if not cfg.speculative_adaptive and cfg.speculative_num_steps is None:
