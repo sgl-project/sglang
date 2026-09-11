@@ -424,7 +424,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # this common code keeps the original behavior (decode never skips
             # the indexer, i.e. always runs the full logits path) because the
             # decode k-only path has not been validated on CUDA yet. Mirrors the
-            # is_hip() gate on dsa_dual_graph in decode_cuda_graph_runner, which
+            # is_hip() gate in create_attention_graph_variants, which
             # already prevents the CUDA capture path from setting a "dense"
             # variant.
             if not _is_hip:
@@ -440,10 +440,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 # at replay. The capture-variant signal tells us which one to
                 # bake in.
                 from sglang.srt.model_executor.runner_utils.capture_mode import (
-                    get_capture_dsa_variant,
+                    get_capture_attention_variant,
                 )
 
-                variant = get_capture_dsa_variant()
+                variant = get_capture_attention_variant()
                 if variant == "dense":
                     return True
                 if variant == "sparse":

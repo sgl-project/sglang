@@ -128,7 +128,7 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         forward,
         stream_idx=None,
         variant_label=None,
-        dsa_variant=None,
+        attention_variant=None,
     ):
         """capture one CUDA graph with/out UNO LoRA."""
         if self._tree_draft_mode:
@@ -139,7 +139,7 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
                     forward,
                     stream_idx,
                     None,
-                    dsa_variant,
+                    attention_variant,
                 )
             finally:
                 self._lora_state.reset()
@@ -152,7 +152,7 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
                     forward,
                     stream_idx,
                     None,
-                    dsa_variant,
+                    attention_variant,
                 )
             finally:
                 self.model_runner.lora_manager.reset_lora_batch()
@@ -169,7 +169,7 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             forward,
             stream_idx,
             variant_label,
-            dsa_variant,
+            attention_variant,
         )
         self._lora_state.reset()
 

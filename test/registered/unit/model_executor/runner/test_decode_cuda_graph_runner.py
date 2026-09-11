@@ -1,4 +1,4 @@
-"""Unit tests for ``DecodeCudaGraphRunner`` capture-phase profiling — CPU-only.
+"""Unit tests for ``DecodeCudaGraphRunner`` capture profiling and variant dispatch — CPU-only.
 
 Two capture-trace modes plus their precedence:
 
@@ -25,13 +25,16 @@ server is constructed.
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.layers.attention.dsa.indexer_capture import DsaGraphVariants
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -291,6 +294,61 @@ class TestOriginalTraceExport(CustomTestCase):
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
                 )
+
+
+class TestCaptureVariants(CustomTestCase):
+    def test_capture_order_and_draft_runner_without_variants(self):
+        module = "sglang.srt.model_executor.runner.decode_cuda_graph_runner"
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.attention_graph_variants = DsaGraphVariants(16)
+        runner.record_nolora_graph = True
+        runner.capture_bs = [1, 8]
+        runner.compile_bs = []
+        runner.captured_req_width = 1
+        runner.model_runner = SimpleNamespace(
+            device="cpu", gpu_id=0, model=object(), tp_group=object()
+        )
+        captured = []
+
+        def capture(size, forward, stream_idx, lora, attention=None):
+            self.assertEqual(capture_mode.get_capture_attention_variant(), attention)
+            self.assertEqual(capture_mode.get_capture_lora_variant(), lora)
+            captured.append((size, lora, attention))
+
+        with (
+            mock.patch(f"{module}.get_available_gpu_memory", return_value=1),
+            mock.patch(
+                f"{module}.get_parallel", return_value=SimpleNamespace(tp_rank=1)
+            ),
+            mock.patch(
+                f"{module}.torch_compile_decoration.patch_model",
+                side_effect=lambda *a, **kw: nullcontext(None),
+            ),
+        ):
+            try:
+                runner.capture_one_shape = capture
+                runner._capture_one_stream()
+                self.assertEqual(
+                    captured,
+                    [
+                        (size, lora, attention)
+                        for size in (8, 1)
+                        for lora in ("lora", "nolora")
+                        for attention in ("dense", "sparse")
+                    ],
+                )
+                self.assertIsNone(capture_mode.get_capture_attention_variant())
+                del runner.attention_graph_variants
+                runner.record_nolora_graph = False
+                captured.clear()
+                runner.capture_one_shape = lambda size, forward, stream, lora: capture(
+                    size, forward, stream, lora
+                )
+                runner._capture_one_stream()
+                self.assertEqual(captured, [(8, None, None), (1, None, None)])
+            finally:
+                capture_mode._set_capture_lora_variant(None)
+                capture_mode._set_capture_attention_variant(None)
 
 
 if __name__ == "__main__":
