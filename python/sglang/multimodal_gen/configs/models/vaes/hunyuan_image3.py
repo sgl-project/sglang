@@ -5,8 +5,6 @@ from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAECon
 
 @dataclass
 class HunyuanImage3VAEArchConfig(VAEArchConfig):
-    """VAE architecture config for HunyuanImage-3."""
-
     spatial_compression_ratio: int = 16
 
     # VAE architecture params
@@ -36,8 +34,6 @@ class HunyuanImage3VAEArchConfig(VAEArchConfig):
 
 @dataclass
 class HunyuanImage3VAEConfig(VAEConfig):
-    """VAE config for HunyuanImage-3."""
-
     arch_config: HunyuanImage3VAEArchConfig = field(
         default_factory=HunyuanImage3VAEArchConfig
     )

@@ -18,8 +18,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 @dataclass
 class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
-    """HunyuanImage-3 pipeline config."""
-
     vae_precision: str = "fp32"
 
     should_use_guidance: bool = True
@@ -42,8 +40,7 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
         self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
 
     def supports_dynamic_batching(self):
-        # The AR stage batches compatible requests in one diffusion loop
-        # (run_grouped_requests), falling back to single-request execution.
+        # The AR stage batches compatible requests in one diffusion loop.
         return True
 
     def supports_native_grouped_requests(self):
@@ -52,13 +49,9 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
     def calculate_condition_image_size(self, image, width, height):
         """Let the native processor choose the conditional-image bucket.
 
-        ``InputValidationStage`` normally resizes image-to-image inputs and
-        snaps the output canvas to a generic ``2 * vae_scale`` grid.  That is
-        not valid for HunyuanImage-3: its processor derives independent VAE
-        and vision inputs from the original image and accepts a 16-pixel
-        output grid.  Applying the generic resize first can therefore alter a
-        requested or reference aspect ratio before the native processor sees
-        it.
+        The generic resize snaps to a ``2 * vae_scale`` grid, but this model's
+        processor derives VAE and vision inputs from the original image and
+        accepts a 16-px grid; resizing first can alter the aspect ratio.
         """
         del image, width, height
         return None
@@ -69,8 +62,8 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
         return None
 
     def supports_batching_image_conditioning(self):
-        # TI2I requests carry per-request conditioning (per-row masks/scatter/
-        # RoPE); requests are bucketed by resolution and condition-image count.
+        # TI2I requests carry per-request conditioning (masks/scatter/RoPE);
+        # requests are bucketed by resolution and condition-image count.
         return True
 
     def supports_sequential_dit_inference(self):

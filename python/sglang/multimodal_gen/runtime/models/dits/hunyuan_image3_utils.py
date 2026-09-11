@@ -1,7 +1,6 @@
 """Attention metadata and 2D RoPE helpers for HunyuanImage-3.
 
-Ported from the official HunyuanImage-3 model repository
-(`modeling_hunyuan_image_3.py`).
+Ported from the official repository (``modeling_hunyuan_image_3.py``).
 """
 
 import math
@@ -13,7 +12,6 @@ import torch.nn.functional as F
 
 
 def timestep_embedding(t, dim, max_period=10000):
-    """Create sinusoidal timestep embeddings."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(max_period)
@@ -55,13 +53,10 @@ def rotate_half(x):
 def apply_rotary_pos_emb(q, k, cos, sin):
     """Apply 2D RoPE with the official tiled angle layout.
 
-    ``cos``/``sin`` come from ``build_2d_rope`` already expanded to the full
-    head dimension (its trailing ``.repeat(1, 2)``), shaped [seq, head_dim] or
-    [batch, seq, head_dim]. ``rotate_half`` pairs dim ``i`` with dim
-    ``i + head_dim/2`` and both carry the same angle, exactly like the
-    reference implementation. ``q``/``k`` are [batch, seq, heads, head_dim];
-    batched cos/sin broadcast per row so requests with different image layouts
-    in one batch keep their own positions.
+    ``cos``/``sin`` from ``build_2d_rope`` are already expanded to full
+    head_dim ([seq, head_dim] or [batch, seq, head_dim]); batched tables
+    broadcast per row so requests with different layouts keep their own
+    positions. ``q``/``k`` are [batch, seq, heads, head_dim].
     """
     if cos.dim() == 2:
         cos = cos.unsqueeze(0)
@@ -72,8 +67,6 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
 
 class HunYuanRotary2DEmbedder:
-    """2D RoPE wrapper for HunyuanImage-3 attention."""
-
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -100,7 +93,6 @@ class HunYuanRotary2DEmbedder:
 
         q, k = apply_rotary_pos_emb(q.to(torch.float32), k.to(torch.float32), cos, sin)
 
-        # Restore packed shape in bfloat16
         q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(torch.bfloat16)
         k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(torch.bfloat16)
         hidden_states = hidden_states.reshape(hidden_states_shape)
@@ -145,8 +137,8 @@ def build_2d_rope(
                 pass
             beta_y = L + (w * h - h) / 2
             beta_x = L + (w * h - w) / 2
-            # linspace(a, b, n+1)[:n] == arange(a, a+n); kept as-is for
-            # bit-parity with the official implementation
+            # linspace(a, b, n+1)[:n] == arange(a, a+n); kept for bit-parity
+            # with the official implementation
             y_axis = torch.linspace(
                 beta_y, beta_y + h, h + 1, dtype=torch.float32, device=device
             )[:h]
@@ -168,10 +160,9 @@ def build_2d_rope(
     y_pos = y_pos[:seq_len]
     all_pos = torch.stack((y_pos, x_pos), dim=1).unsqueeze(1).to(device)  # [seq_len, 1, 2]
 
-    # Tile the half-dim angle table up to head_dim (official layout):
-    # rotate_half pairs dim i with dim i + n_elem/2 and both must carry the
-    # SAME angle; expanding by interleaving instead pairs mismatched
-    # frequencies and garbles positional encoding.
+    # Tile the half-dim angles up to head_dim (official layout): rotate_half
+    # pairs dim i with dim i + n_elem/2, both carrying the SAME angle;
+    # interleaved expansion pairs mismatched frequencies and garbles positions.
     idx_theta = (all_pos * theta).reshape(all_pos.shape[0], n_elem // 2).repeat(1, 2)
     cos = torch.cos(idx_theta)
     sin = torch.sin(idx_theta)
@@ -185,7 +176,6 @@ def build_batch_2d_rope(
     device: Optional[torch.device] = None,
     base: int = 10000,
 ):
-    """Build batched 2D RoPE cos/sin tables."""
     cos_list, sin_list = [], []
     if image_infos is None:
         image_infos = [None]
@@ -200,8 +190,6 @@ def build_batch_2d_rope(
 
 
 class CachedRoPE:
-    """Caches 2D RoPE cos/sin tables across diffusion steps."""
-
     def __init__(self, rope_theta: float, head_dim: int, rope_type: str = "2d"):
         # "2d" and "default" are the official spellings of the same scheme;
         # anything else in a checkpoint config would silently get wrong RoPE.

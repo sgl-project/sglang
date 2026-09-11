@@ -18,10 +18,9 @@ def build_hunyuan_image3_output_geometry(
 ) -> dict[str, object]:
     """Create a request-local output contract before native bucketing.
 
-    ``width`` and ``height`` are the user-visible target geometry (or the
-    unmodified reference geometry for an edit with no explicit size), not the
-    processor-selected bucket.  Keeping this dictionary on ``Req.extra`` makes
-    it safe to use with cloned requests and decoder disaggregation.
+    ``width``/``height`` are the user-visible target geometry, not the
+    processor-selected bucket. Kept on ``Req.extra`` so it is safe with
+    cloned requests and decoder disaggregation.
     """
     width, height = int(width), int(height)
     if width <= 0 or height <= 0:
@@ -68,9 +67,8 @@ def resolve_hunyuan_image3_output_resolution(
 ) -> tuple[int, int]:
     """Return the raw target size used for native aspect-ratio bucketing.
 
-    Explicit dimensions take precedence. Image editing without an explicit
-    size inherits the unmodified reference size instead of the generic
-    1280x720 pipeline default.
+    Explicit dimensions take precedence; editing without an explicit size
+    inherits the reference size instead of the 1280x720 pipeline default.
     """
     if reference_size is not None and not {"width", "height"} & explicit_fields:
         width, height = reference_size

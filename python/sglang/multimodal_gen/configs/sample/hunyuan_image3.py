@@ -31,15 +31,13 @@ SYSTEM_PROMPT_PRESETS = {
 
 @dataclass
 class HunyuanImage3SamplingParams(SamplingParams):
-    """Sampling parameters for HunyuanImage-3."""
-
     negative_prompt: str = ""
     num_frames: int = 1
     guidance_scale: float = 2.5
     num_inference_steps: int = 50
 
-    # Tokenizer bot_task: controls the bot response prefix. Default "image"
-    # adds no bot prefix for gen_image mode.
+    # Tokenizer bot_task: controls the bot response prefix; "image" adds
+    # no bot prefix in gen_image mode.
     bot_task: str = "image"
 
     # Preset name (see SYSTEM_PROMPT_PRESETS) or raw custom text.
@@ -48,9 +46,9 @@ class HunyuanImage3SamplingParams(SamplingParams):
     # Pre-generated CoT text from AR stage (think/recaption output)
     cot_text: str | None = None
 
-    # Output geometry is deliberately separate from the generation canvas.
-    # The AR processor chooses its own native bucket, then the decoder applies
-    # this request-scoped policy to the fully decoded pixels.
+    # Output geometry is separate from the generation canvas: the AR
+    # processor picks its own bucket, then the decoder applies this
+    # request-scoped policy to the decoded pixels.
     output_size_mode: str = "aspect_ratio"
     output_strategy: str = "native_crop"
     output_ratio_policy: str = "exact"
@@ -70,8 +68,8 @@ class HunyuanImage3SamplingParams(SamplingParams):
     )
 
     def _adjust(self, server_args):
-        # The processor's get_target_size() picks the bucket by aspect ratio;
-        # pre-aligning each dimension to a 16-px grid here would distort it.
+        # Pre-aligning each dimension to a 16-px grid here would distort the
+        # processor's aspect-ratio bucket selection.
         if self.bot_task not in VALID_BOT_TASKS:
             logger.warning(
                 f"Invalid bot_task '{self.bot_task}'. Must be one of {VALID_BOT_TASKS}. "

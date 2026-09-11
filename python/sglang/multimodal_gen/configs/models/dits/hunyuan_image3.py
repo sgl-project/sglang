@@ -53,8 +53,6 @@ class HunyuanImage3ArchConfig(DiTArchConfig):
 
 @dataclass
 class HunyuanImage3DitConfig(DiTConfig):
-    """DiT config for HunyuanImage-3."""
-
     arch_config: DiTArchConfig = field(default_factory=HunyuanImage3ArchConfig)
 
     prefix: str = "hunyuan_image3"

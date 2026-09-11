@@ -1,12 +1,9 @@
 """Tokenizer wrapper for HunyuanImage-3 within sglang.
 
-Provides ``HunyuanImage3TokenizerWrapper`` which wraps a base
-``PreTrainedTokenizerFast`` (loaded via ``AutoTokenizer`` *without*
-``trust_remote_code``) and implements the multimodal ``apply_chat_template``
-entry point needed for AR tokenization.
-
-The logic mirrors the ``TokenizerWrapper`` in vllm-omni but is entirely
-self-contained — no external dependency on vllm-omni.
+``HunyuanImage3TokenizerWrapper`` wraps a base ``PreTrainedTokenizerFast``
+(loaded via ``AutoTokenizer`` without ``trust_remote_code``) and implements
+the multimodal ``apply_chat_template`` entry point needed for AR tokenization.
+Mirrors vllm-omni's ``TokenizerWrapper`` but is entirely self-contained.
 """
 
 import random
@@ -24,12 +21,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# ImageInfo — lightweight copy compatible with the wrapper
-# ---------------------------------------------------------------------------
-
 class ImageInfo:
-    """Stores image metadata for the tokenizer (mirrors vllm-omni's class)."""
+    """Image metadata for the tokenizer (mirrors vllm-omni's class)."""
 
     def __init__(
         self,
@@ -97,12 +90,11 @@ class ImageInfo:
 
 
 class JointImageInfo:
-    """Stores dual VAE + ViT metadata for a conditional (joint) image.
+    """Dual VAE + ViT metadata for a conditional (joint) image.
 
-    Mirrors vllm-omni's ``JointImageInfo``.  The ``meta_info`` property
-    returns ``token_length`` as a list ``[vae_len, vit_len]`` so the
-    tokenizer's ``encode_sequence`` can lay out both VAE and ViT token
-    regions within a single ``joint_image`` section.
+    ``meta_info`` returns ``token_length`` as ``[vae_len, vit_len]`` so
+    ``encode_sequence`` can lay out both token regions within one
+    ``joint_image`` section.
     """
 
     def __init__(self, vae_image_info: ImageInfo, vision_image_info: ImageInfo,
@@ -151,10 +143,6 @@ class JointImageInfo:
         )
 
 
-# ---------------------------------------------------------------------------
-# TokenizerEncodeOutput
-# ---------------------------------------------------------------------------
-
 @dataclass
 class TokenizerEncodeOutput:
     tokens: torch.Tensor = None
@@ -178,32 +166,17 @@ class TokenizerEncodeOutput:
     joint_image_slices: list = None
 
 
-# ---------------------------------------------------------------------------
-# Conversation template
-# ---------------------------------------------------------------------------
-
 class _Conversation:
     roles: list = ["User", "Assistant"]
     sep: str = "\n\n"
 
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
 def _default(value, default_value):
     return value if value is not None else default_value
 
 
-# ---------------------------------------------------------------------------
-# Main wrapper
-# ---------------------------------------------------------------------------
-
 class HunyuanImage3TokenizerWrapper:
-    """Wraps a base HF tokenizer with multimodal ``apply_chat_template``.
-
-    Mirrors the vllm-omni ``TokenizerWrapper`` but is self-contained.
-    """
+    """HF tokenizer with multimodal ``apply_chat_template`` (vllm-omni parity)."""
 
     def __init__(self, tokenizer):
         from transformers import AutoTokenizer
@@ -213,7 +186,6 @@ class HunyuanImage3TokenizerWrapper:
         else:
             self.tokenizer = tokenizer
 
-        # Short names for special tokens
         self.bos_token_id = self.tokenizer.bos_token_id
         self.eos_token_id = self.tokenizer.eos_token_id
         self.pad_token_id = self.tokenizer.pad_token_id
@@ -228,8 +200,6 @@ class HunyuanImage3TokenizerWrapper:
         self.joint_img_sep_token_id = self.tokenizer.convert_tokens_to_ids("<joint_img_sep>")
         self.special_token_map = self.tokenizer.added_tokens_encoder
 
-    # -- padding helper -----------------------------------------------------
-
     @staticmethod
     def _pad(tensors, dim=0, pad_val=0):
         max_len = max(t.shape[dim] for t in tensors)
@@ -239,8 +209,6 @@ class HunyuanImage3TokenizerWrapper:
                 t = F.pad(t, (0, max_len - t.shape[dim]), value=pad_val)
             out.append(t)
         return out
-
-    # -- CoT section parser -------------------------------------------------
 
     def _get_cot_sections(self, cot_text, uncond_kwargs, drop_think=False):
         """Parse <think>/</think> or <recaption>/</recaption> blocks."""
@@ -277,8 +245,6 @@ class HunyuanImage3TokenizerWrapper:
                 + self._get_cot_sections(after, uncond_kwargs, drop_think)
             )
         return [dict(type="text", text=cot_text, **uncond_kwargs)]
-
-    # -- encode_text --------------------------------------------------------
 
     def encode_text(
         self,
@@ -330,8 +296,6 @@ class HunyuanImage3TokenizerWrapper:
             return text_tokens, lengths
         return text_tokens
 
-    # -- encode_sequence ----------------------------------------------------
-
     def encode_sequence(
         self,
         template,
@@ -353,7 +317,6 @@ class HunyuanImage3TokenizerWrapper:
         for v in token_source.values():
             assert isinstance(v, (list, tuple))
 
-        # Validate key counts match
         assert set(keys) == set(token_source.keys())
         _key_counts = {k: 0 for k in keys}
         for k in keys:
@@ -397,12 +360,10 @@ class HunyuanImage3TokenizerWrapper:
                 if drop_last is True and total_length is not None and token_count + extra_count + source["length"] > total_length:
                     drop_last_break = True
                     break
-                # <boi>
                 if source.get("front_boi", use_front_boi_token):
                     token_seq.append(self.boi_token_id)
                     extra["boi"].append(token_count)
                     token_count += 1
-                # image meta (timestep, guidance, image_shape)
                 token_count = self._add_image_meta_info_token(
                     token_seq, token_count, extra,
                     add_timestep_token=source.get("timestep", add_timestep_token),
@@ -416,7 +377,6 @@ class HunyuanImage3TokenizerWrapper:
                     token_seq.append(self.boi_token_id)
                     extra["boi"].append(token_count)
                     token_count += 1
-                # <img> * N + <eoi>
                 token_seq.extend([self.img_token_id] * source["length"] + [self.eoi_token_id])
                 extra["<img>_start"].append(token_count)
                 extra["<all_img>_start"].append(token_count)
@@ -441,12 +401,11 @@ class HunyuanImage3TokenizerWrapper:
                 if drop_last is True and total_length is not None and token_count + extra_count + vae_len + vit_len > total_length:
                     drop_last_break = True
                     break
-                # <boi>
                 if source.get("front_boi", use_front_boi_token):
                     token_seq.append(self.boi_token_id)
                     extra["boi"].append(token_count)
                     token_count += 1
-                # image meta (timestep, image_shape — no guidance for joint_image)
+                # image meta (timestep, image_shape; no guidance for joint_image)
                 token_count = self._add_image_meta_info_token(
                     token_seq, token_count, extra,
                     add_timestep_token=source.get("timestep", add_timestep_token),
@@ -460,7 +419,6 @@ class HunyuanImage3TokenizerWrapper:
                     token_seq.append(self.boi_token_id)
                     extra["boi"].append(token_count)
                     token_count += 1
-                # VAE <img> tokens
                 token_seq.extend([self.img_token_id] * vae_len)
                 extra["<vae_img>_start"].append(token_count)
                 extra["<joint_img>_start"].append(token_count)
@@ -468,11 +426,9 @@ class HunyuanImage3TokenizerWrapper:
                 token_count += vae_len
                 extra["<vae_img>_end"].append(token_count - 1)
                 extra["<all_img>_end"].append(token_count - 1)
-                # <joint_img_sep>
                 token_seq.append(self.joint_img_sep_token_id)
                 extra["joint_img_sep"].append(token_count)
                 token_count += 1
-                # ViT <img> tokens
                 token_seq.extend([self.img_token_id] * vit_len)
                 extra["<vit_img>_start"].append(token_count)
                 extra["<all_img>_start"].append(token_count)
@@ -480,7 +436,6 @@ class HunyuanImage3TokenizerWrapper:
                 extra["<vit_img>_end"].append(token_count - 1)
                 extra["<joint_img>_end"].append(token_count - 1)
                 extra["<all_img>_end"].append(token_count - 1)
-                # <eoi>
                 token_seq.append(self.eoi_token_id)
                 extra["eoi"].append(token_count)
                 token_count += 1
@@ -489,7 +444,6 @@ class HunyuanImage3TokenizerWrapper:
                 raise ValueError(f"Unsupported key: {key}")
             index_indicator[key] += 1
 
-        # EOS
         if add_eos is True and not drop_last_break:
             token_seq.append(self.eos_token_id)
             extra["eos"].append(token_count)
@@ -500,7 +454,6 @@ class HunyuanImage3TokenizerWrapper:
                 extra["eos"].append(token_count)
                 token_count += 1
 
-        # Truncate / pad to total_length
         if total_length:
             if token_count > total_length and drop_last:
                 for sk, ek in [
@@ -547,8 +500,6 @@ class HunyuanImage3TokenizerWrapper:
             extra_token_pos["guidance"].append(token_count)
             token_count += 1
         return token_count
-
-    # -- encode_general -----------------------------------------------------
 
     def encode_general(self, sections, max_token_length=None,
                        add_eos="auto", use_text_mask=True,
@@ -603,12 +554,10 @@ class HunyuanImage3TokenizerWrapper:
         )
         full_tensor = torch.tensor(full_token_seq, dtype=torch.long)
 
-        # Scatter indices
         timestep_idx = torch.tensor(extra["timestep"], dtype=torch.long) if "timestep" in extra else None
         gen_ts_idx = torch.tensor(extra["gen_timestep"], dtype=torch.long) if "gen_timestep" in extra else None
         cond_ts_idx = torch.tensor(extra["cond_timestep"], dtype=torch.long) if "cond_timestep" in extra else None
         
-        # Image slices / mask
         gen_image_slices = []
         gen_image_mask = None
         if "<img>_start" in extra and "<img>_end" in extra:
@@ -617,7 +566,6 @@ class HunyuanImage3TokenizerWrapper:
             for sl in gen_image_slices:
                 gen_image_mask[sl] = True
         
-        # Conditional (joint) image slices / mask
         joint_image_slices = []
         cond_vae_image_mask = None
         cond_vit_image_mask = None
@@ -636,17 +584,14 @@ class HunyuanImage3TokenizerWrapper:
         if "<joint_img>_start" in extra and "<joint_img>_end" in extra:
             joint_image_slices = [slice(s, e + 1) for s, e in zip(extra["<joint_img>_start"], extra["<joint_img>_end"])]
         
-        # All image slices
         all_image_slices = []
         if "<all_img>_start" in extra and "<all_img>_end" in extra:
             all_image_slices = [slice(s, e + 1) for s, e in zip(extra["<all_img>_start"], extra["<all_img>_end"])]
         
-        # Text slices
         text_slices = []
         if "<text>_start" in extra and "<text>_end" in extra:
             text_slices = [slice(s, e + 1) for s, e in zip(extra["<text>_start"], extra["<text>_end"])]
         
-        # Text mask
         text_mask = None
         if use_text_mask:
             text_mask = torch.zeros_like(full_tensor, dtype=torch.float32)
@@ -679,8 +624,6 @@ class HunyuanImage3TokenizerWrapper:
             uncond_cfg_start_pos=[extra.get("<cfg>_start", [None])[0]],
         )
 
-    # -- apply_chat_template ------------------------------------------------
-
     def apply_chat_template(
         self,
         batch_prompt=None,
@@ -698,7 +641,7 @@ class HunyuanImage3TokenizerWrapper:
         add_assistant_prefix=None,
         drop_think=False,
     ):
-        """Main entry point — mirrors vllm-omni ``TokenizerWrapper.apply_chat_template``."""
+        """Main entry point; mirrors vllm-omni ``apply_chat_template``."""
         assert bot_task in ["image", "auto", "think", "recaption", "img_ratio"]
 
         if batch_message_list is None:
@@ -743,8 +686,6 @@ class HunyuanImage3TokenizerWrapper:
         )
         return dict(output=output, sections=sections)
 
-    # -- apply_general_template (internal) ----------------------------------
-
     def _apply_general_template(
         self, message_list, max_length=None,
         add_assistant_prefix=False, answer="auto",
@@ -754,8 +695,8 @@ class HunyuanImage3TokenizerWrapper:
     ):
         if batchify:
             # One prompt slot per request: _batch_gen_infer zips prompt_list
-            # against the kwargs list, and a shorter prompt_list would
-            # silently truncate the batch to its first request.
+            # against the kwargs list; a shorter prompt_list would silently
+            # truncate the batch to its first request.
             return self._batch_gen_infer(
                 infer_fn=self._apply_general_template,
                 prompt_list=[[]] * len(message_list),
@@ -776,13 +717,11 @@ class HunyuanImage3TokenizerWrapper:
         conv = _Conversation()
         uncond_kwargs = dict(uncond_enabled=uncond_p == 1.0, uncond_p=uncond_p)
 
-        # Answer tags
         if (answer == "auto" and sequence_template == "instruct") or answer is True:
             answer_prefix, answer_suffix = "<answer>", "</answer>"
         else:
             answer_prefix, answer_suffix = "", ""
 
-        # Template formatting tokens
         if sequence_template == "pretrain":
             system_suffix = user_prefix = user_suffix = bot_prefix = bot_suffix = ""
         else:
@@ -792,7 +731,6 @@ class HunyuanImage3TokenizerWrapper:
             bot_prefix = f"{conv.roles[1]}: "
             bot_suffix = conv.sep
 
-        # Build sections
         sections: list[dict] = []
         cur_idx = 0
         final_role = None
@@ -810,7 +748,6 @@ class HunyuanImage3TokenizerWrapper:
                 if sub:
                     final_role = role
 
-        # Optional trailing assistant prefix
         if add_assistant_prefix:
             if final_role == "assistant":
                 _bot_prefix = ""
@@ -834,8 +771,6 @@ class HunyuanImage3TokenizerWrapper:
                 f"Encoded length {output.tokens.shape[-1]} exceeds max_length {max_length}."
             )
         return output, sections
-
-    # -- process successive messages of the same role -----------------------
 
     def _process_successive(self, message_list, cur_idx, role,
                             prefix, suffix, answer_prefix="", answer_suffix="",
@@ -880,8 +815,6 @@ class HunyuanImage3TokenizerWrapper:
             sub_sections.insert(0, dict(type="text", text=prefix))
             sub_sections.append(dict(type="text", text=suffix))
         return sub_sections, cur_idx
-
-    # -- batch_gen_infer (CFG batching) ------------------------------------
 
     def _batch_gen_infer(self, infer_fn, prompt_list, infer_fn_kwargs_list,
                          do_classifier_free_guidance=False,

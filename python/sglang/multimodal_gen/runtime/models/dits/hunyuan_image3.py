@@ -1,7 +1,6 @@
 """HunyuanImage-3 AR backbone + diffusion I/O for multimodal_gen.
 
-Ported from the official HunyuanImage-3 repository
-(`modeling_hunyuan_image_3.py`).
+Ported from the official HunyuanImage-3 repository (``modeling_hunyuan_image_3.py``).
 """
 
 import re
@@ -53,21 +52,16 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# Checkpoint weight names of the non-AR parts (VAE, ViT), skipped during
-# backbone weight loading.
+# Non-AR checkpoint weights (VAE, ViT), skipped during backbone loading.
 UNEXPECTED_KEYWORDS = [
     "vae",
     "vision_aligner",
     "vision_model",
 ]
 
-# =============================================================
-# Diffusion I/O helper functions and modules
-# (ported from official HunyuanImage-3 model repository)
-# =============================================================
+# Diffusion I/O helpers, ported from the official HunyuanImage-3 repository.
 
 def _conv_nd(dims, *args, **kwargs):
-    """Create a 1D, 2D, or 3D convolution module."""
     if dims == 1:
         return nn.Conv1d(*args, **kwargs)
     elif dims == 2:
@@ -78,14 +72,12 @@ def _conv_nd(dims, *args, **kwargs):
 
 
 def _zero_module(module):
-    """Zero out the parameters of a module and return it."""
     for p in module.parameters():
         p.detach().zero_()
     return module
 
 
 def _normalization(channels, **kwargs):
-    """GroupNorm normalization."""
     return nn.GroupNorm(32, channels, **kwargs)
 
 
@@ -216,8 +208,6 @@ class _ResBlock(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
-    """Embeds scalar timesteps into vector representations."""
-
     def __init__(self, hidden_size, act_layer=nn.GELU, frequency_embedding_size=256,
                  max_period=10000, out_size=None, dtype=None, device=None):
         factory_kwargs = {"dtype": dtype, "device": device}
@@ -384,9 +374,8 @@ class HunYuanMLP(nn.Module):
 
 
 class HunYuanSparseMoeBlock(nn.Module):
-    """Sparse MoE block using SRT FusedMoE with separate TopK routing.
+    """Sparse MoE block: TopK does softmax + top-k routing, FusedMoE the experts.
 
-    TopK handles softmax + top-k routing, FusedMoE handles expert computation.
     A separate shared MLP (when present) is always applied to all tokens.
     """
 
@@ -447,24 +436,16 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Router logits: [num_tokens, num_experts]
         router_logits, _ = self.gate(hidden_states)
-
-        # TopK routing: softmax + top-k selection
         topk_output = self.topk(hidden_states, router_logits)
-
-        # FusedMoE expert computation
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        # Shared MLP contribution (always applied to all tokens)
         if self.shared_mlp is not None:
             _shared_out = self.shared_mlp(hidden_states)
             final_hidden_states = final_hidden_states + _shared_out
 
-        # NOTE: The AscendTPDispatcher's finalize routing performs all-gather
-        # internally for the FusedMoE output on NPU. The shared MLP's down_proj
-        # uses reduce_results=True to all-reduce its output across TP ranks.
-        # Both components are now properly TP-synchronized.
+        # NPU: AscendTPDispatcher all-gathers the FusedMoE output internally;
+        # the shared MLP's down_proj all-reduces its own output.
 
         return final_hidden_states.view(orig_shape)
 
@@ -510,10 +491,8 @@ class HunYuanAttention(nn.Module):
 
         if is_cross_attention:
             # CLA follower: project only Q; K/V are reused from the master layer
-            # via ``kv_states``. Matches the reference HunYuanCrossAttention and
-            # the weight loader, which skips the fused-qkv mapping for follower
-            # layers (layer_id % cla_factor != 0) and routes their ``.q_proj``
-            # weights to this standalone q_proj.
+            # via ``kv_states``. The weight loader routes follower ``.q_proj``
+            # weights here instead of the fused-qkv mapping.
             self.q_proj = ColumnParallelLinear(
                 hidden_size,
                 hidden_size,
@@ -590,7 +569,6 @@ class HunYuanAttention(nn.Module):
         hidden_states = hidden_states.reshape(-1, hidden_size)
 
         if self.is_cross_attention:
-            # CLA follower: attend to the master layer's K/V.
             ori_k, v = kv_states
             k = ori_k
             q, _ = self.q_proj(hidden_states)
@@ -606,27 +584,13 @@ class HunYuanAttention(nn.Module):
             ori_k = k
 
         if self.use_qk_norm:
-            # Master layers use NPU fused RMSNorm; followers use generic RMSNorm.
-            if self.is_cross_attention:
-                q = self.query_layernorm(
-                    q.view(-1, self.num_heads, self.head_dim).contiguous()
-                )
-                k = self.key_layernorm(
-                    k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
-                )
-            else:
-                import torch_npu
+            q = self.query_layernorm(
+                q.view(-1, self.num_heads, self.head_dim).contiguous()
+            )
+            k = self.key_layernorm(
+                k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+            )
 
-                q = torch_npu.npu_rms_norm(
-                    q.view(-1, self.num_heads, self.head_dim).contiguous(),
-                    gamma=self.query_layernorm.weight.float(),
-                    epsilon=self.rms_norm_eps,
-                )[0]
-                k = torch_npu.npu_rms_norm(
-                    k.view(-1, self.num_kv_heads, self.head_dim).contiguous(),
-                    gamma=self.key_layernorm.weight.float(),
-                    epsilon=self.rms_norm_eps,
-                )[0]
 
         if attn_meta is not None:
             attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask)
@@ -813,8 +777,6 @@ class HunyuanImage3Model(nn.Module):
 
 
 class HunyuanImage3ForCausalMM(CachableDiT):
-    """Top-level HunyuanImage-3 model for diffusion pipeline."""
-
     def __init__(
         self, config: HunyuanImage3DitConfig, prefix: str = "", **kwargs,
     ):
@@ -827,8 +789,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         )
 
         self.unpadded_vocab_size = arch_config.vocab_size
-        # multimodal_gen has no dedicated LM-head layer; the vocab-parallel
-        # embedding shares its layout and only `.weight` is consumed downstream.
+        # multimodal_gen has no LM-head layer; the vocab-parallel embedding
+        # shares its layout and only ``.weight`` is consumed downstream.
         self.lm_head = VocabParallelEmbedding(
             self.unpadded_vocab_size, arch_config.hidden_size,
             org_num_embeddings=self.unpadded_vocab_size,
@@ -837,7 +799,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         if getattr(arch_config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
-        # ---- Diffusion I/O modules ----
         patch_size = getattr(arch_config, "patch_size", 1)
         patch_embed_hidden_dim = getattr(arch_config, "patch_embed_hidden_dim", 1024)
         img_proj_type = getattr(arch_config, "img_proj_type", "unet")
@@ -884,8 +845,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         self, hidden_states, attention_mask, custom_pos_emb,
         num_image_tokens=None, first_step=False, timestep=None,
     ):
-        # TeaCache gate: skip layers on similar steps, reuse the cached
-        # residual; one decision covers the packed CFG batch.
+        # TeaCache gate: skip similar steps and reuse the cached residual;
+        # one decision covers the packed CFG batch.
         if timestep is not None and self.should_skip_forward_for_cached_states(
             timestep=timestep
         ):
@@ -911,7 +872,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    # TeaCache — see runtime/cache/teacache.py
+    # TeaCache: see runtime/cache/teacache.py
 
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
         ctx = self._get_teacache_context()
@@ -920,7 +881,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         if ctx is None:
             return False
         # Cond/uncond rows share one packed forward (same timestep), so skip
-        # boundaries are step-unit based — no CFG doubling.
+        # boundaries are step-unit based; no CFG doubling.
         start_skipping, end_skipping = ctx.teacache_params.get_skip_boundaries(
             ctx.num_inference_steps, do_cfg=False
         )
@@ -974,8 +935,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
 
         cla_factor = _get_cla_factor(self.config)
 
-        # Expert mapping for FusedMoE loading (matching vllm-omni); remaps
-        # to fused gate_and_up_proj checkpoint keys.
+        # FusedMoE expert mapping, remapped to the fused gate_and_up_proj
+        # checkpoint keys.
         expert_weights_remapping = {
             "gate_proj": ("gate_and_up_proj", 1, 2),
             "up_proj": ("gate_and_up_proj", 0, 2),
@@ -1071,8 +1032,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             if is_found:
                 continue
 
-            # Expert weights: FusedMoE.make_expert_params_mapping +
-            # expert_weights_remapping handle the fused gate_and_up_proj format.
+            # Expert weights: expert_params_mapping + expert_weights_remapping
+            # handle the fused gate_and_up_proj format.
             is_expert_weight = False
             is_found = False
             found_num = 0
@@ -1139,7 +1100,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        # Log missing weights; filter out expected missing patterns
         all_param_names = set(params_dict.keys())
         missing = all_param_names - loaded_params
         if missing:
@@ -1171,7 +1131,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
 
 
 class LightProjector(nn.Module):
-    """ViT embedding → transformer dim projection."""
+    """ViT embedding -> transformer dim projection."""
 
     def __init__(self, config):
         config = types.SimpleNamespace(**config)
@@ -1196,15 +1156,10 @@ class _Hi3CacheBlock(nn.Module):
     """Pattern_3 view of one decoder layer for cache-dit.
 
     cache-dit drives blocks as ``(hidden_states, *conds) -> hidden_states``
-    (ForwardPattern.Pattern_3); the real layer has the AR-backbone signature
-    ``(positions, hidden, forward_batch, residual, kv_states, mask, pos_emb)
-    -> (hidden, residual, kv)``. In the masked diffusion path the layer resets
-    ``residual = hidden`` internally and CLA is off, so it is a pure
-    ``hidden -> hidden`` map with the two condition tensors passed through.
-
-    The real layer is held by plain reference (object.__setattr__) so its
-    parameters stay registered only under ``HunyuanImage3Model.layers`` -- no
-    double registration in named_parameters/state_dict.
+    (ForwardPattern.Pattern_3); in the masked diffusion path the real layer
+    resets ``residual = hidden`` internally and CLA is off, so it is a pure
+    ``hidden -> hidden`` map. Held by plain reference (object.__setattr__)
+    so parameters stay registered only under ``HunyuanImage3Model.layers``.
     """
 
     def __init__(self, layer: nn.Module):
@@ -1212,10 +1167,8 @@ class _Hi3CacheBlock(nn.Module):
         object.__setattr__(self, "_layer", layer)
 
     def forward(self, hidden_states, attention_mask, custom_pos_emb):
-        # The restored pre-compact attention contract dispatches on attn_meta,
-        # which Model.forward_block always builds via the factory. This adapter
-        # was added after that threading was removed, so it builds the metadata
-        # itself (ImageKVCacheManager only reads query_lens from it).
+        # Model.forward_block no longer threads attn_meta; ImageKVCacheManager
+        # only reads query_lens from it, so build the metadata here.
         attn_meta = create_hunyuan_image_attention_meta(attention_mask, None, False)
         hidden_states, _, _ = self._layer(
             None, hidden_states, None, None, None, attn_meta, attention_mask, custom_pos_emb,
@@ -1224,21 +1177,13 @@ class _Hi3CacheBlock(nn.Module):
 
 
 class Hi3CacheBlockAdapter(nn.Module):
-    """cache-dit-wrappable view of the diffusion block loop.
+    """cache-dit-wrappable view of the diffusion block loop (Pattern_3).
 
-    ``forward`` matches ForwardPattern.Pattern_3 so DBCache caches the
-    hidden_states residual across steps and threads ``attention_mask`` /
-    ``custom_pos_emb`` through every block unchanged. This is the module handed
-    to ``enable_cache_on_transformer``; its spec is registered under this class
-    name by the AR stage (``_register_hi3_cache_dit_spec``).
-
-    The name deliberately does NOT start with ``HunyuanImage``: cache-dit's
-    ``BlockAdapterRegister.is_supported`` / ``get_adapter`` resolve a module by
-    ``cls_name.startswith(prefix)``, so a ``HunyuanImage3...`` name prefix-matches
-    cache-dit's built-in HunyuanImage (diffusers) adapter, which reads
-    ``transformer_blocks`` and mis-fires on this AR backbone. A non-colliding
-    name makes ``is_supported`` return False so the custom Pattern_3 spec
-    (``blocks_attr="blocks"``) is used instead.
+    Threads ``attention_mask`` / ``custom_pos_emb`` through every block
+    unchanged. The name must NOT start with ``HunyuanImage``: cache-dit's
+    ``BlockAdapterRegister.is_supported`` prefix-matches class names and would
+    mis-resolve this AR backbone to its built-in diffusers HunyuanImage
+    adapter instead of the custom Pattern_3 spec.
     """
 
     def __init__(self, model: "HunyuanImage3Model"):

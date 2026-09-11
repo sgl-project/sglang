@@ -16,7 +16,7 @@ When rewriting the prompt (inside the `<recaption>` tags), you must adhere to th
 1.  **Absolute Objectivity**: Describe only what is visually present. Avoid subjective words like "beautiful" or "sad". Convey aesthetic qualities through specific descriptions of color, light, shadow, and composition.
 2.  **Physical and Logical Consistency**: All scene elements (e.g., gravity, light, shadows, reflections, spatial relationships, object proportions) must strictly adhere to real-world physics and common sense. For example, tennis players must be on opposite sides of the net; objects cannot float without a cause.
 3.  **Structured Description**: Strictly follow a logical order: from general to specific, background to foreground, and primary to secondary elements. Use directional terms like "foreground," "mid-ground," "background," and "left side of the frame" to clearly define the spatial layout.
-4.  **Use Present Tense**: Describe the scene from an observer's perspective using the present tense, such as "A man stands..." or "Light shines on...".
+4.  **Use Present Tense**: Describe the scene from an observer's perspective using the present tense, such as "A man stands..." or "Light shines on..."
 5.  **Use Rich and Specific Descriptive Language**: Use precise adjectives to describe the quantity, size, shape, color, and other attributes of objects, subjects, and text. Vague expressions are strictly prohibited.
 
 If the user specifies a style (e.g., oil painting, anime, UI design, text rendering), strictly adhere to that style. Otherwise, first infer a suitable style from the user's input. If there is no clear stylistic preference, default to an **ultra-realistic photographic style**. Then, generate the detailed rewritten prompt according to the **Style-Specific Creation Guide** below:
@@ -42,7 +42,7 @@ Based on the determined artistic style, apply the corresponding professional kno
 1.  **Output the Final Prompt Only**: Do not show any thought process, Markdown formatting, or line breaks.
 2.  **Adhere to the Input**: You must retain the core concepts, attributes, and any specified text from the user's input.
 3.  **Style Reinforcement**: Mention the core style 3-5 times within the prompt and conclude with a style declaration sentence.
-4.  **Avoid Self-Reference**: Describe the image content directly. Remove redundant phrases like "This image shows..." or "The scene depicts...".
+4.  **Avoid Self-Reference**: Describe the image content directly. Remove redundant phrases like "This image shows..." or "The scene depicts..."
 5.  **The final output must be wrapped in `<recaption>xxxx</recaption>` tags.**
 
 The user will now provide an input prompt. You will provide the expanded prompt.
@@ -57,7 +57,7 @@ Your workflow is divided into two phases:
 Subject: Clearly define the core character(s) or object(s) in the scene, including their appearance, posture, expression, and emotion.
 Composition: Set the camera angle and layout, such as close-up, long shot, bird's-eye view, golden ratio composition, etc.
 Environment/Background: Describe the scene where the subject is located, including the location, time of day, weather, and other elements in the background.
-Lighting: Define the type, direction, and quality of the light source, such as soft afternoon sunlight, cool tones of neon lights, dramatic Rembrandt lighting, etc.
+Lighting: Define the type, direction, and quality of the light source, such as soft afternoon sunlight, cool tones of neon lights, dramatic Rembrandt lighting, etc., to create a specific atmosphere.
 Color Palette: Set the main color tone and color scheme of the image, such as vibrant and saturated, low-saturation Morandi colors, black and white, etc.
 Quality/Style: Determine the artistic style and technical details of the image. This includes user-specified styles (e.g., anime, oil painting) or the default realistic style, as well as camera parameters (e.g., focal length, aperture, depth of field).
 Details: Add minute elements that enhance the realism and narrative quality of the image, such as a character's accessories, the texture of a surface, dust particles in the air, etc.
@@ -71,7 +71,7 @@ Physical and Logical Consistency: All scene elements (e.g., gravity, light and s
 
 Structured Description: Strictly follow a logical order: from whole to part, background to foreground, and primary to secondary. Use directional words like "foreground," "mid-ground," "background," "left side of the frame" to clearly define the spatial layout.
 
-Use Present Tense: Describe from an observer's perspective, such as "a man stands," "light shines on...".
+Use Present Tense: Describe from an observer's perspective using the present tense, such as "a man stands," "light shines on..."
 Use Rich and Specific Descriptive Language: Use precise adjectives to describe the quantity, size, shape, color, and other attributes of objects/characters/text. Absolutely avoid any vague expressions.
 
 
@@ -119,7 +119,7 @@ Deconstruct the user's request into the following core visual components:
 *   **Color Palette:** The dominant hues and overall color scheme.
 *   **Style/Quality:** The artistic style, clarity, depth of field, and other technical details.
 *   **Text:** Identify any text to be rendered in the image, including its content, style, and position.
-*   **Details:** Small elements that add narrative depth and realism to the image.
+*   **Details:** Small elements that add narrative depth and realism.
 
 **For TI2I (Image Editing):**
 Adopt a task-diagnostic approach:
@@ -155,7 +155,6 @@ Adopt a task-diagnostic approach:
     *   **Addition:** Clearly state what to add, where, and what it looks like.
 *   **Unambiguous Referencing:** Avoid vague references (e.g., "that person"). Use specific descriptions of appearance.
 """,
-    "en_vanilla_short": "You are a helpful assistant to generate an image from user's description.",
 }
 
 
@@ -173,8 +172,8 @@ def resolve_system_prompt(
             return _SYSTEM_PROMPTS["en_think_recaption"]
         elif bot_task == "recaption":
             return _SYSTEM_PROMPTS["en_recaption"]
-        elif bot_task == "image":
-            return _SYSTEM_PROMPTS["en_vanilla_short"]
+        elif bot_task in ("image", "auto"):
+            return _SYSTEM_PROMPTS["en_vanilla"]
         return None
     if system_prompt == "auto":
         return _SYSTEM_PROMPTS["en_unified"]

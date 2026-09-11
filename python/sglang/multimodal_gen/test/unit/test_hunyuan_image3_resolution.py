@@ -142,10 +142,9 @@ def test_native_crop_is_maximum_area_within_pixel_rounding_and_preserves_pixels(
 
 
 def test_native_crop_handles_coprime_ratios_without_discarding_pixels():
-    # gcd(1000, 701) == 1: a strict 1000:701-multiple crop would collapse to
-    # 1000x701 and discard ~30% of the decoded image (or raise when the
-    # reduced ratio exceeds the bucket). The crop must stay near-exact and
-    # near-maximum-area instead.
+    # gcd(1000, 701) == 1: a strict 1000:701-multiple crop would discard
+    # ~30% of the decoded image (or raise); the crop must stay near-exact
+    # and near-maximum-area instead.
     geometry = build_hunyuan_image3_output_geometry(1000, 701)
     frames = torch.arange(1216 * 832, dtype=torch.float32).reshape(1, 1, 832, 1216)
 

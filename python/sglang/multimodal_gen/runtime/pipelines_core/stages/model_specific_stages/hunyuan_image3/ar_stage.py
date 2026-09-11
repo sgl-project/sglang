@@ -53,16 +53,12 @@ logger = init_logger(__name__)
 
 
 def _is_oom_error(exc: BaseException) -> bool:
-    """True for a device OOM: torch.OutOfMemoryError, or the RuntimeError that
-    some backends raise carrying an 'out of memory' message."""
     if isinstance(exc, torch.OutOfMemoryError):
         return True
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
 def _empty_device_cache() -> None:
-    """empty_cache() on the active device module; a no-op for backends whose
-    module (e.g. torch.cpu) exposes no cache to empty."""
     empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
     if empty_cache is not None:
         empty_cache()
@@ -155,33 +151,36 @@ def _build_rope_image_info(
         batch_info: list[tuple[slice, tuple[int, int]]] = []
         shape_idx = 0
 
-        def _collect(slices_row: list[slice], fallback_shape: tuple[int, int]):
+        def _take(s: slice, fallback_shape: tuple[int, int]):
             nonlocal shape_idx
-            for s in slices_row:
-                if shape_idx < len(section_shapes):
-                    batch_info.append((s, section_shapes[shape_idx]))
-                    shape_idx += 1
-                else:
-                    batch_info.append((s, fallback_shape))
+            if shape_idx < len(section_shapes):
+                batch_info.append((s, section_shapes[shape_idx]))
+                shape_idx += 1
+            else:
+                batch_info.append((s, fallback_shape))
+
+        # The section shape stream follows sequence order: each joint image
+        # contributes [vae, vit] dims and the tokenizer emits VAE tokens then
+        # ViT tokens inside every joint block. Cond spans arrive grouped by
+        # type (all VAE slices, then all ViT slices), so sort them by sequence
+        # position to restore per-image pairing -- consuming the groups as-is
+        # hands image 1's VAE span image 0's ViT dims whenever two cond images
+        # differ in size.
+        cond_spans: list[tuple[int, slice]] = [
+            (s.start, s) for s in tokenizer_output.cond_vae_image_slices[b]
+        ] + [(s.start, s) for s in tokenizer_output.cond_vit_image_slices[b]]
+        for _, s in sorted(cond_spans):
+            _take(s, (token_h, token_w))
 
         # Cond (joint) images precede gen images in the sequence
-        _collect(tokenizer_output.cond_vae_image_slices[b], (token_h, token_w))
-        _collect(tokenizer_output.cond_vit_image_slices[b], (token_h, token_w))
-        _collect(tokenizer_output.gen_image_slices[b], (th, tw))
+        for s in tokenizer_output.gen_image_slices[b]:
+            _take(s, (th, tw))
 
         rope_image_info.append(batch_info)
     return rope_image_info
 
 
 def _register_hi3_cache_dit_spec() -> None:
-    """Register Hi3CacheBlockAdapter's cache-dit block spec (idempotent).
-
-    cache-dit resolves a module's adapter by class-name prefix; the adapter is
-    named to avoid every built-in prefix, so enable_cache_on_transformer falls
-    back to _CUSTOM_BLOCK_ADAPTER_SPECS. That registry lives in the shared
-    cache_dit_integration module -- we add our entry here (model side) to keep
-    the shared module generic and untouched.
-    """
     from cache_dit import ForwardPattern
 
     from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
@@ -198,8 +197,6 @@ def _register_hi3_cache_dit_spec() -> None:
 
 
 class HunyuanImage3AR(PipelineStage):
-    """Native AR diffusion-loop stage for HunyuanImage-3."""
-
     def __init__(
         self,
         ar_model,
@@ -220,9 +217,7 @@ class HunyuanImage3AR(PipelineStage):
         self._model_path = model_path
         self._vision_model = vision_model
         self._vision_aligner = vision_aligner
-        # Initial cap for the cond-encode chunk, derived from the scheduler's
-        # --batching-max-size: an operator raising it declares the device can
-        # take grouped work; None (or 1) leaves the chunk unlimited.
+        # Initial cond-encode chunk cap from --batching-max-size.
         self._max_cond_encode_chunk = max_cond_encode_chunk
         self._custom_tokenizer = HunyuanImage3TokenizerWrapper(tokenizer)
         self._gen_config_cache: dict | None = None
@@ -252,8 +247,7 @@ class HunyuanImage3AR(PipelineStage):
         return StageParallelismType.REPLICATED
 
     def _rebuild_image_info(self, image_info):
-        # Re-create as this module's ImageInfo so isinstance checks in the
-        # tokenizer pass (the processor ships its own copy).
+        # Re-create as this module's ImageInfo so isinstance checks pass.
         if isinstance(image_info, ImageInfo):
             return image_info
         new_info = ImageInfo.__new__(ImageInfo)
@@ -276,10 +270,9 @@ class HunyuanImage3AR(PipelineStage):
     def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
         """Mount cache-dit on the diffusion block loop (env-gated, idempotent).
 
-        Mirrors DenoisingStage._maybe_enable_cache_dit for this custom stage.
-        The AR backbone is not a diffusers DiT, so it is exposed to cache-dit
-        through Hi3CacheBlockAdapter (ForwardPattern.Pattern_3); the
-        SGLANG_CACHE_DIT_* env vars then apply exactly as for GLM-Image/Wan.
+        The AR backbone is not a diffusers DiT, so it is exposed via
+        Hi3CacheBlockAdapter (see the adapter's docstring for the naming
+        constraint); SGLANG_CACHE_DIT_* then apply as for GLM-Image/Wan.
         """
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
@@ -327,9 +320,8 @@ class HunyuanImage3AR(PipelineStage):
         cos = cos.contiguous()
         sin = sin.contiguous()
 
-        # hidden_states changes on every denoising step, so keep its TP
-        # synchronization in the per-step path. Request-static attention
-        # inputs are synchronized once before the loop.
+        # hidden_states changes every step, so its TP sync stays here;
+        # request-static inputs are broadcast once before the loop.
         if model_parallel_is_initialized():
             tp_group = get_tp_group()
             if tp_group.world_size > 1:
@@ -356,7 +348,6 @@ class HunyuanImage3AR(PipelineStage):
         attention_mask: torch.Tensor,
         custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Synchronize request-static attention inputs once across TP ranks."""
         attention_mask = attention_mask.contiguous()
         cos, sin = custom_pos_emb
         cos = cos.contiguous()
@@ -585,9 +576,8 @@ class HunyuanImage3AR(PipelineStage):
                 [[] for _ in per_request_joint_infos],
             )
 
-        # Batched cond encoding is opt-in via env var: the AR backbone is
-        # resident on the same device, so full-batch encoding is tight on
-        # memory and stays sequential unless explicitly enabled.
+        # Batched cond encoding is opt-in: the AR backbone is resident on the
+        # same device, so full-batch encoding is memory-tight by default.
         batched = None
         if envs.SGLANG_HI3_COND_ENCODE_BATCHING:
             try:
@@ -628,8 +618,7 @@ class HunyuanImage3AR(PipelineStage):
         vae_embeds: list = []
         t_values: list = []
         vit_embeds: list = []
-        # Autocast matches the diffusion loop so cached embeddings stay
-        # bit-identical with in-loop computation.
+        # Autocast matches the diffusion loop for bit-identical embeddings.
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=torch.bfloat16,
@@ -650,9 +639,7 @@ class HunyuanImage3AR(PipelineStage):
                 t_values.append(t_i)
 
                 vit_kwargs = self._cond_vit_kwargs(info)
-                # Reference Siglip2VisionTransformer takes the padded pixel_values
-                # + attention_mask + spatial_shapes and returns padded embeddings
-                # (zeros at padding), so no manual packing/re-padding is needed.
+                # Reference Siglip2VisionTransformer returns padded embeddings.
                 pixels = info.vision_image_info.image_tensor
                 image_embed = self._vision_model(
                     pixels.unsqueeze(0).to(device),
@@ -676,20 +663,11 @@ class HunyuanImage3AR(PipelineStage):
         return vit_kwargs
 
     def _encode_adaptive(self, count, run_batch, max_chunk=None):
-        """Encode ``count`` items via ``run_batch(indices) -> list`` in the
-        largest batch that fits.
+        """Encode items in the largest batch that fits; on OOM halve and retry.
 
-        Starts with every item in one batched call (capped to ``max_chunk``
-        when given -- the cap never blocks work, it only splits it: the
-        remaining items are processed in further calls of the same size).
-        On OOM it empties the cache, halves the batch, and retries the same
-        items -- down to one at a time.
-        Chunking is bit-safe here: VAE conv is independent per batch row and the
-        ViT isolates each image via its attention_mask + spatial_shapes (packed
-        internally), so each image's embedding does not depend on which other
-        images share the call. A hard failure only occurs
-        when a single item cannot fit, which then propagates to the sequential
-        fallback in ``_encode_conditions``.
+        Chunking is bit-safe: VAE conv is per-row and the ViT isolates each
+        image via its mask + spatial_shapes. A single-item failure propagates
+        to the sequential fallback in ``_encode_conditions``.
         """
         if count <= 0:
             return []
@@ -724,10 +702,7 @@ class HunyuanImage3AR(PipelineStage):
         if any(t.ndim != 2 or t.shape[-1] != feat_dim for t in vit_tensors):
             return None
 
-        # Reference Siglip2VisionTransformer takes padded pixel_values +
-        # attention_mask + spatial_shapes (it unpacks/re-pads internally), so
-        # collect the per-image masks/shapes and feed the padded pixels. All
-        # images pad to the same max_patches, so they stack into one batch.
+        # Stackable only when every image pads to the same max_patches.
         if len({t.shape[0] for t in vit_tensors}) > 1:
             return None
         vit_mask_rows: list = []
@@ -737,8 +712,7 @@ class HunyuanImage3AR(PipelineStage):
             vit_mask_rows.append(vit_kwargs["attention_mask"][0])
             spatial_shape_rows.append(vit_kwargs["spatial_shapes"][0])
 
-        # Autocast matches the diffusion loop so cached embeddings stay
-        # bit-identical with in-loop computation.
+        # Autocast matches the diffusion loop for bit-identical embeddings.
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=torch.bfloat16,
@@ -769,10 +743,7 @@ class HunyuanImage3AR(PipelineStage):
             vae_embeds = [r[0] for r in vae_results]
             t_values = [r[1] for r in vae_results]
 
-            # ViT: feed padded pixels + attention_mask + spatial_shapes; the
-            # reference Siglip2VisionTransformer unpacks per image internally and
-            # returns padded embeddings, so any batch size is equivalent and the
-            # output rows are already padded to max_patches.
+            # ViT: the reference ViT unpacks per image internally.
             def _run_vit(idxs):
                 pixel_values = torch.stack(
                     [
@@ -830,10 +801,8 @@ class HunyuanImage3AR(PipelineStage):
         n_req,
         do_cfg,
     ):
-        # The uncond half of the CFG-packed sequence keeps the cond (joint)
-        # image sections (only the text is replaced with <cfg> tokens), so the
-        # ViT embeddings must be scattered into those rows too -- matching the
-        # reference, which repeats the cond tensors cfg_factor times.
+        # The CFG-packed uncond half keeps the cond (joint) image sections,
+        # so scatter ViT embeddings into those rows too.
         for r, embeds in enumerate(per_request_vit_embeds):
             if not embeds:
                 continue
@@ -850,7 +819,13 @@ class HunyuanImage3AR(PipelineStage):
 
     @staticmethod
     def _normalize_bot_task(bot_task: str) -> str:
-        if bot_task in ("none", "vanilla"):
+        # Mirrors vllm-omni's _normalize_single_stage_bot_task: "none" falls
+        # back to "auto" (which maps to the vanilla system prompt under the
+        # "dynamic" preset), "vanilla" to "image", and the composite
+        # think_recaption to its single-stage "think" form.
+        if bot_task == "none":
+            return "auto"
+        if bot_task == "vanilla":
             return "image"
         if bot_task == "think_recaption":
             return "think"
@@ -904,12 +879,8 @@ class HunyuanImage3AR(PipelineStage):
         gen_config = self._generation_config()
         tokenizer_kwargs: dict[str, Any] = dict(
             batch_prompt=[req.prompt for req in reqs],
-            # Match the reference stage's call exactly:
-            # - mode="gen_image" is required: the default "gen_text" omits the
-            #   gen_image assistant message and leaves gen_image_mask / gen
-            #   slices unset (the reduced tokenizer had no mode param).
-            # - bot_task / drop_think drive template selection and think-token
-            #   handling, sourced the same way as the reference stage.
+            # mode="gen_image" is required: "gen_text" omits the gen_image
+            # assistant message and leaves gen_image_mask / gen slices unset.
             mode="gen_image",
             bot_task=tokenizer_bot_task,
             sequence_template=gen_config.get("sequence_template", "pretrain"),
@@ -973,14 +944,9 @@ class HunyuanImage3AR(PipelineStage):
             joint_slices[i] + gen_slices[i] for i in range(actual_batch_size)
         ]
 
-        # CFG packs [cond..., uncond...] and runs the two halves in separate
-        # backbone calls, so only one half's mask is live at a time. When both
-        # halves share an identical image-token layout (the usual case: same
-        # target image, only the text prompt differs), build one half-size
-        # [n_req, 1, L, L] mask and reuse it for both halves -- halving resident
-        # and peak mask memory on every rank. The slice-list compare is exact,
-        # so this stays byte-identical to the full-batch mask; any layout
-        # mismatch falls back to the full [actual_batch_size, 1, L, L] mask.
+        # Only one half's mask is live at a time; when both halves share an
+        # identical image-token layout, build one half-size mask and reuse it
+        # (byte-identical; any layout mismatch falls back to the full mask).
         half_bs = actual_batch_size // 2
         mask_shared = (
             do_cfg
@@ -1023,7 +989,7 @@ class HunyuanImage3AR(PipelineStage):
         latent_w: int,
         device: torch.device,
     ) -> torch.Tensor:
-        # One generator per request keeps each request bit-identical with its
+        # One generator per request keeps output bit-identical to its
         # single-request run.
         noise_rows = []
         for req in reqs:
@@ -1059,8 +1025,7 @@ class HunyuanImage3AR(PipelineStage):
 
     @staticmethod
     def _effective_resolution(req: Req, raw_cond_images) -> tuple[int, int]:
-        # Use the input-validation snapshot, not condition_image, because the
-        # latter can have passed through generic preprocessing in older flows.
+        # Use the input-validation snapshot, not the preprocessed image.
         user_explicit_fields = getattr(req.sampling_params, "_explicit_fields", set())
         reference_size = req.original_condition_image_size
         if reference_size is None and raw_cond_images:
@@ -1264,6 +1229,24 @@ class HunyuanImage3AR(PipelineStage):
         cond_vit_slices_rows = tok["cond_vit_slices_rows"]
         cond_timestep_scatter_index = tok["cond_timestep_scatter_index"]
 
+        # Concatenate per-request cond timesteps once, outside the denoising
+        # loop. Requests without cond images contribute None entries; they are
+        # skipped so batch composition cannot surface as an opaque TypeError
+        # mid-loop. An all-None group with a stale scatter index skips
+        # instantiation (warned); a partial group fails the expected-count
+        # check inside the loop with a clear diagnostic.
+        all_cond_t = None
+        if has_cond_encoded and cond_timestep_scatter_index is not None:
+            cond_t_rows = [t for t in per_request_t if t is not None]
+            if cond_t_rows:
+                all_cond_t = torch.cat(cond_t_rows, dim=0).repeat(cfg_factor)
+            else:
+                logger.warning(
+                    "cond_timestep_scatter_index present but no request in the "
+                    "group produced cond timesteps; skipping cond timestep "
+                    "instantiation"
+                )
+
         num_image_tokens = token_h * token_w
 
         for step_idx, t in enumerate(self.progress_bar(timesteps, batch=head)):
@@ -1312,12 +1295,10 @@ class HunyuanImage3AR(PipelineStage):
                         n_req,
                         do_cfg,
                     )
-                    if cond_timestep_scatter_index is not None:
-                        all_cond_t = torch.cat(per_request_t, dim=0).repeat(cfg_factor)
+                    if cond_timestep_scatter_index is not None and all_cond_t is not None:
                         cond_ts_index = cond_timestep_scatter_index
                         # Legacy tokenizer shapes: 1-D [P] or [1, P] must be
-                        # expanded to one index row per sequence row (the
-                        # cfg-packed uncond rows keep the cond sections too).
+                        # expanded to one index row per sequence row.
                         if cond_ts_index.ndim == 1:
                             cond_ts_index = cond_ts_index.unsqueeze(0).expand(
                                 actual_batch_size, -1

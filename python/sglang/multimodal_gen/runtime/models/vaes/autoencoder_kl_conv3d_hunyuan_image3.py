@@ -353,10 +353,7 @@ class Decoder(nn.Module):
 
 
 class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
-    """3D VAE copied from the official HunyuanImage-3 repository
-    (``autoencoder_kl_3d.py``); the distributed variant and standalone
-    weight-loading helpers are not included.
-    """
+    """3D VAE copied from the official HunyuanImage-3 repository."""
 
     _supports_gradient_checkpointing = True
 

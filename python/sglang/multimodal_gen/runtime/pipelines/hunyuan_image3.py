@@ -63,8 +63,6 @@ def _module_memory_gb(module: torch.nn.Module) -> float:
 
 
 class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
-    """Pipeline for HunyuanImage-3 text-to-image generation."""
-
     pipeline_name = "HunyuanImage3Pipeline"
 
     _required_config_modules = [
@@ -196,7 +194,6 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         cpu_offload: bool,
         param_dtype: torch.dtype,
     ) -> None:
-        """Apply FSDP sharding to the already-loaded AR backbone."""
         mp_policy = MixedPrecisionPolicy(
             param_dtype=param_dtype,
             reduce_dtype=torch.float32,
@@ -284,10 +281,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         config_dict: dict[str, Any],
     ) -> torch.nn.Module:
         vit_config = config_dict["vit"]
-        # Use the reference HunyuanImage-3 SigLIP2 ViT (plain PyTorch: padded
-        # pixel_values + attention_mask, F.sdpa packed attention) instead of SRT
-        # Siglip2Model, matching the hunyuan_image_3 branch's cond-image path.
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3_vision import (
+        # Reference SigLIP2 ViT (plain PyTorch, F.sdpa packed attention)
+        # instead of SRT Siglip2Model, matching the official cond-image path.
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3.vision import (
             Siglip2VisionTransformer,
         )
 
