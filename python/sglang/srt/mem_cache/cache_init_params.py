@@ -58,6 +58,9 @@ class CacheInitParams:
     # paged SWA pool only a draft uses), so it must not gate prefix matching.
     swa_gates_prefix_match: bool = True
     decoder_swa_bounded_replay: bool = False
+    # Tokens back from the committed length that a fused draft reads in the
+    # swa sub-pool (BaseSpecWorker.draft_swa_window); 0 when it reads none.
+    draft_swa_window: int = 0
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
@@ -70,3 +73,11 @@ class CacheInitParams:
 
     mtp_draft_device_pools: tuple[object, ...] = ()
     mtp_draft_mamba_pools: tuple[object, ...] = ()
+
+    @property
+    def swa_retain_window(self) -> Optional[int]:
+        # What the frees and unlocks of a running request's SWA keep behind it;
+        # every other SWA rule uses sliding_window_size.
+        if self.sliding_window_size is None:
+            return None
+        return max(self.sliding_window_size, self.draft_swa_window)

@@ -406,7 +406,7 @@ class KVIndexTranslator:
         reads stay virtual (a static pool, or DCP)."""
         if not self._reads_translated(kind):
             return self._passthrough_table(req_pool_indices)
-        if plan.has_read_table(kind):
+        if plan.has_read_table(kind, reader=self):
             return self._plan_table(plan, kind=kind, rows=bs)
         return KVIndexTable(
             ids=self.req_to_token,
@@ -444,7 +444,7 @@ class KVIndexTranslator:
             "a translating reader must read through the plan of its own "
             "req_to_token rows"
         )
-        return plan.read_table(kind=kind, rows=rows, into=into)
+        return plan.read_table(kind=kind, rows=rows, into=into, reader=self)
 
     def _passthrough_table(self, req_pool_indices: torch.Tensor) -> KVIndexTable:
         return KVIndexTable(
@@ -474,7 +474,7 @@ class KVIndexTranslator:
         (a static pool, or DCP) for the caller to finish; a static SWA pool can
         fuse its full->swa table into the gather as ``token_mapping``."""
         bs = int(seq_lens.numel())
-        if self._reads_translated(kind) and not plan.has_read_table(kind):
+        if self._reads_translated(kind) and not plan.has_read_table(kind, reader=self):
             assert plan.is_read_by(self), (
                 "a translating reader must read through the plan of its own "
                 "req_to_token rows"
@@ -534,7 +534,7 @@ class KVIndexTranslator:
             "DCP, where the caller selects this rank's share itself)"
         )
         rows = out.shape[0]
-        first = not plan.has_read_table(kind)
+        first = not plan.has_read_table(kind, reader=self)
         table = self._plan_table(
             plan, kind=kind, rows=rows, into=out if first else None
         )

@@ -34,6 +34,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftSWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1091,6 +1092,20 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 )
             ),
         )
+
+    @property
+    def draft_swa_window(self) -> int:
+        # The widened extend starts front rows below the committed length, and
+        # each depth reads its own window back from there.
+        draft = self._draft_worker
+        windows = [
+            runner.sliding_window_size
+            for runner in draft.draft_runner_list
+            if isinstance(runner.token_to_kv_pool, UnifiedDraftSWAKVPool)
+        ]
+        if not windows:
+            return 0
+        return max(windows) + draft.draft_extend_num_front_tokens
 
     def forward_batch_generation(
         self,
