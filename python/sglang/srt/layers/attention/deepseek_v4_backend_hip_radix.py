@@ -482,9 +482,8 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
         self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
-        self.is_dspark_draft = (
-            self.is_draft_worker and model_runner.spec_algorithm.is_dspark()
-        )
+        self.is_dspark = model_runner.spec_algorithm.is_dspark()
+        self.is_dspark_draft = self.is_draft_worker and self.is_dspark
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
@@ -493,6 +492,15 @@ class DeepseekV4HipRadixBackend(
             # CUDA-side convention gamma + 1, so use an explicit effective value
             # instead of mutating speculative_num_draft_tokens in place.
             self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens - 1
+        # Past MAX_FUSED_ROWS the fp4 schedule falls back to AITER's preamble,
+        # which frees the scratch its kernels read -- not capture-safe.
+        self._fp4_graph_row_limit: Optional[int] = None
+        if self.enable_deepseek_v4_fp4_indexer and self.speculative_num_steps == 0:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+                MAX_FUSED_ROWS,
+            )
+
+            self._fp4_graph_row_limit = MAX_FUSED_ROWS
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,
@@ -645,8 +653,29 @@ class DeepseekV4HipRadixBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         ragged_layout=None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        # HIP path: build target-verify metadata eagerly. The raw/lazy-upgrade route can
-        # hit planner invariants during graph capture for DSV4+EAGLE.
+        # DSPARK verifies a uniform num_draft block, exactly what
+        # make_forward_metadata_from_raw_verify expands, so the build can be
+        # deferred into the graph. Graph path only: the upgrade sizes its page
+        # table by MAX_SEQ_LEN_FOR_CAPTURE, far wider than the live max_seq_len
+        # an eager caller passes. EAGLE and ragged layouts stay eager -- no raw
+        # expansion, and EAGLE's fixed-tier plan trips planner invariants.
+        if (
+            use_prefill_cuda_graph
+            and self.is_dspark
+            and ragged_layout is None
+            and out_cache_loc is not None
+            # Oversized batches keep the eager build; see _fp4_graph_row_limit.
+            and (
+                self._fp4_graph_row_limit is None
+                or self.target_verify_num_draft_tokens * len(seq_lens)
+                <= self._fp4_graph_row_limit
+            )
+        ):
+            return DSV4RawVerifyMetadata(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+            )
         if seq_lens_cpu is None:
             seq_lens_cpu = seq_lens.tolist()
         return self.init_forward_metadata_target_verify_old(
@@ -755,6 +784,18 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=True,
         )
+        # extend_seq_lens is uniform here (seq_lens already carries the draft
+        # block, so the minimum above cannot trim it), hence an exact token count.
+        self._attach_unified_kv_prefill_meta(
+            core_attn_metadata,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            num_draft_tokens * bs,
+        )
+        self._attach_unified_kv_decode_streams(
+            core_attn_metadata, req_pool_indices_repeated
+        )
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
         create = functools.partial(
             create_paged_compressor_data,
@@ -845,7 +886,8 @@ class DeepseekV4HipRadixBackend(
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Raw metadata must be materialized inside the graph to refresh on replay.
-        if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
+        upgraded_verify = isinstance(self.forward_metadata, DSV4RawVerifyMetadata)
+        if upgraded_verify:
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
             )
@@ -895,6 +937,12 @@ class DeepseekV4HipRadixBackend(
             metadata.fp4_q_positions = metadata.core_attn_metadata.positions.to(
                 torch.int64
             )
+
+        if upgraded_verify:
+            # The out-graph refresh saw raw metadata and skipped. Without this
+            # the logits kernel builds its own schedule -- the variant that
+            # frees the scratch it reads, which every replay would re-read.
+            self._refresh_fp4_prefill_workspace(forward_batch)
 
         # Decode's schedule builder is capture-safe because the workspace pins
         # the scratch it reads, so it can stay next to the metadata it consumes.
