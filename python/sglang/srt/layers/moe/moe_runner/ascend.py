@@ -94,8 +94,9 @@ class AscendRunnerCore(MoeRunnerCore):
             # separate activation step — run() skips it. Left None on purpose so
             # that reaching for it fails loudly instead of silently applying an
             # unfused swiglu to already-requantised activations. This holds for
-            # both dispatchers: ascend_tp gets its activation quant fused into
-            # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
+            # both dispatchers: ascend_tp quantises during routing, and DeepEP
+            # can supply MXFP8 inputs. BF16 dispatch or fallback is quantised
+            # before gmm1 by the method's activation quantiser.
             self.activation = None
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
