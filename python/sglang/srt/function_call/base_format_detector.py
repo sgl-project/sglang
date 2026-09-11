@@ -273,7 +273,11 @@ class BaseFormatDetector(ABC):
             # Case 2: Handle streaming arguments
             # This happens when we've already sent the tool name and now need to stream arguments incrementally
             else:
+                # A zero-parameter call omits the key entirely; the completed
+                # call still owes the client "{}" and the bookkeeping below.
                 cur_arguments = current_tool_call.get("arguments")
+                if cur_arguments is None and is_current_complete:
+                    cur_arguments = {}
                 res = StreamingParseResult()
 
                 if cur_arguments is not None:
