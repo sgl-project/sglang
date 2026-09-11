@@ -1,5 +1,6 @@
 //! Transport-neutral renderer failures.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,4 +48,42 @@ impl RendererError {
             Self::WorkerDropped | Self::Internal(_) => RendererErrorKind::Internal,
         }
     }
+}
+
+/// A host error carried through semantic processing without interpreting it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseError {
+    pub kind: ResponseErrorKind,
+    pub message: String,
+}
+
+impl From<RendererError> for ResponseError {
+    fn from(error: RendererError) -> Self {
+        let kind = match error.kind() {
+            RendererErrorKind::InvalidRequest => ResponseErrorKind::InvalidRequest,
+            RendererErrorKind::Unavailable => ResponseErrorKind::Unavailable,
+            RendererErrorKind::Tokenize | RendererErrorKind::Internal => {
+                ResponseErrorKind::Internal
+            }
+        };
+        ResponseError {
+            kind,
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Failure category interpreted by the receiving transport adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResponseErrorKind {
+    InvalidRequest,
+    Unavailable,
+    Internal,
+    Upstream(UpstreamErrorCode),
+}
+
+/// Original upstream code, preserved without imposing response transport policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpstreamErrorCode {
+    Http(u16),
 }

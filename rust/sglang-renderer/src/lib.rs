@@ -17,8 +17,8 @@ mod frontend;
 mod launcher;
 #[cfg_attr(not(feature = "http"), allow(dead_code))]
 mod openai;
+mod postprocessing;
 mod preprocessing;
-mod response;
 #[cfg(feature = "http")]
 mod runtime;
 mod types;
@@ -28,9 +28,14 @@ pub(crate) use engine::{
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
     MatchedStop, PositionLogprobs, TokenLogprob,
 };
-pub use error::{RendererError, RendererErrorKind};
+pub use error::{
+    RendererError, RendererErrorKind, ResponseError, ResponseErrorKind, UpstreamErrorCode,
+};
 #[cfg(feature = "http")]
 pub use launcher::run_cli;
+pub use postprocessing::{
+    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
+};
 pub(crate) use preprocessing::ChatFormatter;
 pub(crate) use preprocessing::SamplingParamsOverrides;
 pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
@@ -41,10 +46,6 @@ pub use preprocessing::{
 pub use preprocessing::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
     TextRequest, TokenIdsRequest,
-};
-pub use response::{
-    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    ResponseError, ResponseErrorKind, UpstreamErrorCode,
 };
 #[cfg(feature = "http")]
 pub use runtime::{RendererRuntimeConfig, serve};

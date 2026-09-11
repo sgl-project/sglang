@@ -19,8 +19,8 @@ use dynamo_protocols::types::{
     ChatCompletionToolChoiceOption, CreateChatCompletionStreamResponse, FinishReason, Role,
 };
 use futures::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
 
+use crate::ResponseError;
 use crate::preprocessing::dynamo_parser_name;
 
 /// Engine-neutral terminal reason understood by chat response processing.
@@ -41,45 +41,6 @@ pub struct DecodedChatEvent {
     pub logprobs: Option<ChatChoiceLogprobs>,
     pub prompt_tokens: u32,
     pub completion_tokens: u64,
-}
-
-/// A host error carried through semantic processing without interpreting it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseError {
-    pub kind: ResponseErrorKind,
-    pub message: String,
-}
-
-impl From<crate::RendererError> for ResponseError {
-    fn from(error: crate::RendererError) -> Self {
-        use crate::RendererErrorKind;
-        let kind = match error.kind() {
-            RendererErrorKind::InvalidRequest => crate::ResponseErrorKind::InvalidRequest,
-            RendererErrorKind::Unavailable => crate::ResponseErrorKind::Unavailable,
-            RendererErrorKind::Tokenize | RendererErrorKind::Internal => {
-                crate::ResponseErrorKind::Internal
-            }
-        };
-        ResponseError {
-            kind,
-            message: error.to_string(),
-        }
-    }
-}
-
-/// Failure category interpreted by the receiving transport adapter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResponseErrorKind {
-    InvalidRequest,
-    Unavailable,
-    Internal,
-    Upstream(UpstreamErrorCode),
-}
-
-/// Original upstream code, preserved without imposing response transport policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UpstreamErrorCode {
-    Http(u16),
 }
 
 /// One semantic tool-call delta, independent of HTTP or gRPC framing.
