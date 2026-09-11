@@ -4,18 +4,16 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Fetch tags from origin to ensure we have the latest
-if git fetch --tags origin; then
-  # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
-  if [ -n "$VERSION_FROM_TAG" ]; then
-    SGLANG_VERSION="$VERSION_FROM_TAG"
-    echo "Using SGLang version from git tags: $SGLANG_VERSION"
-  else
-    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
-  fi
+# Read the tag name off the remote. The helper still sorts stable/post releases
+# above rc tags, and explains why this must not go back to fetching tag objects
+# into the checkout.
+TAG_LOOKUP_START=$SECONDS
+VERSION_FROM_TAG=$(python3 scripts/ci/amd/amd_ci_latest_release_tag.py || true)
+if [ -n "$VERSION_FROM_TAG" ]; then
+  SGLANG_VERSION="$VERSION_FROM_TAG"
+  echo "Using SGLang version from git tags: $SGLANG_VERSION (resolved in $(( SECONDS - TAG_LOOKUP_START ))s)"
 else
-  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+  echo "Warning: No version tags resolved; using default $SGLANG_VERSION" >&2
 fi
 
 
