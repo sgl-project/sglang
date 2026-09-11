@@ -701,10 +701,10 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
 }
 
 #[test]
-fn next_swa_uuid_counts_up_from_two() {
+fn next_component_uuid_counts_up_from_two() {
     let mut tc = core();
-    assert_eq!(tc.next_swa_uuid_(), 2);
-    assert_eq!(tc.next_swa_uuid_(), 3);
+    assert_eq!(tc.next_component_uuid_(), 2);
+    assert_eq!(tc.next_component_uuid_(), 3);
 }
 
 #[test]
@@ -8397,12 +8397,7 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                 let lock = tc
                     .inc_lock_ref(anchor, ComponentSet::EMPTY)
                     .expect("live match anchor");
-                let params = DecLockRefParams {
-                    node_id: None,
-                    swa_uuid_for_lock: lock.swa_uuid_for_lock,
-                    swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                    skipped_lock_components: lock.skipped_lock_components,
-                };
+                let params = DecLockRefParams::from(&lock);
                 tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                     .expect("live match anchor");
             }
@@ -8421,12 +8416,7 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                     &mut mamba_next,
                     mamba,
                 ));
-                let params = DecLockRefParams {
-                    node_id: None,
-                    swa_uuid_for_lock: lock.swa_uuid_for_lock,
-                    swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                    skipped_lock_components: lock.skipped_lock_components,
-                };
+                let params = DecLockRefParams::from(&lock);
                 tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                     .expect("live match anchor");
             }

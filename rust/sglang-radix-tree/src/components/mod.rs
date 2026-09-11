@@ -308,7 +308,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     //           node itself (mamba state is per-leaf, not per-path).
     //
     //         When ``lock_host`` is True, the lock applies to host-side state:
-    //         - Full: single-node host lock.
+    //         - Full: a one-node UUID-bounded segment that expands across splits.
     //         - SWA: host window-lock with a dedicated host UUID boundary.
     //         - Mamba: single-node host lock with host LRU detach."""
     //         ...
@@ -338,7 +338,8 @@ pub trait TreeComponent<K: ChildKeyType> {
     //         - Mamba: single-node unlock — only decrements lock_ref on the
     //           node itself.
     //
-    //         When ``lock_host`` is True, the inverse host-side semantics apply."""
+    //         When ``lock_host`` is True, Full and SWA replay their host boundary
+    //         UUIDs while Mamba retains its single-node semantics."""
     //         ...
     fn release_component_lock(
         &self,

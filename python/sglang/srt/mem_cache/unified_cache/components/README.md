@@ -181,7 +181,7 @@ Lock a node to protect it (and its ancestors) from eviction.
 |--------|--------|
 | **Purpose** | Called when a request begins using a cached prefix — prevents eviction of nodes it depends on |
 | **Inputs** | `node` — the last matched node (deepest); `skip_lock_components` names components to leave untaken (the decode hold passes `(MAMBA,)`) |
-| **Output** | `IncLockRefResult(node_id, swa_uuid_for_lock, skipped_lock_components)` — the receipt the matching release must replay: the anchor node, the SWA boundary, and the skipped set |
+| **Output** | `IncLockRefResult(node_id, swa_uuid_for_lock, skipped_lock_components, full_uuid_for_host_lock)` - the receipt the matching release must replay: the anchor node, component boundaries, and the skipped set |
 | **Mutation** | Increments `lock_ref` per component along its contiguous segment; moves data-bearing tokens from evictable to protected size counters |
 | **Complexity** | **O(D)** — Full: node to root; SWA: up to window boundary O(min(D, W)); Mamba: O(1).|
 
@@ -215,7 +215,10 @@ so the order is not load-bearing for the leaf sets. Full walks to root; SWA
 stops at the receipt boundary; components in `skipped_lock_components` are
 left alone. `skip_swa=True` also skips lower-priority components already
 released by `dec_swa_lock_only`. The host-side `dec_host_lock_ref` takes the
-same required receipt.
+same required receipt. A Full host lock begins as a one-node UUID-bounded
+segment. A later radix split copies the anchor's `host_lock_ref` to the inserted
+prefix and migrates the UUID to that prefix; release walks every fragment until
+it finds the receipt's UUID.
 
 ---
 
@@ -313,8 +316,8 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
-| `acquire_component_lock(lock_host=False)` | Increment device or host lock refs; moves device tokens from evictable to protected. Full: path-lock for device, single-node host lock. SWA: window-lock with UUID boundary. Mamba: single-node lock. | `inc_lock_ref`, `inc_host_lock_ref` | *abstract* |
-| `release_component_lock(lock_host=False)` | Decrement device or host lock refs; moves device tokens from protected to evictable when `lock_ref` → 0. Full path-unlocks device; SWA walks up to UUID boundary; Mamba unlocks a single node. | `dec_lock_ref`, `dec_host_lock_ref` | *abstract* |
+| `acquire_component_lock(lock_host=False)` | Increment device or host lock refs; moves device tokens from evictable to protected. Full: path-lock for device; its host lock starts as a one-node UUID-bounded segment so later split fragments remain protected. SWA: window-lock with UUID boundary. Mamba: single-node lock. | `inc_lock_ref`, `inc_host_lock_ref` | *abstract* |
+| `release_component_lock(lock_host=False)` | Decrement device or host lock refs; moves device tokens from protected to evictable when `lock_ref` -> 0. Full path-unlocks device and releases all host split fragments to the receipt boundary; SWA walks up to UUID boundary; Mamba unlocks a single node. | `dec_lock_ref`, `dec_host_lock_ref` | *abstract* |
 
 ### Caching Phase
 

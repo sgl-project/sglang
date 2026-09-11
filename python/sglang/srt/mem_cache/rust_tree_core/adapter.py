@@ -158,6 +158,7 @@ def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
         skipped_lock_components=tuple(
             ComponentType(ct) for ct in result.skipped_lock_components
         ),
+        full_uuid_for_host_lock=result.full_uuid_for_host_lock,
     )
 
 
@@ -169,6 +170,7 @@ def _dec_lock_ref_params_to_binding(bindings_module, params: DecLockRefParams):
         swa_uuid_for_lock=params.swa_uuid_for_lock,
         swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
         skipped_lock_components=[int(ct) for ct in params.skipped_lock_components],
+        full_uuid_for_host_lock=params.full_uuid_for_host_lock,
     )
 
 

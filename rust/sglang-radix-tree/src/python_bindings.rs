@@ -652,23 +652,26 @@ pub struct DecLockRefParamsBinding {
     pub swa_uuid_for_lock: Option<i64>,
     pub swa_uuid_for_host_lock: Option<i64>,
     pub skipped_lock_components: Vec<u8>,
+    pub full_uuid_for_host_lock: Option<i64>,
 }
 
 #[pymethods]
 impl DecLockRefParamsBinding {
     #[new]
-    #[pyo3(signature = (node_id = None, swa_uuid_for_lock = None, swa_uuid_for_host_lock = None, skipped_lock_components = Vec::new()))]
+    #[pyo3(signature = (node_id = None, swa_uuid_for_lock = None, swa_uuid_for_host_lock = None, skipped_lock_components = Vec::new(), full_uuid_for_host_lock = None))]
     fn new(
         node_id: Option<NodeId>,
         swa_uuid_for_lock: Option<i64>,
         swa_uuid_for_host_lock: Option<i64>,
         skipped_lock_components: Vec<u8>,
+        full_uuid_for_host_lock: Option<i64>,
     ) -> Self {
         DecLockRefParamsBinding {
             node_id,
             swa_uuid_for_lock,
             swa_uuid_for_host_lock,
             skipped_lock_components,
+            full_uuid_for_host_lock,
         }
     }
 }
@@ -681,6 +684,7 @@ impl DecLockRefParamsBinding {
             swa_uuid_for_lock: self.swa_uuid_for_lock,
             swa_uuid_for_host_lock: self.swa_uuid_for_host_lock,
             skipped_lock_components: component_set_from_py(&self.skipped_lock_components)?,
+            full_uuid_for_host_lock: self.full_uuid_for_host_lock,
         })
     }
 }
@@ -694,6 +698,7 @@ pub struct IncLockRefResultBinding {
     swa_uuid_for_lock: Option<i64>,
     swa_uuid_for_host_lock: Option<i64>,
     skipped_lock_components: Vec<u8>,
+    full_uuid_for_host_lock: Option<i64>,
 }
 
 impl IncLockRefResultBinding {
@@ -708,6 +713,7 @@ impl IncLockRefResultBinding {
                 .iter()
                 .map(|ct| ct.idx() as u8)
                 .collect(),
+            full_uuid_for_host_lock: result.full_uuid_for_host_lock,
         }
     }
 }

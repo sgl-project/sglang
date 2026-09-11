@@ -4891,6 +4891,69 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(m.host_hit_length, 0)
         cache.sanity_check()
 
+    def test_hicache_split_preserves_inflight_full_host_pin(self):
+        """A split prefix keeps an outstanding storage backup's host ownership."""
+        if _selected_tree_core_test_backend() != "python":
+            self.skipTest("checks Python TreeCore host lock state directly")
+        if self.cfg != CacheConfig():
+            self.skipTest("single Full page-size-1 ownership regression")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        host_pool = cache.cache_controller.mem_pool_host
+        baseline_host = host_pool.available_size()
+
+        seq = [1, 2, 3, 4]
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self._backup_node(cache, leaf)
+
+        lock_params = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self.assertIsNotNone(lock_params.full_uuid_for_host_lock)
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 9, 10])
+        split_parent = _node_parent(cache, leaf)
+        split_host = _host_value(cache, split_parent, ComponentType.FULL)
+        split_parent_node = cache.tree_core.node_by_id(split_parent)
+        leaf_node = cache.tree_core.node_by_id(leaf)
+        self.assertEqual(
+            split_parent_node.component_data[ComponentType.FULL].host_lock_ref, 1
+        )
+        self.assertEqual(leaf_node.component_data[ComponentType.FULL].host_lock_ref, 1)
+
+        # Before the fix the prefix had host_lock_ref == 0 and these slots were
+        # reclaimed while the storage thread could still be reading them.
+        self.assertEqual(cache.evict_host(len(split_host)), 0)
+
+        # A lock acquired after the split covers only the suffix and gets a new
+        # boundary there. Releasing it must not consume the older segment lock
+        # that was propagated to the prefix.
+        suffix_lock_params = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self.assertEqual(
+            split_parent_node.component_data[ComponentType.FULL].host_lock_ref, 1
+        )
+        self.assertEqual(leaf_node.component_data[ComponentType.FULL].host_lock_ref, 2)
+        self.assertNotEqual(
+            suffix_lock_params.full_uuid_for_host_lock,
+            lock_params.full_uuid_for_host_lock,
+        )
+        cache.dec_host_lock_ref(leaf, suffix_lock_params)
+        self.assertEqual(
+            split_parent_node.component_data[ComponentType.FULL].host_lock_ref, 1
+        )
+        self.assertEqual(leaf_node.component_data[ComponentType.FULL].host_lock_ref, 1)
+        self.assertEqual(cache.evict_host(len(split_host)), 0)
+
+        cache.dec_host_lock_ref(leaf, lock_params)
+        self.assertEqual(
+            split_parent_node.component_data[ComponentType.FULL].host_lock_ref, 0
+        )
+        self.assertEqual(leaf_node.component_data[ComponentType.FULL].host_lock_ref, 0)
+        self.assertEqual(cache.evict_host(len(seq)), len(seq))
+        self.assertEqual(host_pool.available_size(), baseline_host)
+        cache.sanity_check()
+
     def _skip_unsupported_hicache_test(self):
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")

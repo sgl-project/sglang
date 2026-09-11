@@ -1670,12 +1670,10 @@ fn inc_host_lock_ref_runs_full_and_swa_host_arms_together() {
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 0);
     assert!(result.swa_uuid_for_host_lock.is_some());
-    // The release replays the acquire's uuid and unwinds both arms.
-    let params = DecLockRefParams {
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-        ..Default::default()
-    };
+    assert!(result.full_uuid_for_host_lock.is_some());
+    // The centralized conversion preserves both UUIDs, so the release
+    // unwinds the Full and SWA arms together.
+    let params = DecLockRefParams::from(&result);
     tc.dec_host_lock_ref(tc.arena.node(c).id, &params)
         .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(c, FULL), 0);
@@ -1704,11 +1702,7 @@ fn dec_host_lock_ref_with_the_inner_uuid_leaves_an_outer_window_pinned() {
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
     // Releasing the inner window with its own uuid stops at b; the outer
     // window's lock above the boundary survives.
-    let params = DecLockRefParams {
-        swa_uuid_for_host_lock: inner.swa_uuid_for_host_lock,
-        skipped_lock_components: inner.skipped_lock_components,
-        ..Default::default()
-    };
+    let params = DecLockRefParams::from(&inner);
     tc.dec_host_lock_ref(tc.arena.node(c).id, &params)
         .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
@@ -2011,12 +2005,7 @@ fn release_lock_returns_the_window_to_evictable() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
@@ -2045,12 +2034,7 @@ fn release_lock_keeps_sizes_while_other_locks_remain() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: first.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: first.swa_uuid_for_host_lock,
-        skipped_lock_components: first.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&first);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
@@ -2073,12 +2057,7 @@ fn release_lock_replays_the_tombstone_skips() {
     );
     // b gained a device value AFTER the acquire recorded it as a tombstone.
     store_swa_device(&mut tc, b);
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
@@ -2105,12 +2084,7 @@ fn release_lock_stops_at_the_window_uuid() {
     tc.arena
         .node_mut(a)
         .set_lock_ref_(ValueSlotIdx::device(SWA), 1);
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
@@ -2139,12 +2113,7 @@ fn release_host_lock_stops_at_the_host_uuid_boundary() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
@@ -2191,12 +2160,7 @@ fn release_host_lock_reparks_tombstoned_host_nodes() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
@@ -2215,12 +2179,7 @@ fn inc_then_dec_lock_ref_roundtrips_with_dec_params() {
     let result = tc
         .inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY)
         .expect("live test node");
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     tc.dec_lock_ref(tc.arena.node(c).id, &params, /* skip_swa = */ false)
         .expect("live test node");
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
@@ -2397,12 +2356,7 @@ fn release_lock_skip_set_leaves_a_relocked_tombstone_credited() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: first.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: first.swa_uuid_for_host_lock,
-        skipped_lock_components: first.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&first);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
@@ -2593,12 +2547,7 @@ fn release_host_lock_does_not_repark_a_node_whose_host_value_was_taken() {
     // The host value moved out while the lock was held; the node has no
     // device value either, so the release has nothing to park.
     let _ = tc.arena.take_host_value(a, SWA);
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     swa.release_component_lock(&mut tc, a, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 0);
     assert!(!tc.host_lru_list(SWA).in_list(Some(a)));
@@ -2620,12 +2569,7 @@ fn release_host_lock_skips_reparking_device_valued_nodes() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     // Device-valued nodes never re-park in the host LRU on host release.
     assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
@@ -2649,12 +2593,7 @@ fn release_host_lock_leaves_an_already_listed_node_listed() {
     );
     // Something re-listed b while the lock was held (e.g. a split re-park).
     tc.host_lru_list_mut(SWA).insert_mru(b);
-    let params = DecLockRefParams {
-        node_id: None,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert!(tc.host_lru_list(SWA).in_list(Some(b)));
     assert!(tc.host_lru_list(SWA).in_list(Some(c)));
@@ -4928,12 +4867,7 @@ fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
             let lock = tc
                 .inc_lock_ref(anchor, ComponentSet::EMPTY)
                 .expect("live test node");
-            let params = DecLockRefParams {
-                node_id: None,
-                swa_uuid_for_lock: lock.swa_uuid_for_lock,
-                swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                skipped_lock_components: lock.skipped_lock_components,
-            };
+            let params = DecLockRefParams::from(&lock);
             tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                 .expect("live test node");
             tc.finish_load_back(anchor).expect("live test node");
@@ -5044,12 +4978,7 @@ fn aux_release_refreshes_the_leaf_set_whatever_the_release_order() {
         .inc_lock_ref(tc.arena.node(leaf).id, ComponentSet::EMPTY)
         .expect("live test node");
     assert!(!tc.evictable_device_leaves.contains(leaf));
-    let params = DecLockRefParams {
-        node_id: result.node_id,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: None,
-        skipped_lock_components: ComponentSet::EMPTY,
-    };
+    let params = DecLockRefParams::from(&result);
     // Full first: its walk still sees the SWA lock, so the leaf stays out.
     crate::components::FullComponent
         .release_component_lock(&mut tc, leaf, &params, /* lock_host = */ false);
@@ -5068,12 +4997,7 @@ fn dec_lock_ref_rejects_a_receipt_from_another_node() {
     let result = tc
         .inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY)
         .expect("live test node");
-    let params = DecLockRefParams {
-        node_id: result.node_id,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: None,
-        skipped_lock_components: result.skipped_lock_components,
-    };
+    let params = DecLockRefParams::from(&result);
     // Same receipt, wrong anchor: the walk would otherwise release a's
     // segment, which this holder never locked.
     tc.dec_lock_ref(tc.arena.node(a).id, &params, /* skip_swa = */ false)
@@ -5090,12 +5014,7 @@ fn dec_host_lock_ref_rejects_a_receipt_from_another_node() {
     let result = tc
         .inc_host_lock_ref(tc.arena.node(c).id)
         .expect("live test node");
-    let params = DecLockRefParams {
-        node_id: result.node_id,
-        swa_uuid_for_lock: None,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skipped_lock_components: ComponentSet::EMPTY,
-    };
+    let params = DecLockRefParams::from(&result);
     tc.dec_host_lock_ref(tc.arena.node(a).id, &params)
         .expect("live test node");
 }
@@ -5113,12 +5032,7 @@ fn receipt_anchor_follows_the_locked_node_through_a_split() {
     assert_eq!(result.node_id, Some(leaf_id));
     // Diverge inside the node: the split keeps the id on the deeper half.
     tc.insert(&insert_params_swa(&vec![1, 3], &[12, 13], 0, 0));
-    let params = DecLockRefParams {
-        node_id: result.node_id,
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: None,
-        skipped_lock_components: ComponentSet::EMPTY,
-    };
+    let params = DecLockRefParams::from(&result);
     tc.dec_lock_ref(leaf_id, &params, /* skip_swa = */ false)
         .expect("live test node");
     assert_eq!(

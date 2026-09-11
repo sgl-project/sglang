@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     TreeComponent,
+    next_component_uuid,
 )
 
 if TYPE_CHECKING:
@@ -146,6 +147,13 @@ class FullComponent(TreeComponent):
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
         new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
         child_cd = child.component_data[ct]
+        new_parent.component_data[ct].host_lock_ref = child_cd.host_lock_ref
+        # A Full host lock starts as a one-node segment. Splitting that node
+        # extends the segment through the inserted prefix, so its boundary
+        # moves to the prefix's older edge just like the SWA segment boundary.
+        host_uuid = child_cd.metadata.pop("host_uuid", None)
+        if host_uuid is not None:
+            new_parent.component_data[ct].metadata["host_uuid"] = host_uuid
         assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
         if child_cd.value is not None:
@@ -274,6 +282,9 @@ class FullComponent(TreeComponent):
             # write_back mode: the anchor may be device-only (no host_value); pin it anyway.
             if cd.host_value is None and not self.tree_core.is_write_back:
                 return result
+            if cd.metadata.get("host_uuid") is None:
+                cd.metadata["host_uuid"] = next_component_uuid()
+            result.full_uuid_for_host_lock = cd.metadata["host_uuid"]
             cd.host_lock_ref += 1
             self.tree_core._update_evictable_leaf_sets(node)
             return result
@@ -314,13 +325,26 @@ class FullComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         if lock_host:
-            cd = node.component_data[ct]
-            if cd.host_lock_ref == 0:
+            boundary_uuid = params.full_uuid_for_host_lock
+            # None means this receipt did not acquire the Full host component.
+            if boundary_uuid is None:
                 return
-            if cd.host_value is None and not self.tree_core.is_write_back:
-                return
-            cd.host_lock_ref -= 1
-            self.tree_core._update_evictable_leaf_sets(node)
+            while True:
+                cd = node.component_data[ct]
+                if cd.host_value is None and not self.tree_core.is_write_back:
+                    return
+                assert cd.host_lock_ref > 0, (
+                    f"Full host segment release hit host_lock_ref=0 on node {node.id}"
+                )
+                cd.host_lock_ref -= 1
+                self.tree_core._update_evictable_leaf_sets(node)
+                if cd.metadata.get("host_uuid") == boundary_uuid:
+                    break
+                assert node.parent is not None, (
+                    f"Full host lock boundary {boundary_uuid} is not an ancestor "
+                    f"of receipt anchor {params.node_id}"
+                )
+                node = node.parent
             return
 
         root = self.tree_core.root_node
