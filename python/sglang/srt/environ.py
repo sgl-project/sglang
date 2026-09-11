@@ -534,6 +534,10 @@ class Envs:
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
+    # Build the DSpark draft block's attention metadata with one fused
+    # Triton kernel, recorded inside the draft decode graph, instead of the
+    # target's ~85-launch eager prologue. See dsv4/dspark_draft_meta.py.
+    SGLANG_DSPARK_FUSED_PROLOGUE = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)

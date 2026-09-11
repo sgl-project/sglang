@@ -28,6 +28,10 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
+from sglang.srt.layers.attention.dsv4.dspark_draft_meta import (
+    DSparkDraftMetaBuffers,
+    make_dspark_draft_metadata,
+)
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
@@ -500,6 +504,10 @@ class DeepseekV4HipRadixBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+        # Per-(bs, gamma) persistent metadata for the fused DSpark draft
+        # prologue. Addresses stay pinned for the life of the backend so the
+        # fill can be recorded inside the draft decode graph.
+        self._dspark_draft_meta: Dict[tuple, tuple] = {}
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -841,7 +849,93 @@ class DeepseekV4HipRadixBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
+    # ------------------------------------------------------------------
+    # DSpark draft: fused, graph-recordable metadata prologue
+    # ------------------------------------------------------------------
+    def _dspark_fused_prologue_enabled(self) -> bool:
+        """True when this backend drives a DSpark draft block over unified KV.
+
+        Every DSparkV4Stage pins compress_ratio=0, so the unified-KV decode
+        path reads only the SWA index stream, its indptr, the ring write
+        target and the per-token req-slot map. The target's builder produces
+        all of that plus a compressor plan, an FP4 indexer workspace and two
+        unused index streams, at ~85 eager launches per step.
+        """
+        if not self.is_dspark_draft:
+            return False
+        if not envs.SGLANG_DSPARK_FUSED_PROLOGUE.get():
+            return False
+        if get_parallel().attn_cp_size != 1:
+            # apply_cp_reindex rewrites per-token metadata fields the lean
+            # build deliberately leaves empty; fall back to the full builder.
+            return False
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        return is_unified_kv_triton()
+
+    def _dspark_draft_metadata_for(self, *, bs: int) -> tuple:
+        # Same block width the eager builder uses (init_forward_metadata_
+        # target_verify_old's extend_seq_lens), so token counts and every
+        # downstream shape are bit-identical to the path this replaces.
+        gamma = self.target_verify_num_draft_tokens
+        key = (bs, gamma)
+        entry = self._dspark_draft_meta.get(key)
+        if entry is None:
+            pool = self.token_to_kv_pool
+            buffers = DSparkDraftMetaBuffers(
+                bs=bs,
+                gamma=gamma,
+                win=int(pool.unified_swa_window),
+                device=self.device,
+            )
+            metadata = make_dspark_draft_metadata(
+                buffers=buffers,
+                page_size=self.page_size,
+                c4_sparse_topk=self.c4_topk,
+                cuda_int32_kwargs=self.cuda_int32_kwargs,
+                metadata_cls=DSV4Metadata,
+                attn_metadata_cls=DSV4AttnMetadata,
+                unified_cls=UnifiedKvMetadata,
+            )
+            entry = (buffers, metadata)
+            self._dspark_draft_meta[key] = entry
+        return entry
+
+    def _bind_dspark_draft_metadata(self, forward_batch: ForwardBatch) -> tuple:
+        """Resolve (and allocate on first sight) this bucket's buffers.
+
+        Runs out of graph so no allocation happens under capture; the fill
+        itself is issued from init_forward_metadata_in_graph.
+        """
+        buffers, metadata = self._dspark_draft_metadata_for(bs=forward_batch.batch_size)
+        self.forward_metadata = metadata
+        return buffers, metadata
+
+    def _fill_dspark_draft_metadata(self, forward_batch: ForwardBatch) -> None:
+        bs = forward_batch.batch_size
+        buffers, _ = self._bind_dspark_draft_metadata(forward_batch)
+        buffers.fill(
+            seq_lens=forward_batch.seq_lens[:bs].contiguous(),
+            req_pool_indices=forward_batch.req_pool_indices[:bs].contiguous(),
+            ring_stride=int(self.token_to_kv_pool.unified_swa_ring_size),
+        )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self._dspark_fused_prologue_enabled()
+        ):
+            # Recorded inside the draft decode graph: one kernel over the
+            # runner's static seq_lens / req_pool_indices buffers, writing the
+            # pinned metadata the captured attention already binds. Nothing
+            # below applies -- the draft owns no compressor, no FP4 indexer,
+            # and stores its KV through the unified ring (get_unified_swa_loc),
+            # never through swa_out_cache_loc.
+            self._fill_dspark_draft_metadata(forward_batch)
+            return
+
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
         # materialization is recorded inside the cuda graph; a no-op (Full
         # already) when PREP_IN_CUDA_GRAPH=0.
@@ -967,6 +1061,17 @@ class DeepseekV4HipRadixBackend(
         in_capture: bool = False,
     ) -> None:
         bucket = _GraphBucket.of(forward_batch.forward_mode)
+        if (
+            bucket == _GraphBucket.TARGET_VERIFY
+            and self._dspark_fused_prologue_enabled()
+        ):
+            # Bind (and allocate on first sight) the pinned buffers here, out
+            # of capture; the fill runs in graph. Replay-prep issues no kernel
+            # at all, which is what removes the eager-launch bubble.
+            self._bind_dspark_draft_metadata(forward_batch)
+            if in_capture:
+                self._current_capture_raw = None
+            return
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -1100,6 +1205,13 @@ class DeepseekV4HipRadixBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+            return
+
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self._dspark_fused_prologue_enabled()
+        ):
+            self._fill_dspark_draft_metadata(forward_batch)
             return
 
         req_pool_indices = forward_batch.req_pool_indices
