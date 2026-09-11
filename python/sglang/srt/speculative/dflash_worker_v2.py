@@ -72,6 +72,19 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.lilicorr_components.lilicorr_candidates import (
+    publish_anchor,
+    target_input_embeddings,
+)
+from sglang.srt.speculative.lilicorr_components.lilicorr_config import (
+    SAMPLING_ENABLED as _LILICORR_SAMPLING_ENABLED,
+)
+from sglang.srt.speculative.lilicorr_components.lilicorr_draft_sampler import (
+    build_lilicorr_draft_sampler,
+)
+from sglang.srt.speculative.lilicorr_components.lilicorr_select import (
+    propose_lilicorr_block,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -364,6 +377,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
+        self._warned_lilicorr_eager = False
         self._draft_probs_buf = None
         self._logged_first_verify = False
         self._tp_sync = SpecTpSync(get_tp_group())
@@ -383,6 +397,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
+        # The sampled LiLiCorr commit rides the selector's accept path, so it is
+        # available exactly where that path is. Requesting it elsewhere falls back to
+        # the argmax commit and the existing verify, with the warning below.
+        self._lilicorr_sampling_enabled = (
+            _LILICORR_SAMPLING_ENABLED and self._selector_sampling_enabled
+        )
+        # Set by LiLiCorrDraftModel, None on every other DFLASH draft.
+        self.lilicorr = self.draft_model.lilicorr
+        self._lilicorr_anchor: Optional[torch.Tensor] = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -753,6 +776,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not is_dense_head_weight(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
+        if self.lilicorr is not None:
+            return build_lilicorr_draft_sampler(
+                sampling_enabled=self._lilicorr_sampling_enabled,
+                head=self.lilicorr,
+                draft_model=self.draft_model,
+                embed_tokens=target_input_embeddings(target_model),
+                lm_head=lm_head,
+                block_size=self.block_size,
+            )
         tp_group = get_tp_group()
         if self._is_domino:
             if tp_group.world_size != 1:
@@ -1550,6 +1582,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        extend_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1627,6 +1660,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            if self.lilicorr is not None:
+                self._lilicorr_anchor = publish_anchor(
+                    draft_sampler=self._draft_sampler,
+                    ctx_hidden=ctx_hidden,
+                    extend_lens=extend_lens,
+                    commit_lens=commit_lens,
+                )
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -1974,6 +2014,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._warned_sampling_fallback = True
             return
 
+        # Under LILICORR_SAMPLING the head proposes from the request's own temperature
+        # and hands verify the q it drew from, so this batch needs no warning and no
+        # fallback. With sampling off it falls through to the chain check below, which
+        # is correct: the argmax draft is still verified losslessly, just target-only.
+        # Checked after the selector branch because the two heads are mutually
+        # exclusive: a selector worker returns above and never reads `lilicorr`.
+        if self.lilicorr is not None and self._lilicorr_sampling_enabled:
+            return
+
         if (
             not is_dflash_sampling_verify_available()
             and not self._warned_sampling_fallback
@@ -2062,6 +2111,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_hidden=logits_output.hidden_states,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
+                extend_lens=ctx_lens,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -2257,7 +2307,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-        if self.selector is not None:
+        # LiLiCorr joins this arm under LILICORR_SAMPLING: it too proposes from a
+        # per-row temperature and greedy_mask that the replay consumes, and it too
+        # publishes a sparse q the accept path reads. With sampling off its
+        # stage_sampling_params is a no-op and _selector_sample stays None, so the
+        # clearing below is the only thing that runs.
+        if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
             if self._draft_sampler is not None:
                 # Consumed by the in-graph sample; must be staged before the replay.
@@ -2310,6 +2365,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
                 )
+            elif (
+                self.lilicorr is not None
+                and self._lilicorr_sampling_enabled
+                and not _is_all_greedy(batch.sampling_info)
+            ):
+                # Same buffers, same shapes, same accept path as the selector: the
+                # sparse q over each slot's candidates plus the ids it is indexed
+                # against. An all-greedy batch deliberately publishes nothing, so it
+                # takes the target-only verify it takes today.
+                self._selector_sample = (
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                )
         elif self.selector is not None:
             draft_next = self._propose_selector_block(
                 draft_logits_output=draft_logits_output,
@@ -2318,6 +2386,44 @@ class DFlashWorkerV2(BaseSpecWorker):
                 anchor_token_ids=block_ids[:, 0],
                 sampling_info=batch.sampling_info,
             )
+        elif self.lilicorr is not None:
+            # The eager head exists to serve the steps the draft graph cannot, but a
+            # decode step landing here while sampling is on is a throughput cliff of
+            # roughly 17%, and it is invisible in the results: acceptance is identical
+            # on both paths, so only the tokens/s move. build_lilicorr_draft_sampler
+            # already warns when it refuses to fold; this covers the other half of
+            # `folded`, where the sampler exists but the graph could not run the step.
+            if (
+                self._lilicorr_sampling_enabled
+                and not self._warned_lilicorr_eager
+                and self.ps.tp_rank == 0
+            ):
+                logger.warning(
+                    "LiLiCorr sampled draft ran the eager head on a decode step "
+                    "(draft cuda graph unavailable for batch size %d; captured "
+                    "buckets do not cover it, or graphs are disabled). Acceptance is "
+                    "unaffected but expect a large throughput regression, and do not "
+                    "compare tokens/s from this run against a folded one.",
+                    bs,
+                )
+                self._warned_lilicorr_eager = True
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
+                propose_lilicorr_block(
+                    head=self.lilicorr,
+                    draft_hidden=draft_hidden.view(bs, int(self.block_size), -1),
+                    lm_head=lm_head,
+                    embed_tokens=target_input_embeddings(
+                        self.target_worker.model_runner.model
+                    ),
+                    anchor=self._lilicorr_anchor,
+                    sampling_info=batch.sampling_info,
+                )
+            )
+            if lilicorr_q_rows is not None and not _is_all_greedy(batch.sampling_info):
+                self._selector_sample = (lilicorr_candidate_ids, lilicorr_q_rows)
         else:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
