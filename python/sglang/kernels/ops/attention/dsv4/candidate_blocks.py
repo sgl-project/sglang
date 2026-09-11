@@ -414,6 +414,7 @@ def candidate_slots(
     )
 
     rows, logical_width = logits.shape
+    assert triton.next_power_of_2(topk_blocks) == topk_blocks
     num_blocks = triton.cdiv(logical_width, block_size)
     if block_scores is None:
         score_storage = torch.empty(
@@ -514,6 +515,7 @@ def finalize_candidate_topk(
     """Finalize sorted sparse-attention slots without PyTorch elementwise launches."""
     use_candidates = candidate_positions is not None
     assert use_candidates == (candidate_slots is not None)
+    assert triton.next_power_of_2(page_indices.shape[1]) == page_indices.shape[1]
     source_width = (
         candidate_positions.shape[1]
         if use_candidates

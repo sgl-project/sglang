@@ -132,7 +132,7 @@ class TestDecodeProjections(CustomTestCase):
         )
 
         torch.manual_seed(29)
-        rows, width, block_size, topk_blocks = 3, 259, 8, 7
+        rows, width, block_size, topk_blocks = 3, 259, 8, 8
         logits = torch.randn(rows, width, device="cuda")
         lens = torch.tensor([259, 130, 0], device="cuda", dtype=torch.int32)
 
