@@ -19,6 +19,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
+    causal_conv1d_update_varlen,
 )
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import empty_gpu_cache
@@ -433,6 +434,71 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("width", [2, 4])
+def test_causal_conv1d_update_varlen_matches_per_row(width):
+    device = get_device()
+    dtype = torch.bfloat16
+    dim, max_seqlen, num_cache_lines = 128, 4, 8
+    lengths = [4, 1, 3, 0, 0]
+    query_start_loc = torch.tensor([0, 4, 5, 8, 8, 8], dtype=torch.int32, device=device)
+    cache_indices = torch.tensor(
+        [2, 6, 4, PAD_SLOT_ID, PAD_SLOT_ID],
+        dtype=torch.int32,
+        device=device,
+    )
+    x = torch.randn(sum(lengths), dim, dtype=dtype, device=device)
+    weight = torch.randn(dim, width, dtype=dtype, device=device)
+    bias = torch.randn(dim, dtype=dtype, device=device)
+    state = torch.randn(num_cache_lines, dim, width - 1, dtype=dtype, device=device)
+    expected_state = state.clone()
+    intermediate = torch.zeros(
+        num_cache_lines,
+        max_seqlen,
+        dim,
+        width - 1,
+        dtype=dtype,
+        device=device,
+    )
+    expected_intermediate = torch.zeros_like(intermediate)
+
+    expected_rows = []
+    for row, length in enumerate(lengths[:3]):
+        start = int(query_start_loc[row].item())
+        row_x = x[start : start + length].T.unsqueeze(0)
+        row_index = cache_indices[row : row + 1]
+        expected_rows.append(
+            causal_conv1d_update(
+                row_x,
+                expected_state,
+                weight,
+                bias,
+                activation="silu",
+                conv_state_indices=row_index,
+                intermediate_conv_window=expected_intermediate,
+                intermediate_state_indices=row_index,
+            )
+            .squeeze(0)
+            .T
+        )
+
+    actual = causal_conv1d_update_varlen(
+        x,
+        state,
+        weight,
+        bias,
+        activation="silu",
+        query_start_loc=query_start_loc,
+        conv_state_indices=cache_indices,
+        intermediate_conv_window=intermediate,
+        intermediate_state_indices=cache_indices,
+        max_seqlen=max_seqlen,
+    )
+
+    torch.testing.assert_close(actual, torch.cat(expected_rows), rtol=1e-2, atol=5e-2)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(intermediate, expected_intermediate, rtol=0, atol=0)
 
 
 def test_causal_conv1d_varlen_mixed_input_and_state_dtype():

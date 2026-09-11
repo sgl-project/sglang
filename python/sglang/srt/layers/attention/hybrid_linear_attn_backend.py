@@ -378,8 +378,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 draft_token_num=spec_info.draft_token_num,
             )
             num_dense_tokens = (
-                (metadata.query_start_loc.shape[0] - 1) * spec_info.draft_token_num
-            )
+                metadata.query_start_loc.shape[0] - 1
+            ) * spec_info.draft_token_num
             metadata.ragged_verify_dense_gather_indices = torch.where(
                 metadata.ragged_verify_dense_indices < num_dense_tokens,
                 metadata.ragged_verify_dense_indices,
@@ -1297,9 +1297,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         init = getattr(self.full_attn_backend, "init_mha_chunk_metadata", None)
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
-
-    def get_indexer_metadata(self, layer_id, forward_batch):
-        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
