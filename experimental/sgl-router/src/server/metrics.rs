@@ -42,6 +42,7 @@
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
 //! cache-aware prefill selection that resolves a worker, so the labels sum to
@@ -346,6 +347,7 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -739,6 +741,24 @@ impl MetricsRegistry {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_sampling_contract_rejections_total{param}`.
+    ///
+    /// Recorded when the fleet-wide sampling contract refuses a request under
+    /// `--sampling-param-conflict reject`. This is the rollout gauge for the
+    /// flag: it answers "how much client traffic is the contract turning away,
+    /// and on which parameter" — which is otherwise unanswerable, because the
+    /// rejection reaches the client as a 400 like any other. `param` is a
+    /// wire name from a fixed enum, so the label set is bounded.
+    pub fn record_sampling_contract_rejection(&self, param: &'static str) {
+        let mut guard = self.sampling_contract_rejections_total.lock();
+        let counter = guard
+            .entry(param)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -1183,6 +1203,26 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // sampling_contract_rejections_total
+        out.push_str(
+            "# HELP sgl_router_sampling_contract_rejections_total Requests refused by the fleet-wide sampling contract (--override-sampling-params under --sampling-param-conflict reject), by parameter.\n",
+        );
+        out.push_str("# TYPE sgl_router_sampling_contract_rejections_total counter\n");
+        let guard = self.sampling_contract_rejections_total.lock();
+        let mut entries: Vec<(&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| entry.0);
+        for (param, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_sampling_contract_rejections_total{{param=\"{}\"}} {}\n",
+                escape_label(param),
                 value,
             ));
         }
@@ -1737,6 +1777,31 @@ mod tests {
         assert!(
             out.contains(r#"model_id="back\\slash""#),
             "render did not escape backslash; got:\n{out}",
+        );
+    }
+    /// The contract's rollout gauge: absent until a request is actually
+    /// refused, then keyed by the parameter that refused it.
+    #[test]
+    fn sampling_contract_rejections_are_keyed_by_param() {
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_sampling_contract_rejections_total counter"));
+        assert!(
+            !out.contains("sgl_router_sampling_contract_rejections_total{"),
+            "must emit no series before the first rejection"
+        );
+
+        reg.record_sampling_contract_rejection("temperature");
+        reg.record_sampling_contract_rejection("temperature");
+        reg.record_sampling_contract_rejection("top_p");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_sampling_contract_rejections_total{param="temperature"} 2"#),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains(r#"sgl_router_sampling_contract_rejections_total{param="top_p"} 1"#),
+            "got:\n{out}"
         );
     }
 }
