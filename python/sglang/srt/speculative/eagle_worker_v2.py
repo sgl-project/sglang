@@ -767,6 +767,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
+                        forward_batch.sampling_info.top_ks,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -1117,6 +1118,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
+                batch.sampling_info.top_ks,
             )
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
