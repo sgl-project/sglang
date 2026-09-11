@@ -27,9 +27,7 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
     resolve_hf_gguf_reference,
 )
-from sglang.srt.utils.hf_transformers.config import (
-    _apply_gemma4_attention_overrides,
-)
+from sglang.srt.utils.hf_transformers.config import _apply_gemma4_attention_overrides
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -696,8 +694,6 @@ class TestRopeParametersValidationPatch(CustomTestCase):
         self.assertEqual(config.rope_parameters["rope_type"], "axial")
 
     def test_scaling_rope_type_without_max_position_embeddings_does_not_raise(self):
-        """The original guard's purpose: no `AttributeError` out of __post_init__."""
-
         class _ScalingConfig(PretrainedConfig):
             pass
 
@@ -732,12 +728,8 @@ _KNOWN_NAME_MISMATCHES = {"inkling_mm_model"}
 
 
 class TestAutoConfigRegistration(CustomTestCase):
-    """`AutoConfig` must keep resolving to a class the Auto* mappings can key on.
-
-    `_LazyAutoMapping` looks its entries up by config class `__name__`, so a
-    SGLang class that shadows a native one under a different name silently
-    disappears from PROCESSOR_MAPPING / TOKENIZER_MAPPING / MODEL_MAPPING.
-    """
+    """`_LazyAutoMapping` keys on the config class `__name__`: a shadow under
+    another name drops out of PROCESSOR / TOKENIZER / MODEL_MAPPING."""
 
     def test_shadowing_entries_keep_the_native_class_name(self):
         from transformers.models.auto.configuration_auto import (
@@ -783,9 +775,8 @@ class TestAutoConfigRegistration(CustomTestCase):
 
 
 class TestPixtralVisionRope(CustomTestCase):
-    """The Pixtral tower takes its rope table from transformers, so a change to
-    the axial recomposition would rotate every patch by the wrong angle with
-    the shapes and the import both still intact."""
+    """The Pixtral tower takes its rope table from transformers: a changed axial
+    recomposition rotates every patch wrongly with the shapes still intact."""
 
     def test_rope_table_matches_the_axial_closed_form(self):
         import torch
@@ -837,10 +828,8 @@ class TestPixtralVisionRope(CustomTestCase):
 
 
 class TestGemma4AttentionOverrides(CustomTestCase):
-    """Gemma4 states its global/SWA attention split as a heterogeneous
-    `per_layer_config`, which makes a plain `config.head_dim` read raise. Every
-    Gemma4 server launch died in `get_config` until the parser read the split
-    off the per-layer configs and dropped the spec once it had flattened it."""
+    """A parsed Gemma4 config carries the full-attention shape on its base
+    attributes, the sliding-window one on `swa_*`, and no per-layer spec."""
 
     def _make_config(self, **text_overrides):
         from transformers import Gemma4Config
@@ -893,8 +882,8 @@ class TestGemma4AttentionOverrides(CustomTestCase):
         self.assertEqual(text_config.swa_num_key_value_heads, 2)
 
     def test_unflattenable_per_layer_attribute_is_rejected(self):
-        """Dropping the spec would revert such an attribute to its global value
-        and build the model with the wrong per-layer shapes, silently."""
+        """An attribute the parser does not flatten would otherwise revert to
+        the global value and build the model with the wrong per-layer shapes."""
         config = self._make_config(
             intermediate_size=1024,
             per_layer_config={
@@ -907,7 +896,7 @@ class TestGemma4AttentionOverrides(CustomTestCase):
             _apply_gemma4_attention_overrides(config)
 
     def test_layer_type_with_more_than_one_shape_is_rejected(self):
-        """SGLang carries one shape per layer type; such a config must be
+        """SGLang carries one shape per layer type, so such a config must be
         rejected here rather than deep inside the transformers layer view."""
         config = self._make_config(
             per_layer_config={0: {"head_dim": 64}, 5: {"head_dim": 256}}
@@ -923,10 +912,8 @@ class TestGemma4AttentionOverrides(CustomTestCase):
 
 
 class TestNormalizeTpStyle(CustomTestCase):
-    """transformers appends `embed_tokens: embedding_rowwise` to the TP plan of
-    every tied-embedding config, and the Transformers backend raised on the
-    unknown style before it ever reached a module, so those models stopped
-    loading entirely."""
+    """Every style a shipped TP plan can name must normalize; a tied-embedding
+    plan naming an unknown one stops the model loading at all."""
 
     def test_tied_embedding_plan_normalizes(self):
         from transformers import AutoConfig

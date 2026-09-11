@@ -66,17 +66,12 @@ _GEMMA4_MODEL_TYPES = (
 _GEMMA4_FLATTENED_PER_LAYER_ATTRS = frozenset({"head_dim", "num_key_value_heads"})
 
 
-def _gemma4_attention_shapes(text_config) -> dict:
-    """`{layer_type: (head_dim, num_key_value_heads)}`, read off the layer configs.
-
-    Reading either attribute off the global config raises while the per-layer
-    spec is attached, and indexing the view by layer type demands that the whole
-    type be uniform, so the values come off concrete layer indices instead.
-    """
-    # `is_heterogeneous` is `hasattr(_heterogeneity_spec)`, and the spec is the
-    # only statement of which attributes the checkpoint declared per layer.
+def _gemma4_attention_shapes(text_config) -> dict[str, tuple[int, int]]:
+    # `_heterogeneity_spec` is the only statement of what the checkpoint
+    # declared per layer; `is_heterogeneous` is a `hasattr` of it.
     spec = text_config._heterogeneity_spec
     unsupported = set(spec.per_layer_attributes) - _GEMMA4_FLATTENED_PER_LAYER_ATTRS
+    # `per_layer_attributes` discards `skip`, so it needs its own check.
     if any("skip" in overrides for overrides in spec.per_layer_overrides.values()):
         unsupported.add("skip")
     if unsupported:
@@ -86,6 +81,8 @@ def _gemma4_attention_shapes(text_config) -> dict:
             f"shape, and flattens only {sorted(_GEMMA4_FLATTENED_PER_LAYER_ATTRS)}."
         )
 
+    # Indexing the view by layer type demands that the whole type be uniform,
+    # and reading the global config raises while the spec is attached.
     per_layer = text_config.per_layer_config
     shapes: dict[str, set] = {}
     for layer_idx, layer_type in enumerate(text_config.layer_types):
@@ -106,15 +103,13 @@ def _gemma4_attention_shapes(text_config) -> dict:
 
 
 def _apply_gemma4_attention_overrides(config):
-    # Gemma4 states its attention shapes SWA-first: the base attributes are the
-    # sliding-window values and the full-attention layers override them. SGLang
-    # expects the opposite -- base = full attention, `swa_*` = the overrides.
+    # Gemma4 states its shapes SWA-first: base attributes are the sliding-window
+    # values and full-attention overrides them; SGLang's base is full attention.
     text_config = config.text_config
 
     if text_config.is_heterogeneous:
-        # transformers >= 5.16 states that split as a heterogeneous
-        # `per_layer_config` instead of `global_head_dim` /
-        # `num_global_key_value_heads`, which it consumes building the spec.
+        # transformers >= 5.16 states that split as a `per_layer_config`, and
+        # consumes `global_head_dim` / `num_global_key_value_heads` building it.
         shapes = _gemma4_attention_shapes(text_config)
         full_head_dim, full_kv_heads = shapes["full_attention"]
         # The last layer is forced to full attention, so that key is always
@@ -122,15 +117,12 @@ def _apply_gemma4_attention_overrides(config):
         swa_head_dim, swa_kv_heads = shapes.get(
             "sliding_attention", shapes["full_attention"]
         )
-        # `_gemma4_attention_shapes` rejects every per-layer attribute except the
-        # two flattened here, so dropping the spec discards nothing -- and while
-        # it is attached, every later read of `head_dim` raises
-        # `AmbiguousGlobalPerLayerAttributeError`.
+        # Dropping the spec discards nothing once the two attributes it may
+        # carry are flattened, and every read of `head_dim` raises until it is.
         text_config.per_layer_config = None
     else:
-        # No spec means no split to recover: transformers pops `global_head_dim`
-        # and `num_global_key_value_heads` whether or not it builds one, so a
-        # config that reaches here states a single attention shape.
+        # transformers pops `global_head_dim` / `num_global_key_value_heads`
+        # whether or not it builds a spec, so there is no split left to recover.
         full_head_dim = swa_head_dim = text_config.head_dim
         full_kv_heads = swa_kv_heads = text_config.num_key_value_heads
 

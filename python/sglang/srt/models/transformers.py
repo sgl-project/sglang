@@ -238,10 +238,8 @@ def _normalize_tp_style(style: str) -> Style:
         "packed_rowwise": "rowwise",
         "local_rowwise": "rowwise",
         "local_packed_rowwise": "rowwise",
-        # transformers >= 5.16 injects `embed_tokens: embedding_rowwise` into
-        # `base_model_tp_plan` for every tied-embedding config. It targets an
-        # `nn.Embedding`, which this backend shards itself in
-        # `replace_vocab_embed_class`, so the plan entry never reaches a Linear.
+        # transformers >= 5.16 puts this in every tied-embedding `base_model_tp_plan`;
+        # it names the embedding, which `replace_vocab_embed_class` shards instead.
         "embedding_rowwise": "replicate",
         "isolated": "replicate",
         "local": "replicate",

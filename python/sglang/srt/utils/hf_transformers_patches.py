@@ -166,8 +166,7 @@ def _patch_rope_parameters_validation():
         _orig_standardize = PretrainedConfig.standardize_rope_params
 
         def _safe_standardize(self):
-            # Only the llama3/yarn/longrope branches read the attribute, so the
-            # call must still run: it also resolves `default_rope_type`, which
+            # The call must still run: it resolves `default_rope_type`, which
             # Pixtral's vision config needs to reach "axial".
             try:
                 return _orig_standardize(self)
