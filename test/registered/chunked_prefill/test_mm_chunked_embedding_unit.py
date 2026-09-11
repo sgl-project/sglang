@@ -2,9 +2,9 @@
 
 A DataEmbeddingFunc may return either one combined [tokens, hidden] tensor or
 one tensor per item (see mm_schedule.DataEmbeddingFunc). These tests assert the
-two forms produce bitwise-identical chunked-prefill embeddings, and that the
-per-item form yields cache entries that own their storage (a torch.split view
-of the combined tensor pins the whole concatenated buffer).
+two forms produce bitwise-identical chunked-prefill embeddings and that cached
+embeddings own their storage (a torch.split view of the combined tensor would
+otherwise pin the whole concatenated buffer).
 
 CPU-only: exercises mm_schedule internals directly, no engine or GPU.
 """
@@ -172,20 +172,16 @@ def test_list_cache_entries_own_storage():
         assert emb.untyped_storage().nbytes() == own_bytes
 
 
-def test_tensor_cache_entries_share_storage():
-    # Documents the motivation for the per-item form: split views of the
-    # combined tensor keep the whole concatenated buffer alive.
+def test_tensor_cache_entries_own_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
     mm_schedule._get_chunked_embedding_by_item(
         _encoder_tensor, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
     )
-    total_tokens = sum(_num_tokens(item) for item in items)
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
-        assert (
-            emb.untyped_storage().nbytes() == total_tokens * HIDDEN * emb.element_size()
-        )
+        own_bytes = emb.numel() * emb.element_size()
+        assert emb.untyped_storage().nbytes() == own_bytes
 
 
 def test_by_item_mismatched_cache_entry_is_reencoded():

@@ -1,6 +1,6 @@
 import abc
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 import torch
@@ -115,6 +115,13 @@ class MultiModalStaticCache(MultimodalCache):
                 return False
             lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
             self.current_size -= _get_tensor_size(lru_embedding.embedding)
+
+        tensor = embedding.embedding
+        if tensor.untyped_storage().nbytes() > data_size:
+            # torch.split/slicing returns views. Caching a view would retain the
+            # whole batched encoder output while current_size accounts for only
+            # this item's bytes. replace() preserves subclass metadata.
+            embedding = replace(embedding, embedding=tensor.clone())
 
         self.mm_cache[mm_hash] = embedding
         self.current_size += data_size
