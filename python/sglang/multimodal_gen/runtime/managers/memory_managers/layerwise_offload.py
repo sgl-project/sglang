@@ -426,6 +426,31 @@ def _unpin_in_place(data_ptr: int) -> None:
         pass
 
 
+def _shared_storage(nbytes: int) -> Optional[torch.UntypedStorage]:
+    """Anonymous shared memory (memfd) of exactly `nbytes`, or None off Linux.
+
+    Shared rather than private anonymous memory so the locked pages stay on
+    the shmem side of the process's accounting, where cudaHostAlloc kept
+    them: the host-anon figures (and the forced-host-view budget that
+    subtracts them) keep meaning "pageable copies".
+    """
+    if not hasattr(os, "memfd_create"):
+        return None
+    try:
+        fd = os.memfd_create("sglang-pinned-store", 0)
+    except OSError:
+        return None
+    try:
+        os.ftruncate(fd, nbytes)
+        return torch.UntypedStorage.from_file(
+            f"/proc/self/fd/{fd}", shared=True, nbytes=nbytes
+        )
+    except Exception:
+        return None
+    finally:
+        os.close(fd)
+
+
 # Below this, torch's own pinned pool: its power-of-two rounding costs little on
 # small blocks, and two small blocks can share a page, which cudaHostRegister
 # refuses to lock twice.
@@ -435,14 +460,24 @@ _REGISTER_MIN_BYTES = 64 << 20
 def _pinned_empty(*size: int, dtype: torch.dtype, stride=None) -> torch.Tensor:
     """A pinned CPU tensor of exactly this size; torch's pinned pool as fallback."""
     shape = size[0] if stride is not None else size
-    if math.prod(shape) * dtype.itemsize >= _REGISTER_MIN_BYTES:
-        if stride is None:
+    if stride is None:
+        storage_numel = math.prod(shape)
+    else:
+        storage_numel = 1 + sum((d - 1) * st for d, st in zip(shape, stride) if d > 0)
+        storage_numel = storage_numel if math.prod(shape) else 0
+    nbytes = storage_numel * dtype.itemsize
+    if nbytes >= _REGISTER_MIN_BYTES:
+        storage = _shared_storage(nbytes)
+        tensor = torch.empty(0, dtype=dtype)
+        if storage is not None:
+            tensor.set_(storage, 0, shape, stride or tensor.stride())
+        elif stride is None:
             tensor = torch.empty(*size, dtype=dtype)
         else:
             tensor = torch.empty_strided(size=shape, stride=stride, dtype=dtype)
         if _pin_in_place(tensor):
             return tensor
-        del tensor
+        del tensor, storage
     if stride is None:
         return torch.empty(*size, dtype=dtype, pin_memory=True)
     return torch.empty_strided(size=shape, stride=stride, dtype=dtype, pin_memory=True)
