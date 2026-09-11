@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.attention.dsv4.indexer import CandidateRole
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,8 +35,7 @@ class _Indexer:
     def __init__(self, q, weights, topk):
         self.q, self.w = q, weights
         self.index_topk = topk
-        self.is_candidate_source = False
-        self.uses_candidates = False
+        self.candidate_role = CandidateRole.NONE
         self.candidate_topk_blocks = 2
         self.candidate_block_size = 32
         self.owns_k = False
@@ -55,7 +55,7 @@ def _backend(core, pool, req_to_token):
     backend.forward_metadata = SimpleNamespace(core_metadata=core, late_layer_tail=None)
     backend.token_to_kv_pool = pool
     backend.req_to_token = req_to_token
-    backend.candidate_masks = None
+    backend.candidate_masks_by_request = None
     return backend
 
 
