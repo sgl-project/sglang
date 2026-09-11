@@ -156,7 +156,7 @@ NIGHTLY_SUITES = {
         "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
         # Reporting-only serving benchmark; dispatched by
         # nightly-benchmark-amd.yml, not by the AMD nightly test workflow.
-        "nightly-perf-4-gpu-mi35x-qwen35-mxfp4-agentic-mtp",
+        "nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
     ],

@@ -3,15 +3,15 @@ name: Nightly Benchmark (AMD)
 # Serving benchmarks that report numbers rather than gate anything.
 #
 # They are deliberately not jobs in nightly-test-amd-rocm720.yml: a benchmark
-# holds the one 8-GPU MI35x runner for half an hour, its result is a throughput
-# number rather than a pass/fail, and inside the nightly test workflow a slow or
-# failed replay would either turn the whole nightly red or have to be pinned
-# behind continue-on-error, which hides real breakage. Here the job's own status
-# is the signal, and the workload can be tuned without touching the gate.
+# holds scarce MI35x runners for over an hour, its result is a throughput number
+# rather than a pass/fail, and inside the nightly test workflow a slow or failed
+# replay would either turn the whole nightly red or have to be pinned behind
+# continue-on-error, which hides real breakage. Here the job's own status is the
+# signal, and the workload can be tuned without touching the gate.
 on:
   schedule:
     # Clear of the AMD nightly test sweep (17:30 UTC) so the two do not queue
-    # behind each other on linux-mi35x-gpu-8.
+    # behind each other on the MI35x runners.
     - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
@@ -39,7 +39,7 @@ on:
           - 'all'
           - qwen35-mxfp4-agentic-mtp-mi35x
       workload_env:
-        description: 'Optional workload overrides, space separated (e.g. "AGENTIC_CONCURRENCY=64 AGENTIC_NUM_CONVERSATIONS=128")'
+        description: 'Optional workload overrides, space separated (e.g. "AGENTIC_NUM_CONVERSATIONS=128 AGENTIC_MAX_TURNS=20")'
         required: false
         type: string
         default: ''
@@ -62,19 +62,31 @@ concurrency:
 
 jobs:
   # ==============================================================================
-  # Qwen3.5-397B-A17B MXFP4 + EAGLE MTP, AgentX coding-agent replay (MI35x, tp4)
+  # Qwen3.5-397B-A17B MXFP4 + EAGLE MTP, AgentX coding-agent replay (MI35x)
   # ==============================================================================
   qwen35-mxfp4-agentic-mtp-mi35x:
-    name: ${{ format('qwen35-mxfp4-agentic-mtp-mi35x ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    name: ${{ format('qwen35-mxfp4-agentic-mtp-mi35x {0} ({1})', matrix.point.name, matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         # One image per run by default -- the schedule measures the current
-        # ROCm lane, and sweeping three of them would hold the 8-GPU MI35x
-        # runner for hours to produce three numbers nobody compares.
+        # ROCm lane, and sweeping three of them would hold the MI35x runners
+        # for hours to produce three sets of numbers nobody compares.
         rocm_version: ${{ fromJson(inputs.rocm_version == 'all' && '["rocm10", "rocm724", "rocm720"]' || format('["{0}"]', inputs.rocm_version || 'rocm10')) }}
+        point:
+          - { name: tp4-hicache-c48, runner: linux-mi35x-gpu-8, tp: 4, concurrency: 48, kv_offloading: hicache }
+          - { name: tp2-gpu-kv-c1, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 1, kv_offloading: none }
+          - { name: tp2-gpu-kv-c4, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 4, kv_offloading: none }
+          - { name: tp2-gpu-kv-c8, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 8, kv_offloading: none }
+          - { name: tp2-gpu-kv-c12, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 12, kv_offloading: none }
+          - { name: tp2-gpu-kv-c16, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 16, kv_offloading: none }
+          - { name: tp2-gpu-kv-c20, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 20, kv_offloading: none }
+          - { name: tp2-hicache-c20, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 20, kv_offloading: hicache }
+          - { name: tp2-hicache-c24, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 24, kv_offloading: hicache }
+          - { name: tp2-hicache-c28, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 28, kv_offloading: hicache }
+          - { name: tp2-hicache-c32, runner: linux-mi35x-gpu-2, tp: 2, concurrency: 32, kv_offloading: hicache }
     if: github.repository == 'sgl-project/sglang' && (!inputs.benchmark_select || inputs.benchmark_select == 'all' || inputs.benchmark_select == 'qwen35-mxfp4-agentic-mtp-mi35x')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: ${{ matrix.point.runner }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -106,7 +118,7 @@ jobs:
       # The replay converts the published AgentX corpus on first use and caches
       # it under the persistent /sgl-data mount alongside the weights, so only
       # the first run on a fresh runner pays for the download.
-      - name: Qwen3.5-MXFP4 agentic MTP replay (4-GPU MI35x)
+      - name: Qwen3.5-MXFP4 agentic MTP replay (${{ matrix.point.name }})
         timeout-minutes: 240
         env:
           WORKLOAD_ENV: ${{ inputs.workload_env }}
@@ -120,6 +132,9 @@ jobs:
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             "${ENV_ARGS[@]}" \
-            python3 run_suite.py --hw amd --suite nightly-perf-4-gpu-mi35x-qwen35-mxfp4-agentic-mtp --nightly --timeout-per-file 12600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            -e AGENTIC_TP=${{ matrix.point.tp }} \
+            -e AGENTIC_CONCURRENCY=${{ matrix.point.concurrency }} \
+            -e AGENTIC_KV_OFFLOADING=${{ matrix.point.kv_offloading }} \
+            python3 run_suite.py --hw amd --suite nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp --nightly --timeout-per-file 12600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}

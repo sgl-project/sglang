@@ -57,7 +57,7 @@ what makes the number worth tracking; the prompt-side gap is the harness.
 Everything is env-overridable so the AMD CI owners can retune the workload
 without touching the recipe.
 
-Registry: nightly-perf-4-gpu-mi35x-qwen35-mxfp4-agentic-mtp suite
+Registry: nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp suite
 """
 
 import os
@@ -78,7 +78,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=7200,
-    suite="nightly-perf-4-gpu-mi35x-qwen35-mxfp4-agentic-mtp",
+    suite="nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp",
     nightly=True,
 )
 
@@ -90,10 +90,9 @@ MODEL_PATH = os.environ.get("QWEN35_MXFP4_MODEL_PATH", "amd/Qwen3.5-397B-A17B-MX
 # Parallelism and concurrency come from the recipe's own search space in
 # InferenceX configs/amd-master.yaml (qwen3.5-fp4-mi355x-sglang-agentic-mtp):
 # tp2 and tp4 at ep1, with the HiCache CPU tier only on the high-concurrency
-# rows -- tp4 runs it at concurrency 40/48/56/64. 48 is the middle of that row,
-# so one CI point exercises the offload path the rest of this config exists to
-# serve. tp4 leaves half of the 8-GPU runner idle, as the MiniMax-M3 tp4 job
-# already does; the recipe never runs this checkpoint at tp8.
+# rows. The CI matrix covers all ten tp2 points on the 2-GPU runner and keeps
+# tp4 + HiCache at c48 as a reference point on the 8-GPU runner; the recipe
+# never runs this checkpoint at tp8.
 TP_SIZE = int(os.environ.get("AGENTIC_TP", "4"))
 EP_SIZE = int(os.environ.get("AGENTIC_EP_SIZE", "1"))
 CONCURRENCY = int(os.environ.get("AGENTIC_CONCURRENCY", "48"))
@@ -241,6 +240,11 @@ def render_report(result: dict, trace_summary: str) -> str:
     accept_cell = f"{accept_length:.2f}" if accept_length else "n/a (not reported)"
     if SIMULATE_ACC_LEN:
         accept_cell += f" (simulated {SIMULATE_ACC_LEN})"
+    asm_verify_cell = (
+        ("on" if ASM_VERIFY_ATTN == "1" else "off")
+        if TP_SIZE == 4
+        else "n/a (tp2 GQA16 path)"
+    )
 
     report = (
         f"### Qwen3.5-397B-A17B MXFP4 + EAGLE MTP, AgentX agentic replay "
@@ -250,8 +254,7 @@ def render_report(result: dict, trace_summary: str) -> str:
         f"| concurrency | {CONCURRENCY} |\n"
         f"| max turns / conversation | {MAX_TURNS} |\n"
         f"| kv offloading | {KV_OFFLOADING} |\n"
-        f"| gfx950 asm verify attention | "
-        f"{'on' if ASM_VERIFY_ATTN == '1' else 'off'} |\n"
+        f"| gfx950 asm verify attention | {asm_verify_cell} |\n"
         f"{trace_summary}\n"
         f"| metric | value |\n| --- | --- |\n"
         f"| completed turns | {result.get('completed')} |\n"
