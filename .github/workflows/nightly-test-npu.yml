@@ -343,7 +343,9 @@ jobs:
   # Suites suffixed with `-cann910` run against the CANN 9.1.0 image.
   nightly-perf-16-npu-a3-cann910:
     name: nightly-perf-16-npu-a3-cann910
-    # if: ${{ false }}
+    # Temporarily disabled: only run DSV4-0731 w8a8 8p GPQA (cann910 acc) and
+    # glm_5_2 w8a8 16p GPQA (9.0.0 multi-node mix).
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -462,8 +464,8 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    # Disabled: does not involve CANN 9.1.0.
-    if: ${{ false }}
+    # Temporarily enabled: only run glm_5_2 w8a8 16p GPQA (9.0.0 multi-node mix).
+    # if: ${{ false }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
@@ -476,10 +478,11 @@ jobs:
             test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
             test_type: 'accuracy'
           # kimi_k3 accuracy tests
-          - name: kimi_k3_w4a8_32p_gpqa
-            node_size: 4
-            test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
-            test_type: 'accuracy'
+          # Temporarily commented out: only run glm_5_2 for this round.
+          # - name: kimi_k3_w4a8_32p_gpqa
+          #   node_size: 4
+          #   test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
+          #   test_type: 'accuracy'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
