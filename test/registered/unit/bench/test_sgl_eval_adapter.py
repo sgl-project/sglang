@@ -14,7 +14,11 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.run_eval import run_eval
-from sglang.test.sgl_eval import api_base_url, run_sgl_eval
+from sglang.test.sgl_eval import (
+    _print_truncated_samples,
+    api_base_url,
+    run_sgl_eval,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="stage-a-test-cpu-intel")
@@ -80,6 +84,41 @@ class TestSglEvalAdapter(CustomTestCase):
             SimpleNamespace(base_url="http://127.0.0.1:30000/v1/"),
         ):
             self.assertEqual(api_base_url(args), "http://127.0.0.1:30000/v1")
+
+    def test_truncated_sample_previews_are_bounded(self):
+        from sgl_eval.types import Example, ExampleResult, Sample
+
+        response = "start " + "repeated reasoning " * 10000 + "end"
+        examples = [
+            ExampleResult(
+                example=Example(id=str(index), inputs={}, target="7"),
+                samples=[
+                    Sample(text="Normal answer", finish_reason="stop"),
+                    Sample(
+                        text=response,
+                        finish_reason="length",
+                        completion_tokens=16384,
+                    ),
+                ],
+                scores=[1.0, 0.0],
+                extracted=["7", None],
+            )
+            for index in range(5)
+        ]
+        with patch("builtins.print") as output:
+            _print_truncated_samples(SimpleNamespace(per_example=examples))
+        self.assertEqual(output.call_count, 3)
+        for index, call in enumerate(output.call_args_list):
+            line = call.args[0]
+            self.assertLess(len(line), 1500)
+            preview = json.loads(line.removeprefix("sgl-eval truncated sample: "))
+            self.assertEqual(preview["example_id"], str(index))
+            self.assertEqual(preview["repeat"], 1)
+            self.assertEqual(preview["completion_tokens"], 16384)
+            self.assertEqual(preview["score"], 0.0)
+            self.assertEqual(preview["text_chars"], len(response))
+            self.assertTrue(preview["head"].startswith("start "))
+            self.assertTrue(preview["tail"].endswith("end"))
 
     def test_gsm8k_always_dispatches_to_sgl_eval(self):
         for api in (None, "chat", "completion", "generate", "sgl_eval"):
@@ -192,6 +231,8 @@ class TestSglEvalAdapter(CustomTestCase):
                     temperature=0.7,
                     top_p=0.9,
                     top_k=20,
+                    presence_penalty=1.5,
+                    seed=42,
                     min_p=0.1,
                     sgl_eval_thinking=thinking,
                     return_latency=True,
@@ -221,6 +262,9 @@ class TestSglEvalAdapter(CustomTestCase):
                 self.assertEqual(latency, metrics["latency"])
                 self.assertAlmostEqual(metrics["output_throughput"] * latency, 8)
                 self.assertTrue(Path(metrics["sgl_eval_metrics_path"]).exists())
+                saved = json.loads(Path(metrics["sgl_eval_metrics_path"]).read_text())
+                self.assertEqual(saved["generation"]["presence_penalty"], 1.5)
+                self.assertEqual(saved["generation"]["seed"], 42)
                 self.assertTrue(
                     list(Path(directory).glob("sgl_eval_gsm8k_*/output-rs0.jsonl"))
                 )
@@ -233,6 +277,8 @@ class TestSglEvalAdapter(CustomTestCase):
             self.assertEqual(path, "/v1/chat/completions")
             self.assertEqual(payload["max_tokens"], 128)
             self.assertEqual(payload["top_k"], 20)
+            self.assertEqual(payload["presence_penalty"], 1.5)
+            self.assertEqual(payload["seed"], 42)
             self.assertEqual(payload["min_p"], 0.1)
             self.assertEqual(payload["temperature"], 0.7)
             self.assertEqual(payload["top_p"], 0.9)

@@ -45,24 +45,29 @@ class TestUnifiedQwenHybridTriton(DefaultServerBase):
     other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "triton"]
 
     def test_gsm8k(self):
-        self.assertGreaterEqual(self._run_gsm8k(thinking=True), self.gsm8k_threshold)
+        self.assertGreaterEqual(self._run_gsm8k(), self.gsm8k_threshold)
 
-    def _run_gsm8k(self, *, thinking):
+    def _run_gsm8k(self, *, greedy=False, num_examples=None):
         from sglang.test.run_eval import run_eval as run_gsm8k_eval
 
         url = urlparse(self.base_url)
         args = SimpleNamespace(
             eval_name="gsm8k",
-            num_examples=self.num_gsm8k_questions,
-            max_tokens=16384 if thinking else 2048,
-            sgl_eval_thinking=thinking,
+            num_examples=num_examples or self.num_gsm8k_questions,
+            max_tokens=16384,
+            sgl_eval_thinking=True,
+            temperature=0.0 if greedy else 1.0,
+            top_p=0.95,
+            top_k=-1 if greedy else 20,
+            presence_penalty=0.0 if greedy else 1.5,
+            seed=42,
             num_threads=self.parallel,
             host=f"http://{url.hostname}",
             port=int(url.port),
         )
         metrics = run_gsm8k_eval(args)
         print(
-            f"[{self.__class__.__name__}] thinking={thinking}, "
+            f"[{self.__class__.__name__}] greedy={greedy}, "
             f"GSM8K accuracy: {metrics['accuracy']:.3f} "
             f"(threshold: {self.gsm8k_threshold})"
         )
@@ -88,8 +93,8 @@ class TestStaticQwenHybridFa3(TestUnifiedQwenHybridTriton):
     other_args = _COMMON_ARGS + ["--attention-backend", "fa3"]
 
     def test_gsm8k(self):
-        # Measure the previous protocol on static pools before the thinking run.
-        self._run_gsm8k(thinking=False)
+        # Capture truncated samples from the previous greedy thinking protocol.
+        self._run_gsm8k(greedy=True, num_examples=32)
         super().test_gsm8k()
 
 

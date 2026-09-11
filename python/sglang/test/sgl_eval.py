@@ -7,6 +7,7 @@ import threading
 import uuid
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
+from itertools import islice
 from pathlib import Path
 
 
@@ -19,6 +20,27 @@ def api_base_url(args):
         base_url = f"{host}:{getattr(args, 'port', None) or 30000}"
     base_url = base_url.rstrip("/")
     return base_url if base_url.endswith("/v1") else base_url + "/v1"
+
+
+def _print_truncated_samples(result):
+    truncated = (
+        (example, repeat, sample)
+        for example in result.per_example
+        for repeat, sample in enumerate(example.samples)
+        if sample.finish_reason == "length"
+    )
+    for example, repeat, sample in islice(truncated, 3):
+        preview = {
+            "example_id": example.example.id,
+            "repeat": repeat,
+            "finish_reason": sample.finish_reason,
+            "completion_tokens": sample.completion_tokens,
+            "score": example.scores[repeat],
+            "text_chars": len(sample.text),
+            "head": sample.text[:500],
+            "tail": sample.text[-500:],
+        }
+        print(f"sgl-eval truncated sample: {json.dumps(preview)}", flush=True)
 
 
 def run_sgl_eval(args):
@@ -71,6 +93,26 @@ def run_sgl_eval(args):
     if extra_body:
         overrides["extra_body"] = extra_body
     gen = replace(spec.default_gen, **overrides)
+    generation = {
+        key: getattr(gen, key)
+        for key in (
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "min_p",
+            "repetition_penalty",
+            "seed",
+            "chat_template_kwargs",
+        )
+    }
+    generation.update(
+        {
+            key: value
+            for key, value in (gen.extra_body or {}).items()
+            if key in ("top_k", "presence_penalty", "frequency_penalty")
+        }
+    )
+    print(f"sgl-eval {spec.name} generation: {generation}", flush=True)
     sampler = ChatCompletionSampler(
         base_url=api_base_url(args),
         model=getattr(args, "model", None),
@@ -122,6 +164,7 @@ def run_sgl_eval(args):
             {
                 "name": spec.name,
                 "model": sampler.model,
+                "generation": generation,
                 "aggregate": result.aggregate,
                 "num_examples": result.num_examples,
                 "n_repeats": result.n_repeats,
@@ -131,6 +174,7 @@ def run_sgl_eval(args):
             indent=2,
         )
     )
+    _print_truncated_samples(result)
     if result.aggregate.get("error_rate", 0) > 0:
         raise RuntimeError(
             f"{spec.name} evaluation had request errors "

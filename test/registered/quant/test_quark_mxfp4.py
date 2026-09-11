@@ -160,12 +160,12 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             # Weights initialized on meta device (not for dense BF16->MXFP4)
             assert peak_memory_before_load < 5
 
-    def _test_gsm8k(self, accuracy_threshold):
+    def _test_gsm8k(self, accuracy_threshold, *, max_tokens=512):
         """Helper method to test GSM8K accuracy against a threshold."""
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=500,
-            max_tokens=512,
+            max_tokens=max_tokens,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -240,7 +240,7 @@ class TestDeepSeekR10528NVFP4ToMXFP4(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.95.
-        self._test_gsm8k(accuracy_threshold=0.90)
+        self._test_gsm8k(accuracy_threshold=0.90, max_tokens=16384)
 
 
 class TestFP8ToMXFP4DenseTP1(TestOnlineQuantizationMemoryLoad):

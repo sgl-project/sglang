@@ -126,6 +126,11 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
                 num_threads=GSM8K_NUM_QUESTIONS,
                 max_tokens=16384,
                 sgl_eval_thinking=True,
+                temperature=0.6,
+                top_p=0.95,
+                top_k=20,
+                presence_penalty=0.0,
+                seed=42,
             )
         )
 

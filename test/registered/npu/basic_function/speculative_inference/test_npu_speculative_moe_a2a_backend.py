@@ -87,7 +87,7 @@ class TestAscendDistTimeout(CustomTestCase):
                     eval_name="gsm8k",
                     num_examples=1319,
                     num_threads=128,
-                    max_tokens=512,
+                    max_tokens=16384,
                     temperature=0.0,
                 )
 

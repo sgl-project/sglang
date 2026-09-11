@@ -141,7 +141,7 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
             eval_name="gsm8k",
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=GSM8K_NUM_THREADS,
-            max_tokens=512,
+            max_tokens=16384,
             temperature=0.0,
         )
         metrics = run_eval(args)

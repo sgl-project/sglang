@@ -78,7 +78,7 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=16384,
             num_threads=128,
             host=f"http://{self.url.hostname}",
             port=int(self.url.port),
