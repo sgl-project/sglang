@@ -407,6 +407,15 @@ def test_real_pool_backend_commit_tracking_and_lifecycle():
         with patch.object(pool.mamba_pool, "enable_linear_replayssm", True):
             with pytest.raises(ValueError, match="no ReplaySSM"):
                 KDAAttnBackend(runner)
+        # The deferred commit handles KDA SSM/conv checkpoints only. Reject
+        # optional PLE state rather than bypassing its ordinary commit path.
+        for side_pool, field in (
+            (pool.short_conv_pool, "conv_state"),
+            (pool.ngram_pool, "context"),
+        ):
+            with patch.object(side_pool, field, torch.empty(1, device="cuda")):
+                with pytest.raises(ValueError, match="no PLE side states"):
+                    KDAAttnBackend(runner)
         with envs.SGLANG_OPT_KDA_ACCEPTED_STATE.override(False):
             assert KDAAttnBackend(runner).accepted_state is None
         runner.is_draft_worker = True

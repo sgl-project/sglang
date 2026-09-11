@@ -490,10 +490,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 and self.req_to_token_pool.mamba_ckpt_pool is None
                 and type(pool) is MambaPool
                 and self.req_to_token_pool.mamba_v2p_table is None
+                and self.req_to_token_pool.short_conv_pool.conv_state is None
+                and self.req_to_token_pool.ngram_pool.context is None
             ):
                 raise ValueError(
                     "KDA accepted-state requires SM90 Triton T2 EAGLE chain verify "
-                    "with a static MambaPool, no int8 checkpoints, and no ReplaySSM"
+                    "with a static MambaPool, no int8 checkpoints, no ReplaySSM, "
+                    "and no PLE side states"
                 )
             self.accepted_state = getattr(pool, "kda_accepted_state", None)
             if self.accepted_state is None:
