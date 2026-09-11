@@ -13,9 +13,11 @@ slot, and a host page move carries the draft bytes with it.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache import memory_pool as mem_pool
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -25,7 +27,11 @@ from sglang.srt.mem_cache.layout.token_major import (
     align_entry_bytes,
     align_part_offset,
 )
-from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.unified_draft_pool import (
+    UnifiedDraftKVPool,
+    UnifiedDraftSWAKVPool,
+)
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
@@ -422,6 +428,102 @@ class TestFusedMLAHost(unittest.TestCase):
         self.assertEqual(
             dp.k_buffer[0].stride(0) * dp.k_buffer[0].element_size(), entry
         )
+
+
+class TestUnifiedDraftSWAKVPool(unittest.TestCase):
+    """A draft with window layers binds one dense side per host sub-pool and
+    routes per layer like the target's composite: a window layer's write
+    needs the swa loc and lands in the swa entry's draft part, never in the
+    full entry."""
+
+    PS = 2
+    PAGES = 8
+
+    def _pool(self):
+        full_region = _draft_region()
+        swa_region = DenseDraftRegion(
+            lane_num=1, head_num=1, head_dim=8, store_dtype=_DTYPE
+        )
+        full = _host_spec(full_region)
+        swa = MHASubPoolSpec(
+            name="swa",
+            layer_num=1,
+            head_num=2,
+            head_dim=4,
+            store_dtype=_DTYPE,
+            grow_direction="up",
+            draft_region=swa_region,
+        )
+        total = self.PAGES * self.PS * (full.entry_bytes() + swa.entry_bytes())
+        return UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, swa],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            fused_draft=FusedDraftPlacement.from_counts(
+                counts={"full": [1], "swa": [1]},
+                regions={"full": full_region, "swa": swa_region},
+            ),
+        )
+
+    def _draft_pool(self, pool):
+        return UnifiedDraftSWAKVPool(
+            unified_buffer=pool,
+            host_allocator=object(),
+            page_size=self.PS,
+            full_layer_lanes={0: 0},
+            swa_layer_lanes={1: 0},
+        )
+
+    def test_routes_each_layer_to_its_side(self):
+        pool = self._pool()
+        dp = self._draft_pool(pool)
+        self.assertEqual(dp.layers_mapping, {0: (0, False), 1: (0, True)})
+        dk, _ = pool.build_dense_draft_views("swa")
+        self.assertEqual(dp.get_key_buffer(1).data_ptr(), dk[0].data_ptr())
+        self.assertEqual(dp.get_key_buffer(1).shape[1:], (1, 8))
+        self.assertEqual(dp.get_key_buffer(0).shape[1:], (1, 24))
+        self.assertEqual(dp.swa_layer_nums, 1)
+        self.assertEqual(dp.full_layer_nums, 1)
+
+    def test_a_window_only_draft_answers_its_own_v_width(self):
+        # MiMoV2MTP: no full layer at all; the composite still works.
+        pool = self._pool()
+        swa_only = UnifiedDraftSWAKVPool(
+            unified_buffer=pool,
+            host_allocator=object(),
+            page_size=self.PS,
+            full_layer_lanes={},
+            swa_layer_lanes={0: 0},
+        )
+        self.assertIsNone(swa_only.full_kv_pool)
+        self.assertEqual(swa_only.get_v_head_dim(), 8)
+        self.assertEqual(swa_only.layers_mapping, {0: (0, True)})
+
+    def test_window_write_needs_the_swa_loc_and_stays_in_the_swa_entry(self):
+        pool = self._pool()
+        dp = self._draft_pool(pool)
+        layer = SimpleNamespace(layer_id=1)
+        k = torch.full((1, 1, 8), 3.0, dtype=_DTYPE)
+        v = torch.full((1, 1, 8), 5.0, dtype=_DTYPE)
+        loc = torch.tensor([6], dtype=torch.int64)
+        with self.assertRaises(AssertionError):
+            dp.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
+        raw = pool._raw
+        raw.zero_()
+        # `_is_cuda` is a PLATFORM constant, not a per-tensor device check, so
+        # on a CUDA box the store dispatches the CUDA-only `sglang::store_cache`
+        # at these CPU tensors and raises NotImplementedError. This fixture is
+        # CPU by contract (register_cpu_ci), and the subject here is WHERE the
+        # bytes land, not which kernel puts them there -- take the naive path.
+        with patch.object(mem_pool, "can_use_store_cache", return_value=False):
+            dp.set_kv_buffer(layer, KVWriteLoc(loc, swa_loc=loc, physical=True), k, v)
+        swa_entry = pool.spec("swa").entry_bytes()
+        lo = 6 * swa_entry + pool.spec("swa").draft_offset_in_entry()
+        nz = raw.nonzero()
+        self.assertGreater(nz.numel(), 0)
+        self.assertTrue(bool((nz >= lo).all() and (nz < 7 * swa_entry).all()))
 
 
 if __name__ == "__main__":
