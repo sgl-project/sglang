@@ -43,7 +43,6 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
-    _all_reduce_polls,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -53,7 +52,7 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
-    pp_sync_polls,
+    poll_and_all_reduce_pp2,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -438,21 +437,10 @@ class PrefillBootstrapQueue:
                 return [], []
 
         if self.pp_size > 1:
-            if self.pp_rank == 0:
-                polls = [
-                    int(req.disagg_kv_sender.poll_pp_consensus()) for req in self.queue
-                ]
-                if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
-                    import random
-
-                    polls = [
-                        int(KVPoll.Failed) if random.random() < failure_prob else poll
-                        for poll in polls
-                    ]
-            else:
-                polls = None
-            polls = pp_sync_polls(
-                polls,
+            polls = poll_and_all_reduce_pp2(
+                [req.disagg_kv_sender for req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
                 self.scheduler.pp_group,
                 self.pp_rank,
                 self.pp_size,
@@ -464,10 +452,6 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_cp_cpu_group,
                 self.scheduler.attn_tp_cpu_group,
             )
-
-        if self.pp_size > 1:
-            polls = _all_reduce_polls(polls, self.scheduler.attn_tp_cpu_group)
-            polls = _all_reduce_polls(polls, self.scheduler.attn_cp_cpu_group)
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
