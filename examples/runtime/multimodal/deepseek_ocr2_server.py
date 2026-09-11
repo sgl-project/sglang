@@ -1,7 +1,20 @@
 """
-Serve DeepSeek-OCR-2 (and DeepSeek-OCR) with SGLang.
+Serve DeepSeek-OCR-2 (and DeepSeek-OCR) with SGLang, and run pages through it.
 
-# Start the server (CUDA):
+# Start the server. Pick one of the two context settings:
+
+# (A) Official setting: total input+output stays within the model's 8192-token
+#     window, which is what the official vLLM recipe does and what makes the
+#     numbers comparable to it. No env var is needed: the scheduler clamps each
+#     page's output budget down to `8192 - expanded_input` (see below).
+python -m sglang.launch_server \
+    --model-path deepseek-ai/DeepSeek-OCR-2 --enable-multimodal \
+    --context-length 8192 --enable-custom-logit-processor
+
+# (B) Full output budget on long pages. Any --context-length above the derived
+#     8192 needs this env var (9000 needs it exactly as much as 16384 does), and
+#     pages whose input+output actually exceed 8192 then run past the trained
+#     window, so their scores are not comparable to the official ones.
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-OCR-2 --enable-multimodal \
     --context-length 16384 --enable-custom-logit-processor
@@ -20,11 +33,14 @@ or batch a whole image directory into per-page markdown files (each named
     python examples/runtime/multimodal/deepseek_ocr2_server.py \
         --image-dir /path/to/pages --output /path/to/pred_md
 
-Why the env var and --context-length: DeepSeek-OCR-2 pages expand to ~1100 image
-tokens at the official 768px local-crop geometry, and long pages generate up to
-8192 output tokens. sglang derives a context limit from the model (8192) and
-rejects a request whose input+output budget exceeds it at input time; the env
-var lets --context-length raise that limit (official vLLM caps total at 8192).
+Why --max-new-tokens defaults to 8192: a 768px page expands to ~1100 image tokens
+(up to 6 local crops of 144 plus the 256-token global view). Under setting (A)
+(`--context-length 8192`) run the server with `--allow-auto-truncate`: sglang then
+clamps each request's output budget to the remaining context
+(`context_len - expanded_input`), which is the official "total <= 8192" semantics
+and lets the full 8192 ceiling be requested. Without `--allow-auto-truncate` a
+request whose `max_new_tokens + expanded_input` exceeds the context length is
+rejected (400); lower the ceiling to fit if you need to run without the flag.
 
 The DeepSeek-OCR-2 processor geometry (768px local crops) is applied
 automatically by the server for OCR-2; DeepSeek-OCR stays at 640px.
@@ -33,6 +49,7 @@ automatically by the server for OCR-2; DeepSeek-OCR stays at 640px.
 import argparse
 import os
 import re
+import sys
 
 import requests
 
@@ -82,6 +99,7 @@ def build_payload(image, max_new_tokens):
             # survive for postprocess()
             "skip_special_tokens": False,
             "custom_params": {
+                # Official DeepSeek-OCR recipe values.
                 "ngram_size": 40,
                 "window_size": 90,
                 "whitelist_token_ids": [128821, 128822],  # <td> </td>
@@ -99,33 +117,70 @@ def run_one(url, image, max_new_tokens):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Run DeepSeek-OCR-2 over one page or a directory of pages.",
+    )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=30000)
-    ap.add_argument("--image", help="single document page image path/URL")
-    ap.add_argument("--image-dir", help="dir of page images to batch (jpg/png)")
-    ap.add_argument("--output", help="dir for batch per-page .md predictions")
-    ap.add_argument("--max-new-tokens", type=int, default=8192)
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--image", help="single document page image path/URL")
+    source.add_argument("--image-dir", help="dir of page images to batch (jpg/png)")
+    ap.add_argument(
+        "--output", help="dir for per-page .md predictions (required with --image-dir)"
+    )
+    ap.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=8192,
+        help="output ceiling; with --allow-auto-truncate the server clamps it to the remaining context",
+    )
+    ap.add_argument(
+        "--raw",
+        action="store_true",
+        help="emit the raw model output instead of running postprocess() on it",
+    )
     args = ap.parse_args()
     url = f"http://{args.host}:{args.port}{ROUTE}"
 
     if args.image:
-        print(run_one(url, args.image, args.max_new_tokens))
-        return
+        text = run_one(url, args.image, args.max_new_tokens)
+        print(text if args.raw else postprocess(text))
+        return 0
+
+    if not args.output:
+        ap.error("--output is required with --image-dir")
 
     images = sorted(
         p
         for p in os.listdir(args.image_dir)
         if p.lower().endswith((".jpg", ".jpeg", ".png"))
     )
+    if not images:
+        ap.error(f"no jpg/jpeg/png images found in {args.image_dir}")
     os.makedirs(args.output, exist_ok=True)
-    for name in images:
-        text = run_one(url, os.path.join(args.image_dir, name), args.max_new_tokens)
+
+    failures = []
+    for idx, name in enumerate(images, start=1):
+        try:
+            text = run_one(url, os.path.join(args.image_dir, name), args.max_new_tokens)
+        except Exception as exc:  # one bad page must not discard the whole run
+            failures.append((name, exc))
+            print(f"[{idx}/{len(images)}] FAILED {name}: {exc}", file=sys.stderr)
+            continue
         with open(os.path.join(args.output, md_name(name)), "w", encoding="utf-8") as f:
-            f.write(postprocess(text))
-        print(f"wrote {md_name(name)}")
-    print(f"done: {len(images)} pages -> {args.output}")
+            f.write(text if args.raw else postprocess(text))
+        print(f"[{idx}/{len(images)}] wrote {md_name(name)}")
+
+    print(f"done: {len(images) - len(failures)}/{len(images)} pages -> {args.output}")
+    if failures:
+        print(
+            f"failed pages ({len(failures)}): "
+            + ", ".join(name for name, _ in failures),
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

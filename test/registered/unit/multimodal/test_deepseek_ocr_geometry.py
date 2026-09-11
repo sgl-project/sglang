@@ -1,38 +1,38 @@
-"""DeepSeek-OCR/OCR-2 local-crop geometry unit tests (no weights).
+"""DeepSeek-OCR / OCR-2 local-crop geometry unit tests (no weights).
 
-OCR-1 runs 640px local crops and OCR-2 runs 768px crops. Both checkpoints
-declare candidate_resolutions=[[1024, 1024]] (the global base), so the local
-crop size is selected from the vision encoder identity, not the config. At
-768px a crop yields (768//16//4)**2 = 144 visual tokens, which is exactly the
-length of the tuned query_768 embedding table in Qwen2Decoder2Encoder; at 640px
-it yields 100 tokens, which falls back to an interpolated query table (off
-design). These tests pin that mapping so a rewrite cannot silently put OCR-2
-back on 640 crops or decouple the crop pixel size from the token budget.
+DeepSeek-OCR-2 must run its 768px local crops, not the 640px ones inherited from
+the DeepSeek-OCR processor: at 768px a crop expands to (768 // 16 // 4) ** 2 ==
+144 visual tokens, exactly the length of the tuned query_768 embedding table in
+Qwen2Decoder2Encoder, while 640px yields 100 and falls back to an interpolated
+table.
+
+The crop size is not in the checkpoints -- both ship identical processor configs
+with no `image_size` and candidate_resolutions=[[1024, 1024]] (the *global*
+base) -- so `local_crop_size` selects it from the model config and
+`apply_ocr_geometry` patches it onto the processor. These tests fail if OCR-2 is
+put back on 640px crops, at either the policy or the wiring.
+
+Not covered here: the in-processor thresholds that consume `image_size` (the
+`img_w <= image_size` early-out and the global-view resize) need a real
+tokenizer, so they are only observable end to end.
 """
 
-import math
 import unittest
 from types import SimpleNamespace
 
 from PIL import Image
 
-from sglang.srt.configs.deepseek_ocr import dynamic_preprocess
-from sglang.srt.models.deepseek_ocr import _is_ocr2
+from sglang.srt.configs.deepseek_ocr import (
+    IMAGE_SIZE,
+    OCR2_IMAGE_SIZE,
+    dynamic_preprocess,
+    local_crop_size,
+)
+from sglang.srt.multimodal.processors.deepseek_ocr import apply_ocr_geometry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
-
-# Patch/downsample are copied from the checkpoints' processor_config.json
-# (patch_size 16, downsample_ratio 4 for both DeepSeek-OCR and DeepSeek-OCR-2).
-OCR_PATCH = 16
-OCR_DOWNSAMPLE = 4
-
-
-def _vis_tokens_per_crop(image_size: int) -> int:
-    """Visual tokens one local crop expands to, mirroring the processor."""
-    per_side = math.ceil((image_size // OCR_PATCH) / OCR_DOWNSAMPLE)
-    return per_side * per_side
 
 
 def _hf_config(vision_model_name: str, projector_input_dim) -> SimpleNamespace:
@@ -42,25 +42,39 @@ def _hf_config(vision_model_name: str, projector_input_dim) -> SimpleNamespace:
     )
 
 
-class TestDeepseekOcrGeometry(CustomTestCase):
-    def test_ocr2_selection_and_ocr1_untouched(self):
-        # OCR-2 checkpoints match either signature; OCR-1 must stay 640.
-        self.assertTrue(
-            _is_ocr2(_hf_config("deepencoderv2", 896))
-        )  # DeepSeek-OCR-2 (real config)
-        self.assertFalse(
-            _is_ocr2(_hf_config("deeplip_b_l", 2048))
-        )  # DeepSeek-OCR (real config)
-        self.assertFalse(_is_ocr2(_hf_config("", None)))
+def _ocr2_config() -> SimpleNamespace:
+    """DeepSeek-OCR-2: DeepEncoder V2 vision encoder, 896-dim projector."""
+    return _hf_config("deepencoderv2", 896)
 
-    def test_768_crop_tokens_are_144_and_640_are_100(self):
-        # 768px local crop must hit the tuned query_768 table (144) and 1024px
-        # the query_1024 table (256); 640px is the off-design 100-token case.
-        self.assertEqual(_vis_tokens_per_crop(768), 144)
-        self.assertEqual(_vis_tokens_per_crop(1024), 256)
-        self.assertEqual(_vis_tokens_per_crop(640), 100)
+
+def _ocr1_config() -> SimpleNamespace:
+    """DeepSeek-OCR: deeplip_b_l vision encoder, 2048-dim projector."""
+    return _hf_config("deeplip_b_l", 2048)
+
+
+class TestDeepseekOcrGeometry(CustomTestCase):
+    def test_local_crop_size_is_768_for_ocr2_and_640_for_ocr1(self):
+        # Guards the processor's per-model selection: OCR-2 must not be served
+        # with OCR-1's 640px crops, and OCR-1 must stay on 640.
+        self.assertEqual(local_crop_size(_ocr2_config()), 768)
+        self.assertEqual(local_crop_size(_ocr2_config()), OCR2_IMAGE_SIZE)
+        self.assertEqual(local_crop_size(_ocr1_config()), 640)
+        self.assertEqual(local_crop_size(_ocr1_config()), IMAGE_SIZE)
+
+    def test_processor_geometry_wiring(self):
+        # The processor patches both attributes onto the HF processor; assert the
+        # patching itself so a regression in the call site is caught too.
+        stub = SimpleNamespace()
+        apply_ocr_geometry(stub, _ocr2_config())
+        self.assertEqual(stub.image_size, 768)
+        self.assertTrue(stub.ocr2_mode)
+        apply_ocr_geometry(stub, _ocr1_config())
+        self.assertEqual(stub.image_size, 640)
+        self.assertFalse(stub.ocr2_mode)
 
     def test_dynamic_preprocess_crop_px_follows_image_size(self):
+        # `tokenize_with_images` passes the processor's `image_size` through, so
+        # the crop pixels follow whichever crop size was selected above.
         wide = Image.new("RGB", (3072, 1024))  # aspect 3:1 -> 3x1 tile grid
         for image_size, expected_size in ((768, 768), (640, 640)):
             crops, ratio = dynamic_preprocess(
@@ -68,7 +82,9 @@ class TestDeepseekOcrGeometry(CustomTestCase):
             )
             self.assertEqual(ratio, (3, 1))
             self.assertEqual(len(crops), 3)
-            self.assertTrue(all(crop.size == (expected_size, expected_size) for crop in crops))
+            self.assertTrue(
+                all(crop.size == (expected_size, expected_size) for crop in crops)
+            )
 
 
 if __name__ == "__main__":
