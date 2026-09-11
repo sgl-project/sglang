@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import (
-    get_parallel,
-    get_schedule,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -23,15 +19,14 @@ from sglang.kernels.ops.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
+    kv_indices_num_token_blocks,
 )
 from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_ragged_to_page_table_kernel,
     scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -76,10 +71,7 @@ from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    fp8_dtype,
-    scaled_fp8_quant,
-)
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
@@ -122,6 +114,13 @@ _MLA_REDUCE_V1_HEADS = {
 # fake non-ps, intra_batch_mode needs to be True for non-ps-mode
 fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
+
+
+# Token-block parallel KV-index building is enabled only where it pays:
+# the speculative-decoding paths (target_verify / draft_extend / draft
+# decode) of long-context servers. Everything else keeps the historical
+# one-program-per-request launch.
+_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 
 class WrapperDispatch(Enum):
@@ -239,9 +238,7 @@ class AiterAttnBackend(AttentionBackend):
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
-        from sglang.kernels.ops.attention.extend_attention import (
-            extend_attention_fwd,
-        )
+        from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 
         self.input_dtype = model_runner.model_config.dtype
 
@@ -628,7 +625,6 @@ class AiterAttnBackend(AttentionBackend):
         max_split_per_batch,
         intra_batch_mode,
     ):
-
         nhead_kv = 1
         page_size = self.page_size
         dtype = self.kv_cache_dtype
@@ -1170,6 +1166,11 @@ class AiterAttnBackend(AttentionBackend):
         )
         return output[:, : layer.tp_q_head_num, :] if head_pad else output
 
+    def _kv_index_blocks(self, bs: int) -> int:
+        if self.max_context_len < _KV_INDEX_BLOCKS_MIN_CONTEXT:
+            return 1
+        return kv_indices_num_token_blocks(self.req_to_token.shape[1], bs)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1374,7 +1375,8 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_sum, device
                 )
 
-                create_flashinfer_kv_indices_triton[(bs,)](
+                num_token_blocks = self._kv_index_blocks(bs)
+                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
@@ -1382,6 +1384,7 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     kv_indices,
                     self.req_to_token.stride(0),
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
 
                 if _use_mla_ps_kernel:
@@ -1467,7 +1470,8 @@ class AiterAttnBackend(AttentionBackend):
                     kv_lens_sum,
                     device,
                 )
-                create_flashinfer_kv_indices_triton[(bs,)](
+                num_token_blocks = self._kv_index_blocks(bs)
+                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     kv_lens,
@@ -1475,6 +1479,7 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     kv_indices,
                     self.req_to_token.stride(0),
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
 
                 # if self.kv_cache_dtype == fp8_dtype:
@@ -1525,8 +1530,8 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
+                draft_num = forward_batch.input_ids.shape[0] // bs
                 bs = len(forward_batch.req_pool_indices)
-                draft_num = spec_info.draft_token_num
 
                 if self._use_unified_verify:
                     page_table, qo_indptr, max_q_len, swa_page_table = (
@@ -1564,7 +1569,8 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices = torch.empty(
                         kv_indptr[-1], dtype=torch.int64, device=self.device
                     )
-                    create_flashinfer_kv_indices_triton[(bs,)](
+                    num_token_blocks = self._kv_index_blocks(bs)
+                    create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
@@ -1572,6 +1578,7 @@ class AiterAttnBackend(AttentionBackend):
                         None,
                         kv_indices,
                         self.req_to_token.stride(0),
+                        TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                     )
 
                     custom_mask = spec_info.custom_mask
@@ -1834,7 +1841,6 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         verify_tokens_per_req: Optional[int],
     ):
-
         num_kv_splits = None
         # num_kv_splits_indptr = None
 
@@ -2018,7 +2024,8 @@ class AiterAttnBackend(AttentionBackend):
                     bs=bs,
                     seq_lens_sum=seq_lens_sum,
                 )
-            create_flashinfer_kv_indices_triton[(bs,)](
+            num_token_blocks = self._kv_index_blocks(bs)
+            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                 self.req_to_token,
                 req_pool_indices,
                 kv_lens,
@@ -2026,6 +2033,7 @@ class AiterAttnBackend(AttentionBackend):
                 None,
                 kv_indices,
                 self.req_to_token.stride(0),
+                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
@@ -2144,7 +2152,8 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
+            num_token_blocks = self._kv_index_blocks(bs)
+            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                 self.req_to_token,
                 req_pool_indices,
                 seq_lens,
@@ -2152,6 +2161,7 @@ class AiterAttnBackend(AttentionBackend):
                 None,
                 kv_indices,
                 self.req_to_token.stride(0),
+                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
             )
 
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
@@ -2770,7 +2780,9 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
+                        seqused_k=(
+                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        ),
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
@@ -3241,7 +3253,7 @@ class AiterAttnBackend(AttentionBackend):
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         seqused_k=forward_batch.seq_lens,
                         max_seqlen_k=max_kv_len,
-                        softmax_scale=self.scale,
+                        softmax_scale=layer.scaling,
                         block_table=page_table,
                         k_descale=k_descale,
                         v_descale=v_descale,
@@ -3268,7 +3280,7 @@ class AiterAttnBackend(AttentionBackend):
                     seqused_k=forward_batch.seq_lens,
                     max_seqlen_q=self.forward_metadata.max_q_len,
                     max_seqlen_k=max_kv_len,
-                    softmax_scale=self.scale,
+                    softmax_scale=layer.scaling,
                     causal=True,
                     window_size=window_size,
                     block_table=page_table,
@@ -3356,7 +3368,6 @@ class AiterIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
     ):
-
         kv_start_idx = None
         kv_indptr = self.kv_indptr
         qo_indptr = self.qo_indptr
@@ -3544,8 +3555,15 @@ class AiterMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
+        num_token_blocks = (
+            kv_indices_num_token_blocks(
+                self.pool_len, self.speculative_num_steps * num_seqs * self.topk
+            )
+            if self.max_context_len >= _KV_INDEX_BLOCKS_MIN_CONTEXT
+            else 1
+        )
         self.generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
+            (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
@@ -3560,6 +3578,9 @@ class AiterMultiStepDraftBackend:
             triton.next_power_of_2(self.speculative_num_steps),
             triton.next_power_of_2(bs),
             self.page_size,
+            # A single token block is the historical launch; NUM_STEPS=0 keeps
+            # its 128-wide program instead of the token-block specialization.
+            NUM_STEPS=self.speculative_num_steps if num_token_blocks > 1 else 0,
         )
 
         for i in range(self.speculative_num_steps - 1):
