@@ -771,7 +771,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
         indexer = SimpleNamespace(
             queries=lambda q, _: q,
             head_weights=lambda x: x,
-            candidate_topk_blocks=2,
+            candidate_topk_blocks=4,
             candidate_block_size=4,
             index_topk=topk,
         )
@@ -801,6 +801,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             ratio,
             width,
             candidate_block_size=0,
+            write_logits=True,
         ):
             logical = torch.arange(width)
             slots = req_to_token[req_rows[:, None], logical * ratio] // ratio
@@ -813,7 +814,27 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 torch.arange(block_scores.shape[1]) == last[:, None], torch.inf
             )
             block_lens = (lens + candidate_block_size - 1) // candidate_block_size
+            if not write_logits:
+                return block_scores, block_lens
             return logits, block_scores, block_lens
+
+        def score_candidate_blocks(
+            q,
+            weights,
+            req_to_token,
+            req_rows,
+            candidate_blocks,
+            candidate_lens,
+            table,
+            page_size,
+            ratio,
+            block_size,
+        ):
+            positions = (
+                candidate_blocks[:, :, None] * block_size + torch.arange(block_size)
+            ).flatten(1)
+            slots = req_to_token[req_rows[:, None], positions * ratio] // ratio
+            return score(q, weights, slots, candidate_lens, table, page_size)
 
         def topk_v2(scores, lens, page_table, out, page_size, metadata):
             self.assertEqual(lens.dtype, torch.int32)
@@ -822,36 +843,25 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             out[:, :k] = scores.topk(k, dim=-1, sorted=False).indices.to(torch.int32)
 
         def publish_candidates(
-            scores,
+            block_scores,
+            block_lens,
             lens,
-            req_to_token,
-            req_rows,
             *,
             topk_blocks,
             block_size,
-            ratio,
-            block_scores=None,
-            block_lens=None,
         ):
-            from sglang.srt.layers.attention.dsv4.indexer import (
-                select_candidate_block_indices,
+            top = block_scores.topk(topk_blocks, dim=-1)
+            blocks = (
+                top.indices.masked_fill(top.values == -torch.inf, block_scores.shape[1])
+                .sort(dim=-1)
+                .values
             )
-
-            blocks, reachable = select_candidate_block_indices(
-                scores, lens[:, None], topk_blocks, block_size
-            )
-            blocks = blocks.masked_fill(~reachable, width).sort(dim=-1).values
             positions = (
                 blocks[:, :, None] * block_size + torch.arange(block_size)
             ).flatten(1)
             valid = positions < lens[:, None]
-            slots = (
-                req_to_token[req_rows[:, None], positions.clamp_max(width - 1) * ratio]
-                // ratio
-            ).masked_fill(~valid, 0)
             return (
-                positions,
-                slots,
+                blocks.to(torch.int32),
                 valid.sum(dim=-1).to(torch.int32),
                 torch.empty(0),
             )
@@ -866,8 +876,8 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             raw_out,
             *,
             ratio,
-            candidate_positions=None,
-            candidate_slots=None,
+            candidate_blocks=None,
+            candidate_block_size=1,
         ):
             selected = selected.to(torch.int64)
             selected_scores = scores.gather(1, selected.clamp(0, scores.shape[1] - 1))
@@ -878,7 +888,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             )
             selected = selected.masked_fill(~valid, scores.shape[1]).sort(1).values
             valid = selected < score_lens[:, None]
-            if candidate_positions is None:
+            if candidate_blocks is None:
                 logical = selected
                 slots = (
                     req_to_token[
@@ -888,12 +898,10 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                     // ratio
                 )
             else:
-                logical = candidate_positions.gather(
-                    1, selected.clamp_max(scores.shape[1] - 1)
-                )
-                slots = candidate_slots.gather(
-                    1, selected.clamp_max(scores.shape[1] - 1)
-                )
+                safe = selected.clamp_max(scores.shape[1] - 1)
+                blocks = candidate_blocks.gather(1, safe // candidate_block_size)
+                logical = blocks * candidate_block_size + safe % candidate_block_size
+                slots = req_to_token[req_rows[:, None], logical * ratio] // ratio
             page_out.fill_(-1)
             page_out[:, : selected.shape[1]] = slots.masked_fill(~valid, -1)
             if raw_out is not None:
@@ -909,11 +917,13 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 torch.ones(len(req), 1), None, full_slots, lens, table, 64
             )
             candidates = module.select_candidate_blocks(
-                source_scores, lens[:, None], 2, 4
+                source_scores, lens[:, None], 4, 4
             )
             with (
                 mock.patch.object(
-                    module, "fp4_index_logits_decode", side_effect=score
+                    module,
+                    "fp4_index_logits_candidate_blocks",
+                    side_effect=score_candidate_blocks,
                 ) as compact_logits,
                 mock.patch.object(
                     module,
@@ -924,7 +934,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                     module, "topk_transform_paged_v2", side_effect=topk_v2
                 ) as full_topk,
                 mock.patch(
-                    "sglang.kernels.ops.attention.dsv4.candidate_blocks.candidate_slots",
+                    "sglang.kernels.ops.attention.dsv4.candidate_blocks.candidate_block_state",
                     side_effect=publish_candidates,
                 ),
                 mock.patch(
@@ -963,23 +973,20 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                         self.assertIs(
                             backend.forward_metadata.sm90_candidates, published
                         )
-                        positions, slots, counts, _ = published
-                        self.assertIs(compact_logits.call_args.args[2], slots)
-                        torch.testing.assert_close(
-                            positions < lens[:, None],
-                            torch.arange(slots.shape[1]) < counts[:, None],
+                        blocks, counts, _ = published
+                        self.assertIs(compact_logits.call_args.args[4], blocks)
+                        positions = (blocks[:, :, None] * 4 + torch.arange(4)).flatten(
+                            1
                         )
                         torch.testing.assert_close(
-                            slots,
-                            full_slots.gather(
-                                1, positions.clamp_max(width - 1)
-                            ).masked_fill(positions >= lens[:, None], 0),
+                            positions < lens[:, None],
+                            torch.arange(positions.shape[1]) < counts[:, None],
                         )
                 self.assertEqual(full_logits.call_args.args[-1], width)
                 self.assertEqual(full_topk.call_count, 5 if use_topk_v2 else 4)
                 self.assertEqual(
-                    [call.args[2].shape[1] for call in compact_logits.call_args_list],
-                    [8, 8, 8, 8],
+                    [call.args[4].shape[1] for call in compact_logits.call_args_list],
+                    [4, 4, 4, 4, 4],
                 )
 
     def test_decode_candidates_preserve_slots_across_layers_and_steps(self):

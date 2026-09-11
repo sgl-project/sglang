@@ -102,62 +102,24 @@ def _sort_candidate_blocks_kernel(
 
 
 @triton.jit
-def _materialize_candidate_slots_kernel(
-    SORTED,
-    LENS,
-    REQ_TO_TOKEN,
-    REQ,
-    POSITIONS,
-    SLOTS,
-    WIDTH: tl.constexpr,
-    TOPK_BLOCKS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    REQ_STRIDE: tl.constexpr,
-    RATIO: tl.constexpr,
-    TILE: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    offsets = tl.program_id(1) * TILE + tl.arange(0, TILE)
-    block_col = offsets // BLOCK_SIZE
-    within = offsets % BLOCK_SIZE
-    block = tl.load(
-        SORTED + row * TOPK_BLOCKS + block_col,
-        mask=block_col < TOPK_BLOCKS,
-        other=NUM_BLOCKS,
-    )
-    position = block * BLOCK_SIZE + within
-    length = tl.load(LENS + row)
-    valid = (offsets < WIDTH) & (block < NUM_BLOCKS) & (position < length)
-    req = tl.load(REQ + row).to(tl.int64)
-    slot = tl.load(
-        REQ_TO_TOKEN + req * REQ_STRIDE + position * RATIO,
-        mask=valid,
-        other=0,
-    )
-    tl.store(POSITIONS + row * WIDTH + offsets, position, mask=offsets < WIDTH)
-    tl.store(SLOTS + row * WIDTH + offsets, slot // RATIO, mask=offsets < WIDTH)
-
-
-@triton.jit
 def _finalize_candidate_topk_kernel(
     SELECTED,
     SCORES,
     LENS,
     REQ_TO_TOKEN,
     REQ,
-    CANDIDATE_POSITIONS,
-    CANDIDATE_SLOTS,
+    CANDIDATE_BLOCKS,
     PAGE_INDICES,
     RAW_INDICES,
     SELECTED_STRIDE: tl.constexpr,
     SCORE_STRIDE: tl.constexpr,
     REQ_STRIDE: tl.constexpr,
-    CANDIDATE_STRIDE: tl.constexpr,
+    CANDIDATE_BLOCK_STRIDE: tl.constexpr,
     OUTPUT_STRIDE: tl.constexpr,
     TOPK: tl.constexpr,
     SOURCE_WIDTH: tl.constexpr,
     RATIO: tl.constexpr,
+    CANDIDATE_BLOCK_SIZE: tl.constexpr,
     USE_CANDIDATES: tl.constexpr,
     HAS_RAW: tl.constexpr,
 ):
@@ -178,16 +140,21 @@ def _finalize_candidate_topk_kernel(
     safe = tl.minimum(selected, SOURCE_WIDTH - 1)
 
     if USE_CANDIDATES:
-        logical = tl.load(
-            CANDIDATE_POSITIONS + row * CANDIDATE_STRIDE + safe,
+        block_col = safe // CANDIDATE_BLOCK_SIZE
+        within = safe % CANDIDATE_BLOCK_SIZE
+        block = tl.load(
+            CANDIDATE_BLOCKS + row * CANDIDATE_BLOCK_STRIDE + block_col,
             mask=valid,
             other=0,
         )
+        logical = block * CANDIDATE_BLOCK_SIZE + within
+        req = tl.load(REQ + row).to(tl.int64)
         slot = tl.load(
-            CANDIDATE_SLOTS + row * CANDIDATE_STRIDE + safe,
+            REQ_TO_TOKEN + req * REQ_STRIDE + logical * RATIO,
             mask=valid,
             other=0,
         )
+        slot = slot // RATIO
     else:
         logical = safe
         req = tl.load(REQ + row).to(tl.int64)
@@ -304,58 +271,26 @@ def candidate_block_indices(
     return top.indices, top.values > -torch.inf
 
 
-def candidate_slots(
-    logits: torch.Tensor,
+def candidate_block_state(
+    block_scores: torch.Tensor,
+    block_lens: torch.Tensor,
     seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    req: torch.Tensor,
     *,
     topk_blocks: int,
     block_size: int,
-    ratio: int,
-    block_scores: torch.Tensor | None = None,
-    block_lens: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Publish sorted logical positions and physical slots for Reindex layers."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Publish sorted candidate blocks, valid position counts, and a shared plan."""
     from sglang.kernels.ops.attention.dsv4.topk import (
         plan_topk_v2,
         topk_transform_paged_v2,
     )
 
-    rows, logical_width = logits.shape
+    rows, num_blocks = block_scores.shape
     assert triton.next_power_of_2(topk_blocks) == topk_blocks
-    num_blocks = triton.cdiv(logical_width, block_size)
-    if block_scores is None:
-        score_storage = torch.empty(
-            (rows, triton.cdiv(num_blocks, 4) * 4),
-            dtype=torch.float32,
-            device=logits.device,
-        )
-        block_scores = score_storage[:, :num_blocks]
-        block_lens = torch.empty(rows, dtype=torch.int32, device=logits.device)
-        group_pad = triton.next_power_of_2(block_size)
-        block_tile = max(1, 1024 // group_pad)
-        _candidate_scores_kernel[(rows, triton.cdiv(num_blocks, block_tile))](
-            logits,
-            seq_lens,
-            logits,
-            block_scores,
-            block_lens,
-            logical_width,
-            logits.stride(0),
-            block_scores.stride(0),
-            num_blocks,
-            block_size,
-            group_pad,
-            block_tile,
-            False,
-        )
-    else:
-        assert block_scores.shape == (rows, num_blocks)
-        assert block_lens is not None and block_lens.shape == (rows,)
+    assert block_lens.shape == seq_lens.shape == (rows,)
 
     selected_blocks = torch.empty(
-        (rows, topk_blocks), dtype=torch.int32, device=logits.device
+        (rows, topk_blocks), dtype=torch.int32, device=block_scores.device
     )
     topk_transform_paged_v2(
         block_scores,
@@ -367,7 +302,7 @@ def candidate_slots(
     )
 
     sorted_blocks = torch.empty_like(selected_blocks)
-    counts = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    counts = torch.empty(rows, dtype=torch.int32, device=block_scores.device)
     _sort_candidate_blocks_kernel[(rows,)](
         selected_blocks,
         block_scores,
@@ -381,31 +316,7 @@ def candidate_slots(
         num_blocks,
         num_warps=8,
     )
-
-    candidate_width = topk_blocks * block_size
-    positions = torch.empty(
-        (rows, candidate_width), dtype=torch.int64, device=logits.device
-    )
-    slots = torch.empty(
-        (rows, candidate_width), dtype=torch.int32, device=logits.device
-    )
-    tile = 256
-    _materialize_candidate_slots_kernel[(rows, triton.cdiv(candidate_width, tile))](
-        sorted_blocks,
-        seq_lens,
-        req_to_token,
-        req,
-        positions,
-        slots,
-        candidate_width,
-        topk_blocks,
-        block_size,
-        num_blocks,
-        req_to_token.stride(0),
-        ratio,
-        tile,
-    )
-    return positions, slots, counts, plan_topk_v2(counts)
+    return sorted_blocks, counts, plan_topk_v2(counts)
 
 
 def finalize_candidate_topk(
@@ -418,15 +329,14 @@ def finalize_candidate_topk(
     raw_indices: torch.Tensor | None,
     *,
     ratio: int,
-    candidate_positions: torch.Tensor | None = None,
-    candidate_slots: torch.Tensor | None = None,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 1,
 ) -> None:
     """Finalize sorted sparse-attention slots without PyTorch elementwise launches."""
-    use_candidates = candidate_positions is not None
-    assert use_candidates == (candidate_slots is not None)
+    use_candidates = candidate_blocks is not None
     assert triton.next_power_of_2(page_indices.shape[1]) == page_indices.shape[1]
     source_width = (
-        candidate_positions.shape[1]
+        candidate_blocks.shape[1] * candidate_block_size
         if use_candidates
         else req_to_token.shape[1] // ratio
     )
@@ -436,18 +346,18 @@ def finalize_candidate_topk(
         score_lens,
         req_to_token,
         req,
-        candidate_positions if use_candidates else req_to_token,
-        candidate_slots if use_candidates else req_to_token,
+        candidate_blocks if use_candidates else req_to_token,
         page_indices,
         raw_indices if raw_indices is not None else page_indices,
         selected.stride(0),
         scores.stride(0),
         req_to_token.stride(0),
-        candidate_positions.stride(0) if use_candidates else 0,
+        candidate_blocks.stride(0) if use_candidates else 0,
         page_indices.stride(0),
         page_indices.shape[1],
         source_width,
         ratio,
+        candidate_block_size,
         use_candidates,
         raw_indices is not None,
         num_warps=8,
