@@ -83,6 +83,8 @@ GLM_5_2_W8A8_16P_TWO_NODE_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--speculative-draft-model-quantization",
+    "unquant",
 ]
 
 GLM_5_2_W8A8_16P_TWO_NODE_MODEL_CONFIG = {
