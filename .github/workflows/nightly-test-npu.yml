@@ -503,9 +503,9 @@ jobs:
       matrix:
         test_config:
           # glm_5_2 accuracy tests
-          - name: glm_5_2_w4a8_16p_gpqa
+          - name: glm_5_2_w8a8_16p_gpqa
             node_size: 2
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w4a8_16p_gpqa.py
+            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
             test_type: 'accuracy'
           # kimi_k3 accuracy tests
           - name: kimi_k3_w4a8_32p_gpqa
