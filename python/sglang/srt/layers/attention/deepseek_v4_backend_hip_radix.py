@@ -507,6 +507,7 @@ class DeepseekV4HipRadixBackend(
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(
             page_size=self.page_size,
+            compressed_page_size=self.token_to_kv_pool.get_index_k_page_size(),
             page_table=core_attn_metadata.page_table,
             compressed_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
@@ -1601,23 +1602,20 @@ class DeepseekV4HipRadixBackend(
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
-            swa_window_size = token_to_kv_pool.swa_window_size
+            swa_page_size = token_to_kv_pool.swa_page_size
             assert swa_k_cache.ndim == 2
             k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
+            swa_k_cache = swa_k_cache[:, : swa_page_size * k_cache_total_dim].view(
+                swa_k_cache.shape[0], swa_page_size, 1, k_cache_total_dim
             )
 
             if extra_k_cache is not None:
-                page_sizes = {
-                    4: token_to_kv_pool.page_size // 4,
-                    128: token_to_kv_pool.page_size // 128,
-                }
+                extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
                 extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    :, : extra_page_size * k_cache_total_dim
                 ].view(
                     extra_k_cache.shape[0],
-                    page_sizes[compress_ratio],
+                    extra_page_size,
                     1,
                     k_cache_total_dim,
                 )
