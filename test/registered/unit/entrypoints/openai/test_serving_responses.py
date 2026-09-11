@@ -622,6 +622,36 @@ class MultimodalRequestTestCase(CustomTestCase):
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
+    def test_multimodal_token_first_specs_route_through_prompt_ids(self):
+        """Bug regression: token-first encoders leave prompt == "" with
+        non-empty prompt_ids; forwarding the empty text 400s in
+        _tokenize_texts, so the multimodal branch must forward prompt_ids."""
+        for spec in ("inkling", "kimi_k3"):
+            with self.subTest(spec=spec):
+                serving = make_serving(is_multimodal=True)
+                serving.chat_encoding_spec = spec
+                serving._process_messages = Mock(
+                    return_value=MessageProcessingResult(
+                        prompt="",
+                        prompt_ids=[4, 5, 6],
+                        image_data=None,
+                        audio_data=None,
+                        video_data=None,
+                        modalities=[],
+                        stop=[],
+                    )
+                )
+                request = ResponsesRequest(model="x", input="hi", store=False)
+
+                _, request_prompts, engine_prompts, _ = asyncio.run(
+                    serving._make_request(
+                        request, None, serving.tokenizer_manager.tokenizer
+                    )
+                )
+
+                self.assertEqual(engine_prompts, [[4, 5, 6]])
+                self.assertEqual(request_prompts, [[4, 5, 6]])
+
 
 class OutputItemsTestCase(CustomTestCase):
     def setUp(self):
@@ -892,7 +922,7 @@ class EnginePassthroughTestCase(CustomTestCase):
     """Both flags cross hops with no type contract, and dropping either fails
     silently."""
 
-    def _capture(self, serving, request):
+    def _capture(self, serving, request, raw_request=None):
         # Let the real _process_messages run: it is the hop that turns
         # skip_special_tokens off, so mocking it would make that assertion vacuous.
         # chat_template_name=None routes it through the tokenizer's template
@@ -924,8 +954,34 @@ class EnginePassthroughTestCase(CustomTestCase):
             yield context
 
         serving._generate_with_builtin_tools = fake_generate
-        asyncio.run(serving.create_responses(request))
+        asyncio.run(serving.create_responses(request, raw_request=raw_request))
         return captured
+
+    def test_pd_routing_fields_forwarded_to_engine(self):
+        serving = make_serving()
+        raw_request = Mock(headers={"x-data-parallel-rank": "2"}, state=Mock())
+
+        captured = self._capture(
+            serving,
+            ResponsesRequest(
+                model="x",
+                input="hi",
+                bootstrap_host="10.0.0.1",
+                bootstrap_port=8998,
+                bootstrap_room=42,
+                routed_dp_rank=1,
+                disagg_prefill_dp_rank=0,
+                store=False,
+            ),
+            raw_request=raw_request,
+        )
+
+        adapted_request = captured["adapted_request"]
+        self.assertEqual(adapted_request.bootstrap_host, "10.0.0.1")
+        self.assertEqual(adapted_request.bootstrap_port, 8998)
+        self.assertEqual(adapted_request.bootstrap_room, 42)
+        self.assertEqual(adapted_request.routed_dp_rank, 2)
+        self.assertEqual(adapted_request.disagg_prefill_dp_rank, 0)
 
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()
