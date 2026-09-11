@@ -4,7 +4,6 @@ import atexit
 import logging
 import threading
 import time
-from array import array
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -1941,14 +1940,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         ticket = state.ticket
-        prefetch_key = RadixKey(
-            array("q", ticket.token_ids),
-            extra_key=ticket.extra_key,
-            is_bigram=ticket.is_bigram,
-            cache_salt=ticket.cache_salt,
-        )
+        prefetch_key = ticket.prefetch_key
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
-            self.root_node_handle(ticket.extra_key),
+            self.root_node_handle(prefetch_key.extra_key),
             prefetch_key,
             operation.host_indices,
             operation,
@@ -1964,8 +1958,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.buffer_pipeline.set_prefix_ctx(
             req_id,
             ticket.matched_prefix_tokens,
-            extra_key=ticket.extra_key,
-            cache_salt=ticket.cache_salt,
+            extra_key=prefetch_key.extra_key,
+            cache_salt=prefetch_key.cache_salt,
         )
         self.buffer_pipeline.try_lock_anchor(req_id)
         self.cache_controller.append_host_mem_release(

@@ -1,5 +1,6 @@
-"""CPU tests for ticket submission, eager prefetch, and buffer ownership."""
+"""CPU regressions for PP ticket ordering, admission, and buffer ownership."""
 
+import pickle
 import threading
 import unittest
 from array import array
@@ -9,14 +10,10 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.managers.cache_controller import PrefetchAck
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
-    PPPrefetchPoolSpec,
-    PPPrefetchState,
-    PPPrefetchTicket,
-    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -26,46 +23,27 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def make_ticket(**kwargs):
-    fields = dict(
-        rid="hit",
-        token_ids=list(range(8)),
-        last_hash="ab" * 32,
-        prefix_keys=["prefix-key"],
-        matched_prefix_tokens=[10, 11, 12, 13],
-        extra_key="adapter",
-        cache_salt="tenant",
-        is_bigram=False,
-        pool_specs=(),
-        storage_hit_count=8,
-    )
-    return PPPrefetchTicket(**(fields | kwargs))
-
-
 class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
-        # Avoid allocating CUDA pools or starting the controller's background threads.
-        self.controller = c = HybridCacheController.__new__(HybridCacheController)
+        self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
         c.get_hash_str = get_hash_str
         c.pp_rank = c.tp_rank = 0
         c.pp_size, c.tp_size = 4, 2
-        c.pp_group = "pp"
-        c.pp_prefetch_command_group = "command"
+        c.pp_group, c.pp_prefetch_command_group = "pp", "command"
         c.pp_prefetch_command_thread = None
-        c.prefetch_hits_sync_groups = ["pp", "tp"]
-        c.prefetch_completion_sync_groups = ["pp", "tp"]
-        c.pp_prefetch_states = {}
-        c.pp_prefetch_decisions = {}
+        c.prefetch_hits_sync_groups = c.prefetch_completion_sync_groups = ["pp", "tp"]
+        c.pp_prefetch_states, c.pp_prefetch_decisions = {}, {}
         c.pp_prefetch_state_lock = threading.Lock()
-        c.pp_prefetch_command_queue = Mock(spec=Queue)
-        c.prefetch_buffer = Queue()
+        c.pp_prefetch_command_queue = Queue()
         c.prefetch_queue = Queue()
         c.prefetch_sync_queue = Queue()
         c.ack_prefetch_queue = Queue()
+        c.host_mem_release_queue = Queue()
+        c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
         c.prefetch_tokens_occupied = 0
-        c.mem_pool_host = Mock()
+        c.mem_pool_host = Mock(page_size=4)
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c._storage_hit_query = Mock(return_value=(["h0", "h1"], 8))
         c._all_reduce = Mock()
@@ -75,318 +53,134 @@ class TestPPPrefetchTicket(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-
-    def submit(self, rid="hit", pool_transfers=None):
-        return self.controller.submit_prefetch(
-            rid,
-            RadixKey(array("q", range(8)), extra_key="adapter", cache_salt="tenant"),
-            "ab" * 32,
-            ["prefix-key"],
-            [10, 11, 12, 13],
-            pool_transfers,
-        )
-
-    def sync_acks(self, *acks):
-        c = self.controller
-        for ack in acks:
-            c.prefetch_sync_queue.put(ack)
-        # Run exactly these ACKs without timing-dependent sleeps or live collectives.
-        with patch.object(
-            c.storage_stop_event, "is_set", side_effect=[False] * len(acks) + [True]
-        ):
-            c.prefetch_sync_thread_func()
-
-    def test_miss_and_subpage_hit_do_not_broadcast(self):
-        c = self.controller
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        self.cache = cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.pp_rank = 1
         cache.tree_core = Mock(enable_storage=True)
         cache.cache_controller = c
-        cache.ongoing_prefetch = {}
         cache._all_reduce = Mock()
-        for hit in (0, 3):
-            with self.subTest(hit=hit):
-                c._storage_hit_query.return_value = ([], hit)
-                submission = self.submit()
-                self.assertFalse(submission.decision)
-                self.assertIsNone(submission.operation)
-                self.assertEqual(c.pp_prefetch_states, {})
-                c.pp_prefetch_command_queue.put.assert_not_called()
-                c.pp_prefetch_command_queue.join.assert_not_called()
-                self.assertFalse(c.get_prefetch_submission("hit").decision)
-                self.assertFalse(c.get_prefetch_submission("hit").decision)
-                query_count = c._storage_hit_query.call_count
-                # Even if L3 becomes available, requeue/retry must reuse the miss.
-                c._storage_hit_query.return_value = (["h0", "h1"], 8)
-                for _ in range(2):
-                    self.assertTrue(cache.check_prefetch_progress("hit"))
-                    self.assertFalse(
-                        cache.prefetch_from_storage("hit", 0, list(range(8)))
-                    )
-                self.assertEqual(c._storage_hit_query.call_count, query_count)
-                cache._all_reduce.assert_not_called()
-                c.pp_prefetch_command_queue.put.assert_not_called()
-                self.assertFalse(c.release_pp_prefetch("hit"))
-                self.assertIsNone(c.get_prefetch_submission("hit"))
-                self.assertEqual(c.pp_prefetch_decisions, {})
+        cache.ongoing_prefetch = {}
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.root_node_handle = Mock(return_value=0)
+        cache.buffer_pipeline = Mock()
+        cache._handle_prefetch_result = Mock()
 
-    def test_pre_relay_records_skipped_prefetch_before_normal_enqueue(self):
-        from sglang.test.test_utils import maybe_stub_sgl_kernel
-
-        maybe_stub_sgl_kernel()
-        from sglang.srt.disaggregation.utils import DisaggregationMode
-        from sglang.srt.managers.scheduler import Scheduler
-
-        c = self.controller
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.tree_core = Mock(enable_storage=True)
-        cache.cache_controller = c
-        scheduler = Mock(tree_cache=cache, disaggregation_mode=DisaggregationMode.NULL)
-        scheduler.ps.pp_rank = 0
-        scheduler.metrics_reporter.enable_metrics = False
-        scheduler.spec_algorithm.is_dflash_family.return_value = False
-        scheduler.spec_algorithm.is_uno.return_value = False
-        scheduler._prefetch_kvcache.return_value = (
-            None  # E.g. short suffix/alloc failure.
+    def submit(self, rid="hit", pools=None):
+        key = RadixKey(
+            array("q", range(9)), "adapter", is_bigram=True, cache_salt="tenant"
         )
-        scheduler.grammar_manager.process_req_with_grammar.return_value = False
-        scheduler._add_request_to_queue.side_effect = lambda req: (
-            cache.prefetch_from_storage(req.rid, 0, list(range(8)))
+        return self.c.submit_prefetch(
+            rid, key, "ab" * 32, ["prefix"], [10, 11, 12, 13], pools
         )
-        recv_req = Mock(
-            session_params=None,
-            session_id=None,
-            input_embeds=None,
-            bootstrap_port=1,
-            pp_prefetch_ticketed=False,
-            mm_inputs=None,
-            return_logprob=False,
-            logprob_start_len=-1,
-            return_routed_experts=False,
-        )
-        req = Mock(rid="skip", return_sampling_mask=False, is_prefill_only=False)
-        req.origin_input_ids = list(range(8))
-        with (
-            patch(
-                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
-                return_value=1,
-            ),
-            patch("sglang.srt.managers.scheduler.Req", return_value=req),
-            patch(
-                "sglang.srt.managers.scheduler.validate_input_length", return_value=None
-            ),
-            patch("sglang.srt.managers.scheduler.get_serving"),
-            patch(
-                "sglang.srt.managers.scheduler.get_device",
-                return_value=Mock(mlx_enable_sampling=False),
-            ),
-        ):
-            Scheduler.handle_generate_request(scheduler, recv_req)
-        scheduler._prefetch_kvcache.assert_called_once_with(req)
-        scheduler._add_request_to_queue.assert_called_once_with(req)
-        self.assertIs(c.pp_prefetch_decisions["skip"], PPPrefetchDecision.SKIPPED)
-        self.assertFalse(recv_req.pp_prefetch_ticketed)
-        c._storage_hit_query.assert_not_called()
-        c.pp_prefetch_command_queue.put.assert_not_called()
 
-    def test_query_failure_falls_back_to_miss(self):
-        c = self.controller
-        c._storage_hit_query.side_effect = RuntimeError("storage unavailable")
-        with self.assertLogs(
-            "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller", level="ERROR"
-        ):
-            self.assertFalse(self.submit().decision)
-        # A failed local query still participates in TP consensus.
-        self.assertEqual(c._all_reduce.call_args.args[0].item(), 0)
-        c.pp_prefetch_command_queue.put.assert_not_called()
-
-    def test_tp_peer_miss_suppresses_local_hit(self):
-        c = self.controller
-        c._all_reduce.side_effect = lambda tensor, *_: tensor.zero_()
-        self.assertFalse(self.submit().decision)
-        self.assertEqual(c.pp_prefetch_states, {})
-        c.pp_prefetch_command_queue.put.assert_not_called()
-
-    def test_query_shards_cover_every_pp_namespace(self):
-        c = self.controller
-        for tp_size in (1, 2, 8):
-            queried = []
-            for tp_rank in range(tp_size):
-                c.tp_size, c.tp_rank = tp_size, tp_rank
-                c._storage_hit_query.reset_mock()
-                self.submit(rid=f"{tp_size}-{tp_rank}")
-                queried.extend(
-                    args.kwargs["pp_rank"]
-                    for args in c._storage_hit_query.call_args_list
-                )
-            self.assertEqual(sorted(queried), list(range(c.pp_size)))
-
-    def test_hit_uses_tp_min_and_broadcasts_one_aligned_ticket(self):
-        c = self.controller
-        c._storage_hit_query.side_effect = [(["h0", "h1"], 8), (["h0"], 7)]
-
-        def reduce_hit(tensor, op, groups):
-            self.assertEqual(tensor.item(), 7)
-            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
-            self.assertEqual(groups, ["tp"])  # No cross-PP hit collective.
-            tensor.fill_(5)
-
-        c._all_reduce.side_effect = reduce_hit
-        submission = self.submit()
-        ticket = c.pp_prefetch_command_queue.put.call_args.args[0]
-        self.assertEqual(ticket, make_ticket(storage_hit_count=4))
-        self.assertTrue(submission.decision)
-        self.assertTrue(submission.operation.is_pp_broadcast)
-        self.assertIs(c.pp_prefetch_states["hit"].operation, submission.operation)
-        c.pp_prefetch_command_queue.put.assert_called_once()
-        c.pp_prefetch_command_queue.join.assert_not_called()
-        self.assertFalse(c.is_pp_prefetch_ready("hit"))
-        self.assertTrue(c.get_prefetch_submission("hit").decision)
-        self.assertTrue(c.get_prefetch_submission("hit").decision)
-
-    def test_duplicate_ticket_is_rejected_without_second_broadcast(self):
-        c = self.controller
-        first = self.submit()
-        with self.assertRaisesRegex(RuntimeError, "Duplicate PP prefetch"):
-            self.submit()
-        self.assertIs(c.pp_prefetch_states["hit"].operation, first.operation)
-        c.pp_prefetch_command_queue.put.assert_called_once()
-
-    def test_downstream_skips_submission_and_cannot_query(self):
-        c = self.controller
-        c.pp_rank = 1
-        submission = c.get_prefetch_submission("not-arrived")
-        self.assertIsNone(submission.operation)
-        self.assertIsNone(submission.decision)
-        with self.assertRaisesRegex(RuntimeError, "Only PP0"):
-            self.submit()
-        c._storage_hit_query.assert_not_called()
-
-    def test_tp_only_keeps_normal_prefetch_queue(self):
-        c = self.controller
-        c.pp_prefetch_command_group = None
-        self.assertIsNone(c.get_prefetch_submission("hit"))
-        submission = self.submit()
-        self.assertIsNone(submission.decision)
-        self.assertIs(c.prefetch_queue.get_nowait(), submission.operation)
-        c._storage_hit_query.assert_not_called()
-        c.pp_prefetch_command_queue.put.assert_not_called()
-
-    def test_downstream_prefetches_before_request_without_requery(self):
-        c = self.controller
-        c.pp_rank = 1
-        ticket = make_ticket(
-            is_bigram=True,
-            token_ids=list(range(9)),
-            pool_specs=(
-                PPPrefetchPoolSpec(PoolName.SWA, 4, keys=["h1"]),
-                PPPrefetchPoolSpec(
-                    PoolName.DRAFT_SWA, 0, indices_from_pool=PoolName.SWA
-                ),
-            ),
-        )
-        commands = iter([ticket, None])
+    def run_commands(self, *tickets):
+        commands = iter((*tickets, None))
+        self.c.pp_prefetch_command_queue.put(None)
 
         def broadcast(objects, **kwargs):
-            self.assertEqual(kwargs, {"src": 0, "group": "command"})
-            objects[0] = next(commands)
+            if self.c.pp_rank:
+                objects[0] = next(commands)
 
         with patch.object(torch.distributed, "broadcast_object_list", broadcast):
-            c.pp_prefetch_command_thread_func()
-        operation = c.prefetch_buffer.get_nowait()
-        self.assertIs(c.pp_prefetch_states["hit"].operation, operation)
-        self.assertEqual(len(operation.token_ids), 8)
-        self.assertTrue(operation.token_ids.is_bigram)
-        self.assertEqual(operation.storage_start, 4)
-        self.assertEqual(operation.storage_hit_count, 8)
-        self.assertEqual(len(operation.hash_value), 2)
-        self.assertEqual(operation.all_hash_values, operation.hash_value)
-        self.assertEqual(operation.prefix_keys, ticket.prefix_keys)
-        self.assertEqual(c.prefetch_tokens_occupied, 8)
-        swa, draft_swa = operation.pool_transfers
-        self.assertEqual(swa.host_indices.numel(), 4)
-        self.assertIs(draft_swa.host_indices, swa.host_indices)
-        self.assertFalse(operation.pool_transfers_done)
-        self.assertEqual(c.mem_pool_host.alloc.call_count, 2)
-        c.mem_pool_host.alloc.assert_called_with(4, pool=PoolName.SWA)
+            self.c.pp_prefetch_command_thread_func()
+
+    def sync_acks(self, *acks):
+        for ack in acks:
+            self.c.prefetch_sync_queue.put(ack)
+        with patch.object(
+            self.c.storage_stop_event,
+            "is_set",
+            side_effect=[False] * len(acks) + [True],
+        ):
+            self.c.prefetch_sync_thread_func()
+
+    def test_hit_and_miss_are_reused_across_enqueue_retract_and_retry(self):
+        c = self.c
+        for hit in (0, 8):
+            with self.subTest(hit=hit):
+                rid = str(hit)
+                c._storage_hit_query.return_value = ([], hit)
+                self.assertEqual(self.submit(rid).decision, bool(hit))
+                queries = c._storage_hit_query.call_count
+                for _ in range(2):
+                    self.assertEqual(
+                        self.cache.prefetch_from_storage(rid, 0, []), bool(hit)
+                    )
+                self.assertEqual(c._storage_hit_query.call_count, queries)
+                if hit:
+                    state = c.pp_prefetch_states[rid]
+                    state.ready_event.set()
+                    c.take_ready_pp_prefetch(rid)
+                    self.assertFalse(self.cache.prefetch_from_storage(rid, 0, []))
+                self.assertTrue(self.cache.check_prefetch_progress(rid))
+                self.assertFalse(c.release_pp_prefetch(rid))
+                self.assertIsNone(c.get_prefetch_submission(rid))
+        self.assertEqual(c.pp_prefetch_command_queue.qsize(), 1)
+        self.cache._all_reduce.assert_not_called()
+
+    def test_submission_does_not_wait_for_worker_and_uses_only_tp_consensus(self):
+        c = self.c
+        with patch.object(
+            c.pp_prefetch_command_queue,
+            "join",
+            side_effect=AssertionError("scheduler blocked"),
+        ):
+            self.assertTrue(self.submit().decision)
+            self.assertTrue(self.submit("next").decision)
+        self.assertEqual(c.pp_prefetch_command_queue.qsize(), 2)
         self.assertFalse(c.is_pp_prefetch_ready("hit"))
+        c.mem_pool_host.alloc.assert_not_called()
+        self.assertEqual(
+            c._all_reduce.call_args.args[1:], (torch.distributed.ReduceOp.MIN, ["tp"])
+        )
+        self.assertEqual(
+            [call.kwargs["pp_rank"] for call in c._storage_hit_query.call_args_list],
+            [0, 2, 0, 2],
+        )
+
+    def test_tp_only_preserves_normal_prefetch(self):
+        c = self.c
+        c.pp_prefetch_command_group = None
+        result = self.submit()
+        self.assertIsNone(result.decision)
+        self.assertIs(c.prefetch_queue.get_nowait(), result.operation)
         c._storage_hit_query.assert_not_called()
-        c.pp_prefetch_command_queue.get.assert_not_called()
 
-    def test_storage_query_forwards_pp_namespace_for_kv_and_sidecars(self):
-        c = self.controller
-        c.storage_backend = Mock()
-        c.storage_backend.batch_exists.return_value = 1
-        for transfers in (None, [PoolTransfer(PoolName.SWA, keys=["h1"])]):
-            with self.subTest(sidecars=bool(transfers)):
-                operation = PrefetchOperation(
-                    "hit",
-                    list(range(8)),
-                    prefix_keys=["prefix"],
-                    pool_transfers=transfers,
-                )
-                c.storage_backend.batch_exists_v2.return_value = (
-                    operation.pool_storage_result
-                )
-                operation.pool_storage_result.kv_hit_pages = 1
-                hashes, hits = HybridCacheController._storage_hit_query(
-                    c, operation, pp_rank=3
-                )
-                query = (
-                    c.storage_backend.batch_exists_v2
-                    if transfers
-                    else c.storage_backend.batch_exists
-                )
-                extra_info = query.call_args.args[-1]
-                self.assertEqual(extra_info.extra_info, {"pp_rank": 3})
-                self.assertEqual(extra_info.prefix_keys, ["prefix"])
-                self.assertIsNot(extra_info.prefix_keys, operation.prefix_keys)
-                self.assertEqual(hits, 4)
-                self.assertEqual(hashes, operation.all_hash_values[:1])
-
-    def test_source_reuses_operation_and_consumes_commands(self):
-        c = self.controller
-        operation = self.submit().operation
-        ticket = c.pp_prefetch_states["hit"].ticket
-        c.pp_prefetch_command_queue = Queue()
-        c.pp_prefetch_command_queue.put(ticket)
-        c.pp_prefetch_command_queue.put(None)
-        with patch.object(torch.distributed, "broadcast_object_list") as broadcast:
-            c.pp_prefetch_command_thread_func()
-        self.assertIs(c.prefetch_buffer.get_nowait(), operation)
-        self.assertEqual(broadcast.call_count, 2)  # Ticket and shutdown sentinel.
-        self.assertTrue(c.pp_prefetch_command_queue.empty())
-        self.assertEqual(c.pp_prefetch_command_queue.unfinished_tasks, 0)
-
-    def test_command_allocation_failure_still_enters_io_completion_path(self):
-        c = self.controller
-        borrowed = PoolTransfer(PoolName.SWA, host_indices=torch.arange(4))
-        operation = self.submit(pool_transfers=[borrowed]).operation
-        ticket = c.pp_prefetch_states["hit"].ticket
-        c.mem_pool_host.alloc.return_value = None
-        c.mem_pool_host.alloc.side_effect = None
-        c.pp_prefetch_command_queue.get.side_effect = [ticket, None]
-        with patch.object(torch.distributed, "broadcast_object_list"):
-            c.pp_prefetch_command_thread_func()
-        self.assertIs(c.prefetch_buffer.get_nowait(), operation)
-        self.assertTrue(operation.is_terminated())
-        self.assertEqual(operation.host_indices.numel(), 0)
+    def test_downstream_request_and_ticket_order_preserves_pp0_admission(self):
+        c, cache = self.c, self.cache
+        self.submit()
+        ticket = pickle.loads(pickle.dumps(c.pp_prefetch_states["hit"].ticket))
+        c.pp_rank = 1
+        c.pp_prefetch_states.clear()
+        cache.bind_prefetch_ticket("hit")
+        self.assertFalse(cache.check_prefetch_progress("hit"))
+        c._storage_hit_query.reset_mock()
+        self.run_commands(ticket)
+        operation = c.prefetch_buffer.get_nowait()
+        self.assertTrue(operation.token_ids.is_bigram)
+        self.assertEqual(len(operation.token_ids), 8)
+        c._storage_hit_query.assert_not_called()
+        self.sync_acks(PrefetchAck("hit", operation, completed_tokens=8))
         self.assertFalse(c.is_pp_prefetch_ready("hit"))
-        self.assertEqual(c.pp_prefetch_command_queue.task_done.call_count, 2)
-        self.assertIs(operation.pool_transfers[0], borrowed)
-        c.mem_pool_host.free.assert_not_called()
-        c.prefetch_buffer.put(operation)
-        with patch.object(c.storage_stop_event, "is_set", side_effect=[False, True]):
-            c.prefetch_io_aux_func()
-        acks = [c.prefetch_sync_queue.get_nowait() for _ in range(3)]
-        self.assertEqual(acks[1].pool_hits, {})
-        self.sync_acks(*acks)
-        self.assertTrue(c.is_pp_prefetch_ready("hit"))
-        c.take_ready_pp_prefetch("hit")
-        self.assertEqual(c.mem_pool_host.free.call_args.kwargs, {"pool": PoolName.SWA})
-        self.assertIsNone(borrowed.host_indices)
+        self.sync_acks(PrefetchAck("hit", operation, completed_req=True))
+        self.assertFalse(cache.check_prefetch_progress("hit"))  # PP0 has not admitted.
+        cache._all_reduce.side_effect = lambda tensor, _: tensor.fill_(1)
+        self.assertTrue(cache.check_prefetch_progress("hit"))
+        cache._handle_prefetch_result.assert_called_once_with(operation)
+        key = cache.ongoing_prefetch["hit"].prefetch_key
+        self.assertEqual((key.extra_key, key.cache_salt), ("adapter", "tenant"))
+        self.assertTrue(key.is_bigram)
+        self.assertFalse(c.is_pp_prefetch_ready("hit"))
 
-    def test_allocation_exception_preserves_ack_sequence_and_next_ticket(self):
-        c = self.controller
+    def test_allocation_error_preserves_ack_sequence_and_next_ticket(self):
+        c = self.c
+        self.submit(
+            pools=[
+                PoolTransfer(PoolName.SWA, host_indices=torch.arange(4), keys=["h1"])
+            ]
+        )
+        ticket = c.pp_prefetch_states.pop("hit").ticket
+        following = pickle.loads(pickle.dumps(ticket))
+        following.rid = "next"
         c.pp_rank = 1
         kv = torch.arange(8)
         c.mem_pool_host.alloc.side_effect = [
@@ -395,34 +189,11 @@ class TestPPPrefetchTicket(unittest.TestCase):
             torch.arange(8),
             torch.arange(4),
         ]
-        specs = (PPPrefetchPoolSpec(PoolName.SWA, 4, keys=["h1"]),)
-        commands = iter(
-            [
-                make_ticket(pool_specs=specs),
-                make_ticket(rid="next", pool_specs=specs),
-                None,
-            ]
-        )
-
-        def broadcast(objects, **kwargs):
-            objects[0] = next(commands)
-
-        with (
-            patch.object(torch.distributed, "broadcast_object_list", broadcast),
-            self.assertLogs(
-                "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
-                level="ERROR",
-            ),
-        ):
-            c.pp_prefetch_command_thread_func()
+        with self.assertLogs(level="ERROR"):
+            self.run_commands(ticket, following)
         failed = c.pp_prefetch_states["hit"].operation
         self.assertTrue(failed.is_terminated())
-        self.assertEqual(failed.pool_transfers[0].name, PoolName.SWA)
-        self.assertIsNone(failed.pool_transfers[0].host_indices)
-        c.mem_pool_host.free.assert_called_once()
-        self.assertIs(c.mem_pool_host.free.call_args.args[0], kv)
-        self.assertEqual(c.prefetch_tokens_occupied, 8)  # Only the next ticket.
-
+        c.mem_pool_host.free.assert_called_once_with(kv, pool=PoolName.KV)
         c.page_get_func = Mock(return_value=1)
         c.storage_backend = Mock()
         c.storage_backend.batch_get_v2.return_value = {"swa": [True]}
@@ -434,551 +205,80 @@ class TestPPPrefetchTicket(unittest.TestCase):
         ):
             c.prefetch_io_aux_func()
         acks = [c.prefetch_sync_queue.get_nowait() for _ in range(8)]
-        self.assertTrue(c.prefetch_sync_queue.empty())
+        self.assertEqual([a.rid for a in acks], ["hit"] * 4 + ["next"] * 4)
         self.assertEqual(
-            [(a.rid, a.completed_tokens, a.pool_hits, a.completed_req) for a in acks],
-            [
-                ("hit", 0, None, None),
-                ("hit", 0, None, None),
-                ("hit", None, {}, None),
-                ("hit", None, None, True),
-                ("next", 4, None, None),
-                ("next", 8, None, None),
-                ("next", None, {"swa": 1}, None),
-                ("next", None, None, True),
-            ],
+            [a.completed_tokens for a in acks], [0, 0, None, None, 4, 8, None, None]
         )
-        self.assertEqual(c.page_get_func.call_count, 2)  # No I/O for the failed ticket.
-        c.storage_backend.batch_get_v2.assert_called_once()
-        self.sync_acks(*acks[:3])
-        self.assertFalse(c.is_pp_prefetch_ready("hit"))
-        self.sync_acks(acks[3])
+        self.assertEqual((acks[2].pool_hits, acks[6].pool_hits), ({}, {"swa": 1}))
+        self.assertEqual(
+            c.page_get_func.call_count, 2
+        )  # No reads for the failed ticket.
+        self.sync_acks(*acks)
         self.assertTrue(c.is_pp_prefetch_ready("hit"))
-        self.assertEqual(failed.completed_tokens, 0)
-        self.sync_acks(*acks[4:])
-        self.assertTrue(c.is_pp_prefetch_ready("next"))
         self.assertEqual(c.pp_prefetch_states["next"].operation.completed_tokens, 8)
+        self.assertEqual(c.prefetch_tokens_occupied, 8)
 
-    def test_ticket_submission_does_not_wait_for_worker(self):
-        c = self.controller
-        c.pp_prefetch_command_queue = Queue()
-        # No consumer: a submission must return with its ticket still queued.
-        with (
-            patch.object(
-                c.pp_prefetch_command_queue,
-                "join",
-                side_effect=AssertionError("blocking join"),
-            ),
-            patch.object(
-                c.pp_prefetch_command_queue.all_tasks_done,
-                "wait_for",
-                side_effect=AssertionError("blocking wait"),
-            ),
-        ):
-            self.assertTrue(self.submit().decision)
-            self.assertTrue(self.submit(rid="next").decision)
-            c._storage_hit_query.return_value = ([], 0)
-            self.assertFalse(self.submit(rid="miss").decision)
-        self.assertEqual(c.pp_prefetch_command_queue.qsize(), 2)
-        self.assertFalse(c.is_pp_prefetch_ready("hit"))
-        self.assertFalse(c.is_pp_prefetch_ready("next"))
-        c.mem_pool_host.alloc.assert_not_called()
-        self.assertTrue(c.prefetch_buffer.empty())
-
-    def test_downstream_binds_request_before_ticket_arrives(self):
-        c = self.controller
+    def test_cancel_before_ticket_defers_free_until_final_ack(self):
+        c, cache = self.c, self.cache
+        self.submit(pools=[PoolTransfer(PoolName.SWA, host_indices=torch.arange(4))])
+        ticket = c.pp_prefetch_states.pop("hit").ticket
         c.pp_rank = 1
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.pp_rank = 1
-        cache.cache_controller = c
-        cache._all_reduce = Mock()
         cache.bind_prefetch_ticket("hit")
-        self.assertEqual(c.pp_prefetch_states, {})
-        self.assertFalse(cache.check_prefetch_progress("hit"))
-
-        commands = iter([make_ticket(), None])
-
-        def broadcast(objects, **kwargs):
-            objects[0] = next(commands)
-
-        with patch.object(torch.distributed, "broadcast_object_list", broadcast):
-            c.pp_prefetch_command_thread_func()
+        self.assertTrue(c.release_pp_prefetch("hit"))
+        self.assertTrue(c.release_pp_prefetch("hit"))
+        self.assertIs(c.pp_prefetch_decisions["hit"], PPPrefetchDecision.CANCELLED)
+        self.run_commands(ticket)
         operation = c.prefetch_buffer.get_nowait()
-        self.sync_acks(
-            PrefetchAck("hit", operation, completed_tokens=8, completed_req=True)
+        self.sync_acks(PrefetchAck("hit", operation, completed_tokens=4))
+        c.mem_pool_host.free.assert_not_called()
+        self.sync_acks(PrefetchAck("hit", operation, completed_req=True))
+        self.assertEqual(
+            [call.kwargs["pool"] for call in c.mem_pool_host.free.call_args_list],
+            [PoolName.KV, PoolName.SWA],
         )
-        self.assertTrue(c.is_pp_prefetch_ready("hit"))
-        # Local completion still cannot bypass PP0's admission decision.
-        self.assertFalse(cache.check_prefetch_progress("hit"))
-        c._storage_hit_query.assert_not_called()
+        self.assertEqual(c.prefetch_tokens_occupied, 0)
+        self.assertEqual(c.pp_prefetch_states, {})
+        self.assertEqual(c.pp_prefetch_decisions, {})
 
-    def test_failed_ticket_completes_queue_task_and_worker_continues(self):
-        c = self.controller
-        c.pp_prefetch_command_queue = Queue()
-        c.mem_pool_host.alloc.side_effect = [KeyError(PoolName.KV), torch.arange(8)]
+    def test_failed_source_allocation_does_not_free_borrowed_sidecar_early(self):
+        c = self.c
+        borrowed = PoolTransfer(PoolName.SWA, host_indices=torch.arange(4))
+        operation = self.submit(pools=[borrowed]).operation
+        c.mem_pool_host.alloc.side_effect = lambda *args, **kwargs: None
+        self.run_commands()
+        self.assertTrue(operation.is_terminated())
+        c.mem_pool_host.free.assert_not_called()
+        self.sync_acks(
+            PrefetchAck("hit", operation, completed_tokens=0, completed_req=True)
+        )
+        c.take_ready_pp_prefetch("hit")
+        self.assertIsNone(borrowed.host_indices)
+        self.assertEqual(c.mem_pool_host.free.call_args.kwargs["pool"], PoolName.SWA)
+
+    def test_command_failure_finishes_queue_task_and_is_reported_on_poll(self):
+        c = self.c
         with (
-            patch.object(torch.distributed, "broadcast_object_list"),
-            self.assertLogs(
-                "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
-                level="ERROR",
+            patch.object(
+                torch.distributed,
+                "broadcast_object_list",
+                side_effect=RuntimeError("broken"),
             ),
+            self.assertLogs(level="ERROR"),
         ):
             worker = threading.Thread(
                 target=c.pp_prefetch_command_thread_func, daemon=True
             )
+            c.pp_prefetch_command_thread = worker
             worker.start()
-            try:
-                failed = self.submit().operation
-                following = self.submit(rid="next").operation
-            finally:
-                c.pp_prefetch_command_queue.put(None)
-                worker.join(timeout=1)
+            self.submit()
+            worker.join(timeout=1)
         self.assertFalse(worker.is_alive())
         self.assertEqual(c.pp_prefetch_command_queue.unfinished_tasks, 0)
-        self.assertTrue(failed.is_terminated())
-        self.assertFalse(following.is_terminated())
-        self.assertIs(c.prefetch_buffer.get_nowait(), failed)
-        self.assertIs(c.prefetch_buffer.get_nowait(), following)
-
-    def test_ticket_worker_error_is_reported_by_ready_poll(self):
-        c = self.controller
-        for stage in ("broadcast", "prepare"):
-            with self.subTest(stage=stage):
-                c.pp_prefetch_command_queue = Queue()
-                error = RuntimeError(f"{stage} failed")
-                with (
-                    patch.object(
-                        torch.distributed,
-                        "broadcast_object_list",
-                        side_effect=error if stage == "broadcast" else None,
-                    ),
-                    patch.object(c, "get_hash_str", side_effect=error),
-                    self.assertLogs(
-                        "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
-                        level="ERROR",
-                    ) as logs,
-                ):
-                    worker = threading.Thread(
-                        target=c.pp_prefetch_command_thread_func, daemon=True
-                    )
-                    c.pp_prefetch_command_thread = worker
-                    worker.start()
-                    self.assertTrue(self.submit(rid=stage).decision)
-                    worker.join(timeout=1)
-                self.assertFalse(worker.is_alive())
-                self.assertIs(logs.records[-1].exc_info[1], error)
-                self.assertFalse(c.pp_prefetch_states[stage].ready_event.is_set())
-                self.assertEqual(c.pp_prefetch_command_queue.unfinished_tasks, 0)
-                self.assertTrue(c.prefetch_buffer.empty())
-                with self.assertRaisesRegex(
-                    RuntimeError, f"ticket thread exited: req={stage}"
-                ):
-                    c.is_pp_prefetch_ready(stage)
-                # A later request must not wait forever behind the dead worker.
-                self.assertTrue(self.submit(rid=f"{stage}-next").decision)
-                with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
-                    c.is_pp_prefetch_ready(f"{stage}-next")
-
-    def test_pool_specs_copy_metadata_without_host_indices(self):
-        for source in (None, PoolName.KV):
-            with self.subTest(source=source):
-                transfer = PoolTransfer(
-                    PoolName.INDEXER,
-                    host_indices=torch.arange(8),
-                    keys=["h0", "h1"],
-                    indices_from_pool=source,
-                )
-                spec = PPPrefetchPoolSpec.from_transfer(transfer)
-                self.assertEqual(spec.num_slots, 8 if source is None else 0)
-                self.assertEqual(spec.indices_from_pool, source)
-                transfer.keys.append("h2")
-                self.assertEqual(spec.keys, ["h0", "h1"])
-                self.assertFalse(hasattr(spec, "host_indices"))
-
-    def test_allocate_and_release_sidecars_without_double_free(self):
-        c = self.controller
-        swa_indices = torch.arange(20, 24)
-        transfers = [
-            PoolTransfer(PoolName.INDEXER, indices_from_pool=PoolName.KV),
-            PoolTransfer(
-                PoolName.SWA,
-                host_indices=swa_indices,
-                keys=["h1"],
-                hit_policy=PoolHitPolicy.TRAILING_PAGES,
-            ),
-            PoolTransfer(PoolName.DRAFT_SWA, indices_from_pool=PoolName.SWA),
-        ]
-        ticket = make_ticket(
-            pool_specs=tuple(PPPrefetchPoolSpec.from_transfer(t) for t in transfers)
-        )
-        operation = PrefetchOperation("hit", ticket.token_ids, pool_transfers=transfers)
-        self.assertTrue(c._allocate_pp_prefetch_buffers(ticket, operation))
-        c.mem_pool_host.alloc.assert_called_once_with(8, pool=PoolName.KV)
-        indexer, swa, draft_swa = operation.pool_transfers
-        self.assertIs(indexer.host_indices, operation.host_indices)
-        self.assertIs(swa.host_indices, swa_indices)
-        self.assertIs(draft_swa.host_indices, swa_indices)
-        self.assertEqual(swa.hit_policy, PoolHitPolicy.TRAILING_PAGES)
-        state = PPPrefetchState(ticket, operation)
-        c.pp_prefetch_states["hit"] = state
-        state.ready_event.set()
-        self.assertTrue(c.release_pp_prefetch("hit"))
-        self.assertFalse(c.release_pp_prefetch("hit"))
-        self.assertEqual(c.prefetch_tokens_occupied, 0)
-        self.assertEqual(
-            [args.kwargs["pool"] for args in c.mem_pool_host.free.call_args_list],
-            [PoolName.KV, PoolName.SWA],
-        )
-
-    def test_sidecar_allocation_failure_rolls_back_owned_buffers(self):
-        c = self.controller
-        kv, swa = torch.arange(8), torch.arange(4)
-        c.mem_pool_host.alloc.side_effect = [kv, swa, None]
-        ticket = make_ticket(
-            pool_specs=(
-                PPPrefetchPoolSpec(PoolName.SWA, 4),
-                PPPrefetchPoolSpec(PoolName.MAMBA, 1),
-            )
-        )
-        operation = PrefetchOperation("hit", ticket.token_ids)
-        self.assertFalse(c._allocate_pp_prefetch_buffers(ticket, operation))
-        self.assertEqual(c.mem_pool_host.free.call_count, 2)
-        self.assertIs(c.mem_pool_host.free.call_args_list[0].args[0], swa)
-        self.assertIs(c.mem_pool_host.free.call_args_list[1].args[0], kv)
-        self.assertEqual(c.prefetch_tokens_occupied, 0)
-        self.assertIsNone(operation.host_indices)
-
-    def test_missing_derived_source_rolls_back_but_preserves_borrowed_sidecar(self):
-        c = self.controller
-        borrowed = PoolTransfer(PoolName.SWA, host_indices=torch.arange(4))
-        ticket = make_ticket(
-            pool_specs=(
-                PPPrefetchPoolSpec.from_transfer(borrowed),
-                PPPrefetchPoolSpec(
-                    PoolName.INDEXER, 0, indices_from_pool=PoolName.MAMBA
-                ),
-            )
-        )
-        operation = PrefetchOperation(
-            "hit", ticket.token_ids, pool_transfers=[borrowed]
-        )
-        self.assertFalse(c._allocate_pp_prefetch_buffers(ticket, operation))
-        c.mem_pool_host.free.assert_called_once()
-        self.assertEqual(c.mem_pool_host.free.call_args.kwargs, {"pool": PoolName.KV})
-        self.assertIs(operation.pool_transfers[0], borrowed)
-        self.assertIsNotNone(borrowed.host_indices)
-
-    def test_progressive_ack_publishes_only_global_completion(self):
-        c = self.controller
-        operation = self.submit().operation
-        state = c.pp_prefetch_states["hit"]
-        c._allocate_pp_prefetch_buffers(state.ticket, operation)
-        operation.hash_value = ["h0", "h1"]
-        operation.pool_transfers_done = False
-
-        def reduce_ack(tensor, op, groups):
-            self.assertFalse(state.ready_event.is_set())
-            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
-            self.assertEqual(groups, c.prefetch_completion_sync_groups)
-            tensor.clamp_(max=4 if tensor.ndim == 0 else 1)
-
-        c._all_reduce.side_effect = reduce_ack
-        self.sync_acks(PrefetchAck("hit", operation, completed_tokens=8))
-        self.assertEqual(operation.completed_tokens, 4)
-        self.assertFalse(c.is_pp_prefetch_ready("hit"))
-        self.sync_acks(PrefetchAck("hit", operation, pool_hits={PoolName.SWA: 2}))
-        self.assertEqual(operation.pool_storage_result.extra_pool_hit_pages["swa"], 1)
-        self.assertTrue(operation.pool_transfers_done)
-        self.assertFalse(c.is_pp_prefetch_ready("hit"))
-        self.sync_acks(PrefetchAck("hit", operation, completed_req=True))
-        self.assertTrue(c.is_pp_prefetch_ready("hit"))
-        self.assertEqual(operation.hash_value, ["h0"])
-        self.assertEqual(operation.storage_hit_count, 4)
-        self.assertTrue(c.ack_prefetch_queue.empty())
-
-    def test_normal_ack_still_goes_to_scheduler(self):
-        c = self.controller
-        operation = PrefetchOperation("tp", list(range(8)))
-        ack = PrefetchAck("tp", operation, completed_tokens=4, completed_req=True)
-        self.sync_acks(ack)
-        self.assertIs(c.ack_prefetch_queue.get_nowait(), ack)
-        self.assertEqual(c.pp_prefetch_states, {})
-
-    def test_release_waits_for_final_ack(self):
-        c = self.controller
-        operation = self.submit().operation
-        state = c.pp_prefetch_states["hit"]
-        c._allocate_pp_prefetch_buffers(state.ticket, operation)
-        self.assertTrue(c.release_pp_prefetch("hit"))
-        self.assertTrue(state.release_requested)
-        c.mem_pool_host.free.assert_not_called()
-        self.sync_acks(PrefetchAck("hit", operation, completed_tokens=4))
-        c.mem_pool_host.free.assert_not_called()
-        self.sync_acks(PrefetchAck("hit", operation, completed_req=True))
-        c.mem_pool_host.free.assert_called_once()
-        self.assertEqual(c.pp_prefetch_states, {})
-        self.assertEqual(c.pp_prefetch_decisions, {})
-        self.assertEqual(c.prefetch_tokens_occupied, 0)
-
-    def test_release_before_local_ticket_registration_waits_for_final_ack(self):
-        c = self.controller
-        c.pp_rank = 1
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.cache_controller = c
-        cache.bind_prefetch_ticket("hit")
-        self.assertTrue(c.release_pp_prefetch("hit"))
-        # Repeated cleanup must retain cancellation until the ticket arrives.
-        self.assertTrue(c.release_pp_prefetch("hit"))
-        self.assertIs(c.pp_prefetch_decisions["hit"], PPPrefetchDecision.CANCELLED)
-
-        ticket = make_ticket(
-            pool_specs=(
-                PPPrefetchPoolSpec(PoolName.SWA, 4, keys=["h1"]),
-                PPPrefetchPoolSpec(
-                    PoolName.DRAFT_SWA, 0, indices_from_pool=PoolName.SWA
-                ),
-            ),
-        )
-        commands = iter([ticket, None])
-
-        def broadcast(objects, **kwargs):
-            objects[0] = next(commands)
-
-        with patch.object(torch.distributed, "broadcast_object_list", broadcast):
-            c.pp_prefetch_command_thread_func()
-        operation = c.prefetch_buffer.get_nowait()
-        self.assertTrue(c.pp_prefetch_states["hit"].release_requested)
-        self.assertEqual(c.pp_prefetch_decisions, {})
-        c.mem_pool_host.free.assert_not_called()
-        self.sync_acks(PrefetchAck("hit", operation, completed_tokens=4))
-        c.mem_pool_host.free.assert_not_called()
-        self.sync_acks(PrefetchAck("hit", operation, completed_req=True))
-        self.assertEqual(
-            [args.kwargs["pool"] for args in c.mem_pool_host.free.call_args_list],
-            [PoolName.KV, PoolName.SWA],
-        )
-        self.assertEqual(c.prefetch_tokens_occupied, 0)
-        self.assertEqual(c.pp_prefetch_states, {})
-        self.assertEqual(c.pp_prefetch_decisions, {})
-        self.assertFalse(c.release_pp_prefetch("unknown"))
-        self.assertEqual(c.pp_prefetch_decisions, {})
-
-    def test_take_ready_transfers_ownership_exactly_once(self):
-        c = self.controller
-        operation = self.submit().operation
-        state = c.pp_prefetch_states["hit"]
-        c._allocate_pp_prefetch_buffers(state.ticket, operation)
-        operation.completed_tokens = 8
-        # Simulate a downstream consumer waiting for its local final ACK.
-        state.ready_event = Mock(spec=threading.Event)
-        self.assertIs(c.take_ready_pp_prefetch("hit"), state)
-        state.ready_event.wait.assert_called_once_with()
-        self.assertTrue(state.consumed)
-        self.assertIs(c.pp_prefetch_states["hit"], state)
-        self.assertFalse(c.is_pp_prefetch_ready("hit"))
-        self.assertFalse(c.get_prefetch_submission("hit").decision)
-        self.assertIsNone(c.take_ready_pp_prefetch("hit"))
-        self.assertFalse(c.release_pp_prefetch("hit"))
-        self.assertNotIn("hit", c.pp_prefetch_states)
-        self.assertIsNone(c.get_prefetch_submission("hit"))
-        c.mem_pool_host.free.assert_not_called()
-        self.assertEqual(c.prefetch_tokens_occupied, 8)  # Now owned by buffer mode.
-
-    def test_repeated_prefetch_reuses_issued_ticket_before_and_after_consumption(self):
-        c = self.controller
-        operation = self.submit().operation
-        state = c.pp_prefetch_states["hit"]
-        c._allocate_pp_prefetch_buffers(state.ticket, operation)
-        operation.completed_tokens = 8
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.tree_core = Mock(enable_storage=True)
-        cache.cache_controller = c
-        cache.ongoing_prefetch = {}
-        cache._all_reduce = Mock()
-        for phase in ("pending", "ready", "consumed"):
-            with self.subTest(phase=phase):
-                if phase == "ready":
-                    state.ready_event.set()
-                elif phase == "consumed":
-                    c.take_ready_pp_prefetch("hit")
-                for _ in range(2):
-                    self.assertEqual(
-                        cache.prefetch_from_storage("hit", 0, list(range(8))),
-                        phase != "consumed",
-                    )
-        self.assertTrue(cache.check_prefetch_progress("hit"))
-        cache._all_reduce.assert_not_called()
-        self.assertEqual(
-            c._storage_hit_query.call_count, 2
-        )  # Original PP0 query shards.
-        c.pp_prefetch_command_queue.put.assert_called_once()
-        c.mem_pool_host.free.assert_not_called()
-
-    def test_consumed_ticket_abort_still_releases_buffer_mode_hold(self):
-        c = self.controller
-        self.submit()
-        state = c.pp_prefetch_states["hit"]
-        state.ready_event.set()
-        c.take_ready_pp_prefetch("hit")
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.cache_controller = c
-        cache.linker = None
-        cache.prefetch_loaded_tokens_by_reqid = {}
-        cache.prefetch_loaded_storage_start_by_reqid = {}
-        cache._storage_prefetch_missed_rids = set()
-        cache.buffer_pipeline = Mock()
-        cache.buffer_pipeline.release_staged_hold.return_value = True
-        cache.release_aborted_request("hit")
-        self.assertNotIn("hit", c.pp_prefetch_states)
-        cache.buffer_pipeline.release_staged_hold.assert_called_once_with("hit")
-        c.mem_pool_host.free.assert_not_called()
-
-    def test_finished_request_retires_ticket_but_retraction_preserves_it(self):
-        c = self.controller
-        self.submit()
-        state = c.pp_prefetch_states["hit"]
-        state.ready_event.set()
-        c.take_ready_pp_prefetch("hit")
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.cache_controller = c
-        cache.session = Mock()
-        cache.session.try_cache_finished_req.return_value = True
-        cache.bind_prefetch_ticket("miss", False)
-        for rid in ("hit", "miss"):
-            with self.subTest(rid=rid):
-                req = Mock(rid=rid)
-                req.finished.return_value = False
-                cache.cache_finished_req(req, kv_len_to_handle=0)
-                self.assertFalse(c.get_prefetch_submission(rid).decision)
-                req.finished.return_value = True
-                cache.cache_finished_req(req, kv_len_to_handle=0)
-                self.assertIsNone(c.get_prefetch_submission(rid))
-        self.assertEqual(c.pp_prefetch_states, {})
-        self.assertEqual(c.pp_prefetch_decisions, {})
-        c.mem_pool_host.free.assert_not_called()
-
-    def test_take_zero_completion_releases_buffers(self):
-        c = self.controller
-        operation = self.submit().operation
-        state = c.pp_prefetch_states["hit"]
-        c._allocate_pp_prefetch_buffers(state.ticket, operation)
-        state.ready_event.set()
-        self.assertIs(c.take_ready_pp_prefetch("hit"), state)
-        self.assertIsNone(operation.host_indices)
-        self.assertEqual(c.prefetch_tokens_occupied, 0)
-        self.assertFalse(c.get_prefetch_submission("hit").decision)
-        self.assertFalse(c.release_pp_prefetch("hit"))
-        c.mem_pool_host.free.assert_called_once()
-
-
-class TestPPTicketAdmission(unittest.TestCase):
-    def setUp(self):
-        self.cache = cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.pp_rank = 1
-        cache.cache_controller = Mock()
-        cache.cache_controller.pp_prefetch_state_lock = threading.Lock()
-        cache.cache_controller.pp_prefetch_decisions = {}
-        cache.bind_prefetch_ticket("hit")
-        cache.buffer_pipeline = Mock()
-        cache._all_reduce = Mock()
-        cache.ongoing_prefetch = {}
-        cache.prefetch_loaded_tokens_by_reqid = {}
-        cache.root_node_handle = Mock(return_value=0)
-        cache._handle_prefetch_result = Mock()
-
-    def test_local_downstream_ready_cannot_admit_before_pp0(self):
-        cache = self.cache
-        cache.cache_controller.is_pp_prefetch_ready.return_value = True
-        self.assertFalse(cache.check_prefetch_progress("hit"))
-        self.assertIs(
-            cache.cache_controller.pp_prefetch_decisions["hit"],
-            PPPrefetchDecision.TICKETED,
-        )
-        self.assertEqual(cache._all_reduce.call_args.args[0].item(), 0)
-        cache.cache_controller.is_pp_prefetch_ready.assert_not_called()
-        cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
-
-    def test_pp0_not_ready_does_not_consume_ticket(self):
-        cache = self.cache
-        cache.pp_rank = 0
-        cache.cache_controller.is_pp_prefetch_ready.return_value = False
-        self.assertFalse(cache.check_prefetch_progress("hit"))
-        self.assertIs(
-            cache.cache_controller.pp_prefetch_decisions["hit"],
-            PPPrefetchDecision.TICKETED,
-        )
-        cache.cache_controller.is_pp_prefetch_ready.assert_called_once_with("hit")
-        cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
-
-    def test_admitted_ticket_enters_existing_buffer_result_path(self):
-        cache = self.cache
-        ticket = make_ticket(is_bigram=True, token_ids=list(range(9)))
-        transfers = [
-            PoolTransfer(name=PoolName.SWA),
-            PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, indices_from_pool=PoolName.KV),
-            PoolTransfer(
-                name=PoolName.DEEPSEEK_V4_C4_STATE, indices_from_pool=PoolName.SWA
-            ),
-        ]
-        operation = PrefetchOperation("hit", ticket.token_ids, pool_transfers=transfers)
-        operation.host_indices = torch.arange(8)
-        operation.completed_tokens = 4
-        cache.cache_controller.take_ready_pp_prefetch.return_value = PPPrefetchState(
-            ticket, operation
-        )
-
-        def check_anchor_registration(rid):
-            # Bigram anchor matching needs the suffix's boundary token here.
-            key = cache.ongoing_prefetch[rid].prefetch_key
-            self.assertTrue(key.is_bigram)
-            self.assertEqual(key.token_ids[0], ticket.token_ids[0])
-
-        cache.buffer_pipeline.try_lock_anchor.side_effect = check_anchor_registration
-        cache._all_reduce.side_effect = lambda tensor, _: tensor.fill_(1)
-        self.assertTrue(cache.check_prefetch_progress("hit"))
-        cache.cache_controller.take_ready_pp_prefetch.assert_called_once_with("hit")
-        cache.buffer_pipeline.set_prefix_ctx.assert_called_once_with(
-            "hit",
-            ticket.matched_prefix_tokens,
-            extra_key="adapter",
-            cache_salt="tenant",
-        )
-        cache.buffer_pipeline.try_lock_anchor.assert_called_once_with("hit")
-        ongoing = cache.ongoing_prefetch["hit"]
-        self.assertIs(ongoing.operation, operation)
-        self.assertEqual(ongoing.prefetch_key.extra_key, "adapter")
-        self.assertEqual(ongoing.prefetch_key.cache_salt, "tenant")
-        # Buffer mode appends derived sidecars from operation.pool_transfers itself.
-        self.assertEqual(
-            [t for xfers in ongoing.comp_xfers.values() for t in xfers], [transfers[0]]
-        )
-        tail = cache.cache_controller.append_host_mem_release.call_args.args[0]
-        self.assertEqual(tail.tolist(), [4, 5, 6, 7])
-        cache._handle_prefetch_result.assert_called_once_with(operation)
-
-    def test_miss_admission_keeps_decision_without_collective(self):
-        cache = self.cache
-        cache.bind_prefetch_ticket("miss", False)
-        self.assertTrue(cache.check_prefetch_progress("miss"))
-        self.assertIs(
-            cache.cache_controller.pp_prefetch_decisions["miss"],
-            PPPrefetchDecision.SKIPPED,
-        )
-        cache._all_reduce.assert_not_called()
-        cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
-
-    def test_cancelled_decision_does_not_enter_ticket_admission(self):
-        cache = self.cache
-        cache.cache_controller.pp_prefetch_decisions["hit"] = (
-            PPPrefetchDecision.CANCELLED
-        )
-        self.assertTrue(cache.check_prefetch_progress("hit"))
-        self.assertIs(
-            cache.cache_controller.pp_prefetch_decisions["hit"],
-            PPPrefetchDecision.CANCELLED,
-        )
-        cache._all_reduce.assert_not_called()
-        cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
+        for rid in ("hit", "next"):
+            if rid == "next":
+                self.submit(rid)
+            with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
+                c.is_pp_prefetch_ready(rid)
 
 
 if __name__ == "__main__":

@@ -72,13 +72,10 @@ class PPPrefetchPoolSpec:
 @dataclass
 class PPPrefetchTicket:
     rid: str
-    token_ids: List[int]
+    prefetch_key: RadixKey
     last_hash: Optional[str]
     prefix_keys: Optional[List[str]]
     matched_prefix_tokens: List[int]
-    extra_key: Optional[str]
-    cache_salt: Optional[str]
-    is_bigram: bool
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
     storage_hit_count: int = 0
 
@@ -721,49 +718,20 @@ class HybridCacheController(BaseHiCacheController):
                 )
             )
 
-        operation = self.submit_pp_prefetch(
-            rid=rid,
-            token_ids=list(prefetch_key.token_ids),
-            last_hash=last_hash,
-            prefix_keys=prefix_keys,
-            matched_prefix_tokens=list(matched_prefix_tokens or []),
-            extra_key=prefetch_key.extra_key,
-            cache_salt=prefetch_key.cache_salt,
-            is_bigram=prefetch_key.is_bigram,
-            pool_transfers=pool_transfers,
-        )
-        decision = operation is not None
-        with self.pp_prefetch_state_lock:
-            self.pp_prefetch_decisions[rid] = (
-                PPPrefetchDecision.TICKETED if decision else PPPrefetchDecision.SKIPPED
-            )
-        return PrefetchSubmission(operation=operation, decision=decision)
-
-    def submit_pp_prefetch(
-        self,
-        rid: str,
-        token_ids: List[int],
-        last_hash: Optional[str],
-        prefix_keys: Optional[List[str]],
-        matched_prefix_tokens: List[int],
-        extra_key: Optional[str],
-        cache_salt: Optional[str],
-        is_bigram: bool,
-        pool_transfers: Optional[list[PoolTransfer]],
-    ) -> Optional[PrefetchOperation]:
-        """Query every PP stage from PP0 and broadcast only storage hits."""
-        if self.pp_prefetch_command_group is None or self.pp_rank != 0:
+        if self.pp_rank != 0:
             raise RuntimeError("Only PP0 can submit a PP prefetch ticket.")
 
         ticket = PPPrefetchTicket(
             rid=rid,
-            token_ids=list(token_ids),
+            prefetch_key=RadixKey(
+                array("q", prefetch_key.token_ids),
+                extra_key=prefetch_key.extra_key,
+                cache_salt=prefetch_key.cache_salt,
+                is_bigram=prefetch_key.is_bigram,
+            ),
             last_hash=last_hash,
             prefix_keys=list(prefix_keys) if prefix_keys else None,
-            matched_prefix_tokens=list(matched_prefix_tokens),
-            extra_key=extra_key,
-            cache_salt=cache_salt,
-            is_bigram=is_bigram,
+            matched_prefix_tokens=list(matched_prefix_tokens or []),
             pool_specs=tuple(
                 PPPrefetchPoolSpec.from_transfer(transfer)
                 for transfer in pool_transfers or []
@@ -771,13 +739,13 @@ class HybridCacheController(BaseHiCacheController):
         )
         operation = PrefetchOperation(
             rid,
-            RadixKey(array("q", ticket.token_ids), is_bigram=ticket.is_bigram),
+            ticket.prefetch_key,
             last_hash,
             prefix_keys=ticket.prefix_keys,
             pool_transfers=pool_transfers,
         )
 
-        storage_hit_count = len(token_ids) // self.page_size * self.page_size
+        storage_hit_count = len(ticket.prefetch_key.token_ids)
         try:
             for pp_rank in range(self.tp_rank, self.pp_size, self.tp_size):
                 _, rank_hit_count = self._storage_hit_query(operation, pp_rank=pp_rank)
@@ -797,7 +765,9 @@ class HybridCacheController(BaseHiCacheController):
         storage_hit_count = int(hit_tensor.item())
         storage_hit_count -= storage_hit_count % self.page_size
         if storage_hit_count < self.prefetch_threshold:
-            return None
+            with self.pp_prefetch_state_lock:
+                self.pp_prefetch_decisions[rid] = PPPrefetchDecision.SKIPPED
+            return PrefetchSubmission(decision=False)
 
         ticket.storage_hit_count = storage_hit_count
         operation.is_pp_broadcast = True
@@ -806,9 +776,10 @@ class HybridCacheController(BaseHiCacheController):
             if rid in self.pp_prefetch_states:
                 raise RuntimeError(f"Duplicate PP prefetch request id: {rid}")
             self.pp_prefetch_states[rid] = state
+            self.pp_prefetch_decisions[rid] = PPPrefetchDecision.TICKETED
 
         self.pp_prefetch_command_queue.put(ticket)
-        return operation
+        return PrefetchSubmission(operation=operation, decision=True)
 
     def _allocate_pp_prefetch_buffers(
         self, ticket: PPPrefetchTicket, operation: PrefetchOperation
@@ -951,10 +922,7 @@ class HybridCacheController(BaseHiCacheController):
                     if state is None:
                         operation = PrefetchOperation(
                             ticket.rid,
-                            RadixKey(
-                                array("q", ticket.token_ids),
-                                is_bigram=ticket.is_bigram,
-                            ),
+                            ticket.prefetch_key,
                             ticket.last_hash,
                             prefix_keys=ticket.prefix_keys,
                             # Keep sidecar ACKs aligned even if allocation fails.
@@ -979,7 +947,7 @@ class HybridCacheController(BaseHiCacheController):
                     operation = state.operation
 
                 operation.hash_value = self.get_hash_str(
-                    ticket.token_ids,
+                    ticket.prefetch_key.token_ids,
                     ticket.last_hash,
                     page_size=self.page_size,
                 )[: ticket.storage_hit_count // self.page_size]

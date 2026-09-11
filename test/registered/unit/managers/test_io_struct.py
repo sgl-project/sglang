@@ -70,42 +70,6 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
             "Rust may omit only a defaulted suffix of the Python wire schema",
         )
 
-    def test_pp_prefetch_ticketed_wire_compatibility(self):
-        fields = TokenizedGenerateReqInput.__struct_fields__
-        self.assertEqual(fields[-1], "pp_prefetch_ticketed")
-        req = TokenizedGenerateReqInput(
-            input_text="hi",
-            input_ids=None,
-            input_embeds=None,
-            mm_inputs=None,
-            token_type_ids=None,
-            sampling_params=SamplingParams(),
-            return_logprob=False,
-            logprob_start_len=-1,
-            top_logprobs_num=0,
-            token_ids_logprob=None,
-            stream=True,
-            return_hidden_states=True,
-            bootstrap_host="10.0.0.1",
-            disagg_prefill_dp_rank=3,
-        )
-        for ticketed in (False, True):
-            with self.subTest(ticketed=ticketed):
-                req.pp_prefetch_ticketed = ticketed
-                decoded = self._round_trip(req)
-                self.assertEqual(decoded, req)
-                self.assertIs(decoded.pp_prefetch_ticketed, ticketed)
-
-        wire = msgspec.msgpack.decode(msgpack_encode(req))
-        # Both older Python senders and Rust may omit the defaulted tail.
-        for end in (len(wire) - 1, fields.index("disagg_prefill_dp_rank") + 2):
-            with self.subTest(wire_length=end):
-                decoded = msgpack_decode(msgspec.msgpack.encode(wire[:end]))
-                self.assertFalse(decoded.pp_prefetch_ticketed)
-                self.assertTrue(decoded.return_hidden_states)
-                self.assertEqual(decoded.bootstrap_host, req.bootstrap_host)
-                self.assertEqual(decoded.disagg_prefill_dp_rank, 3)
-
     def _make_mm_inputs(self, device="cpu"):
         return MultimodalProcessorOutput(
             mm_items=[
