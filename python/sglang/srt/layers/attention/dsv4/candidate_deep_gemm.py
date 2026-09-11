@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,6 +14,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_bf16_small,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
@@ -155,6 +157,11 @@ class DeepGemmCandidateIndexer:
         assert block_size == CANDIDATE_BLOCK_SIZE, block_size
         self.topk_blocks = topk_blocks
         self.block_size = block_size
+        self.alt_stream = None
+        self.need_wait = False
+        # TODO: maybe lower this priority
+        if envs.SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP.get():
+            self.alt_stream = torch.cuda.Stream()
 
     def publish_decode(
         self,
@@ -177,6 +184,16 @@ class DeepGemmCandidateIndexer:
             metadata.deep_gemm_metadata,
             metadata.max_c4_seq_len,
         )
+        if self.alt_stream is not None:
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            # the level-one chain reads `logits` on the side stream while the main
+            # stream moves on: keep the allocator from handing its memory to a
+            # later main-stream allocation before those reads ran
+            logits.record_stream(self.alt_stream)
+            self.need_wait = True
+            stream_ctx = torch.cuda.stream(self.alt_stream)
+        else:
+            stream_ctx = contextlib.nullcontext()
         # TODO(candidate): one kernel for both selections below (dense logits read once)
         topk_transform_paged_v2(
             logits,
@@ -188,28 +205,29 @@ class DeepGemmCandidateIndexer:
             out_raw_indices=raw_indices,
         )
         # per row: block count for the block top-k, sparse-row length for the consumers
-        nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
-        blocks = amax_topk_blocks(logits, seq_lens, nblocks, self.topk_blocks)
-        # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
-        phys_blocks = sort_candidate_blocks(
-            blocks,
-            seq_lens,
-            metadata.page_table,
-            metadata.c4_page_size,
-        )
-        schedule = build_sparse_indexer_schedule(
-            blocks,
-            seq_lens,
-            metadata.page_table,
-            metadata.c4_page_size,
-            inputs.q_fp4.dtype,
-        )
-        return SparseBlockTable(
-            blocks=blocks,
-            schedule=schedule,
-            phys_blocks=phys_blocks,
-            valid_lens=row_valid_lens,
-        )
+        with stream_ctx:
+            nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
+            blocks = amax_topk_blocks(logits, seq_lens, nblocks, self.topk_blocks)
+            # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
+            phys_blocks = sort_candidate_blocks(
+                blocks,
+                seq_lens,
+                metadata.page_table,
+                metadata.c4_page_size,
+            )
+            schedule = build_sparse_indexer_schedule(
+                blocks,
+                seq_lens,
+                metadata.page_table,
+                metadata.c4_page_size,
+                inputs.q_fp4.dtype,
+            )
+            return SparseBlockTable(
+                blocks=blocks,
+                schedule=schedule,
+                phys_blocks=phys_blocks,
+                valid_lens=row_valid_lens,
+            )
 
     def scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
         """A consumer: bf16 logits ``[rows, topk_blocks * 8]`` of the published
@@ -235,6 +253,9 @@ class DeepGemmCandidateIndexer:
         given)."""
         assert raw_indices is None
         table = candidate_metadata
+        if self.alt_stream is not None and self.need_wait:
+            self.need_wait = False
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
         logits = self.scores(table, inputs)
         # decode carries no raw_indices; the kernel writes slots only
         topk_transform_sparse(logits, table.valid_lens, table, page_indices)

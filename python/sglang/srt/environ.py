@@ -1407,6 +1407,8 @@ class Envs:
     # index-source layers after the candidate source (decode). Needs a DeepGEMM
     # with fp8_fp4_paged_sparse_mqa_logits on SM100; off = the torch masks.
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
+    # use multistream to overlap the publish-side with other computation
+    SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
