@@ -1244,7 +1244,9 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 continue
 
             # Expert weights: expert_params_mapping + expert_weights_remapping
-            # handle the fused gate_and_up_proj format.
+            # handle the fused gate_and_up_proj format (the format the released
+            # checkpoints ship; separate gate_proj/up_proj keys are rejected
+            # below instead of being silently dropped).
             is_expert_weight = False
             is_found = False
             found_num = 0
@@ -1301,6 +1303,13 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             if is_expert_weight:
                 # Recognised as expert weight but not mapped locally
                 continue
+            if _is_moe(self.config) and "mlp.experts" in name:
+                raise KeyError(
+                    f"Unsupported expert checkpoint key '{name}': expected fused "
+                    "'gate_and_up_proj'/'down_proj' expert keys (separate "
+                    "gate_proj/up_proj checkpoints are not supported; re-export "
+                    "the checkpoint with fused gate_and_up_proj)."
+                )
 
             if name.endswith(".bias") and name not in params_dict:
                 continue

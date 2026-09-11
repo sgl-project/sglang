@@ -993,6 +993,8 @@ class HunyuanImage3AR(PipelineStage):
         noise_rows = []
         for req in reqs:
             generator = torch.Generator(device=device)
+            # Seeds arrive normalized to per-output scalars by
+            # _expand_multi_output.
             if req.seed is not None:
                 generator.manual_seed(req.seed)
             noise_rows.append(
@@ -1091,6 +1093,10 @@ class HunyuanImage3AR(PipelineStage):
     def _expand_multi_output(req: Req) -> list[Req]:
         num_outputs = int(req.num_outputs_per_prompt)
         if num_outputs == 1:
+            # No clone loop for n=1, so normalize the seed here: downstream
+            # noise preparation assumes per-output scalar seeds.
+            if req.seed is not None:
+                req.seed = _seed_for_output(req.seed, 0)
             return [req]
         clones: list[Req] = []
         for output_idx in range(num_outputs):
