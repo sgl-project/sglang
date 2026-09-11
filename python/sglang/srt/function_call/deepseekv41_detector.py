@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union, get_args
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import StructuralTag
@@ -21,8 +21,7 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
     think_end_token = "</think>"
 
     def get_structural_tag_name(self) -> Optional[str]:
-        # xgrammar's builtin "deepseek_v4" tag hardcodes the unspaced names,
-        # so the V4.1 tag is assembled in get_structural_tag instead.
+        # Keep local wrappers to support parallel_tool_calls=False.
         return None
 
     def get_structural_tag(
@@ -32,12 +31,7 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
-        """The builtin "deepseek_v4" shape with the spaced tag names.
-
-        Bodies are JSON: xgrammar's "deepseek_xml" body style also hardcodes
-        the unspaced " parameter" name, and the V3.2-lineage parser accepts a
-        JSON body inside an invoke.
-        """
+        """Constrain spaced DSML parameters with XGrammar's V4.1 XML style."""
         try:
             from xgrammar.structural_tag import (
                 AnyTextFormat,
@@ -56,12 +50,23 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
         tools = list(tools or [])
         if isinstance(tool_choice, ToolChoice):
             tools = [
-                tool for tool in tools if tool.function.name == tool_choice.function.name
+                tool
+                for tool in tools
+                if tool.function.name == tool_choice.function.name
             ]
             if len(tools) != 1:
                 return None
         if not tools:
             return None
+
+        # Older XGrammar releases only support JSON bodies in spaced invokes.
+        # Retain that parser-compatible fallback until they provide the XML style.
+        style = (
+            "deepseek_v4_1_xml"
+            if "deepseek_v4_1_xml"
+            in get_args(JSONSchemaFormat.model_fields["style"].annotation)
+            else "json"
+        )
 
         def invoke_tag(tool: Tool) -> TagFormat:
             function = tool.function
@@ -69,8 +74,8 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
             if schema is None:
                 schema = True
             return TagFormat(
-                begin=f'{self.invoke_start_token} name="{function.name}">',
-                content=JSONSchemaFormat(json_schema=schema),
+                begin=f'{self.invoke_start_token} name="{function.name}">\n',
+                content=JSONSchemaFormat(json_schema=schema, style=style),
                 end=f"{self.invoke_end_token}\n",
             )
 
