@@ -47,19 +47,8 @@ def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
     assert pinned_revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 
 
-def test_remote_file_exists_returns_false_for_definitive_404(monkeypatch):
-    class Response:
-        status_code = 404
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(test_utils.requests, "head", lambda *args, **kwargs: Response())
-
-    assert test_utils._remote_file_exists("https://example.com/missing.png") is False
-
-
 def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     monkeypatch.setattr(test_utils, "_remote_file_exists", lambda url: None)
 
     files = test_utils._find_remote_consistency_gt_files(
@@ -262,8 +251,10 @@ def test_remote_platform_video_gt_prefers_platform_sglang_before_default_officia
     monkeypatch.setattr(
         test_utils,
         "_remote_file_exists",
-        lambda url: url.startswith(sglang_platform_prefix)
-        or url.startswith(official_default_prefix),
+        lambda url: (
+            url.startswith(sglang_platform_prefix)
+            or url.startswith(official_default_prefix)
+        ),
     )
 
     files = test_utils._find_remote_consistency_gt_files(

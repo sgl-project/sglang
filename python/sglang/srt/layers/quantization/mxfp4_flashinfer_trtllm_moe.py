@@ -7,22 +7,24 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_platform,
+)
 from sglang.srt.utils import (
     is_flashinfer_available,
     log_info_on_rank0,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
+from sglang.srt.utils.common import next_power_of_2
 
-_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
+_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
 if is_flashinfer_available():
     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
@@ -51,12 +53,19 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        # precision=fp8 is an SM90 knob (Humming W4A8); this SM100 trtllm path
+        # already runs MXFP8 activations, so the flag is inert here rather than
+        # an error -- one config can move across hardware.
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
+        # Applies flashinfer trtllm directly instead of going through a
+        # MoeRunner; FusedMoE still reads `.runner`, and this class is not a
+        # FusedMoEMethodBase subclass so it inherits no default.
+        self.runner = None
 
         swiglu_limit = moe_runner_config.swiglu_limit
         self._gemm1_clamp_limit_tensor = (
@@ -285,8 +294,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
-
         precision = self.flashinfer_mxfp4_moe_precision
         if precision == "bf16":
             assert hidden_states.dtype == torch.bfloat16
@@ -335,7 +342,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             )
 
         output = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_topk,
+            topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
             hidden_states=x_quant,
             hidden_states_scale=x_scale,
@@ -352,7 +359,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
-            top_k=packed_topk.shape[1],
+            top_k=topk_ids.shape[1],
             n_group=1,
             topk_group=1,
             intermediate_size=intermediate_size,
