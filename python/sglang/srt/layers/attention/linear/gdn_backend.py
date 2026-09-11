@@ -22,9 +22,6 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
-from sglang.srt.speculative.ragged_verify import (
-    ragged_verify_dense_scatter_indices,
-)
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
@@ -898,11 +895,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # Conv requires dense rows; compact verify stores packed rows.
                 batch_size = query_start_loc.shape[0] - 1
                 num_dense_tokens = batch_size * draft_token_num
-                dense_token_indices = ragged_verify_dense_scatter_indices(
-                    query_start_loc=query_start_loc,
-                    seq_len=seq_len,
-                    draft_token_num=draft_token_num,
-                )
+                dense_token_indices = forward_metadata.ragged_verify_dense_indices
+                assert dense_token_indices is not None
                 dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
                 dense.index_copy_(0, dense_token_indices, mixed_qkv)
                 mixed_qkv_dense = dense[:num_dense_tokens].view(

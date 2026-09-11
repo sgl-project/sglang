@@ -135,7 +135,6 @@ class DSparkVerifyPlanner:
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
-        self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -428,33 +427,29 @@ class DSparkVerifyPlanner:
                 or self._budget_planner.forced_budget_frac is None
             )
         ):
-            # Verify-all: the uniform layout (or None, past the captured grid)
-            # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips. A profiler
-            # budget pin must still reach the dynamic layout path even when the
-            # bootstrap SPS table is uninitialized.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
-            if key not in self._uniform_layout_cache:
-                self._uniform_layout_cache[key] = uniform_ragged_layout(
-                    bs=key[0],
-                    device=device,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
-                    ragged_verify_mode=self._ragged_verify_mode,
-                    model_runner=self.model_runner,
-                    tier_num_reqs=global_num_reqs,
-                )
-            return self._uniform_layout_cache[key]
+            # No SPS decision exists, so every request verifies the full window.
+            # Use the regular uniform verify path and avoid compact packing.
+            # A profiler budget pin must still reach the scheduler below.
+            return None
+        aligned_budget = self._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=budget,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
+        local_bs = int(req_pool_indices.shape[0])
+        verify_floor = max(self._schedule_cfg.min_verify_len, 1)
+        full_budget = local_bs * (self.verify_num_draft_tokens - verify_floor)
+        if aligned_budget is not None and aligned_budget >= full_budget:
+            # A full compact layout is identical to regular uniform verify, but
+            # pays for ragged scheduling, packing, and linear-attention remapping.
+            return None
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
+            budget=aligned_budget,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (

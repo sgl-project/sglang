@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.ragged_verify import ragged_verify_dense_scatter_indices
 from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
@@ -321,6 +322,22 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        metadata = self.forward_metadata
+        metadata.ragged_verify_dense_indices = None
+        spec_info = forward_batch.spec_info
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.ragged_verify_layout is not None
+        ):
+            metadata.ragged_verify_dense_indices = ragged_verify_dense_scatter_indices(
+                query_start_loc=metadata.query_start_loc,
+                seq_len=forward_batch.input_ids.shape[0],
+                draft_token_num=spec_info.draft_token_num,
+            )
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
