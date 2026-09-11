@@ -88,6 +88,11 @@ jobs:
       # 372 GiB against 196 GiB needed. The margin is deliberate: the fleet eats
       # into anything released while the download runs.
       #
+      # /sgl-data/agentic-traces is 172 MB that nothing in this repo creates or
+      # reads, so something staged it out of band. The GLM-5.2 agentic benchmark
+      # synthesizes its corpus for want of a real one and takes a real one from
+      # SGLANG_AGENTIC_TRACE_PATH, so it is worth knowing what is in there.
+      #
       # Not on the list, though the join reports them unreferenced:
       # amd/Qwen3.5-397B-A17B-MXFP4, because the MI35x Qwen3.5 nightly does load
       # that checkpoint and only reads as unreferenced because it names a local
@@ -100,6 +105,7 @@ jobs:
             -e RECLAIM_DIRS="models--amd--Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 models--deepseek-ai--DeepSeek-V4-Flash-0731" \
             -e SEED_MODEL="amd/GLM-5.2-MXFP4" \
             -e SEED_MIN_GIB="408" \
+            -e AUDIT_DIRS="/sgl-data/agentic-traces" \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             bash scripts/ci/amd/reclaim_and_seed_hf_cache.sh || EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true

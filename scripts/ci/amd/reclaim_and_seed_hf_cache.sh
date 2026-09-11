@@ -17,6 +17,8 @@
 #   SETTLE_SECONDS  How long to wait for a reclaim to show up in df, default
 #                 1200. Zero makes the wait a single check, which is what the
 #                 tests want.
+#   AUDIT_DIRS    Extra directories to list during the audit, for the ones whose
+#                 contents matter rather than their size.
 #   HF_HOME       Cache root, default /sgl-data/hf-cache.
 #
 # Why the two halves are one job: freeing space and then queueing the job that
@@ -121,6 +123,17 @@ ls -1 "$HUB" > hf-cache-listing.txt 2>/dev/null
 echo
 echo "$(wc -l < hf-cache-listing.txt) entries in ${HUB}"
 echo
+
+# shellcheck disable=SC2086  # AUDIT_DIRS is a whitespace-separated list.
+for extra in ${AUDIT_DIRS:-}; do
+    echo "=== ${extra} ==="
+    if [[ -d "$extra" ]]; then
+        timeout 300 du -sh "$extra"/* 2>/dev/null | sort -rh | head -40 || true
+    else
+        echo "absent"
+    fi
+    echo
+done
 
 {
     echo "### AMD HF cache reclaim and seed"
