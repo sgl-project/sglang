@@ -486,6 +486,12 @@ sparse KV blocks needed by the next attention layer. Enable it with
 `--enable-sparda` and provide a Forecast/indexer checkpoint with
 `--sparda-indexer-path`:
 
+The example assumes a Linux host with NVIDIA CUDA, a locally accessible
+MiniCPM4.1 model and Forecast indexer, and tensor parallelism of one. Set
+`--tp` to the tensor-parallel size used by the model when using another
+supported layout. If either artifact comes from a gated model repository,
+authenticate with your normal Hugging Face setup before starting the server.
+
 ```bash Command
 python3 -m sglang.launch_server \
   --model-path openbmb/MiniCPM4.1-8B \

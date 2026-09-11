@@ -672,6 +672,61 @@ class TestSparDAPrefetcher(CustomTestCase):
         self.assertEqual(page_table.tolist(), [[10, 11, 12, 13]])
         self.assertEqual(cache.token_to_kv_pool_allocator.freed, [])
 
+    def test_lmcache_sparse_prefetch_requires_cleanup_hooks(self):
+        try:
+            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+                LMCacheMode,
+                LMCRadixCache,
+            )
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        cache = LMCRadixCache.__new__(LMCRadixCache)
+        cache._mode = LMCacheMode.MP
+        cache.page_size = 1
+        cache.lmcache_connector = SimpleNamespace(
+            sparse_prefetch=lambda: None,
+            sparse_retrieve=lambda: None,
+            create_sparse_object_keys=lambda: None,
+        )
+
+        self.assertFalse(cache.sparda_prefetch_available())
+
+    def test_lmcache_host_resident_admission_requires_resolver(self):
+        try:
+            from sglang.srt.mem_cache.radix_cache import RadixKey
+            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+                LMCacheMode,
+                LMCRadixCache,
+                _LMCacheLoadBackMarker,
+            )
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        request = SimpleNamespace(
+            full_untruncated_fill_ids=list(range(8)),
+        )
+        marker = _LMCacheLoadBackMarker(
+            key=RadixKey(list(range(8)), None, cache_salt=None),
+            value_numel=0,
+        )
+        cache = LMCRadixCache.__new__(LMCRadixCache)
+        cache._mode = LMCacheMode.MP
+        cache.page_size = 1
+        cache._sparda_host_resident_enabled = True
+        cache.sparda_prefetcher = None
+        cache._sparda_index_available = Mock(return_value=True)
+        cache.lmcache_connector = SimpleNamespace(
+            sparse_prefetch=lambda: None,
+            sparse_retrieve=lambda: None,
+            create_sparse_object_keys=lambda: None,
+            sparse_cancel_prefetch=lambda: None,
+            sparse_release_prefetch=lambda: None,
+        )
+
+        self.assertFalse(cache._sparda_can_admit_host_resident(marker, request))
+        cache._sparda_index_available.assert_not_called()
+
     def test_lmcache_host_resident_admission_skips_full_retrieve(self):
         try:
             from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -704,9 +759,11 @@ class TestSparDAPrefetcher(CustomTestCase):
         )
         cache = LMCRadixCache.__new__(LMCRadixCache)
         cache._mode = LMCacheMode.MP
+        cache.page_size = 1
         cache.device = torch.device("cpu")
         cache._mp_load_back_markers = {request.rid: marker}
         cache._sparda_host_resident_enabled = True
+        cache.sparda_prefetcher = object()
         cache._sparda_index_available = Mock(return_value=True)
         cache._load_back = Mock(
             side_effect=AssertionError("host-resident admission did a full load")
@@ -714,6 +771,11 @@ class TestSparDAPrefetcher(CustomTestCase):
         cache.token_to_kv_pool_allocator = _Allocator()
         cache.lmcache_connector = SimpleNamespace(
             chunk_size=lambda: 4,
+            sparse_prefetch=lambda: None,
+            sparse_retrieve=lambda: None,
+            create_sparse_object_keys=lambda: None,
+            sparse_cancel_prefetch=lambda: None,
+            sparse_release_prefetch=lambda: None,
             retrieve_kv=Mock(
                 side_effect=AssertionError("host-resident admission retrieved KV")
             ),

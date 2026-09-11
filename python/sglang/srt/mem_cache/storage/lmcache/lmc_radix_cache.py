@@ -232,14 +232,16 @@ class LMCRadixCache(RadixCache):
 
     def sparda_prefetch_available(self) -> bool:
         """Return whether the LMCache connector can stage one sparse layer."""
+        connector = getattr(self, "lmcache_connector", None)
         return (
-            self._mode is LMCacheMode.MP
-            and self.page_size == 1
-            and callable(getattr(self.lmcache_connector, "sparse_prefetch", None))
-            and callable(getattr(self.lmcache_connector, "sparse_retrieve", None))
-            and callable(
-                getattr(self.lmcache_connector, "create_sparse_object_keys", None)
-            )
+            getattr(self, "_mode", None) is LMCacheMode.MP
+            and getattr(self, "page_size", None) == 1
+            and connector is not None
+            and callable(getattr(connector, "sparse_prefetch", None))
+            and callable(getattr(connector, "sparse_retrieve", None))
+            and callable(getattr(connector, "create_sparse_object_keys", None))
+            and callable(getattr(connector, "sparse_cancel_prefetch", None))
+            and callable(getattr(connector, "sparse_release_prefetch", None))
         )
 
     def _sparda_index_available(
@@ -358,6 +360,11 @@ class LMCRadixCache(RadixCache):
             # The radix key normally excludes the current token.  A larger
             # gap is a genuine partial host hit and still needs boundary
             # compression from dense K values.
+            return False
+        if (
+            getattr(self, "sparda_prefetcher", None) is None
+            or not self.sparda_prefetch_available()
+        ):
             return False
         available = bool(self._sparda_index_available(marker, request))
         metrics = getattr(self, "_sparda_metrics", None)
