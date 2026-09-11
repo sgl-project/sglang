@@ -12,6 +12,8 @@ the Triton reference, so a ~1e-6 fraction of elements can land one e4m3 ulp
 apart; the assertions allow exactly that and nothing more.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -142,3 +144,7 @@ def test_uniform_fp8_store_prefill_plan_with_invalid_rows(num_rows):
     written = torch.zeros(rows.shape[0], dtype=torch.bool, device="cuda")
     written[out_loc[ragged[valid].long()]] = True
     assert (rows[~written] == 0).all(), "invalid prefill rows must be skipped"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
