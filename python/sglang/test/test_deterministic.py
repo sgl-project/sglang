@@ -624,6 +624,16 @@ def test_deterministic(args):
         cached_logprob = cached_token_data[0]
         cached_token_id = cached_token_data[1]
 
+        # Without a hit here, both sides of the comparison take the same path.
+        cached_prefix_len = cached_response["meta_info"]["cached_tokens"]
+        if cached_prefix_len == 0:
+            print(
+                "✗✗✗ TEST INCONCLUSIVE - request 2 did not hit the radix cache "
+                "(cached_tokens=0) ✗✗✗"
+            )
+            return [0]
+        print(f"  Cache hit: {cached_prefix_len}/{len(prefix_token_ids)} tokens reused")
+
         print(f"✓ Generated with cache:")
         print(f"  Token ID: {cached_token_id}")
         print(f"  Logprob:  {cached_logprob:.10f}")
@@ -647,6 +657,15 @@ def test_deterministic(args):
         uncached_token_data = uncached_logprobs[0]
         uncached_logprob = uncached_token_data[0]
         uncached_token_id = uncached_token_data[1]
+
+        # If the flush did not take, this reuses the same KV as request 2.
+        uncached_prefix_len = uncached_response["meta_info"]["cached_tokens"]
+        if uncached_prefix_len != 0:
+            print(
+                f"✗✗✗ TEST INCONCLUSIVE - request 3 reused {uncached_prefix_len} "
+                "tokens, the flush did not take ✗✗✗"
+            )
+            return [0]
 
         print(f"✓ Generated without cache:")
         print(f"  Token ID: {uncached_token_id}")
