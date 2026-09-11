@@ -2289,6 +2289,7 @@ def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
     assert manager._ensure_mapped_courier().direct_read
 
     # the host can cache it: keep the page cache path
+    (tmp_path / "cached").mkdir()
     cached = _mapped_manager(tmp_path / "cached", monkeypatch, available_gib=0.001)
     monkeypatch.setattr(
         layerwise_offload_mod, "host_copies_would_not_fit", lambda _b: False
