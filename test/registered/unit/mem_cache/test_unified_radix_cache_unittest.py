@@ -6281,7 +6281,8 @@ class UnifiedRadixCacheSuite:
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
                 req=req,
-                mem_quota=-1_000_000,
+                # Pinning the resident ancestors leaves too little for the tail.
+                mem_quota=len(tokens) - 1,
             )
         )
 
