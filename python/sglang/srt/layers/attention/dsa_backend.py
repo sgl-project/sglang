@@ -312,7 +312,6 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
-    _dcp_sharded_kv: bool = False
 
     def __init__(
         self,
@@ -3119,8 +3118,8 @@ class DeepseekSparseAttnBackend(
             causal=causal,
         )
 
-    def _dcp_localize_page_table(self, page_table: torch.Tensor) -> torch.Tensor:
-        """Partition sparse selections by owner and address each rank's KV rows."""
+    @staticmethod
+    def _dcp_localize_page_table(page_table: torch.Tensor) -> torch.Tensor:
         parallel = get_parallel()
         owned = (page_table >= 0) & (
             page_table % parallel.attn_dcp_size == parallel.attn_dcp_rank
@@ -3148,8 +3147,7 @@ class DeepseekSparseAttnBackend(
             kv_a,
             k_pe,
         )
-        # Fused RAGGED top-k uses cu_seqlens_k offsets into precisely this
-        # per-request [prefix; extend] layout. Extend has no LSE reduction.
+        # RAGGED top-k indexes this per-request [prefix; extend] layout.
         return kv_full.view(kv_full.shape[0], 1, -1)
 
     def _forward_tilelang(

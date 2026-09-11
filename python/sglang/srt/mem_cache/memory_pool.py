@@ -3941,8 +3941,9 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "index_head_dim", None)
 
     @property
-    def index_buf_size(self) -> Optional[int]:
-        return getattr(self.full_kv_pool, "index_buf_size", None)
+    def index_buf_size(self) -> int:
+        assert isinstance(self.full_kv_pool, DSATokenToKVPool)
+        return self.full_kv_pool.index_buf_size
 
     @property
     def quant_block_size(self) -> Optional[int]:

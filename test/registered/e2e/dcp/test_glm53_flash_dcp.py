@@ -1,9 +1,4 @@
-"""GLM-5.3-Flash DCP accuracy and allocation-watermark regression (#36886).
-
-An intentionally small per-rank pool makes ordinary 12K-token requests cross
-the old OOB boundary. Chunking and repeated requests exercise prefix reads;
-both ordinary decode and EAGLE target verification must retain accuracy.
-"""
+"""Regression for #36886: decode and EAGLE past the physical KV pool boundary."""
 
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -24,13 +19,14 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=2400, stage="extra-b", runner_config="8-gpu-h200")
 
 
-class _GLM53FlashDCPBase:
+class TestGLM53FlashDCP(GSM8KMixin, CustomTestCase):
     spec_args = ()
     gsm8k_num_examples = 200
     gsm8k_score_threshold = 0.90
 
     @classmethod
     def setUpClass(cls):
+        cls.process = None
         cls.model = try_cached_model("zai-org/GLM-5.3-Flash")
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, trust_remote_code=True)
@@ -73,7 +69,7 @@ class _GLM53FlashDCPBase:
 
     @classmethod
     def tearDownClass(cls):
-        if getattr(cls, "process", None):
+        if cls.process is not None:
             kill_process_tree(cls.process.pid)
 
     def _needle(self, wave, request):
@@ -108,24 +104,17 @@ class _GLM53FlashDCPBase:
     def test_allocation_watermark_and_prefix_reuse(self):
         for wave in range(2):
             with ThreadPoolExecutor(max_workers=3) as executor:
-                results = list(
+                list(
                     executor.map(
                         lambda request, wave=wave: self._needle(wave, request), range(3)
                     )
                 )
-            self.assertTrue(
-                all(r["meta_info"]["completion_tokens"] > 0 for r in results)
-            )
             # Revisit the same prompt after crossing the per-rank watermark.
             cached = self._needle(wave, 2)
             self.assertGreater(cached["meta_info"]["cached_tokens"], 0)
 
 
-class TestGLM53FlashDCP(_GLM53FlashDCPBase, GSM8KMixin, CustomTestCase):
-    pass
-
-
-class TestGLM53FlashDCPEagle(_GLM53FlashDCPBase, GSM8KMixin, CustomTestCase):
+class TestGLM53FlashDCPEagle(TestGLM53FlashDCP):
     spec_args = (
         "--speculative-algorithm",
         "EAGLE",

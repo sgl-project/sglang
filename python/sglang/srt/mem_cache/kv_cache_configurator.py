@@ -386,9 +386,7 @@ class KVCacheConfigurator:
         return pool_size, physical_page_size
 
     def _dsa_index_buf_size(self, size: int) -> int:
-        # Index-K is replicated: top-k scores cover the full sequence on each
-        # rank. Include the widened allocator's reserved page as well as its
-        # usable tokens. Draft sizes already span the virtual address space.
+        # Replicate index-K including the reserved page; draft sizes are already global.
         scale = get_parallel().attn_dcp_size // self.loc_space_scale
         return (size + self.pool_page_size) * scale - get_schedule().page_size
 
