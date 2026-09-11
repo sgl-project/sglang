@@ -170,12 +170,14 @@ def _create_unified_radix_cache(
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
             C128SidecarComponent,
+            DSV4SWAComponent,
         )
 
         tree_components.append(ComponentType.C128)
         params.component_registry_override = {
             **(params.component_registry_override or {}),
             ComponentType.C128: C128SidecarComponent,
+            ComponentType.SWA: DSV4SWAComponent,
         }
 
     params.tree_components = tuple(tree_components)
