@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -198,9 +199,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (cfg.device.startswith("cuda") or cfg.device == "npu"):
+    algorithm = "DFLASH"
+    if current_platform.is_out_of_tree():
+        is_supported = current_platform.supports_speculative_algorithm(algorithm)
+    else:
+        is_supported = cfg.device.startswith("cuda") or cfg.device == "npu"
+    if not is_supported:
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA and NPU devices."
+            f"{algorithm} speculative decoding is not supported by "
+            f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
     if resolved_view(server_args).enable_dp_attention:
@@ -730,14 +737,29 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         "trtllm_mha",
         "ascend",
     )
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
+
+    def get_fallback_backend() -> str:
+        if current_platform.is_out_of_tree():
+            try:
+                return current_platform.get_default_attention_backend()
+            except NotImplementedError as error:
+                raise ValueError(
+                    f"{type(current_platform).__name__} must implement "
+                    "get_default_attention_backend() to use DFLASH."
+                ) from error
+        return "triton" if get_platform().is_hip else "flashinfer"
+
+    def is_supported_backend(backend: str) -> bool:
+        return backend in supported_draft_backends or (
+            current_platform.is_out_of_tree()
+            and current_platform.supports_speculative_draft_attention_backend(backend)
+        )
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend is None:
-        draft_backend = fallback_backend
+        draft_backend = get_fallback_backend()
     elif draft_backend == "trtllm_mha":
         from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
         from sglang.srt.utils.hf_transformers_utils import get_config
@@ -760,6 +782,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
         if not (all_sliding or all_causal):
+            fallback_backend = get_fallback_backend()
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when all layers use sliding "
                 "attention or the draft is explicitly causal; got "
@@ -770,12 +793,13 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
-    elif draft_backend not in supported_draft_backends:
+    elif not is_supported_backend(draft_backend):
+        fallback_backend = get_fallback_backend()
         logger.warning(
-            "DFLASH draft worker only supports attention_backend in %s for now, "
-            "but got %r. Falling back to '%s'.",
-            supported_draft_backends,
+            "DFLASH draft worker does not support attention_backend %r on %s. "
+            "Falling back to '%s'.",
             draft_backend,
+            type(current_platform).__name__,
             fallback_backend,
         )
         draft_backend = fallback_backend

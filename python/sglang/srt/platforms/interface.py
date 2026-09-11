@@ -12,11 +12,13 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Callable, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
@@ -87,6 +89,12 @@ class SRTPlatform(DeviceMixin):
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
 
+    def get_speculative_cache_locs_fn(
+        self,
+    ) -> Optional[Callable[..., torch.Tensor]]:
+        """Return a platform implementation for speculative KV-cache locations."""
+        return None
+
     def get_quantization_config(
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
@@ -101,6 +109,14 @@ class SRTPlatform(DeviceMixin):
 
     def supports_fp8(self) -> bool:
         """Whether this platform supports FP8 quantization."""
+        return False
+
+    def supports_speculative_algorithm(self, algorithm: str) -> bool:
+        """Whether this platform supports the named speculative algorithm."""
+        return False
+
+    def supports_speculative_draft_attention_backend(self, backend: str) -> bool:
+        """Whether this platform supports a custom speculative draft backend."""
         return False
 
     def support_cuda_graph(self) -> bool:
