@@ -14,6 +14,10 @@ spec:
         app: sgl-router
     spec:
       serviceAccountName: sgl-router
+      # Must exceed --shutdown-drain-secs plus the time in-flight requests
+      # need after the pause, or the pod is SIGKILLed mid-drain and the drain
+      # has bought nothing.
+      terminationGracePeriodSeconds: 40
       containers:
         - name: router
           image: sgl-router:e2e
@@ -44,6 +48,18 @@ spec:
             - "sgl-router-test"
             - "--selector"
             - "app=sglang"
+            # On SIGTERM, keep serving with /readyz at 503 so the endpoint
+            # removal reaches kube-proxy before the listener closes. Sized for
+            # the deletionTimestamp path, which does not wait on a probe.
+            # Probe-driven deregistration would instead need this above the
+            # readinessProbe's failureThreshold * periodSeconds below.
+            # test_shutdown_drain.py reads this value; do not restate it there.
+            - "--shutdown-drain-secs"
+            - "8"
+            # Declared so the startup advisory compares the drain against this
+            # pod's real grace period instead of assuming the k8s default.
+            - "--termination-grace-secs"
+            - "40"
           ports:
             - containerPort: 8090
               name: http
