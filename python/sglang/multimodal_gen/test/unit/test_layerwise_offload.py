@@ -2280,14 +2280,17 @@ def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
         layerwise_offload_mod, "host_copies_are_redundant", lambda: False
     )
 
-    # copies do not fit: the mapping is re-read from the drive every pass
+    # the page cache cannot hold the mapping: it is re-read from the drive every pass
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
     manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
     assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
     assert manager._ensure_mapped_courier().direct_read
 
     # the same mapping on a host that can cache it keeps the page-cache path
     monkeypatch.setattr(
-        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: False
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: False
     )
     manager._mapped_courier = None
     assert not manager._ensure_mapped_courier().direct_read
@@ -2316,6 +2319,9 @@ def test_cached_mapped_layers_are_copied_rather_than_re_read(tmp_path, monkeypat
     monkeypatch.setattr(
         layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
     )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
     # the page cache holds the layer: shipping it is a memcpy, not a drive read
     monkeypatch.setattr(
         layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 1.0
@@ -2343,6 +2349,9 @@ def test_blocking_loads_of_cold_mapped_layers_go_through_the_courier(
         layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
     )
     monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    monkeypatch.setattr(
         layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 0.0
     )
     manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
@@ -2366,6 +2375,9 @@ def test_a_fully_resident_small_component_may_still_read_directly(
     )
     monkeypatch.setattr(
         layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
     )
     # far below the size floor, but every layer is resident: it is armed once
     # per request, so there is no re-streamed pass for the floor to protect

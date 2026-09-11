@@ -154,14 +154,16 @@ def cgroup_memory_limit_bytes(
     return None
 
 
-def host_memory_available_bytes() -> int:
+def host_memory_available_bytes(*, physical: bool = False) -> int:
     """Bytes this process can still commit without hitting a wall.
 
     The smaller of what the kernel reports free and what the cgroup still
     allows, so a container does not plan against the whole machine.
+    `physical` ignores the test-only forced host view: it sizes what the
+    kernel's page cache can hold, which the pretend host does not change.
     """
     forced_gib = envs.SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB
-    if forced_gib is not None:
+    if forced_gib is not None and not physical:
         # Behave like a machine of that size: what such a host would still
         # have free is the pretend total minus what this process has already
         # taken in anonymous memory.
@@ -209,6 +211,20 @@ def host_copies_are_redundant() -> bool:
     that has one, whatever the free-memory reading says.
     """
     return current_platform.device_shares_host_memory()
+
+
+def page_cache_cannot_hold(mapped_bytes: int) -> bool:
+    """Whether the kernel's page cache cannot keep a mapping of this size.
+
+    Read against the machine, not the test-only forced view: a mapping the
+    cache holds is re-read from memory however small the pretend host is.
+    """
+    if mapped_bytes <= 0:
+        return False
+    return (
+        mapped_bytes
+        >= host_memory_available_bytes(physical=True) - HOST_COPY_RESERVE_BYTES
+    )
 
 
 def host_copies_would_not_fit(weight_bytes: int) -> bool:
