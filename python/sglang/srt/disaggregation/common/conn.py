@@ -392,6 +392,8 @@ class CommonKVManager(BaseKVManager):
             self.failure_records[bootstrap_room] = failure_reason
             if status_code is not None:
                 self.failure_status_codes[bootstrap_room] = int(status_code)
+            else:
+                self.failure_status_codes.pop(bootstrap_room, None)
 
     def register_deferred_abort_room(self, bootstrap_room: int) -> None:
         """Arm drain-ack accounting for a held room; a fresh set wipes stale acks

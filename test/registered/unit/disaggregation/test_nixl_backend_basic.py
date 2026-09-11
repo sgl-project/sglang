@@ -347,6 +347,7 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr._connect = MagicMock()
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
+        mgr.failure_status_codes = {}
         # These cases cover the legacy no-ack behavior; the deferred-release ack
         # path is exercised in test_nixl_deferred_kv_release.py.
         mgr.enable_deferred_decode_kv_release = False
@@ -792,6 +793,7 @@ class TestNixlNodeFailure(CustomTestCase):
             5: KVPoll.Success,
         }
         mgr.failure_records = {}
+        mgr.failure_status_codes = {}
         mgr.failure_lock = threading.Lock()
         mgr.update_status = CommonKVManager.update_status.__get__(mgr, CommonKVManager)
         mgr.check_status = CommonKVManager.check_status.__get__(mgr, CommonKVManager)

@@ -258,6 +258,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = get_observability().enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Serialize bootstrap metadata registration with scheduler-side
+            # failure notification and cleanup. Nested lifecycle helpers share
+            # this lock; always acquire it before failure_lock.
+            self._room_state_lock = threading.RLock()
             self.required_dst_info_num_table: dict[int, int] = {}
             self.failure_timestamps: dict[int, float] = {}
             self.orphan_failed_room_ttl = (
@@ -1703,11 +1707,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         failure_reason: str,
         status_code: Optional[int] = None,
     ):
-        super().record_failure(bootstrap_room, failure_reason, status_code)
         if hasattr(self, "failure_timestamps"):
-            with self.failure_lock:
-                self.failure_timestamps.setdefault(bootstrap_room, time.monotonic())
-            self.maybe_cleanup_orphan_failed_rooms()
+            with self._room_state_lock:
+                super().record_failure(bootstrap_room, failure_reason, status_code)
+                with self.failure_lock:
+                    self.failure_timestamps.setdefault(bootstrap_room, time.monotonic())
+                self.maybe_cleanup_orphan_failed_rooms()
+        else:
+            super().record_failure(bootstrap_room, failure_reason, status_code)
 
     def _is_decode_metadata_ready(self, room: int) -> bool:
         required = self.required_dst_info_num_table.get(room)
@@ -1741,54 +1748,57 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return True
 
     def clear_room(self, room: int) -> None:
-        self.request_status.pop(room, None)
-        with self.failure_lock:
-            self.failure_records.pop(room, None)
-            self.failure_status_codes.pop(room, None)
-            self.failure_timestamps.pop(room, None)
-        self.transfer_infos.pop(room, None)
-        self.req_to_decode_prefix_len.pop(room, None)
-        self.required_dst_info_num_table.pop(room, None)
+        with self._room_state_lock:
+            self.request_status.pop(room, None)
+            with self.failure_lock:
+                self.failure_records.pop(room, None)
+                self.failure_status_codes.pop(room, None)
+                self.failure_timestamps.pop(room, None)
+            self.transfer_infos.pop(room, None)
+            self.req_to_decode_prefix_len.pop(room, None)
+            self.required_dst_info_num_table.pop(room, None)
 
     def try_notify_decode_failure_and_clear(self, room: int) -> bool:
-        if self.request_status.get(room) != KVPoll.Failed:
-            return False
-        if not self._is_decode_metadata_ready(room):
-            return False
-        with self.failure_lock:
-            failure_reason = self.failure_records.get(room)
-            status_code = self.failure_status_codes.get(room)
-        if not self.notify_decode_status_for_room(
-            room,
-            KVPoll.Failed,
-            failure_reason,
-            status_code,
-        ):
-            return False
-        self.clear_room(room)
-        return True
+        with self._room_state_lock:
+            if self.request_status.get(room) != KVPoll.Failed:
+                return False
+            if not self._is_decode_metadata_ready(room):
+                return False
+            with self.failure_lock:
+                failure_reason = self.failure_records.get(room)
+                status_code = self.failure_status_codes.get(room)
+            if not self.notify_decode_status_for_room(
+                room,
+                KVPoll.Failed,
+                failure_reason,
+                status_code,
+            ):
+                return False
+            self.clear_room(room)
+            return True
 
     def maybe_cleanup_orphan_failed_rooms(self) -> None:
-        now = time.monotonic()
-        if now < self._next_orphan_failed_room_cleanup_time:
-            return
-        self._next_orphan_failed_room_cleanup_time = (
-            now + self._orphan_failed_room_cleanup_interval
-        )
-        with self.failure_lock:
-            failure_timestamps = list(self.failure_timestamps.items())
-        for room, failed_at in failure_timestamps:
-            if now - failed_at < self.orphan_failed_room_ttl:
-                continue
-            if self._is_decode_metadata_ready(room):
-                self.try_notify_decode_failure_and_clear(room)
-            else:
-                logger.warning(
-                    "Cleaning up orphan failed Mooncake room %s after %.1fs",
-                    room,
-                    now - failed_at,
-                )
-                self.clear_room(room)
+        with self._room_state_lock:
+            now = time.monotonic()
+            if now < self._next_orphan_failed_room_cleanup_time:
+                return
+            self._next_orphan_failed_room_cleanup_time = (
+                now + self._orphan_failed_room_cleanup_interval
+            )
+            with self.failure_lock:
+                failure_timestamps = list(self.failure_timestamps.items())
+            for room, failed_at in failure_timestamps:
+                if now - failed_at < self.orphan_failed_room_ttl:
+                    continue
+                if self._is_decode_metadata_ready(room):
+                    self.try_notify_decode_failure_and_clear(room)
+                else:
+                    logger.warning(
+                        "Cleaning up orphan failed Mooncake room %s after %.1fs",
+                        room,
+                        now - failed_at,
+                    )
+                    self.clear_room(room)
 
     def transfer_worker(
         self,
@@ -2156,8 +2166,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
                 self.maybe_cleanup_orphan_failed_rooms()
+                # Wake even without traffic so orphan failures can expire.
+                if not self.server_socket.poll(timeout=1000):
+                    continue
+                waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2264,28 +2277,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
-                    self.required_dst_info_num_table[room] = required_dst_info_num
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
+                    with self._room_state_lock:
+                        self.required_dst_info_num_table[room] = required_dst_info_num
+                        if room not in self.transfer_infos:
+                            self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
+                        self.transfer_infos[room][mooncake_session_id] = (
+                            TransferInfo.from_zmq(waiting_req_bytes)
                         )
-                        if self.request_status.get(room) == KVPoll.Failed:
-                            self.try_notify_decode_failure_and_clear(room)
-                            continue
-                        self.update_status(room, KVPoll.WaitingForInput)
+                        # NOTE: after bootstrapping we can mark the req as waiting for input
+                        if len(self.transfer_infos[room]) == required_dst_info_num:
+                            self.resolve_kv_replica_factor(self.transfer_infos[room])
+                            self.req_to_decode_prefix_len[room] = next(
+                                (
+                                    info.decode_prefix_len
+                                    for info in self.transfer_infos[room].values()
+                                    if info.decode_prefix_len is not None
+                                ),
+                                0,
+                            )
+                            if self.request_status.get(room) == KVPoll.Failed:
+                                self.try_notify_decode_failure_and_clear(room)
+                                continue
+                            self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2596,9 +2610,14 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.trace_ctx.trace_req_start()
 
     def abort(self):
-        super().abort()
+        with self.kv_mgr._room_state_lock:
+            super().abort()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
+
+    def clear(self) -> None:
+        with self.kv_mgr._room_state_lock:
+            super().clear()
 
 
 class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):

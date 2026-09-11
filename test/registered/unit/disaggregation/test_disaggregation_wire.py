@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
     MooncakeKVReceiver,
+    MooncakeKVSender,
 )
 from sglang.srt.disaggregation.utils import (
     KVPoll,
@@ -220,6 +221,7 @@ class TestMooncakeAbortedRoomLifecycle(unittest.TestCase):
         manager.failure_status_codes = {17: 400}
         manager.failure_timestamps = {17: 100.0}
         manager.failure_lock = threading.Lock()
+        manager._room_state_lock = threading.RLock()
         manager.transfer_infos = {}
         manager.req_to_decode_prefix_len = {}
         manager.required_dst_info_num_table = {17: 1}
@@ -299,6 +301,147 @@ class TestMooncakeAbortedRoomLifecycle(unittest.TestCase):
 
         self.assertEqual(raised.exception.failure_reason, "Input is too long")
         self.assertEqual(raised.exception.status_code, 400)
+
+    def test_untyped_failure_replaces_previous_http_status(self):
+        """A later transport failure must not inherit an earlier validation code."""
+        manager = self._new_manager()
+        CommonKVManager.record_failure(manager, 17, "Transport failed")
+        manager.required_prefill_response_num_table = {}
+        manager.prefill_response_tracker = {}
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.bootstrap_room = 17
+        receiver.kv_mgr = manager
+        receiver.conclude_state = KVPoll.Failed
+
+        with self.assertRaises(KVTransferError) as raised:
+            receiver.failure_exception()
+
+        self.assertEqual(raised.exception.failure_reason, "Transport failed")
+        self.assertIsNone(raised.exception.status_code)
+
+    def test_idle_bootstrap_loop_cleans_orphan_failure(self):
+        """Failed rooms expire even when no more bootstrap messages arrive."""
+        manager = self._new_manager()
+        manager._orphan_failed_room_cleanup_interval = 1.0
+        manager.server_socket = Mock()
+        manager.server_socket.poll.side_effect = [0, 0, EOFError]
+        manager.server_socket.recv_multipart.side_effect = EOFError
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.threading.Thread"
+        ) as thread:
+            manager.start_prefill_thread()
+        bootstrap = thread.call_args.kwargs["target"]
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.time.monotonic",
+            side_effect=[100.0, 111.0, 112.0],
+        ):
+            with self.assertRaises(EOFError):
+                bootstrap()
+
+        self.assertNotIn(17, manager.request_status)
+        self.assertNotIn(17, manager.failure_timestamps)
+        manager.server_socket.recv_multipart.assert_not_called()
+
+    def test_metadata_registration_races_with_failure_notification(self):
+        """Concurrent notification cannot clear partially registered metadata."""
+        self._race_metadata_registration("notify")
+
+    def test_metadata_registration_races_with_sender_abort(self):
+        """An abort during readiness checking must not be overwritten as ready."""
+        self._race_metadata_registration("abort")
+
+    def test_metadata_registration_races_with_sender_clear(self):
+        """Sender cleanup cannot remove metadata while bootstrap still uses it."""
+        self._race_metadata_registration("clear")
+
+    def _race_metadata_registration(self, action):
+        manager = self._new_manager()
+        sender = object.__new__(MooncakeKVSender)
+        sender.kv_mgr = manager
+        sender.bootstrap_room = 17
+        sender.trace_ctx = Mock()
+        if action == "clear":
+            manager.request_status[17] = KVPoll.Bootstrapping
+        manager.maybe_cleanup_orphan_failed_rooms = Mock()
+        manager.resolve_kv_replica_factor = Mock()
+        manager.server_socket = Mock()
+        manager.server_socket.poll.side_effect = [1, EOFError]
+        manager.server_socket.recv_multipart.side_effect = [
+            [b"17", b"127.0.0.1", b"8999", b"session", b"", b"0", b"", b"1"],
+            EOFError,
+        ]
+        attempted = threading.Event()
+        errors = []
+        lock = threading.RLock()
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread() is notifier:
+                    attempted.set()
+                return lock.__enter__()
+
+            def __exit__(self, *args):
+                return lock.__exit__(*args)
+
+        manager._room_state_lock = ObservedLock()
+
+        def notify():
+            try:
+                if action == "clear":
+                    sender.clear()
+                else:
+                    if action == "abort":
+                        sender.abort()
+                    manager.try_notify_decode_failure_and_clear(17)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                # On the buggy code there is no lock acquisition to observe.
+                attempted.set()
+
+        notifier = threading.Thread(target=notify, daemon=True)
+
+        def start_notifier():
+            notifier.start()
+            self.assertTrue(attempted.wait(timeout=5))
+
+        class PublishedMetadata(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                start_notifier()
+
+        class CheckedStatus(dict):
+            def get(self, key, default=None):
+                status = super().get(key, default)
+                if threading.current_thread() is not notifier:
+                    start_notifier()
+                return status
+
+        if action == "abort":
+            manager.request_status = CheckedStatus({17: KVPoll.Bootstrapping})
+        else:
+            manager.transfer_infos[17] = PublishedMetadata()
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.threading.Thread"
+        ) as thread:
+            manager.start_prefill_thread()
+        bootstrap = thread.call_args.kwargs["target"]
+        try:
+            with self.assertRaises(EOFError):
+                bootstrap()
+        finally:
+            notifier.join(timeout=5)
+
+        self.assertFalse(notifier.is_alive())
+        self.assertEqual(errors, [])
+        if action == "clear":
+            manager.sync_status_to_decode_endpoint.assert_not_called()
+        else:
+            manager.sync_status_to_decode_endpoint.assert_called_once()
+        self.assertNotIn(17, manager.request_status)
+        self.assertNotIn(17, manager.transfer_infos)
+        self.assertNotIn(17, manager.req_to_decode_prefix_len)
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
