@@ -4115,7 +4115,11 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+        from sglang.srt.utils.runai_utils import (
+            ObjectStorageModel,
+            is_runai_obj_uri,
+            list_safetensors,
+        )
 
         is_object_storage_path = is_runai_obj_uri(model_name_or_path)
         if self._is_distributed is None:
@@ -4156,6 +4160,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 index_file,
                 self.load_config.download_dir,
                 revision,
+            )
+        if is_object_storage_path:
+            index_file = os.path.abspath(
+                os.path.join(ObjectStorageModel.get_path(hf_folder), index_file)
             )
         hf_weights_files = filter_duplicate_safetensors_files(
             hf_weights_files, hf_folder, index_file

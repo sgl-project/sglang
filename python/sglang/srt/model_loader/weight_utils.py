@@ -830,7 +830,10 @@ def filter_duplicate_safetensors_files(
             if any(fnmatch.fnmatch(rel_path, pattern) for pattern in allow_patterns):
                 files_to_validate.add(f)
 
-    missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
+    if "://" in hf_folder:
+        missing_files = sorted(files_to_validate.difference(hf_weights_files))
+    else:
+        missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
     if missing_files:
         raise RuntimeError(
             f"{index_file} references {len(missing_files)} shard file(s) missing "
