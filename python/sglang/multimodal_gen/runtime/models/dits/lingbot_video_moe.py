@@ -23,7 +23,20 @@ from sglang.kernels.ops.diffusion import (
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
-from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_sp_world_size,
+    get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ulysses_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    gather_seq,
+    shard_like,
+    tail_attn_meta,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
     build_varlen_mask_meta,
@@ -43,6 +56,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -81,6 +95,11 @@ def should_keep_in_fp32(name: str) -> bool:
     return any(
         module_name in name.split(".") for module_name in LINGBOT_VIDEO_FP32_MODULES
     )
+
+
+def is_compute_dtype(dtype: torch.dtype) -> bool:
+    # Quantized weights (fp8) are storage, not a dtype activations can carry.
+    return dtype.is_floating_point and dtype.itemsize >= 2
 
 
 class LingBotVideoRMSNorm(nn.Module):
@@ -171,7 +190,7 @@ def _joint_position_ids(
     text_len_padded: int,
     device: torch.device,
 ) -> torch.Tensor:
-    # Joint video;text positions for rotary_emb; on-device, padding masked in attention.
+    # Padding rows are masked in attention, not here.
     B = text_lens.shape[0]
     n_video = grid_t * grid_h * grid_w
     seq_len = n_video + text_len_padded
@@ -223,10 +242,16 @@ class LingBotVideoAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
+        # The ulysses all-to-all splits the TP-local heads again.
+        ulysses_size = max(get_ulysses_parallel_world_size(), 1)
+        if self.local_num_heads % ulysses_size != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) / tp_size ({tp_size}) must be "
+                f"divisible by ulysses_degree ({ulysses_size})."
+            )
 
         self.to_q = ColumnParallelLinear(
             hidden_size,
@@ -311,30 +336,29 @@ class LingBotVideoAttention(nn.Module):
 class LingBotVideoBlock(nn.Module):
     def __init__(
         self,
-        hidden_size,
-        num_attention_heads,
-        intermediate_size,
-        norm_eps,
-        qkv_bias,
-        out_bias,
-        num_experts,
-        num_experts_per_tok,
-        moe_intermediate_size,
-        decoder_sparse_step,
-        mlp_only_layers,
-        n_shared_experts,
-        score_func,
-        norm_topk_prob,
-        n_group,
-        topk_group,
-        routed_scaling_factor,
+        hidden_size: int,
+        num_attention_heads: int,
+        intermediate_size: int,
+        norm_eps: float,
+        qkv_bias: bool,
+        out_bias: bool,
+        num_experts: int,
+        num_experts_per_tok: int,
+        moe_intermediate_size: int,
+        decoder_sparse_step: int,
+        mlp_only_layers: tuple[int, ...],
+        n_shared_experts: int,
+        score_func: str,
+        norm_topk_prob: bool,
+        n_group: int,
+        topk_group: int,
+        routed_scaling_factor: float,
         layer_idx: int,
         prefix: str = "",
         supported_attention_backends: Optional[set[AttentionBackendEnum]] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.layer_idx = layer_idx
         h = hidden_size
         self.scale_shift_table = nn.Parameter(torch.zeros(1, 6 * h))
         mark_lingbot_video_gated_residual_site(self)
@@ -378,23 +402,14 @@ class LingBotVideoBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[dict] = None,
     ) -> torch.Tensor:
-        expected_tokens = x.shape[0] * x.shape[1]
-        if temb6.ndim != 2 or temb6.shape[0] != expected_tokens:
-            raise ValueError(
-                "LingBotVideoBlock expects token-level temb6 with shape "
-                f"(B*S, 6D); got {tuple(temb6.shape)} for hidden states {tuple(x.shape)}."
-            )
-        mod = temb6.view(x.shape[0], x.shape[1], -1) + self.scale_shift_table.unsqueeze(
-            0
-        )
+        mod = temb6.unsqueeze(1) + self.scale_shift_table.unsqueeze(0)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(
             6, dim=-1
         )
         gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
 
-        bulk_dtype = self.attn.to_q.weight.dtype
         attn_in = _lingbot_norm_modulate(
-            self, self.norm1, x, scale_msa, shift_msa, bulk_dtype
+            self, self.norm1, x, scale_msa, shift_msa, x.dtype
         )
         attn_out = self.attn(
             attn_in,
@@ -405,7 +420,7 @@ class LingBotVideoBlock(nn.Module):
         x = _lingbot_gated_residual(self, x, self.norm_post_attn(attn_out), gate_msa)
 
         ffn_in = _lingbot_norm_modulate(
-            self, self.norm2, x, scale_mlp, shift_mlp, bulk_dtype
+            self, self.norm2, x, scale_mlp, shift_mlp, x.dtype
         )
         ffn_out = self.ffn(ffn_in)
         ffn_normed = self.norm_post_ffn(ffn_out)
@@ -415,10 +430,14 @@ class LingBotVideoBlock(nn.Module):
 
 class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _no_split_modules = ("LingBotVideoBlock",)
-    _keep_in_fp32_modules = tuple(LINGBOT_VIDEO_FP32_MODULES)
+    # norms, router and time embedder stay fp32; FSDP must gather them in their
+    # own dtype instead of the bf16 default.
+    _fsdp_mixed_dtype_params = True
 
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]
+    # The experts are bare Parameters, so get_quant_method never reaches them.
+    supports_runtime_quantization = False
     param_names_mapping = LingBotVideoMoEConfig().param_names_mapping
     reverse_param_names_mapping = LingBotVideoMoEConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotVideoMoEConfig().lora_param_names_mapping
@@ -426,18 +445,14 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     def to(self, *args, **kwargs):
         # _parse_to is private but the only exact parser for .to() overloads.
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
-        if dtype is None or dtype == torch.float32:
-            return super().to(*args, **kwargs)
-
-        dtype_is_floating = torch.is_floating_point(torch.empty((), dtype=dtype))
-        if not dtype_is_floating:
+        if dtype is None or not is_compute_dtype(dtype):
             return super().to(*args, **kwargs)
 
         if device is not None:
             super().to(device=device, non_blocking=non_blocking)
 
         for name, param in self.named_parameters():
-            if not torch.is_floating_point(param):
+            if not is_compute_dtype(param.dtype):
                 continue
             target_dtype = torch.float32 if should_keep_in_fp32(name) else dtype
             param.data = param.data.to(dtype=target_dtype, non_blocking=non_blocking)
@@ -447,7 +462,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 )
 
         for name, buffer in self.named_buffers():
-            if not torch.is_floating_point(buffer):
+            if not is_compute_dtype(buffer.dtype):
                 continue
             target_dtype = torch.float32 if should_keep_in_fp32(name) else dtype
             buffer.data = buffer.data.to(dtype=target_dtype, non_blocking=non_blocking)
@@ -564,6 +579,13 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         self.__post_init__()
         self.layer_names = ["blocks"]
+        self.sp_size = get_sp_world_size()
+
+    def _shard_sequence(self) -> bool:
+        if self.sp_size <= 1:
+            return False
+        forward_batch = get_forward_context().forward_batch
+        return forward_batch is not None and forward_batch.enable_sequence_shard
 
     def forward(
         self,
@@ -596,11 +618,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         joint = torch.cat([x, text], dim=1)  # [video; text]
         joint_seq_len = joint.shape[1]
 
-        positions = _joint_position_ids(text_lens, gt, gh, gw, L, device)
-        cos, sin = self.rotary_emb.forward_uncached(positions)
-        freqs_cis = (cos.float(), sin.float())
-
-        attention_mask = attn_mask_meta = None
+        attention_mask = None
         # B==1 text is trimmed to true length upstream, so no mask; B>1 may pad, build a key mask.
         if B > 1 and encoder_attention_mask is not None:
             attention_mask = torch.cat(
@@ -610,15 +628,35 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 ],
                 dim=1,
             )
-            attn_mask_meta = build_varlen_mask_meta(attention_mask)
 
-        timestep_for_embed = timestep.float()
-        timestep_proj = self.time_proj(timestep_for_embed)
+        positions = _joint_position_ids(text_lens, gt, gh, gw, L, device)
+
+        # Text shards with the video: attention refuses a replicated segment
+        # combined with a key mask.
+        shard = None
+        if self._shard_sequence():
+            shard = build_shard_plan(joint_seq_len)
+            joint = shard_like(joint, shard)
+            positions = shard_like(
+                positions.reshape(B, joint_seq_len, 3), shard, pad_mode="repeat_last"
+            ).reshape(-1, 3)
+            if attention_mask is not None:
+                attention_mask = shard_like(attention_mask, shard)
+
+        if attention_mask is not None:
+            # Under SP the layer all-gathers the mask and rebuilds this itself.
+            attn_mask_meta = (
+                None if shard is not None else build_varlen_mask_meta(attention_mask)
+            )
+        else:
+            attn_mask_meta = None if shard is None else tail_attn_meta(shard, B, device)
+
+        cos, sin = self.rotary_emb.forward_uncached(positions)
+        freqs_cis = (cos.float(), sin.float())
+
+        timestep_proj = self.time_proj(timestep.float())
         t_emb = self.time_embedder(timestep_proj)  # (B, D)
-        temb_input = t_emb.unsqueeze(1).expand(B, joint_seq_len, -1)  # (B, S, D)
-        temb6 = self.time_modulation(temb_input.reshape(B * joint_seq_len, -1))
-        temb6 = temb6.reshape(B, joint_seq_len, -1)  # (B, S, 6D)
-        temb6 = temb6.reshape(temb6.shape[0] * temb6.shape[1], -1)
+        temb6 = self.time_modulation(t_emb)  # (B, 6D), broadcast over the sequence
 
         for block in self.blocks:
             joint = block(
@@ -629,12 +667,11 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 attn_mask_meta,
             )
 
-        final_mod = self.norm_out_modulation(
-            temb_input.reshape(joint.shape[0] * joint.shape[1], -1)
-        )
-        shift, scale = final_mod.reshape(joint.shape[0], joint.shape[1], -1).chunk(
-            2, dim=-1
-        )
+        if shard is not None:
+            joint = gather_seq(joint, shard.orig_len)
+
+        final_mod = self.norm_out_modulation(t_emb)  # (B, 2D)
+        shift, scale = final_mod.unsqueeze(1).chunk(2, dim=-1)
         final_hidden = self.norm_out(joint) * (1.0 + scale) + shift
         projected = self.proj_out(final_hidden.to(self.proj_out.weight.dtype))
         x = projected[:, :n_video]

@@ -364,6 +364,10 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    "LingBotVideoTransformer3DModel": CustomBlockAdapterSpec(
+        blocks_attr="blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
 }
 
 
