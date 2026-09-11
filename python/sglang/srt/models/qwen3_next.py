@@ -64,6 +64,31 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def _shared_expert_excluded_from_quant(quant_config) -> bool:
+    """True when the checkpoint quantizes the routed experts but keeps the
+    shared expert in higher precision (selective quantization).
+
+    In that case the shared expert must not be fused into the routed FusedMoE:
+    load_weights would remap `...shared_expert.*.weight` onto
+    `...experts.w{1,2,3}_weight`, which does not exist on a quantized
+    FusedMoE module (it holds `w{1,2,3}_weight_packed/_scale/_shape`).
+    """
+    if quant_config is None:
+        return False
+    ignore = getattr(quant_config, "ignore", None) or []
+    excluded = any("shared_expert" in str(pattern) for pattern in ignore)
+    if excluded:
+        logger.warning_once(
+            "Disabling shared-expert fusion: this checkpoint keeps shared experts "
+            "unquantized while routed experts use %s. Fusing them would remap "
+            "'...shared_expert.*.weight' onto '...experts.w{1,2,3}_weight', which "
+            "does not exist on a quantized FusedMoE module.",
+            quant_config.get_name(),
+        )
+    return excluded
+
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -542,8 +567,12 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=True,
-                enable_cuda_shared_expert_fusion=True,
+                support_shared_expert_fusion=not _shared_expert_excluded_from_quant(
+                    quant_config
+                ),
+                enable_cuda_shared_expert_fusion=not _shared_expert_excluded_from_quant(
+                    quant_config
+                ),
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -710,8 +739,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=True,
-                enable_cuda_shared_expert_fusion=True,
+                support_shared_expert_fusion=not _shared_expert_excluded_from_quant(
+                    quant_config
+                ),
+                enable_cuda_shared_expert_fusion=not _shared_expert_excluded_from_quant(
+                    quant_config
+                ),
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -1217,6 +1250,13 @@ class Qwen3NextForCausalLM(nn.Module):
                     ) and replaced_name not in params_dict:
                         continue
                     name = replaced_name
+                    if name not in params_dict:
+                        raise KeyError(
+                            f"Checkpoint weight maps to parameter '{name}', which "
+                            f"does not exist. quantization="
+                            f"{self.quant_config.get_name() if self.quant_config else 'none'}, "
+                            f"shared_expert_fusion={self.enable_shared_expert_fusion}."
+                        )
                     param = params_dict[name]
 
                     weight_loader = getattr(param, "weight_loader")
