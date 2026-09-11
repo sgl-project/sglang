@@ -497,6 +497,7 @@ POSITIONAL_FIELD_ORDER = (
     "return_hidden_states_mode",
     "enable_return_routed_experts",
     "enable_return_indexer_topk",
+    "sampling_mask_max_tokens",
     "disable_outlines_disk_cache",
     "enable_mis",
     "weight_cache_mode",
