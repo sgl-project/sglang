@@ -485,6 +485,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
+        elif self.config.gemm1_alpha is not None:
+            assert self.config.gemm1_beta == 1.0, (
+                "The OAI-SwiGLU DeepGEMM kernel requires gemm1_beta=1.0, "
+                f"got {self.config.gemm1_beta}"
+            )
+            down_input_fp8, down_input_scale = _contiguous_deep_gemm_silu_mul_quant(
+                gateup_output,
+                group_size=scale_block_size,
+                topk=self.config.top_k,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+            )
+            del gateup_output
         elif self.use_swizzle:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
             use_contig_swizzle = self.use_swizzle and not running_state.get(
@@ -1505,6 +1518,30 @@ def _varlen_deep_gemm_situ_mul_quant(
         down_input_scale = down_input_scale.transpose(-1, -2)
 
     return down_input, down_input_scale
+
+
+def _contiguous_deep_gemm_silu_mul_quant(
+    gateup_output: torch.Tensor,
+    group_size: int,
+    topk: int,
+    gemm1_alpha: float,
+    gemm1_clamp_limit: Optional[float],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply OAI-SwiGLU to the contiguous DeepGEMM activation layout."""
+    num_tokens = gateup_output.shape[0]
+    masked_m = torch.tensor(
+        [num_tokens], dtype=torch.int32, device=gateup_output.device
+    )
+    output, output_scale = _varlen_deep_gemm_silu_mul_quant(
+        gateup_output.unsqueeze(0),
+        masked_m=masked_m,
+        group_size=group_size,
+        topk=topk,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        num_real_tokens=num_tokens,
+    )
+    return output.squeeze(0), output_scale.squeeze(0)
 
 
 def _varlen_deep_gemm_silu_mul_quant(
