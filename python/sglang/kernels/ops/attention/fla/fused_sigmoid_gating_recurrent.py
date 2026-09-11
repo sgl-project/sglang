@@ -71,6 +71,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     CACHE_RING: tl.constexpr = False,
     SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
+    accepted_rows=None,
+    accepted_steps=None,
+    USE_ACCEPTED_STATE: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -142,6 +145,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 + o_v[None, :] * K
                 + o_k[:, None]
             )
+            if USE_ACCEPTED_STATE:
+                accepted_step = tl.load(accepted_steps + idx).to(tl.int64)
+                if accepted_step >= 0:
+                    accepted_row = tl.load(accepted_rows + idx).to(tl.int64)
+                    p_h0 = (
+                        intermediate_states_buffer
+                        + (accepted_row * cache_steps + accepted_step) * HV * K * V
+                        + i_hv * K * V
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+            # Each CTA owns this head/V fragment across all checkpoints. Read
+            # the accepted fragment before overwriting the same request row.
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     # Preload tree attention data if needed
@@ -377,6 +393,8 @@ def fused_sigmoid_gating_delta_rule_update(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    accepted_rows: Optional[torch.Tensor] = None,
+    accepted_steps: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -388,6 +406,19 @@ def fused_sigmoid_gating_delta_rule_update(
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
     """
+    if accepted_steps is not None:
+        if not (
+            is_kda
+            and disable_state_update
+            and intermediate_states_buffer is not None
+            and accepted_rows is not None
+            and retrieve_parent_token is None
+            and not cache_ring
+            and initial_state_source is not None
+        ):
+            raise ValueError("accepted-state seeds require dense KDA chain verify")
+    elif accepted_rows is not None:
+        raise ValueError("accepted_rows requires accepted_steps")
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]
@@ -524,6 +555,9 @@ def fused_sigmoid_gating_delta_rule_update(
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
         SPLIT_N_HV_GRID=split_n_hv_grid,
+        accepted_rows=accepted_rows,
+        accepted_steps=accepted_steps,
+        USE_ACCEPTED_STATE=accepted_steps is not None,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

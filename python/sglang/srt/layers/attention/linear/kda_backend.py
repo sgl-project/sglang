@@ -394,6 +394,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # The verify kernel is varlen and the conv path scatters ragged tokens
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
+    accepted_state = None
 
     # KDA gets graph padding explicitly and never uses ReplaySSM's host-seqlen
     # force-flush path.
@@ -466,6 +467,60 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.int32,
                 device=model_runner.device,
             )
+
+        self.accepted_state = None
+        if (
+            envs.SGLANG_OPT_KDA_ACCEPTED_STATE.get()
+            and not self.is_draft_worker
+            and get_disagg().disaggregation_mode != "prefill"
+        ):
+            from sglang.srt.mem_cache.kda_accepted_state import KDAAcceptedState
+            from sglang.srt.mem_cache.memory_pool import MambaPool
+
+            pool = self.req_to_token_pool.mamba_pool
+            if not (
+                is_cuda()
+                and torch.cuda.get_device_capability()[0] == 9
+                and verify_backend.is_triton()
+                and get_spec().speculative_algorithm in ("EAGLE", "EAGLE3", "NEXTN")
+                and get_spec().speculative_num_draft_tokens == 2
+                and speculative_topk == 1
+                and not get_exec().mamba.enable_linear_replayssm_spec
+                and not pool.enable_linear_replayssm
+                and self.req_to_token_pool.mamba_ckpt_pool is None
+                and type(pool) is MambaPool
+                and self.req_to_token_pool.mamba_v2p_table is None
+            ):
+                raise ValueError(
+                    "KDA accepted-state requires SM90 Triton T2 EAGLE chain verify "
+                    "with a static MambaPool, no int8 checkpoints, and no ReplaySSM"
+                )
+            self.accepted_state = getattr(pool, "kda_accepted_state", None)
+            if self.accepted_state is None:
+                caches = (
+                    self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+                )
+                # Scratch is indexed by request identity, including PD's
+                # preallocated rows, rather than by the current batch order.
+                if (
+                    caches.intermediate_ssm.shape[1]
+                    < self.req_to_token_pool.req_to_token.shape[0]
+                ):
+                    raise ValueError(
+                        "KDA accepted-state scratch must cover every request row"
+                    )
+                self.accepted_state = KDAAcceptedState(
+                    caches.temporal, caches.intermediate_ssm
+                )
+                pool.kda_accepted_state = self.accepted_state
+
+    def _materialize_accepted_state(self, layer_id):
+        # Run on the model's execution stream, inside graph capture as needed.
+        # One all-layer flush before the first layer reads committed state.
+        if self.accepted_state is not None and layer_id == min(
+            self.req_to_token_pool.mamba_map
+        ):
+            self.accepted_state.materialize(self.forward_metadata.mamba_cache_indices)
 
     @staticmethod
     def _can_fuse_accept_state(verify_backend) -> bool:
@@ -550,6 +605,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        self._materialize_accepted_state(layer.layer_id)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -805,6 +861,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
+        self._materialize_accepted_state(layer.layer_id)
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -993,7 +1050,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
-        if self._can_run_dspark_cutedsl_mtp(
+        if self.accepted_state is not None and (
+            draft_token_num != 2
+            or ragged_layout is not None
+            or retrieve_parent_token is not None
+        ):
+            raise ValueError("KDA accepted-state requires dense T2 chain verify")
+        if self.accepted_state is None and self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
             a=a,
@@ -1031,7 +1094,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
             # the reference kernels.
-            if self._can_run_fused_chain_verify(
+            if self.accepted_state is None and self._can_run_fused_chain_verify(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -1149,6 +1212,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
+            )
+
+        if self.accepted_state is not None:
+            intermediate_state_indices = forward_batch.req_pool_indices
+            ring_kwargs.update(
+                accepted_rows=self.accepted_state.rows,
+                accepted_steps=self.accepted_state.steps,
             )
 
         core_attn_out = self.kernel_dispatcher.target_verify(

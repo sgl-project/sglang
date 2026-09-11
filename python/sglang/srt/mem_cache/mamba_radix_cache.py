@@ -547,6 +547,9 @@ class MambaRadixCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ) -> None:
         """Cache request when it finishes."""
+        pool = self.req_to_token_pool.mamba_pool
+        if (accepted := getattr(pool, "kda_accepted_state", None)) is not None:
+            accepted.materialize(req.kv.mamba_pool_idx.reshape(-1))
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, :kv_len_to_handle

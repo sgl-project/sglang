@@ -302,6 +302,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        if (
+            accepted := getattr(self.mamba_pool, "kda_accepted_state", None)
+        ) is not None:
+            accepted.invalidate()
         self.mamba_allocator.clear()
 
 
