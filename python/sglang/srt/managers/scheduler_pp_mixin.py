@@ -1147,9 +1147,7 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        all_gather_group = (
-            self.attn_tp_group if self.require_attn_tp_allgather else None
-        )
+        all_gather_group = self.attn_tp_group
 
         # ---- Prepare send dict ----
         # On NPU, always send something (full output or a lightweight skip
