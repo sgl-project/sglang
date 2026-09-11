@@ -1445,6 +1445,8 @@ class Envs:
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+    # Log the --deepseek-v4-prefill-reuse dose every N reuse calls per rank; 0 disables.
+    SGLANG_LOG_DSV4_PREFILL_REUSE_INTERVAL = EnvInt(0)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)

@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
+from sglang.srt.layers.attention.dsv4.prefill_reuse import PRESETS, maybe_apply_reuse
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,6 +24,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
+_PREFILL_REUSE = "sglang.srt.layers.attention.dsv4.prefill_reuse"
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
@@ -455,6 +457,97 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         torch.testing.assert_close(call.args[3], plan.ks)
         torch.testing.assert_close(call.args[4], plan.ke)
         self.assertEqual(call.kwargs, {"clean_logits": False, "max_seqlen_k": 128})
+
+
+def _fake_topk_transform(logits, seq_lens, page_table, out, page_size, raw_out):
+    # Fills slot 0 with the scored row id and leaves the other slots untouched,
+    # like a row with a single candidate.
+    out[:, 0] = logits[:, 0].to(out.dtype)
+    raw_out[:, 0] = logits[:, 0].to(raw_out.dtype) + 1000
+
+
+_SGL_KERNEL_TOPK = SimpleNamespace(
+    is_torch=lambda: False,
+    is_flashinfer=lambda: False,
+    should_use_topk_v2=lambda: False,
+)
+
+
+class TestDSV4PrefillReuse(CustomTestCase):
+    query_rows = 10
+
+    def _apply(self, *, layer_id, topk_backend):
+        n = self.query_rows
+        # Each query row carries its own row id, so the logits name the leader.
+        q_indexer = torch.arange(n, dtype=torch.float32).unsqueeze(1)
+        plan = NonPagedIndexerPlan(
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            gather_seq_lens=torch.tensor([n], dtype=torch.int32),
+            ks=torch.zeros(n, dtype=torch.int32),
+            ke=torch.arange(1, n + 1, dtype=torch.int32),
+            seq_len_sum=n,
+            max_seq_len=n,
+            max_seqlen_k=64,
+            query_rows=n,
+        )
+        pages = torch.full((n, 3), 7, dtype=torch.int32)
+        raw = torch.full((n + 2, 3), 7, dtype=torch.int32)
+        forward = MagicMock(side_effect=lambda **kw: kw["q_indexer"].clone())
+        with patch(f"{_PREFILL_REUSE}.topk_transform_paged", _fake_topk_transform):
+            applied = maybe_apply_reuse(
+                preset=PRESETS["deep10-inf-w4"],
+                topk_backend=topk_backend,
+                forward_nonpaged_indexer=forward,
+                c4_indexer=SimpleNamespace(layer_id=layer_id),
+                token_to_kv_pool=MagicMock(),
+                plan=plan,
+                q_indexer=q_indexer,
+                weights=torch.ones((n, 2)),
+                c4_seq_lens=torch.arange(1, n + 1, dtype=torch.int32),
+                page_table=torch.zeros((n, 2), dtype=torch.int32),
+                c4_sparse_page_indices=pages,
+                raw_indices=raw,
+                compressed_page_size=64,
+            )
+        return applied, pages, raw, forward, plan
+
+    def test_every_row_takes_its_window_leader_selection(self):
+        n = self.query_rows
+        # Layer 22 keeps a window of 4; layer 24 is a deep layer sharing one
+        # selection per chunk.
+        cases = {22: [0, 0, 0, 0, 4, 4, 4, 4, 8, 8], 24: [0] * n}
+        for layer_id, leaders in cases.items():
+            with self.subTest(layer_id=layer_id):
+                applied, pages, raw, forward, plan = self._apply(
+                    layer_id=layer_id, topk_backend=_SGL_KERNEL_TOPK
+                )
+                expected = torch.tensor(leaders, dtype=torch.int32)
+                self.assertTrue(applied)
+                torch.testing.assert_close(pages[:, 0], expected)
+                # Unfilled slots must read as invalid pages, not stale memory.
+                self.assertTrue(bool((pages[:, 1:] == -1).all()))
+                # Sparse prefill attention reads raw indices, so they broadcast too.
+                torch.testing.assert_close(raw[:n, 0], expected + 1000)
+                self.assertTrue(bool((raw[n:] == 7).all()))
+                scored = torch.unique(expected).long()
+                leader_plan = forward.call_args.kwargs["plan"]
+                self.assertEqual(leader_plan.query_rows, scored.numel())
+                torch.testing.assert_close(leader_plan.ke, plan.ke[scored])
+
+    def test_unsupported_topk_backends_leave_outputs_untouched(self):
+        for name in ("torch", "flashinfer"):
+            topk_backend = SimpleNamespace(
+                is_torch=lambda name=name: name == "torch",
+                is_flashinfer=lambda name=name: name == "flashinfer",
+                should_use_topk_v2=lambda: False,
+            )
+            with self.subTest(topk_backend=name):
+                applied, pages, raw, forward, _ = self._apply(
+                    layer_id=22, topk_backend=topk_backend
+                )
+                self.assertFalse(applied)
+                self.assertTrue(bool((pages == 7).all()))
+                self.assertTrue(bool((raw == 7).all()))
 
 
 if __name__ == "__main__":

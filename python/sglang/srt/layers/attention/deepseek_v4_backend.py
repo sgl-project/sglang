@@ -57,6 +57,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     copy_metadata,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.attention.dsv4.prefill_reuse import resolve_prefill_reuse_preset
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
@@ -647,6 +648,9 @@ class DeepseekV4AttnBackend(
         kernel = get_exec().kernel
         self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
+        self.prefill_reuse_preset = resolve_prefill_reuse_preset(
+            kernel.deepseek_v4_prefill_reuse
+        )
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not get_platform().is_sm90:

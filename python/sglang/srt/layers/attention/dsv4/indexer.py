@@ -39,6 +39,10 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
+from sglang.srt.layers.attention.dsv4.prefill_reuse import (
+    ReusePreset,
+    maybe_apply_reuse,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -444,6 +448,7 @@ class C4IndexerBackendMixin:
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        self.prefill_reuse_preset: Optional[ReusePreset] = None
         self.flashinfer_topk_transform: Callable[..., None] = (
             topk_transform_flashinfer_fused
             if envs.SGLANG_DSA_FUSE_TOPK.get()
@@ -895,14 +900,34 @@ class C4IndexerBackendMixin:
 
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
-            logits = self._forward_nonpaged_indexer(
-                q_indexer=q_indexer,
-                weights=weights,
-                c4_indexer=c4_indexer,
-                token_to_kv_pool=token_to_kv_pool,
-                plan=nonpaged_plan,
-            )
-            run_topk_transform(all_rows, logits)
+            # Capture needs per-row indices, which reuse does not produce.
+            if (
+                self.prefill_reuse_preset is None
+                or capture_enabled
+                or not maybe_apply_reuse(
+                    preset=self.prefill_reuse_preset,
+                    topk_backend=self.dsa_topk_backend,
+                    forward_nonpaged_indexer=self._forward_nonpaged_indexer,
+                    c4_indexer=c4_indexer,
+                    token_to_kv_pool=token_to_kv_pool,
+                    plan=nonpaged_plan,
+                    q_indexer=q_indexer,
+                    weights=weights,
+                    c4_seq_lens=c4_seq_lens,
+                    page_table=page_table,
+                    c4_sparse_page_indices=c4_sparse_page_indices,
+                    raw_indices=raw_indices,
+                    compressed_page_size=indexer_metadata.compressed_page_size,
+                )
+            ):
+                logits = self._forward_nonpaged_indexer(
+                    q_indexer=q_indexer,
+                    weights=weights,
+                    c4_indexer=c4_indexer,
+                    token_to_kv_pool=token_to_kv_pool,
+                    plan=nonpaged_plan,
+                )
+                run_topk_transform(all_rows, logits)
         elif use_aiter_fp4:
             q_fp4, q_scale = q
             is_decode = forward_batch.forward_mode.is_decode()
