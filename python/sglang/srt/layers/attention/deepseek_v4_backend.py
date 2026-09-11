@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
 )
@@ -2829,6 +2830,9 @@ class DeepseekV4AttnBackend(
         freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
         kv_cache = pool.get_extra_key_buffer(layer_id)
         page_size = pool.get_extra_key_page_size(layer_id)
+        # The pool's page format: V4, or the V4.1 fp8 / fp4 layouts (the fp4 one
+        # stores the e2m1 codes directly, so the fp4 rounding happens once).
+        kv_layout = pool.get_extra_key_layout(layer_id)
         assert kv_cache is not None
 
         if layer.compress_ratio == 1:
@@ -2842,6 +2846,7 @@ class DeepseekV4AttnBackend(
                 freqs_cis,
                 kv_cache,
                 page_size=page_size,
+                layout=kv_layout,
             )
             out_loc = core.c1_out_loc
         else:
@@ -2867,6 +2872,7 @@ class DeepseekV4AttnBackend(
                 page_size=page_size,
                 ring_size=state.ring_size,
                 **verify_args,
+                layout=kv_layout,
             )
             out_loc = core.c2_out_loc
 
@@ -3003,7 +3009,14 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
-        # The FlashMLA cache requantizes the FP4/E4M3 latent into its FP8 layout.
+        if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
+            # The fp4 cache stores the e2m1 codes themselves: the kernel rotates the
+            # tail and rounds once, no fake quantization in between.
+            pool.set_extra_key_buffer_fused(
+                layer_id=layer.layer_id, loc=slots, cache_k=latent, freqs_cis=freqs
+            )
+            return
+        # The fp8 FlashMLA caches requantize the FP4/E4M3 latent into their layout.
         latent = _rope_fq4(latent, freqs, layer.rope_head_dim, compressed_kv=True)
         pool.set_extra_key_buffer_fused(
             layer_id=layer.layer_id, loc=slots, cache_k=latent
@@ -3608,24 +3621,25 @@ class DeepseekV4AttnBackend(
 
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
-            k_cache_total_dim = (
-                token_to_kv_pool.qk_nope_head_dim
-                + token_to_kv_pool.qk_rope_head_dim * 2
-                + 8
-            )
+            # The kernel detects each cache's format from the last dim of this
+            # view: 584 (V4), 528 (V4.1 fp8) or 288 (V4.1 fp4, extra cache only).
+            k_cache_total_dim = token_to_kv_pool.get_swa_key_bytes_per_token()
             swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
                 swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
             )
 
             if extra_k_cache is not None:
                 extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+                extra_total_dim = token_to_kv_pool.get_extra_key_bytes_per_token(
+                    layer_id
+                )
                 extra_k_cache = extra_k_cache[
-                    :, : extra_page_size * k_cache_total_dim
+                    :, : extra_page_size * extra_total_dim
                 ].view(
                     extra_k_cache.shape[0],
                     extra_page_size,
                     1,
-                    k_cache_total_dim,
+                    extra_total_dim,
                 )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
@@ -3831,12 +3845,14 @@ class DeepseekV4AttnBackend(
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
+                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
             out=swa_slice,
+            layout=token_to_kv_pool.get_swa_key_layout(),
         )
         kv = workspace
 
@@ -4007,6 +4023,8 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
+        # The Q8KV8 gather reads the 584-byte V4 layout only (its kernel is SM90).
+        assert token_to_kv_pool.get_swa_key_layout() is KVLayout.V4
         if compressed_slice is not None:
             gather_dequant_requant_fp8_paged(
                 extra_k_cache,
