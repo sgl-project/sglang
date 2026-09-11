@@ -48,13 +48,13 @@ def run_sm90_mega_routed(
     topk_weights: torch.Tensor,
     buf: SymmBuffer,
     num_tokens: int,
+    routed_scaling_factor: float = 1.0,
+    activation: str = "swiglu",
+    activation_alpha: float = 1.0,
+    activation_up_bias: float = 0.0,
+    activation_clamp: float | None = None,
 ) -> torch.Tensor:
     import deep_gemm
-
-    if moe.experts.should_fuse_routed_scaling_factor_in_topk:
-        routed_scaling_factor = 1.0
-    else:
-        routed_scaling_factor = float(moe.routed_scaling_factor)
 
     deep_gemm.mega_moe_pre_dispatch_sm90(
         hidden_states,
@@ -80,8 +80,10 @@ def run_sm90_mega_routed(
         moe.experts.mega_l2_weights,
         buf,
         recipe=(128, 128, 128),
-        activation="swiglu",
-        activation_clamp=getattr(moe.config, "swiglu_limit", None),
+        activation=activation,
+        activation_alpha=activation_alpha,
+        activation_up_bias=activation_up_bias,
+        activation_clamp=activation_clamp,
         fast_math=True,
     )
     y = y[:num_tokens]
