@@ -189,8 +189,17 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 "SenseNova-U1 Cache-DiT currently supports DBCache knobs only; "
                 f"unsupported keys: {sorted(unsupported)}."
             )
+        # Compare effective settings so omitted and explicit defaults share a mount.
+        effective_config = {
+            "Fn_compute_blocks": envs.SGLANG_CACHE_DIT_FN,
+            "Bn_compute_blocks": envs.SGLANG_CACHE_DIT_BN,
+            "max_warmup_steps": envs.SGLANG_CACHE_DIT_WARMUP,
+            "residual_diff_threshold": envs.SGLANG_CACHE_DIT_RDT,
+            "max_continuous_cached_steps": envs.SGLANG_CACHE_DIT_MC,
+        }
+        effective_config.update(overrides)
         desired_key = (
-            (cache_dit_overrides_key(overrides), has_separate_cfg)
+            (cache_dit_overrides_key(effective_config), has_separate_cfg)
             if requested
             else None
         )
@@ -219,22 +228,8 @@ class SenseNovaU1GenerationStage(PipelineStage):
         try:
             config = CacheDitConfig(
                 enabled=True,
-                Fn_compute_blocks=overrides.get(
-                    "Fn_compute_blocks", envs.SGLANG_CACHE_DIT_FN
-                ),
-                Bn_compute_blocks=overrides.get(
-                    "Bn_compute_blocks", envs.SGLANG_CACHE_DIT_BN
-                ),
-                max_warmup_steps=overrides.get(
-                    "max_warmup_steps", envs.SGLANG_CACHE_DIT_WARMUP
-                ),
-                residual_diff_threshold=overrides.get(
-                    "residual_diff_threshold", envs.SGLANG_CACHE_DIT_RDT
-                ),
-                max_continuous_cached_steps=overrides.get(
-                    "max_continuous_cached_steps", envs.SGLANG_CACHE_DIT_MC
-                ),
                 num_inference_steps=steps,
+                **effective_config,
             )
             enable_cache_on_transformer(
                 transformer,
