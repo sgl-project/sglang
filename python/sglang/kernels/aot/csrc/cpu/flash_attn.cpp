@@ -71,6 +71,9 @@ void flash_attn_kernel_impl(
   const int num_groups = num_heads / num_heads_kv;
   TORCH_CHECK(num_groups * num_heads_kv == num_heads);
 
+  // bottom-right aligned causal offset: query row j may attend up to key (causal_offset + j)
+  const int causal_offset = seqlen_k - seqlen_q;
+
   // number of super locks along M
   int MB = div_up(seqlen_q, BLOCK_M);
 
@@ -119,7 +122,7 @@ void flash_attn_kernel_impl(
       fill_stub(s_prime, 0.f, m_size);
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
 
-      int num_keys = causal ? std::min(m + m_size, seqlen_k) : seqlen_k;
+      int num_keys = causal ? std::min(m + m_size + causal_offset, seqlen_k) : seqlen_k;
       for (int n = 0; n < num_keys; n += BLOCK_N) {
         int n_size = std::min(BLOCK_N, num_keys - n);
 
@@ -150,9 +153,9 @@ void flash_attn_kernel_impl(
 
         // apply causal mask
         // See [Note] condition to apply causal mask.
-        if (causal && n + n_size - 1 > m) {
+        if (causal && n + n_size - 1 > m + causal_offset) {
           for (int row = 0; row < m_size; ++row) {
-            int last_col = m + row - n;
+            int last_col = causal_offset + m + row - n;
             // See [Note] mask the entire row if last_col < 0.
             last_col = std::max(last_col, -1);
             // fill [last_col + 1, n_size) to -inf
@@ -303,7 +306,9 @@ void flash_attn_varlen_kernel_impl(
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
 
       int seqlen_k = cu_seqlens_k[bs + 1] - cu_seqlens_k[bs];
-      int num_keys = causal ? std::min(m + m_size, seqlen_k) : seqlen_k;
+      // bottom-right aligned causal offset: query row j may attend up to key (causal_offset + j)
+      int causal_offset = seqlen_k - seqlen_q;
+      int num_keys = causal ? std::min(m + m_size + causal_offset, seqlen_k) : seqlen_k;
       for (int n = 0; n < num_keys; n += BLOCK_N) {
         int n_size = std::min(BLOCK_N, num_keys - n);
 
@@ -334,9 +339,9 @@ void flash_attn_varlen_kernel_impl(
 
         // apply causal mask
         // See [Note] condition to apply causal mask.
-        if (causal && n + n_size - 1 > m) {
+        if (causal && n + n_size - 1 > m + causal_offset) {
           for (int row = 0; row < m_size; ++row) {
-            int last_col = m + row - n;
+            int last_col = causal_offset + m + row - n;
             // See [Note] mask the entire row if last_col < 0.
             last_col = std::max(last_col, -1);
             // fill [last_col + 1, n_size) to -inf
@@ -443,7 +448,8 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal) {
+    bool causal,
+    double sm_scale) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
@@ -479,8 +485,10 @@ at::Tensor flash_attn_varlen_func(
   TORCH_CHECK(head_size % 2 == 0, "invalid head_size ", head_size);
   TORCH_CHECK(head_size_v % 2 == 0, "invalid head_size_v ", head_size_v);
 
-  // softmax scale
-  double sm_scale = 1.0 / std::sqrt(static_cast<double>(head_size));
+  // softmax scale: caller-provided, or 1/sqrt(head_size) when <= 0 (default)
+  if (sm_scale <= 0) {
+    sm_scale = 1.0 / std::sqrt(static_cast<double>(head_size));
+  }
 
   // check whether the batch has variant lengths
   const bool is_varlen =
@@ -491,65 +499,76 @@ at::Tensor flash_attn_varlen_func(
   at::Tensor indices = at::empty({}, q.options().dtype(at::kInt));
   at::Tensor out = at::empty({num_tokens, num_heads, head_size_v}, q.options());
 
-  // TODO: tune the block size
-  constexpr int BLOCK_M = 512;
-  constexpr int BLOCK_N = 768;
+// block size tuned by max_seqlen_q.
+#define LAUNCH_FLASH_ATTN_VARLEN_KERNEL(BLOCK_M, BLOCK_N)                                            \
+  do {                                                                                                \
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "flash_attn_varlen_func", [&] {               \
+      int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v);          \
+      if (is_varlen) {                                                                                \
+        resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q);                                     \
+        flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(                                     \
+            out.data_ptr<scalar_t>(),                                                                 \
+            q.data_ptr<scalar_t>(),                                                                   \
+            k.data_ptr<scalar_t>(),                                                                   \
+            v.data_ptr<scalar_t>(),                                                                   \
+            cu_seqlens_q.data_ptr<int32_t>(),                                                         \
+            cu_seqlens_k.data_ptr<int32_t>(),                                                         \
+            buffer.data_ptr(),                                                                       \
+            indices.data_ptr<int32_t>(),                                                              \
+            max_seqlen_q,                                                                             \
+            max_seqlen_k,                                                                             \
+            num_seqs,                                                                                 \
+            num_heads,                                                                                \
+            num_heads_kv,                                                                             \
+            head_size,                                                                                \
+            head_size_v,                                                                              \
+            q_strideM,                                                                                \
+            q_strideH,                                                                                \
+            k_strideN,                                                                                \
+            k_strideH,                                                                                \
+            v_strideN,                                                                                \
+            v_strideH,                                                                                \
+            sm_scale,                                                                                 \
+            sz,                                                                                       \
+            causal);                                                                                  \
+      } else {                                                                                        \
+        flash_attn_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(                                            \
+            out.data_ptr<scalar_t>(),                                                                 \
+            q.data_ptr<scalar_t>(),                                                                   \
+            k.data_ptr<scalar_t>(),                                                                   \
+            v.data_ptr<scalar_t>(),                                                                   \
+            buffer.data_ptr(),                                                                       \
+            max_seqlen_q,                                                                             \
+            max_seqlen_k,                                                                             \
+            num_seqs,                                                                                 \
+            num_heads,                                                                                \
+            num_heads_kv,                                                                             \
+            head_size,                                                                                \
+            head_size_v,                                                                              \
+            q_strideM,                                                                                \
+            q_strideH,                                                                                \
+            k_strideN,                                                                                \
+            k_strideH,                                                                                \
+            v_strideN,                                                                                \
+            v_strideH,                                                                                \
+            sm_scale,                                                                                 \
+            sz,                                                                                       \
+            causal);                                                                                  \
+      }                                                                                                \
+    });                                                                                                \
+  } while (0)
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "flash_attn_varlen_func", [&] {
-    int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v);
+  if (max_seqlen_q <= 256) {
+    LAUNCH_FLASH_ATTN_VARLEN_KERNEL(32, 64);
+  } else if (max_seqlen_q <= 1024) {
+    LAUNCH_FLASH_ATTN_VARLEN_KERNEL(128, 256);
+  } else if (max_seqlen_q <= 4096) {
+    LAUNCH_FLASH_ATTN_VARLEN_KERNEL(256, 768);
+  } else {
+    LAUNCH_FLASH_ATTN_VARLEN_KERNEL(512, 768);
+  }
 
-    if (is_varlen) {
-      resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q);
-      flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
-          out.data_ptr<scalar_t>(),
-          q.data_ptr<scalar_t>(),
-          k.data_ptr<scalar_t>(),
-          v.data_ptr<scalar_t>(),
-          cu_seqlens_q.data_ptr<int32_t>(),
-          cu_seqlens_k.data_ptr<int32_t>(),
-          buffer.data_ptr(),
-          indices.data_ptr<int32_t>(),
-          max_seqlen_q,
-          max_seqlen_k,
-          num_seqs,
-          num_heads,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          q_strideM,
-          q_strideH,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          sm_scale,
-          sz,
-          causal);
-    } else {
-      flash_attn_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
-          out.data_ptr<scalar_t>(),
-          q.data_ptr<scalar_t>(),
-          k.data_ptr<scalar_t>(),
-          v.data_ptr<scalar_t>(),
-          buffer.data_ptr(),
-          max_seqlen_q,
-          max_seqlen_k,
-          num_seqs,
-          num_heads,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          q_strideM,
-          q_strideH,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          sm_scale,
-          sz,
-          causal);
-    }
-  });
+#undef LAUNCH_FLASH_ATTN_VARLEN_KERNEL
 
   return out;
 }
