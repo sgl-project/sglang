@@ -2633,11 +2633,29 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def _drain_backup():
             drained = 0
+            # On the rank-synced path, all-reduce completed_tokens to the
+            # minimum successful prefix so every rank feeds identical
+            # (pessimistic) existence beliefs, keeping covers_all admission
+            # TP-deterministic when the backend failed partway on a subset.
+            # The detach/shutdown local drain (n_backup is None) skips sync;
+            # it passes None and beliefs are cleared on the same path.
+            local_drain = n_backup is None
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
                 if buffer_mode:
                     # Storage write acked: free the staging.
-                    self.buffer_pipeline.finish_storage_write_ack(operation.id)
+                    successful_tokens = None
+                    if not local_drain:
+                        ct = torch.tensor(
+                            operation.completed_tokens,
+                            dtype=torch.int,
+                            device="cpu",
+                        )
+                        self._all_reduce(ct, torch.distributed.ReduceOp.MIN)
+                        successful_tokens = int(ct.item())
+                    self.buffer_pipeline.finish_storage_write_ack(
+                        operation.id, successful_tokens=successful_tokens
+                    )
                 else:
                     entry = self.ongoing_backup.pop(operation.id, None)
                     if entry is not None:

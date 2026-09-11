@@ -704,18 +704,33 @@ class BufferModePipeline:
         )
         self.ongoing_backup[operation_id] = entry
 
-    def finish_storage_write_ack(self, operation_id: int) -> None:
+    def finish_storage_write_ack(
+        self, operation_id: int, successful_tokens: Optional[int] = None
+    ) -> None:
         """Storage write acked (rank-synced drain): free the entry's staging
-        outright. Existence entries are added unconditionally
-        (completed_tokens can diverge across ranks under backend failure) to
-        keep admission decisions TP-deterministic. No-op for operations this
+        outright. Existence beliefs are added only for the prefix the storage
+        write actually persisted; marking the unwritten tail as stored would
+        make ``covers_all`` skip its re-write forever, and unlike a normal
+        stale positive the data never reached L3 so the belief never
+        self-heals (recompute re-stages the same content hashes).
+
+        ``successful_tokens`` is the cross-rank-aligned minimum successful
+        prefix (caller all-reduces ``operation.completed_tokens``); ``None``
+        means the caller cannot supply it (detach/shutdown local drain, where
+        beliefs are cleared on the same path). No-op for operations this
         pipeline does not own (e.g. acks for already-reset state)."""
         entry = self.ongoing_backup.pop(operation_id, None)
         if entry is None:
             return
         intent = entry.intent
         snapshot = intent.snapshot
-        self._cache.storage_existence_cache.add(PoolName.KV, snapshot.hash_values)
+        if successful_tokens is None:
+            successful_pages = snapshot.hash_values
+        else:
+            successful_pages = snapshot.hash_values[
+                : max(0, successful_tokens) // self._cache.page_size
+            ]
+        self._cache.storage_existence_cache.add(PoolName.KV, successful_pages)
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= len(entry.host_indices)
         self.inflight_backup_node_ids.discard(snapshot.node_id)
