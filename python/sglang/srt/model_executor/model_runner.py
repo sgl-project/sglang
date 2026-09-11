@@ -677,7 +677,6 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
-            spec_algorithm=self.spec_algorithm,
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,
