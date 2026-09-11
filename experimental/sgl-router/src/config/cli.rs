@@ -9,6 +9,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::num::NonZeroU32;
 
+use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy, SamplingOverrides};
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
@@ -59,6 +60,33 @@ pub struct Cli {
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
     pub bucket_config: Option<String>,
+
+    // ---- fleet-wide sampling contract (opt-in) ----
+    /// Sampling parameters fixed fleet-wide, as one JSON object keyed by the
+    /// request-body field names — e.g. `{"temperature": 1, "top_p": 0.95}`.
+    /// Keys: temperature, top_p, top_k, min_p, repetition_penalty,
+    /// frequency_penalty, presence_penalty, n. Each value is a number, or an
+    /// inclusive band `{"min": LO, "max": HI}`.
+    ///
+    /// A configured value is injected whenever the request omits that field;
+    /// `--sampling-param-conflict` decides what a request that sends one gets.
+    /// Unknown or repeated keys, out-of-domain values and a band under `allow`
+    /// all fail the launch, naming the offending key. Full contract — domains,
+    /// `null` handling, cost — in the router README.
+    #[arg(long, value_name = "JSON")]
+    pub override_sampling_params: Option<String>,
+    /// What a request that sends a value differing from
+    /// `--override-sampling-params` gets: `reject` (the default) 400s it
+    /// before admission, quoting the configured value; `allow` forwards the
+    /// client's value untouched. Only accepted alongside
+    /// `--override-sampling-params`.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        requires = "override_sampling_params"
+    )]
+    pub sampling_param_conflict: Option<ConflictPolicy>,
 
     // ---- circuit breaker (opt-in via --cb-threshold) ----
     /// Consecutive upstream failures before the circuit breaker opens.
@@ -577,6 +605,13 @@ impl Cli {
             None
         };
 
+        let sampling_overrides = match &self.override_sampling_params {
+            None => SamplingOverrides::default(),
+            Some(raw) => {
+                parse_sampling_overrides(raw, self.sampling_param_conflict.unwrap_or_default())?
+            }
+        };
+
         let config = Config {
             server: ServerConfig {
                 host: self.host,
@@ -600,6 +635,7 @@ impl Cli {
                 affinity,
                 fused,
                 eligibility,
+                sampling_overrides,
             },
             discovery,
             proxy: ProxyConfig {
@@ -1884,5 +1920,65 @@ mod tests {
             buckets.tps_slo_policy,
             crate::config::SloBucketPolicy::BestEffort
         );
+    }
+
+    /// The flag reaches `ModelConfig`, and is opt-in: unset leaves the model
+    /// with an empty sampling contract, so no request is ever checked.
+    #[test]
+    fn override_sampling_params_reaches_the_model_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"temperature": 1, "top_p": 0.95}"#,
+        ]))
+        .unwrap();
+        assert_eq!(c.model.sampling_overrides.params.len(), 2);
+        // `reject` is the default mode: declaring a contract is the usual
+        // reason to declare one.
+        assert_eq!(c.model.sampling_overrides.conflict, ConflictPolicy::Reject);
+
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(c.model.sampling_overrides.params.is_empty());
+    }
+
+    #[test]
+    fn sampling_param_conflict_selects_the_mode() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"temperature": 1}"#,
+            "--sampling-param-conflict",
+            "allow",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.sampling_overrides.conflict, ConflictPolicy::Allow);
+
+        // The mode alone governs nothing, so clap rejects it (`requires`).
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--sampling-param-conflict",
+            "reject",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--override-sampling-params"), "got: {err}");
+    }
+
+    /// A malformed contract fails the launch with the parser's own message,
+    /// rather than starting a router that 400s every request at the engine.
+    #[test]
+    fn malformed_override_sampling_params_fails_the_launch() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"temp": 1}"#,
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown parameter"), "got: {err}");
     }
 }
