@@ -1,0 +1,95 @@
+name: AMD MI35x HF cache reclaim and seed
+
+# Frees space on the MI35x HuggingFace cache PVC and downloads a large
+# checkpoint into it, in that order, in one job. See the rationale in
+# scripts/ci/amd/reclaim_and_seed_hf_cache.sh: on this volume the two halves
+# cannot be separate jobs, because the fleet absorbs anything released before
+# the job that needs it gets a runner.
+#
+# What it reclaims and what it seeds are set by RECLAIM_DIRS and SEED_MODEL
+# below, so reusing this means editing them and dispatching from the branch
+# carrying that edit. RECLAIM_DIRS empty is an audit: the job reports the cache
+# and uploads a listing, and deletes nothing.
+#
+# It runs on pull_request as well as dispatch because a workflow file that is
+# not yet on the default branch cannot be dispatched at all, and the cache is
+# usually blocking the very PR that is adding the entry.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "scripts/ci/amd/reclaim_and_seed_hf_cache.sh"
+      - "scripts/ci/amd/seed_hf_checkpoint.py"
+      - ".github/workflows/amd-mi35x-hf-cache-reclaim-and-seed.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  # Never cancel in flight: a cancelled seed leaves a partial checkpoint behind,
+  # which is the state this job exists to get out of.
+  group: amd-mi35x-hf-cache-reclaim-and-seed
+  cancel-in-progress: false
+
+jobs:
+  reclaim-and-seed:
+    if: github.repository == 'sgl-project/sglang'
+    name: reclaim-and-seed (mi35x)
+    # The 1-GPU and 8-GPU MI35x pools mount the same cache PVC, so the cheap
+    # pool can seed for the expensive one.
+    runs-on: linux-mi35x-gpu-1
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      # The weights are owned by root because the CI container downloads them,
+      # so the unprivileged runner user can neither unlink nor replace them.
+      # Both halves have to happen inside the container that mounts the PVC.
+      - name: Setup docker
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      # So the seed runs the checkout's downloader rather than the image's, and
+      # therefore the same code the consumer job will use to decide the
+      # checkpoint is already cached.
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+
+      - name: Reclaim and seed
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e RECLAIM_DIRS="" \
+            -e SEED_MODEL="" \
+            -e SEED_MIN_GIB="0" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            bash scripts/ci/amd/reclaim_and_seed_hf_cache.sh || EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${EXIT_CODE:-0}
+
+      # The reachability join that says which of these checkpoints any AMD suite
+      # still names runs off-runner, against this listing.
+      - name: Upload cache listing
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi35x-hf-cache-listing
+          path: |
+            hf-cache-sizes.txt
+            hf-cache-listing.txt
+          if-no-files-found: warn
+          retention-days: 7
