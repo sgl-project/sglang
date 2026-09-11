@@ -18,7 +18,7 @@ These methods delegate to TokenizerManager.score_request() which is provided
 by TokenizerManagerScoreMixin.
 """
 
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import torch
 
@@ -37,6 +37,8 @@ class EngineScoreMixin:
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         return_pooled_hidden_states: bool = False,
+        stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,
+        stacked_query_item_embed_ipc_handle: Optional[Any] = None,
     ) -> ScoreResult:
         """
         Score items against a query using the loaded model.
@@ -64,6 +66,17 @@ class EngineScoreMixin:
             return_pooled_hidden_states: Whether to include raw pooled transformer
                 hidden states (before the task head) in the result. Only supported
                 for non-generation models (SequenceClassification, RewardModel).
+            stacked_query_item_embed_overrides: Zero-copy alternative to
+                query_/item_embed_overrides. One already-stacked [N, hidden] tensor per
+                output sequence, rows ordered query-placeholders-then-item. See
+                score_request.
+            stacked_query_item_embed_ipc_handle: CUDA IPC handle of the buffer backing
+                stacked_query_item_embed_overrides, for zero-copy IPC transport. See
+                score_request. Caller contract: each override must be a view into the
+                buffer this handle exports; writes must be complete before the call; the
+                region must stay allocated and immutable until scoring finishes;
+                overlapping requests must use distinct, unreclaimed regions; and
+                zero-copy IPC requires tp_size == 1.
 
         Returns:
             ScoreResult with scores (one list per item), prompt token count, and
@@ -79,6 +92,8 @@ class EngineScoreMixin:
                 embed_override_token_id=embed_override_token_id,
                 query_embed_overrides=query_embed_overrides,
                 item_embed_overrides=item_embed_overrides,
+                stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,
+                stacked_query_item_embed_ipc_handle=stacked_query_item_embed_ipc_handle,
                 request=None,
                 return_pooled_hidden_states=return_pooled_hidden_states,
             )
@@ -95,6 +110,8 @@ class EngineScoreMixin:
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         return_pooled_hidden_states: bool = False,
+        stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,
+        stacked_query_item_embed_ipc_handle: Optional[Any] = None,
     ) -> ScoreResult:
         """Asynchronous version of score(). See score() for full documentation."""
         return await self.tokenizer_manager.score_request(
@@ -106,6 +123,8 @@ class EngineScoreMixin:
             embed_override_token_id=embed_override_token_id,
             query_embed_overrides=query_embed_overrides,
             item_embed_overrides=item_embed_overrides,
+            stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,
+            stacked_query_item_embed_ipc_handle=stacked_query_item_embed_ipc_handle,
             request=None,
             return_pooled_hidden_states=return_pooled_hidden_states,
         )
