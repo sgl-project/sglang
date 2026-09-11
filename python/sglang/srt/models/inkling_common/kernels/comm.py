@@ -116,9 +116,11 @@ def _get_inkling_ar_resources(comm) -> _InklingArResources | None:
     cached = _INKLING_AR_CACHE.get(key)
     if cached is not None:
         return cached
-    if torch.cuda.is_current_stream_capturing():
-        return None
+    # is_cuda() first: torch.cuda.is_current_stream_capturing() raises on XPU,
+    # where the dummy _cuda_isCurrentStreamCapturing base class is not instantiable.
     if not is_cuda():
+        return None
+    if torch.cuda.is_current_stream_capturing():
         return None
     import torch.distributed._symmetric_memory as torch_symm_mem
 
