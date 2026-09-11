@@ -1437,8 +1437,15 @@ class TestSWAPageRepsFree(CustomTestCase):
                 mutate(mapping, full_indices, swa_indices)
                 allocator.swa_attn_allocator.debug_mode = True
 
-                with self.assertRaisesRegex(
-                    AssertionError, "swa pages do not match the mapped pages"
+                # Exercise debug validation without CI's fatal async assertion.
+                with (
+                    patch.dict(
+                        "os.environ",
+                        {"SGLANG_INVARIANT_CHECK": str(int(InvariantCheckLevel.OFF))},
+                    ),
+                    self.assertRaisesRegex(
+                        AssertionError, "swa pages do not match the mapped pages"
+                    ),
                 ):
                     allocator.free_swa_segment(full_indices[:num_tokens], start_pos=0)
 
