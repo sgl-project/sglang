@@ -3,6 +3,8 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
 
 class WindowLayout(msgspec.Struct, frozen=True):
     req: torch.Tensor
@@ -171,9 +173,6 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
-        # Startup warmups and graph captures read synthetic history that no
-        # request wrote; the ownership check starts with the first real request.
-        self._serving = False
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -183,7 +182,6 @@ class RequestWindow:
         self.workspace = self.pool_factory(size, 1)
 
     def reset(self, slots):
-        self._serving = True
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
             self.capacity, device=slots.device
         )
@@ -222,12 +220,17 @@ class RequestWindow:
         )
 
     def buffer(self, layer):
-        if self.prepared != layer:
+        # The runner's capture scope includes eager warmups, before CUDA capture
+        # starts. Include the phase in the key so leaving that scope revalidates
+        # ownership even when the layout and layer have not changed.
+        in_capture = get_is_capture_mode() or _capturing()
+        prepared_key = (layer, in_capture)
+        if self.prepared != prepared_key:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
             src = self._history_src(layout)
-            if self._serving and not _capturing():
+            if not in_capture:
                 valid = layout.history_valid
                 if not torch.equal(
                     self.tags[layer, src][valid], layout.history_pos[valid]
@@ -242,7 +245,7 @@ class RequestWindow:
                 layout.history_loc,
                 page_size=self.page_size,
             )
-            self.prepared = layer
+            self.prepared = prepared_key
         return self.workspace.kv_buffer[0]
 
     def commit(self, layer):

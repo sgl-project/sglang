@@ -698,9 +698,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self.request_window = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
-        # Keep DSpark's paged SWA cache: removing its history hurts speculative
-        # decoding acceptance length. The draft shares the target allocator's
-        # full-to-SWA mapping, so the target still needs that allocator.
+        # Note(Oasis-Git): Keep DSpark's paged SWA cache because removing its
+        # history hurts speculative decoding acceptance length. The draft shares
+        # the target's full-to-SWA mapping, so the target still needs the allocator.
         self.needs_paged_swa_allocator = (
             not encoder_replay
             or is_draft_worker

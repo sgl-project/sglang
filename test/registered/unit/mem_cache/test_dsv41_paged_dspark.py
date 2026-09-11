@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -81,6 +82,27 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
         self.assertEqual(
             draft.translate_loc_from_full_to_swa(full).tolist(), [256, 300, 511]
         )
+
+    def test_non_overlap_scheduler_keyword_dispatch(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, is_extend_in_batch=False
+        )
+        expected = object()
+        worker = SimpleNamespace(_forward_decode=Mock(return_value=expected))
+        result = DSparkWorkerV2.forward_batch_generation(
+            worker, batch, pp_proxy_tensors=None
+        )
+        self.assertIs(result, expected)
+        worker._forward_decode.assert_called_once_with(batch, None, None)
+        with self.assertRaisesRegex(AssertionError, "pipeline parallelism"):
+            DSparkWorkerV2.forward_batch_generation(
+                worker, batch, pp_proxy_tensors=object()
+            )
 
     def test_budget_reserves_target_window_and_real_draft_layer_count(self):
         cfg = SimpleNamespace(

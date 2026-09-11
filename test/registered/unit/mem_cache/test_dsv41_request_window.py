@@ -7,6 +7,7 @@ from sglang.srt.mem_cache.dsv41_request_window import (
     copy_packed_tokens,
     window_layout,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -145,6 +146,34 @@ def test_startup_dummy_history_does_not_relax_real_request_validation():
         state.buffer(0)
 
 
+@pytest.mark.parametrize("after_reset", [False, True])
+def test_capture_scope_does_not_relax_eager_history_validation(after_reset):
+    state = RequestWindow(
+        PackedPool, num_slots=3, layers=1, page_size=4, capacity=8, workspace_rows=64
+    )
+    layout = window_layout(torch.tensor([1]), torch.tensor([20]), window=3, capacity=8)
+    if after_reset:
+        state.reset(torch.tensor([1]))
+    state.activate(layout)
+    with pytest.raises(RuntimeError, match="history is missing"):
+        state.buffer(0)
+    workspace_address = state.workspace.kv_buffer[0].data_ptr()
+    for _ in range(2):
+        with model_capture_mode():
+            state.buffer(0)
+            state.buffer(0)
+        # Same layout/layer after warmup must not reuse an unchecked buffer.
+        with pytest.raises(RuntimeError, match="history is missing"):
+            state.buffer(0)
+        assert state.workspace.kv_buffer[0].data_ptr() == workspace_address
+    with pytest.raises(ValueError, match="capture failure"):
+        with model_capture_mode():
+            state.buffer(0)
+            raise ValueError("capture failure")
+    with pytest.raises(RuntimeError, match="history is missing"):
+        state.buffer(0)
+
+
 @pytest.mark.parametrize("accepted", range(1, 7))
 def test_verify_rejection_preserves_required_history(accepted):
     state = RequestWindow(
@@ -191,6 +220,7 @@ def test_cuda_graph_replay_refreshes_request_history():
     for slot in (1, 2):
         for pos in range(7, 10):
             put(state.state.kv_buffer[0], slot * state.capacity + pos, slot * 40 + pos)
+            state.tags[0, slot * state.capacity + pos] = pos
     a = window_layout(
         torch.tensor([1], device="cuda"),
         torch.tensor([10], device="cuda"),

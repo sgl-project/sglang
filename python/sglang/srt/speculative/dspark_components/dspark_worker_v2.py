@@ -522,6 +522,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        # The non-overlap scheduler passes this keyword even when PP=1.
         assert pp_proxy_tensors is None, "DSpark does not support pipeline parallelism"
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()

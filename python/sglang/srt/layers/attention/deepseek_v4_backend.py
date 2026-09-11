@@ -624,7 +624,6 @@ class DSV4AttnMetadata:
                 "c2_sparse_topk_lengths",
                 "c2_sparse_page_indices",
                 "c2_sparse_raw_indices",
-                # Captured window copies read the layout tensors by address.
                 "request_window_layout",
             ],
             assign_fields=[
