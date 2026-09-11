@@ -978,6 +978,42 @@ class TestSWARequestSizing(CustomTestCase):
                 expected_full = (budget // 1024 - expected_swa) // 16 * 16
                 self.assertEqual(sizes.max_total_num_tokens, expected_full)
 
+    def test_request_headroom_covers_prefill_overlap_and_pd_transfer(self):
+        for fields, execution_headroom in (
+            ({}, 288),
+            ({"disable_overlap_schedule": True}, 224),
+            (
+                {
+                    "disaggregation_mode": "decode",
+                    "disaggregation_decode_extra_slots": 3,
+                },
+                576,
+            ),
+        ):
+            with self.subTest(fields=fields):
+                cfg = self._configurator(**fields)
+                budget = cfg._swa_request_budget
+                self.assertEqual(budget.working_set_tokens, 4 * 128)
+                self.assertEqual(budget.execution_headroom_tokens, execution_headroom)
+                self.assertEqual(budget.cache_headroom_tokens, 0)
+                sizes = cfg.calculate_pool_sizes(8 << 20, 16)
+                self.assertEqual(
+                    sizes.swa_max_total_num_tokens, 512 + execution_headroom
+                )
+
+    def test_budget_log_distinguishes_headroom_alignment_and_token_limit(self):
+        cfg = self._configurator(max_running_requests=3, sliding_window_size=127)
+        with self.assertLogs(
+            "sglang.srt.model_executor.pool_configurator", level="INFO"
+        ) as logs:
+            sizes = cfg.calculate_pool_sizes_from_max_tokens(512, 16)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 512)
+        self.assertIn(
+            "working_set=381, execution_headroom=252, cache_headroom=0, "
+            "page_alignment=7, reservation=640, capacity=512",
+            logs.output[0],
+        )
+
     def test_request_rejects_unsupported_configurations(self):
         for fields in (
             {"max_running_requests": None},
@@ -1073,6 +1109,32 @@ class TestDSV4SizingPolicy(CustomTestCase):
             cfg.finalize_with_max_running_requests(config)
         self.assertEqual(first.c4_state_pool_size, second.c4_state_pool_size)
         self.assertEqual(first.c128_state_pool_size, second.c128_state_pool_size)
+
+    def test_ring_headroom_accounts_for_extra_slots_without_changing_bytes(self):
+        cfg = self._configurator(
+            unified=True,
+            swa_full_tokens_ratio=None,
+            disaggregation_mode="decode",
+            disaggregation_decode_extra_slots=3,
+        )
+        budget = cfg._swa_ring_request_budget(16)
+        self.assertEqual(budget.working_set_tokens, 16 * 128)
+        self.assertEqual(
+            budget.execution_headroom_tokens,
+            16 * (cfg._swa_ring_size - 128) + 4 * cfg._swa_ring_size,
+        )
+        self.assertEqual(budget.cache_headroom_tokens, 0)
+        self.assertEqual(
+            cfg._fixed_swa_bytes(16),
+            20 * cfg._swa_ring_size * 192 * 2 * 2,
+        )
+        with self.assertLogs(
+            "sglang.srt.model_executor.pool_configurator", level="INFO"
+        ) as logs:
+            cfg.calculate_pool_sizes(128 << 20, 128)
+        self.assertTrue(
+            any("layout=ring, working_set=2048" in line for line in logs.output)
+        )
 
     def test_paged_cost_matches_main_budget_equation(self):
         from sglang.srt.environ import envs

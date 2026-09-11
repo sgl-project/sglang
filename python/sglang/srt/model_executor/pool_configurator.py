@@ -842,6 +842,35 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
+@dataclass(frozen=True)
+class _SWARequestBudget:
+    working_set_tokens: int
+    execution_headroom_tokens: int
+    cache_headroom_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            self.working_set_tokens
+            + self.execution_headroom_tokens
+            + self.cache_headroom_tokens
+        )
+
+    def log(self, *, layout: str, reserved_tokens: int, capacity_tokens: int) -> None:
+        logger.info(
+            "SWA request budget (tokens): layout=%s, working_set=%d, "
+            "execution_headroom=%d, cache_headroom=%d, page_alignment=%d, "
+            "reservation=%d, capacity=%d",
+            layout,
+            self.working_set_tokens,
+            self.execution_headroom_tokens,
+            self.cache_headroom_tokens,
+            reserved_tokens - self.total_tokens,
+            reserved_tokens,
+            capacity_tokens,
+        )
+
+
 class SWARequestPoolConfigurator(HybridSWAPoolConfigurator):
     """Hybrid SWA configurator with a request-based SWA reservation.
 
@@ -861,11 +890,7 @@ class SWARequestPoolConfigurator(HybridSWAPoolConfigurator):
         draft_tokens = get_spec().speculative_num_draft_tokens or 1
         eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
-        """
-        __________[padding][eviction_interval][window]
-        Padding to make sure eviction point is page-aligned.
-        """
-        trailing_tokens = window + eviction_interval * draft_tokens + page_size
+        eviction_headroom = eviction_interval * draft_tokens
         if get_spec().speculative_algorithm is None:
             decode_alloc = page_size
         elif get_schedule().disable_overlap_schedule:
@@ -880,21 +905,25 @@ class SWARequestPoolConfigurator(HybridSWAPoolConfigurator):
             # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
             # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
             decode_alloc = 2 * get_alloc_len_per_decode()
-        per_request = trailing_tokens + decode_alloc
+        per_request_headroom = eviction_headroom + page_size + decode_alloc
 
         num_reqs = get_schedule().max_running_requests // kvc.ps.attn_dp_size
         if get_disagg().disaggregation_mode == "decode":
-            self._swa_request_tokens = (
-                per_request * num_reqs
-                + (window + page_size) * get_disagg().disaggregation_decode_extra_slots
-            )
+            batch_headroom = (
+                window + page_size
+            ) * get_disagg().disaggregation_decode_extra_slots
         else:
             chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
-            self._swa_request_tokens = (
-                per_request * num_reqs
-                + chunks_in_flight * get_schedule().chunked_prefill_size
-                + page_size
+            batch_headroom = (
+                chunks_in_flight * get_schedule().chunked_prefill_size + page_size
             )
+
+        self._swa_request_budget = _SWARequestBudget(
+            working_set_tokens=num_reqs * window,
+            execution_headroom_tokens=num_reqs * per_request_headroom + batch_headroom,
+            # Paged request sizing currently requires radix cache to be disabled.
+            cache_headroom_tokens=0,
+        )
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
@@ -912,10 +941,27 @@ class SWARequestPoolConfigurator(HybridSWAPoolConfigurator):
             return False
         return len(kvc.model_config.full_attention_layer_ids) > 0
 
+    def _resolve_swa_tokens(
+        self, page_size: int, token_limit: Optional[int] = None
+    ) -> int:
+        budget = self._swa_request_budget
+        reserved_tokens = ceil_align(budget.total_tokens, page_size)
+        capacity_tokens = (
+            reserved_tokens
+            if token_limit is None
+            else min(reserved_tokens, token_limit)
+        )
+        budget.log(
+            layout="paged",
+            reserved_tokens=reserved_tokens,
+            capacity_tokens=capacity_tokens,
+        )
+        return capacity_tokens
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        swa_tokens = ceil_align(self._swa_request_tokens, page_size)
+        swa_tokens = self._resolve_swa_tokens(page_size)
         fixed_swa_bytes = self._swa_pool_bytes(swa_tokens)
         if self._enable_unified_memory and self._draft_pool_bytes_per_token() > 0:
             full_tokens = self._max_unified_full_tokens(
@@ -944,12 +990,12 @@ class SWARequestPoolConfigurator(HybridSWAPoolConfigurator):
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         # A global token limit also bounds the useful request reservation.
-        swa_tokens = ceil_align(self._swa_request_tokens, page_size)
+        swa_tokens = self._resolve_swa_tokens(page_size, max_total_num_tokens)
         full_tokens = (max_total_num_tokens // page_size) * page_size
         return MemoryPoolConfig(
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=min(swa_tokens, max_total_num_tokens),
+            swa_max_total_num_tokens=swa_tokens,
         )
 
 
@@ -1227,13 +1273,24 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         estimated = max(min(estimated, 4096), 2048)
         return min(estimated, full_token // 2)
 
+    def _swa_ring_request_budget(self, max_running_requests: int) -> _SWARequestBudget:
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+        extra_slots = num_req_slots - max_running_requests
+        return _SWARequestBudget(
+            working_set_tokens=max_running_requests * self.swa_page_size,
+            execution_headroom_tokens=(
+                max_running_requests * (self._swa_ring_size - self.swa_page_size)
+                + extra_slots * self._swa_ring_size
+            ),
+            cache_headroom_tokens=0,
+        )
+
     def _fixed_swa_bytes(self, max_running_requests: int) -> int:
         if not self._unified:
             return 0
-        num_req_slots = self._get_num_req_slots(max_running_requests)
+        budget = self._swa_ring_request_budget(max_running_requests)
         ring_bytes = (
-            num_req_slots
-            * self._swa_ring_size
+            budget.total_tokens
             * self.attn_head_dim
             * 2  # bf16
             * self.num_layers_total
@@ -1290,6 +1347,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             max_running_requests_per_worker
         )
         swa_ring_fixed_bytes = self._fixed_swa_bytes(max_running_requests_per_worker)
+        if self._unified:
+            budget = self._swa_ring_request_budget(max_running_requests_per_worker)
+            budget.log(
+                layout="ring",
+                reserved_tokens=budget.total_tokens,
+                capacity_tokens=budget.total_tokens,
+            )
         c4_state_fixed_bytes = self._fixed_c4_state_bytes(
             max_running_requests_per_worker
         )
