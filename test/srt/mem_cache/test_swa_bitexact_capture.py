@@ -434,18 +434,20 @@ class TestSwaHostSizingByStride(unittest.TestCase):
 class TestSwaStrideArg(unittest.TestCase):
     """Task A1: --hicache-swa-offload-page-stride parses and defaults to 1.
 
-    ServerArgs.__post_init__ eagerly resolves the model config (network I/O for
-    a bogus model path), so we validate the dataclass field default and the CLI
-    wiring directly instead of constructing a full ServerArgs.
+    ServerArgs resolves the model config eagerly (network I/O for a bogus model
+    path), so we read the field default and the CLI wiring directly instead of
+    constructing a full ServerArgs.
     """
 
     def test_default_is_one(self):
+        import msgspec
+
         from sglang.srt.server_args import ServerArgs
 
-        self.assertEqual(
-            ServerArgs.__dataclass_fields__["hicache_swa_offload_page_stride"].default,
-            1,
-        )
+        default = {f.name: f.default for f in msgspec.structs.fields(ServerArgs)}[
+            "hicache_swa_offload_page_stride"
+        ]
+        self.assertEqual(default, 1)
 
     def test_cli_default_is_one(self):
         import argparse
