@@ -150,6 +150,9 @@ static __device__ __forceinline__ uint32_t ld_acq_b32(const uint32_t* ptr) {
 static __device__ __forceinline__ void fence_async_global() {
   asm volatile("fence.proxy.async.global;");
 }
+static __device__ __forceinline__ void fence_async_shared() {
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
 
 // ---- tcgen05 (TMEM lifecycle, ld/st, MMA, fences) ----
 static __device__ __forceinline__ void tcgen05_alloc(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
@@ -1524,6 +1527,7 @@ __device__ static void chain_body(
       // after the TMA through mb_pre)
       ptx::mbar_wait_parity(&S.mb_pre, q2 & 1);
       widen_map_tf32(bL, pL, vc, ch);
+      ptx::fence_async_shared();
       ptx::tcgen05_fence_before_thread_sync();
       __syncthreads();
       if (tid == 0) {
