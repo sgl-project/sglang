@@ -1875,7 +1875,13 @@ class LayerwiseOffloadManager:
                         or host_copies_would_not_fit(self._mapped_bytes)
                     )
                     and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ
-                    and self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
+                    # the size floor guards components re-streamed many times
+                    # per request; one armed once (every layer resident) has
+                    # no such pass to protect
+                    and (
+                        self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
+                        or not self._streamed_order
+                    )
                 ),
                 direct_read_always=host_copies_are_redundant(),
                 cold_source=self._mapped_source_is_cold,
