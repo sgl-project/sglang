@@ -24,6 +24,9 @@ class IndexerInputs:
     k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
     weights: torch.Tensor  # [rows, heads] bf16/fp32 head weights
     metadata: PagedIndexerMetadata  # this ratio's lengths, page table and plans
+    # [rows] int, one request id per query row, the rows of one request
+    # consecutive (verify: its draft tokens); None = every row its own request
+    request_ids: Optional[torch.Tensor] = None
 
     @property
     def num_rows(self) -> int:

@@ -77,19 +77,41 @@ def amax_topk_blocks(
     return blocks
 
 
+_ROW_IDS: dict = {}
+
+
+def _row_ids(rows: int, device: torch.device) -> torch.Tensor:
+    """``arange(rows)`` int32 from a cached buffer (grown in steps of 8192), so the
+    every-row-its-own-request case costs no launch."""
+    buf = _ROW_IDS.get(device)
+    if buf is None or buf.numel() < rows:
+        size = max(8192, -(-rows // 8192) * 8192)
+        buf = _ROW_IDS[device] = torch.arange(size, dtype=torch.int32, device=device)
+    return buf[:rows]
+
+
 def build_sparse_indexer_schedule(
     blocks: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     page_size: int,
     q_dtype: torch.dtype,
+    request_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """DeepGEMM's schedule for the published blocks: ``seq_lens`` ``[rows]``
-    int32, ``page_table`` ``[rows, pages]`` int32 at the index pool's page size."""
+    int32, ``page_table`` ``[rows, pages]`` int32 at the index pool's page size.
+    ``request_ids`` ``[rows]``, one id per row with a request's rows consecutive
+    (verify: its draft tokens), lets DeepGEMM pair two rows of a request on one
+    KV pass; each row keeps its own block list and output layout. Paired rows
+    must share their page-table row. None: every row is its own request."""
     import deep_gemm
 
-    # TODO(candidate): the request ids are shape-only; they belong in the metadata
-    request_ids = torch.arange(blocks.shape[0], dtype=torch.int32, device=blocks.device)
+    rows = blocks.shape[0]
+    if request_ids is None:
+        request_ids = _row_ids(rows, blocks.device)  # cached, no launch
+    else:
+        # the scheduler keeps request indices as int64; one small cast per publish
+        request_ids = request_ids[:rows].to(torch.int32).contiguous()
     return deep_gemm.get_paged_sparse_mqa_logits_metadata(
         seq_lens.contiguous(),
         page_table,
@@ -221,6 +243,7 @@ class DeepGemmCandidateIndexer:
                 metadata.page_table,
                 metadata.c4_page_size,
                 inputs.q_fp4.dtype,
+                inputs.request_ids,
             )
             return SparseBlockTable(
                 blocks=blocks,

@@ -248,6 +248,115 @@ class TestSparseIndexer(CustomTestCase):
             got_vals = dense16[b].float()[p].sort().values
             self.assertTrue(torch.equal(got_vals, ref_vals), f"row {b}")
 
+    @unittest.skipUnless(
+        _sparse_indexer_available(), "needs DeepGEMM's paged sparse MQA logits on SM100"
+    )
+    def test_paired_verify_rows_match_unpaired(self):
+        """Verify shape: each request has 6 consecutive rows (its draft tokens) with
+        lengths L, L+1, ..., sharing one page-table row. With request ids DeepGEMM
+        pairs the rows on one KV pass; the sparse logits must equal the unpaired
+        (every row its own request) result bitwise, row layout unchanged."""
+        import deep_gemm
+
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_row_lens,
+        )
+        from sglang.kernels.ops.attention.dsv4.topk import (
+            sort_candidate_blocks,
+        )
+        from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
+            SparseBlockTable,
+            amax_topk_blocks,
+            build_sparse_indexer_schedule,
+            sparse_logits,
+            valid_lens,
+        )
+
+        torch.manual_seed(3)
+        draft = 6
+        base = torch.tensor([20000, 16385, 70000], dtype=torch.int32, device="cuda")
+        lens = (
+            base[:, None] + torch.arange(draft, device="cuda", dtype=torch.int32)
+        ).flatten()
+        request_ids = torch.repeat_interleave(
+            torch.tensor([7, 3, 11], dtype=torch.int64, device="cuda"), draft
+        )
+        rows = lens.numel()
+        max_pages = (int(lens.max()) + PAGE - 1) // PAGE
+        num_pages = base.numel() * max_pages
+        pool = torch.randint(
+            0, 255, (num_pages, PAGE * 68), dtype=torch.uint8, device="cuda"
+        )
+        pool[:, PAGE * 64 :] = torch.randint(
+            118, 123, (num_pages, PAGE * 4), dtype=torch.uint8, device="cuda"
+        )
+        k_cache = pool.view(num_pages, PAGE, 1, 68)
+        per_request = (
+            torch.randperm(num_pages, device="cuda")
+            .view(base.numel(), max_pages)
+            .to(torch.int32)
+        )
+        page_table = per_request.repeat_interleave(draft, dim=0)  # rows share theirs
+        q_fp4 = torch.randint(
+            0, 255, (rows, 1, HEADS, HEAD_DIM // 2), dtype=torch.uint8, device="cuda"
+        ).view(torch.int8)
+        q_sf = (
+            torch.randint(
+                118, 123, (rows, 1, HEADS, 4), dtype=torch.uint8, device="cuda"
+            )
+            .view(torch.int32)
+            .squeeze(-1)
+        )
+        weights = (torch.rand(rows, HEADS, device="cuda") * 0.05).to(torch.bfloat16)
+        sched = deep_gemm.get_paged_mqa_logits_metadata(
+            lens.view(-1, 1), PAGE, deep_gemm.get_num_sms()
+        )
+        dense = deep_gemm.fp8_fp4_paged_mqa_logits(
+            (q_fp4, q_sf),
+            k_cache,
+            weights.float(),
+            lens.view(-1, 1),
+            page_table,
+            sched,
+            int(lens.max()),
+            False,
+            torch.float32,
+        )
+        nblocks, row_valid = candidate_row_lens(lens, BLOCKS)
+        blocks = amax_topk_blocks(dense, lens, nblocks, BLOCKS)
+        phys = sort_candidate_blocks(blocks, lens, page_table, PAGE)
+        out = {}
+        for name, ids in (("paired", request_ids), ("unpaired", None)):
+            schedule = build_sparse_indexer_schedule(
+                blocks, lens, page_table, PAGE, q_fp4.dtype, ids
+            )
+            table = SparseBlockTable(
+                blocks=blocks, schedule=schedule, phys_blocks=phys, valid_lens=row_valid
+            )
+            out[name] = sparse_logits(q_fp4, q_sf, k_cache, weights, table)
+        cols = torch.arange(BLOCKS * 8, device="cuda")
+        valid = cols[None, :] < row_valid[:, None].long()
+        self.assertTrue(torch.equal(row_valid, valid_lens(lens, BLOCKS)))
+        self.assertTrue(
+            torch.equal(out["paired"][valid], out["unpaired"][valid]),
+            "pairing changed the sparse logits",
+        )
+        # and both equal the dense bf16 logits at the published positions
+        dense16 = deep_gemm.fp8_fp4_paged_mqa_logits(
+            (q_fp4, q_sf),
+            k_cache,
+            weights,
+            lens.view(-1, 1),
+            page_table,
+            sched,
+            int(lens.max()),
+            False,
+            torch.bfloat16,
+        )
+        pos = blocks.long().repeat_interleave(8, dim=1) * 8 + (cols % 8)[None, :]
+        ref = dense16.gather(1, pos.clamp(max=dense16.shape[1] - 1))
+        self.assertTrue(torch.equal(out["paired"][valid], ref[valid]))
+
 
 if __name__ == "__main__":
     unittest.main()

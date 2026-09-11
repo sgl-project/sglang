@@ -3018,7 +3018,10 @@ class DeepseekV4AttnBackend(
         )
         if is_decode_or_verify:
             if _is_sm100_or_newer():
-                self._low_ratio_index_topk_decode(layer, x, q_lora, pos)
+                # verify rows of one request share a request id (DeepGEMM pairs
+                # them); decode has one row per request, nothing to pair
+                req_ids = None if forward_batch.forward_mode.is_decode() else req
+                self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
             else:
                 self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
         elif (
@@ -3253,7 +3256,7 @@ class DeepseekV4AttnBackend(
             if raw_indices is not None:
                 raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(torch.int32)
 
-    def _low_ratio_index_topk_decode(self, layer, x, q_lora, pos) -> None:
+    def _low_ratio_index_topk_decode(self, layer, x, q_lora, pos, req=None) -> None:
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             skip_low_ratio_indexer,
         )
@@ -3319,7 +3322,14 @@ class DeepseekV4AttnBackend(
 
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
-        inputs = IndexerInputs(q_fp4, q_sf, k_cache, weights, metadata)
+        inputs = IndexerInputs(
+            q_fp4,
+            q_sf,
+            k_cache,
+            weights,
+            metadata,
+            request_ids=req,  # one per query row; verify rows of a request share one
+        )
         candidate_layer = not _every_request_fits()
         # use special selection for candidate layers
         if indexer.uses_candidates and candidate_layer:
