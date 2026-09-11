@@ -100,14 +100,18 @@ class TestNPUGLM_5_2_W8A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = GLM_5_2_W8A8_16P_TWO_NODE_MODEL_CONFIG
     accuracy = 0.912
+    # Run GPQA only once; fail without retrying when accuracy misses the threshold.
+    accuracy_max_retries = 1
     datasets = ["gpqa_diamond"]
     # eval_batch_size = 16
     # generation_config = {"max_tokens": 131072, "temperature": 1.0}
     eval_batch_size = 32
     generation_config = {
-        "max_tokens": 65536,
+        "max_tokens": 131072,
+        "top_p": 0.95,
         "temperature": 1.0,
-        "timeout": 1200,
+        "timeout": 7200,
+        "retries": 2,
         "stream": True,
     }
 
