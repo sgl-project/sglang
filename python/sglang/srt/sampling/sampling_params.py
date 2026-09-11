@@ -159,6 +159,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     stop_str_max_len: int = 0  # set by normalize()
     stop_regex_max_len: int = 0  # set by normalize()
     is_normalized: bool = False  # set by normalize()
+    ebnf_full_assistant: bool = False
 
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers

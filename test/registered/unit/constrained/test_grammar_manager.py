@@ -87,6 +87,7 @@ def _make_req(
     req.sampling_params.json_schema = json_schema
     req.sampling_params.regex = regex
     req.sampling_params.ebnf = ebnf
+    req.sampling_params.ebnf_full_assistant = False
     req.sampling_params.structural_tag = structural_tag
     req.sampling_params.custom_params = custom_params
     req.require_reasoning = False
@@ -201,11 +202,16 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         future = Future()
         mgr.grammar_backend.get_cached_or_future_value.return_value = (future, False)
 
-        req = _make_req(ebnf="root ::= 'hello'")
-        result = mgr.process_req_with_grammar(req)
-
-        self.assertTrue(result)
-        self.assertEqual(req.grammar_key, ("ebnf", "root ::= 'hello'"))
+        for full_assistant, key_type in (
+            (False, "ebnf"),
+            (True, "full_assistant_ebnf"),
+        ):
+            with self.subTest(full_assistant=full_assistant):
+                req = _make_req(ebnf='root ::= "hello"')
+                req.sampling_params.ebnf_full_assistant = full_assistant
+                result = mgr.process_req_with_grammar(req)
+                self.assertTrue(result)
+                self.assertEqual(req.grammar_key, (key_type, 'root ::= "hello"'))
 
     def test_structural_tag_cache_miss(self):
         mgr = self._make_mgr()

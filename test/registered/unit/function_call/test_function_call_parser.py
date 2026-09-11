@@ -3,6 +3,8 @@ import json
 import unittest
 import warnings
 
+import xgrammar as xgr
+
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
@@ -14,6 +16,7 @@ from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector,
     _parse_gemma4_args,
@@ -3671,11 +3674,142 @@ class TestGlm47MoeDetector(unittest.TestCase):
             self.assertIsNone(self.detector.get_structural_tag(self.tools))
 
             parser = FunctionCallParser(self.tools, "glm47")
+            self.assertEqual(
+                "full_assistant_ebnf",
+                parser.get_structure_constraint("required")[0],
+            )
+            strict_tools = [
+                tool.model_copy(
+                    update={
+                        "function": tool.function.model_copy(update={"strict": True})
+                    }
+                )
+                for tool in self.tools
+            ]
+            parser = FunctionCallParser(strict_tools, "glm47")
             constraint = parser.get_structure_constraint("required")
 
             self.assertIsNotNone(constraint)
             self.assertEqual("json_schema", constraint[0])
             _glm47_native_structural_tag_available.cache_clear()
+
+
+class TestGlm47FullAssistantGrammar(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+
+    def _compile(self, parameters=None, choice="auto", parallel=True, thinking=False):
+        tools = [
+            Tool(type="function", function=Function(name=name, parameters=parameters))
+            for name in ("alpha", "beta")
+        ]
+        parser = FunctionCallParser(tools, "glm47")
+        constraint = parser.get_structure_constraint(
+            choice, parallel_tool_calls=parallel, thinking_mode=thinking
+        )
+        self.assertIsNotNone(constraint)
+        return self.compiler.compile_grammar(xgr.Grammar.from_ebnf(constraint[1]))
+
+    def _accepts(self, grammar, text):
+        matcher = xgr.GrammarMatcher(grammar)
+        return matcher.accept_string(text) and matcher.is_completed()
+
+    def test_tool_choice_and_parallel_calls(self):
+        alpha = "<tool_call>alpha</tool_call>"
+        beta = "<tool_call>beta</tool_call>"
+        named = ToolChoice(function=ToolChoiceFuncName(name="alpha"))
+        for thinking in (False, True):
+            prefix = "analysis</think>" if thinking else ""
+            for parallel in (False, True):
+                for choice in ("auto", "required", named, "none"):
+                    with self.subTest(
+                        thinking=thinking, parallel=parallel, choice=choice
+                    ):
+                        grammar = self._compile(
+                            choice=choice, parallel=parallel, thinking=thinking
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + "Hello"),
+                            choice in ("auto", "none"),
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + alpha), choice != "none"
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + beta),
+                            choice in ("auto", "required"),
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + alpha * 2),
+                            parallel and choice != "none",
+                        )
+
+    def test_enum_json_types_and_boolean_schemas(self):
+        cases = [
+            ({"enum": [1, 2]}, ["1", "2"], ["3"]),
+            ({"enum": [True, False]}, ["true", "false"], ["True", "1"]),
+            (
+                {"type": ["string", "null"], "enum": ["ok", None]},
+                ["ok", "null"],
+                ["None", "bad"],
+            ),
+            ({"enum": [{"x": 1}, [True, None]]}, ['{"x": 1}', "[true, null]"], ["{}"]),
+            (True, ["anything"], []),
+            (False, ["anything"], []),
+        ]
+        for schema, accepted, rejected in cases:
+            with self.subTest(schema=schema):
+                grammar = self._compile({"properties": {"p": schema}})
+                for values, expected in ((accepted, True), (rejected, False)):
+                    for value in values:
+                        text = f"<tool_call>alpha<arg_key>p</arg_key><arg_value>{value}</arg_value></tool_call>"
+                        self.assertEqual(self._accepts(grammar, text), expected, text)
+
+    def test_composed_and_unresolved_schemas_allow_arguments(self):
+        schemas = [
+            {keyword: [{"properties": {"city": {"type": "string"}}}]}
+            for keyword in ("allOf", "anyOf", "oneOf")
+        ]
+        schemas += [
+            {
+                "properties": {"country": {"type": "string"}},
+                "allOf": [{"properties": {"city": {"type": "string"}}}],
+            },
+            {
+                "$ref": "#/$defs/args",
+                "$defs": {"args": {"properties": {"city": {"type": "string"}}}},
+            },
+            {
+                "anyOf": [
+                    {"properties": {"city": {"enum": [1]}}},
+                    {"properties": {"city": {"enum": ["Paris"]}}},
+                ]
+            },
+        ]
+        for schema in schemas:
+            with self.subTest(schema=schema):
+                grammar = self._compile(schema)
+                arg = "<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+                self.assertTrue(
+                    self._accepts(grammar, f"<tool_call>alpha{arg}</tool_call>")
+                )
+                self.assertTrue(
+                    self._accepts(grammar, f"<tool_call>alpha{arg}{arg}</tool_call>")
+                )
+                self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
+
+    def test_escaped_property_names(self):
+        for key in ['a"b', "path\\name", "line\nbreak", "tab\tkey", "control\x01key"]:
+            with self.subTest(key=key):
+                grammar = self._compile({"properties": {key: {"type": "string"}}})
+                text = f"<tool_call>alpha<arg_key>{key}</arg_key><arg_value>v</arg_value></tool_call>"
+                self.assertTrue(self._accepts(grammar, text))
 
 
 class TestLing3Detector(unittest.TestCase):

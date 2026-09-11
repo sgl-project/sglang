@@ -269,7 +269,7 @@ class BaseGrammarBackend:
             grammar = self.dispatch_json(key_string)
         elif key_type == "regex":
             grammar = self.dispatch_regex(key_string)
-        elif key_type == "ebnf":
+        elif key_type in ("ebnf", "full_assistant_ebnf"):
             grammar = self.dispatch_ebnf(key_string)
         elif key_type == "structural_tag":
             grammar = self.dispatch_structural_tag(key_string)
@@ -439,7 +439,6 @@ def create_grammar_backend(
             reasoning_parser,
             tokenizer,
             enable_strict_thinking=get_serving().enable_strict_thinking,
-            skip_ebnf=get_serving().tool_call_parser == "glm47",
         )
 
     return grammar_backend

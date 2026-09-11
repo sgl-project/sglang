@@ -267,11 +267,9 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         reasoning_parser: ReasoningParser,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         enable_strict_thinking: bool = False,
-        skip_ebnf: bool = False,
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
-        self.skip_ebnf = skip_ebnf
         think_end_ids = tokenizer.encode(
             reasoning_parser.detector.think_end_token, add_special_tokens=False
         )
@@ -354,6 +352,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
-        if self.skip_ebnf and key[0] == "ebnf":
+        if key[0] == "full_assistant_ebnf":
             return ret
         return self._make_grammar_object(ret, reasoning)

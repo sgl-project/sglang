@@ -274,35 +274,41 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
-        if (
-            isinstance(self.detector, Glm47MoeDetector)
-            and self.detector.use_full_assistant_constraint
-        ):
-            functions = (
-                [tool.function for tool in self.tools]
-                if self.tools and tool_choice != "none"
-                else None
-            )
-            return (
-                "ebnf",
-                generate_glm_grammar(
-                    enable_thinking=thinking_mode,
-                    functions=functions,
-                    special_tokens=GlmSpecialTokenConfig(),
-                    chat_template_version="glm47",
-                    accommodate_chat_template=True,
-                    allow_multiple_assistant_turns=False,
-                ),
-            )
-
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
         should_constrain_auto = tool_choice == "auto" and (
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
 
-        # Highest priority: model-native structural_tag when available.
         try:
+            if (
+                isinstance(self.detector, Glm47MoeDetector)
+                and self.detector.use_full_assistant_constraint
+            ):
+                functions = (
+                    [
+                        tool.function
+                        for tool in self.tools
+                        if not isinstance(tool_choice, ToolChoice)
+                        or tool.function.name == tool_choice.function.name
+                    ]
+                    if self.tools and tool_choice != "none"
+                    else None
+                )
+                return (
+                    "full_assistant_ebnf",
+                    generate_glm_grammar(
+                        enable_thinking=thinking_mode,
+                        functions=functions,
+                        special_tokens=GlmSpecialTokenConfig(),
+                        chat_template_version="glm47",
+                        accommodate_chat_template=True,
+                        allow_multiple_assistant_turns=False,
+                        required=is_required,
+                        parallel_tool_calls=parallel_tool_calls,
+                    ),
+                )
+            # Highest priority: model-native structural_tag when available.
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(
                     tools=self.tools,

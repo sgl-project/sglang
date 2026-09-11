@@ -867,7 +867,9 @@ def _glm_hash_name(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
 
 
-def _glm_get_value_rule(prop: dict) -> str:
+def _glm_get_value_rule(prop: Any) -> str:
+    if not isinstance(prop, dict):
+        return "text_without_special_tokens"
     if "enum" in prop:
         return _glm_handle_enum(prop)
     if "type" in prop:
@@ -876,26 +878,19 @@ def _glm_get_value_rule(prop: dict) -> str:
 
 
 def _glm_escape_ebnf_string(s: str) -> str:
-    s = s.replace("\\", "\\\\")
-    s = s.replace('"', '\\"')
-    s = s.replace("\n", "\\n")
-    s = s.replace("\t", "\\t")
-    s = s.replace("\r", "\\r")
-    return s
+    return json.dumps(s, ensure_ascii=False)[1:-1]
 
 
 def _glm_handle_enum(prop: dict) -> str:
     enum_values = prop["enum"]
-    prop_type = prop.get("type", "string")
 
     def format_enum_val(v: Any) -> str:
-        if prop_type == "boolean":
-            return '"true"' if v else '"false"'
-        if prop_type == "string":
-            return f'"{_glm_escape_ebnf_string(v)}"'
-        return f'"{v}"'
+        value = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        return f'"{_glm_escape_ebnf_string(value)}"'
 
     formatted_values = [format_enum_val(v) for v in enum_values]
+    if not formatted_values:
+        return "text_without_special_tokens"
     enum_rule = " | ".join(formatted_values)
     return f"({enum_rule})" if len(formatted_values) > 1 else enum_rule
 
@@ -915,6 +910,8 @@ def _glm_build_tool_call_rules(
     functions: list[Any],
     special_tokens: "GlmSpecialTokenConfig",
     chat_template_version: Literal["glm45", "glm47"],
+    required: bool = False,
+    parallel_tool_calls: bool = True,
 ) -> list[str]:
     """Build non-strict XML tool-call rules with shallow value constraints."""
     if chat_template_version == "glm45":
@@ -926,8 +923,11 @@ def _glm_build_tool_call_rules(
             f"Unsupported chat_template_version: {chat_template_version}"
         )
 
+    repetition = (
+        ("+" if required else "*") if parallel_tool_calls else ("" if required else "?")
+    )
     rules = [
-        f"{non_terminal_name} ::= ( {extra_seperator} tool_call_unit )*",
+        f"{non_terminal_name} ::= ( {extra_seperator} tool_call_unit ){repetition}",
         f'tool_call_unit ::= "{special_tokens.begin_of_tool_call}" single_tool_call "{special_tokens.end_of_tool_call}"',
     ]
 
@@ -943,16 +943,32 @@ def _glm_build_tool_call_rules(
     kv_separator = extra_seperator
 
     for function_index, func in enumerate(functions):
-        tool_name = func.name
+        tool_name = _glm_escape_ebnf_string(func.name)
         namehash = _glm_hash_name(func.name + str(function_index))
         params = func.parameters or {}
-        properties = params.get("properties", {})
+        properties = get_schema_properties(params)
+        if isinstance(params, dict) and (
+            "$ref" in params
+            or "patternProperties" in params
+            or (
+                "properties" in params
+                and any(keyword in params for keyword in ("allOf", "anyOf", "oneOf"))
+            )
+        ):
+            properties = {}
 
         prop_kv_pairs = {}
 
         for prop_name, prop_schema in properties.items():
-            value_rule = _glm_get_value_rule(prop_schema)
-            pair = kv_template.format(key=prop_name, valrule=value_rule)
+            # Composition branches can disagree on a property's value schema.
+            value_rule = (
+                "text_without_special_tokens"
+                if any(keyword in params for keyword in ("allOf", "anyOf", "oneOf"))
+                else _glm_get_value_rule(prop_schema)
+            )
+            pair = kv_template.format(
+                key=_glm_escape_ebnf_string(prop_name), valrule=value_rule
+            )
             prop_kv_pairs[prop_name] = pair
 
         # Non-strict arguments may be omitted, repeated, or emitted in any order.
@@ -964,7 +980,12 @@ def _glm_build_tool_call_rules(
                 f"( ( {all_choices} ) ( {kv_separator} ( {all_choices} ) )* )?"
             )
         else:
-            arguments_rule = '""'
+            arguments_rule = (
+                f'( "{special_tokens.begin_of_key}" text_without_special_tokens '
+                f'"{special_tokens.end_of_key}" {extra_seperator} '
+                f'"{special_tokens.begin_of_value}" text_without_special_tokens '
+                f'"{special_tokens.end_of_value}" {kv_separator} )*'
+            )
 
         rules.append(
             f'call_{namehash} ::= "{tool_name}" {extra_seperator} ( arguments_{namehash} {extra_seperator} )?'
@@ -999,6 +1020,8 @@ def generate_glm_grammar(
     accommodate_chat_template: bool,
     allow_multiple_assistant_turns: bool,
     root_name: str = "root",
+    required: bool = False,
+    parallel_tool_calls: bool = True,
 ) -> str:
     ebnf_lines = [
         f'{root_name} ::= assistant_turn ( "{special_tokens.assistant_token}" assistant_turn )*'
@@ -1084,6 +1107,8 @@ def generate_glm_grammar(
                 functions=functions,
                 special_tokens=special_tokens,
                 chat_template_version=chat_template_version,
+                required=required,
+                parallel_tool_calls=parallel_tool_calls,
             )
         )
     else:
