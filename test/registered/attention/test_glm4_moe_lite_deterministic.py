@@ -27,7 +27,7 @@ GLM_MODEL = "zai-org/GLM-4.7-Flash"
 # COMMON_SERVER_ARGS is shared module state; copy it. Extending it in place
 # would leak the fa4 flag into the auto class below and silently make that
 # test a second fa4 test.
-SERVER_ARGS = COMMON_SERVER_ARGS + [
+SERVER_ARGS = list(COMMON_SERVER_ARGS) + [
     "--chunked-prefill-size",
     "2048",
     "--max-prefill-tokens",

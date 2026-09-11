@@ -37,14 +37,10 @@ class TestFlashinferDeterministic(TestDeterministicBase):
     # Test with flashinfer attention backend
     @classmethod
     def get_server_args(cls):
-        args = COMMON_SERVER_ARGS
-        args.extend(
-            [
-                "--attention-backend",
-                "flashinfer",
-            ]
-        )
-        return args
+        return list(COMMON_SERVER_ARGS) + [
+            "--attention-backend",
+            "flashinfer",
+        ]
 
 
 @unittest.skipIf(_is_xpu, "CUDA runner only")
@@ -53,14 +49,10 @@ class TestFa3Deterministic(TestDeterministicBase):
     # Test with fa3 attention backend
     @classmethod
     def get_server_args(cls):
-        args = COMMON_SERVER_ARGS
-        args.extend(
-            [
-                "--attention-backend",
-                "fa3",
-            ]
-        )
-        return args
+        return list(COMMON_SERVER_ARGS) + [
+            "--attention-backend",
+            "fa3",
+        ]
 
 
 @unittest.skipIf(_is_xpu, "CUDA/AMD runner only")
@@ -68,14 +60,10 @@ class TestTritonDeterministic(TestDeterministicBase):
     # Test with triton attention backend
     @classmethod
     def get_server_args(cls):
-        args = COMMON_SERVER_ARGS
-        args.extend(
-            [
-                "--attention-backend",
-                "triton",
-            ]
-        )
-        return args
+        return list(COMMON_SERVER_ARGS) + [
+            "--attention-backend",
+            "triton",
+        ]
 
 
 @unittest.skipUnless(_is_xpu, "XPU runner only")
