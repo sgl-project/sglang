@@ -107,14 +107,9 @@ fn prefill_policy_reason(
     }
 }
 
-/// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
-/// long context — a ~1 M-token context tokenized as JSON fits under this —
-/// while preventing a hostile client from forcing the router to
-/// heap-allocate hundreds of MiB before forwarding. The cap is wired in
-/// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
-/// layer; axum's `Bytes` extractor enforces it and returns 413
-/// PAYLOAD_TOO_LARGE before this handler runs.
-pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
+/// Maximum buffered chat-completions body (32MiB). Sized for base64 multimodal inputs;
+/// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
+pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
 /// Minimal probe over the request body — we only need the `stream` field
 /// and the `model` field to decide between buffered vs SSE forwarding and
