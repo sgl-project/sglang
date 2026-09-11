@@ -1,9 +1,11 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib
+import functools
+import logging
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import triton
@@ -17,6 +19,8 @@ from sglang.srt.utils.common import (
     get_device_core_count,
     get_dispatch_device_backend,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 if _is_npu:
@@ -170,6 +174,134 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+# Fixed tile configs for the persistent matmul/bmm kernels, keyed by dtype.
+# Shared by matmul_kernel_persistent and bmm_kernel_persistent. Tuned for
+# datacenter parts with >=160KB of per-block shared memory.
+_MATMUL_PERSISTENT_CONFIGS: Dict[torch.dtype, Dict[str, int]] = {
+    torch.bfloat16: {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_stages": 3,
+        "num_warps": 8,
+    },
+    torch.float16: {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_stages": 3,
+        "num_warps": 8,
+    },
+    torch.float32: {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 8,
+        "num_stages": 3,
+        "num_warps": 8,
+    },
+}
+
+# Shared memory the float16 config above requires when Triton lowers it for
+# sm_8x: 106496 B, measured on L40S and RTX 4060 Laptop (both sm_89, issue
+# #29149), where the per-block limit is 101376 B, so the first launch dies
+# with OutOfResources. The footprint is a property of (config, target arch),
+# not of the config alone: the identical config fits on SM120 under the same
+# 101376 B limit because newer-arch codegen stages the tiles differently.
+# Hence the gate below checks compute capability as well as the limit;
+# gating on the limit alone would wrongly degrade archs where the config
+# fits.
+_SM8X_FP16_SMEM_REQUIRED_BYTES = 106496
+
+# Conservative float16 variant for low-shared-memory sm_8x parts. Only
+# num_stages differs from the default (3 -> 2). num_stages is the depth of
+# Triton's software pipeline (how many K-tiles are prefetched into shared
+# memory in flight); it changes neither the tile shapes, nor the K-loop
+# iteration order, nor the accumulation order inside tl.dot, so the reduction
+# order that batch invariance rests on is unchanged. Bitwise equality against
+# the num_stages=3 lowering is not asserted here and cannot be measured on
+# sm_89, where that config does not fit. Verified to fit and pass health
+# checks on L40S in issue #29149.
+_MATMUL_PERSISTENT_FP16_LOW_SMEM_CONFIG: Dict[str, int] = {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 256,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 8,
+    "num_stages": 2,
+    "num_warps": 8,
+}
+
+
+def _select_matmul_persistent_configs(
+    capability: Tuple[int, int], smem_per_block_bytes: Optional[int]
+) -> Dict[torch.dtype, Dict[str, int]]:
+    """Pick the per-dtype persistent-matmul configs for a device arch.
+
+    Pure function of static device properties (compute capability, per-block
+    shared memory limit). It must never depend on tensor shapes or batch
+    size: batch invariance requires the kernel config to stay fixed for the
+    lifetime of the process for a given (device, dtype).
+    """
+    major, _ = capability
+    if (
+        smem_per_block_bytes is not None
+        and major < 9
+        and smem_per_block_bytes < _SM8X_FP16_SMEM_REQUIRED_BYTES
+    ):
+        configs = dict(_MATMUL_PERSISTENT_CONFIGS)
+        configs[torch.float16] = _MATMUL_PERSISTENT_FP16_LOW_SMEM_CONFIG
+        return configs
+    return _MATMUL_PERSISTENT_CONFIGS
+
+
+@functools.lru_cache(maxsize=None)
+def _matmul_persistent_configs_for_device(
+    device_index: int,
+) -> Dict[torch.dtype, Dict[str, int]]:
+    """Config table for a CUDA device, computed once per device index and
+    cached for the lifetime of the process."""
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        capability = (props.major, props.minor)
+        smem = getattr(props, "shared_memory_per_block_optin", None)
+        if not smem:
+            # Fallback for torch builds without that field: Triton's internal
+            # driver API (subject to change across Triton versions, hence the
+            # broad except). Same probe as the fused-MoE clamp in #28038.
+            smem = triton.runtime.driver.active.utils.get_device_properties(
+                device_index
+            )["max_shared_mem"]
+    except Exception:
+        return _MATMUL_PERSISTENT_CONFIGS
+    configs = _select_matmul_persistent_configs(capability, smem)
+    if configs is not _MATMUL_PERSISTENT_CONFIGS:
+        logger.warning(
+            "Batch-invariant persistent matmul: the default float16 config "
+            "needs %d B of shared memory as lowered for sm_%d%d but device %d "
+            "provides %d B per block; using the num_stages=2 variant instead "
+            "(issue #29149). Results stay batch-invariant.",
+            _SM8X_FP16_SMEM_REQUIRED_BYTES,
+            capability[0],
+            capability[1],
+            device_index,
+            smem,
+        )
+    return configs
+
+
+def _get_matmul_persistent_configs(
+    device: torch.device,
+) -> Dict[torch.dtype, Dict[str, int]]:
+    if device.type != "cuda":
+        return _MATMUL_PERSISTENT_CONFIGS
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    return _matmul_persistent_configs_for_device(index)
+
+
 def _matmul_persistent_triton(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
@@ -196,32 +328,7 @@ def _matmul_persistent_triton(
             ),
         )
 
-    configs = {
-        torch.bfloat16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float32: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-    }
+    configs = _get_matmul_persistent_configs(a.device)
     # print(a.device, b.device, c.device)
     matmul_kernel_persistent[grid](
         a,
@@ -746,32 +853,7 @@ def bmm_batch_invariant(a, b, *, out=None):
         NUM_SMS = get_device_core_count()
 
         # Use fixed kernel configuration for determinism
-        configs = {
-            torch.bfloat16: {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "num_stages": 3,
-                "num_warps": 8,
-            },
-            torch.float16: {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "num_stages": 3,
-                "num_warps": 8,
-            },
-            torch.float32: {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 8,
-                "num_stages": 3,
-                "num_warps": 8,
-            },
-        }
+        configs = _get_matmul_persistent_configs(a.device)
 
         config = configs.get(dtype)
         if config is None:
