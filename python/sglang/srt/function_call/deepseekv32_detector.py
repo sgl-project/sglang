@@ -93,6 +93,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
+        # False while nothing but whitespace has been emitted since the last DSML
+        # tag: that whitespace is the layout separating the tag from the prose
+        # after it, not content. True to start with, because the preamble is
+        # content from the first character.
+        self._gap_started = True
+        # Whether any normal text has left the detector this turn. A gap has
+        # something to separate itself from only if it has.
+        self._emitted_anything = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -194,18 +202,25 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].removesuffix("\n\n") if idx != -1 else text
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+        if idx == -1:
+            # No section opener, but the turn may have been cut off inside one.
+            return StreamingParseResult(normal_text=self._cut_at_markup(text), calls=[])
+
+        # The whitespace in front of the opener indents it; the line break the
+        # call stood on comes back from `_join_gap` on the other side.
+        normal_text = text[:idx].rstrip()
 
         calls = []
         try:
-            sections = re.findall(self.function_calls_regex, text, re.DOTALL)
+            sections = list(re.finditer(self.function_calls_regex, text, re.DOTALL))
             if not sections:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
+            normal_text += self._section_gaps(text, sections)
+
             # Find all invoke blocks
-            for function_calls_content in sections:
+            for section in sections:
+                function_calls_content = section.group(1)
                 for invoke_match in re.finditer(
                     self.invoke_regex, function_calls_content, re.DOTALL
                 ):
@@ -225,6 +240,211 @@ class DeepSeekV32Detector(BaseFormatDetector):
             logger.error(f"Error in detect_and_parse: {e}")
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
+
+    @staticmethod
+    def _cut_at_markup(text: str) -> str:
+        """Everything up to the first DSML tag, opening or closing, and its indent.
+
+        A turn can stop anywhere -- a length cap, an abort -- including in the
+        middle of a tag the model was still writing. What follows the `<｜` (or
+        `</｜`) was markup by then, not content, and must not reach the client;
+        what precedes it is prose no completed call ever consumed. The whitespace
+        in front of the tag goes with it, exactly as `_strip_section_markers`
+        drops the indent of a tag that did finish arriving.
+        """
+        markup = re.search(r"\s*</?｜", text)
+        return text if markup is None else text[: markup.start()]
+
+    @staticmethod
+    def _join_gap(layout: str, *, after_text: bool) -> str:
+        """What a gap's leading whitespace collapses to once its call is gone.
+
+        The call sat on its own line, so removing it has to leave the line break
+        it was standing on -- and nothing more. Deleting the whitespace outright
+        runs `'Let me look it up.'` into `'It is sunny in SF.'`, and takes the
+        indent off the line that follows, which is content: a list item stops
+        starting its line, a code line loses the four spaces the newline was
+        carrying. Collapsing to two would open a paragraph break the model never
+        wrote.
+
+        Nothing at all when no text has been emitted yet: the turn opened with
+        the call, so there is nothing on the other side to separate from. And a
+        run with no newline in it never had a line to keep -- the call was inline
+        -- so it stands as the model wrote it.
+        """
+        if not after_text:
+            return ""
+        line_start = layout.rfind("\n")
+        return layout if line_start == -1 else "\n" + layout[line_start + 1 :]
+
+    def _gap_text(self, text: str) -> str:
+        """Resolve the layout whitespace at the head of a gap, once per gap.
+
+        Tracked on the instance rather than trimmed in place because a gap
+        arrives over several deltas: only the whitespace before the gap's first
+        real character is layout, and a newline in the middle of the prose has
+        to survive. Whitespace with nothing behind it yet is left for a later
+        delta to resolve, since what it collapses to depends on the text that
+        follows it.
+
+        Call this on text that is being emitted, never on text `_split_flushable`
+        may still hold back: a fragment that grows into a tag would otherwise
+        count as the gap's first real character and strand the layout behind it.
+        """
+        if self._gap_started:
+            self._emitted_anything = self._emitted_anything or bool(text)
+            return text
+
+        prose = text.lstrip()
+        if not prose:
+            return ""
+
+        layout = text[: len(text) - len(prose)]
+        self._gap_started = True
+        joined = self._join_gap(layout, after_text=self._emitted_anything) + prose
+        self._emitted_anything = True
+        return joined
+
+    def _section_gaps(self, text: str, sections: list["re.Match[str]"]) -> str:
+        """The normal text between and after the tool call sections of `text`.
+
+        The one-shot counterpart of what the streaming path emits from
+        `_gap_text` and `_lead_text`, trimmed to match: leading layout goes
+        through `_join_gap`, trailing layout goes wherever another section
+        follows it and can claim the whitespace as its indent. The last gap ends
+        the turn, so its trailing newlines are the model's own.
+        """
+        emitted = bool(text[: sections[0].start()].strip())
+        gaps = []
+        for i, section in enumerate(sections):
+            is_last = i + 1 == len(sections)
+            end = len(text) if is_last else sections[i + 1].start()
+            gap = self._cut_at_markup(text[section.end() : end])
+            prose = gap.lstrip()
+            if prose in ("<", "</"):
+                # Nothing in this gap but the first characters of the next tag,
+                # which the turn stopped inside of. Layout, not the model's `<`.
+                prose = ""
+            if not prose:
+                continue
+            layout = gap[: len(gap) - len(gap.lstrip())]
+            joined = self._join_gap(layout, after_text=emitted) + prose
+            gaps.append(joined if is_last else joined.rstrip())
+            emitted = True
+        return "".join(gaps)
+
+    def _markers(self) -> tuple[str, ...]:
+        """Every DSML tag this detector can meet, longest-lived first.
+
+        Read off the instance rather than cached at construction: subclasses set
+        their own `bot_token` / `eot_token` after `super().__init__()` (V4 says
+        `tool_calls` where V3.2 says `function_calls`).
+        """
+        return (
+            self.bot_token,
+            self.eot_token,
+            self.invoke_end_token,
+            "<｜DSML｜invoke",
+        )
+
+    def _strip_section_markers(self, text: str) -> str:
+        """Drop whole DSML tags, along with the newlines that indent them.
+
+        The indent belongs to the tag, not to the prose around it, which is why
+        `detect_and_parse` never shows it either. Safe to swallow here only
+        because `_split_flushable` refuses to release a trailing newline, so an
+        indent is still in the buffer when its tag lands however the chunks fell.
+        """
+        for token in (self.eot_token, self.invoke_end_token, self.bot_token):
+            text = re.sub(rf"\s*{re.escape(token)}", "", text)
+        return text
+
+    def _strip_leading_closers(self, text: str) -> str:
+        """Drop the closers of a call that already streamed, and their indent.
+
+        Only the leading run: a tag further in is one the turn was cut off
+        inside, and `_cut_at_markup` has to see it where it stands rather than
+        have it spliced out from under the prose in front of it.
+        """
+        closers = "|".join(
+            re.escape(t) for t in (self.invoke_end_token, self.eot_token)
+        )
+        return re.sub(rf"^(?:\s*(?:{closers}))+", "", text)
+
+    def _split_flushable(self, text: str) -> tuple[str, str]:
+        """Split `text` into (safe to emit now, hold back for the next chunk).
+
+        Held back: a suffix that is a strict prefix of a real marker, and a
+        trailing run of newlines, which may yet turn out to be the indent of a
+        tag rather than prose. Emitting an indent is not something a later chunk
+        can take back, and that is what would make the output depend on where
+        the deltas split. Whatever is held is released by `finish()` once the
+        stream ends and the marker can no longer arrive.
+
+        Nothing else is held: prose that merely contains `<` ("5 < 6") streams
+        out immediately.
+        """
+        hold_from = len(text)
+        start = text.rfind("<")
+        if start != -1:
+            tail = text[start:]
+            if any(
+                len(tail) < len(marker) and marker.startswith(tail)
+                for marker in self._markers()
+            ):
+                hold_from = start
+        # Whatever is held takes its indent with it, otherwise the newlines in
+        # front of a half-arrived tag go out before the tag is known.
+        hold_from = len(text[:hold_from].rstrip())
+        return text[:hold_from], text[hold_from:]
+
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Release text held for a marker that can no longer arrive.
+
+        `_split_flushable` withholds anything that could still turn out to be a
+        DSML tag. Once the stream is over nothing more is coming, so a held
+        fragment was ordinary text all along and is owed to the client -- unless
+        the tag did arrive and the turn ended inside it, which is what
+        `_cut_at_markup` separates.
+        """
+        held, self._buffer = self._buffer, ""
+        bot_pos = held.find(self.bot_token)
+        if bot_pos != -1 and self.current_tool_id == -1:
+            # The turn stopped inside the opening section, before any invoke was
+            # matched, so what is held is the preamble and nothing else. Trim it
+            # exactly as `detect_and_parse` trims it.
+            return StreamingParseResult(normal_text=held[:bot_pos].rstrip())
+
+        # Closers first: the buffer can still carry those of a call that did
+        # finish, and the prose after them is owed to the client.
+        held = self._cut_at_markup(self._strip_leading_closers(held))
+        if not self._gap_started:
+            # Nothing but layout has been emitted since the last tag, so a lone
+            # `<` sitting in it is the next tag cut short rather than the model's
+            # own `5 < 6` -- which is why that reading is confined to here.
+            held = held.partition("<")[0]
+        return StreamingParseResult(normal_text=self._gap_text(held))
+
+    def _lead_text(self, current_text: str, *, invoke_start: int) -> tuple[str, int]:
+        """The normal text in front of the call, and where that call begins.
+
+        Trailing whitespace always goes: it indents the call, which is all the
+        separator between two parallel invokes ever is, and keeping it would not
+        be stable anyway -- it lands in this lead or in the preceding flush
+        depending only on where the deltas happened to split. What the call was
+        standing on comes back on the other side, from `_join_gap`.
+        """
+        call_start = current_text.rfind(self.bot_token, 0, invoke_start)
+        if call_start == -1:
+            call_start = invoke_start
+        had_text = self._emitted_anything
+        lead = self._gap_text(self._strip_section_markers(current_text[:call_start]))
+        trimmed = lead.rstrip()
+        # This is the one caller that trims what `_gap_text` handed back, so it
+        # is the one that has to say what actually reached the client: a lead of
+        # nothing but the call's own indent leaves the turn still empty.
+        self._emitted_anything = had_text or bool(trimmed)
+        return trimmed, call_start
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -252,16 +472,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
             and not potentially_dsml
             and not ends_with_prefix
         ):
-            self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in current_text:
                     current_text = current_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=current_text)
+            flushable, self._buffer = self._split_flushable(current_text)
+            return StreamingParseResult(normal_text=self._gap_text(flushable))
 
         all_calls: list[ToolCallItem] = []
-        # Only recovered for the first call: the DSML guard above never releases a
-        # buffer that still holds a marker, so later prose stays buffered.
-        preamble = ""
+        normal_text_parts: list[str] = []
+        # The lead of the call being assembled is still sitting at the head of
+        # current_text; only advancing past a completed call consumes it. The
+        # error path below needs to know, or it re-emits what it dumps verbatim.
+        lead_is_still_in_current_text = False
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -278,17 +500,30 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_match
                 )
 
+                is_first_call = self.current_tool_id == -1
+
                 # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
+                if is_first_call:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
-                    call_start = invoke_match.start()
-                    bot_pos = current_text.rfind(self.bot_token, 0, call_start)
-                    if bot_pos != -1:
-                        call_start = bot_pos
-                    # Same trailing-newline trim as detect_and_parse, so both agree.
-                    preamble = current_text[:call_start].removesuffix("\n\n")
+
+                # Whatever precedes this call is content the model meant to show.
+                # Guarded on `current_tool_name_sent` so it runs exactly once per
+                # call: it is only False the first time a call is seen, so an
+                # invoke that spans chunks can't re-emit the same lead.
+                if not self.current_tool_name_sent:
+                    lead, call_start = self._lead_text(
+                        current_text, invoke_start=invoke_match.start()
+                    )
+                    if lead:
+                        normal_text_parts.append(lead)
+                        lead_is_still_in_current_text = True
+                    # The lead has left the detector, so drop it from the buffer.
+                    # A completed call advances past it below; an incomplete one
+                    # never would, and `finish()` would emit it a second time at
+                    # the end of a turn cut short inside this invoke.
+                    self._buffer = current_text[call_start:]
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -351,6 +586,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]
                     current_text = self._buffer  # Update for next iteration
+                    lead_is_still_in_current_text = False
+                    # Whatever whitespace follows the call indents its closers.
+                    self._gap_started = False
 
                     # Move to next tool call
                     self.current_tool_id += 1
@@ -363,19 +601,34 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Wait for more chunks until we see </｜DSML｜invoke>
                     break
 
-            # No more invoke blocks found
-            return StreamingParseResult(normal_text=preamble, calls=all_calls)
+            # No more invoke blocks found. Anything still buffered is trailing
+            # prose: the guard at the top can never release it, because the
+            # section closer keeps `potentially_dsml` true for the rest of the
+            # turn. Flush it here instead, holding back only a suffix that could
+            # still grow into a marker.
+            if not self.has_tool_call(current_text):
+                flushable, self._buffer = self._split_flushable(
+                    self._strip_section_markers(current_text)
+                )
+                normal_text_parts.append(self._gap_text(flushable))
+
+            return StreamingParseResult(
+                normal_text="".join(normal_text_parts), calls=all_calls
+            )
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            # Re-emit verbatim rather than swallowing the turn; the preamble is
-            # still inside current_text unless a completed call advanced past it.
+            # Re-emit verbatim rather than swallowing the turn. Leads whose call
+            # completed are gone from current_text and have to be kept; the lead
+            # of the call that failed is still in there and would come out twice.
             # Calls are dropped on purpose: the failure can land between a tool's
             # name and its arguments, and a half-formed call is worse than none.
             self._buffer = ""
-            if not current_text.startswith(preamble):
-                current_text = preamble + current_text
-            return StreamingParseResult(normal_text=current_text)
+            if lead_is_still_in_current_text and normal_text_parts:
+                normal_text_parts.pop()
+            return StreamingParseResult(
+                normal_text="".join(normal_text_parts) + current_text
+            )
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
