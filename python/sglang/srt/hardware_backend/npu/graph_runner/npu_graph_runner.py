@@ -233,7 +233,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
-        graph_key = self._make_graph_key(self.bs)
+        # UNO captures separate LoRA-draft and base-only variants for the same
+        # batch shape.  Preserve the generic variant/DSA dispatch in the NPU
+        # replay key instead of collapsing both phases onto the unlabeled key.
+        graph_key = self._make_graph_key(
+            self.bs,
+            variant_label=self._resolve_lora_variant(forward_batch),
+            dsa_variant=self._resolve_dsa_variant(forward_batch),
+        )
 
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)

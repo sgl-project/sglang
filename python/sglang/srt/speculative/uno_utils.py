@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from flashinfer import top_k as _flashinfer_top_k
-
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
@@ -14,8 +12,30 @@ from sglang.srt.speculative.dflash_utils import (
     build_dflash_verify_target_probs,
 )
 from sglang.srt.speculative.spec_utils import fast_sample
+from sglang.srt.utils import is_cuda, is_npu
+
+_is_npu = is_npu()
+if is_cuda():
+    from flashinfer import top_k as _flashinfer_top_k  # noqa: E402
+else:
+    _flashinfer_top_k = None
 
 _SPARSE_TOP_K_LIMIT = 128
+
+
+def _top_k(
+    logits: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device-portable top-k with FlashInfer retained as the CUDA fast path."""
+    if logits.device.type == "cuda" and _flashinfer_top_k is not None:
+        return _flashinfer_top_k(
+            logits.contiguous(),
+            k,
+            sorted=True,
+            deterministic=False,
+        )
+    return torch.topk(logits, k=k, dim=-1, largest=True, sorted=True)
 
 
 def _normalize_sparse_topk_probs(
@@ -33,7 +53,7 @@ def _normalize_sparse_topk_probs(
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def _sparse_rejection_from_support(
     candidates: torch.Tensor,
     target_ids: torch.Tensor,
@@ -124,7 +144,7 @@ def _sparse_rejection_from_support(
     return accepted_counts, bonus
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def _build_sparse_target_support_tensors(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -136,12 +156,7 @@ def _build_sparse_target_support_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build compact support using the fastest available top-k primitive."""
     rows = batch_size * forward_width
-    topk_logits, topk_ids = _flashinfer_top_k(
-        next_token_logits.contiguous(),
-        max_top_k,
-        sorted=True,
-        deterministic=False,
-    )
+    topk_logits, topk_ids = _top_k(next_token_logits, max_top_k)
 
     expanded_temperatures = torch.repeat_interleave(
         temperatures,
@@ -326,42 +341,105 @@ def _run_dense_rejection(
         dtype=torch.float32,
         device=next_token_logits.device,
     )
-    (
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        predicts,
-        accept_index,
-        accepted_counts,
-    ) = _get_or_create_chain_verify_buffers(
-        bs=batch_size,
-        draft_token_num=forward_width,
-        device=next_token_logits.device,
-    )
-    chain_speculative_sampling_triton(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accepted_counts,
+    if candidates.device.type == "cuda":
+        (
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            predicts,
+            accept_index,
+            accepted_counts,
+        ) = _get_or_create_chain_verify_buffers(
+            bs=batch_size,
+            draft_token_num=forward_width,
+            device=next_token_logits.device,
+        )
+        chain_speculative_sampling_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accepted_counts,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=accept_uniforms,
+            uniform_samples_for_final_sampling=final_uniforms,
+            target_probs=target_probs,
+            draft_probs=draft_distribution.probs,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+        )
+        rows = torch.arange(batch_size, device=candidates.device)
+        bonus_positions = accept_index[
+            rows,
+            accepted_counts.to(torch.long),
+        ].to(torch.long)
+        bonus = predicts[bonus_positions].to(candidates.dtype)
+        return accepted_counts, bonus
+
+    return _dense_rejection_torch(
         candidates=candidates,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=accept_uniforms,
-        uniform_samples_for_final_sampling=final_uniforms,
         target_probs=target_probs,
         draft_probs=draft_distribution.probs,
-        threshold_single=1.0,
-        threshold_acc=1.0,
-        deterministic=True,
+        accept_uniforms=accept_uniforms,
+        final_uniforms=final_uniforms,
     )
 
-    rows = torch.arange(batch_size, device=candidates.device)
-    bonus_positions = accept_index[
-        rows,
-        accepted_counts.to(torch.long),
-    ].to(torch.long)
-    bonus = predicts[bonus_positions].to(candidates.dtype)
-    return accepted_counts, bonus
+
+@torch.compile(dynamic=True, disable=_is_npu)
+def _dense_rejection_torch(
+    *,
+    candidates: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    accept_uniforms: torch.Tensor,
+    final_uniforms: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact linear-chain p/q rejection using portable tensor operations."""
+    batch_size, forward_width = candidates.shape
+    num_proposals = forward_width - 1
+    if num_proposals == 0:
+        accepted_counts = torch.zeros(
+            batch_size, dtype=torch.int32, device=candidates.device
+        )
+        final_probs = target_probs[:, 0]
+    else:
+        proposal_ids = candidates[:, 1:].to(torch.long)
+        p_proposal = (
+            target_probs[:, :num_proposals]
+            .gather(2, proposal_ids.unsqueeze(-1))
+            .squeeze(-1)
+        )
+        q_proposal = draft_probs.gather(2, proposal_ids.unsqueeze(-1)).squeeze(-1)
+        ratios = torch.where(
+            q_proposal > 0,
+            p_proposal / q_proposal,
+            torch.zeros_like(p_proposal),
+        ).clamp_(max=1.0)
+        accepted_flags = accept_uniforms[:, :num_proposals] < ratios
+        accepted_counts = accepted_flags.to(torch.int32).cumprod(dim=1).sum(dim=1)
+
+        batch_indices = torch.arange(batch_size, device=candidates.device)
+        final_rows = accepted_counts.to(torch.long)
+        target_final = target_probs[batch_indices, final_rows]
+        rejected = final_rows < num_proposals
+        draft_rows = final_rows.clamp(max=num_proposals - 1)
+        draft_final = draft_probs[batch_indices, draft_rows]
+        residual = (target_final - draft_final).clamp_min_(0.0)
+        residual_sum = residual.sum(dim=-1, keepdim=True)
+        residual = torch.where(
+            residual_sum > 0,
+            residual / residual_sum.clamp_min(1e-12),
+            target_final,
+        )
+        final_probs = torch.where(rejected[:, None], residual, target_final)
+
+    cdf = torch.cumsum(final_probs, dim=-1)
+    thresholds = final_uniforms * final_probs.sum(dim=-1)
+    bonus = (cdf <= thresholds[:, None]).sum(dim=-1)
+    bonus.clamp_(max=final_probs.shape[-1] - 1)
+    return accepted_counts, bonus.to(candidates.dtype)
 
 
 @dataclass
