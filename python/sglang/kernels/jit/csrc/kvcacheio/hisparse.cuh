@@ -733,11 +733,10 @@ void load_cache_to_device_buffer(
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const auto kernel_device = top_k_tokens.device();
-  runtime::DeviceGuard device_guard(kernel_device.device_id);
   const auto device = LaunchKernel::resolve_device(kernel_device);
-  const void* const host_cache_k_ptr = runtime::device_accessible_ptr(host_cache_k);
+  const void* const host_cache_k_ptr = runtime::get_device_accessible_ptr(host_cache_k);
   const void* const host_cache_v_ptr =
-      (IsMLA || host_cache_v.ndim() == 0) ? nullptr : runtime::device_accessible_ptr(host_cache_v);
+      (IsMLA || host_cache_v.ndim() == 0) ? nullptr : runtime::get_device_accessible_ptr(host_cache_v);
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
@@ -915,11 +914,10 @@ void copy_cache_planned(
     throw std::runtime_error("copy_cache_planned: miss_src/miss_dst row strides differ");
   }
   const auto kernel_device = miss_src_locs.device();
-  runtime::DeviceGuard device_guard(kernel_device.device_id);
   const auto device = LaunchKernel::resolve_device(kernel_device);
-  const void* const host_cache_k_ptr = runtime::device_accessible_ptr(host_cache_k);
+  const void* const host_cache_k_ptr = runtime::get_device_accessible_ptr(host_cache_k);
   const void* const host_cache_v_ptr =
-      (IsMLA || host_cache_v.ndim() == 0) ? nullptr : runtime::device_accessible_ptr(host_cache_v);
+      (IsMLA || host_cache_v.ndim() == 0) ? nullptr : runtime::get_device_accessible_ptr(host_cache_v);
   LaunchKernel(num_blocks, BLOCK_SIZE, device)(
       copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO>,
       static_cast<const int64_t*>(miss_src_locs.data_ptr()),
