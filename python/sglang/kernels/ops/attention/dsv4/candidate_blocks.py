@@ -406,7 +406,7 @@ def candidate_slots(
     ratio: int,
     block_scores: torch.Tensor | None = None,
     block_lens: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Publish sorted logical positions and physical slots for Reindex layers."""
     from sglang.kernels.ops.attention.dsv4.topk import (
         plan_topk_v2,
@@ -496,7 +496,7 @@ def candidate_slots(
         ratio,
         tile,
     )
-    return positions, slots, counts
+    return positions, slots, counts, plan_topk_v2(counts)
 
 
 def finalize_candidate_topk(

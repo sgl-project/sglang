@@ -162,7 +162,7 @@ class TestDecodeProjections(CustomTestCase):
             rows * width, device="cuda", dtype=torch.int32
         ).view(rows, width)
         req = torch.arange(rows, device="cuda", dtype=torch.int64)
-        positions, slots, counts = candidate_slots(
+        positions, slots, counts, _ = candidate_slots(
             logits,
             lens,
             req_to_token,
