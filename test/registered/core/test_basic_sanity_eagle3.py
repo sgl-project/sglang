@@ -75,7 +75,7 @@ class TestBasicSanityEagle3(
                 "--mem-fraction-static",
                 "0.7",
                 "--enable-metrics",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
             ],
             env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )

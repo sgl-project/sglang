@@ -37,8 +37,10 @@ def _split(extend_lens, prefix_lens, track_seqlens, track_mask):
     backend = _backend()
     cache_indices = torch.arange(len(extend_lens))
     (
+        _track_chunk_idx,
         h_src,
         h_dst,
+        _h_batch_src,
         _final_src,
         _final_dst,
         seq_idx,

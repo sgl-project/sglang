@@ -106,7 +106,7 @@ def _init_compressed_attn_metadata_triton(
     Optional[torch.Tensor],
 ]:
     bs = seq_lens.shape[0]
-    # CP-v2 may add padding rows to the attention metadata, but those rows have
+    # CP may add padding rows to the attention metadata, but those rows have
     # no cache-write locations. Keep the write buffers unpadded and mask those
     # rows in the kernel.
     num_write_tokens = raw_out_loc.shape[0]

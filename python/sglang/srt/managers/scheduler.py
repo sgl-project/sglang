@@ -309,7 +309,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -456,6 +455,8 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
+        # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
+        self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog()
 
@@ -971,10 +972,11 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        # For the MM models, check the text_config for MoE settings
-        config_to_check = getattr(
-            self.model_config.hf_config, "text_config", self.model_config.hf_config
-        )
+        config_to_check = self.model_config.hf_config
+        if hasattr(self.model_config.hf_config, "text_config"):
+            config_to_check = self.model_config.hf_config.text_config
+        elif hasattr(self.model_config, "hf_text_config"):
+            config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
@@ -1114,7 +1116,13 @@ class Scheduler(
                 self.draft_worker.prewarm_sampling()
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
-            model_runner.post_capture_resize_kv_pool()
+            model_runner.post_capture_resize_kv_pool(
+                draft_runners=(
+                    self.draft_worker._draft_model_runners()
+                    if self.draft_worker is not None
+                    else ()
+                )
+            )
             self.kv_cache_allocation_time += time.perf_counter() - tic
 
         if get_model().is_startup_weight_load_overlap:
@@ -1501,6 +1509,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -1547,6 +1556,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -2884,30 +2894,29 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if (
-            req.return_sampling_mask
-            and self.disaggregation_mode != DisaggregationMode.NULL
-            and not self.disagg_metadata_buffers.enable_sampling_mask
-        ):
-            error_msg = (
-                "return_sampling_mask with disaggregation requires "
-                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
-        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
-            error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+        if req.return_sampling_mask:
+            if (
+                self.disaggregation_mode != DisaggregationMode.NULL
+                and not self.disagg_metadata_buffers.enable_sampling_mask
+            ):
+                self._reject_sampling_mask_request(
+                    req,
+                    "return_sampling_mask requires "
+                    "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
+                    "decode servers when using disaggregated serving.",
+                )
+                return
+            top_k = req.sampling_params.top_k
+            sampling_mask_cap = self.server_args.sampling_mask_max_tokens
+            if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
+                error_msg = (
+                    "return_sampling_mask requires top_k=1 for greedy sampling "
+                    f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
+                    f"{top_k}. Lower top_k or increase "
+                    "--sampling-mask-max-tokens."
+                )
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             # Spec workers do not emit one sampling support per accepted token, so
@@ -2916,9 +2925,7 @@ class Scheduler(
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
@@ -2928,9 +2935,7 @@ class Scheduler(
                 "return_sampling_mask is not supported with the ascend "
                 "sampling backend."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         # Handle multimodal inputs
@@ -3162,6 +3167,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3176,6 +3182,13 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
+        """Return a sampling-mask validation error without running the model."""
+        logger.error(f"{error_msg}, {req.rid=}")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -3754,7 +3767,11 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, running_batch)
+        self.policy.calc_priority(
+            self.waiting_queue,
+            running_batch,
+            processed_tokens=self.processed_tokens_counter,
+        )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4211,6 +4228,10 @@ class Scheduler(
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
