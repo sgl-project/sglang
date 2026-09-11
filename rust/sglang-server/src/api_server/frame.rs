@@ -254,49 +254,65 @@ pub(super) fn cumulative_frame_json(
     // quirk is reproduced instead of re-derived.
     let finish = serde_json::to_value(&o.finish_reason).ok()?.to_string();
 
-    // Alphabetical by convention only — a stable order that is easy to extend and
-    // diff.
-    let mut m = String::new();
-    let _ = write!(m, "{{\"completion_tokens\":{}", o.completion_tokens);
-    let _ = write!(m, ",\"finish_reason\":{finish}");
-    if let Some(h) = &acc.hidden_json {
-        let _ = write!(m, ",\"hidden_states\":{h}");
-    }
-    let _ = write!(m, ",\"id\":{}", serde_json::Value::String(rid.to_string()));
-    if let Some(v) = &acc.in_tid_json {
-        let _ = write!(m, ",\"input_token_ids_logprobs\":{v}");
-    }
-    // Input+output token logprobs are emitted as a PAIR whenever either side has
-    // data (empty list included), matching `frame_value` byte for byte — see the
-    // PD-router rationale there.
     let lp_pair = acc.in_lp_json.is_some() || !acc.out_lp_json.is_empty();
-    if lp_pair {
-        let v = acc.in_lp_json.as_deref().unwrap_or("[]");
-        let _ = write!(m, ",\"input_token_logprobs\":{v}");
-    }
-    if let Some(v) = &acc.in_top_json {
-        let _ = write!(m, ",\"input_top_logprobs\":{v}");
-    }
-    // The `Value` path keys these off the source columns being non-empty; an empty
-    // source renders to an empty body, so the two guards coincide.
-    if !acc.out_tid_json.is_empty() {
-        let _ = write!(m, ",\"output_token_ids_logprobs\":[{}]", acc.out_tid_json);
-    }
-    if lp_pair {
-        let _ = write!(m, ",\"output_token_logprobs\":[{}]", acc.out_lp_json);
-    }
-    if !acc.out_top_json.is_empty() {
-        let _ = write!(m, ",\"output_top_logprobs\":[{}]", acc.out_top_json);
-    }
-    let _ = write!(m, ",\"prompt_tokens\":{}}}", o.prompt_tokens);
-
-    let mut s = String::with_capacity(acc.text_json.len() + acc.ids_json.len() + m.len() + 40);
+    let optional_len = |v: &Option<String>| v.as_deref().map_or(0, str::len);
+    let mut s = String::with_capacity(
+        acc.text_json.len()
+            + acc.ids_json.len()
+            + acc.out_lp_json.len()
+            + acc.out_top_json.len()
+            + acc.out_tid_json.len()
+            + optional_len(&acc.in_lp_json)
+            + optional_len(&acc.in_top_json)
+            + optional_len(&acc.in_tid_json)
+            + optional_len(&acc.hidden_json)
+            + finish.len()
+            + rid.len()
+            + 256,
+    );
     s.push('{');
     if let Some(i) = index {
         let _ = write!(s, "\"index\":{i},");
     }
-    s.push_str("\"meta_info\":");
-    s.push_str(&m);
+
+    // Alphabetical by convention only — a stable order that is easy to extend and
+    // diff. Write directly into the final frame so large cumulative logprob metadata
+    // is not first materialized in a temporary String and then copied here.
+    let _ = write!(
+        s,
+        "\"meta_info\":{{\"completion_tokens\":{}",
+        o.completion_tokens
+    );
+    let _ = write!(s, ",\"finish_reason\":{finish}");
+    if let Some(h) = &acc.hidden_json {
+        let _ = write!(s, ",\"hidden_states\":{h}");
+    }
+    let _ = write!(s, ",\"id\":{}", serde_json::Value::String(rid.to_string()));
+    if let Some(v) = &acc.in_tid_json {
+        let _ = write!(s, ",\"input_token_ids_logprobs\":{v}");
+    }
+    // Input+output token logprobs are emitted as a PAIR whenever either side has
+    // data (empty list included), matching `frame_value` byte for byte — see the
+    // PD-router rationale there.
+    if lp_pair {
+        let v = acc.in_lp_json.as_deref().unwrap_or("[]");
+        let _ = write!(s, ",\"input_token_logprobs\":{v}");
+    }
+    if let Some(v) = &acc.in_top_json {
+        let _ = write!(s, ",\"input_top_logprobs\":{v}");
+    }
+    // The `Value` path keys these off the source columns being non-empty; an empty
+    // source renders to an empty body, so the two guards coincide.
+    if !acc.out_tid_json.is_empty() {
+        let _ = write!(s, ",\"output_token_ids_logprobs\":[{}]", acc.out_tid_json);
+    }
+    if lp_pair {
+        let _ = write!(s, ",\"output_token_logprobs\":[{}]", acc.out_lp_json);
+    }
+    if !acc.out_top_json.is_empty() {
+        let _ = write!(s, ",\"output_top_logprobs\":[{}]", acc.out_top_json);
+    }
+    let _ = write!(s, ",\"prompt_tokens\":{}}}", o.prompt_tokens);
     if !acc.ids_json.is_empty() {
         s.push_str(",\"output_ids\":[");
         s.push_str(&acc.ids_json);
