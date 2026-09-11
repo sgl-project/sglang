@@ -31,13 +31,13 @@ import unittest
 
 import torch
 
-# Mirror sibling GDN unittests: register for CUDA/AMD CI. Module-level calls
-# (the CI collector parses them statically; see test_linear_replayssm_decode).
+# Register for CUDA/AMD CI, kernel-kind suites (see sibling kernel tests).
+# Module-level calls: the CI collector parses them statically via AST.
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _one_step_inputs(device, dtype):
