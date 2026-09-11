@@ -111,6 +111,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "triton",
     "ascend",
     "trtllm_mha",
+    "intel_xpu",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -146,6 +147,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_megamoe",
     "cutlass",
     "aiter",
     "marlin",
@@ -159,6 +161,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
+    "flashinfer_megamoe",
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
 ]
