@@ -61,8 +61,12 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
+# Measured 2309 s over both arms on the staged corpus (run 34554491724), and
+# 1409 s on the synthesized one (run 34551237847). The budget keeps enough room
+# for a heavier corpus without claiming the three hours this was guessed at
+# before either number existed.
 register_amd_ci(
-    est_time=10800,
+    est_time=3600,
     suite="nightly-perf-8-gpu-mi35x-glm52-fp4-agentic-mtp",
     nightly=True,
 )
