@@ -1,12 +1,16 @@
 import argparse
-import dataclasses
 import json
 import os
+import pickle
+import shutil
 import socket
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import msgspec
+import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
@@ -47,8 +51,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
-    handle_legacy_cp_runtime_compatibility,
-    handle_platform_cp_compatibility,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
@@ -74,6 +76,10 @@ from sglang.srt.entrypoints.sidecar import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
+from sglang.srt.layers.moe.utils import (
+    FlashinferA2ADispatchType,
+    get_flashinfer_a2a_dispatch_type,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -94,7 +100,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 register_cpu_ci(est_time=11, suite="stage-b-test-cpu-intel")
 
 # Mock get_device() so all tests run on CPU-only CI runners
@@ -105,6 +111,23 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_ple_embedding_offload_rejects_generic_weight_offload(self):
+        for generic_offload in (
+            {"cpu_offload_gb": 1},
+            {"offload_group_size": 1},
+        ):
+            with (
+                self.subTest(generic_offload=generic_offload),
+                self.assertRaisesRegex(
+                    ValueError, "ple-offload-embedding cannot be combined"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    ple_offload_embedding=True,
+                    **generic_offload,
+                ).resolve_once()
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",
@@ -162,6 +185,38 @@ class TestPrepareServerArgs(CustomTestCase):
             ValueError, "--prefill-decode-interval must be non-negative"
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
+
+    def test_sampling_mask_max_tokens(self):
+        self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
+        self.assertEqual(
+            ServerArgs(
+                model_path="dummy", sampling_mask_max_tokens=8192
+            ).sampling_mask_max_tokens,
+            8192,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "--sampling-mask-max-tokens must be positive"
+        ):
+            prepare_server_args(
+                ["--model-path", "dummy", "--sampling-mask-max-tokens", "0"]
+            ).resolve_once()
+
+    def test_legacy_sampling_mask_env_requires_migration(self):
+        """Legacy configuration must not silently disable PD sampling masks."""
+        for value in ("0", "128", "invalid", ""):
+            for enabled in (False, True):
+                with (
+                    self.subTest(value=value, enabled=enabled),
+                    envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.override(value),
+                    envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(enabled),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.*"
+                        "Unset it.*SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1.*"
+                        "--sampling-mask-max-tokens.*prefill and decode",
+                    ),
+                ):
+                    ServerArgs(model_path="dummy").resolve_once()
 
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
@@ -237,13 +292,20 @@ class TestPrepareServerArgs(CustomTestCase):
             resolution_result(inherited, "speculative_draft_model_quantization"),
             "modelopt_fp4",
         )
+        # The provenance bit, not the public field: `from_server_args` reads
+        # `cfg._speculative_draft_quantization_explicitly_set` to tell an
+        # inherited draft quantization from one the operator asked for, and
+        # resolution decided the value without consuming that evidence.
         self.assertFalse(
             resolution_result(
                 inherited, "_speculative_draft_quantization_explicitly_set"
             )
         )
 
-        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
+        # And across the hop that matters: the scheduler and the draft worker
+        # rebuild the record from its fields and resolve again, so the bit has
+        # to survive `asdict` and come back the same the second time.
+        reconstructed = ServerArgs(**msgspec.structs.asdict(inherited))
         handle_missing_default_values(reconstructed)
 
         self.assertFalse(
@@ -1022,15 +1084,13 @@ class TestContextParallelServerArgs(CustomTestCase):
         ServerArgs.add_cli_args(self.parser)
 
     def _new_cp_args(self, **overrides):
-        server_args = object.__new__(ServerArgs)
+        # Constructed, not conjured: a Struct has no uninitialized form, and
+        # every field this case does not name wants its declared default
+        # anyway.
         defaults = dict(
-            enable_prefill_context_parallel=False,
-            enable_dsa_prefill_context_parallel=False,
             enable_prefill_cp=False,
             cp_strategy=None,
             model_path="instance://127.0.0.1:8000/dummy",
-            dsa_prefill_cp_mode="round-robin-split",
-            prefill_cp_mode="in-seq-split",
             attn_cp_size=1,
             tp_size=1,
             dp_size=1,
@@ -1041,9 +1101,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             enable_aiter_allreduce_fusion=False,
         )
         defaults.update(overrides)
-        for key, value in defaults.items():
-            setattr(server_args, key, value)
-        return server_args
+        return ServerArgs(**defaults)
 
     def test_canonical_prefill_cp_requires_strategy(self):
         args = self.parser.parse_args(["--model", "dummy", "--enable-prefill-cp"])
@@ -1073,76 +1131,11 @@ class TestContextParallelServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
             handle_context_parallelism(server_args)
 
-    @override_platform(is_hip=False, is_npu=False)
-    def test_generic_canonical_cp_mirrors_to_transitional_runtime_fields(self):
-        cases = (
-            (
-                "zigzag_mla_or_gqa",
-                "zigzag",
-                "fa3",
-                True,
-                False,
-                "in-seq-split",
-            ),
-            (
-                "interleave_dsa",
-                "interleave",
-                "dsa",
-                False,
-                True,
-                "round-robin-split",
-            ),
-        )
-
-        for name, strategy, backend, expect_generic, expect_dsa, mode in cases:
-            with self.subTest(name=name):
-                server_args = self._new_cp_args(
-                    enable_prefill_cp=True,
-                    cp_strategy=strategy,
-                    attention_backend=backend,
-                )
-
-                handle_platform_cp_compatibility(server_args)
-
-                self.assertFalse(
-                    resolution_result(server_args, "enable_prefill_context_parallel")
-                )
-                self.assertFalse(
-                    resolution_result(
-                        server_args, "enable_dsa_prefill_context_parallel"
-                    )
-                )
-
-                handle_legacy_cp_runtime_compatibility(server_args)
-
-                self.assertEqual(
-                    resolution_result(server_args, "enable_prefill_context_parallel"),
-                    expect_generic,
-                )
-                self.assertEqual(
-                    resolution_result(
-                        server_args, "enable_dsa_prefill_context_parallel"
-                    ),
-                    expect_dsa,
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "dsa_prefill_cp_mode"), mode
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "prefill_cp_mode"), mode
-                )
-
-    @override_platform(is_hip=False, is_npu=False)
-    def test_non_platform_legacy_prefill_cp_is_rejected(self):
-        server_args = ServerArgs(
-            model_path="instance://127.0.0.1:8000/dummy",
-            enable_prefill_context_parallel=True,
-        )
-        with self.assertRaisesRegex(ValueError, "HIP or Ascend NPU"):
-            handle_platform_cp_compatibility(server_args)
-
     def test_generic_v1_cp_options_are_not_public_cli(self):
         removed_options = (
+            ("--enable-prefill-context-parallel", []),
+            ("--enable-nsa-prefill-context-parallel", []),
+            ("--nsa-prefill-cp-mode", ["round-robin-split"]),
             ("--enable-dsa-prefill-context-parallel", []),
             ("--dsa-prefill-cp-mode", ["round-robin-split"]),
             ("--prefill-cp-mode", ["in-seq-split"]),
@@ -1151,47 +1144,6 @@ class TestContextParallelServerArgs(CustomTestCase):
         for option, values in removed_options:
             with self.subTest(option=option), self.assertRaises(SystemExit):
                 self.parser.parse_args(["--model", "dummy", option, *values])
-
-    def test_npu_cp_compatibility_options_remain_public_cli(self):
-        args = self.parser.parse_args(
-            [
-                "--model",
-                "dummy",
-                "--enable-prefill-context-parallel",
-                "--enable-nsa-prefill-context-parallel",
-                "--nsa-prefill-cp-mode",
-                "round-robin-split",
-            ]
-        )
-
-        self.assertTrue(resolution_result(args, "enable_prefill_context_parallel"))
-        self.assertTrue(resolution_result(args, "enable_dsa_prefill_context_parallel"))
-        self.assertEqual(
-            resolution_result(args, "dsa_prefill_cp_mode"), "round-robin-split"
-        )
-
-    def test_canonical_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
-        server_args = self._new_cp_args(
-            enable_prefill_cp=True,
-            cp_strategy="interleave",
-            attention_backend="dsa",
-        )
-
-        handle_legacy_cp_runtime_compatibility(server_args)
-        handle_context_parallelism(server_args)
-
-        self.assertTrue(
-            resolution_result(server_args, "enable_dsa_prefill_context_parallel")
-        )
-        self.assertFalse(
-            resolution_result(server_args, "enable_prefill_context_parallel")
-        )
-        self.assertEqual(
-            resolution_result(server_args, "dsa_prefill_cp_mode"), "round-robin-split"
-        )
-        self.assertEqual(
-            resolution_result(server_args, "prefill_cp_mode"), "round-robin-split"
-        )
 
     def test_context_parallel_handler_initializes_cp_strategy(self):
         server_args = self._new_cp_args(
@@ -1205,6 +1157,264 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
+
+
+class TestFlashinferA2ADispatchType(CustomTestCase):
+    def setUp(self):
+        self._nvfp4_env_backup = os.environ.get("SGLANG_MOE_NVFP4_DISPATCH")
+        envs.SGLANG_MOE_NVFP4_DISPATCH.clear()
+
+    def tearDown(self):
+        if self._nvfp4_env_backup is None:
+            envs.SGLANG_MOE_NVFP4_DISPATCH.clear()
+        else:
+            os.environ["SGLANG_MOE_NVFP4_DISPATCH"] = self._nvfp4_env_backup
+
+    def _make_args(
+        self,
+        quantization=None,
+        dispatch_type=None,
+        runner_backend="flashinfer_trtllm_routed",
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            quantization=quantization,
+            moe_a2a_backend="flashinfer",
+            moe_runner_backend=runner_backend,
+            flashinfer_a2a_dispatch_type=dispatch_type,
+            enable_dp_attention=True,
+            dp_size=4,
+            tp_size=4,
+        )
+        server_args._model_config = SimpleNamespace(nvfp4_moe_meta=None)
+        return server_args
+
+    def test_auto_resolves_mxfp8_and_normalizes_trtllm(self):
+        server_args = self._make_args(
+            quantization="mxfp8",
+            dispatch_type="auto",
+            runner_backend="flashinfer_trtllm",
+        )
+        handle_a2a_moe(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "moe_runner_backend"),
+            "flashinfer_trtllm_routed",
+        )
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "mxfp8"
+        )
+
+    def test_auto_resolves_modelopt_fp4_to_nvfp4(self):
+        server_args = self._make_args(quantization="modelopt_fp4", dispatch_type="auto")
+        handle_a2a_moe(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
+        )
+
+    def test_auto_resolves_hybrid_nvfp4_metadata_to_nvfp4(self):
+        server_args = self._make_args(quantization="fp8", dispatch_type="auto")
+        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        handle_a2a_moe(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
+        )
+
+    def test_unspecified_preserves_legacy_nvfp4_auto_enable(self):
+        server_args = self._make_args(quantization="modelopt_fp4")
+        handle_a2a_moe(server_args)
+
+        self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
+        self.assertTrue(envs.SGLANG_MOE_NVFP4_DISPATCH.get())
+
+    def test_unspecified_getter_preserves_legacy_bf16_fallback(self):
+        with get_context().override_server_args(
+            flashinfer_a2a_dispatch_type=None,
+            quantization="mxfp8",
+        ):
+            self.assertEqual(
+                get_flashinfer_a2a_dispatch_type(),
+                FlashinferA2ADispatchType.BF16,
+            )
+
+    def test_runtime_getter_rejects_unresolved_auto(self):
+        with get_context().override_server_args(
+            flashinfer_a2a_dispatch_type="auto",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must resolve it"):
+                get_flashinfer_a2a_dispatch_type()
+
+    def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
+        server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")
+        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        handle_a2a_moe(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
+        )
+
+    def test_explicit_bf16_overrides_auto(self):
+        server_args = self._make_args(quantization="modelopt_fp4", dispatch_type="bf16")
+        handle_a2a_moe(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "bf16"
+        )
+
+    def test_legacy_env_maps_to_dispatch_type(self):
+        with envs.SGLANG_MOE_NVFP4_DISPATCH.override("1"):
+            server_args = self._make_args(quantization="modelopt_fp4")
+            handle_a2a_moe(server_args)
+        self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
+
+        with envs.SGLANG_MOE_NVFP4_DISPATCH.override("0"):
+            server_args = self._make_args(quantization="modelopt_fp4")
+            handle_a2a_moe(server_args)
+        self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
+
+    def test_legacy_env_conflicts_with_explicit_cli(self):
+        with envs.SGLANG_MOE_NVFP4_DISPATCH.override("1"):
+            server_args = self._make_args(
+                quantization="modelopt_fp4", dispatch_type="bf16"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_MOE_NVFP4_DISPATCH cannot be set"
+            ):
+                handle_a2a_moe(server_args)
+
+    def test_mxfp8_dispatch_requires_mxfp8_quantization(self):
+        server_args = self._make_args(quantization="fp8", dispatch_type="mxfp8")
+        with self.assertRaisesRegex(ValueError, "requires --quantization mxfp8"):
+            handle_a2a_moe(server_args)
+
+    def test_explicit_dispatch_type_requires_flashinfer_a2a(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="none",
+            flashinfer_a2a_dispatch_type="bf16",
+        )
+        with self.assertRaisesRegex(ValueError, "requires --moe-a2a-backend"):
+            handle_a2a_moe(server_args)
+
+
+class TestFlashinferMegaMoeConfig(CustomTestCase):
+    def setUp(self):
+        self._combine_dtype_backup = os.environ.get(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE"
+        )
+        self._ikr_backup = os.environ.get(
+            "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE"
+        )
+        envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.clear()
+        envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.clear()
+
+    def tearDown(self):
+        if self._combine_dtype_backup is None:
+            envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.clear()
+        else:
+            os.environ["SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE"] = (
+                self._combine_dtype_backup
+            )
+        if self._ikr_backup is None:
+            envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.clear()
+        else:
+            os.environ["SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE"] = (
+                self._ikr_backup
+            )
+
+    def _make_args(
+        self,
+        architecture="DeepseekV4ForCausalLM",
+        quantization="modelopt_fp4",
+        *,
+        is_fp4_experts=False,
+        nvfp4_moe_meta=None,
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            quantization=quantization,
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            enable_dp_attention=True,
+            dp_size=4,
+            tp_size=4,
+        )
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]),
+            is_fp4_experts=is_fp4_experts,
+            nvfp4_moe_meta=nvfp4_moe_meta,
+        )
+        return server_args
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_accepts_audited_model_architectures(self, _):
+        supported = (
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "Glm4MoeForCausalLM",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen2MoeForCausalLM",
+            "Qwen3MoeForCausalLM",
+        )
+        for architecture in supported:
+            with self.subTest(architecture=architecture):
+                handle_a2a_moe(self._make_args(architecture))
+
+    def test_megamoe_rejects_unaudited_model_architecture(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "not validated for model architectures.*UnsupportedMoeForCausalLM",
+        ):
+            handle_a2a_moe(self._make_args("UnsupportedMoeForCausalLM"))
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_accepts_supported_quantization_formats(self, _):
+        supported = (
+            {"quantization": "modelopt_fp4"},
+            {"quantization": "mxfp8"},
+            {"quantization": "fp8", "is_fp4_experts": True},
+            {"quantization": "modelopt_mixed", "nvfp4_moe_meta": {}},
+        )
+        for config in supported:
+            with self.subTest(config=config):
+                handle_a2a_moe(self._make_args(**config))
+
+    def test_megamoe_rejects_standard_fp8(self):
+        with self.assertRaisesRegex(ValueError, "Standard FP8 MoE checkpoints"):
+            handle_a2a_moe(self._make_args(quantization="fp8"))
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=False)
+    def test_megamoe_requires_sm100_for_all_quantization_formats(self, _):
+        with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
+            handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
+        with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):
+            handle_a2a_moe(self._make_args())
+
+        with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("mxfp8"):
+            handle_a2a_moe(self._make_args())
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_combine_dtype_rejects_invalid_value(self, _):
+        with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("fp8"):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE"
+            ):
+                handle_a2a_moe(self._make_args())
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_combine_dtype_conflicts_with_ikr(self, _):
+        with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):
+            with envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override("1"):
+                with self.assertRaisesRegex(ValueError, "incompatible"):
+                    handle_a2a_moe(self._make_args())
 
 
 class TestPortArgs(unittest.TestCase):
@@ -2256,7 +2466,7 @@ class TestDeepEPv2Args(CustomTestCase):
             prefill=PhaseConfig(backend=Backend.FULL, max_bs=512),
         )
         server_args._resolved_overrides = []
-        valid = {f.name for f in dataclasses.fields(ServerArgs)}
+        valid = {f.name for f in msgspec.structs.fields(ServerArgs)}
         for key, value in overrides.items():
             # Reject stale field names before setattr silently accepts them.
             assert key in valid, f"{key} is not a ServerArgs field"
@@ -2575,7 +2785,7 @@ class TestHandleCrashDumpEnv(CustomTestCase):
     )
 
     def _run_handler(self, crash_dump_folder, preset_env=None):
-        server_args = ServerArgs.__new__(ServerArgs)
+        server_args = ServerArgs(model_path="dummy")
         server_args.crash_dump_folder = crash_dump_folder
         with patch.dict(os.environ, preset_env or {}):
             for key in self._COREDUMP_ENV_KEYS:
@@ -2931,6 +3141,216 @@ class TestDcpKvEventContract(CustomTestCase):
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
+
+
+class TestTheInputIsSealedDuringResolution(CustomTestCase):
+    """The record holds what the operator asked for, and resolution does not
+    write it -- enforced, not merely observed.
+
+    The guard used to arm only once resolution had *finished*, so for the whole
+    length of the pipeline nothing stopped a resolver from assigning a field.
+    Nothing in-tree did, but a resolver that started to would overwrite the
+    input the record exists to remember, and the defect is invisible: the value
+    it wrote is indistinguishable from a value the operator typed.
+    """
+
+    def test_a_write_before_resolution_is_fine(self):
+        """Callers assemble the record however they like."""
+        server_args = ServerArgs(model_path="/tmp/x")
+        server_args.tp_size = 2
+        self.assertEqual(server_args.tp_size, 2)
+
+    def test_a_write_during_resolution_is_refused(self):
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        # The seal is what the pipeline runs under; drive it directly rather
+        # than injecting a violation into a real handler.
+        msgspec.Struct.__setattr__(server_args, "_input_frozen", True)
+        with self.assertRaisesRegex(AttributeError, "during resolution"):
+            server_args.tp_size = 4
+        # and the message says what to do instead
+        try:
+            server_args.tp_size = 4
+        except AttributeError as caught:
+            self.assertIn("declare_resolution", str(caught))
+
+    def test_the_seal_comes_off_when_resolution_ends(self):
+        """`_resolution_finished` takes over; the two messages are different
+        because the fix is different."""
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        server_args.resolve_once()
+        self.assertFalse(getattr(server_args, "_input_frozen", False))
+        with self.assertRaisesRegex(AttributeError, "after resolution"):
+            server_args.tp_size = 4
+
+    def test_it_has_no_exception(self):
+        """A resolver from outside this tree assigns fields -- an interface this
+        tree does not own -- and it still does not reach the record.
+
+        `record_foreign_defaults` hands it a stand-in: the assignment is
+        captured and declared, the field keeps the operator's input, and the
+        seal stays armed for the whole call. There used to be a named lift for
+        this, which made the record the one thing resolution could write.
+        """
+        from sglang.srt.arg_groups.overrides import (
+            record_foreign_defaults,
+            resolution_result,
+        )
+
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        msgspec.Struct.__setattr__(server_args, "_input_frozen", True)
+
+        def foreign(config):
+            # What a plugin does: read what is decided, assign a default.
+            assert config.tp_size == 1
+            config.tp_size = 4
+
+        record_foreign_defaults(server_args, "platform:probe", foreign)
+
+        self.assertEqual(resolution_result(server_args, "tp_size"), 4)
+        self.assertEqual(server_args.tp_size, 1, "the record is the input")
+        with self.assertRaisesRegex(AttributeError, "during resolution"):
+            server_args.tp_size = 8
+
+    def test_a_failed_resolution_does_not_leave_it_sealed(self):
+        """A record that failed resolution is still the operator's input, and
+        `resolve_once` already refuses to re-run on it. Leaving the seal armed
+        would make the failure look like a different one to anyone inspecting
+        the record afterwards."""
+        server_args = ServerArgs(
+            model_path="dummy", device="cuda", prefill_decode_interval=-5
+        )
+        with self.assertRaisesRegex(ValueError, "prefill-decode-interval"):
+            server_args.resolve_once()
+        self.assertFalse(getattr(server_args, "_input_frozen", False))
+
+
+class TestLaunchCommand(CustomTestCase):
+    """The record answers what was asked for, not only what was decided.
+
+    `resolved_dict` and `launch_command` are different questions, and neither
+    recovers the other: a field the operator never set resolves to the same
+    value as one they set to what resolution would have picked anyway.
+    """
+
+    def test_the_launcher_records_what_it_parsed(self):
+        server_args = prepare_server_args(
+            ["--model-path", "/tmp/x", "--tp-size", "2", "--log-level", "warning"]
+        )
+        self.assertEqual(
+            server_args.launch_command,
+            "--model-path /tmp/x --tp-size 2 --log-level warning",
+        )
+
+    def test_a_record_nobody_launched_has_no_command(self):
+        self.assertIsNone(ServerArgs(model_path="/tmp/x").launch_command)
+
+    def test_it_crosses_a_process_boundary(self):
+        """The scheduler and detokenizer get the record by pickle, and they
+        answer `/server_info` for their own process."""
+        server_args = prepare_server_args(["--model-path", "/tmp/x"])
+        self.assertEqual(
+            pickle.loads(pickle.dumps(server_args)).launch_command,
+            server_args.launch_command,
+        )
+
+    def test_it_is_not_a_config_field(self):
+        """It describes how the configuration was asked for, so it is not part
+        of the configuration: no CLI flag, no namespace, not in the bags."""
+        self.assertNotIn(
+            "launch_command", {f.name for f in msgspec.structs.fields(ServerArgs)}
+        )
+        self.assertNotIn(
+            "launch_command", ServerArgs(model_path="/tmp/x").resolved_dict()
+        )
+
+
+class TestNoneMeansUnset(CustomTestCase):
+    """A valued field the resolution rewrites carries `None` for "not set".
+
+    `mamba_full_memory_ratio` used to default to 0.9, so a model family asking
+    "did the operator leave this alone?" had to compare against the class
+    default -- which stops being true the moment anything declares the field
+    first, and says nothing at all if the operator happens to pass 0.9. `None`
+    answers both, and the generic value lands during resolution instead.
+    """
+
+    def _resolved(self, **kwargs):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda", **kwargs)
+        server_args.resolve_once()
+        return resolution_result(server_args, "mamba_full_memory_ratio")
+
+    def _checkpoint(self) -> str:
+        directory = tempfile.mkdtemp(prefix="none_means_unset_")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        with open(os.path.join(directory, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        return directory
+
+    def test_the_record_keeps_none_and_resolution_supplies_the_value(self):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda")
+        self.assertIsNone(server_args.mamba_full_memory_ratio)
+        server_args.resolve_once()
+        # The record still carries what the operator typed; the value is the
+        # resolution's.
+        self.assertIsNone(server_args.mamba_full_memory_ratio)
+        self.assertEqual(resolution_result(server_args, "mamba_full_memory_ratio"), 0.9)
+
+    def test_an_explicit_value_is_never_overwritten(self):
+        self.assertEqual(self._resolved(mamba_full_memory_ratio=0.5), 0.5)
+
+    def test_the_swa_ratio_behaves_the_same_way(self):
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda")
+        self.assertIsNone(server_args.swa_full_tokens_ratio)
+        server_args.resolve_once()
+        self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.8)
+
+        explicit = ServerArgs(
+            model_path=self._checkpoint(), device="cuda", swa_full_tokens_ratio=0.3
+        )
+        explicit.resolve_once()
+        self.assertEqual(resolution_result(explicit, "swa_full_tokens_ratio"), 0.3)
+
+    def test_the_swa_ratio_is_still_range_checked(self):
+        """The check reads the resolved value, so `None` must be gone by then."""
+        with self.assertRaisesRegex(ValueError, "swa-full-tokens-ratio"):
+            ServerArgs(
+                model_path=self._checkpoint(),
+                device="cuda",
+                swa_full_tokens_ratio=0.0,
+            ).resolve_once()
+
+    def test_a_dummy_model_still_gets_the_generic_values(self):
+        """The dummy short circuit returns long before the normal fill slot.
+
+        The families it skips are exactly the ones that would have claimed
+        these fields, so the generic values have to land on the way out --
+        otherwise every bag on this path holds None where it used to hold a
+        ratio.
+        """
+        server_args = ServerArgs(model_path="dummy", device="cuda")
+        server_args.resolve_once()
+        self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.8)
+        self.assertEqual(resolution_result(server_args, "mamba_full_memory_ratio"), 0.9)
+
+    def test_an_explicit_value_equal_to_the_generic_one_still_reads_as_set(self):
+        """The case the class-default comparison could never see."""
+        server_args = ServerArgs(
+            model_path=self._checkpoint(), device="cuda", mamba_full_memory_ratio=0.9
+        )
+        self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
 if __name__ == "__main__":
