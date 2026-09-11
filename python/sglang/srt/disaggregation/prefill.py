@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _all_reduce_polls,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -51,7 +52,6 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
-    _all_reduce_polls,
     poll_and_all_reduce_attn_cp_tp_group,
     pp_sync_polls,
     prepare_abort,
@@ -446,9 +446,7 @@ class PrefillBootstrapQueue:
                     import random
 
                     polls = [
-                        int(KVPoll.Failed)
-                        if random.random() < failure_prob
-                        else poll
+                        int(KVPoll.Failed) if random.random() < failure_prob else poll
                         for poll in polls
                     ]
             else:

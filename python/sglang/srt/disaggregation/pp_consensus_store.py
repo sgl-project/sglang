@@ -5,7 +5,7 @@ import pickle
 import queue
 import threading
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 _Key = Union[int, str]
 
@@ -88,7 +88,9 @@ class PPConsensusStore:
                 if op[0] == _OpKind.PUT:
                     _, key, value = op
                     logger.debug(f"put {key} = {value}")
-                    self._store.set(self._store_key(self.pp_rank, key), pickle.dumps(value))
+                    self._store.set(
+                        self._store_key(self.pp_rank, key), pickle.dumps(value)
+                    )
                 elif op[0] == _OpKind.DELETE:
                     _, key = op
                     store_key = self._store_key(self.pp_rank, key)
@@ -108,7 +110,9 @@ class PPConsensusStore:
         self._flush_seq += 1
         seq = self._flush_seq
         self._store.set(f"{_FLUSH_DONE_PREFIX}/{self.pp_rank}/{seq}", b"1")
-        wait_keys = [f"{_FLUSH_DONE_PREFIX}/{rank}/{seq}" for rank in range(self.pp_size)]
+        wait_keys = [
+            f"{_FLUSH_DONE_PREFIX}/{rank}/{seq}" for rank in range(self.pp_size)
+        ]
         self._store.wait(wait_keys)
 
     def put(self, key: _Key, value: Any) -> None:

@@ -9,8 +9,6 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
-from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
-
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -28,6 +26,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
     StateType,
 )
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,

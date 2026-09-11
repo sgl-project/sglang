@@ -2558,7 +2558,6 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         else:
             return self.conclude_state
 
-
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
             self.trace_ctx = TraceReqContext(
