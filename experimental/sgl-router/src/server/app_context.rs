@@ -118,6 +118,7 @@ impl AppContext {
                 server: crate::config::ServerConfig {
                     host: "x".into(),
                     port: 0,
+                    ..Default::default()
                 },
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
