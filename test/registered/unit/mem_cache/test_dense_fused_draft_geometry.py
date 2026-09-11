@@ -63,8 +63,10 @@ def _draft_region():
     )
 
 
-def _placement(region):
-    return FusedDraftPlacement(region=region, runner_lane_counts=(region.lane_num,))
+def _placement(region, num_runners=1):
+    return FusedDraftPlacement.from_counts(
+        counts={"full": [region.lane_num] * num_runners}, regions={"full": region}
+    )
 
 
 class TestFusedSpecMath(unittest.TestCase):
