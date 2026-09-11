@@ -12,17 +12,23 @@ name: AMD MI35x HF cache reclaim and seed
 # and uploads a listing, and deletes nothing. Run it that way first -- the
 # allowlist should come from what is on the volume, not from memory of it.
 #
-# It runs on pull_request as well as dispatch because a workflow file that is
-# not yet on the default branch cannot be dispatched at all, and the cache is
-# usually blocking the very PR that is adding the entry.
+# Dispatch-only: reclaiming and seeding is not a per-PR activity, and this takes
+# a scarce MI35x runner for as long as the download lasts.
+#
+# It ran on pull_request while it was being brought up, because a workflow file
+# that is not yet on the default branch cannot be dispatched at all, and the
+# cache was blocking the very PR that added it. That is worth knowing before
+# reaching for the same trick: a `paths` filter does not limit a pull_request
+# trigger to pushes that touch those paths. The filter matches the whole PR
+# diff, so once the PR contains this file every subsequent push re-runs the job,
+# whatever it changed. Runs 34548293873 (audit), 34549258956 and 34549982464
+# (reclaim and seed) were the useful ones; the rest were pushes to unrelated
+# files.
+#
+# The values below are left as the record of what that seeding did. Reusing this
+# means editing them and dispatching from the branch carrying that edit.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - "scripts/ci/amd/reclaim_and_seed_hf_cache.sh"
-      - "scripts/ci/amd/seed_hf_checkpoint.py"
-      - ".github/workflows/amd-mi35x-hf-cache-reclaim-and-seed.yml"
   workflow_dispatch:
 
 permissions:
