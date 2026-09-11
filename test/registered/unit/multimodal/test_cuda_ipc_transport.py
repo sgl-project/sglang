@@ -5,6 +5,7 @@ the bounded pool and the scheduler process opens the shared CUDA allocation.
 CPU-only policy tests intentionally cannot exercise this cross-process handle.
 """
 
+import copy
 import gc
 import multiprocessing as mp
 import queue
@@ -28,7 +29,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=75, stage="base-b", runner_config="1-gpu-large")
 
 
 def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
@@ -73,6 +74,61 @@ def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
         gc.collect()
         torch.cuda.ipc_collect()
     result_queue.put(("ok", None))
+
+
+def _produce_auxiliary_items(proxy_queue, consumer_done, result_queue):
+    """Reuse one bounded producer pool across multiple auxiliary transfers."""
+    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+
+    pool = None
+    try:
+        torch.cuda.set_device(0)
+        pool = MmItemMemoryPool(
+            memory_size=1 << 20,
+            recycle_interval=0.01,
+            base_gpu_id=0,
+            consumer_count=1,
+        )
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.use_ipc_pool_handle_cache = True
+        processor.cudaipc_mmfeature_pool = pool
+        for iteration in range(8):
+            consumer_done.clear()
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=torch.full(
+                    (16,), iteration, dtype=torch.float32, device="cuda"
+                ),
+                model_specific_data={
+                    "patch_pixel_values": torch.full(
+                        (256, 256), iteration + 1, dtype=torch.float32, device="cuda"
+                    )
+                },
+            )
+            processor._prepare_mm_items_for_transport([item])
+            if not isinstance(
+                item.model_specific_data["patch_pixel_values"],
+                CudaIpcTensorTransportProxy,
+            ):
+                raise AssertionError("auxiliary tensor bypassed the CUDA IPC pool")
+            proxy_queue.put(item)
+            if not consumer_done.wait(timeout=60):
+                raise TimeoutError("auxiliary consumer did not finish")
+            deadline = time.monotonic() + 5
+            while pool.active_lease_count and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if pool.active_lease_count:
+                raise AssertionError(f"iteration {iteration}: unreleased pool leases")
+            del item
+    except Exception as exc:
+        result_queue.put(("error", repr(exc)))
+    else:
+        result_queue.put(("ok", None))
+    finally:
+        if pool is not None:
+            pool.shutdown()
 
 
 class TestCudaIpcTransport(CustomTestCase):
@@ -127,6 +183,70 @@ class TestCudaIpcTransport(CustomTestCase):
                     producer.terminate()
                     producer.join(timeout=10)
             self.assertEqual(producer.exitcode, 0)
+
+    def test_auxiliary_round_trips_release_pool_leases(self):
+        from sglang.srt.managers.mm_utils import _offload_auxiliary_features
+
+        ctx = mp.get_context("spawn")
+        proxy_queue, results = ctx.Queue(), ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_auxiliary_items,
+            args=(proxy_queue, consumer_done, results),
+        )
+        producer.start()
+        item = original_metadata = None
+        try:
+            for iteration in range(8):
+                item = proxy_queue.get(timeout=60)
+                self.assertIsInstance(
+                    item.model_specific_data["patch_pixel_values"],
+                    CudaIpcTensorTransportProxy,
+                )
+                if iteration % 2:
+                    # Rejected requests must release both primary and auxiliary
+                    # leases without ever reconstructing their GPU tensors.
+                    item.release_transport_proxies()
+                    torch.cuda.synchronize()
+                else:
+                    item.reconstruct(0)
+                    torch.cuda.synchronize()
+                    self.assertTrue(
+                        torch.equal(
+                            item.feature.cpu(), torch.full((16,), float(iteration))
+                        )
+                    )
+                    original_metadata = item.model_specific_data
+                    _offload_auxiliary_features(item)
+                    torch.cuda.synchronize()
+                    self.assertTrue(original_metadata["patch_pixel_values"].is_cuda)
+                    auxiliary = item.model_specific_data["patch_pixel_values"]
+                    self.assertEqual(auxiliary.device.type, "cpu")
+                    self.assertTrue(
+                        torch.equal(
+                            auxiliary, torch.full((256, 256), float(iteration + 1))
+                        )
+                    )
+                item = original_metadata = None
+                _pool_handle_cache_clear()
+                gc.collect()
+                torch.cuda.ipc_collect()
+                consumer_done.set()
+            status, error = results.get(timeout=15)
+            self.assertEqual(status, "ok", error)
+        finally:
+            item = original_metadata = None
+            _pool_handle_cache_clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=15)
+            if producer.is_alive():
+                producer.terminate()
+                producer.join(timeout=10)
+            proxy_queue.close()
+            results.close()
+        self.assertEqual(producer.exitcode, 0)
 
     def test_failed_reconstruction_releases_pooled_tensor(self):
         ctx = mp.get_context("spawn")
@@ -237,6 +357,10 @@ class TestCudaIpcTransport(CustomTestCase):
             for feature in features
         ]
 
+        auxiliary = torch.ones(32, device="cuda")
+        original_metadata = {"patch_pixel_values": auxiliary}
+        items[0].model_specific_data = original_metadata
+        sibling = copy.copy(items[0])
         try:
             with self.assertRaisesRegex(ValueError, "empty tensor"):
                 processor._prepare_mm_items_for_transport(items)
@@ -247,6 +371,8 @@ class TestCudaIpcTransport(CustomTestCase):
             self.assertEqual(pool.active_lease_count, 0)
             self.assertIs(items[0].feature, features[0])
             self.assertIs(items[1].feature, features[1])
+            self.assertIs(items[0].model_specific_data, original_metadata)
+            self.assertIs(sibling.model_specific_data["patch_pixel_values"], auxiliary)
         finally:
             pool.shutdown()
 
