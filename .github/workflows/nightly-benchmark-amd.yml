@@ -69,7 +69,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
+        # One image per run by default -- the schedule measures the current
+        # ROCm lane, and sweeping three of them would hold the 8-GPU MI35x
+        # runner for hours to produce three numbers nobody compares.
+        rocm_version: ${{ fromJson(inputs.rocm_version == 'all' && '["rocm10", "rocm724", "rocm720"]' || format('["{0}"]', inputs.rocm_version || 'rocm10')) }}
     if: github.repository == 'sgl-project/sglang' && (!inputs.benchmark_select || inputs.benchmark_select == 'all' || inputs.benchmark_select == 'qwen35-mxfp4-agentic-mtp-mi35x')
     runs-on: linux-mi35x-gpu-8
     steps:
