@@ -1310,8 +1310,19 @@ class DeepseekV4AttnBackend(
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
+            #
+            # The low-ratio (compress_ratio 1/2) indexer is FP4-only: it has no
+            # Torch/TileLang fallback and always calls DeepGEMM's
+            # fp8_fp4_paged_mqa_logits, so it needs the schedule metadata even
+            # when the C4 indexer takes the Torch fallback -- which is the SM120
+            # default (model_hook force-enables
+            # SGLANG_FP8_PAGED_MQA_LOGITS_TORCH there). Keying the force on the
+            # experimental C4 FP4 flag alone left deep_gemm_metadata=None and
+            # made the low-ratio decode path call the kernel with a null
+            # schedule (TypeError: Expected DLTensor* but got None).
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                get_platform().is_sm120
+                and (self.enable_deepseek_v4_fp4_indexer or compress_ratio in (1, 2))
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
