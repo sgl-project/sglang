@@ -12,9 +12,7 @@ on:
       # floor) from here, via ci_install_dependency.sh's
       # `pip install -e python[...]` — a bump there must re-run this workflow.
       - "python/pyproject.toml"
-      # The gRPC-mode launch path the SMG workers boot through; only this
-      # workflow exercises it.
-      - "python/sglang/launch_server.py"
+      # The SMG gRPC entrypoint; only this workflow exercises it.
       - "python/sglang/srt/entrypoints/grpc_server.py"
   pull_request:
     branches: [ main ]
@@ -28,9 +26,7 @@ on:
       # floor) from here, via ci_install_dependency.sh's
       # `pip install -e python[...]` — a bump there must re-run this workflow.
       - "python/pyproject.toml"
-      # The gRPC-mode launch path the SMG workers boot through; only this
-      # workflow exercises it.
-      - "python/sglang/launch_server.py"
+      # The SMG gRPC entrypoint; only this workflow exercises it.
       - "python/sglang/srt/entrypoints/grpc_server.py"
   workflow_dispatch:
 
