@@ -7,6 +7,11 @@ by ``.github/workflows/nightly-benchmark-amd.yml``. It reports a throughput
 number rather than gating anything, which is why it runs there and not in the
 AMD nightly test workflow.
 
+The recipe has two modes and so does this file, selected by ``AGENTIC_MODE``:
+``replay`` (the default) measures the coding-agent replay, and ``eval`` is the
+script's ``EVAL_ONLY`` pass, which scores the same serving configuration on
+GSM8K. Each mode is one CI matrix point, so neither waits on the other's server.
+
 Why this exists next to the batch-sweep perf tests: every other MI35x perf test
 runs ``bench_one_batch_server`` at a fixed batch size and a fixed prompt length,
 which is the workload shape this serving config is least like. The AgentX recipe
@@ -63,11 +68,15 @@ Registry: nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp suite
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.agentic_trace_replay import run_agentic_replay
 from sglang.test.agentic_trace_utils import ensure_agentic_trace_file, weka_trace_url
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -87,12 +96,18 @@ register_amd_ci(
 # but that path is a dev-host mount and is not visible inside the CI container.
 MODEL_PATH = os.environ.get("QWEN35_MXFP4_MODEL_PATH", "amd/Qwen3.5-397B-A17B-MXFP4")
 
+# AgentX runs this recipe twice: a throughput replay, and an EVAL_ONLY pass
+# that scores the served model. Both modes share this file and its server
+# configuration, and each skips the other's case rather than launching a second
+# 400B server it would not use.
+MODE = os.environ.get("AGENTIC_MODE", "replay")
+
 # Parallelism and concurrency come from the recipe's own search space in
 # InferenceX configs/amd-master.yaml (qwen3.5-fp4-mi355x-sglang-agentic-mtp):
 # tp2 and tp4 at ep1, with the HiCache CPU tier only on the high-concurrency
-# rows. The CI matrix covers all ten tp2 points on the 2-GPU runner and keeps
-# tp4 + HiCache at c48 as a reference point on the 8-GPU runner; the recipe
-# never runs this checkpoint at tp8.
+# rows. The CI matrix runs the ten tp2 points on the 2-GPU MI35x runner; tp4
+# needs the 8-GPU runner, so it stays a manual override rather than a scheduled
+# point. The recipe never runs this checkpoint at tp8.
 TP_SIZE = int(os.environ.get("AGENTIC_TP", "4"))
 EP_SIZE = int(os.environ.get("AGENTIC_EP_SIZE", "1"))
 CONCURRENCY = int(os.environ.get("AGENTIC_CONCURRENCY", "48"))
@@ -107,6 +122,15 @@ OUTPUT_LEN = int(os.environ.get("AGENTIC_OUTPUT_LEN", "0")) or None
 KV_OFFLOADING = os.environ.get("AGENTIC_KV_OFFLOADING", "hicache")
 SCHEDULER_RECV_INTERVAL = os.environ.get("SCHEDULER_RECV_INTERVAL", "30")
 SIMULATE_ACC_LEN = os.environ.get("AGENTIC_SIMULATE_ACC_LEN", "")
+
+# AgentX scores its eval pass with lm-eval's gsm8k over the full 1319-question
+# set. sglang's own gsm8k runner asks the same questions few-shot through the
+# completion API, which is what every other AMD accuracy test uses, so the score
+# is comparable to those rather than to an lm-eval number. The gate sits below
+# the 0.91 the plain MXFP4 accuracy test holds, because this recipe also serves
+# fp8 KV and EAGLE MTP.
+EVAL_NUM_EXAMPLES = int(os.environ.get("AGENTIC_EVAL_NUM_EXAMPLES", "1319"))
+EVAL_ACC_THRESHOLD = float(os.environ.get("AGENTIC_EVAL_ACC_THRESHOLD", "0.88"))
 
 HICACHE_RATIO = os.environ.get("HICACHE_RATIO", "1.5")
 HICACHE_WRITE_POLICY = os.environ.get("HICACHE_WRITE_POLICY", "write_through")
@@ -227,7 +251,9 @@ def build_server_args() -> list:
 def build_server_env() -> dict:
     env = os.environ.copy()
     env.update(COMMON_ENV)
-    if SIMULATE_ACC_LEN:
+    # AgentX pins acceptance on the throughput side only; its eval pass keeps
+    # real target-model verification, so a pinned length is dropped here.
+    if SIMULATE_ACC_LEN and MODE != "eval":
         env["SGLANG_SIMULATE_ACC_LEN"] = SIMULATE_ACC_LEN
         env["SGLANG_SIMULATE_ACC_METHOD"] = "match-expected"
         env["SGLANG_SIMULATE_ACC_TOKEN_MODE"] = "real-draft-token"
@@ -279,6 +305,7 @@ def render_report(result: dict, trace_summary: str) -> str:
     return report
 
 
+@unittest.skipUnless(MODE == "replay", f"AGENTIC_MODE={MODE} skips the replay")
 class TestQwen35Mxfp4AgenticMtpMI35x(CustomTestCase):
     """AgentX coding-agent replay against the MI35x MXFP4 + MTP serving recipe."""
 
@@ -353,6 +380,57 @@ class TestQwen35Mxfp4AgenticMtpMI35x(CustomTestCase):
             result["failed"], 0, f"{result['failed']} turns failed: {result['errors']}"
         )
         self.assertGreater(result["output_throughput"], 0, "No output tokens generated")
+
+
+@unittest.skipUnless(MODE == "eval", f"AGENTIC_MODE={MODE} skips the eval pass")
+class TestQwen35Mxfp4AgenticEvalMI35x(CustomTestCase):
+    """AgentX's EVAL_ONLY pass: score the same serving recipe on GSM8K."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+
+    def test_gsm8k(self):
+        process = popen_launch_server(
+            MODEL_PATH,
+            self.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=build_server_args(),
+            env=build_server_env(),
+        )
+        try:
+            requests.get(self.base_url + "/flush_cache")
+            metrics = run_eval(
+                SimpleNamespace(
+                    base_url=self.base_url,
+                    model=MODEL_PATH,
+                    eval_name="gsm8k",
+                    api="completion",
+                    max_tokens=2048,
+                    num_examples=EVAL_NUM_EXAMPLES,
+                    num_threads=CONCURRENCY,
+                )
+            )
+        finally:
+            kill_process_tree(process.pid)
+
+        report = (
+            f"### Qwen3.5-397B-A17B MXFP4 + EAGLE MTP, AgentX eval "
+            f"[{os.getenv('GPU_CONFIG', 'MI35x')}]\n\n"
+            f"| workload | value |\n| --- | --- |\n"
+            f"| parallelism | tp{TP_SIZE} / ep{EP_SIZE} |\n"
+            f"| concurrency | {CONCURRENCY} |\n"
+            f"| kv offloading | {KV_OFFLOADING} |\n"
+            f"| metric | value |\n| --- | --- |\n"
+            f"| gsm8k questions | {EVAL_NUM_EXAMPLES} |\n"
+            f"| gsm8k score | {metrics['score']:.3f} "
+            f"(threshold {EVAL_ACC_THRESHOLD}) |\n"
+        )
+        print(report, flush=True)
+        if is_in_ci():
+            write_github_step_summary(report)
+
+        self.assertGreater(metrics["score"], EVAL_ACC_THRESHOLD)
 
 
 if __name__ == "__main__":
