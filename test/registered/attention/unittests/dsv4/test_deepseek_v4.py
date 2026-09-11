@@ -703,18 +703,28 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
         from sglang.srt.layers.attention import deepseek_v4_backend as module
 
         topk = 3
-        for width, ratio, mode in (
-            (127, 1, ForwardMode.DECODE),
-            (128, 1, ForwardMode.DECODE),
-            (384, 1, ForwardMode.DECODE),
-            (127, 2, ForwardMode.DECODE),
-            (128, 2, ForwardMode.DECODE),
-            (384, 2, ForwardMode.DECODE),
-            (384, 1, ForwardMode.TARGET_VERIFY),
-            (384, 2, ForwardMode.TARGET_VERIFY),
+        for width, ratio, consumer_ratio, mode in (
+            (127, 1, 1, ForwardMode.DECODE),
+            (128, 1, 1, ForwardMode.DECODE),
+            (384, 1, 1, ForwardMode.DECODE),
+            (127, 2, 2, ForwardMode.DECODE),
+            (128, 2, 2, ForwardMode.DECODE),
+            (384, 2, 2, ForwardMode.DECODE),
+            (384, 1, 1, ForwardMode.TARGET_VERIFY),
+            (384, 2, 2, ForwardMode.TARGET_VERIFY),
+            (127, 1, 2, ForwardMode.DECODE),
+            (128, 1, 2, ForwardMode.DECODE),
+            (255, 1, 2, ForwardMode.DECODE),
+            (256, 1, 2, ForwardMode.DECODE),
+            (385, 1, 2, ForwardMode.DECODE),
+            (385, 1, 2, ForwardMode.TARGET_VERIFY),
+            (128, 2, 1, ForwardMode.DECODE),
+            (385, 2, 1, ForwardMode.DECODE),
         ):
-            with self.subTest(width=width, ratio=ratio, mode=mode):
-                pages = torch.tensor([[7, 5, 1], [6, 4, 2], [9, 8, 3]])
+            with self.subTest(
+                width=width, ratio=ratio, consumer_ratio=consumer_ratio, mode=mode
+            ):
+                pages = torch.tensor([[7, 5, 1, 10], [6, 4, 2, 11], [9, 8, 3, 12]])
                 tokens = torch.arange(width * ratio)
                 mapping = pages[:, tokens // 256] * 256 + tokens % 256
                 req = torch.tensor([2, 0, 1])
@@ -728,8 +738,10 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
                 backend.forward_metadata = module.DSV4Metadata(
                     core_attn_metadata=core,
                     indexer_metadata=None,
-                    c1_indexer_metadata=SimpleNamespace(max_c4_seq_len=width),
-                    c2_indexer_metadata=SimpleNamespace(max_c4_seq_len=width),
+                    c1_indexer_metadata=SimpleNamespace(max_c4_seq_len=width * ratio),
+                    c2_indexer_metadata=SimpleNamespace(
+                        max_c4_seq_len=width * ratio // 2
+                    ),
                 )
                 backend.req_to_token = mapping
                 backend.candidate_masks = None
@@ -792,24 +804,47 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
                             indexer.is_candidate_source = i == 0
                             indexer.uses_candidates = i > 0
                             layer.layer_id = 20 + i * 4
+                            layer.compress_ratio = ratio if i == 0 else consumer_ratio
+                            layer_width = width * ratio // layer.compress_ratio
+                            layer_lens = (pos + 1) // layer.compress_ratio
+                            layer_slots = (
+                                mapping[
+                                    req[:, None],
+                                    torch.arange(layer_width) * layer.compress_ratio,
+                                ]
+                                // layer.compress_ratio
+                            )
                             q = torch.full((3, 1), (-1) ** i * (i + 1))
                             backend._low_ratio_index_topk(
                                 layer, q, q, req, pos, forward_batch
                             )
                             expected_scores = score(
-                                q, None, full_slots, lens, table, 64
+                                q, None, layer_slots, layer_lens, table, 64
                             )
                             if i:
-                                expected_scores.masked_fill_(~candidates, -torch.inf)
+                                candidate_mask = torch.zeros_like(
+                                    expected_scores, dtype=torch.bool
+                                )
+                                shared_width = min(width, layer_width)
+                                candidate_mask[:, :shared_width] = candidates[
+                                    :, :shared_width
+                                ]
+                                if width >= 128 and mode == ForwardMode.DECODE:
+                                    candidate_mask &= (
+                                        torch.arange(layer_width) < lens[:, None]
+                                    )
+                                expected_scores.masked_fill_(
+                                    ~candidate_mask, -torch.inf
+                                )
                             values, chosen = expected_scores.topk(topk, dim=1)
                             chosen = (
-                                chosen.masked_fill(values == -torch.inf, width)
+                                chosen.masked_fill(values == -torch.inf, layer_width)
                                 .sort(1)
                                 .values
                             )
-                            valid = chosen < width
-                            expected_pages = full_slots.gather(
-                                1, chosen.clamp_max(width - 1)
+                            valid = chosen < layer_width
+                            expected_pages = layer_slots.gather(
+                                1, chosen.clamp_max(layer_width - 1)
                             ).masked_fill(~valid, -1)
                             torch.testing.assert_close(
                                 page_indices, expected_pages.to(torch.int32)
@@ -827,17 +862,26 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
                                     backend.forward_metadata.sm90_decode_candidates,
                                     published,
                                 )
-                                positions, slots, counts = published
-                                self.assertIs(logits.call_args.args[2], slots)
+                                positions, slots, counts, source_ratio = published
+                                self.assertEqual(source_ratio, ratio)
+                                if layer.compress_ratio == ratio:
+                                    self.assertIs(logits.call_args.args[2], slots)
                                 torch.testing.assert_close(
                                     positions < lens[:, None],
                                     torch.arange(slots.shape[1]) < counts[:, None],
                                 )
+                                visible = (positions < layer_lens[:, None]) & (
+                                    torch.arange(slots.shape[1]) < counts[:, None]
+                                )
                                 torch.testing.assert_close(
-                                    slots,
-                                    full_slots.gather(
-                                        1, positions.clamp_max(width - 1)
-                                    ).masked_fill(positions >= lens[:, None], 0),
+                                    logits.call_args.args[2],
+                                    layer_slots.gather(
+                                        1, positions.clamp_max(layer_width - 1)
+                                    ).masked_fill(~visible, 0),
+                                )
+                                torch.testing.assert_close(
+                                    logits.call_args.args[3],
+                                    visible.sum(dim=-1),
                                 )
                         self.assertEqual(
                             [call.args[2].shape[1] for call in logits.call_args_list],
@@ -845,7 +889,7 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
                             + [
                                 8
                                 if width >= 128 and mode == ForwardMode.DECODE
-                                else width
+                                else width * ratio // consumer_ratio
                             ]
                             * 4,
                         )

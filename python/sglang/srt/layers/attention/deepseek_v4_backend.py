@@ -944,9 +944,9 @@ class DSV4Metadata:
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
 
-    # Source-produced logical positions, physical slots and valid lengths for decode.
+    # Source-produced logical positions, physical slots, valid lengths and ratio.
     sm90_decode_candidates: Optional[
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
     ] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
@@ -3459,20 +3459,34 @@ class DeepseekV4AttnBackend(
             return
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
+        candidates = self.forward_metadata.sm90_decode_candidates
         # H100 timings support amortizing candidate construction at this capacity.
-        compact = (
-            forward_batch.forward_mode.is_decode()
-            and lmax
+        # Consumers follow the source's choice across compression-ratio boundaries.
+        compact = forward_batch.forward_mode.is_decode() and (
+            candidates is not None
+            if indexer.uses_candidates and not indexer.is_candidate_source
+            else lmax
             >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
         )
         positions = None
         score_lens = lens
         if compact and indexer.uses_candidates and not indexer.is_candidate_source:
-            candidates = self.forward_metadata.sm90_decode_candidates
             assert candidates is not None and candidates[0].shape[0] == bs, (
                 "candidate slots missing for decode"
             )
-            positions, slots, score_lens = candidates
+            positions, slots, score_lens, source_ratio = candidates
+            if ratio != source_ratio:
+                valid = (
+                    torch.arange(positions.shape[1], device=pos.device)
+                    < score_lens[:, None]
+                ) & (positions < lens[:, None])
+                slots = (
+                    self.req_to_token[
+                        req[:, None], positions.clamp_max(lmax - 1) * ratio
+                    ].to(torch.int64)
+                    // ratio
+                ).masked_fill(~valid, 0)
+                score_lens = valid.sum(dim=-1)
         else:
             j = torch.arange(lmax, device=pos.device)
             valid = j[None, :] < lens[:, None]
@@ -3505,6 +3519,7 @@ class DeepseekV4AttnBackend(
                     candidate_positions,
                     candidate_slots,
                     valid.sum(dim=-1),
+                    ratio,
                 )
             else:
                 self.candidate_masks = select_candidate_blocks(
