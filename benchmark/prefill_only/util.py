@@ -30,6 +30,11 @@ class BenchmarkConfig:
         self.num_unique_requests = 100
         self.distribution = "POISSON"  # Options: "CONSTANT", "POISSON"
         self.profile = False
+        # Also profile the tokenizer manager process and merge its trace with
+        # the scheduler traces. Off by default: the scheduler traces alone are
+        # what most prefill/attention analysis needs, and the extra trace makes
+        # the merge noticeably slower.
+        self.profile_tokenizer = False
 
         # Garbage Collection Control
         self.freeze_gc = True  # Enable/disable garbage collection freezing
@@ -282,7 +287,10 @@ async def make_http_call(
 
 
 async def send_profile_request(
-    profile_text: str, http_url: str, session: Optional[aiohttp.ClientSession] = None
+    profile_text: str,
+    http_url: str,
+    session: Optional[aiohttp.ClientSession] = None,
+    profile_tokenizer: bool = False,
 ) -> None:
     """
     Send a profile request (START_PROFILE or STOP_PROFILE) and wait for completion.
@@ -291,6 +299,8 @@ async def send_profile_request(
         profile_text: "START_PROFILE" or "STOP_PROFILE"
         http_url: Base HTTP URL (will derive profile endpoints from this)
         session: Optional aiohttp session to use
+        profile_tokenizer: Also profile the tokenizer manager process
+            (START_PROFILE only)
     """
     try:
         if session:
@@ -311,8 +321,15 @@ async def send_profile_request(
                 return
 
             headers = {"Content-Type": "application/json"}
+            payload = (
+                {"profile_tokenizer": True}
+                if profile_text == "START_PROFILE" and profile_tokenizer
+                else None
+            )
 
-            async with session.post(endpoint_url, headers=headers) as resp:
+            async with session.post(
+                endpoint_url, headers=headers, json=payload
+            ) as resp:
                 resp_text = await resp.text()
                 if resp.status == 200:
                     print(f"{profile_text} request completed")
@@ -747,7 +764,12 @@ async def run_generic_benchmark(
     ) as session:
         # Send START_PROFILE if profiling is enabled
         if config.profile:
-            await send_profile_request("START_PROFILE", http_url, session=session)
+            await send_profile_request(
+                "START_PROFILE",
+                http_url,
+                session=session,
+                profile_tokenizer=config.profile_tokenizer,
+            )
 
         # Add progress bar for sending requests
         with tqdm(

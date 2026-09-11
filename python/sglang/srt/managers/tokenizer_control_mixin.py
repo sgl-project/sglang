@@ -390,10 +390,26 @@ class TokenizerControlMixin:
         )
         req.record_shapes = (req.record_shapes is not False) and env_record_shapes
         req.profile_id = req.profile_id or str(time.time())
+
+        if req.profile_tokenizer:
+            self.start_tokenizer_profile(
+                output_dir=req.output_dir,
+                activities=req.activities,
+                with_stack=req.with_stack,
+                record_shapes=req.record_shapes,
+                profile_id=req.profile_id,
+            )
+            # The tokenizer trace is only useful next to the scheduler traces,
+            # so merging is implied when it is requested.
+            req.merge_profiles = True
+
         return await self._execute_profile(req)
 
     async def stop_profile(self: TokenizerManager):
         self.auto_create_handle_loop()
+        # Export the tokenizer trace before the scheduler stops, so it is on
+        # disk by the time the scheduler merges the traces for this profile id.
+        self.stop_tokenizer_profile()
         req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 

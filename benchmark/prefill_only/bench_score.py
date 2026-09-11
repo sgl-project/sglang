@@ -43,6 +43,9 @@ config.freeze_gc = True  # Enable GC freeze functionality
 # Profiler output directory - by default uses present working directory (pwd)
 # Uncomment and customize the line below to override the default location:
 # config.profiler_dir = "/sglang-oss-trace"
+# Uncomment to also profile the tokenizer manager process and merge its trace
+# with the scheduler traces:
+# config.profile_tokenizer = True
 
 # HTTP Configuration
 HTTP_URL = "http://localhost:30000/v1/score"  # Use score API directly

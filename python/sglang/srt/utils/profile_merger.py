@@ -1,4 +1,8 @@
-"""Merge Chrome trace files from multiple ranks (TP, DP, PP, EP) into a single trace."""
+"""Merge Chrome trace files from multiple ranks (TP, DP, PP, EP, TKN) into a single trace.
+
+Large traces are merged in streaming mode so the merge does not have to hold
+every event of every rank in memory at once.
+"""
 
 import glob
 import gzip
@@ -6,13 +10,16 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Above this compressed size, merge in streaming mode instead of in memory.
+LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024
+
 
 class ProfileMerger:
-    """Merge profile traces from all parallelism types: TP, DP, PP, EP."""
+    """Merge profile traces from all parallelism types: TP, DP, PP, EP, plus TKN."""
 
     def __init__(self, output_dir: str, profile_id: str):
         self.output_dir = output_dir
@@ -21,12 +28,15 @@ class ProfileMerger:
             output_dir, f"merged-{profile_id}.trace.json.gz"
         )
 
-        # Rank types in priority order (used for sorting and labeling)
-        self.rank_types = ["tp", "dp", "pp", "ep"]
+        # Rank types in priority order (used for sorting and labeling).
+        # TKN (tokenizer manager) is not a GPU rank; it is listed first so it
+        # shows up above the GPU ranks in the trace viewer.
+        self.rank_types = ["tkn", "tp", "dp", "pp", "ep"]
 
-        # Sort index multipliers: DP (highest) > EP > PP > TP (lowest)
+        # Sort index multipliers: TKN (highest) > DP > EP > PP > TP (lowest)
         # These ensure proper visual ordering in trace viewer
         self.sort_index_multipliers = {
+            "tkn_rank": 1_000_000_000,
             "dp_rank": 100_000_000,
             "ep_rank": 1_000_000,
             "pp_rank": 10_000,
@@ -51,6 +61,13 @@ class ProfileMerger:
 
         logger.info(f"Found {len(trace_files)} trace files to merge")
 
+        if any(os.path.getsize(f) > LARGE_FILE_THRESHOLD_BYTES for f in trace_files):
+            logger.info("Large trace files detected, using streaming merge")
+            return self._merge_streaming(trace_files)
+        return self._merge_in_memory(trace_files)
+
+    def _merge_in_memory(self, trace_files: List[str]) -> str:
+        """Merge by loading each trace fully into memory."""
         merged_trace = {"traceEvents": []}
         all_device_properties = []
 
@@ -81,8 +98,97 @@ class ProfileMerger:
 
         return self.merged_trace_path
 
+    def _merge_streaming(self, trace_files: List[str]) -> str:
+        """Merge by writing events out per rank instead of buffering all of them.
+
+        Only one rank's trace is resident at a time and the merged document is
+        never materialized, so peak memory is bounded by the largest single
+        input rather than by the sum of all inputs plus the merged copy.
+        """
+        all_device_properties = []
+        other_metadata: Dict[str, Any] = {}
+        total_events = 0
+
+        with gzip.open(self.merged_trace_path, "wt", encoding="utf-8") as out_f:
+            out_f.write('{"traceEvents": [')
+            first_event = True
+
+            for trace_file in sorted(trace_files, key=self._get_rank_sort_key):
+                rank_info = self._extract_rank_info(trace_file)
+                file_size_mb = os.path.getsize(trace_file) / (1024 * 1024)
+                logger.info(
+                    f"Streaming {trace_file} ({file_size_mb:.1f}MB) "
+                    f"with rank info: {rank_info}"
+                )
+
+                try:
+                    for event, metadata in self._stream_trace_file(
+                        trace_file, rank_info
+                    ):
+                        if event is not None:
+                            if not first_event:
+                                out_f.write(",")
+                            out_f.write(json.dumps(event))
+                            first_event = False
+                            total_events += 1
+                        elif metadata is not None:
+                            all_device_properties.extend(
+                                metadata.pop("deviceProperties", [])
+                            )
+                            for key, value in metadata.items():
+                                other_metadata.setdefault(key, value)
+                except Exception as e:
+                    logger.error(f"Failed to stream trace file {trace_file}: {e}")
+                    continue
+
+            out_f.write("]")
+
+            if all_device_properties:
+                out_f.write(',"deviceProperties":')
+                out_f.write(json.dumps(all_device_properties))
+
+            for key, value in other_metadata.items():
+                out_f.write(f",{json.dumps(key)}:")
+                out_f.write(json.dumps(value))
+
+            out_f.write("}")
+
+        logger.info(f"Merged profile saved to: {self.merged_trace_path}")
+        logger.info(f"Total events merged: {total_events}")
+
+        return self.merged_trace_path
+
+    def _stream_trace_file(
+        self, path: str, rank_info: Dict[str, int]
+    ) -> Generator[Tuple[Optional[Dict], Optional[Dict]], None, None]:
+        """Yield ``(event, None)`` per processed event, then ``(None, metadata)``."""
+        rank_label = self._create_rank_label(rank_info)
+
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            trace = json.load(f)
+
+        for event in trace.pop("traceEvents", []):
+            yield self._process_single_event(event, rank_info, rank_label), None
+
+        if trace:
+            yield None, trace
+
+    def _process_single_event(
+        self, event: Dict, rank_info: Dict[str, int], rank_label: str
+    ) -> Dict:
+        """Update ``sort_index`` and prefix the PID with the rank label."""
+        if event.get("name") == "process_sort_index":
+            pid = self._maybe_cast_int(event.get("pid"))
+            if pid is not None and pid < self.pid_sort_index_threshold:
+                event.setdefault("args", {})["sort_index"] = self._calculate_sort_index(
+                    rank_info, pid
+                )
+
+        event["pid"] = f"{rank_label} {event.get('pid', '')}"
+        return event
+
     def _discover_trace_files(self) -> List[str]:
-        """Discover trace files matching profile_id (supports TP/DP/PP/EP formats)."""
+        """Discover trace files matching profile_id (supports TP/DP/PP/EP/TKN formats)."""
         patterns = [f"{self.profile_id}*.trace.json.gz"]
 
         trace_files = []
@@ -95,7 +201,7 @@ class ProfileMerger:
             for f in trace_files
             if not f.endswith(f"merged-{self.profile_id}.trace.json.gz")
             and not f.endswith("-memory.pickle")
-            and "TP-" in f
+            and ("TP-" in f or "TKN-" in f)
         ]
         trace_files = list(set(trace_files))
         return trace_files
@@ -147,14 +253,7 @@ class ProfileMerger:
         rank_label = self._create_rank_label(rank_info)
 
         for event in events:
-            if event.get("name") == "process_sort_index":
-                pid = self._maybe_cast_int(event.get("pid"))
-                if pid is not None and pid < self.pid_sort_index_threshold:
-                    event["args"]["sort_index"] = self._calculate_sort_index(
-                        rank_info, pid
-                    )
-
-            event["pid"] = f"{rank_label} {event['pid']}"
+            self._process_single_event(event, rank_info, rank_label)
 
         return events
 
@@ -164,11 +263,15 @@ class ProfileMerger:
             sort_index += rank_info.get(rank_type, 0) * multiplier
         return sort_index
 
-    def _get_rank_sort_key(self, path: str) -> Tuple[int, int, int, int]:
+    def _get_rank_sort_key(self, path: str) -> Tuple[int, int, int, int, int]:
         rank_info = self._extract_rank_info(path)
-        return tuple(
-            rank_info.get(f"{rank_type}_rank", 0)
-            for rank_type in ["dp", "ep", "pp", "tp"]
+        # TKN traces sort before the GPU traces, then by DP, EP, PP, TP.
+        return (
+            -1 if "tkn_rank" in rank_info else 0,
+            rank_info.get("dp_rank", 0),
+            rank_info.get("ep_rank", 0),
+            rank_info.get("pp_rank", 0),
+            rank_info.get("tp_rank", 0),
         )
 
     def _maybe_cast_int(self, x) -> Optional[int]:

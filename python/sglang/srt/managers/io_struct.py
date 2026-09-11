@@ -2141,6 +2141,10 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_stages: Optional[List[str]] = None
     # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
     detailed_annotations: bool = False
+    # Also profile the tokenizer manager process. Only meaningful on the
+    # START_PROFILE request received by the tokenizer manager; the scheduler
+    # ignores this field.
+    profile_tokenizer: bool = False
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):

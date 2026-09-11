@@ -103,6 +103,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
+from sglang.srt.managers.tokenizer_profiler_mixin import TokenizerProfilerMixin
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     is_health_check_generate_req,
@@ -396,7 +397,9 @@ class InputFormat(Enum):
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
-class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+class TokenizerManager(
+    TokenizerControlMixin, TokenizerManagerScoreMixin, TokenizerProfilerMixin
+):
     """TokenizerManager is a process that tokenizes the text."""
 
     @property
@@ -463,6 +466,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        # Init the (opt-in, default-off) tokenizer manager process profiler
+        self.init_tokenizer_profiler()
 
         # Construct this last so later initialization failures cannot orphan
         # the transport's recycler thread.

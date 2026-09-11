@@ -79,15 +79,69 @@ class TestProfileMerger(CustomTestCase):
         self.assertEqual(sort_idx, 83)
 
     def test_rank_sort_key(self):
-        # Full ranks: TP-1, DP-2, PP-3, EP-4 → sorted as (DP, EP, PP, TP)
+        # Full ranks: TP-1, DP-2, PP-3, EP-4 → sorted as (TKN, DP, EP, PP, TP)
         filename = f"{self.profile_id}-TP-1-DP-2-PP-3-EP-4.trace.json.gz"
         sort_key = self.merger._get_rank_sort_key(filename)
-        self.assertEqual(sort_key, (2, 4, 3, 1))
+        self.assertEqual(sort_key, (0, 2, 4, 3, 1))
 
-        # Missing ranks: only TP-1 → sorted as (DP=0, EP=0, PP=0, TP=1)
+        # Missing ranks: only TP-1 → sorted as (TKN=0, DP=0, EP=0, PP=0, TP=1)
         filename = f"{self.profile_id}-TP-1.trace.json.gz"
         sort_key = self.merger._get_rank_sort_key(filename)
-        self.assertEqual(sort_key, (0, 0, 0, 1))
+        self.assertEqual(sort_key, (0, 0, 0, 0, 1))
+
+        # The tokenizer-manager trace sorts ahead of every GPU rank.
+        tkn_key = self.merger._get_rank_sort_key(
+            f"{self.profile_id}-TKN-0.trace.json.gz"
+        )
+        self.assertEqual(tkn_key, (-1, 0, 0, 0, 0))
+        self.assertLess(tkn_key, sort_key)
+
+    def test_tokenizer_trace_discovery_and_labeling(self):
+        filename = f"{self.profile_id}-TKN-0.trace.json.gz"
+        rank_info = self.merger._extract_rank_info(filename)
+        self.assertEqual(rank_info, {"tkn_rank": 0})
+        self.assertEqual(self.merger._create_rank_label(rank_info), "[TKN00]")
+
+        for name in (filename, f"{self.profile_id}-TP-0.trace.json.gz"):
+            with gzip.open(os.path.join(self.temp_dir, name), "wt") as f:
+                json.dump({"traceEvents": []}, f)
+
+        discovered = {os.path.basename(f) for f in self.merger._discover_trace_files()}
+        self.assertIn(filename, discovered)
+
+    def test_streaming_merge_matches_in_memory_merge(self):
+        for rank, name in enumerate(["TP-0", "TP-1"]):
+            payload = {
+                "traceEvents": [
+                    {
+                        "name": "process_sort_index",
+                        "pid": 1,
+                        "args": {"sort_index": 0},
+                    },
+                    {"name": f"op-{rank}", "pid": 1, "ts": rank},
+                ],
+                "deviceProperties": [{"id": rank}],
+                "schemaVersion": 1,
+            }
+            path = os.path.join(
+                self.temp_dir, f"{self.profile_id}-{name}.trace.json.gz"
+            )
+            with gzip.open(path, "wt") as f:
+                json.dump(payload, f)
+
+        trace_files = self.merger._discover_trace_files()
+
+        in_memory_path = self.merger._merge_in_memory(trace_files)
+        with gzip.open(in_memory_path, "rt") as f:
+            in_memory = json.load(f)
+
+        streamed_path = self.merger._merge_streaming(trace_files)
+        with gzip.open(streamed_path, "rt") as f:
+            streamed = json.load(f)
+
+        self.assertEqual(streamed["traceEvents"], in_memory["traceEvents"])
+        self.assertEqual(streamed["deviceProperties"], in_memory["deviceProperties"])
+        self.assertEqual(streamed["schemaVersion"], in_memory["schemaVersion"])
 
     def test_discover_trace_files(self):
         # Create mock trace files
