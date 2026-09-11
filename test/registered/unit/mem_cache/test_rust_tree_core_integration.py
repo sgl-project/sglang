@@ -1443,8 +1443,13 @@ def test_host_lock_refs_round_trip(swa, missing_receipt):
     host_lock = core.inc_host_lock_ref(leaf)
     assert not host_lock.component_lock_uuids
     assert not device_lock.component_host_lock_uuids
+    assert host_lock.component_host_lock_uuids[ComponentType.FULL] > 0
     if swa:
-        assert host_lock.component_host_lock_uuids == {ComponentType.SWA: None}
+        assert set(host_lock.component_host_lock_uuids) == {
+            ComponentType.FULL,
+            ComponentType.SWA,
+        }
+        assert host_lock.component_host_lock_uuids[ComponentType.SWA] is None
     params = host_lock.to_dec_params()
     if missing_receipt:
         params.component_host_lock_uuids.clear()
@@ -5009,6 +5014,9 @@ def test_stale_inspection_handles_raise_key_error_or_report_absence():
         "get_component_device_lock_ref": lambda: core.get_component_device_lock_ref(
             stale_root, ComponentType.FULL
         ),
+        "get_component_host_lock_ref": lambda: core.get_component_host_lock_ref(
+            stale_root, ComponentType.FULL
+        ),
         "get_node_hit_count": lambda: core.get_node_hit_count(stale_root),
         "get_write_through_pending_id": lambda: core.get_write_through_pending_id(
             stale_root
@@ -5060,6 +5068,9 @@ def test_stale_inspection_handles_raise_key_error_or_report_absence():
             stale_root, ComponentType.SWA
         ),
         "get_component_device_lock_ref": lambda: core.get_component_device_lock_ref(
+            stale_root, ComponentType.SWA
+        ),
+        "get_component_host_lock_ref": lambda: core.get_component_host_lock_ref(
             stale_root, ComponentType.SWA
         ),
         "set_component_device_value_raw": lambda: core.set_component_device_value_raw(

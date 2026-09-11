@@ -79,6 +79,13 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
         ...
 
     @abstractmethod
+    def get_component_host_lock_ref(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> int:
+        """The component's host lock count on the node."""
+        ...
+
+    @abstractmethod
     def get_node_hit_count(self, node_id: NodeId) -> int:
         """The node's accumulated match count."""
         ...
