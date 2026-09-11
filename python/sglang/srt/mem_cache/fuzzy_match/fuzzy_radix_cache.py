@@ -149,6 +149,23 @@ class FuzzyRadixCache(RadixCache):
         )
         self._release_donor(req)
 
+    def cache_unfinished_req(self, req: Req, chunked: bool = False):
+        # Chunked prefill publishes at every chunk boundary, so the guard in
+        # cache_finished_req arrives one chunk too late: a long served prompt
+        # reached the exact tree while it was still running. The request keeps
+        # its own slots and resumes from them; nothing is published, so no
+        # segment is handed to the tree and the lock refs held by the exact
+        # prefix are left as they are.
+        if req.kv.fuzzy_match_result is None:
+            super().cache_unfinished_req(req, chunked=chunked)
+            return
+        if self.disable:
+            return
+        token_ids = req.get_fill_ids()
+        req.prefix_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+
     ##### Internal Helper Functions #####
 
     def _match_prefix_fuzzy(

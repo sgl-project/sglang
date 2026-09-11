@@ -111,6 +111,7 @@ class _StubReq:
         self.origin_input_ids = list(origin_input_ids or [])
         self.output_ids = list(output_ids or [])
         self.last_node = None
+        self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.kv_committed_len = committed_kv_len
         # Per-request KV lifecycle state lives on the kv record (ReqKvInfo).
         self.kv = SimpleNamespace(
@@ -121,6 +122,9 @@ class _StubReq:
             fuzzy_donor_node=None,
             fuzzy_realized_locs=None,
         )
+
+    def get_fill_ids(self) -> List[int]:
+        return self.origin_input_ids + self.output_ids
 
 
 class _ScriptedProvider(FuzzyMatchProvider):
@@ -612,6 +616,48 @@ class TestDonorLifecycle(CustomTestCase):
         again = cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=None))
         self.assertEqual(int(again.device_indices.numel()), 0)
         self.assertEqual(allocator.outstanding_slots, 0)
+
+    def test_served_request_is_not_inserted_on_the_unfinished_path(self):
+        """Chunked-prefill sibling of the test above.
+
+        ``cache_finished_req`` refuses the insert for a served request, but a
+        long prompt publishes through ``cache_unfinished_req`` at every chunk
+        boundary, and that path was inherited from the exact cache unguarded.
+        The approximate span reached the exact tree one chunk before the
+        request ever finished, so the next request sharing its token prefix
+        still received donor KV through a trusted exact match.
+        """
+        pool = _StubReqToTokenPool()
+        pool.req_to_token[0, :3] = torch.tensor([70, 71, 72], dtype=torch.int64)
+        cache, provider, allocator = _make_cache(req_to_token_pool=pool)
+        allocator._outstanding += 3  # the request's own slots, allocated by the scheduler
+        donor = _seed_exact(
+            cache, token_ids=[1, 2, 3, 4], values=[10, 11, 12, 13]
+        ).last_device_node
+        provider.result = _scripted_fuzzy_result(
+            cached_token_count=2,
+            kv_indices=[10, 11],
+            cached_start_pos=2,
+            donor_last_node_id=donor.id,
+        )
+        req = _StubReq(
+            rid="recipient",
+            origin_input_ids=[90, 91],
+            output_ids=[92],
+            req_pool_idx=0,
+            committed_kv_len=3,
+        )
+        cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=req))
+        req.kv.cache_protected_len = 0  # the realizer narrows it to the exact prefix
+
+        cache.cache_unfinished_req(req)
+
+        again = cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=None))
+        self.assertEqual(
+            int(again.device_indices.numel()),
+            0,
+            "served approximate KV reached the exact tree through the chunked path",
+        )
 
     def test_plain_request_is_still_inserted_and_registered(self):
         pool = _StubReqToTokenPool()
