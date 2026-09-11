@@ -42,7 +42,7 @@ def inputs():
     return values, tensor
 
 
-def selected_warps(values, major=10, hip=False):
+def selected_launch(values, major=10, hip=False):
     with (
         patch.object(
             kda_triton, "get_jit_cuda_arch", return_value=ArchInfo(major, 3, "a")
@@ -51,12 +51,13 @@ def selected_warps(values, major=10, hip=False):
         patch.object(kda_triton, "fused_sigmoid_gating_delta_rule_update") as launch,
     ):
         kda_triton.TritonKDAKernel().target_verify(**values)
-    return launch.call_args.kwargs.get("num_warps", 1)
+    kwargs = launch.call_args.kwargs
+    return kwargs.get("num_warps", 1), kwargs.get("block_v", 32)
 
 
-def test_dense_safe_gate_verify_selects_multiwarp(inputs):
+def test_dense_safe_gate_verify_selects_small_tile(inputs):
     values, _ = inputs
-    assert selected_warps(values) == 4
+    assert selected_launch(values) == (1, 8)
 
 
 @pytest.mark.parametrize(
@@ -129,7 +130,7 @@ def test_unvalidated_verify_contract_keeps_reference_launch(inputs, case):
         major = 9
     elif case == "hip":
         hip = True
-    assert selected_warps(values, major, hip) == 1
+    assert selected_launch(values, major, hip) == (1, 32)
 
 
 if __name__ == "__main__":

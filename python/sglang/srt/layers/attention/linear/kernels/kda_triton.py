@@ -190,7 +190,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         # the committed pool (disable_state_update=True), and handles chain + tree
         # (retrieve_parent_token). The verify kernel for the Triton / CuTe DSL KDA
         # decode backends, and the reference the KDA correctness tests assert against.
-        num_warps = 1
+        block_v = 32
         if (
             dense_verify
             and lower_bound == -5
@@ -213,7 +213,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             and intermediate_states_buffer.is_contiguous()
             and get_jit_cuda_arch().major == 10
         ):
-            num_warps = 4
+            block_v = 8
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -240,7 +240,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
-            num_warps=num_warps,
+            block_v=block_v,
         )
 
     def extend(
