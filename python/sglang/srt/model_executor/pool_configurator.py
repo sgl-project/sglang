@@ -55,10 +55,12 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 @dataclass
@@ -310,6 +312,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
+            if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+                # NPU sparse KV offload uses an index-only device pool.
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                    get_sparsity_driven_kv_offload_cell_size,
+                )
+
+                offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
+                    model_config=model_config,
+                    use_mla_backend=kvc.use_mla_backend,
+                    num_layers=num_layers,
+                    element_size=kv_size,
+                )
+                if offload_cell_size is not None:
+                    return offload_cell_size
+
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
             )
@@ -454,6 +471,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            dtype = kvc.kv_cache_dtype
+            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
+            if dtype != torch.float8_e4m3fn:
+                indexer_size_per_token = index_head_dim
+                element_size = torch._utils._element_size(dtype)
+            if not is_npu_arch35():
+                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

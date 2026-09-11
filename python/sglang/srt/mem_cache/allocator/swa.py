@@ -431,8 +431,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa(self, free_index: torch.Tensor):
         """Release the SWA peers of an arbitrary slot set and clear their mapping.
-        Synchronizes at page_size > 1; kv-row segments go through free_swa_segment()."""
-        if free_index.numel() == 0:
+        No-op for a per-request ring, which owns no paged SWA peers. Otherwise
+        synchronizes at page_size > 1; kv-row segments use free_swa_segment()."""
+        if self._swa_req_ring or free_index.numel() == 0:
             return
 
         if self.page_size == 1:
@@ -455,8 +456,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """free_swa() for a kv-row segment; same start-alignment contract as
-        free_segment(), and fixed-shape at every page size."""
-        if free_index.numel() == 0:
+        free_segment(), and fixed-shape at every page size. No-op for a
+        per-request ring, as in free_swa()."""
+        if self._swa_req_ring or free_index.numel() == 0:
             return
         self._free_swa_pages(free_index, start_pos=start_pos)
 
@@ -484,6 +486,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     torch.unique(ref[ref > 0] // ps),
                 ), "swa pages do not match the mapped pages"
         self.clear_full_to_swa_mapping(mapping_indices)
+
+        if self._swa_req_ring:
+            # Ring slots are owned by the req slot, never lent by the paged
+            # allocator; returning them over-credits its available_size().
+            return
 
         if self.free_group is not None:
             # Resolve ownership now, as above.
@@ -547,7 +554,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.swa_page_ids_group:
             swa_page_ids_group = self.swa_page_ids_group
             self.swa_page_ids_group = []
-            self.swa_attn_allocator.free_page_ids(torch.cat(swa_page_ids_group))
+            if not self._swa_req_ring:
+                self.swa_attn_allocator.free_page_ids(torch.cat(swa_page_ids_group))
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []

@@ -54,10 +54,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import set_mixed_precision_policy
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     process_model_weights_after_loading,
 )
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
@@ -370,7 +370,9 @@ def maybe_load_fsdp_model(
         )
         register_fsdp_entrypoints(model)
 
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+    param_names_mapping_fn = get_param_names_mapping(
+        model.param_names_mapping, valid_target_names=set(model.state_dict())
+    )
 
     # 2. load model from disk
     preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
