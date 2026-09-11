@@ -791,10 +791,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         request: Request<proto::StartProfileRequest>,
     ) -> Result<Response<proto::StartProfileResponse>, Status> {
         let req = request.into_inner();
+        if req.num_steps.is_some_and(|steps| steps <= 0) {
+            return Err(Status::invalid_argument("num_steps must be positive"));
+        }
         let rid = uuid::Uuid::new_v4().to_string();
         let receiver = self
             .bridge
-            .submit_start_profile(&rid, req.output_dir.as_deref())
+            .submit_start_profile(&rid, req.output_dir.as_deref(), req.num_steps)
             .map_err(|e| pyerr_to_status(e, "Failed to start profile"))?;
 
         let json_str =
