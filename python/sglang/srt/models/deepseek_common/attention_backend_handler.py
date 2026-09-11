@@ -196,6 +196,8 @@ def handle_attention_aiter(attn, forward_batch):
     if forward_batch.forward_mode.is_extend_without_speculative():
         if not _support_mha_one_shot(attn, forward_batch, "aiter"):
             return AttnForwardMethod.MHA_CHUNKED_KV
+        if get_parallel().dcp_enabled:
+            return AttnForwardMethod.MHA_ONE_SHOT
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA

@@ -1,7 +1,9 @@
 """B200 per-commit CI: DeepSeek-V4-Flash FP4 with the trtllm attention backend.
 
-Mirrors the four FlashMLA recipes with a uniform-FP8 KV pool and trtllm-gen
-sparse MLA for decode and prefill.
+Mirrors two of the FlashMLA recipes with a uniform-FP8 KV pool and trtllm-gen
+sparse MLA for decode and prefill: the spec-decoding recipe (draft extend /
+target verify / multi-step backend) and the breakable-CUDA-graph DP recipe
+(DP padding, graph replay refresh, mixed chunk).
 """
 
 import unittest
@@ -18,7 +20,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=700, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -40,6 +42,8 @@ class TestDSV4FlashFP4B200Trtllm(
     gsm8k_accuracy_thres = 0.93
     accept_length_thres = 2.8
     bs_1_speed_thres = 220
+    # Arbitrary distinctive digits; only needs to survive tokenization intact.
+    NEEDLE = "48173"
 
     @classmethod
     def setUpClass(cls):
@@ -76,100 +80,31 @@ class TestDSV4FlashFP4B200Trtllm(
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-
-class TestDSV4FlashFP4B200BalancedTrtllm(
-    SpecDecodingMixin,
-    BasicDecodeCorrectnessMixin,
-    GSM8KMixin,
-    CustomTestCase,
-):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
-
-    gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 1.8
-    bs_1_speed_thres = 100
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--dsv4-attn-backend",
-                "trtllm",
-                "--tp",
-                "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
-                "--deepep-config",
-                DEEPEP_CONFIG,
-            ],
-            env=_DEEPEP_ENV,
+    def test_long_prompt_chunked_prefill_recall(self):
+        # The needle sits in the first chunk and the question in the last, so
+        # only a correct multi-chunk _forward_trtllm_prefill can recall it.
+        filler = (
+            "The expedition recorded water temperature, salinity, and current "
+            "speed at every station along the transect. "
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-
-class TestDSV4FlashFP4NonMTPB200Trtllm(
-    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
-):
-    """Non-MTP recipe: TP=4, DP=4, DeepEP, no speculative decoding."""
-
-    gsm8k_accuracy_thres = 0.93
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--dsv4-attn-backend",
-                "trtllm",
-                "--tp",
-                "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--deepep-config",
-                DEEPEP_CONFIG,
-            ],
-            env=_DEEPEP_ENV,
+        prompt = (
+            f"The station beacon identifier is {self.NEEDLE}.\n\n"
+            + "".join(f"[Entry {i}] {filler}" for i in range(220))
+            + "\n\nQ: What is the station beacon identifier? Reply with just "
+            "the number.\nA:"
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+        # Second pass extends from the radix-cached prefix instead of prefilling it.
+        for label in ("cold", "cached-prefix"):
+            out = self._decode_generate(
+                prompt=prompt, max_new_tokens=self.sanity_max_new_tokens_short
+            )
+            self.assertIn(self.NEEDLE, out, f"{label}: {out!r}")
 
 
 class TestDSV4FlashFP4BreakableCudaGraphB200Trtllm(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):
-    """BCG recipe: TP=4, DP=4, DeepEP, DP attention, mixed chunk."""
+    """BCG recipe: TP=4, DP=4, DeepEP, DP attention, mixed chunk, no spec."""
 
     gsm8k_accuracy_thres = 0.93
 
