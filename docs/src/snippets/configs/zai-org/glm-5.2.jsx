@@ -1011,6 +1011,9 @@ sgl-eval run aime25 \\
     // mi355x cells. MTP (mtp-314, steps=3) is validated on MI355X gfx950 with
     // this precision — see the mtp-314 cell below. Not yet benchmarked for
     // GLM-5.2 on the base strategies → verified:false.
+    // DSA backend: triton (SGLang's ROCm default). At TP4 this shape hits the
+    // gfx950 FP8 sparse-MLA tuning; the TP8 FP8/BF16 cells above stay on
+    // tilelang, where their published numbers were measured.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
@@ -1021,8 +1024,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
         "--chunked-prefill-size 131072",
         "--mem-fraction-static 0.80",
         "--watchdog-timeout 1200",
@@ -1039,8 +1042,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 128",
@@ -1059,8 +1062,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
@@ -1086,8 +1089,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
+        "--dsa-prefill-backend triton",
+        "--dsa-decode-backend triton",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
