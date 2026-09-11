@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval_once
+from sglang.test.run_eval import run_eval, run_eval_once
 from sglang.test.server_fixtures.default_fixture import openai_api_env
 from sglang.test.simple_eval_common import make_report
 from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
@@ -19,9 +19,9 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# Two cold server launches and a serialized MMMU baseline cost more than
-# the Step3.5 GSM8K test. This is an estimate pending the first GPU CI run.
-register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-h200")
+# Three cold server launches, GSM8K, and a serialized MMMU baseline.
+# This is an estimate pending a complete GPU CI run.
+register_cuda_ci(est_time=2400, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestStep3p7Flash(CustomTestCase):
@@ -42,6 +42,35 @@ class TestStep3p7Flash(CustomTestCase):
         "--model-loader-extra-config",
         '{"enable_multithread_load": true, "num_threads": 64}',
     ]
+
+    def test_gsm8k(self):
+        process = popen_launch_server(
+            self.model,
+            self.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
+            other_args=self.other_args,
+        )
+        try:
+            args = SimpleNamespace(
+                base_url=self.base_url,
+                model=self.model,
+                eval_name="gsm8k",
+                api="completion",
+                max_tokens=4096,
+                num_examples=500,
+                num_threads=128,
+            )
+            with openai_api_env("EMPTY"):
+                metrics = run_eval(args)
+            summary = f"Step3.7 GSM8K (500 samples): score={metrics['score']:.4f}"
+            print(summary)
+            if is_in_ci():
+                write_github_step_summary(summary + "\n")
+            # Initial floor from test_step3p5_flash_chain_mtp.py; this has
+            # not yet been calibrated against a measured Step3.7 baseline.
+            self.assertGreater(metrics["score"], 0.83, summary)
+        finally:
+            terminate_and_kill_process_tree(process, wait_timeout=60)
 
     def test_mmmu_serial_vs_concurrent(self):
         # Reuse the nightly MMMU dataset selection, prompts, answer parser,
