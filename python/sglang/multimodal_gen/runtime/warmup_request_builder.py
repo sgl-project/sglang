@@ -531,7 +531,10 @@ def should_include_warmup_image(
         # graphs and silently run eager. Capture the T2V signature instead;
         # image-conditioned requests fall back to eager.
         return False
-    if type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig":
+    if type(server_args.pipeline_config).__name__ in (
+        "GlmImagePipelineConfig",
+        "SenseNovaU1PipelineConfig",
+    ):
         return False
     if server_based_warmup:
         return task_type in (ModelTaskType.TI2I, ModelTaskType.TI2V)
