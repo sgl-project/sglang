@@ -509,9 +509,9 @@ Latency: 9.739 s
 Output throughput: 2405.505 token/s
 ```
 
-#### 5.3.2 MMLU Pro with lm-eval
+#### 5.3.2 MMLU-Pro with sgl-eval
 
-Accuracy on MMLU Pro matches [Meta's official benchmark numbers](https://ai.meta.com/blog/llama-4-multimodal-intelligence/) on 8×H100 (reproduction details: [PR #5092](https://github.com/sgl-project/sglang/pull/5092)):
+The table below records historical lm-eval measurements on 8×H100 alongside [Meta's official benchmark numbers](https://ai.meta.com/blog/llama-4-multimodal-intelligence/) (reproduction details: [PR #5092](https://github.com/sgl-project/sglang/pull/5092)). These scores were not produced by the sgl-eval commands below; rerun the evaluation for results using sgl-eval's prompts and grading.
 
 <table style={{width: "100%", borderCollapse: "collapse"}}>
   <thead>
@@ -535,6 +535,12 @@ Accuracy on MMLU Pro matches [Meta's official benchmark numbers](https://ai.meta
   </tbody>
 </table>
 
+Install the evaluation package before running either command:
+
+```bash
+pip install sgl-eval==0.1.0
+```
+
 **Scout:**
 
 ```bash Command
@@ -546,13 +552,12 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.8 \
   --context-length 65536
 
-# Run lm_eval
-lm_eval --model local-chat-completions \
-  --model_args model=meta-llama/Llama-4-Scout-17B-16E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 \
-  --tasks mmlu_pro \
-  --batch_size 128 \
-  --apply_chat_template \
-  --num_fewshot 0
+# Run MMLU-Pro
+sgl-eval run mmlu_pro \
+  --base-url http://localhost:30000/v1 \
+  --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
+  --max-tokens 2048 \
+  --num-threads 128
 ```
 
 **Maverick:**
@@ -566,11 +571,10 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.8 \
   --context-length 65536
 
-# Run lm_eval
-lm_eval --model local-chat-completions \
-  --model_args model=meta-llama/Llama-4-Maverick-17B-128E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 \
-  --tasks mmlu_pro \
-  --batch_size 128 \
-  --apply_chat_template \
-  --num_fewshot 0
+# Run MMLU-Pro
+sgl-eval run mmlu_pro \
+  --base-url http://localhost:30000/v1 \
+  --model meta-llama/Llama-4-Maverick-17B-128E-Instruct \
+  --max-tokens 2048 \
+  --num-threads 128
 ```
