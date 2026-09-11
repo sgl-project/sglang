@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
 )
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
@@ -1284,6 +1285,12 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
+        if getattr(
+            forward_batch, "attn_cp_metadata", None
+        ) is not None and is_cp_active(forward_batch):
+            return self._forward_extend_cp(
+                q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+            )
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
@@ -1371,6 +1378,73 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+        )
+        return self._pad_extend_output(output, num_output_rows)
+
+    def _forward_extend_cp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch,
+        topk_indices: torch.Tensor,
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        """Prefill CP: this rank holds the query rows of its two zigzag blocks
+        (all heads) and the K/V of the same rows. All-gather K/V into global
+        token order (also written to the KV pool so decode sees every token),
+        then run the chunk-prefill sparse kernel with one entry per zigzag
+        block: q rows are contiguous per block, ``kv_lens`` is the block's
+        absolute end position (bottom-right causal), ``cu_k`` is the request's
+        base row in the packed full K/V, and ``topk_indices`` are per-request
+        logical positions exactly as in the non-CP path."""
+        from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
+
+        meta = forward_batch.attn_cp_metadata
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        if prefix_lens is not None and any(int(x) for x in prefix_lens):
+            raise NotImplementedError(
+                "QSA prefill CP requires zero prefix (disable the radix cache and "
+                "chunked prefill)."
+            )
+        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        num_output_rows = q.shape[0]
+        k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+        k_width = k.shape[1] * k.shape[2]
+        v_width = v.shape[1] * v.shape[2]
+        kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
+        kv_full = cp_materialize_global_token_order(kv_local, forward_batch)
+        k_full, v_full = kv_full.split([k_width, v_width], dim=-1)
+        k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
+        v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()
+        if save_kv_cache:
+            # out_cache_loc was trimmed to the full extend token count by
+            # prepare_cp_forward; write the complete sequence on every rank.
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k_full, v_full
+            )
+        num_local_rows = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        q = q[:num_local_rows].contiguous()
+        indices = topk_indices[:num_local_rows].to(torch.int32).contiguous()
+        seq_lens = [int(x) for x in forward_batch.seq_lens_cpu[: meta.bs]]
+        base = [0]
+        for length in seq_lens[:-1]:
+            base.append(base[-1] + length)
+        # one entry per (request, prev block) then per (request, next block);
+        # the kernel reads cu_k[e] as the request's K base row only.
+        cu_k = torch.tensor(base + base, dtype=torch.int32, device=q.device)
+        output = sparse_gqa_fwd_interface_triton_ck(
+            q,
+            k_full,
+            v_full,
+            indices,
+            meta.cu_seqlens_q_combined_tensor,
+            cu_k,
+            meta.kv_len_combined_tensor,
+            layer.scaling,
+            max_q=meta.max_seqlen_q_combined,
         )
         return self._pad_extend_output(output, num_output_rows)
 

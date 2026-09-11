@@ -736,7 +736,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         defer_finalize: bool = False,
+        reduce_output: bool = True,
     ) -> torch.Tensor:
+        # reduce_output=False returns the TP-partial sum (routed + shared
+        # experts) so a sequence-parallel caller can reduce-scatter it.
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
@@ -808,7 +811,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else:
                 final_hidden_states += shared_output
         if (
-            self.tp_size > 1
+            reduce_output
+            and self.tp_size > 1
             and not should_skip_post_experts_all_reduce(
                 is_tp_path=True,
             )

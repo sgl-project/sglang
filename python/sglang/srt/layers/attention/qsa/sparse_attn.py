@@ -263,12 +263,19 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+def sparse_gqa_fwd_interface_triton_ck(
+    q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q=None
+):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    # max_q sizes the grid; a caller that already holds it on the host (CP
+    # metadata) avoids the D2H sync of the .item() below.
+    if max_q is None:
+        max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    else:
+        max_q = int(max_q)
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     out = torch.empty_like(q)
