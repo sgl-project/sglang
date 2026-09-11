@@ -158,6 +158,12 @@ class BaseSpecWorker(ABC):
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
         return self._hicache_draft_plan
 
+    @property
+    def draft_swa_window(self) -> int:
+        """Tokens back from the committed length that the draft reads in the
+        target's swa sub-pool; 0 when the target's own window covers them."""
+        return 0
+
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
         """(role, runner) pairs weight ops apply to; [] when the draft owns no weights."""
         # NGRAM and UNO have no draft model

@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DraftStateGeometry,
     FusedDraftDecision,
     FusedDraftPlacement,
+    PlacementContext,
     RunnerLanes,
     draft_kv_profile,
     place_fused_draft,
@@ -74,6 +75,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _HOSTS = ("full", "swa")
 _DTYPE = torch.bfloat16
+_WINDOW = DraftKVGeometry(head_num=2, head_dim=64, v_head_dim=64)
 _STATE = DraftStateGeometry(
     conv_state_shapes=((2, 4), (2, 4)),
     conv_dtype=torch.bfloat16,
@@ -90,6 +92,7 @@ def _profile(
     state_layer_ids=(),
     head_dim=64,
     v_head_dim=64,
+    window=64,
 ):
     kinds = {}
     full_ids = tuple(i for i in range(num_layers) if i not in window_layer_ids)
@@ -102,11 +105,7 @@ def _profile(
         )
     if window_layer_ids:
         kinds[LAYER_WINDOW] = DraftLayerSet(
-            layer_ids=tuple(window_layer_ids),
-            geometry=DraftKVGeometry(
-                head_num=4, head_dim=head_dim, v_head_dim=v_head_dim
-            ),
-            window=64,
+            layer_ids=tuple(window_layer_ids), geometry=_WINDOW, window=window
         )
     if state_layer_ids:
         kinds[LAYER_STATE] = DraftLayerSet(
@@ -115,13 +114,24 @@ def _profile(
     return DraftKVProfile(num_layers=num_layers, num_depths=num_depths, kinds=kinds)
 
 
-def _place(profile, num_runners=1, asymmetric_rows_ok=False, host_names=_HOSTS):
+def _place(
+    profile,
+    num_runners=1,
+    asymmetric_rows_ok=False,
+    host_names=_HOSTS,
+    target_window=None,
+    draft_backends=("triton",),
+):
     return place_fused_draft(
         profile=profile,
         num_runners=num_runners,
-        host_names=host_names,
+        ctx=PlacementContext(
+            host_names=host_names,
+            target_window=target_window,
+            asymmetric_rows_ok=asymmetric_rows_ok,
+            draft_backends=draft_backends,
+        ),
         store_dtype=_DTYPE,
-        asymmetric_rows_ok=asymmetric_rows_ok,
     )
 
 
@@ -151,6 +161,85 @@ class TestPlaceFusedDraft(CustomTestCase):
         decision = _place(_profile(), host_names=("full", "swa", "mamba"))
         self.assertIsNotNone(decision.placement, decision.declined)
         self.assertEqual(decision.placement.hosts(), ("full",))
+
+    def test_window_layers_ride_in_the_swa_sub_pool_within_the_target_window(self):
+        # MiMoV2MTP shape: one window layer per runner, the target's own window.
+        decision = _place(
+            _profile(window_layer_ids=(0,), window=128),
+            num_runners=3,
+            target_window=128,
+        )
+        placement = decision.placement
+        self.assertIsNotNone(placement, decision.declined)
+        self.assertIsNone(decision.note)
+        self.assertEqual(placement.hosts(), ("swa",))
+        self.assertIsNone(placement.region("full"))
+        self.assertEqual(placement.region("swa").lane_num, 3)
+        self.assertEqual(placement.region("swa").head_num, _WINDOW.head_num)
+        for r in range(3):
+            self.assertEqual(placement.lanes_for(r, "swa"), range(r, r + 1))
+            self.assertEqual(placement.lanes_for(r, "full"), range(0))
+
+    def test_per_depth_head_places_each_depth_by_its_kind(self):
+        # Inkling shape: depth 1 is a local (window) block, depths 0 and 2 full.
+        decision = _place(
+            _profile(num_layers=8, num_depths=8, window_layer_ids=(1,), window=64),
+            num_runners=3,
+            target_window=128,
+        )
+        placement = decision.placement
+        self.assertIsNotNone(placement, decision.declined)
+        self.assertEqual(placement.region("full").lane_num, 2)
+        self.assertEqual(placement.region("swa").lane_num, 1)
+        self.assertEqual(placement.lanes_for(0, "full"), range(0, 1))
+        self.assertEqual(placement.lanes_for(1, "swa"), range(0, 1))
+        self.assertEqual(placement.lanes_for(1, "full"), range(0))
+        self.assertEqual(placement.lanes_for(2, "full"), range(1, 2))
+
+    def test_window_layers_fall_back_to_the_full_sub_pool(self):
+        """A window wider than the target's, an undeclared window, or a host
+        without an swa sub-pool sends the window layers to the full sub-pool
+        with their own row geometry; the decision says why."""
+        for kwargs in (
+            dict(window=256, target_window=128),
+            dict(window=None, target_window=128),
+            dict(window=64, target_window=None),
+            dict(window=64, target_window=128, host_names=("full", "mamba")),
+        ):
+            profile = _profile(window_layer_ids=(0,), window=kwargs.pop("window"))
+            decision = _place(profile, num_runners=2, **kwargs)
+            placement = decision.placement
+            self.assertIsNotNone(placement, decision.declined)
+            self.assertIn("ride in the 'full' sub-pool", decision.note)
+            self.assertIsNone(placement.region("swa"))
+            self.assertEqual(placement.region("full").lane_num, 2)
+            self.assertEqual(placement.region("full").head_num, _WINDOW.head_num)
+            self.assertEqual(placement.lanes_for(1, "full"), range(1, 2))
+
+    def test_a_fold_cannot_mix_two_row_geometries(self):
+        """One region holds one row geometry: window layers the swa sub-pool
+        turns away fold into the full sub-pool only when their rows match the
+        full layers', else the whole draft declines."""
+        decision = _place(
+            _profile(num_layers=2, window_layer_ids=(1,), window=256),
+            target_window=128,
+        )
+        self.assertIsNone(decision.placement)
+        self.assertIn("cannot share", decision.declined)
+
+    def test_a_window_draft_needs_a_rail_carrying_draft_backend(self):
+        """Only the Triton multi-step draft backend builds the per-step window
+        rails; any other draft backend would sink-write the window layers."""
+        decision = _place(
+            _profile(window_layer_ids=(0,), window=128),
+            target_window=128,
+            draft_backends=("fa3",),
+        )
+        self.assertIsNone(decision.placement)
+        self.assertIn("['fa3']", decision.declined)
+        self.assertIn("triton", decision.declined)
+        # A full-only draft never consults the rail rule.
+        self.assertIsNotNone(_place(_profile(), draft_backends=("fa3",)).placement)
 
     def test_per_depth_head_needs_one_runner_per_depth(self):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)
@@ -420,7 +509,9 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
         cfg.is_hybrid_swa_compress = False
         cfg.use_mla_backend = False
         cfg.kv_cache_dtype = _DTYPE
-        cfg.layer_info = SimpleNamespace(full_attention_layer_ids=[0, 3])
+        cfg.layer_info = SimpleNamespace(
+            full_attention_layer_ids=[0, 3], swa_attention_layer_ids=[1, 2]
+        )
         cfg.model_config = SimpleNamespace(
             get_num_kv_heads=lambda tp, dcp: 4,
             head_dim=192,
@@ -428,6 +519,8 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
             get_swa_num_kv_heads=lambda tp: 8,
             swa_head_dim=192,
             swa_v_head_dim=128,
+            # The whole model's split; a runner prices its own layer_info.
+            swa_attention_layer_ids=[1, 2, 4, 5],
         )
         return cfg
 
@@ -447,6 +540,17 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
             spec = self._configurator()._full_host_spec(region)
         self.assertEqual(
             (spec.layer_num, spec.head_dim, spec.v_head_dim), (2, 192, 128)
+        )
+
+    def test_the_swa_fused_price_reads_this_runners_window_layers(self):
+        region = DenseDraftRegion(
+            lane_num=1, head_num=4, head_dim=64, store_dtype=_DTYPE
+        )
+        with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
+            spec = self._configurator()._swa_host_spec(region)
+        self.assertEqual(
+            (spec.layer_num, spec.head_num, spec.head_dim, spec.v_head_dim),
+            (2, 8, 192, 128),
         )
 
 

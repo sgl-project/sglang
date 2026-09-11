@@ -170,6 +170,18 @@ class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
     kinds: Dict[str, DraftLayerSet] = {}
 
 
+class PlacementContext(msgspec.Struct, frozen=True, kw_only=True):
+    """Target-side facts a host kind consults when placing a layer set:
+    the sub-pools the host builds, the target's window, whether every
+    resolved backend carries v_head_dim, and the backends the draft worker
+    may run on (its explicit one, else the target's)."""
+
+    host_names: Tuple[str, ...]
+    target_window: Optional[int] = None
+    asymmetric_rows_ok: bool = False
+    draft_backends: Tuple[str, ...] = ()
+
+
 class HostKind(msgspec.Struct, frozen=True, kw_only=True):
     """A unified sub-pool that carries one kind of draft layer in its entries.
 
@@ -184,15 +196,16 @@ class HostKind(msgspec.Struct, frozen=True, kw_only=True):
     family: str
     fallback_host: Optional[str] = None
 
-    def admits(
-        self,
-        *,
-        layers: DraftLayerSet,
-        host_names: Sequence[str],
-        target_window: Optional[int],
+    def prerequisite(
+        self, *, layers: DraftLayerSet, ctx: PlacementContext
     ) -> Optional[str]:
-        """None when this host can carry ``layers``, else why not."""
-        if self.name not in host_names:
+        """What the runtime must carry for ``layers`` to be served fused at
+        all, whichever host takes them; a reason here declines the draft."""
+        return None
+
+    def admits(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> Optional[str]:
+        """None when this host's entries can carry ``layers``, else why not."""
+        if self.name not in ctx.host_names:
             return f"the host has no {self.name!r} sub-pool"
         return None
 
@@ -276,6 +289,48 @@ def register_host_kind(kind: HostKind) -> HostKind:
 
 FULL_HOST = register_host_kind(
     DenseHostKind(name="full", serves=LAYER_FULL, family="dense")
+)
+
+# Multi-step draft backends that build the per-step sliding-window read and
+# write rails a fused window layer needs (TritonMultiStepDraftBackend).
+WINDOW_RAIL_BACKENDS = frozenset({"triton"})
+
+
+class WindowHostKind(DenseHostKind):
+    """The swa sub-pool: a draft window layer rides there when its window fits
+    the target's; eviction keeps any further reach the draft worker declares."""
+
+    def prerequisite(
+        self, *, layers: DraftLayerSet, ctx: PlacementContext
+    ) -> Optional[str]:
+        unrailed = sorted(set(ctx.draft_backends) - WINDOW_RAIL_BACKENDS)
+        if unrailed:
+            return (
+                f"the draft's attention backend {unrailed} carries no per-step "
+                f"sliding-window rail (only {sorted(WINDOW_RAIL_BACKENDS)} does)"
+            )
+        return None
+
+    def admits(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> Optional[str]:
+        reason = super().admits(layers=layers, ctx=ctx)
+        if reason is not None:
+            return reason
+        if layers.window is None:
+            return "the draft declares no sliding window size"
+        if ctx.target_window is None:
+            return "the target declares no sliding window size"
+        if layers.window > ctx.target_window:
+            return (
+                f"its window {layers.window} exceeds the target's window "
+                f"{ctx.target_window}"
+            )
+        return None
+
+
+SWA_HOST = register_host_kind(
+    WindowHostKind(
+        name="swa", serves=LAYER_WINDOW, family="dense", fallback_host="full"
+    )
 )
 
 
@@ -523,33 +578,32 @@ def place_fused_draft(
     *,
     profile: DraftKVProfile,
     num_runners: int,
-    host_names: Sequence[str],
+    ctx: PlacementContext,
     store_dtype: torch.dtype,
-    asymmetric_rows_ok: bool,
     kv_dtype: Optional[torch.dtype] = None,
-    target_window: Optional[int] = None,
 ) -> FusedDraftDecision:
     """Assign every draft layer of every runner to a host sub-pool through the
     registry: a layer kind goes to the host that serves it, else to that
     host's fallback under the fold rule. A kind no host takes declines the
-    whole draft, as do asymmetric K/V rows unless the caller vouches that
-    every attention backend carries v_head_dim through to the kernel, and rows
-    off the entry-part alignment."""
+    whole draft, as does a kind whose runtime prerequisite is missing,
+    asymmetric K/V rows unless ``ctx`` vouches that every attention backend
+    carries v_head_dim through to the kernel, and rows off the entry-part
+    alignment."""
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)
     for kind, layers in profile.kinds.items():
-        if host_for(kind) is None:
-            return FusedDraftDecision(
-                declined=(
-                    f"the draft has {len(layers.layer_ids)} "
-                    f"{_LAYER_KIND_NOUN[kind]} layer(s) and no host kind serves them"
-                )
-            )
+        what = f"the draft's {len(layers.layer_ids)} {_LAYER_KIND_NOUN[kind]} layer(s)"
+        host = host_for(kind)
+        if host is None:
+            return FusedDraftDecision(declined=f"{what}: no host kind serves them")
+        reason = host.prerequisite(layers=layers, ctx=ctx)
+        if reason is not None:
+            return FusedDraftDecision(declined=f"{what}: {reason}")
         reason = _kv_rows_declined(
             layers.geometry,
             store_dtype=store_dtype,
-            asymmetric_rows_ok=asymmetric_rows_ok,
+            asymmetric_rows_ok=ctx.asymmetric_rows_ok,
         )
         if reason is not None:
             return FusedDraftDecision(declined=reason)
@@ -560,9 +614,7 @@ def place_fused_draft(
     for kind, layers in profile.kinds.items():
         host = host_for(kind)
         what = f"the draft's {len(layers.layer_ids)} {_LAYER_KIND_NOUN[kind]} layer(s)"
-        reason = host.admits(
-            layers=layers, host_names=host_names, target_window=target_window
-        )
+        reason = host.admits(layers=layers, ctx=ctx)
         if reason is not None:
             fallback = (
                 None if host.fallback_host is None else HOST_KINDS[host.fallback_host]
@@ -571,11 +623,7 @@ def place_fused_draft(
             if fallback is not None:
                 fold = _fold_refused(profile, kind=kind, into=fallback)
                 if fold is None:
-                    fold = fallback.admits(
-                        layers=layers,
-                        host_names=host_names,
-                        target_window=target_window,
-                    )
+                    fold = fallback.admits(layers=layers, ctx=ctx)
             if fallback is None or fold is not None:
                 if fold is not None:
                     reason = f"{reason}, and {fold}"

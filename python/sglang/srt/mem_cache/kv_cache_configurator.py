@@ -758,14 +758,16 @@ class KVCacheConfigurator:
         # The region holds rows in the target's KV dtype; a draft that resolved
         # its own would read and write them as something else. Compare the KV
         # dtypes, not their storage: every fp8 flavor is stored as uint8.
-        region_kv_dtype = placement.region("full").resolved_kv_dtype()
-        if self.kv_cache_dtype != region_kv_dtype:
-            raise ValueError(
-                f"Fused draft KV: the draft resolved its KV cache dtype to "
-                f"{self.kv_cache_dtype}, but its region inside the target's pages "
-                f"holds {region_kv_dtype}. Set "
-                "--speculative-draft-kv-cache-dtype to the target's KV cache dtype."
-            )
+        for host in placement.hosts():
+            region_kv_dtype = placement.region(host).resolved_kv_dtype()
+            if self.kv_cache_dtype != region_kv_dtype:
+                raise ValueError(
+                    f"Fused draft KV: the draft resolved its KV cache dtype to "
+                    f"{self.kv_cache_dtype}, but its region inside the target's "
+                    f"pages holds {region_kv_dtype}. Set "
+                    "--speculative-draft-kv-cache-dtype to the target's KV cache "
+                    "dtype."
+                )
         return placement
 
     def _init_unified_mamba_pools(
@@ -992,6 +994,7 @@ class KVCacheConfigurator:
         to the kernel."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
+            PlacementContext,
             draft_kv_profile,
             place_fused_draft,
         )
@@ -1110,12 +1113,23 @@ class KVCacheConfigurator:
         return place_fused_draft(
             profile=profile,
             num_runners=num_runners,
-            host_names=self._unified_host_names(),
-            asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
-            target_window=self.model_config.sliding_window_size,
+            ctx=PlacementContext(
+                host_names=self._unified_host_names(),
+                target_window=self.model_config.sliding_window_size,
+                asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
+                draft_backends=self._draft_attention_backends(),
+            ),
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
             kv_dtype=self.kv_cache_dtype,
         )
+
+    def _draft_attention_backends(self) -> tuple:
+        """The backends the draft worker may run on: its explicit one, else
+        the target's, which it inherits."""
+        explicit = get_spec().speculative_draft_attention_backend
+        if explicit is not None:
+            return (explicit,)
+        return tuple(sorted(b for b in attention_backends() if b is not None))
 
     def _draft_backends_carry_v_head_dim(self) -> bool:
         """Whether every resolved attention backend, the draft's included,
@@ -1141,7 +1155,7 @@ class KVCacheConfigurator:
         region = placement.region(sub_pool_name)
         if region is None:
             return None
-        builders = {"full": self._full_host_spec}
+        builders = {"full": self._full_host_spec, "swa": self._swa_host_spec}
         assert sub_pool_name in HOST_KINDS, (
             f"sub-pool {sub_pool_name!r} is not a registered host kind"
         )
@@ -1149,6 +1163,25 @@ class KVCacheConfigurator:
             f"no fused host spec builder for sub-pool {sub_pool_name!r}"
         )
         return builders[sub_pool_name](region).entry_bytes()
+
+    def _swa_host_spec(self, region):
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            MHASubPoolSpec,
+            _store_dtype_for,
+        )
+
+        assert self.is_hybrid_swa, "only a hybrid-SWA host builds an swa sub-pool"
+        geometry = self._unified_swa_head_geometry()
+        return MHASubPoolSpec(
+            name="swa",
+            layer_num=len(self.layer_info.swa_attention_layer_ids),
+            head_num=geometry.swa_head_num,
+            head_dim=geometry.swa_head_dim,
+            v_head_dim=geometry.swa_v_head_dim,
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+            grow_direction="up",
+            draft_region=region,
+        )
 
     def _full_host_spec(self, region):
         from sglang.srt.mem_cache.unified_memory_pool import (

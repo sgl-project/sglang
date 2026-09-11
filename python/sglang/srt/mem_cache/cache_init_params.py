@@ -47,6 +47,9 @@ class CacheInitParams:
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+    # Tokens back from the committed length that a fused draft reads in the
+    # swa sub-pool (BaseSpecWorker.draft_swa_window); 0 when it reads none.
+    draft_swa_window: int = 0
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
@@ -58,3 +61,11 @@ class CacheInitParams:
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+
+    @property
+    def swa_retain_window(self) -> Optional[int]:
+        # What the frees and unlocks of a running request's SWA keep behind it;
+        # every other SWA rule uses sliding_window_size.
+        if self.sliding_window_size is None:
+            return None
+        return max(self.sliding_window_size, self.draft_swa_window)
