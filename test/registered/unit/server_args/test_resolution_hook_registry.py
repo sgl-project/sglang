@@ -131,31 +131,6 @@ class TestRunHook(_IsolatedRegistry):
         run_hook(handle_hardware_runtime_validation)
         self.assertEqual(order, ["before", "builtin", "after"])
 
-    def test_a_two_argument_step_forwards_both(self):
-        """`handle_gpu_memory_settings(server_args, gpu_mem)` is the one real
-        step that takes more than `server_args` -- `previous` takes the same
-        two positional arguments."""
-        order = []
-
-        @register_resolution_hook("handle_gpu_memory_settings")
-        def _wraps(server_args, gpu_mem, previous):
-            order.append(("before", server_args, gpu_mem))
-            previous(server_args, gpu_mem)
-            order.append(("after", server_args, gpu_mem))
-
-        def handle_gpu_memory_settings(server_args, gpu_mem):
-            order.append(("builtin", server_args, gpu_mem))
-
-        run_hook(handle_gpu_memory_settings, "sa", 16.0)
-        self.assertEqual(
-            order,
-            [
-                ("before", "sa", 16.0),
-                ("builtin", "sa", 16.0),
-                ("after", "sa", 16.0),
-            ],
-        )
-
     def test_an_override_that_calls_previous_wraps_the_builtin(self):
         order = []
 

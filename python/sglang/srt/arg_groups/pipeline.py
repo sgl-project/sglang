@@ -19,7 +19,6 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
-from sglang.srt.utils.common import get_device_memory_capacity
 
 
 def run_resolution_pipeline(server_args: Any) -> None:
@@ -227,12 +226,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_platform_defaults, server_args)
 
-    gpu_mem = get_device_memory_capacity(cfg.device)
-
     # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
     from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 
-    run_hook(handle_gpu_memory_settings, server_args, gpu_mem)
+    run_hook(handle_gpu_memory_settings, server_args)
 
     # Apply model-specific adjustments.
     from sglang.srt.arg_groups.model_hook import (

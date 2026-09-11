@@ -17,13 +17,13 @@ and `_handle_cuda_graph_config` merged under one rename and the dispatcher
 called itself). A name that is not on the list fails loudly at import time,
 not silently at the call site three modules away.
 
-Steps do not share one signature -- most take `(server_args)`, one takes
-`(server_args, gpu_mem)`, one takes no arguments at all -- so `run_hook`
-forwards `*args` rather than assuming `server_args` is the only thing there.
-An override's own signature always matches its target's, plus `previous`
-last: `def mine(server_args, gpu_mem, previous)` for a step that takes
-`(server_args, gpu_mem)`. `previous` itself is always called the same way
-regardless -- with whatever `*args` the step was invoked with.
+Steps do not share one signature -- nearly all take `(server_args)`, but
+`handle_hardware_runtime_validation` takes no arguments at all -- so
+`run_hook` forwards `*args` rather than assuming `server_args` is the only
+thing there. An override's own signature always matches its target's, plus
+`previous` last: `def mine(previous)` for that zero-argument step. `previous`
+itself is always called the same way regardless -- with whatever `*args` the
+step was invoked with.
 """
 
 from __future__ import annotations
