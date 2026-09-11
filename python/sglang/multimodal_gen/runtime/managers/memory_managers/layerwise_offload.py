@@ -1728,13 +1728,16 @@ class LayerwiseOffloadManager:
         # this layer's transfer with the previous layer's compute. Blocking
         # callers keep the direct path: they need the weights now.
         ship_mapped = False
-        if non_blocking and self._mapped_cpu_weights.get(layer_idx):
+        if self._mapped_cpu_weights.get(layer_idx) and (
+            non_blocking or self._blocking_load_via_courier()
+        ):
             courier = self._ensure_mapped_courier()
             if courier is not None and courier.submit(layer_idx):
                 self._courier_inflight.add(layer_idx)
                 ship_mapped = True
                 if (
-                    not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED
+                    non_blocking
+                    and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED
                     and not courier.direct_read
                 ):
                     # Schedule the disk read for this layer's pages now, in
@@ -1823,6 +1826,20 @@ class LayerwiseOffloadManager:
 
         if not ship_mapped:
             self._gpu_layers.add(layer_idx)
+        elif not non_blocking:
+            self._collect_mapped_layer(layer_idx)
+
+    def _blocking_load_via_courier(self) -> bool:
+        """Whether a blocking load should still go through the courier.
+
+        A caller that needs the layer now (arming a resident set, the
+        materialization of a permanent placement) otherwise faults the
+        mapping in on this thread; when the courier reads directly, cold
+        pages arrive at the drive's rate instead (measured 4.7 s vs 12 s for
+        the same 47 GiB on one NVMe).
+        """
+        courier = self._ensure_mapped_courier()
+        return courier is not None and courier.direct_read
 
     def _ensure_mapped_courier(self) -> Optional[MappedLayerCourier]:
         """The courier, built on first use; None where it cannot help."""
