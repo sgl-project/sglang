@@ -202,6 +202,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
+                    num_dummy_heads=vision_config.num_dummy_heads,
                     use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(depth)
