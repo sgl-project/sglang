@@ -2572,6 +2572,22 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+def pp_stage_needs_embedding(pp_group, speculative_algorithm) -> bool:
+    """Does this pipeline stage need a real ``embed_tokens``?
+
+    The first stage does, because it embeds the input ids. The last stage does too
+    whenever speculative decoding is on, because that is where ``EAGLEWorkerV2``
+    builds the NextN draft and the draft owns no embedding of its own: the weight
+    loader skips ``embed_tokens`` and ``shared_head.head`` inside the MTP block, and
+    the checkpoint does not ship them there either, so the draft borrows the target's
+    through ``get_embed_and_head`` -> ``set_embed_and_head``. ``lm_head`` needs no
+    such help -- the target already builds it on the last stage.
+    """
+    return pp_group.is_first_rank or (
+        pp_group.is_last_rank and speculative_algorithm is not None
+    )
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -2589,7 +2605,7 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
 
-        if self.pp_group.is_first_rank or (_is_npu and self.pp_group.is_last_rank):
+        if pp_stage_needs_embedding(self.pp_group, get_spec().speculative_algorithm):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,

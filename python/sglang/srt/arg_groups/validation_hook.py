@@ -24,6 +24,37 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def check_pipeline_parallel_compat(cfg: Any) -> None:
+    """What pipeline parallelism rules out, for a config that already has pp_size > 1.
+
+    Speculative decoding is allowed: the draft is built on the last pipeline stage
+    only (``EAGLEWorkerV2._hosts_draft``) and every earlier stage forwards the
+    target's PP proxy tensors and returns, which is platform-neutral machinery. Only
+    the EAGLE (non-multi-layer) shape has been exercised, so that much is enforced.
+    """
+    assert cfg.disable_overlap_schedule, (
+        "Pipeline parallelism is not compatible with overlap schedule"
+    )
+    if cfg.speculative_algorithm is not None:
+        assert (
+            cfg.speculative_algorithm.upper() == "EAGLE"
+            and not cfg.enable_multi_layer_eagle
+        ), (
+            "Pipeline parallelism currently only supports EAGLE "
+            "(non-multi-layer) speculative decoding"
+        )
+        if get_platform().is_npu:
+            assert cfg.disaggregation_mode == "prefill", (
+                "NPU PP + speculative decoding (MTP) is only supported "
+                "on prefill nodes (disaggregation-mode=prefill)"
+            )
+    assert cfg.min_free_slots_delay is None, (
+        "--min-free-slots-delay is not supported with pipeline "
+        "parallelism: allocatable slots per microbatch are bounded by "
+        "pp-max-micro-batch-size, so the threshold may never be reached"
+    )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -49,33 +80,7 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        if get_platform().is_npu:
-            # NPU: allow PP + EAGLE speculative decoding
-            assert cfg.disable_overlap_schedule, (
-                "Pipeline parallelism is not compatible with overlap schedule"
-            )
-            if cfg.speculative_algorithm is not None:
-                assert (
-                    cfg.speculative_algorithm.upper() == "EAGLE"
-                    and not cfg.enable_multi_layer_eagle
-                ), (
-                    "Pipeline parallelism currently only supports EAGLE "
-                    "(non-multi-layer) speculative decoding"
-                )
-                assert cfg.disaggregation_mode == "prefill", (
-                    "NPU PP + speculative decoding (MTP) is only supported "
-                    "on prefill nodes (disaggregation-mode=prefill)"
-                )
-        else:
-            # Non-NPU: PP + speculative decoding is not supported
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-            )
-        assert cfg.min_free_slots_delay is None, (
-            "--min-free-slots-delay is not supported with pipeline "
-            "parallelism: allocatable slots per microbatch are bounded by "
-            "pp-max-micro-batch-size, so the threshold may never be reached"
-        )
+        check_pipeline_parallel_compat(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
         "multi-node data parallel is not supported unless dp attention!"

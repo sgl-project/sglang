@@ -778,6 +778,14 @@ class SchedulerPPMixin:
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
             tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+            # The DSA IndexShare seed has to ride along for the same reason. It is
+            # relayed rather than left on the producing stage because the rebuild
+            # below replaces batch.spec_info on EVERY rank, the last one included:
+            # anything missing from the ring is lost, not merely un-shared.
+            if draft_input.dsa_topk_indices is not None:
+                tensor_dict["draft_dsa_topk_indices"] = (
+                    draft_input.dsa_topk_indices.contiguous()
+                )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -934,6 +942,7 @@ class SchedulerPPMixin:
                 bonus_tokens=next_token_ids,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
+                dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
 
