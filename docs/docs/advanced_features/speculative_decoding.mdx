@@ -405,6 +405,34 @@ print(response.choices[0].message.content)
 
 ---
 
+### MiniCPM-SALA
+
+MiniCPM-SALA provides speculative target interfaces and EAGLE-3 chain
+verification (`--speculative-eagle-topk 1`). Use a draft checkpoint trained
+for the target model; this support does not imply that every speculative
+algorithm can use the target.
+
+Add the following options to your MiniCPM-SALA launch command, preserving
+its model, quantization, and memory settings:
+
+```bash
+--attention-backend minicpm_flashinfer \
+--speculative-algorithm EAGLE3 \
+--speculative-draft-model-path /path/to/matching-eagle3-draft \
+--speculative-draft-attention-backend flashinfer \
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4 \
+--disable-radix-cache \
+--disable-prefill-cuda-graph \
+--disable-flashinfer-autotune
+```
+
+Decode CUDA graphs remain enabled. The compressed-key cache is request-local,
+so prefix-cache reuse must remain disabled. Prefill graphs are outside this
+configuration. Set `SGLANG_MINICPM_DENSE_AS_SPARSE=1` to use sparse rows for
+short queries as well; otherwise short queries retain dense attention.
+
 ## Multi Token Prediction
 
 We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [DeepSeek-V3.2 cookbook §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2#4-2-3-multi-token-prediction-eagle-speculative-decoding)).
