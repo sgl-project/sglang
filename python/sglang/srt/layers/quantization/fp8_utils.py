@@ -1543,6 +1543,7 @@ def requant_block_scale_ue8m0_for_deepgemm(
             weight_block_size=weight_block_size,
             output_dtype=output_dtype,
             weight_shape=weight_shape,
+            is_grouped=weight.ndim == 3,
         )
     ):
         return False
