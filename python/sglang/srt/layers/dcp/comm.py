@@ -207,7 +207,6 @@ def all_gather_kv_cache_for_mha_extend(
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
         attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
-    # NoPE pools return None for the positional key component.
     if prefix_k_pe is None:
         prefix_k_pe = prefix_kv_a[..., :0]
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)

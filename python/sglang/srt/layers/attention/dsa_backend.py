@@ -358,8 +358,7 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        # The dense MHA model path gathers DCP-sharded prefix KV. DSA draft
-        # KV is replicated, so use sparse MLA for both target and draft.
+        # NOTE(kpham-sgl): Dense MHA gathers sharded prefix KV, but DSA draft KV is replicated.
         self.supports_mha_one_shot: bool = not get_parallel().dcp_enabled
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
@@ -453,7 +452,6 @@ class DeepseekSparseAttnBackend(
                     "BF16 KV, tilelang prefill/decode, and fused top-k; "
                     "HiSparse and prefill CP cannot be combined with it."
                 )
-            # Gathered sparse prefill uses the host lengths to assemble prefixes.
             self.needs_cpu_seq_lens = True
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
@@ -1074,7 +1072,6 @@ class DeepseekSparseAttnBackend(
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
-                # The indexer consumes virtual locations into replicated index-K.
                 kv_cache_capacity = (
                     self.token_to_kv_pool.index_buf_size
                     + self.token_to_kv_pool.page_size
@@ -3134,7 +3131,6 @@ class DeepseekSparseAttnBackend(
         metadata = forward_batch.attn_dcp_metadata
         assert metadata is not None, "DCP sparse extend requires prefix metadata"
         kv_a = k.view(k.shape[0], -1)
-        # NoPE has an empty positional key component.
         k_pe = kv_a[:, None, :0]
         kv_full, _ = all_gather_kv_cache_for_mha_extend(
             self.token_to_kv_pool,
@@ -3147,7 +3143,7 @@ class DeepseekSparseAttnBackend(
             kv_a,
             k_pe,
         )
-        # RAGGED top-k indexes this per-request [prefix; extend] layout.
+        # NOTE(kpham-sgl): RAGGED top-k requires this per-request [prefix; extend] order.
         return kv_full.view(kv_full.shape[0], 1, -1)
 
     def _forward_tilelang(

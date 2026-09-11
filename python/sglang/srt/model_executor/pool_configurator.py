@@ -257,7 +257,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    # Draft pools are DCP-replicated, not sharded: budget all copies.
                     dcp_size = kvc.ps.attn_dcp_size
                     draft_kv_size = (
                         int(target_kv_size * draft_num_layers / target_kv_num_layers)
@@ -363,8 +362,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                # Every DCP rank scores the whole sequence with replicated
-                # index-K, while the attention KV above stays sharded.
                 cell_size += (
                     self._compute_dsa_indexer_cell_size(
                         kvc=kvc,

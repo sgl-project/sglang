@@ -381,12 +381,11 @@ class KVCacheConfigurator:
 
     def _dsa_pool_geometry(self, max_total_num_tokens: int) -> tuple[int, int]:
         physical_page_size = get_schedule().page_size
-        # Physical page stays 64 for CUDA DSA kernels; only the token pool is grown.
+        # NOTE(kpham-sgl): CUDA DSA kernels require physical pages of 64 even with DCP.
         pool_size = max_total_num_tokens + self.pool_page_size - physical_page_size
         return pool_size, physical_page_size
 
     def _dsa_index_buf_size(self, size: int) -> int:
-        # Replicate index-K including the reserved page; draft sizes are already global.
         scale = get_parallel().attn_dcp_size // self.loc_space_scale
         return (size + self.pool_page_size) * scale - get_schedule().page_size
 

@@ -301,7 +301,6 @@ class EagerRunner(BaseRunner):
             if (
                 model_runner.ps.attn_dcp_size > 1
                 and not forward_batch.forward_mode.is_target_verify()
-                # Replicated DSA draft KV already uses global token locations.
                 and not (
                     isinstance(kv_pool, MLATokenToKVPool) and kv_pool.dcp_replicated
                 )

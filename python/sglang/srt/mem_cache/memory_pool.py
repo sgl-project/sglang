@@ -4440,7 +4440,6 @@ class MLATokenToKVPool(KVCache):
     # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
     # full-attention layer is translated with blocks_per_page 1.
     write_loc_is_dcp_resolved = False
-    # Draft pools back the entire allocator address space on every rank.
     dcp_replicated = False
 
     @property
