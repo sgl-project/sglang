@@ -1226,7 +1226,10 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Allow only plain chat IDs; other requests still render for routing.
+/// Forward only plain text chats the router renders exactly as the engine does;
+/// tools, media, template overrides, mode toggles, assistant continuations, and
+/// shapes the engine normalizes first still render for routing only.
+/// `response_format` is not gated: neither side renders it into the prompt.
 /// Assumes the router and workers share tokenizer, template, and defaults.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value) || request_is_multimodal(value) {
@@ -1279,15 +1282,17 @@ fn messages_need_engine_render(value: &serde_json::Value) -> bool {
     let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
         return false;
     };
-    messages.iter().enumerate().any(|(i, m)| {
-        let role = m["role"].as_str().unwrap_or_default();
-        !matches!(role, "system" | "user" | "assistant")
-            || !m["content"].is_string()
-            || m.as_object()
-                .is_none_or(|m| m.keys().any(|k| k != "role" && k != "content"))
-            || (role == "system" && i > 0)
-            || (role == "user" && i > 0 && messages[i - 1]["role"] == "user")
-    })
+    // An empty conversation is rejected by the engine rather than rendered.
+    messages.is_empty()
+        || messages.iter().enumerate().any(|(i, m)| {
+            let role = m["role"].as_str().unwrap_or_default();
+            !matches!(role, "system" | "user" | "assistant")
+                || !m["content"].is_string()
+                || m.as_object()
+                    .is_none_or(|m| m.keys().any(|k| k != "role" && k != "content"))
+                || (role == "system" && i > 0)
+                || (role == "user" && i > 0 && messages[i - 1]["role"] == "user")
+        })
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -1639,6 +1644,9 @@ mod tests {
 
     #[test]
     fn input_ids_safe_to_forward_blocks_message_normalization() {
+        assert!(!input_ids_safe_to_forward(
+            &serde_json::json!({"messages": []})
+        ));
         for message in [
             serde_json::json!({"role": "User", "content": "hi"}),
             serde_json::json!({"role": "user", "content": null}),

@@ -22,11 +22,13 @@ path = "src/main.rs"
 unused_qualifications = "warn"
 
 [dependencies]
-dynamo-tokenizers = "1.8.1"
+# Dynamo crates are pinned exactly: Cargo.lock is not committed, and forwarded
+# `input_ids` depend on the renderer's exact behavior. Bumps are deliberate PRs.
+dynamo-tokenizers = "=1.8.1"
 # Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
-dynamo-renderer = "5.1.2"
+dynamo-renderer = "=5.1.2"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 

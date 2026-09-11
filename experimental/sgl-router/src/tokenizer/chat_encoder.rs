@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use dynamo_renderer::{
-    may_be_fix_tool_schema, native_formatter_for, ChatTemplate, ContextMixins, OAIChatLikeRequest,
-    PromptContextMixin, PromptFormatter,
+    deepseek_formatter_for, may_be_fix_tool_schema, ChatTemplate, ContextMixins,
+    OAIChatLikeRequest, PromptContextMixin, PromptFormatter,
 };
 use minijinja::Value;
 
@@ -88,13 +88,28 @@ impl ChatEncoder {
         }))
     }
 
-    /// Dynamo's built-in encoder for models that ship no template (DeepSeek-V4).
-    /// `model_type` (from `config.json`) is authoritative; the model id's last
-    /// path segment is the fallback.
+    /// Families the engine encodes in code even when a template ships (mirrors
+    /// `chat_encoding.resolve_chat_encoding_spec`).
+    pub fn engine_ignores_template(model_type: Option<&str>) -> bool {
+        model_type.is_some_and(|t| {
+            t.starts_with("deepseek_v4") || matches!(t, "inkling_mm_model" | "kimi_k3")
+        })
+    }
+
+    /// Dynamo's DeepSeek encoders (V4 family, V3.2), the only built-in ones
+    /// verified against the engine. `model_type` (from `config.json`) is
+    /// authoritative; the model id's last path segment is the fallback.
     pub fn native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
         let name = model_id.rsplit('/').next().unwrap_or(model_id);
-        let formatter =
-            native_formatter_for(&model_type.map(str::to_lowercase), &name.to_lowercase())?;
+        // The engine treats every `deepseek_v4*` variant (e.g. V4.1) as V4.
+        let model_type = model_type.map(str::to_lowercase).map(|t| {
+            if t.starts_with("deepseek_v4") {
+                "deepseek_v4".into()
+            } else {
+                t
+            }
+        });
+        let formatter = deepseek_formatter_for(&model_type, &name.to_lowercase())?;
         // Engine defaults: chat mode (`SGLANG_DEFAULT_THINKING=false`) and no
         // reasoning-effort preamble; Dynamo defaults to thinking at high effort.
         let defaults = HashMap::from([
@@ -279,6 +294,9 @@ mod tests {
         assert!(ChatEncoder::native(None, "deepseek-ai/DeepSeek-V4-Flash").is_some());
         assert!(ChatEncoder::native(None, "deepseek-v4-tiny").is_some());
         assert!(ChatEncoder::native(Some("deepseek_v4"), "alias").is_some());
+        assert!(ChatEncoder::native(Some("deepseek_v41"), "alias").is_some());
+        assert!(ChatEncoder::native(Some("deepseek_v32"), "DeepSeek-V3.2").is_some());
+        assert!(ChatEncoder::native(Some("inkling_mm_model"), "inkling").is_none());
         assert!(ChatEncoder::native(Some("llama"), "deepseek-v4").is_none());
         assert!(ChatEncoder::native(None, "deepseek-ai/DeepSeek-V3.2-Exp").is_none());
         assert!(ChatEncoder::native(None, "Qwen/Qwen3-0.6B").is_none());

@@ -76,10 +76,14 @@ fn sibling_path(source: &str, file: &str) -> Option<std::path::PathBuf> {
     let path = if Path::new(source).is_file() || looks_like_path(source) {
         Path::new(source).parent()?.join(file)
     } else {
-        // The download error does not distinguish a benign 404 from auth or
-        // network failures, so warn with the cause rather than hiding it.
+        // The download error does not distinguish a benign 404 from auth or network
+        // failures, so warn with the cause; only `chat_template.jinja` is routinely absent.
         match download_repo_file(source, file) {
             Ok(p) => p,
+            Err(e) if file == "chat_template.jinja" => {
+                tracing::debug!(repo = %source, %file, error = %e, "optional file not downloaded");
+                return None;
+            }
             Err(e) => {
                 tracing::warn!(repo = %source, %file, error = %e,
                     "could not download; chat-encoder detection may be degraded for this model \
