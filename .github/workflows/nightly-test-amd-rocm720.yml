@@ -2095,6 +2095,12 @@ jobs:
       # Two arms (TP4/EP4 with HiCache, then TP8/EP1 GPU-resident), each
       # sweeping concurrency over a multi-turn agentic-coding replay. Both load
       # the same checkpoint, so they share one job and one MI35x slot.
+      #
+      # The trace is one of the corpora staged on the MI35x runners: 64
+      # conversations over 584 turns, averaging 86K prompt tokens per turn and
+      # peaking at 231K, against a server that serves 1M context. Without it the
+      # test synthesizes a lighter corpus, which keeps it runnable off these
+      # runners but is not the workload the recipe is about.
       - name: Performance Test MI35x ROCm 7.2 (8-GPU GLM-5.2-MXFP4 agentic MTP)
         timeout-minutes: 300
         continue-on-error: true
@@ -2103,6 +2109,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e SGLANG_AGENTIC_TRACE_PATH="/sgl-data/agentic-traces/agentic_trace_b76deeeacbf0839e.json" \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-glm52-fp4-agentic-mtp --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
