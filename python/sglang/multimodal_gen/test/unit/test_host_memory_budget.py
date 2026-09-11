@@ -304,8 +304,6 @@ def test_the_forced_host_size_behaves_like_a_machine_of_that_size(monkeypatch):
 def test_the_physical_reading_ignores_the_forced_host_view(monkeypatch):
     from types import SimpleNamespace
 
-    from sglang.multimodal_gen import envs
-
     monkeypatch.setattr(
         host_memory_budget.psutil,
         "virtual_memory",
@@ -314,17 +312,17 @@ def test_the_physical_reading_ignores_the_forced_host_view(monkeypatch):
     monkeypatch.setattr(
         host_memory_budget, "cgroup_memory_limit_bytes", lambda *a, **k: None
     )
-    with envs.SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB.override(32):
-        # the pretend host sizes our own copies ...
-        assert (
-            host_memory_budget.host_memory_available_bytes()
-            <= 32 * host_memory_budget.GIB_BYTES
-        )
-        # ... but not what the kernel's page cache can hold
-        assert (
-            host_memory_budget.host_memory_available_bytes(physical=True)
-            == 200 * host_memory_budget.GIB_BYTES
-        )
-        assert not host_memory_budget.page_cache_cannot_hold(
-            45 * host_memory_budget.GIB_BYTES
-        )
+    monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "32")
+    # the pretend host sizes our own copies ...
+    assert (
+        host_memory_budget.host_memory_available_bytes()
+        <= 32 * host_memory_budget.GIB_BYTES
+    )
+    # ... but not what the kernel's page cache can hold
+    assert (
+        host_memory_budget.physical_host_memory_available_bytes()
+        == 200 * host_memory_budget.GIB_BYTES
+    )
+    assert not host_memory_budget.page_cache_cannot_hold(
+        45 * host_memory_budget.GIB_BYTES
+    )
