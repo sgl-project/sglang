@@ -388,6 +388,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 if self.layout in ("page_first", "page_first_direct")
                 else None
             ),
+            require_single_registration=self.layout == "page_first",
         )
         return buffer
 

@@ -199,6 +199,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 if self.layout in ("page_first", "page_first_direct")
                 else None
             ),
+            require_single_registration=self.layout == "page_first",
         )
         return buffer
 
@@ -814,6 +815,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 if self.layout in ("page_first", "page_first_direct")
                 else None
             ),
+            require_single_registration=self.layout == "page_first",
         )
 
     def get_hybrid_pool_buffer(self):
@@ -1138,6 +1140,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
             registration_granularity_bytes=self.page_size * self._k_layout_dim(),
+            require_single_registration=self.layout == "page_first",
         )
         v_buffer = alloc_func(
             v_dims,
@@ -1146,6 +1149,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
             registration_granularity_bytes=self.page_size * self._v_layout_dim(),
+            require_single_registration=self.layout == "page_first",
         )
         return (k_buffer, v_buffer)
 
