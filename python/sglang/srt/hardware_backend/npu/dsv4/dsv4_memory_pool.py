@@ -321,8 +321,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             return self.get_indexer_compress_states(layer_id)
         return self.get_attention_compress_states(layer_id)
 
-    def _make_attn_state_pool(
-        self, ratio: int, enable_memory_saver: bool
+    def _make_compress_state_pool(
+        self, ratio: int, *, head_dim: int, enable_memory_saver: bool
     ) -> NPUCompressStatePool:
         # ONLINE_C128 (CUDA-only) collapses the c128 ring to size 1; the NPU fused
         # compressor has no online mode, so assert the config mismatch early.
@@ -330,41 +330,21 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "SGLANG_OPT_USE_ONLINE_COMPRESS is incompatible with the "
             "NPU fused compressor (no online mode in the kernel)."
         )
+        config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
         # A5 cache_mode=2 addresses one ring bank per request.  The A3
         # explicit-location path can share the smaller flat pool, but the A5
         # cycle ABI needs enough physical banks for every req_pool_idx.
-        size = self._state_pool_size(ratio)
+        size = config.state_size
         if is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
             ring_size=ring_size,
             overlap=ratio == 4,
-            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-            dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
+            head_dim=head_dim,
+            dtype=config.state_dtype,
             device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            ratio=ratio,
-            swa_page_size=self.swa_page_size,
-        )
-
-    def _make_indexer_state_pool(
-        self, ratio: int, enable_memory_saver: bool
-    ) -> NPUCompressStatePool:
-        # c4 indexer shares the c4 state pool size budget but has its own
-        # slot_dim (indexer_head_dim vs attention head_dim).
-        ring_size = self.get_ring_size(ratio)
-        size = self.c4_state_pool_size
-        if is_npu_arch35():
-            size = max(size, self.num_req_slots * ring_size)
-        return NPUCompressStatePool(
-            size=size,
-            ring_size=ring_size,
-            overlap=ratio == 4,
-            head_dim=self.indexer_head_dim,
-            device=self.device,
-            dtype=self.c4_state_dtype,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             swa_page_size=self.swa_page_size,
@@ -394,10 +374,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """Main PD buffers addressed by the full KV page id."""
+        indexer_pool = self._indexer_pool(4)
         buffers = (
             self.c4_kv_pool.kv_buffer
-            + self.c4_indexer_kv_pool.index_k_buffer
-            + self.c4_indexer_kv_pool.index_scale_buffer
+            + indexer_pool.index_k_buffer
+            + indexer_pool.index_scale_buffer
         )
         return (
             [buf.data_ptr() for buf in buffers],
@@ -530,16 +511,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
         """
         item = self.layer_mapping[layer_id]
-        if item.compress_ratio == 4:
-            if from_indexer:
-                kv = self.c4_indexer_kv_pool.get_index_k(item.compress_layer_id)
-            else:
-                kv = self.c4_kv_pool.kv_buffer[item.compress_layer_id]
-        elif item.compress_ratio == 128:
-            assert not from_indexer, "c128 has no indexer pool"
-            kv = self.c128_kv_pool.kv_buffer[item.compress_layer_id]
-        else:
+        if item.compress_ratio == 0:
             return None
+        if from_indexer:
+            indexer_pool = self._indexer_pool(item.compress_ratio)
+            kv = indexer_pool.get_index_k(item.compress_layer_id)
+        else:
+            compress_pool = item.compress_kv_pool
+            assert compress_pool is not None, "Missing compressed KV pool"
+            kv = compress_pool.kv_buffer[item.compress_layer_id]
         if loc is not None:
             kv = kv.flatten(0, 1)[loc]
         return kv
@@ -651,21 +631,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         device_type = kv.device.type
         if from_indexer:
-            assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
+            indexer_pool = self._indexer_pool(ratio)
             if device_type == "npu":
-                assert self.c4_indexer_kv_pool.has_npu_storage, (
+                assert indexer_pool.has_npu_storage, (
                     "NPU index buffers not allocated — pool was init'd on CUDA?"
                 )
-                self.c4_indexer_kv_pool.set_index_k_scale(
-                    compress_layer_id, loc, kv, kv_scale
-                )
+                indexer_pool.set_index_k_scale(compress_layer_id, loc, kv, kv_scale)
                 return
             if kv_scale is None:
-                self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, kv)
+                indexer_pool.set_index_fused(compress_layer_id, loc, kv)
                 return
-            self.c4_indexer_kv_pool.set_index_k_scale_buffer(
-                compress_layer_id, loc, kv, kv_scale
-            )
+            indexer_pool.set_index_k_scale_buffer(compress_layer_id, loc, kv, kv_scale)
             return
         compress_pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
         if device_type == "npu":
@@ -690,5 +666,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     ) -> torch.Tensor:
         # The indexer scale is fp16 on pre-A5 parts and fp32 on A5.
         assert from_indexer, "only indexer compress pool has dequant scale"
-        compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
-        return self.c4_indexer_kv_pool.get_index_scale(compress_layer_id)
+        item = self.layer_mapping[layer_id]
+        indexer_pool = self._indexer_pool(item.compress_ratio)
+        return indexer_pool.get_index_scale(item.compress_layer_id)
