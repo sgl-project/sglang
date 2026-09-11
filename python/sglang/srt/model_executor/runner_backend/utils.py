@@ -54,11 +54,18 @@ _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
 
 def resolve_decode_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
+    *,
+    keep_graph: bool = False,
 ) -> BaseCudaGraphBackend:
     """Pick a backend instance from cuda_graph_config['decode']['backend'].
 
     NPU device returns NPUCudaGraphBackend regardless of mode (only
     the Full-style backend is wired for NPU today).
+
+    ``keep_graph`` is ``keeps_raw_graphs(plan)`` from the runner's
+    graph-serialization plan: the Full backend then keeps every captured
+    ``CUgraph`` so ``export_shape`` can encode it (design section 6.7). The
+    other backends do not serialize in this draft and ignore it.
     """
     model_runner = cuda_graph_runner.model_runner
     cfg = get_exec().graph.cuda_graph_config
@@ -100,14 +107,23 @@ def resolve_decode_backend(
             )
             _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = True
     return FullCudaGraphBackend(
-        cuda_graph_runner, enable_memory_saver=enable_memory_saver
+        cuda_graph_runner,
+        enable_memory_saver=enable_memory_saver,
+        keep_graph=keep_graph,
     )
 
 
 def resolve_prefill_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
+    *,
+    keep_graph: bool = False,
 ) -> BaseCudaGraphBackend:
-    """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
+    """Pick a backend instance from cuda_graph_config['prefill']['backend'].
+
+    ``keep_graph`` is ``keeps_raw_graphs(plan)`` from the runner's
+    graph-serialization plan; only the Full backend acts on it (design
+    section 6.7).
+    """
     model_runner = cuda_graph_runner.model_runner
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
@@ -122,6 +138,7 @@ def resolve_prefill_backend(
         return FullCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=get_exec().features.enable_memory_saver,
+            keep_graph=keep_graph,
         )
     # Default: tc_piecewise.
     return TcPiecewiseCudaGraphBackend(cuda_graph_runner)

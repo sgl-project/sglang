@@ -26,7 +26,7 @@ the kernel captured in the graph dereferences its row at replay time.
 
 import logging
 from contextlib import contextmanager
-from typing import List, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -211,6 +211,10 @@ class CustomAllReduceV2:
         )
         self._graph_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
         self._graph_counter = 0
+        # (absolute row, local data_ptr, nbytes) for every row ever written
+        # into ``graph_params``; read by the graph-serialization exporter
+        # (DESIGN_cuda_graph_serialization.md section 6.10, fact 17)
+        self._graph_row_log: List[Tuple[int, int, int]] = []
         self._graph_mode_allowed = False
         self.disabled = False
 
@@ -454,8 +458,95 @@ class CustomAllReduceV2:
         self.graph_params[self._graph_counter : self._graph_counter + count].copy_(rows)
         # the rows must be visible before any (PDL-chained) graph replay
         torch.cuda.synchronize()
+        for i, (local_ptr, nbytes) in enumerate(self._graph_inputs):
+            self._graph_row_log.append((self._graph_counter + i, local_ptr, nbytes))
         self._graph_counter += count
         self._graph_inputs.clear()
+
+    # ------------------------------------------------------------------
+    # CUDA-graph serialization (DESIGN_cuda_graph_serialization.md 6.10)
+    # ------------------------------------------------------------------
+
+    @property
+    def graph_row_log(self) -> Tuple[Tuple[int, int, int], ...]:
+        """Every ``graph_params`` row written so far, as
+        ``(absolute row, local data_ptr, nbytes)``.
+
+        Row contents (peer pointers) are deliberately not part of the log:
+        they are process-local virtual addresses and are re-exchanged at
+        load (design section 6.10). A copy is returned so callers cannot
+        mutate the log.
+        """
+        return tuple(self._graph_row_log)
+
+    @property
+    def graph_row_count(self) -> int:
+        """Next free ``graph_params`` row (``== _graph_counter``)."""
+        return self._graph_counter
+
+    def pre_advance_graph_counter(self, next_row: int) -> None:
+        """Move the row counter to ``next_row`` before a graph load.
+
+        Row indices are absolute (fact 17): a loaded graph dereferences the
+        rows it was captured with, so shapes that fall back to capture in
+        the same process must allocate ABOVE them. The loader calls this
+        with ``max_row + 1`` of the saved rows before the shape loop
+        (design section 6.10). Only forward moves are allowed and no
+        registration may be pending, otherwise pending inputs would be
+        written at the wrong rows.
+        """
+        assert (
+            not self._graph_inputs
+        ), "pre_advance_graph_counter: graph inputs are pending registration"
+        assert next_row >= self._graph_counter, (
+            f"pre_advance_graph_counter: cannot move the row counter backwards "
+            f"({next_row} < {self._graph_counter})"
+        )
+        assert next_row <= _MAX_GRAPH_INPUTS, (
+            f"pre_advance_graph_counter: {next_row} exceeds the graph_params "
+            f"capacity ({_MAX_GRAPH_INPUTS})"
+        )
+        logger.debug(
+            "custom all-reduce v2 rank %d: graph_params counter %d -> %d",
+            self.rank,
+            self._graph_counter,
+            next_row,
+        )
+        self._graph_counter = next_row
+
+    def register_graph_inputs_at(self, entries: Sequence[Tuple[int, int, int]]) -> None:
+        """Fill ``graph_params`` rows at ABSOLUTE indices for loaded graphs.
+
+        Contract (design section 6.10, fact 17): ``entries`` are
+        ``(absolute_row, local_ptr, nbytes)`` tuples, one per graph input of
+        the loaded graphs, with ``local_ptr`` already rebased into this
+        process. Collective: every rank of ``self.group`` calls it at the
+        same program point, after the shape loop, inside
+        ``parallel_state.graph_capture()``. It must
+
+        * run the same peer-pointer exchange as ``_register_graph_inputs_ipc``
+          (cudaIpc handles, ``dist.all_gather_object`` over the group) or
+          ``VmmGraphInputManager.register_graph_inputs`` (fabric / posix-fd
+          VMM remap) for exactly the given local pointers, choosing the path
+          with ``is_vmm_pointer`` as ``_register_graph_inputs`` does;
+        * write the resulting peer rows at the given absolute indices with
+          an index tensor (``graph_params[index_tensor] = rows``), not the
+          contiguous slice at ``_graph_counter`` that
+          ``register_peer_mapped_inputs`` uses;
+        * never touch ``_graph_counter`` or ``_graph_inputs`` (the existing
+          path both writes from and bumps the counter; the loader has
+          already pre-advanced it past ``max(absolute_row) + 1``);
+        * ``torch.cuda.synchronize()`` before returning, because the rows
+          must be visible before any PDL-chained replay.
+
+        Row contents are never copied from an artifact; only indices and
+        input regions are saved.
+        """
+        raise NotImplementedError(
+            "CustomAllReduceV2.register_graph_inputs_at: the index-taking IPC / "
+            "VMM peer-pointer exchange is not implemented in this draft; see "
+            "DESIGN_cuda_graph_serialization.md section 6.10"
+        )
 
     # ------------------------------------------------------------------
     # Teardown

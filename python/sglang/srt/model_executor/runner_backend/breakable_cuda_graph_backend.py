@@ -27,6 +27,13 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.graph_serialization.format import (
+    ShapeArtifact,
+    ShapeKeyRecord,
+)
+from sglang.srt.model_executor.graph_serialization.materializer import (
+    GraphImportError,
+)
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -49,6 +56,15 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.graph_serialization.format import (
+        BreakSiteRecord,
+        KernelIdentity,
+        OutputSchema,
+    )
+    from sglang.srt.model_executor.graph_serialization.materializer import (
+        GraphLoadContext,
+        GraphSaveContext,
+    )
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
@@ -128,11 +144,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         size = shape_key.size
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
-        with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
-            cuda_graph=graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            barrier_fn=self._tp_group.barrier,
+        with (
+            graph_pool_capture_scope(),
+            BreakableCUDAGraphCapture(
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                barrier_fn=self._tp_group.barrier,
+            ),
         ):
             out = captured_fn()
             out_rows = self._output_rows(out, size)
@@ -258,3 +277,152 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs.clear()
         self._pool = None
         self._shared_output_buffer = None
+
+    # -- serialization seam (design sections 6.7, 6.9, 9.2) -----------------
+
+    @staticmethod
+    def _segment_raw_graph(segment: Any) -> int:
+        """The ``CUgraph`` handle of one ``BreakableCUDAGraph`` segment.
+
+        Segments are ``torch.cuda.CUDAGraph`` objects (``raw_cuda_graph()``)
+        or, under ``SGLANG_ENABLE_CUDA_GRAPH_DEDUP``, ``DedupedCudaGraph``
+        wrappers that carry the handle as ``raw_graph``.
+        """
+        raw_cuda_graph = getattr(segment, "raw_cuda_graph", None)
+        if callable(raw_cuda_graph):
+            return int(raw_cuda_graph())
+        raw_graph = getattr(segment, "raw_graph", None)
+        if raw_graph is None:
+            raise TypeError(
+                f"BCG segment {type(segment).__name__} exposes neither "
+                "raw_cuda_graph() nor raw_graph"
+            )
+        return int(raw_graph)
+
+    def export_shape(self, shape_key: ShapeKey, ctx: GraphSaveContext) -> ShapeArtifact:
+        """One ``SerializedGraph`` per captured segment, one
+        ``BreakSiteRecord`` per break (design section 6.9), the shared output
+        and the retained capture inputs (section 9.2). ``KeyError`` for a
+        shape ``capture_one`` never recorded.
+
+        A segment's ``raw_cuda_graph()`` exists only on a ``keep_graph=True``
+        capture. ``BreakableCUDAGraph`` requests that only under
+        ``SGLANG_ENABLE_CUDA_GRAPH_DEDUP`` today; the plain-path ``keep_graph``
+        seam for segments (``runner_backend_utils/breakable_cuda_graph``) is
+        not wired in this draft, so an export without dedup fails loudly
+        there. Design section 6.7 specifies the ``keep_graph`` capture for
+        the Full backend; the runners' ``keep_graph`` flag is ignored here.
+        """
+        graph = self._graphs[shape_key]
+        segments = tuple(
+            ctx.codec.encode(
+                self._segment_raw_graph(segment),
+                registry=ctx.registry,
+                resolver=ctx.resolver,
+                policy=ctx.policy,
+                event_roles=ctx.event_roles,
+            )
+            for segment in graph._segments
+        )
+        breaks = self._describe_break_sites(graph)
+        output, capture_inputs = self._describe_output(
+            self._outputs[shape_key], self._capture_inputs.get(shape_key)
+        )
+        return ShapeArtifact(
+            shape_key=ShapeKeyRecord.from_shape_key(shape_key),
+            backend="breakable",
+            graphs=segments,
+            output=output,
+            kernels=self._kernel_table(ctx),
+            breaks=breaks,
+            capture_inputs=capture_inputs,
+        )
+
+    def import_shape(
+        self,
+        shape_key: ShapeKey,
+        artifact: ShapeArtifact,
+        ctx: GraphLoadContext,
+    ) -> None:
+        """Materialize every segment (the all-or-nothing preamble, design
+        section 6.7), then rebuild the break closures and assemble the
+        ``BreakableCUDAGraph``.
+
+        The preamble is implemented: an artifact from another backend, an
+        artifact with no segments, or a segment the codec cannot materialize
+        raise ``GraphImportError`` with ``_graphs`` / ``_outputs`` untouched.
+        ``rebuild_break_fn`` and ``BreakableCUDAGraph.from_loaded(segments,
+        break_fns)`` (design section 6.9) live in
+        ``runner_backend_utils/breakable_cuda_graph`` and are not in this
+        draft, so a successful preamble ends in ``NotImplementedError``.
+        """
+        try:
+            if artifact.backend != "breakable":
+                raise ValueError(
+                    f"artifact was exported by backend {artifact.backend!r}, "
+                    "not 'breakable'"
+                )
+            if not artifact.graphs:
+                raise ValueError("the breakable artifact has no segments")
+            loaded_segments = [
+                ctx.codec.materialize(
+                    graph,
+                    kernels=artifact.kernels,
+                    reloc=ctx.reloc,
+                    resolver=ctx.resolver,
+                    events=ctx.events,
+                    device_ctx=ctx.device_ctx,
+                )
+                for graph in artifact.graphs
+            ]
+        except Exception as exc:
+            raise GraphImportError(
+                f"BreakableCudaGraphBackend.import_shape({shape_key}): {exc}"
+            ) from exc
+        raise NotImplementedError(
+            "BreakableCudaGraphBackend.import_shape: rebuilding the break "
+            "closures (rebuild_break_fn) and assembling BreakableCUDAGraph."
+            f"from_loaded over the {len(loaded_segments)} materialized segment(s) "
+            "with the shared output buffer is not implemented in this draft; see "
+            "DESIGN_cuda_graph_serialization.md section 6.9"
+        )
+
+    @staticmethod
+    def _describe_break_sites(graph: BreakableCUDAGraph) -> tuple[BreakSiteRecord, ...]:
+        """One ``BreakSiteRecord`` per ``graph._break_fns`` entry from the
+        ``BreakSiteInfo`` the ``eager_on_graph`` wrapper attaches: the site key
+        by the three-way rule (``op:sglang::<name>`` / ``py:<module>:<qualname>``
+        / ``model:<submodule path>:<method>``, fact 22), tensor arguments as
+        region references, scalars by value, the bridge output as a
+        ``bcg_bridge`` region (design section 6.9)."""
+        raise NotImplementedError(
+            "BreakableCudaGraphBackend._describe_break_sites: deriving "
+            "BreakSiteRecord entries from the eager_on_graph break closures is "
+            "not implemented in this draft; see "
+            "DESIGN_cuda_graph_serialization.md section 6.9"
+        )
+
+    @staticmethod
+    def _describe_output(
+        out: Any, capture_inputs: Any
+    ) -> tuple[OutputSchema, tuple[OutputSchema, ...]]:
+        """Describe the shared-output slice ``replay`` returns and the DP
+        padding tensors retained as ``capture_inputs`` (design sections 6.7
+        and 9.2, fact 13)."""
+        raise NotImplementedError(
+            "BreakableCudaGraphBackend._describe_output: describing the shared "
+            "output buffer slice and the retained capture inputs as region "
+            "references is not implemented in this draft; see "
+            "DESIGN_cuda_graph_serialization.md section 6.7 and section 9.2"
+        )
+
+    @staticmethod
+    def _kernel_table(ctx: GraphSaveContext) -> tuple[KernelIdentity, ...]:
+        """The identity table ``KernelNode.identity`` indexes into, shared by
+        every segment of the shape (design sections 6.5 and 6.6)."""
+        raise NotImplementedError(
+            "BreakableCudaGraphBackend._kernel_table: collecting the encoder's "
+            "kernel identity table for the artifact is not implemented in this "
+            "draft; see DESIGN_cuda_graph_serialization.md section 6.5 and "
+            "section 6.6"
+        )

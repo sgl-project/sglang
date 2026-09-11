@@ -70,6 +70,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.graph_serialization.materializer import (
+    keeps_raw_graphs,
+    resolve_materializer,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -133,6 +137,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.graph_serialization.plan import (
+        GraphSerializationPlan,
+    )
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -221,8 +228,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend=None,
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        graph_serialization_plan: Optional[GraphSerializationPlan] = None,
     ):
         super().__init__(model_runner)
+        # The graph-serialization plan cuda_graph_setup resolved (design
+        # section 13); None for a runner built outside that lifecycle, which
+        # is capture-only.
+        self.graph_serialization_plan = graph_serialization_plan
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -481,7 +493,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # --- backend ---------------------------------------------------
-        self.backend = resolve_decode_backend(self)
+        # keep_graph exactly when the plan is enabled (design section 6.7).
+        self.backend = resolve_decode_backend(
+            self, keep_graph=keeps_raw_graphs(graph_serialization_plan)
+        )
+        # Per-shape capture-versus-import seam (design section 6.8); a None or
+        # disabled plan resolves to CaptureOnlyMaterializer.
+        self.materializer = resolve_materializer(self, graph_serialization_plan)
 
         # --- capture --------------------------------------------------
         try:
@@ -576,6 +594,40 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
+
+    def planned_shape_keys(self) -> list[ShapeKey]:
+        """Every ``ShapeKey`` ``capture`` will hand to ``materialize_shape``, in
+        capture order (design section 6.8): per pdmux stream, the buckets
+        largest first, then the LoRA and DSA variants exactly as
+        ``_capture_one_stream`` iterates them. Forward-free, so the
+        materializer can agree per-shape verdicts across ranks before the
+        shape loop (design section 6.1 decision 4).
+        """
+        stream_indices: list[Optional[int]] = (
+            list(range(len(self.stream_groups))) if self.enable_pdmux else [None]
+        )
+        lora_variants = (
+            ["lora", "nolora"]
+            if getattr(self, "record_nolora_graph", False)
+            else [None]
+        )
+        dsa_variants = (
+            ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
+        )
+        keys: list[ShapeKey] = []
+        for stream_idx in stream_indices:
+            for bs in reversed(self.capture_bs):
+                size = self._capture_graph_size(
+                    bs=bs, num_tokens=bs * self.captured_req_width
+                )
+                for variant_label in lora_variants:
+                    for dsa_variant in dsa_variants:
+                        keys.append(
+                            self._make_graph_key(
+                                size, stream_idx, variant_label, dsa_variant
+                            )
+                        )
+        return keys
 
     def _resolve_dsa_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         """Host dispatch: pick which pre-captured DSA decode graph to replay
@@ -1059,6 +1111,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # already covered by the registry's padding policy.
         self.buffers.reset_index_buffers()
 
+        # Agree per-shape verdicts across ranks before any shape runs (design
+        # section 6.1 decision 4, section 6.8). For the default path's
+        # CaptureOnlyMaterializer plan() is a no-op and session() is exactly
+        # backend.capture_session.
+        materializer = self.materializer_or_capture_only()
+        materializer.plan(self)
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -1071,7 +1130,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     profile_context as prof,
                 ):
                     self.stream = graph_capture_context.stream
-                    with self.backend.capture_session(self.stream):
+                    with materializer.session(self.stream):
                         self._capture_one_stream()
             else:
                 set_pdmux_status(False)
@@ -1081,7 +1140,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         profile_context as prof,
                     ):
                         self.stream = graph_capture_context.stream
-                        with self.backend.capture_session(self.stream):
+                        with materializer.session(self.stream):
                             self._capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
@@ -1259,11 +1318,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
-                self.backend.capture_one(
+                self.materialize_shape(
                     shape_key,
                     run_once,
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
+                    # The runner-owned external event every decode graph
+                    # records (design section 9.1); it is created lazily by
+                    # the captured body, so the first shape sees None.
+                    event_roles=(
+                        {"metadata_prep_done": self.in_graph_metadata_prep_done}
+                        if self.in_graph_metadata_prep_done is not None
+                        else {}
+                    ),
                 )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:

@@ -1926,6 +1926,26 @@ class ServerArgs:
         "Enable debug/eager mode for CUDA graph using breakable CUDA graph. When enabled, graph breaks are inserted so every operation runs eagerly while still going through the CUDA graph capture / replay path. Useful for debugging CUDA graph capture / replay issues.",
         NS("exec.graph"),
     ] = False
+    cuda_graph_cache_mode: A[
+        Literal["off", "save", "load", "auto"],
+        "Save captured CUDA graphs to --cuda-graph-cache-dir after capture (save), rebuild them from a matching artifact instead of capturing (load), or do whichever applies (auto). Default off. Draft: interfaces only; save/load fail loudly in this build.",
+        NS("exec.graph"),
+    ] = "off"
+    cuda_graph_cache_dir: A[
+        Optional[str],
+        "Directory for CUDA graph artifacts. Defaults to $SGLANG_CACHE_DIR/cuda_graphs.",
+        NS("exec.graph"),
+    ] = None
+    cuda_graph_cache_placement: A[
+        Literal["relocate", "fixed_va"],
+        "How saved device pointers are bound at load: patch every pointer word by region delta (relocate) or pin SGLang-owned regions at fixed virtual addresses with VMM arenas (fixed_va).",
+        NS("exec.graph"),
+    ] = "relocate"
+    cuda_graph_cache_verify: A[
+        Literal["none", "shadow-one", "shadow-all"],
+        "Recapture one or every loaded shape and diff it node by node against the loaded graph.",
+        NS("exec.graph"),
+    ] = "none"
 
     # -------------------------------------------------------------------------
     # Communication and kernels

@@ -458,6 +458,67 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
         )
 
 
+def apply_cuda_graph_cache_compatibility(server_args: Any):
+    """Turn CUDA graph serialization off for configurations v1 does not cover.
+
+    Design section 13 names the gates; design sections 9.3 and 9.4 explain
+    them: tc_piecewise phases (torch.compile owns those graphs), speculative
+    decoding (the one-graph EAGLE path samples inside the graph, fact 16),
+    pdmux (green-context streams), DP attention (in-graph NCCL gather), DCP
+    (pynccl a2a inside the graph), DeepEP low-latency dispatch (in-graph
+    low-latency kernels), LoRA and two-batch overlap (no region providers
+    yet) and memory-saver graph mode. The first applicable reason is logged
+    and declared; every rule declares the same value, so a second match
+    would only append a duplicate entry.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.cuda_graph_cache_mode == "off":
+        return
+
+    def _has_tc_piecewise_phase() -> bool:
+        graph_config = cfg.cuda_graph_config
+        if graph_config is None:
+            return False
+        return any(
+            getattr(graph_config, phase).backend == Backend.TC_PIECEWISE
+            for phase in Phase.ALL
+        )
+
+    def _deepep_low_latency() -> bool:
+        # `auto` resolves to low_latency for decode batches
+        # (DeepEPMode.enable_low_latency), so it gates like an explicit one.
+        return cfg.moe_a2a_backend in ("deepep", "deepep_v2") and cfg.deepep_mode in (
+            "auto",
+            "low_latency",
+        )
+
+    rules = [
+        ("a tc_piecewise CUDA graph phase", _has_tc_piecewise_phase),
+        ("speculative decoding", lambda: cfg.speculative_algorithm is not None),
+        ("PD multiplexing (--enable-pdmux)", lambda: cfg.enable_pdmux),
+        ("DP attention", lambda: cfg.enable_dp_attention),
+        ("decode context parallelism (dcp_size > 1)", lambda: cfg.dcp_size > 1),
+        ("DeepEP low-latency dispatch", _deepep_low_latency),
+        ("LoRA", lambda: bool(cfg.lora_paths) or bool(cfg.enable_lora)),
+        ("two-batch overlap", lambda: cfg.enable_two_batch_overlap),
+        ("memory saver (--enable-memory-saver)", lambda: cfg.enable_memory_saver),
+    ]
+    for name, predicate in rules:
+        if predicate():
+            logger.warning(
+                "CUDA graph cache (--cuda-graph-cache-mode %s) is not supported "
+                "with %s in this draft; resolving --cuda-graph-cache-mode off.",
+                cfg.cuda_graph_cache_mode,
+                name,
+            )
+            declare_resolution(
+                server_args,
+                "_apply_cuda_graph_cache_compatibility",
+                cuda_graph_cache_mode="off",
+            )
+            return
+
+
 def handle_cuda_graph_config(server_args: Any):
     cfg = resolving_view(server_args)
 
@@ -465,6 +526,7 @@ def handle_cuda_graph_config(server_args: Any):
     apply_cuda_graph_compatibility(server_args)
     apply_deepep_adjustments(server_args)
     apply_cuda_graph_disaggregation_roles(server_args)
+    apply_cuda_graph_cache_compatibility(server_args)
     validate_cuda_graph_config(server_args)
     # Warn on the final resolved config (not inside the compat cascade —
     # that path is skipped when the user explicitly sets the backend,
