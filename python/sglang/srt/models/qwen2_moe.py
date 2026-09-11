@@ -20,7 +20,7 @@
 
 import logging
 from contextlib import nullcontext
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -65,7 +65,13 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutputChecker,
+    build_precomputed_topk_output,
+    precomputed_topk_postprocess_is_noop,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -123,6 +129,11 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+
+if _is_cuda:
+    # Fused softmax -> top-k -> renormalize kernel used by forward_cp (CUDA only,
+    # like the guarded import in layers/moe/topk.py).
+    from sglang.kernels.ops.moe import topk_softmax
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
@@ -732,15 +743,85 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return router_output, shared_output
 
+    def _use_fused_shared_gate(self) -> bool:
+        return (
+            self.shared_expert_gate is not None
+            and not use_intel_amx_backend(self.shared_expert_gate)
+            and not is_npu()
+        )
+
+    def _cp_router(self, router_logits: torch.Tensor) -> StandardTopKOutput:
+        """Softmax -> top-k -> renormalize (this block's RenormalizeNaive routing)
+        in STANDARD (fp32 weights, int32 ids) format, straight from the fused
+        CUDA kernel. The block's own `TopK` yields the BYPASSED format for the
+        FlashInfer TRT-LLM runner (the kernel routes from logits itself), which
+        cannot be split by rows; going through `select_experts` instead costs
+        ~0.1 ms of host time per layer, which is visible on launch-bound
+        forwards."""
+        cfg = self.topk.topk_config
+        assert cfg.correction_bias is None and not cfg.use_grouped_topk
+        assert precomputed_topk_postprocess_is_noop(cfg)
+        num_tokens = router_logits.shape[0]
+        topk_weights = torch.empty(
+            num_tokens, cfg.top_k, dtype=torch.float32, device=router_logits.device
+        )
+        topk_ids = torch.empty(
+            num_tokens, cfg.top_k, dtype=torch.int32, device=router_logits.device
+        )
+        topk_softmax(topk_weights, topk_ids, router_logits, cfg.renormalize)
+        return build_precomputed_topk_output(topk_weights, topk_ids, cfg, self.layer_id)
+
+    def forward_cp(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        all_gather_rows: Callable[..., list[torch.Tensor]],
+        reduce_scatter_rows: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Collocated prefill CP: router on this rank's rows, experts on all rows.
+
+        gate + top-k run on the local rows only (routing is per token, so this
+        is exact); the rows, the fp32 top-k weights and the int32 top-k ids are
+        all-gathered rank-major in one call (one NCCL group launch on the
+        torch.distributed path), the TP-sharded routed and shared experts run
+        on all N rows, and the TP-partial sum is reduce-scattered back to the
+        local rows. Same bytes as the all-reduce of the TP path plus 80 B per
+        row of top-k, without replicating the router on every rank."""
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        router_logits, _ = self.gate(hidden_states)
+        topk_local = self._cp_router(router_logits)
+        gathered, topk_weights, topk_ids = all_gather_rows(
+            hidden_states, topk_local.topk_weights, topk_local.topk_ids
+        )
+        # The gathered tensors are already contiguous: no pack / unpack copies
+        # (each extra launch costs ~40 us of host time on a launch-bound forward).
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
+        )
+        use_fused_gate = self._use_fused_shared_gate()
+        shared_output = self._forward_shared_experts(
+            gathered, apply_gate=not use_fused_gate
+        )
+        final_hidden_states = self.experts(gathered, topk_output)
+        if shared_output is not None:
+            if use_fused_gate:
+                fused_gate_sigmoid_mul_add(
+                    gathered,
+                    self.shared_expert_gate.weight.squeeze(),
+                    shared_output,
+                    final_hidden_states,
+                )
+            else:
+                final_hidden_states += shared_output
+        return reduce_scatter_rows(final_hidden_states).view(num_tokens, hidden_dim)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         defer_finalize: bool = False,
-        reduce_output: bool = True,
     ) -> torch.Tensor:
-        # reduce_output=False returns the TP-partial sum (routed + shared
-        # experts) so a collocated-CP caller can reduce-scatter it over CP(=TP).
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
@@ -753,11 +834,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ):
             return self._forward_deepep(hidden_states, forward_batch)
 
-        use_fused_gate = (
-            self.shared_expert_gate is not None
-            and not use_intel_amx_backend(self.shared_expert_gate)
-            and not is_npu()
-        )
+        use_fused_gate = self._use_fused_shared_gate()
 
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
@@ -812,8 +889,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else:
                 final_hidden_states += shared_output
         if (
-            reduce_output
-            and self.tp_size > 1
+            self.tp_size > 1
             and not should_skip_post_experts_all_reduce(
                 is_tp_path=True,
             )

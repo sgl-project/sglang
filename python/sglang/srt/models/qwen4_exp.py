@@ -23,7 +23,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.collocated import (
-    cp_all_gather_blocks,
+    cp_all_gather_blocks_multi,
     cp_reduce_scatter_blocks,
     cp_reduce_scatter_global_rows,
 )
@@ -1404,15 +1404,17 @@ class Qwen4ExpLayerExtensionMixin:
         if not self.config.num_experts:
             return self.mlp(hidden_states)
         if self._qwen4_exp_cp_active(forward_batch):
-            # MoE under CP: the TP-sharded experts (and the shared
-            # expert) see every token. All-gather this rank's rows rank-major
-            # (row order is irrelevant for a token-wise MoE), run the block
-            # without its all-reduce, then reduce-scatter the TP partials so
-            # each rank gets the sum for its own rows. Same bytes as the
-            # all-reduce it replaces; router/top-k run on all rows (cheap).
-            gathered = cp_all_gather_blocks(hidden_states)
-            partial = self.mlp(gathered, forward_batch, reduce_output=False)
-            return cp_reduce_scatter_blocks(partial)
+            # MoE under CP: gate + top-k on this rank's rows, then one
+            # coalesced all-gather of the rows and their top-k (rank-major;
+            # row order is irrelevant for a token-wise MoE), the TP-sharded
+            # routed and shared experts on all N rows, and a reduce-scatter of
+            # the TP partials so each rank gets the sum for its own rows. Same
+            # bytes as the all-reduce it replaces, no replicated router.
+            return self.mlp.forward_cp(
+                hidden_states,
+                all_gather_rows=cp_all_gather_blocks_multi,
+                reduce_scatter_rows=cp_reduce_scatter_blocks,
+            )
 
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
         use_attn_tp_a2a_scatter = self._qwen4_exp_use_attn_tp_a2a_scatter()

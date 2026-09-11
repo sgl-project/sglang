@@ -13,6 +13,8 @@ linear-attn-prefill-cp-ulysses) so both models share one row-order contract:
   to the uniform physical per-rank row count;
 - ``cp_all_gather_blocks`` / ``cp_reduce_scatter_blocks`` move equal rank-major
   row blocks over the CP(=TP) group with no reorder (valid for token-wise work);
+  ``cp_all_gather_blocks_multi`` gathers several such tensors (e.g. MoE rows
+  plus their top-k weights and ids) in one NCCL group launch;
 - ``cp_reduce_scatter_global_rows`` first permutes FULL logical rows (global
   token order) into the rank-major zigzag layout so a reduce-scatter lands
   every rank its own local rows.
@@ -41,6 +43,40 @@ def cp_all_gather_blocks(x: torch.Tensor) -> torch.Tensor:
         )
     group.all_gather_into_tensor(out, x)
     return out
+
+
+def cp_all_gather_blocks_multi(*tensors: torch.Tensor) -> list[torch.Tensor]:
+    """Rank-major all-gather of several equal-row tensors over the CP group.
+
+    On the torch.distributed path the collectives are coalesced into one NCCL
+    group (one kernel launch for all of them); on the pynccl / symmetric-memory
+    path they are issued one after another."""
+    group = get_parallel().attn_cp_group
+    inputs = [x.contiguous() for x in tensors]
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+        outputs = [
+            torch.empty(
+                (x.shape[0] * group.world_size, *x.shape[1:]),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            for x in inputs
+        ]
+    pynccl = group.pynccl_comm
+    torch_dist_path = pynccl is None or (
+        pynccl.disabled and not group.is_symmetric_memory_enabled()
+    )
+    coalesce = getattr(torch.distributed, "_coalescing_manager", None)
+    if torch_dist_path and coalesce is not None and len(inputs) > 1:
+        with coalesce(group=group.device_group, device=inputs[0].device):
+            for out, x in zip(outputs, inputs):
+                torch.distributed.all_gather_into_tensor(
+                    out, x, group=group.device_group
+                )
+    else:
+        for out, x in zip(outputs, inputs):
+            group.all_gather_into_tensor(out, x)
+    return outputs
 
 
 def cp_rank_major_blocks(x: torch.Tensor, metadata, cp_size: int) -> torch.Tensor:
@@ -97,6 +133,7 @@ def cp_reduce_scatter_global_rows(partial: torch.Tensor, forward_batch) -> torch
 
 __all__ = [
     "cp_all_gather_blocks",
+    "cp_all_gather_blocks_multi",
     "cp_rank_major_blocks",
     "cp_reduce_scatter_blocks",
     "cp_reduce_scatter_global_rows",
