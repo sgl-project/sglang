@@ -232,10 +232,12 @@ jobs:
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          TEST_LOG_DIR: /tmp/test-logs
         shell: bash
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
           set -euo pipefail
+          mkdir -p "${TEST_LOG_DIR}"
 
           # Install missing python deps (skip if already importable).
           PYTHON_FOR_SGLANG="python"
@@ -274,6 +276,8 @@ jobs:
           # Optional: delegate execution to scripts/run_tests_with_coverage.sh when the
           # caller sets use_coverage_runner=true. The original run_suite.py
           # execution below is preserved unchanged for the default (false) path.
+          LOG_FILE="${TEST_LOG_DIR}/${{ inputs.self_name }}-part${{ matrix.partition }}.log"
+
           if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
             pip install coverage==7.8.*
             python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
@@ -293,4 +297,13 @@ jobs:
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
-            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG
+            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
+
+      - name: Upload test logs
+        if: always() && inputs.use_coverage_runner != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-test-logs-${{ inputs.self_name }}-part${{ matrix.partition }}
+          path: /tmp/test-logs/
+          if-no-files-found: ignore
+          retention-days: 14

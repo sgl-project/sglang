@@ -346,6 +346,125 @@ jobs:
       test_timeout_minutes: '180'
 
 
+  # ==================== Recommend Tests from Coverage ==================== #
+  # Downloads the pre-built coverage baseline (test_case_map.json + covstub)
+  # from OBS and runs test_selector.py to recommend affected test cases for
+  # the current PR. continue-on-error: true so it never blocks the PR gate.
+  recommend-tests-from-coverage:
+    name: Recommend tests from coverage
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: github.event_name == 'pull_request'
+    outputs:
+      coverage_paths: ${{ steps.export-paths.outputs.coverage_paths }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout sglang scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Download test case map
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://sglang.obs.cn-north-4.myhuaweicloud.com/ci/precision-test/test_case_map.json" \
+            -o test_case_map.json
+          test -s test_case_map.json
+          echo "Downloaded test_case_map.json"
+          du -h test_case_map.json
+
+      - name: Download coverage package and extract covstub
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://sglang.obs.cn-north-4.myhuaweicloud.com/ci/precision-test/outputs.tar.gz" \
+            -o outputs.tar.gz
+          test -s outputs.tar.gz
+          echo "Downloaded outputs.tar.gz"
+          du -h outputs.tar.gz
+          tar xzf outputs.tar.gz outputs/covstub
+          test -d outputs/covstub
+          echo "Extracted outputs/covstub"
+          find outputs/covstub -maxdepth 2 -type d | head -20 || true
+
+      - name: Recommend tests for current PR
+        run: |
+          set -euo pipefail
+          if ! python3 -c "import regex" >/dev/null 2>&1; then
+            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
+            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+            python3 get-pip.py --break-system-packages
+            python3 -m pip install --break-system-packages regex
+          fi
+          python3 -c "import regex; print('regex ok:', regex.__file__)"
+          PR_SPEC="sgl-project/sglang#${{ github.event.pull_request.number }}"
+          echo "Selecting tests for PR: ${PR_SPEC}"
+          python3 scripts/test_selector.py \
+            --github-pr "${PR_SPEC}" \
+            --source-dir ./outputs/covstub \
+            --map-file test_case_map.json
+
+      - name: Export coverage paths output
+        id: export-paths
+        if: always()
+        run: |
+          FILE="recommended_pytest_paths.txt"
+          if [ -f "$FILE" ]; then
+            {
+              echo "coverage_paths<<EOF"
+              cat "$FILE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Exported $(wc -l < "$FILE") recommended paths"
+          else
+            echo "coverage_paths=" >> "$GITHUB_OUTPUT"
+            echo "::notice::recommended_pytest_paths.txt not found"
+          fi
+
+  # ==================== Analyze Failure Report ==================== #
+  # Runs after all test jobs and the coverage-based test recommender.
+  # Calls the reusable failure-analysis workflow to collect logs, cross-
+  # reference them with the recommended test paths, and produce a report.
+  # if: always() so it runs even when tests fail (which is the whole point).
+  analyze-failure-report:
+    name: Analyze failure report
+    needs:
+      [
+        base-a-test-1-npu-a2,
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
+
+        multimodal-gen-test-1-npu-a3,
+        multimodal-gen-test-4-npu-a3,
+
+        base-c-test-acc-2-npu-a3,
+        base-c-test-acc-16-npu-a3,
+        base-c-test-perf-2-npu-a3,
+        base-c-test-perf-16-npu-a3,
+
+        recommend-tests-from-coverage,
+      ]
+    if: always()
+    uses: ./.github/workflows/_analyze_failure.yaml
+    with:
+      log_artifact_pattern: selected-test-logs-*
+      recommendations_file: recommended_pytest_paths.txt
+      recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
+
   pr-test-npu-finish:
     needs:
       [
