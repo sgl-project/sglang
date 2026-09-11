@@ -3460,8 +3460,14 @@ class DeepseekV4AttnBackend(
         weights = indexer.head_weights(x)
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         compact = (
-            logical_forward_mode.is_decode() or logical_forward_mode.is_target_verify()
-        ) and lmax >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
+            (
+                logical_forward_mode.is_decode()
+                or logical_forward_mode.is_target_verify()
+            )
+            and (indexer.is_candidate_source or indexer.uses_candidates)
+            and lmax
+            >= 16 * indexer.candidate_topk_blocks * indexer.candidate_block_size
+        )
         candidate_blocks = None
         score_lens = lens
         compact_topk_metadata = None

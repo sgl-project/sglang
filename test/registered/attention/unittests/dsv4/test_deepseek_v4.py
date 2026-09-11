@@ -942,6 +942,17 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                     side_effect=finalize_topk,
                 ),
             ):
+                indexer.is_candidate_source = False
+                indexer.uses_candidates = False
+                layer.layer_id = 2
+                q = torch.ones(len(req), 1)
+                backend._low_ratio_index_topk_sm90(layer, q, q, req, pos, forward_batch)
+                self.assertEqual(full_logits.call_count, 1)
+                self.assertEqual(compact_logits.call_count, 0)
+                self.assertIsNone(backend.forward_metadata.sm90_candidates)
+                full_logits.reset_mock()
+                full_topk.reset_mock()
+
                 for i in range(5):
                     indexer.is_candidate_source = i == 0
                     indexer.uses_candidates = i > 0
