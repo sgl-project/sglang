@@ -35,6 +35,9 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import numpy as np
 import torch
 
+from sglang.srt.compilation.torch_compile_decoration import (
+    prepare_model_for_torch_compile,
+)
 from sglang.srt.configs.model_config import (
     AttentionArch,
     is_deepseek_dsa,
@@ -73,13 +76,13 @@ def patch_model_npu(
     tp_group: GroupCoordinator,
 ):
     if enable_compile:
-        backend = get_compiler_backend("npugraph_ex")
-        yield torch.compile(
-            torch.no_grad()(model.forward),
-            fullgraph=True,
-            dynamic=False,
-            backend=backend,
-        )
+        with prepare_model_for_torch_compile(model, num_tokens, tp_group):
+            yield torch.compile(
+                torch.no_grad()(model.forward),
+                fullgraph=True,
+                dynamic=False,
+                backend=get_compiler_backend("npugraph_ex"),
+            )
     else:
         yield model.forward
 

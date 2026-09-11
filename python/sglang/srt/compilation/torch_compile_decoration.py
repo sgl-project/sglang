@@ -40,6 +40,27 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int) -> None:
 
 
 @contextmanager
+def prepare_model_for_torch_compile(
+    model: torch.nn.Module,
+    num_tokens: int,
+    tp_group: GroupCoordinator,
+):
+    """Put fused ops into their compile-safe form for one compile scope.
+
+    Platform-specific ``patch_model`` implementations must use this helper as
+    well as the default CUDA path. Otherwise Dynamo can trace through Python
+    launchers for device kernels instead of seeing their custom-op boundary.
+    """
+    _to_torch(model, reverse=False, num_tokens=num_tokens)
+    backup_ca_comm = tp_group.ca_comm
+    try:
+        yield
+    finally:
+        _to_torch(model, reverse=True, num_tokens=num_tokens)
+        tp_group.ca_comm = backup_ca_comm
+
+
+@contextmanager
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
@@ -47,12 +68,8 @@ def patch_model(
     tp_group: GroupCoordinator,
 ):
     """Patch the model to make it compatible with torch.compile."""
-    backup_ca_comm = None
-
-    try:
-        if enable_compile:
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
-            backup_ca_comm = tp_group.ca_comm
+    if enable_compile:
+        with prepare_model_for_torch_compile(model, num_tokens, tp_group):
             yield torch.compile(
                 torch.no_grad()(model.forward),
                 mode=os.environ.get(
@@ -60,12 +77,8 @@ def patch_model(
                 ),
                 dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
             )
-        else:
-            yield model.forward
-    finally:
-        if enable_compile:
-            _to_torch(model, reverse=True, num_tokens=num_tokens)
-            tp_group.ca_comm = backup_ca_comm
+    else:
+        yield model.forward
 
 
 def set_torch_compile_config() -> None:
