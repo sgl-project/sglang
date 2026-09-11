@@ -80,8 +80,8 @@ def _probe_transfer(name: str) -> None:
 
 
 def _transfer_backend_args():
-    # mooncake_tcp first: same-node RDMA on ionic fails ibv_reg_mr.
-    # Cross-node AgentX still wants mooncake. nixl last (same ionic issue).
+    # mooncake_tcp first: single-node P+D over RDMA has failed ibv_reg_mr on the
+    # NICs we have. Cross-node still wants mooncake; nixl hits the same thing.
     forced = os.environ.get("SGLANG_TEST_PD_TRANSFER_BACKEND")
     order = []
     if forced:
@@ -246,7 +246,7 @@ class _DSV4FlashPDBase(PDDisaggregationServerBase):
 
     @classmethod
     def _open_side_log_files(cls):
-        # StringIO dies with SIGKILL; NFS files keep the last lines.
+        # StringIO dies with SIGKILL; a real file keeps the last lines.
         logdir = os.environ.get("SGLANG_TEST_PD_LOGDIR")
         cls._log_files = []
         if not logdir:
@@ -309,29 +309,40 @@ class _DSV4FlashPDBase(PDDisaggregationServerBase):
         bar = float(os.environ.get("SGLANG_TEST_PD_GSM8K_BAR", "0.95"))
         self.assertGreater(metrics["accuracy"], bar)
 
-    def test_rope_probe_recalls_marker(self):
-        # Marker sits inside the SWA window so decode must read transferred rope,
-        # not only the compressed nope pages. GSM8K can pass with stale rope.
-        marker = "74931"
-        filler = " ".join(f"tok{i}" for i in range(64))
-        prompt = (
-            f"{filler}\nThe secret marker is {marker}.\n"
-            "Repeat the secret marker and nothing else:"
-        )
+    def _recall_marker(self, marker, filler_tokens, marker_first):
+        filler = " ".join(f"tok{i}" for i in range(filler_tokens))
+        stated = f"The secret marker is {marker}."
+        body = f"{stated}\n{filler}" if marker_first else f"{filler}\n{stated}"
         r = requests.post(
             f"{self.lb_url}/v1/completions",
             json={
                 "model": self.model,
-                "prompt": prompt,
+                "prompt": f"{body}\nRepeat the secret marker and nothing else:",
                 "max_tokens": 16,
                 "temperature": 0,
             },
             timeout=180,
         )
         r.raise_for_status()
-        text = r.json()["choices"][0]["text"]
-        print(f"rope_probe text={text!r}")
-        self.assertIn(marker, text)
+        return r.json()["choices"][0]["text"]
+
+    def test_rope_probe_recalls_marker_in_swa_window(self):
+        # Recent marker: decode answers out of the SWA ring, which ships as
+        # StateType.SWA_RING. GSM8K can pass with stale rope, this can't.
+        text = self._recall_marker("74931", 64, marker_first=False)
+        print(f"rope_probe swa text={text!r}")
+        self.assertIn("74931", text)
+
+    def test_rope_probe_recalls_marker_beyond_swa_window(self):
+        # Same probe with the marker pushed out of the window, so the answer has
+        # to come from the compressed pages -- the groups fp8 splits in two. Bump
+        # SGLANG_TEST_PD_ROPE_PROBE_TOKENS if the model's window grows; if the
+        # window probe above passes and this one fails, suspect rope, and only
+        # then the model losing the needle.
+        filler = int(os.environ.get("SGLANG_TEST_PD_ROPE_PROBE_TOKENS", "2048"))
+        text = self._recall_marker("58207", filler, marker_first=True)
+        print(f"rope_probe compressed text={text!r}")
+        self.assertIn("58207", text)
 
 
 class TestDSV4FlashPDDisaggFp8(_DSV4FlashPDBase):
