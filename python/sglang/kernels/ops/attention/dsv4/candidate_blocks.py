@@ -62,6 +62,29 @@ def _candidate_mask_kernel(
     tl.store(OUT + row * WIDTH + cols, values, cols < WIDTH)
 
 
+@triton.jit
+def _publish_candidate_mask_kernel(
+    INDICES,
+    VALUES,
+    KEEP,
+    WIDTH: tl.constexpr,
+    GROUP: tl.constexpr,
+    TOPK: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    i = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    selected = tl.load(INDICES + row * TOPK + i // GROUP, i < TOPK * GROUP, 0)
+    score = tl.load(VALUES + row * TOPK + i // GROUP, i < TOPK * GROUP, -float("inf"))
+    cols = selected * GROUP + i % GROUP
+    # torch.topk returns unique block indices: each output position has one writer.
+    tl.store(
+        KEEP + row * WIDTH + cols,
+        score > -float("inf"),
+        (i < TOPK * GROUP) & (cols < WIDTH),
+    )
+
+
 def candidate_block_logits(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -108,8 +131,19 @@ def candidate_block_logits(
         group_pad,
         tile,
     )
-    top = scores.topk(min(topk_blocks, blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
+    # Publication only needs membership; sorting the selected pairs is unused.
+    top = scores.topk(min(topk_blocks, blocks), dim=-1, sorted=False)
+    keep = torch.zeros((rows, width), dtype=torch.bool, device=logits.device)
+    _publish_candidate_mask_kernel[
+        (rows, triton.cdiv(top.indices.shape[1] * block_size, 256))
+    ](
+        top.indices,
+        top.values,
+        keep,
+        width,
+        block_size,
+        top.indices.shape[1],
+        256,
+        num_warps=4,
     )
-    return output, keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    return output, keep

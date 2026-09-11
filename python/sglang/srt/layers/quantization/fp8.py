@@ -72,6 +72,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -1047,9 +1048,16 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_mxfp8 or (
             self.block_fp8_as_mxfp8
             and getattr(layer, "block_fp8_mxfp8_ready", False)
-            and not isinstance(x, tuple)
+            and (not isinstance(x, tuple) or isinstance(x, Mxfp8SwizzledInput))
         ):
             backend = self.mxfp8_dense_backend
+            if isinstance(x, Mxfp8SwizzledInput):
+                if not (
+                    backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl()
+                ):
+                    raise ValueError(
+                        "128x4 MXFP8 input requires a FlashInfer CUTLASS backend"
+                    )
             extra_kwargs = {}
             if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled

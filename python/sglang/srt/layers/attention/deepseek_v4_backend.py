@@ -3408,13 +3408,27 @@ class DeepseekV4AttnBackend(
                 selected,
             )
         if filter_candidates:
-            selected = _mask_topk_scores(logits, selected)
-            columns = selected.clamp_min(0).to(torch.int64)
-            slots = metadata.page_table.gather(1, columns // page_size) * page_size
-            slots = slots + columns % page_size
-            page_indices.copy_(torch.where(selected >= 0, slots, -1))
-            if raw_indices is not None:
-                raw_indices.copy_(selected)
+            if logits.is_cuda and torch.version.cuda is not None:
+                from sglang.kernels.ops.attention.dsv4.indexer_postprocess import (
+                    filter_topk_pages,
+                )
+
+                filter_topk_pages(
+                    logits,
+                    selected,
+                    metadata.page_table,
+                    page_indices,
+                    page_size,
+                    raw_indices,
+                )
+            else:
+                selected = _mask_topk_scores(logits, selected)
+                columns = selected.clamp_min(0).to(torch.int64)
+                slots = metadata.page_table.gather(1, columns // page_size) * page_size
+                slots = slots + columns % page_size
+                page_indices.copy_(torch.where(selected >= 0, slots, -1))
+                if raw_indices is not None:
+                    raw_indices.copy_(selected)
 
     def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
         """Hopper decode indexer: one token per request, every request scored at
