@@ -14,6 +14,7 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#include <sgl_kernel/deepseek_v4/topk_coop.cuh>
 #include <sgl_kernel/deepseek_v4/topk_impl.cuh>
 
 #include <dlpack/dlpack.h>
@@ -59,6 +60,10 @@ constexpr uint32_t kClusterFloor = 65536;
 constexpr uint32_t kClusterMaxBatch = 512;
 constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
 
+// Sentinel for TopKPagedParams::coop_floor: no seq_len can exceed it, so with the
+// handoff off the guard is a single compare that never fires.
+constexpr uint32_t kCoopFloorOff = std::numeric_limits<uint32_t>::max();
+
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
 struct alignas(8) GlobalMetadata {
@@ -82,6 +87,8 @@ struct TopKPagedParams {
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
+  // seq_len > this is owned by coop_topk_kernel instead; kCoopFloorOff disables it.
+  uint32_t coop_floor;
 
   SGL_DEVICE const GlobalMetadata& global() const {
     return *reinterpret_cast<const GlobalMetadata*>(metadata);
@@ -319,6 +326,10 @@ template <bool kPDL, TopKMode kMode>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
+  // Handoff to coop_topk_kernel, which carries the inverse guard: both read the
+  // same device-side length, so a captured graph routes per replay with no host
+  // branch. Off by default, when coop_floor is kCoopFloorOff.
+  if (problem.seq_len > params.coop_floor) return;
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
   if (problem.seq_len <= problem.topk) return trivial_transform<kPDL, kMode>(problem);
 
@@ -490,7 +501,9 @@ struct TopKKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::TensorView metadata) {
+      const tvm::ffi::TensorView metadata,
+      const uint32_t coop_floor,  // 0 disables the cooperative handoff entirely
+      const tvm::ffi::Optional<tvm::ffi::TensorView> coop_workspace) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -550,6 +563,35 @@ struct TopKKernel {
     // The floor is chosen on the host per launch.
     constexpr uint32_t kClusterFloorSmall = 32768;
     constexpr uint32_t kSmallBatchLowFloor = 15;
+
+    // Hand the row to the grid-wide cooperative kernel only in the shape it was
+    // measured in (one row, longer than the floor). `max_seq_len` is the score
+    // buffer width, so this decision is fixed at capture time while the per-replay
+    // routing stays on the device-side length.
+    auto coop_floor_value = kCoopFloorOff;
+#ifdef USE_ROCM
+    (void)coop_workspace;
+    RuntimeCheck(coop_floor == 0, "coop top-k needs a cooperative launch, which this build does not support");
+#else
+    void* coop_ws = nullptr;
+    if (coop_floor != 0 && batch_size == 1 && max_seq_len > coop_floor) {
+      // Below kClusterFloorSmall a batch-1 row can reach topk_main_kernel, which
+      // carries no handoff guard, and both kernels would write the same row.
+      RuntimeCheck(
+          coop_floor >= kClusterFloorSmall, "coop top-k floor must be >= ", kClusterFloorSmall, ", got ", coop_floor);
+      RuntimeCheck(coop_workspace.has_value(), "coop top-k requires a workspace tensor");
+      auto W = SymbolicSize{"coop_workspace"};
+      TensorMatcher({W})  // coop_workspace: opaque persistent cross-block state
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(coop_workspace.value());
+      const auto want = coop_workspace_bytes();
+      RuntimeCheck(W.unwrap() * 4 >= want, "coop workspace must be at least ", want, " bytes");
+      coop_ws = coop_workspace.value().data_ptr();
+      coop_floor_value = coop_floor;
+    }
+#endif
+
     const auto params = TopKPagedParams{
         .scores = static_cast<const float*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -561,6 +603,7 @@ struct TopKKernel {
         .topk = topk,
         .page_bits = page_bits,
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
+        .coop_floor = coop_floor_value,
     };
 
 #ifndef USE_ROCM
@@ -609,6 +652,33 @@ struct TopKKernel {
             .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, kMode>, params);
       }
     });
+
+#ifndef USE_ROCM
+    if (coop_ws != nullptr) {
+      const auto coop_params = coop_topk::CoopParams{
+          .scores = params.scores,
+          .seq_lens = params.seq_lens,
+          .page_table = params.page_table,
+          .out = params.page_indices,
+          .ws = static_cast<coop_topk::CoopWorkspace*>(coop_ws),
+          .topk = topk,
+          .page_bits = page_bits,
+          .floor = coop_floor_value,
+      };
+      dispatch([&]<TopKMode kMode>() {  //
+        coop_topk::launch<kMode == TopKMode::PAGE_TABLE>(coop_params, device);
+      });
+    }
+#endif
+  }
+
+  /// Bytes of workspace `transform_paged` needs for the cooperative handoff.
+  static int64_t coop_workspace_bytes() {
+#ifdef USE_ROCM
+    return 0;
+#else
+    return coop_topk::workspace_bytes();
+#endif
   }
 
   /**
