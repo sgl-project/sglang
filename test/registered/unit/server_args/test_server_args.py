@@ -2160,12 +2160,11 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                     ),
                     patch(
                         # `handle_gpu_memory_settings` computes `gpu_mem` itself
-                        # now (`get_device_memory_capacity(cfg.device)`), imported
-                        # function-locally from its source module -- the same
-                        # reason `handle_platform_defaults`'s test patches
-                        # `platforms.current_platform` rather than a name on
-                        # `pipeline`.
-                        "sglang.srt.utils.common.get_device_memory_capacity",
+                        # now (`get_device_memory_capacity(cfg.device)`),
+                        # imported at module scope into `memory_hook` -- patch
+                        # the name where it is looked up, not its origin
+                        # module.
+                        "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
                         return_value=None,
                     ),
                 ):

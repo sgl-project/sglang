@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,6 @@ def handle_gpu_memory_settings(server_args: Any):
         generate_decode_cuda_graph_batch_sizes,
         generate_prefill_cuda_graph_batch_sizes,
     )
-    from sglang.srt.utils.common import get_device_memory_capacity
 
     cfg = resolving_view(server_args)
     gpu_mem = get_device_memory_capacity(cfg.device)
