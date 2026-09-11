@@ -23,6 +23,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+    weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -312,6 +316,12 @@ class LoRAPipeline(ComposedPipelineBase):
                 torch.get_device_module().synchronize()
                 torch.get_device_module().empty_cache()
 
+            # snapshot-offloaded components merge into their restored weights
+            for module_name in module_names:
+                module = self.modules.get(module_name)
+                if isinstance(module, torch.nn.Module):
+                    restore_weight_snapshot(module)
+
             offload_disabled_modules = []
             for module_name in offloaded_module_names:
                 module = self.modules[module_name]
@@ -337,6 +347,11 @@ class LoRAPipeline(ComposedPipelineBase):
             if any(layer.merged for layer in lora_layers_dict.values()):
                 return True
             module = self.modules.get(module_name)
+            if (
+                isinstance(module, torch.nn.Module)
+                and weight_snapshot(module) is not None
+            ):
+                return True
             if module is not None and is_layerwise_offloaded_module(module):
                 return True
         return False
