@@ -10,8 +10,9 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 from typing import Optional
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -20,8 +21,7 @@ from sglang.srt.arg_groups.arg_utils import (
 )
 
 
-@dataclasses.dataclass
-class Parallel:
+class Parallel(msgspec.Struct):
     """Namespace ``parallel``."""
 
     _NS_PATH = "parallel"
@@ -152,7 +152,7 @@ class Parallel:
     cp_strategy: A[
         Optional[str],
         Arg(
-            help="Sharding strategy for prefill CP. 'zigzag' is the former in-seq-split mode; 'interleave' is the former round-robin-split mode.",
+            help="Sharding strategy for prefill CP. 'zigzag' assigns each rank one early and one late sequence block; 'interleave' assigns token indices modulo the CP size.",
             choices=("zigzag", "interleave"),
         ),
     ] = None
