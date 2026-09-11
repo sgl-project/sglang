@@ -2,7 +2,10 @@
 
 Port of InferenceX's AgentX recipe
 ``benchmarks/single_node/agentic/qwen3.5_fp4_mi355x_sglang_mtp.sh``
-(https://github.com/SemiAnalysisAI/InferenceX) into sglang's own nightly AMD CI.
+(https://github.com/SemiAnalysisAI/InferenceX) into sglang's AMD CI, dispatched
+by ``.github/workflows/nightly-benchmark-amd.yml``. It reports a throughput
+number rather than gating anything, which is why it runs there and not in the
+AMD nightly test workflow.
 
 Why this exists next to the batch-sweep perf tests: every other MI35x perf test
 runs ``bench_one_batch_server`` at a fixed batch size and a fixed prompt length,
@@ -24,16 +27,16 @@ takes them as required environment variables.
 
 Two things intentionally differ from AgentX:
 
-* The driver is ``sglang.bench_serving --dataset-name agentic-trace``, not
-  aiperf. aiperf's ``inferencex-agentx-mvp`` scenario is not installable from
-  this repo, and sglang already replays multi-turn agentic conversations
-  natively. ``sglang.test.agentic_trace_utils`` converts the same published
-  SemiAnalysis corpus into that format; see its docstring for what survives the
-  conversion (per-turn prompt growth and decode length, within-conversation
-  reuse, one unique prefix per trajectory) and what does not (recorded think
-  time, sub-agent overlap, prompt content). The absolute number is therefore
-  *not* comparable to a published AgentX submission; it is comparable to this
-  test's own history, which is what a nightly needs.
+* The driver is :mod:`sglang.test.agentic_trace_replay` -- a loop over
+  ``bench_serving``'s own chat request function and metrics -- not aiperf,
+  whose ``inferencex-agentx-mvp`` scenario is not installable from this repo.
+  ``sglang.test.agentic_trace_utils`` converts the same published SemiAnalysis
+  corpus into sglang's agentic-trace format; see its docstring for what
+  survives the conversion (per-turn prompt growth and decode length,
+  within-conversation reuse, one unique prefix per trajectory) and what does
+  not (recorded think time, sub-agent overlap, prompt content). The absolute
+  number is therefore *not* comparable to a published AgentX submission; it is
+  comparable to this test's own history, which is what a nightly needs.
 * Acceptance length is measured, not pinned. AgentX exports
   ``SGLANG_SIMULATE_ACC_LEN=3.39`` so that a cross-framework comparison is not
   confounded by draft quality. Inside sglang's own nightly the draft model is
@@ -47,13 +50,12 @@ without touching the recipe.
 Registry: nightly-perf-4-gpu-mi35x-qwen35-mxfp4-agentic-mtp suite
 """
 
-import json
 import os
-import subprocess
 import tempfile
 import unittest
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.agentic_trace_replay import run_agentic_replay
 from sglang.test.agentic_trace_utils import ensure_agentic_trace_file, weka_trace_url
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
@@ -116,7 +118,6 @@ HICACHE_MEM_LAYOUT = os.environ.get("HICACHE_MEM_LAYOUT", "page_first_direct")
 ASM_VERIFY_ATTN = os.environ.get("AGENTIC_ASM_VERIFY_ATTN", "0")
 
 SERVER_LAUNCH_TIMEOUT = int(os.environ.get("AGENTIC_SERVER_TIMEOUT", "5400"))
-BENCH_TIMEOUT = int(os.environ.get("AGENTIC_BENCH_TIMEOUT", "7200"))
 
 RESULT_DIR = "performance_results_qwen35_mxfp4_agentic_mi35x"
 
@@ -224,44 +225,6 @@ def build_server_env() -> dict:
     return env
 
 
-def build_bench_command(base_url: str, trace_path: str, result_file: str) -> list:
-    command = [
-        "python3",
-        "-m",
-        "sglang.bench_serving",
-        "--backend",
-        "sglang-oai-chat",
-        "--base-url",
-        base_url,
-        "--model",
-        MODEL_PATH,
-        "--tokenizer",
-        MODEL_PATH,
-        "--dataset-name",
-        "agentic-trace",
-        "--dataset-path",
-        trace_path,
-        "--num-prompts",
-        str(NUM_CONVERSATIONS),
-        "--max-concurrency",
-        str(CONCURRENCY),
-        # Warmup replays one trajectory; flushing afterwards keeps its prefix
-        # out of the measured run.
-        "--warmup-requests",
-        "1",
-        "--flush-cache",
-        "--cache-report",
-        "--disable-tqdm",
-        "--output-file",
-        result_file,
-    ]
-    # Without this the trace's own per-turn reply lengths are replayed, which is
-    # what keeps the prompt growth faithful.
-    if OUTPUT_LEN:
-        command += ["--sharegpt-output-len", str(OUTPUT_LEN)]
-    return command
-
-
 def render_report(result: dict, trace_summary: str) -> str:
     cache = result.get("cache_report") or {}
     accept_length = result.get("accept_length")
@@ -311,11 +274,8 @@ class TestQwen35Mxfp4AgenticMtpMI35x(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         os.makedirs(RESULT_DIR, exist_ok=True)
 
-    def _prepare_trace(self):
+    def _prepare_trace(self, tokenizer):
         """Convert the published AgentX corpus, or skip if it is unreachable."""
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
         source = os.environ.get("AGENTIC_TRACE_SOURCE") or weka_trace_url()
         try:
             return ensure_agentic_trace_file(
@@ -334,7 +294,10 @@ class TestQwen35Mxfp4AgenticMtpMI35x(CustomTestCase):
             )
 
     def test_agentic_replay(self):
-        trace_path, stats = self._prepare_trace()
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+        trace_path, stats = self._prepare_trace(tokenizer)
         print(f"Agentic trace: {trace_path} ({stats})", flush=True)
 
         result_file = os.path.join(RESULT_DIR, "agentic_replay.jsonl")
@@ -349,21 +312,19 @@ class TestQwen35Mxfp4AgenticMtpMI35x(CustomTestCase):
             env=build_server_env(),
         )
         try:
-            command = build_bench_command(self.base_url, trace_path, result_file)
-            print(f"Running: {' '.join(command)}", flush=True)
-            completed = subprocess.run(command, timeout=BENCH_TIMEOUT)
+            result = run_agentic_replay(
+                base_url=self.base_url,
+                model=MODEL_PATH,
+                tokenizer=tokenizer,
+                trace_path=trace_path,
+                num_conversations=NUM_CONVERSATIONS,
+                max_turns=MAX_TURNS,
+                output_len=OUTPUT_LEN,
+                max_concurrency=CONCURRENCY,
+                output_file=result_file,
+            )
         finally:
             kill_process_tree(process.pid)
-
-        self.assertEqual(
-            completed.returncode, 0, "sglang.bench_serving agentic replay failed"
-        )
-        self.assertTrue(
-            os.path.exists(result_file), f"No benchmark result at {result_file}"
-        )
-
-        with open(result_file, "r", encoding="utf-8") as f:
-            result = json.loads(f.readlines()[-1])
 
         report = render_report(result, stats.as_markdown_rows())
         print(report, flush=True)
@@ -373,11 +334,12 @@ class TestQwen35Mxfp4AgenticMtpMI35x(CustomTestCase):
         # No throughput gate: the numbers are tracked, and the run itself is the
         # regression guard -- this config only completes if MTP, the HiCache CPU
         # tier and the aiter MXFP4 path all survive a long-context agentic
-        # workload. A turn that errored out never reaches the metrics.
-        self.assertGreater(result.get("completed", 0), 0, "No agentic turns completed")
-        self.assertGreater(
-            result.get("output_throughput", 0), 0, "No output tokens generated"
+        # workload. A dropped turn takes the rest of its trajectory with it, so
+        # a partial replay is a failure and not a smaller benchmark.
+        self.assertEqual(
+            result["failed"], 0, f"{result['failed']} turns failed: {result['errors']}"
         )
+        self.assertGreater(result["output_throughput"], 0, "No output tokens generated")
 
 
 if __name__ == "__main__":

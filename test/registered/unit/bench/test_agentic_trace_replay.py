@@ -6,16 +6,12 @@ prompt at every turn -- which it can only do if each round also generates the
 recorded number of reply tokens, so the two are tested together.
 """
 
-import asyncio
 import contextlib
 import json
 import socket
-import subprocess
-import sys
 import tempfile
 import threading
 import unittest
-from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -24,13 +20,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from sglang.benchmark.datasets.agentic_trace import AgenticTraceDataset
-from sglang.benchmark.serving import (
-    RequestFuncInput,
-    async_request_openai_chat_completions,
-    set_global_args,
-    wrap_multi_turn_request_func,
-)
+from sglang.test.agentic_trace_replay import load_conversations, run_agentic_replay
 from sglang.test.agentic_trace_utils import (
     DEFAULT_MIN_DELTA_TOKENS,
     RecordedTurn,
@@ -234,35 +224,26 @@ class TestBuildAgenticTrace(CustomTestCase):
 
     def test_recorded_output_lengths_survive_a_round_trip(self):
         document, _ = build_agentic_trace(self.records, self.tokenizer, max_turns=2)
-        rows = self._load_dataset(document, fixed_output_len=None)
+        conversations = _load_written_trace(document)
 
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(len(row.prompt) == 2 for row in rows))
-        self.assertEqual(rows[0].output_lens, [10, 30])
-        self.assertEqual(rows[1].output_lens, [20, 50])
-        self.assertEqual(rows[0].output_len, 10)
-        self.assertEqual(rows[0].prompt[0][0]["role"], "user")
+        self.assertEqual(len(conversations), 2)
+        self.assertTrue(all(len(c) == 2 for c in conversations))
+        self.assertEqual([t.output_len for t in conversations[0]], [10, 30])
+        self.assertEqual([t.output_len for t in conversations[1]], [20, 50])
+        self.assertEqual(conversations[0][0].messages[0]["role"], "user")
 
-    def test_fixed_output_len_overrides_the_recorded_lengths(self):
+    def test_uniform_output_len_overrides_the_recorded_lengths(self):
         document, _ = build_agentic_trace(self.records, self.tokenizer, max_turns=2)
-        rows = self._load_dataset(document, fixed_output_len=24)
+        conversations = _load_written_trace(document, output_len=24)
 
-        self.assertTrue(all(row.output_lens is None for row in rows))
-        self.assertTrue(all(row.output_len == 24 for row in rows))
+        self.assertTrue(all(t.output_len == 24 for c in conversations for t in c))
 
-    def _load_dataset(self, document, fixed_output_len):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "trace.json"
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(document, f)
+    def test_loading_caps_conversations_and_turns(self):
+        document, _ = build_agentic_trace(self.records, self.tokenizer)
+        conversations = _load_written_trace(document, num_conversations=1, max_turns=2)
 
-            return AgenticTraceDataset(
-                dataset_path=str(path),
-                num_requests=10,
-                fixed_output_len=fixed_output_len,
-                offset=0,
-                max_turns=None,
-            ).load(self.tokenizer)
+        self.assertEqual(len(conversations), 1)
+        self.assertEqual(len(conversations[0]), 2)
 
 
 class TestRecordStreaming(CustomTestCase):
@@ -285,6 +266,15 @@ class TestRecordStreaming(CustomTestCase):
         self.assertIn("cc-traces-weka", weka_trace_url())
 
 
+def _load_written_trace(document, **kwargs):
+    """Round-trip a converted document through the replay loader."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "trace.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(document, f)
+        return load_conversations(str(path), **kwargs)
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -292,13 +282,15 @@ def _free_port() -> int:
 
 
 class _ChatHandler(BaseHTTPRequestHandler):
-    """Minimal OpenAI chat endpoint that records what it was asked for.
+    """Minimal streaming OpenAI chat endpoint that records what it was asked for.
 
-    Replies with as many tokens as the request asked for, so a caller can check
-    both the requested decode length and how history accumulates.
+    Streams as many tokens as the request asked for, so a caller can check both
+    the requested decode length and how history accumulates, and reports a
+    fixed cached-token count so the cache report has something to aggregate.
     """
 
     request_bodies: list = []
+    cached_tokens_per_turn = 4
 
     def _respond(self, payload: dict):
         body = json.dumps(payload).encode()
@@ -309,10 +301,24 @@ class _ChatHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.wfile.flush()
 
+    def _stream(self, chunks: list):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for chunk in chunks:
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
-        # /v1/models is bench_serving's readiness probe; /server_info is where
-        # it reads the speculative accept length from.
-        self._respond({"data": [{"id": "dummy-model"}], "internal_states": [{}]})
+        # /v1/models is the readiness probe; /server_info is where the replay
+        # reads the speculative accept length from.
+        self._respond(
+            {
+                "data": [{"id": "dummy-model"}],
+                "internal_states": [{"avg_spec_accept_length": 2.5}],
+            }
+        )
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
         length = int(self.headers.get("Content-Length", "0"))
@@ -322,27 +328,50 @@ class _ChatHandler(BaseHTTPRequestHandler):
             return
 
         self.request_bodies.append(body)
-        reply = " ".join(["w1"] * body.get("max_completion_tokens", 1))
-        self._respond(
+        num_tokens = body.get("max_completion_tokens", 1)
+        chunks = [
+            {"choices": [{"index": 0, "delta": {"content": "w1 "}}]}
+            for _ in range(num_tokens)
+        ]
+        chunks.append(
             {
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": reply},
-                        "finish_reason": "length",
-                    }
-                ],
-                "usage": {"completion_tokens": len(reply.split())},
+                "choices": [],
+                "usage": {"completion_tokens": num_tokens},
+                "sglext": {
+                    "cached_tokens_details": {"device": self.cached_tokens_per_turn}
+                },
             }
         )
+        self._stream(chunks)
 
     def log_message(self, fmt, *args):
         return
 
 
+class _FailingSecondTurnHandler(_ChatHandler):
+    """Fails every round that carries history, i.e. every round but the first."""
+
+    def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length)) if length else {}
+        if "chat/completions" not in self.path:
+            self._respond({})
+            return
+        self.request_bodies.append(body)
+        if len(body.get("messages", [])) > 1:
+            self.send_error(500, "boom")
+            return
+        self._stream(
+            [
+                {"choices": [{"index": 0, "delta": {"content": "w1 "}}]},
+                {"choices": [], "usage": {"completion_tokens": 1}},
+            ]
+        )
+
+
 @contextlib.contextmanager
-def _mock_chat_server():
-    class Handler(_ChatHandler):
+def _mock_chat_server(handler_cls=_ChatHandler):
+    class Handler(handler_cls):
         request_bodies = []
 
     server = HTTPServer(("127.0.0.1", _free_port()), Handler)
@@ -355,151 +384,104 @@ def _mock_chat_server():
         server.server_close()
 
 
-class TestMultiTurnDecodeLengths(CustomTestCase):
-    """``wrap_multi_turn_request_func`` must honour per-round output lengths."""
+class TestAgenticReplayDriver(CustomTestCase):
+    """The replay must ask each round for the length its turn recorded.
 
-    @classmethod
-    def setUpClass(cls):
-        set_global_args(
-            Namespace(
-                disable_stream=True,
-                disable_ignore_eos=False,
-                print_requests=False,
-                tokenizer="",
-                header=None,
-            )
-        )
-
-    def _replay(self, prompt, output_len, output_lens):
-        with _mock_chat_server() as (base_url, request_bodies):
-            wrapped = wrap_multi_turn_request_func(
-                async_request_openai_chat_completions, backend="sglang-oai-chat"
-            )
-            outputs = asyncio.run(
-                wrapped(
-                    RequestFuncInput(
-                        prompt=prompt,
-                        api_url=f"{base_url}/v1/chat/completions",
-                        prompt_len=1,
-                        output_len=output_len,
-                        output_lens=output_lens,
-                        model="dummy-model",
-                        lora_name="",
-                        image_data=None,
-                        extra_request_body={},
-                    )
-                )
-            )
-            return outputs, list(request_bodies)
-
-    def test_each_round_requests_its_recorded_length(self):
-        prompt = [
-            [{"role": "user", "content": "turn one"}],
-            [{"role": "user", "content": "turn two"}],
-            [{"role": "user", "content": "turn three"}],
-        ]
-        outputs, bodies = self._replay(prompt, output_len=7, output_lens=[3, 11, 5])
-
-        self.assertTrue(all(o.success for o in outputs), [o.error for o in outputs])
-        self.assertEqual([b["max_completion_tokens"] for b in bodies], [3, 11, 5])
-        # History still accumulates: user turn, reply, user turn, ...
-        self.assertEqual([len(b["messages"]) for b in bodies], [1, 3, 5])
-        self.assertEqual(bodies[1]["messages"][1]["role"], "assistant")
-
-    def test_without_recorded_lengths_every_round_uses_output_len(self):
-        prompt = [
-            [{"role": "user", "content": "turn one"}],
-            [{"role": "user", "content": "turn two"}],
-        ]
-        _, bodies = self._replay(prompt, output_len=7, output_lens=None)
-
-        self.assertEqual([b["max_completion_tokens"] for b in bodies], [7, 7])
-
-    def test_short_length_list_falls_back_for_the_remaining_rounds(self):
-        prompt = [
-            [{"role": "user", "content": "turn one"}],
-            [{"role": "user", "content": "turn two"}],
-        ]
-        _, bodies = self._replay(prompt, output_len=7, output_lens=[3])
-
-        self.assertEqual([b["max_completion_tokens"] for b in bodies], [3, 7])
-
-
-class TestBenchServingAgenticCli(CustomTestCase):
-    """The converted trace must survive the command the AMD nightly runs.
-
-    Everything between the CLI and the request payload -- dataset loading,
-    multi-turn detection, the per-round output length hand-off -- only exists
-    as a chain, and the GPU test that depends on it cannot run without an
-    MI35x node.
+    This is the chain the MI35x nightly depends on and the reason the driver
+    exists: trace conversion, per-turn decode lengths, history accumulation and
+    the metrics hand-off, none of which can run without an MI35x node otherwise.
     """
 
-    def test_cli_replays_the_converted_trace_round_by_round(self):
-        tokenizer = _build_tokenizer()
-        records = [
+    def setUp(self):
+        self.tokenizer = _build_tokenizer()
+        self.records = [
             _weka_record("aaa", [(64, 10), (256, 30)]),
             _weka_record("bbb", [(128, 20), (640, 50)]),
         ]
-        document, stats = build_agentic_trace(records, tokenizer)
 
+    @contextlib.contextmanager
+    def _replay(self, handler_cls=_ChatHandler, **kwargs):
+        document, stats = build_agentic_trace(self.records, self.tokenizer)
         with (
             tempfile.TemporaryDirectory() as tmpdir,
-            _mock_chat_server() as (
-                base_url,
-                request_bodies,
-            ),
+            _mock_chat_server(handler_cls) as (base_url, request_bodies),
         ):
-            tmp = Path(tmpdir)
-            tokenizer.save_pretrained(tmp / "tokenizer")
-            with open(tmp / "trace.json", "w", encoding="utf-8") as f:
+            trace_path = Path(tmpdir) / "trace.json"
+            with open(trace_path, "w", encoding="utf-8") as f:
                 json.dump(document, f)
 
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "sglang.bench_serving",
-                    "--backend",
-                    "sglang-oai-chat",
-                    "--base-url",
-                    base_url,
-                    "--model",
-                    str(tmp / "tokenizer"),
-                    "--tokenizer",
-                    str(tmp / "tokenizer"),
-                    "--dataset-name",
-                    "agentic-trace",
-                    "--dataset-path",
-                    str(tmp / "trace.json"),
-                    "--num-prompts",
-                    "2",
-                    "--max-concurrency",
-                    "1",
-                    "--warmup-requests",
-                    "0",
-                    "--disable-tqdm",
-                    "--output-file",
-                    str(tmp / "result.jsonl"),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=300,
+            output_file = kwargs.pop("output_file", str(Path(tmpdir) / "result.jsonl"))
+            kwargs.setdefault("flush_cache", False)
+            result = run_agentic_replay(
+                base_url=base_url,
+                model="dummy-model",
+                tokenizer=self.tokenizer,
+                trace_path=str(trace_path),
+                warmup=False,
+                output_file=output_file,
+                **kwargs,
             )
-            self.assertEqual(
-                completed.returncode, 0, completed.stderr or completed.stdout
-            )
-            with open(tmp / "result.jsonl", encoding="utf-8") as f:
-                result = json.loads(f.readlines()[-1])
-            bodies = list(request_bodies)
+            yield result, stats, list(request_bodies), Path(output_file)
 
-        self.assertEqual(result["completed"], stats.num_turns)
-        # Recorded reply lengths reach the wire, per round, in trace order.
-        self.assertEqual(
-            sorted(b["max_completion_tokens"] for b in bodies), [10, 20, 30, 50]
-        )
-        self.assertEqual(result["total_output_tokens"], stats.total_output_tokens)
-        # Round two of each conversation carries round one plus its reply.
-        self.assertEqual(sorted(len(b["messages"]) for b in bodies), [1, 1, 3, 3])
+    def test_every_round_asks_for_its_recorded_length(self):
+        # One lane, so the two trajectories replay one after the other and the
+        # recorded bodies are in trace order.
+        with self._replay(max_concurrency=1) as (result, stats, bodies, _):
+            self.assertEqual(result["completed"], stats.num_turns)
+            self.assertEqual(result["failed"], 0)
+            self.assertEqual(
+                [b["max_completion_tokens"] for b in bodies], [10, 30, 20, 50]
+            )
+            self.assertEqual(result["total_output_tokens"], stats.total_output_tokens)
+            # Round two of each conversation carries round one plus its reply.
+            self.assertEqual([len(b["messages"]) for b in bodies], [1, 3, 1, 3])
+            self.assertEqual(bodies[1]["messages"][1]["role"], "assistant")
+
+    def test_uniform_output_len_overrides_the_recording(self):
+        with self._replay(output_len=7, max_concurrency=2) as (_, _, bodies, _):
+            self.assertEqual([b["max_completion_tokens"] for b in bodies], [7] * 4)
+
+    def test_metrics_cover_both_sides_of_the_workload(self):
+        with self._replay(max_concurrency=2, flush_cache=True) as (
+            result,
+            stats,
+            _,
+            output_file,
+        ):
+            # The prompt side is summed per turn, so a trajectory's growing
+            # context is counted once for every round that re-sends it.
+            self.assertEqual(result["total_input_tokens"], stats.total_prompt_tokens)
+            self.assertGreater(result["input_throughput"], 0)
+            self.assertGreater(result["output_throughput"], 0)
+            self.assertGreater(result["mean_ttft_ms"], 0)
+            self.assertEqual(result["accept_length"], 2.5)
+
+            cache = result["cache_report"]
+            self.assertEqual(
+                cache["total_cached_tokens"],
+                stats.num_turns * _ChatHandler.cached_tokens_per_turn,
+            )
+            self.assertEqual(cache["total_prompt_tokens"], result["total_input_tokens"])
+            self.assertEqual(
+                cache["device_cached_tokens"], cache["total_cached_tokens"]
+            )
+
+            with open(output_file, encoding="utf-8") as f:
+                self.assertEqual(json.loads(f.readlines()[-1]), result)
+
+    def test_a_failed_turn_stops_its_trajectory(self):
+        with self._replay(handler_cls=_FailingSecondTurnHandler, max_concurrency=2) as (
+            result,
+            stats,
+            bodies,
+            _,
+        ):
+            # Each conversation gets through its first round and stops on the
+            # second; the turns it never reached still count as not completed.
+            self.assertEqual(result["completed"], 2)
+            self.assertEqual(result["failed"], stats.num_turns - 2)
+            self.assertEqual(len(bodies), 4)
+            self.assertTrue(result["errors"])
 
 
 if __name__ == "__main__":
