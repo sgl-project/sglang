@@ -69,6 +69,9 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=[
                     "--trust-remote-code",
+                    # Target embeddings are shared with the FP16-default draft.
+                    "--dtype",
+                    "bfloat16",
                     "--attention-backend",
                     "triton",
                     "--speculative-algorithm",
