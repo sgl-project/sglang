@@ -1,5 +1,3 @@
-"""Regression for #36886: decode and EAGLE past the physical KV pool boundary."""
-
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -74,8 +72,6 @@ class TestGLM53FlashDCP(GSM8KMixin, CustomTestCase):
 
     def _needle(self, wave, request):
         code = f"{wave + 1}{request + 2}7319"
-        # Distinct prefixes prevent the concurrent allocation wave from
-        # collapsing onto one shared radix entry.
         text = f"Document {wave}/{request}. The secret passcode is {code}.\n"
         text += "This document contains ordinary background information.\n" * 2000
         text += "\nWhat is the secret passcode? Reply with only the six digits."
@@ -109,7 +105,6 @@ class TestGLM53FlashDCP(GSM8KMixin, CustomTestCase):
                         lambda request, wave=wave: self._needle(wave, request), range(3)
                     )
                 )
-            # Revisit the same prompt after crossing the per-rank watermark.
             cached = self._needle(wave, 2)
             self.assertGreater(cached["meta_info"]["cached_tokens"], 0)
 

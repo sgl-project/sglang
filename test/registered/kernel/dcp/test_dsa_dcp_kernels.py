@@ -1,5 +1,3 @@
-"""Check sharded KV writes and merged sparse attention against dense PyTorch."""
-
 import unittest
 
 import torch
@@ -26,13 +24,12 @@ class TestDSADCPKernels(CustomTestCase):
         for size in (1, 2, 4, 8):
             with self.subTest(dcp_size=size):
                 capacity = per_rank_capacity * size
-                # Write past the old per-rank bound into the last virtual page.
                 locs = torch.arange(capacity - 32, capacity, device=device)
                 k = torch.randn(32, 1, dim, device=device, dtype=torch.bfloat16)
                 virtual = torch.full((rows, 64), -1, device=device, dtype=torch.int32)
                 virtual[0, :32] = locs
                 virtual[1, :8] = locs[:8]
-                virtual[2, 0] = locs[-1]  # All but one rank own no selected KV.
+                virtual[2, 0] = locs[-1]
                 partials, lses = [], []
                 for rank in range(size):
                     cache = torch.zeros(
@@ -67,7 +64,6 @@ class TestDSADCPKernels(CustomTestCase):
                         merged[row], expected, atol=0.025, rtol=0.025
                     )
 
-                # The ordinary path retains its original signature and output.
                 replicated = torch.zeros(capacity, 1, dim, device=device, dtype=k.dtype)
                 set_mla_kv_buffer_triton(replicated, locs, k, None)
                 out = tilelang_sparse_fwd(

@@ -416,8 +416,7 @@ def sparse_attention_fwd_kernel_v1(
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
                 if return_lse:
-                    # A DCP rank can own none of this query's selected tokens.
-                    # Its partial must be zero, with -inf LSE, for the merge.
+                    # NOTE(kpham-sgl): Empty ranks need zero output and -inf LSE for the merge.
                     acc_o[h_i, d_i] /= T.if_then_else(sumexp[h_i] > 0, sumexp[h_i], 1)
                 else:
                     acc_o[h_i, d_i] /= sumexp[h_i]
@@ -450,8 +449,7 @@ def sparse_attention_fwd_kernel_v1(
             Indices: T.Tensor(indices_shape, indices_dtype),
             Output: T.Tensor(o_shape, dtype),
         ):
-            # The LSE branch is eliminated at trace time; no extra allocation
-            # or kernel argument is needed on the ordinary sparse path.
+            # NOTE(kpham-sgl): LSE is unused here; Output is only a placeholder for it.
             body(Q, KV, Indices, Output, Output)
 
     return main

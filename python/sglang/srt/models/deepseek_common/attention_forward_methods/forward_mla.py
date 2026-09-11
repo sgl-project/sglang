@@ -92,7 +92,6 @@ def _select_local_dcp_heads_for_autotune(
 def is_dcp_mla_decode_phase(
     forward_batch: ForwardBatch, *, is_dsa_draft: bool = False
 ) -> bool:
-    # Replicated DSA draft KV needs no Q gather or LSE reduction.
     if not get_parallel().dcp_enabled or is_dsa_draft:
         return False
     return (
