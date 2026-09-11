@@ -2,7 +2,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.candidate_blocks import candidate_block_logits
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    candidate_block_logits,
+    candidate_row_lens,
+)
 from sglang.kernels.ops.attention.dsv4.indexer_postprocess import filter_topk_pages
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -21,6 +24,29 @@ def reference_pages(scores, indices, pages, page_size):
 
 
 class TestIndexerPostprocess(CustomTestCase):
+    def test_candidate_row_lens(self):
+        lens = torch.tensor(
+            [1, 7, 8, 9, 300, 16383, 16384, 16385, 16392, 40000, 1048576, 1048571],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        for topk in (2048, 256, 1):
+            nblocks, valid = candidate_row_lens(lens, topk)
+            ref_blocks = (lens + 7) // 8
+            kept = ref_blocks.clamp_max(topk)
+            ref_valid = 8 * (kept - 1) + (lens - 1) % 8 + 1
+            self.assertEqual(nblocks.dtype, torch.int32)
+            self.assertTrue(torch.equal(nblocks, ref_blocks))
+            self.assertTrue(torch.equal(valid, ref_valid))
+            # a row with all its blocks kept is the whole row
+            fits = ref_blocks <= topk
+            self.assertTrue(torch.equal(valid[fits], lens[fits]))
+        nblocks, valid = candidate_row_lens(
+            torch.zeros(3, dtype=torch.int32, device="cuda"), 2048
+        )
+        self.assertTrue(torch.equal(nblocks, torch.zeros_like(nblocks)))
+        self.assertTrue(torch.equal(valid, torch.zeros_like(valid)))
+
     def test_filter_and_page_mapping(self):
         torch.manual_seed(91)
         for rows in (1, 6, 64):

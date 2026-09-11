@@ -1129,6 +1129,64 @@ class C4Indexer(nn.Module):
         )
 
 
+def fp4_paged_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """DeepGEMM paged fp4 logits for the low-ratio indexer. No hadamard: the
+    reference does not apply one."""
+    from deep_gemm import fp8_fp4_paged_mqa_logits
+
+    sl = seq_lens.to(torch.int32)
+    if sl.dim() == 1:
+        sl = sl.unsqueeze(-1)
+    return fp8_fp4_paged_mqa_logits(
+        q_fp4,
+        k_cache,
+        weights,
+        sl,
+        page_table,
+        deep_gemm_metadata,
+        max_seq_len,
+        False,
+    )
+
+
+def fp32_jit_paged_topk(
+    logits: torch.Tensor,
+    metadata,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Plain top-k of the dense paged ``logits``: pool slots into ``page_indices``
+    (``-1`` past the valid count) and, when given, positions into ``raw_indices``;
+    ``metadata`` is the ratio's ``PagedIndexerMetadata``."""
+    if metadata.use_topk_v2:
+        topk_transform_paged_v2(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            metadata.topk_metadata,
+            raw_indices,
+        )
+    else:
+        topk_transform_paged(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            raw_indices,
+        )
+
+
 def select_candidate_blocks(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,

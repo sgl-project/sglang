@@ -61,6 +61,135 @@ def _jit_topk_v2_module():
     )
 
 
+@cache_once
+def _jit_topk_bf16_small_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("topk_bf16_small"),
+        *args,
+        cuda_files=["deepseek_v4/topk_bf16_small.cuh"],
+        cuda_wrappers=[("topk_transform", f"TopKBF16Kernel<{args}>::transform")],
+    )
+
+
+def topk_transform_bf16_small(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """bf16 top-k for rows of at most 16384 scores (the DeepSeek-V4.1 sparse
+    indexer's consumer rows), fused with a page-table transform.
+
+    Row ``b`` selects the ``k = out_page_indices.shape[1]`` best of its first
+    ``seq_lens[b]`` scores; a selected index ``i`` is written as
+    ``page_table[b, i // page_size] * page_size + i % page_size``, in no
+    particular order, and ``-1`` fills the slots past ``min(k, seq_lens[b])``.
+    Selection is by a 13-bit fp16-derived key, exact for bf16 in fp16's normal
+    range; ties within a key are broken arbitrarily.
+    """
+    _jit_topk_bf16_small_module().topk_transform(
+        scores, seq_lens, page_table, out_page_indices, page_size
+    )
+
+
+@cache_once
+def _jit_amax_copy_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("amax_copy"),
+        *args,
+        cuda_files=["deepseek_v4/amax_copy.cuh"],
+        cuda_wrappers=[("amax8_varlen", f"AmaxCopyKernel<{args}>::amax8_varlen")],
+    )
+
+
+def amax8_varlen(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    topk: int = 0,
+    *,
+    max_seqlen: int = 0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Level-one keys of the two-level indexer: ``out[b, i]`` is the max of
+    ``scores[b, 8 i : 8 i + 8]`` for ``i < ceil(seq_lens[b] / 8)``, the last of
+    them ``+inf`` (the newest block is always selected), nothing written past
+    that count. Rows with at most ``topk`` blocks are skipped (every block is
+    selected anyway); ``topk=0`` never skips. ``out`` is allocated as
+    ``[rows, ceil(max_seqlen / 8)]`` when not given, ``max_seqlen`` defaulting to
+    the width of ``scores``; every ``seq_lens[b]`` must fit in ``8 * out.shape[1]``.
+    fp32 only for now; ``scores`` rows must be 32-byte aligned (stride a multiple
+    of 8). Returns ``out``.
+    """
+    if out is None:
+        num_tokens, max_len = scores.shape
+        if max_seqlen == 0:
+            max_seqlen = max_len
+        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8)
+    _jit_amax_copy_module().amax8_varlen(scores, seq_lens, out, topk)
+    return out
+
+
+@cache_once
+def _jit_sort_idx_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("sort_idx"),
+        *args,
+        cuda_files=["deepseek_v4/sort_idx.cuh"],
+        cuda_wrappers=[
+            ("transform", f"SortIdxKernel<{args}>::transform"),
+            ("transform_pages", f"SortIdxKernel<{args}>::transform_pages"),
+        ],
+    )
+
+
+def sort_candidate_blocks(
+    blocks: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    *,
+    out_pages: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The block table of the two-level indexer from a row's selected blocks,
+    in place: ``blocks`` ``[rows, k]`` int32 block ids in any order, ``-1``
+    padded, become the same ids ascending with ``INT32_MAX`` past ``min(k,
+    ceil(seq_lens[b] / 8))``; the matching pool slots / 8 (``page_table[b, id //
+    bpp] * bpp + id % bpp``, ``bpp = page_size // 8``, same padding) go to
+    ``out_pages``. A row with at most ``k`` blocks gets the identity table
+    regardless of its input. Returns ``out_pages``.
+    """
+    if out_pages is None:
+        out_pages = torch.empty_like(blocks)
+    _jit_sort_idx_module().transform(blocks, seq_lens, page_table, out_pages, page_size)
+    return out_pages
+
+
+def transform_candidate_blocks(
+    blocks: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    *,
+    out_pages: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The page transform of ``sort_candidate_blocks`` alone, for a block top-k
+    that already emits ascending ids: ``out_pages[b, t]`` is the pool slot / 8 of
+    ``blocks[b, t]`` for ``t < min(k, ceil(seq_lens[b] / 8))`` (which must be
+    valid block ids), ``INT32_MAX`` past that; ``blocks`` is not modified.
+    Returns ``out_pages``.
+    """
+    if out_pages is None:
+        out_pages = torch.empty_like(blocks)
+    _jit_sort_idx_module().transform_pages(
+        blocks, seq_lens, page_table, out_pages, page_size
+    )
+    return out_pages
+
+
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
