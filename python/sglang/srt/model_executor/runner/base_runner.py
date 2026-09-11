@@ -243,6 +243,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_deepep_v2_elastic_buffer()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -271,6 +272,53 @@ class BaseRunner(ABC):
             )
 
             pp_parallel_deep_gemm_warmup(self)
+
+    def _pre_initialize_deepep_v2_elastic_buffer(self):
+        """Build the DeepEP v2 ElasticBuffer before CG capture.
+
+        DeepEPv2Buffer.get_buffer() is called lazily from the first dispatch(),
+        and on a decode graph that first dispatch happens INSIDE
+        torch.cuda.graph(). ElasticBuffer's constructor reaches
+        ncclDevCommCreate (DeepEP csrc/kernels/backend/nccl.cu:188), which
+        allocates, syncs and talks to the driver -- all illegal while a stream
+        capture is active. CUDA invalidates the capture, and NCCL reports the
+        generic "GIN: DevComm setup failed on all available backends", which
+        reads like a GIN misconfiguration and is not one: the identical
+        construction succeeds one line earlier, outside the capture.
+
+        Same class of problem as the two workspaces above, hence the same slot.
+
+        Goes through the dispatcher's own prepare_buffer() rather than
+        recomputing the constructor arguments here: get_buffer() caches on an
+        exact key (group, hidden_size, router_topk, cap, use_fp8_dispatch,
+        allow_hybrid_mode, world_size), so a key differing in even one element
+        is a cache MISS and would build a *second* buffer inside the capture --
+        reintroducing this bug while appearing to have fixed it.
+        """
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_deepep_v2():
+            return
+
+        from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+            DeepEPv2Dispatcher,
+        )
+
+        for module in self.model_runner.model.modules():
+            dispatcher = getattr(module, "dispatcher", None)
+            if not isinstance(dispatcher, DeepEPv2Dispatcher):
+                continue
+            # The buffer is process-wide and collective, so the first MoE layer
+            # found is both necessary and sufficient -- and it must be exactly
+            # one call, since every rank has to build in lockstep.
+            dispatcher.prepare_buffer()
+            return
+
+        logger.warning(
+            "deepep_v2 is the a2a backend but no DeepEPv2Dispatcher was found on "
+            "the model, so the ElasticBuffer could not be pre-built. Expect CUDA "
+            "graph capture to fail with a GIN DevComm error."
+        )
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Allocate flashinfer allreduce workspaces; must run before CG capture
