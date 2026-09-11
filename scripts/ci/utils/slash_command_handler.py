@@ -1,3 +1,4 @@
+import difflib
 import glob
 import json
 import os
@@ -1615,6 +1616,72 @@ def handle_rerun_group(
     )
 
 
+# Namespaces this handler owns. Anything else reaching the script is a comment
+# that merely quoted a path, and is left alone.
+OWNED_COMMAND_PREFIXES = ("/tag-", "/rerun-", "/run-")
+
+# Suggestion targets. Documented spellings only, so a typo is pointed at the
+# canonical name rather than at an undocumented alias.
+KNOWN_COMMANDS = (
+    "/tag-run-ci-label",
+    "/tag-and-rerun-ci",
+    "/rerun-failed-ci",
+    "/rerun-group",
+    "/rerun-test",
+    "/run-full-ci",
+    "/run-extra-ci",
+)
+
+# Removed commands, kept because they were documented long enough that muscle
+# memory still sends them and difflib would suggest something unrelated.
+RETIRED_COMMANDS = {
+    "/rerun-stage": (
+        "`/rerun-stage` was removed. Use `/rerun-test <test-spec>` for specific "
+        "tests, or `/rerun-failed-ci` for everything that didn't pass."
+    ),
+}
+
+
+def handle_unknown_command(pr, comment, first_line):
+    """
+    Answer a comment addressed to this handler that matched no command.
+
+    A silent skip is indistinguishable from the bot being down, so always react;
+    comment only when there is something concrete to say, to avoid turning every
+    stray `/run-...` into PR noise.
+    """
+    tokens = first_line.split()
+    command = tokens[0] if tokens else first_line
+    if not command.startswith(OWNED_COMMAND_PREFIXES):
+        print(f"Not addressed to this handler: {first_line[:60]!r}")
+        return
+
+    print(f"Unrecognized command: {command}")
+    try:
+        comment.create_reaction("confused")
+    except Exception as e:
+        print(f"Failed to add reaction: {e}")
+
+    hint = RETIRED_COMMANDS.get(command)
+    if hint is None:
+        close = difflib.get_close_matches(command, KNOWN_COMMANDS, n=1, cutoff=0.6)
+        hint = f"Did you mean `{close[0]}`?" if close else None
+
+    if hint is None:
+        print("No close match; reaction only.")
+        return
+
+    try:
+        pr.create_issue_comment(
+            f"⛔ `{command}` isn't a recognized CI command. {hint}\n\n"
+            "See the [command reference]"
+            "(https://docs.sglang.io/docs/developer_guide/contribution_guide"
+            "#how-to-trigger-ci-tests)."
+        )
+    except Exception as e:
+        print(f"Failed to post hint comment: {e}")
+
+
 def main():
     # 1. Load Environment Variables
     token = get_env_var("GITHUB_TOKEN")
@@ -1740,7 +1807,7 @@ def main():
         )
 
     else:
-        print(f"Unknown or ignored command: {first_line}")
+        handle_unknown_command(pr, comment, first_line)
 
 
 if __name__ == "__main__":
