@@ -19,6 +19,10 @@ from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _DEFAULT_SAFETENSORS_INDEX,
+    _list_safetensors_files,
+)
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_readers import (
     FALLBACK_READER,
@@ -31,6 +35,40 @@ from sglang.multimodal_gen.runtime.loader.weight_readers.runai_streamer import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def checkpoint_weights_iterator(
+    model_path: str,
+    *,
+    to_cpu: bool = True,
+    key_filter: Callable[[str], bool] | None = None,
+    index_file: str = _DEFAULT_SAFETENSORS_INDEX,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Read a materialized component checkpoint, preferring indexed safetensors."""
+    files = _list_safetensors_files(
+        model_path, index_file=index_file, key_filter=key_filter
+    )
+    if files:
+        yield from safetensors_weights_iterator(
+            files, to_cpu=to_cpu, key_filter=key_filter
+        )
+        return
+    if os.path.isfile(model_path):
+        files = [model_path] if model_path.endswith((".bin", ".pt")) else []
+    else:
+        for suffix in ("*.bin", "*.pt"):
+            files = filter_files_not_needed_for_inference(
+                sorted(str(path) for path in Path(model_path).glob(suffix))
+            )
+            if files:
+                break
+    if not files:
+        raise ValueError(
+            f"No safetensors, bin, or pt checkpoint found at {model_path!r}"
+        )
+    for name, tensor in pt_weights_iterator(files, to_cpu=to_cpu):
+        if key_filter is None or key_filter(name):
+            yield name, tensor
 
 
 def _disable_runai_streamer_rank_discovery_collective() -> None:
