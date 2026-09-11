@@ -1,0 +1,247 @@
+---
+title: LLaDA-Image
+description: "Deploy LLaDA-Image Base, Turbo, and FP8 checkpoints on NVIDIA H200 for text-to-image generation and single-image editing with SGLang Diffusion."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/inclusionAI/llada-image.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image + editing", "English + Chinese text", "Base 50-step + Turbo 4-step", "SP1 + SP2"]} />
+
+## 1. Quick start
+
+Install with `uv pip install "sglang[diffusion]" --prerelease=allow`, then choose
+the checkpoint, request mode, and verified H200 topology below.
+
+<Deployment config={config} />
+
+<Warning>
+LLaDA-Image loads reviewed configuration code from the checkpoint. Keep
+`--trust-remote-code` and the generated commit-pinned `--revision` together,
+and review remote-code changes before moving to another revision.
+</Warning>
+
+## 2. Model capabilities
+
+[LLaDA-Image](https://huggingface.co/inclusionAI/LLaDA-Image) is a 6B-parameter
+image generation and editing family. The Base checkpoint targets high-fidelity
+text-to-image generation and instruction-guided editing with a 50-step schedule;
+the distilled Turbo checkpoint runs the same two SGLang request modes in four
+steps. Both variants are designed for English and Chinese text rendering.
+
+Prompt conditioning is handled by an embedded **LLaDA 2.0 16B-parameter MoE
+text encoder**. Its checkpoint config declares the `LLaDA2MoeModelLM`
+architecture; this is the LLaDA 2.0 structure, not the earlier LLaDA text
+encoder architecture.
+
+Choose Base when fidelity matters more than latency and Turbo for interactive or
+high-throughput serving. SGLang exposes text-to-image generation and exactly one
+reference image for editing through one server. The model card's VQ-conditioned
+generation mode is not currently exposed by the SGLang Images API.
+
+The checkpoints are released under Apache-2.0. Review the model card and its
+usage terms before production deployment.
+
+## 3. Deployment details
+
+### Checkpoint selection
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "24%"}} />
+    <col style={{width: "32%"}} />
+    <col style={{width: "18%"}} />
+    <col style={{width: "26%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Best fit</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Sampling</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Validation contract</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>inclusionAI/LLaDA-Image</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Maximum fidelity</td>
+      <td style={{padding: "9px 12px"}}>50 steps, CFG 5</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Full BF16 quality suite</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>inclusionAI/LLaDA-Image-FP8</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Lower checkpoint memory</td>
+      <td style={{padding: "9px 12px"}}>50 steps, CFG 5</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Verified H200 SP1 and SP2 serving</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>inclusionAI/LLaDA-Image-Turbo</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Lowest audited latency</td>
+      <td style={{padding: "9px 12px"}}>4 steps, CFG 1</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Full BF16 SP1 and SP2 suite</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>inclusionAI/LLaDA-Image-Turbo-FP8</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Fast lower-memory serving</td>
+      <td style={{padding: "9px 12px"}}>4 steps, CFG 1</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Verified H200 SP1 and SP2 serving</td>
+    </tr>
+  </tbody>
+</table>
+
+### Serving topology
+
+One `LLaDAImagePipeline` server handles both `/v1/images/generations` and
+`/v1/images/edits`; you do not need a second editing deployment. The builder
+pins each Hugging Face revision and emits the only two validated H200 resource
+shapes.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Shape</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Topology</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Request boundary</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>1× H200</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>TP1, SP1, Ulysses1, Ring1</td>
+      <td style={{padding: "9px 12px"}}>The API accepts up to 10 outputs; this page validates <code>n=1</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>2× H200</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>TP1, SP2, Ulysses2, Ring1</td>
+      <td style={{padding: "9px 12px"}}>Requires <code>n=1</code>; both ranks execute one request.</td>
+    </tr>
+  </tbody>
+</table>
+
+The embedded **LLaDA 2.0 16B MoE text encoder** (`LLaDA2MoeModelLM`) stays
+resident on every SP rank. Generic text encoder CPU offload, memory sleep, and
+hot weight updates are unsupported. Use the generated resident recipes rather
+than applying placement flags from another model's cookbook.
+
+## 4. Request examples
+
+The Request tab in the builder emits the matching cURL command for generation or
+editing and automatically switches between the Base and Turbo sampling profiles.
+The following Python examples show the same API contracts with Turbo.
+
+<CodeGroup>
+```python Text-to-image
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
+response = client.images.generate(
+    model="inclusionAI/LLaDA-Image-Turbo",
+    prompt="A bilingual bookstore poster reading '星河书店' and 'Starlight Books'",
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+    extra_body={
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "seed": 42,
+    },
+)
+
+with open("llada-image.png", "wb") as output:
+    output.write(base64.b64decode(response.data[0].b64_json))
+```
+
+```python Single-image editing
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
+with open("input.png", "rb") as source:
+    response = client.images.edit(
+        model="inclusionAI/LLaDA-Image-Turbo",
+        image=source,
+        prompt="Place the subject on a beach at golden hour.",
+        size="1024x1024",
+        n=1,
+        response_format="b64_json",
+        extra_body={
+            "num_inference_steps": 4,
+            "guidance_scale": 1.0,
+            "seed": 42,
+        },
+    )
+
+with open("llada-image-edit.png", "wb") as output:
+    output.write(base64.b64decode(response.data[0].b64_json))
+```
+</CodeGroup>
+
+For Base or Base FP8, change the model ID and pass 50 steps with guidance 5.0.
+SGLang's class defaults are four steps and guidance 1.0, so omitting these fields
+on a Base request selects the wrong sampling profile.
+
+## 5. Feature details
+
+### Sequence parallelism
+
+LLaDA-Image supports SP1 and SP2 with Ulysses only. Output width and height must
+be divisible by 16; at SP2, height must also be divisible by 32. A request may
+cover at most 2048×2048 pixels and at most 10×1024² total output pixels. Editing
+accepts exactly one uploaded image or image URL.
+
+### Reported L20X performance
+
+The [upstream run guide](https://github.com/Anmuliar/llada-image-run-guide/blob/bd85618dba129f8bd00e6c654558cb024ce9f54c/README.md#L663-L679) and [model support PR](https://github.com/sgl-project/sglang/pull/37907) report the following BF16 timings on NVIDIA L20X for revision `8ecbcc6`. The reported protocol uses 1024×1024 output, two warmups and the median client-wall latency of ten sequential requests. Turbo uses four steps with CFG 1, and Base uses 50 steps with CFG 5.
+
+These are historical reported results and have not been independently rerun on L20X. The deployment recipes above are validated on H200.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Task</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Turbo SP1</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Turbo SP2</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Base SP1</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Base SP2</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Text to image</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>0.6216 s</td>
+      <td style={{padding: "9px 12px"}}>0.4629 s</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>12.2036 s</td>
+      <td style={{padding: "9px 12px"}}>7.6757 s</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Image editing</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>1.7717 s</td>
+      <td style={{padding: "9px 12px"}}>1.2141 s</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>32.8138 s</td>
+      <td style={{padding: "9px 12px"}}>19.9279 s</td>
+    </tr>
+  </tbody>
+</table>
+
+### Quality validation
+
+Historical BF16 runs generated 6,704 images each for Base SP1, Turbo SP1 and Turbo SP2 across GenEval, LongText, GEdit and CVTG-2K. Turbo SP1 and SP2 reproduced GenEval 0.8190, LongText English 0.8959, LongText Chinese 0.9123 and CVTG word accuracy 0.8267. Matched Turbo text-to-image outputs were byte-identical across SP1 and SP2, and matched Turbo edits reached RGB Pearson correlation 0.9919. Base BF16 produced GenEval 0.8404, LongText English 0.9120, LongText Chinese 0.9198 and CVTG word accuracy 0.7792. These quality scores are historical and have not been rerun for the current revision.
+
+<Note>
+The published Base FP8 and Turbo FP8 checkpoints are supported on the same H200
+SP1 and SP2 topologies. Select the FP8 checkpoint directly; no server-side
+quantization flag is required.
+</Note>
+
+### Unsupported controls
+
+Cache-DiT is rejected at server startup and per request. The current SGLang
+pipeline also rejects generic text encoder offload, memory release, and hot
+weight updates. The native pipeline accepts `FA` and `TORCH_SDPA` attention
+overrides, but this page keeps the platform default because alternative-backend
+performance was not measured end to end.
+
+For implementation status and the full reproduction record, see
+[SGLang PR #37907](https://github.com/sgl-project/sglang/pull/37907).
