@@ -118,3 +118,7 @@ def softcap_inplace_logits(full_logits, final_logit_softcapping):
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return full_logits
+
+
+def fused_softcap_cpu(logits: torch.Tensor, final_logit_softcapping: float) -> None:
+    torch.ops.sgl_kernel.fused_softcap_cpu(logits, final_logit_softcapping)

@@ -29,6 +29,7 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 
 // fused_sigmoid_mul
 void fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate);
+void fused_softcap_cpu(at::Tensor& input, double softcapping_value);
 
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
@@ -588,6 +589,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
   m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate) -> ()");
   m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
+    m.def("fused_softcap_cpu(Tensor(a!) input, float softcapping_value) -> ()");
+    m.impl("fused_softcap_cpu", torch::kCPU, &fused_softcap_cpu);
 
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
