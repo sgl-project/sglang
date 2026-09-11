@@ -91,6 +91,92 @@ _ROUTED_EXPERT_KEY_RE = re.compile(
 )
 
 
+def probe_safetensors_weight_dtype(
+    model_path: str,
+    weight_name_suffix: str,
+    *,
+    revision: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+) -> Optional[str]:
+    """Return the first matching tensor's dtype without downloading its weights.
+
+    Supports local directories (including unindexed shards) and Hugging Face
+    repos with indexed or single-file safetensors layouts. Returns ``None`` when
+    no matching tensor or readable metadata is available.
+    """
+    try:
+        from huggingface_hub import (
+            parse_local_safetensors_file_metadata,
+            parse_safetensors_file_metadata,
+        )
+        from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME
+        from transformers.utils.hub import cached_file
+
+        index_path = cached_file(
+            model_path,
+            SAFE_WEIGHTS_INDEX_NAME,
+            revision=revision,
+            cache_dir=cache_dir,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if index_path is None:
+            name = None
+            shard = SAFE_WEIGHTS_NAME
+        else:
+            with open(index_path) as f:
+                weight_map = json.load(f).get("weight_map", {}) or {}
+            name = next(
+                (key for key in weight_map if key.endswith(weight_name_suffix)), None
+            )
+            if name is None:
+                return None
+            shard = weight_map[name]
+
+        local_shard = cached_file(
+            model_path,
+            shard,
+            revision=revision,
+            cache_dir=cache_dir,
+            local_files_only=True,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if local_shard is None and index_path is None and os.path.isdir(model_path):
+            for path in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+                metadata = parse_local_safetensors_file_metadata(path)
+                matched_name = next(
+                    (
+                        key
+                        for key in metadata.tensors
+                        if key.endswith(weight_name_suffix)
+                    ),
+                    None,
+                )
+                if matched_name is not None:
+                    return getattr(metadata.tensors[matched_name], "dtype", None)
+            return None
+
+        if local_shard is not None:
+            metadata = parse_local_safetensors_file_metadata(local_shard)
+        elif os.path.isdir(model_path) or huggingface_hub.constants.HF_HUB_OFFLINE:
+            return None
+        else:
+            metadata = parse_safetensors_file_metadata(
+                model_path, shard, revision=revision
+            )
+
+        if name is None:
+            name = next(
+                (key for key in metadata.tensors if key.endswith(weight_name_suffix)),
+                None,
+            )
+        return getattr(metadata.tensors.get(name), "dtype", None)
+    except Exception:
+        logger.debug(
+            "Unable to inspect safetensors metadata for %s", model_path, exc_info=True
+        )
+        return None
+
+
 def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
     """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
     routed-expert weight tensor, or ``None`` if the checkpoint is remote or has

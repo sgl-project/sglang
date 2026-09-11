@@ -1,11 +1,17 @@
-"""Unit tests for srt/model_loader/weight_utils.py shard-index consistency."""
+"""Unit tests for srt/model_loader/weight_utils.py."""
 
 import json
 import os
+import struct
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import call, patch
 
-from sglang.srt.model_loader.weight_utils import filter_duplicate_safetensors_files
+from sglang.srt.model_loader.weight_utils import (
+    filter_duplicate_safetensors_files,
+    probe_safetensors_weight_dtype,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -24,6 +30,99 @@ def _touch(folder, name):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w").close()
     return path
+
+
+def _write_safetensors(folder, filename, weight_name, dtype):
+    size = 1 if dtype.startswith("F8_") else 2
+    header = json.dumps(
+        {weight_name: {"dtype": dtype, "shape": [1], "data_offsets": [0, size]}}
+    ).encode()
+    with open(os.path.join(folder, filename), "wb") as f:
+        f.write(struct.pack("<Q", len(header)) + header + b"\0" * size)
+
+
+class TestProbeSafetensorsWeightDtype(CustomTestCase):
+    _WEIGHT_NAME = "model.layers.0.attn.wo_a.weight"
+    _SUFFIX = ".wo_a.weight"
+
+    def test_local_indexed_and_single_file_checkpoints(self):
+        for filename, indexed, dtype in (
+            ("model-00001-of-00001.safetensors", True, "BF16"),
+            ("model.safetensors", False, "F8_E4M3"),
+        ):
+            with self.subTest(indexed=indexed), tempfile.TemporaryDirectory() as folder:
+                if indexed:
+                    _write_index(folder, {self._WEIGHT_NAME: filename})
+                _write_safetensors(folder, filename, self._WEIGHT_NAME, dtype)
+
+                self.assertEqual(
+                    probe_safetensors_weight_dtype(
+                        folder, self._SUFFIX, revision="revision", cache_dir="/models"
+                    ),
+                    dtype,
+                )
+
+    def test_local_unindexed_shards_are_scanned_until_match(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _write_safetensors(
+                folder, "model-00001.safetensors", "model.other.weight", "BF16"
+            )
+            _write_safetensors(
+                folder, "model-00002.safetensors", self._WEIGHT_NAME, "BF16"
+            )
+
+            self.assertEqual(
+                probe_safetensors_weight_dtype(folder, self._SUFFIX), "BF16"
+            )
+
+    @patch("huggingface_hub.parse_safetensors_file_metadata")
+    @patch("transformers.utils.hub.cached_file")
+    @patch("huggingface_hub.constants.HF_HUB_OFFLINE", False)
+    def test_remote_checkpoint_reads_one_matching_shard_header(self, cached, parse):
+        second_name = "model.layers.1.attn.wo_a.weight"
+        with tempfile.TemporaryDirectory() as folder:
+            _write_index(
+                folder,
+                {
+                    self._WEIGHT_NAME: "model-00001-of-00002.safetensors",
+                    second_name: "model-00002-of-00002.safetensors",
+                },
+            )
+            cached.side_effect = [os.path.join(folder, INDEX_NAME), None]
+            parse.return_value = SimpleNamespace(
+                tensors={self._WEIGHT_NAME: SimpleNamespace(dtype="BF16")}
+            )
+
+            dtype = probe_safetensors_weight_dtype(
+                "org/model", self._SUFFIX, revision="resolved", cache_dir="/models"
+            )
+
+        self.assertEqual(dtype, "BF16")
+        self.assertEqual(
+            cached.call_args_list,
+            [
+                call(
+                    "org/model",
+                    INDEX_NAME,
+                    revision="resolved",
+                    cache_dir="/models",
+                    _raise_exceptions_for_missing_entries=False,
+                ),
+                call(
+                    "org/model",
+                    "model-00001-of-00002.safetensors",
+                    revision="resolved",
+                    cache_dir="/models",
+                    local_files_only=True,
+                    _raise_exceptions_for_missing_entries=False,
+                ),
+            ],
+        )
+        parse.assert_called_once_with(
+            "org/model",
+            "model-00001-of-00002.safetensors",
+            revision="resolved",
+        )
 
 
 class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
