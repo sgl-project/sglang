@@ -67,6 +67,18 @@ class OpenAIServingScore(OpenAIServingBase):
                 else None
             )
 
+            # Multi-position pooling readout (setwise): resolve the extraction
+            # token to an id here (the tokenizer-manager process owns the tokenizer);
+            # score_request then scans each query+item sequence for it and pools the
+            # head at those positions.
+            score_extraction_token_id = None
+            if request.score_extraction_token is not None:
+                score_extraction_token_id = (
+                    self.tokenizer_manager._resolve_score_extraction_token_id(
+                        request.score_extraction_token
+                    )
+                )
+
             result = await self.tokenizer_manager.score_request(
                 query=request.query,
                 items=request.items,
@@ -76,16 +88,22 @@ class OpenAIServingScore(OpenAIServingBase):
                 embed_override_token_id=request.embed_override_token_id,
                 query_embed_overrides=query_embed_overrides,
                 item_embed_overrides=item_embed_overrides,
+                score_extraction_token_id=score_extraction_token_id,
                 request=raw_request,
                 return_pooled_hidden_states=request.return_pooled_hidden_states,
             )
 
-            phs_as_lists = None
-            if result.pooled_hidden_states is not None:
-                phs_as_lists = [
-                    t.tolist() if t is not None else None
-                    for t in result.pooled_hidden_states
-                ]
+            # pooled_hidden_states is a flat list of tensors (pointwise / single-set
+            # setwise) or a nested per-item list of tensors (multi-item setwise with
+            # --enable-mis). Convert tensors to lists at any depth.
+            def _tensors_to_lists(value):
+                if value is None:
+                    return None
+                if isinstance(value, list):
+                    return [_tensors_to_lists(v) for v in value]
+                return value.tolist()
+
+            phs_as_lists = _tensors_to_lists(result.pooled_hidden_states)
 
             response = ScoringResponse(
                 scores=result.scores,

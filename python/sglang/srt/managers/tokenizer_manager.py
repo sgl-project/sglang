@@ -1462,6 +1462,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                token_indices_to_pool=obj.token_indices_to_pool,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
