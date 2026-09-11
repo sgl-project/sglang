@@ -98,6 +98,10 @@ class MoonEPWeightPool:
         start = self.chunk_start(self.ep_rank) + self.layer_offset(layer_id)
         return self.ranges[kind][start : start + self.num_local_experts]
 
+    def block_view(self, kind: str, layer_id: int) -> torch.Tensor:
+        start = self.chunk_start(self.ep_rank) + self.layer_offset(layer_id)
+        return self.ranges[kind][start : start + self.block_rows]
+
     def slot_view(self, kind: str, layer_id: int) -> torch.Tensor:
         start = (
             self.chunk_start(self.ep_rank)
@@ -231,27 +235,6 @@ def expert_rows(layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
     chunk = (owner - _pool.ep_rank) % _pool.ep_size
     rows = chunk * _pool.chunk_rows + _pool.layer_offset(layer_id) + expert_ids % epn
     return torch.where(expert_ids < 0, expert_ids, rows).to(torch.int32)
-
-
-def group_rows(
-    layer_id: int, expert_ids: torch.Tensor, num_global_experts: int
-) -> torch.Tensor:
-    assert _pool is not None, "MoonEP expert pool was never created"
-    rows = expert_rows(layer_id, expert_ids)
-    tail = expert_ids[num_global_experts:]
-    slot_base = (
-        _pool.chunk_start(_pool.ep_rank)
-        + _pool.layer_offset(layer_id)
-        + _pool.num_local_experts
-    )
-    slots = torch.arange(
-        slot_base,
-        slot_base + tail.numel(),
-        device=expert_ids.device,
-        dtype=torch.int32,
-    )
-    rows[num_global_experts:] = torch.where(tail < 0, tail.to(torch.int32), slots)
-    return rows
 
 
 def prefetch_experts(layer_id: int, source_rows: torch.Tensor, num_sms: int) -> None:

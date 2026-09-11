@@ -44,6 +44,7 @@ class MoonEPDispatchOutput(NamedTuple):
     plan: Any
     expert_ids: torch.Tensor
     num_tokens: int
+    capacity: Optional[int] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -500,6 +501,16 @@ def run_moonep_bf16_expert(
     )
 
 
+_MIN_CAPACITY_RUNG = 8
+
+
+def _capacity_rung(num_tokens: int, decode_cap: int) -> int:
+    rung = _MIN_CAPACITY_RUNG
+    while rung < num_tokens and rung < decode_cap:
+        rung *= 2
+    return min(rung, decode_cap)
+
+
 def _resolve_decode_capacity(prefill_capacity: int) -> int | None:
     override = envs.SGLANG_MOONEP_DECODE_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if override > 0:
@@ -551,21 +562,18 @@ class MoonEPDispatcher(BaseDispatcher):
         self.decode_max_dispatch_tokens_per_rank = _resolve_decode_capacity(
             self.num_max_dispatch_tokens_per_rank
         )
+        self._active_capacity = self.num_max_dispatch_tokens_per_rank
         self.num_prefetch_slots = None
 
     @staticmethod
     def _raise_unimplemented() -> NoReturn:
         raise NotImplementedError(_MOONEP_UNSUPPORTED_MESSAGE)
 
-    def _phase_capacity(self) -> int:
-        if self.decode_max_dispatch_tokens_per_rank is None:
+    def _phase_capacity(self, num_tokens: int) -> int:
+        decode_cap = self.decode_max_dispatch_tokens_per_rank
+        if decode_cap is None or num_tokens > decode_cap:
             return self.num_max_dispatch_tokens_per_rank
-
-        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
-
-        if get_is_extend_in_batch():
-            return self.num_max_dispatch_tokens_per_rank
-        return self.decode_max_dispatch_tokens_per_rank
+        return _capacity_rung(num_tokens, decode_cap)
 
     def _get_buffer(self, capacity: int | None = None):
         if self.hidden_size is None or self.num_experts is None:
@@ -579,7 +587,7 @@ class MoonEPDispatcher(BaseDispatcher):
             router_topk=self.router_topk,
             num_experts=self.num_experts,
             num_max_dispatch_tokens_per_rank=(
-                self._phase_capacity() if capacity is None else capacity
+                self._active_capacity if capacity is None else capacity
             ),
             num_prefetch_slots=self.num_prefetch_slots,
         )
@@ -612,8 +620,18 @@ class MoonEPDispatcher(BaseDispatcher):
             return hidden_states, topk_ids, topk_weights, num_tokens
 
         pad_tokens = capacity - num_tokens
+        top_k = topk_ids.shape[1]
         hidden_pad = hidden_states.new_zeros(pad_tokens, hidden_states.shape[1])
-        id_pad = topk_ids.new_zeros(pad_tokens, topk_ids.shape[1])
+        assert self.num_experts is not None
+        id_pad = (
+            torch.arange(
+                num_tokens * top_k,
+                capacity * top_k,
+                device=topk_ids.device,
+                dtype=torch.int32,
+            )
+            % self.num_experts
+        ).view(pad_tokens, top_k)
         weight_pad = topk_weights.new_zeros(pad_tokens, topk_weights.shape[1])
         return (
             torch.cat((hidden_states, hidden_pad), dim=0).contiguous(),
@@ -675,7 +693,8 @@ class MoonEPDispatcher(BaseDispatcher):
         if self.num_experts is None:
             raise ValueError("MoonEPDispatcher requires num_experts.")
 
-        capacity = self._phase_capacity()
+        capacity = self._phase_capacity(int(hidden_states.shape[0]))
+        self._active_capacity = capacity
         hidden_states, topk_ids, topk_weights, num_tokens = self._pad_to_capacity(
             hidden_states,
             topk_output.topk_ids,
@@ -690,7 +709,9 @@ class MoonEPDispatcher(BaseDispatcher):
             topk_ids,
             tokens_per_expert,
             async_finish=False,
+            zero_copy=True,
         )
+        hidden_nvsh = hidden_nvsh.view(hidden_nvsh.shape)
         return MoonEPDispatchOutput(
             hidden_states=hidden_nvsh,
             route_weights_nvs=route_weights_nvs,
@@ -698,6 +719,7 @@ class MoonEPDispatcher(BaseDispatcher):
             plan=plan,
             expert_ids=self._expert_ids_from_plan(cu_seqlens, plan),
             num_tokens=num_tokens,
+            capacity=capacity,
         )
 
     def dispatch_a(
@@ -719,11 +741,14 @@ class MoonEPDispatcher(BaseDispatcher):
                 f"MoonEPDispatcher.combine expected MOONEP input, got "
                 f"{combine_input.format}"
             )
-        hidden_states, _route_weights_sk, _event = self._get_buffer().combine(
+        buffer = self._get_buffer()
+        shard = buffer._require_ctx()["hidden_buf_local"]
+        hidden_states, _route_weights_sk, _event = buffer.combine(
             plan=combine_input.plan,
             hidden_nvsh=combine_input.hidden_states,
             route_weights_nvs=None,
             async_finish=False,
+            zero_copy=combine_input.hidden_states.data_ptr() == shard.data_ptr(),
         )
         return hidden_states[: combine_input.num_tokens].contiguous()
 
