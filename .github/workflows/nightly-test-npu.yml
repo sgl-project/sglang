@@ -343,7 +343,7 @@ jobs:
   # Suites suffixed with `-cann910` run against the CANN 9.1.0 image.
   nightly-perf-16-npu-a3-cann910:
     name: nightly-perf-16-npu-a3-cann910
-    if: ${{ false }}
+    # if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -362,6 +362,7 @@ jobs:
     name: nightly-acc-16-npu-a3-cann910
     # Enabled: run only the cann910 w8a8 8p GPQA accuracy case (the only
     # test registered to this suite).
+    # if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -423,7 +424,7 @@ jobs:
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-  
+
   nightly-poc-multi-node-tests-cann910:
     name: multi-node-poc-cann910
     # Disabled: temporarily run only the cann910 w8a8 8p GPQA accuracy case.
