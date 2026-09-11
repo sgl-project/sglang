@@ -41,6 +41,10 @@ class PlanInput:
     extend_seq_lens: torch.Tensor
     req_to_verify_expected_tokens_valid_lens: torch.Tensor
 
+    @staticmethod
+    def allocation_bytes(bs_capacity: int) -> int:
+        return 4 * bs_capacity * torch.int64.itemsize
+
     def zero_(self) -> None:
         self.req_pool_indices.zero_()
         self.prefix_lens.zero_()
