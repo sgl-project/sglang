@@ -10,7 +10,6 @@ from typing import (
     List,
     Literal,
     Optional,
-    Tuple,
     TypeVar,
     Union,
 )
@@ -546,32 +545,29 @@ class DeepseekV4HipRadixBackend(
         compress_gpu_plan: bool = False,
         extend_start_loc: Optional[torch.Tensor] = None,
         attach_decode_streams: bool = False,
+        # Whether num_tokens == sum(extend_seq_lens) exactly, which lets the
+        # token map skip an implicit D2H.
+        exact_num_tokens: bool = True,
     ) -> DSV4Metadata:
-        if extend_start_loc is not None:
-            from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-                ExpandPrefillCausally,
-            )
+        from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+            ExpandPrefillCausally,
+        )
 
-            _expanded = ExpandPrefillCausally.execute(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                extend_seq_lens=extend_seq_lens,
-                extend_start_loc=extend_start_loc,
-                seq_lens_cpu=None,
-                extend_seq_lens_cpu=None,
-                num_tokens=num_tokens,
-                padded_num_tokens=out_cache_loc.shape[0],
-            )
-            seq_lens_casual = _expanded.seq_lens_casual
-            req_pool_indices_repeated = _expanded.req_pool_indices_repeated
-        else:
-            seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
-                num_tokens=num_tokens,
-                seq_lens=seq_lens_cpu,
-                extend_seq_lens=extend_seq_lens_cpu,
-                req_pool_indices=req_pool_indices,
-                padded_num_tokens=out_cache_loc.shape[0],
-            )
+        # extend_start_loc and the CPU mirrors below only feed the torch
+        # fallback; the triton kernel cumsums extend_seq_lens on device, so
+        # every caller can share it instead of dropping to a per-request loop.
+        _expanded = ExpandPrefillCausally.execute(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+            extend_start_loc=extend_start_loc,
+            seq_lens_cpu=seq_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            num_tokens=num_tokens,
+            padded_num_tokens=out_cache_loc.shape[0],
+        )
+        seq_lens_casual = _expanded.seq_lens_casual
+        req_pool_indices_repeated = _expanded.req_pool_indices_repeated
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -587,7 +583,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens,
             extend_seq_lens,
             num_tokens,
-            need_compress=need_compress,
+            exact_num_tokens=exact_num_tokens,
         )
         if attach_decode_streams:
             # Target-verify runs through the unified_kv DECODE kernel, so build
@@ -693,8 +689,11 @@ class DeepseekV4HipRadixBackend(
             num_tokens = ragged_layout.total_verify_tokens
             if num_tokens is None:
                 num_tokens = int(verify_lens_dev.sum().item())
+                exact_num_tokens = True
             else:
                 num_tokens = int(num_tokens)
+                # Padded tier: num_tokens >= sum(verify_lens)
+                exact_num_tokens = False
             extend_seq_lens_cpu = None
             seq_lens_cpu = None
         else:
@@ -705,6 +704,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu = [self.target_verify_num_draft_tokens] * batch_size
             num_tokens = self.target_verify_num_draft_tokens * batch_size
             extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
+            exact_num_tokens = True
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
         return self.init_forward_metadata_prefill(
@@ -721,6 +721,7 @@ class DeepseekV4HipRadixBackend(
             compress_gpu_plan=ragged_layout is not None,
             extend_start_loc=extend_start_loc,
             attach_decode_streams=True,
+            exact_num_tokens=exact_num_tokens,
         )
 
     def make_forward_metadata_from_raw_verify(
@@ -1160,6 +1161,7 @@ class DeepseekV4HipRadixBackend(
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 need_compress=not is_draft,
+                exact_num_tokens=is_draft,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -1277,7 +1279,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
-        need_compress: bool = True,
+        exact_num_tokens: bool = True,
     ) -> None:
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1290,19 +1292,13 @@ class DeepseekV4HipRadixBackend(
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
         # token -> req index (length L = sum(extend_seq_lens)).
-        # output_size skips the implicit sum() D2H on draft-extend. dropping it on the
-        # target-extend path triggers a GPU memory access fault.
-        if need_compress:
-            bid = torch.repeat_interleave(
-                torch.arange(bs, device=device, dtype=torch.int64),
-                extend_seq_lens,
-            )
-        else:
-            bid = torch.repeat_interleave(
-                torch.arange(bs, device=device, dtype=torch.int64),
-                extend_seq_lens,
-                output_size=num_tokens,
-            )
+        # output_size skips the implicit sum() D2H, but it must equal L:
+        # exact_num_tokens tells whether num_tokens does.
+        bid = torch.repeat_interleave(
+            torch.arange(bs, device=device, dtype=torch.int64),
+            extend_seq_lens,
+            output_size=num_tokens if exact_num_tokens else None,
+        )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
         core.unified.pf_state_slot = req_pool_indices[bid]
@@ -1680,41 +1676,6 @@ class DeepseekV4HipRadixBackend(
             return o
 
         raise NotImplementedError("ragged attention")
-
-    def expand_prefill_casually(
-        self,
-        num_tokens: int,
-        seq_lens: List[int],
-        extend_seq_lens: List[int],
-        req_pool_indices: torch.Tensor,
-        padded_num_tokens: Optional[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        seq_lens_casual = torch.empty(num_tokens, **self.cuda_int32_kwargs)
-        idx_to_req_repeated = torch.empty(num_tokens, **self.cuda_int32_kwargs)
-        offset = 0
-        for i, (kv_len, qo_len) in enumerate(zip(seq_lens, extend_seq_lens)):
-            out = seq_lens_casual[offset : offset + qo_len]
-            offset += qo_len
-            torch.arange(kv_len - qo_len + 1, kv_len + 1, out=out)
-            idx_to_req_repeated[offset - qo_len : offset].fill_(i)
-
-        assert offset == num_tokens
-        req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
-
-        if padded_num_tokens is not None and padded_num_tokens > num_tokens:
-            pad_size = padded_num_tokens - num_tokens
-            seq_lens_casual = torch.nn.functional.pad(
-                seq_lens_casual,
-                (0, pad_size),
-                value=1,
-            )
-            req_pool_indices_repeated = torch.nn.functional.pad(
-                req_pool_indices_repeated,
-                (0, pad_size),
-                value=req_pool_indices_repeated[-1].item(),
-            )
-
-        return seq_lens_casual, req_pool_indices_repeated
 
     def expand_extend_with_same_length(
         self,
