@@ -19,8 +19,6 @@ register_npu_ci(
     est_time=7200,
     suite="nightly-acc-16-npu-a3-cann910",
     nightly=True,
-    # Temporarily disabled: only run the 0731 w8a8 8p GPQA case in this suite.
-    disabled="temporarily disabled for 0731-only run",
 )
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
@@ -139,7 +137,6 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     eval_batch_size = 128
     stream = True
     timeout = 6000
-    seed = 1
 
     def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
         """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""

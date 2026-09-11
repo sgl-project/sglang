@@ -146,6 +146,20 @@ def run_evalscope(
     if dataset_dir:
         config_dict["dataset_dir"] = dataset_dir
 
+    cli_cmd = (
+        f"evalscope eval --model {model} --api-url {api_url} "
+        f"--eval-type {eval_type} --datasets {' '.join(datasets)} "
+        f"--eval-batch-size {eval_batch_size} --limit {limit} "
+        f"--timeout {timeout} --stream {stream} "
+        f"--work-dir {result_path} "
+        f"--generation-config '{json.dumps(generation_config, ensure_ascii=False)}'"
+    )
+    if dataset_args:
+        cli_cmd += f" --dataset-args '{json.dumps(dataset_args, ensure_ascii=False)}'"
+    if dataset_dir:
+        cli_cmd += f" --dataset-dir {dataset_dir}"
+    logger.info(f"Equivalent evalscope CLI command:\n{cli_cmd}")
+
     config_json = json.dumps(config_dict, ensure_ascii=False, indent=2)
     config_json_escaped = config_json.replace("\\", "\\\\").replace("'''", "\\'\\'\\'")
 
@@ -580,7 +594,10 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model_config.get("model_path"))
-            max_retries = get_max_retries(self.datasets)
+            max_retries = (
+                getattr(self, "accuracy_max_retries", None)
+                or get_max_retries(self.datasets)
+            )
             best_metrics = None
             for attempt in range(max_retries):
                 metrics = run_evalscope(
