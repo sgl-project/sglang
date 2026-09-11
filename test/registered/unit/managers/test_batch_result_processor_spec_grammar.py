@@ -6,6 +6,7 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -117,12 +118,13 @@ def _commit_disagg_handoff(
     replayed_boundary: bool = False,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+    queue.gloo_group = None
     queue.scheduler = SimpleNamespace(batch_result_processor=processor)
     queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     queue.metadata_buffers = SimpleNamespace(
         get_buf=lambda _: (
             torch.tensor([token_id], dtype=torch.long),
-            torch.zeros(7, dtype=torch.long),
+            torch.zeros(16, dtype=torch.int32),
             torch.zeros(1),
             torch.zeros(1, dtype=torch.long),
             torch.zeros(1),
@@ -148,7 +150,11 @@ def _commit_disagg_handoff(
         is_rebootstrap=replayed_boundary,
     )
 
-    queue._commit_transfer_to_req(decode_req)
+    with patch(
+        "sglang.srt.disaggregation.decode._all_reduce_polls",
+        side_effect=lambda polls, group: polls,
+    ):
+        queue._commit_transfer_to_req(decode_req)
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):

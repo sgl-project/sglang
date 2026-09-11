@@ -383,6 +383,10 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
+    def notify_bootstrap_failure(self, bootstrap_room: int) -> None:
+        """Best-effort peer notification before any KV send was submitted."""
+        pass
+
     def register_deferred_abort_room(self, bootstrap_room: int) -> None:
         """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
         from a prior request that reused this bootstrap_room."""
@@ -1187,6 +1191,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
+        self._send_started = False
         self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
@@ -1277,6 +1282,7 @@ class CommonKVSender(BaseKVSender):
             (kv_indices, index_slice, is_last_chunk, should_skip)
             If should_skip is True, the caller should return immediately.
         """
+        self._send_started = True
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
@@ -1345,6 +1351,12 @@ class CommonKVSender(BaseKVSender):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+
+    def abort_before_send(self) -> None:
+        if self._send_started:
+            raise RuntimeError("Cannot notify bootstrap failure after a KV send")
+        self.abort()
+        self.kv_mgr.notify_bootstrap_failure(self.bootstrap_room)
 
 
 class CommonKVReceiver(BaseKVReceiver):

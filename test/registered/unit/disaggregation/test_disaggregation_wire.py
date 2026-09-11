@@ -346,6 +346,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
     ):
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
+            origin_input_ids=[1, 2, 3],
+            extend_range=SimpleNamespace(end=3),
             output_ids=[101],
             cached_tokens=0,
             cached_tokens_device=0,

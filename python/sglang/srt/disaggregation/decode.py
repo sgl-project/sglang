@@ -51,12 +51,14 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _all_reduce_polls,
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -639,6 +641,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if is_aborted(req):
+            if self.pp_size > 1:
+                self._create_receiver_and_enqueue(req, is_rebootstrap=is_rebootstrap)
+            else:
+                req.update_finish_state()
+                if not req.finished_output:
+                    self.scheduler.output_streamer.stream_output(
+                        [req], req.return_logprob
+                    )
+            return
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -903,6 +915,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
+            if is_aborted(decode_req.req):
+                poll = KVPoll.Failed
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
@@ -921,11 +935,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     logger.debug(error_message)
                 else:
                     logger.error(error_message)
-                prepare_abort(
-                    decode_req.req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                if not is_aborted(decode_req.req):
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
@@ -984,6 +999,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
+            if is_aborted(decode_req.req):
+                continue
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
@@ -1025,7 +1042,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Group pending requests by bootstrap_addr
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
+        aborted_reqs = []
         for decode_req in self.pending_reqs:
+            if is_aborted(decode_req.req):
+                aborted_reqs.append(decode_req)
+                continue
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
@@ -1078,7 +1099,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefetched is not None:
                     prefetched[1].cancel()
 
-        self.pending_reqs = remaining
+        self.pending_reqs = remaining + aborted_reqs
 
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
@@ -1096,10 +1117,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
-        self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
+
+        for decode_req in self.queue:
+            req = decode_req.req
+            if rids_to_check is not None and req.rid not in rids_to_check:
+                continue
+            if isinstance(req.to_finish, FINISH_ABORT):
+                req.update_finish_state()
+                # Preallocation has not published destination pages yet.
+                decode_req.kv_receiver.abort()
+
+        self._resolve_pending_reqs()
+        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
 
         failed_reqs = []
         preallocated_reqs = []
@@ -2110,6 +2141,36 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
+        transferred_seq_len = cached_tokens[7].item()
+        expected_seq_len = decode_req.req.kv.kv_committed_len
+        # Zero is unknown for older prefill workers and intentionally fails open.
+        length_valid = _is_fake_transfer(decode_req.req) or transferred_seq_len in (
+            0,
+            expected_seq_len,
+        )
+        # Readiness consensus has completed; agree on length before any TP rank
+        # commits, without freeing pages while another rank is still transferring.
+        length_poll = _all_reduce_polls(
+            [KVPoll.Success if length_valid else KVPoll.Failed], self.gloo_group
+        )[0]
+        if length_poll == KVPoll.Failed:
+            logger.error(
+                "KV transfer sequence length mismatch on at least one TP rank: "
+                "request=%s bootstrap_room=%s received=%s expected=%s",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                transferred_seq_len,
+                expected_seq_len,
+            )
+            prepare_abort(
+                decode_req.req,
+                "KV transfer sequence length mismatch",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
         expected_room = (
@@ -2318,11 +2379,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
-            hicache_restore_status = decode_req.hicache_restore_status
-            if (
-                poll == KVPoll.Failed
-                or hicache_restore_status == HiCacheRestoreResult.FAILED
+            if self.scheduler.enable_decode_hicache and poll in (
+                KVPoll.Success,
+                KVPoll.Failed,
             ):
+                # PENDING must block even a peer's FAILED restore until H2D is done.
+                # A restore failure alone must not bypass network/scatter readiness.
+                restore_status = decode_req.hicache_restore_status
+                restore_done, restore_valid = _all_reduce_polls(
+                    [
+                        int(restore_status != HiCacheRestoreResult.PENDING),
+                        int(restore_status != HiCacheRestoreResult.FAILED),
+                    ],
+                    self.gloo_group,
+                )
+                if not restore_done:
+                    continue
+                if not restore_valid:
+                    poll = KVPoll.Failed
+
+            if poll == KVPoll.Failed:
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -2373,11 +2449,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                if (
-                    self.scheduler.enable_decode_hicache
-                    and hicache_restore_status == HiCacheRestoreResult.PENDING
-                ):
-                    continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

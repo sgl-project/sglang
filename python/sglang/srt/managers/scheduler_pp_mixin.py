@@ -9,7 +9,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    is_aborted,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
@@ -617,10 +620,9 @@ class SchedulerPPMixin:
             bad_bootstrapped_rids = list(
                 set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
             )
-        # Route locally-aborted reqs through the bad-union consensus so every PP
-        # rank flushes them in the same consensus round, regardless of when the
-        # AbortReq reaches each rank and regardless of whether
-        # disagg_kv_sender.abort() drives the poll to Failed (it is optional).
+        # Completed AbortReqs bypass readiness even if sender.abort() is a no-op.
+        # Pending admission aborts wait for the ready intersection; each stage
+        # retires its rejected request in pop_bootstrapped.
         aborted_rids = {
             req.rid
             for req in self.disagg_prefill_bootstrap_queue.queue
@@ -1330,7 +1332,7 @@ class SchedulerPPMixin:
         aborted_rids = {
             decode_req.req.rid
             for decode_req in self.disagg_decode_prealloc_queue.queue
-            if isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+            if is_aborted(decode_req.req)
         }
         good_prealloc_rids, bad_prealloc_rids = self._route_aborts_to_bad(
             good_prealloc_rids, bad_prealloc_rids, aborted_rids
