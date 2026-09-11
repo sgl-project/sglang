@@ -8,6 +8,25 @@ use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Which forwarding client the proxy uses for a worker.
+///
+/// Fixed for the worker's lifetime: it is derived by `manager::resolve_protocol`
+/// from the engine's `--enable-http2` launch flag and the dialed URL scheme,
+/// neither of which changes while the process runs. The asymmetry that drives
+/// the default: every engine accepts the negotiating client, while h2c is
+/// prior-knowledge only and fails outright against an engine that does not
+/// serve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireProtocol {
+    /// The negotiating reqwest client: HTTP/1.1 in cleartext, ALPN-negotiated
+    /// over TLS. Safe for every engine, so it is also the fallback.
+    #[default]
+    Http1,
+    /// Cleartext HTTP/2 with prior knowledge (h2c). Used only when a worker
+    /// reports `--enable-http2` on a cleartext URL.
+    H2c,
+}
+
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
 /// fallback chain: parse as-is, retry with `http://` prefix if missing,
 /// fall back to `"localhost"` if both fail. The fallback is defensive —
@@ -134,6 +153,9 @@ pub struct Worker {
     /// Interior-mutable mode so `ModeChanged` can update in place without
     /// dropping the Worker (which would reset `active_requests` + breaker).
     mode: AtomicU8,
+    /// Forwarding wire protocol, resolved from `/model_info` before this
+    /// worker was constructed. Immutable: see [`WireProtocol`].
+    protocol: WireProtocol,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -155,14 +177,16 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(spec: crate::discovery::WorkerSpec) -> Self {
-        Self::with_cb_config(spec, None)
+        Self::with_cb_config(spec, None, WireProtocol::default())
     }
 
-    /// Construct a worker with an explicit circuit-breaker configuration.
-    /// Pass `None` to use the default config (threshold = 3, cool_down = 30 s).
+    /// Construct a worker with an explicit circuit-breaker configuration and
+    /// forwarding protocol. Pass `None` for the default breaker config
+    /// (threshold = 3, cool_down = 30 s).
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
+        protocol: WireProtocol,
     ) -> Self {
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -175,6 +199,7 @@ impl Worker {
             id: spec.id,
             url: spec.url,
             mode: AtomicU8::new(spec.mode.as_u8()),
+            protocol,
             model_ids: spec.model_ids,
             breaker,
             active_requests,
@@ -208,6 +233,11 @@ impl Worker {
     /// identity survives the mode transition.
     pub fn set_mode(&self, m: WorkerMode) {
         self.mode.store(m.as_u8(), Ordering::Relaxed);
+    }
+
+    /// The wire protocol the proxy uses when forwarding to this worker.
+    pub fn protocol(&self) -> WireProtocol {
+        self.protocol
     }
 
     pub fn active_load(&self) -> usize {
@@ -247,6 +277,7 @@ impl std::fmt::Debug for Worker {
             .field("id", &self.id)
             .field("url", &self.url)
             .field("mode", &self.mode())
+            .field("protocol", &self.protocol)
             .field("active_load", &self.active_load())
             .finish()
     }
@@ -333,6 +364,24 @@ mod tests {
         assert_eq!(w.mode(), WorkerMode::Decode);
         w.set_mode(WorkerMode::Plain);
         assert_eq!(w.mode(), WorkerMode::Plain);
+    }
+
+    #[test]
+    fn protocol_is_carried_from_construction() {
+        let spec = || WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            bootstrap_port: None,
+        };
+        // `new` takes the always-safe default; the resolved protocol reaches a
+        // worker only through the constructor the registry uses.
+        assert_eq!(Worker::new(spec()).protocol(), WireProtocol::Http1);
+        assert_eq!(
+            Worker::with_cb_config(spec(), None, WireProtocol::H2c).protocol(),
+            WireProtocol::H2c,
+        );
     }
 
     #[test]

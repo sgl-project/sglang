@@ -6,7 +6,8 @@ pub mod manager;
 pub mod registry;
 pub mod worker;
 
-pub use introspect::{ServerInfo, WorkerIntrospector};
+pub use introspect::{WorkerIntrospection, WorkerIntrospector};
 pub use registry::WorkerRegistry;
 pub use worker::LoadGuard;
+pub use worker::WireProtocol;
 pub use worker::Worker;

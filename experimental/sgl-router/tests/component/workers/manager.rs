@@ -4,26 +4,29 @@
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::workers::{manager, WorkerRegistry};
+use sgl_router::workers::{manager, WireProtocol, WorkerRegistry};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Barrier};
 
-/// Spin up a tiny fake worker that returns `body` on `GET /server_info`.
-/// Returns the worker base URL and a shutdown channel.
+/// Spin up a tiny fake worker that returns `body` on both introspection
+/// endpoints. Returns the worker base URL and a shutdown channel.
+///
+/// One body for both because a real engine reports `served_model_name` on
+/// each.
 async fn spawn_fake_worker(body: Value) -> (String, oneshot::Sender<()>) {
     let body = Arc::new(body);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let app = Router::new().route(
-        "/server_info",
-        get(move || {
-            let body = body.clone();
-            async move { Json((*body).clone()) }
-        }),
-    );
+    let serve_body = move || {
+        let body = body.clone();
+        async move { Json((*body).clone()) }
+    };
+    let app = Router::new()
+        .route("/model_info", get(serve_body.clone()))
+        .route("/server_info", get(serve_body));
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app)
@@ -174,6 +177,167 @@ async fn manager_handles_mode_changed() {
 
     drop(tx);
     h.await.unwrap();
+}
+
+/// A worker that reports `enable_http2: true` is registered with
+/// [`WireProtocol::H2c`], so the proxy forwards to it over cleartext h2c.
+#[tokio::test]
+async fn manager_resolves_h2c_protocol_from_introspection() {
+    let (url, _s) =
+        spawn_fake_worker(json!({"served_model_name": "m", "enable_http2": true})).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    let resolved = wait_for_protocol(&registry, "w1", WireProtocol::H2c).await;
+    assert!(
+        resolved,
+        "worker reporting enable_http2 must resolve to h2c, got {:?}",
+        registry.get(&WorkerId("w1".into())).map(|w| w.protocol()),
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// A worker that omits `enable_http2` (older SGLang) keeps the safe HTTP/1.1
+/// default on its registry entry.
+#[tokio::test]
+async fn manager_defaults_http1_when_enable_http2_absent() {
+    let (url, _s) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    // Non-empty `model_ids` is what proves introspection ran: the protocol and
+    // the model name come from the same `/model_info` fetch, so a registered
+    // worker cannot be carrying the pre-introspection default. The positive
+    // direction — that `enable_http2` is actually read — is pinned by
+    // `manager_resolves_protocol_per_worker_no_fleet_lock` below.
+    let registered = wait_for(Duration::from_secs(2), || {
+        registry
+            .get(&WorkerId("w1".into()))
+            .is_some_and(|w| !w.model_ids.is_empty())
+    })
+    .await;
+    assert!(registered, "worker registered");
+    let w = registry.get(&WorkerId("w1".into())).unwrap();
+    assert_eq!(w.protocol(), WireProtocol::Http1);
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// The load-bearing regression for the production h2c bug: per-worker protocol
+/// means one worker that resolved HTTP/1.1 first does NOT lock the rest of the
+/// fleet off h2c. A mixed fleet (one h2c-capable worker registered AFTER a
+/// plain HTTP/1.1 worker) ends with each worker on its own protocol — the old
+/// single-client first-write-wins design forced both to HTTP/1.1.
+#[tokio::test]
+async fn manager_resolves_protocol_per_worker_no_fleet_lock() {
+    // w-http1 registers first and reports no enable_http2 (resolves Http1);
+    // w-h2c registers second and reports enable_http2: true (must still get
+    // h2c — it is not dragged down by w-http1's earlier Http1 resolution).
+    let (url_http1, _s1) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (url_h2c, _s2) =
+        spawn_fake_worker(json!({"served_model_name": "m", "enable_http2": true})).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w-http1",
+        &url_http1,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    // Let the HTTP/1.1 worker resolve first so it is the one that would have
+    // "won" the old fleet-wide client.
+    assert!(
+        wait_for_protocol(&registry, "w-http1", WireProtocol::Http1).await,
+        "first worker should resolve Http1",
+    );
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w-h2c",
+        &url_h2c,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    assert!(
+        wait_for_protocol(&registry, "w-h2c", WireProtocol::H2c).await,
+        "an h2c-capable worker registered after an Http1 worker must still resolve h2c \
+         (per-worker protocol, no fleet-wide lock); got {:?}",
+        registry
+            .get(&WorkerId("w-h2c".into()))
+            .map(|w| w.protocol()),
+    );
+    // The earlier worker is untouched.
+    let first = registry.get(&WorkerId("w-http1".into())).unwrap();
+    assert_eq!(
+        first.protocol(),
+        WireProtocol::Http1,
+        "the Http1 worker must stay Http1",
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// Block until `worker_id`'s registry entry reports `expected` **as an actual
+/// `/model_info` reading**, or 2 s elapse. Returns whether it converged.
+///
+/// The `model_ids` check is half the predicate on purpose: `Http1` is also the
+/// default for a worker built without a resolved protocol, so waiting on the
+/// value alone could be satisfied by an implementation that never reads one.
+/// Both facts come from the same fetch, so a resolved model proves a resolved
+/// protocol.
+async fn wait_for_protocol(
+    registry: &Arc<WorkerRegistry>,
+    worker_id: &str,
+    expected: WireProtocol,
+) -> bool {
+    let id = WorkerId(worker_id.into());
+    wait_for(Duration::from_secs(2), || {
+        registry
+            .get(&id)
+            .is_some_and(|w| !w.model_ids.is_empty() && w.protocol() == expected)
+    })
+    .await
+}
+
+/// Poll `cond` every 20 ms until it returns true or `budget` elapses.
+async fn wait_for(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
 }
 
 #[tokio::test]

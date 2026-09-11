@@ -7,7 +7,7 @@ use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
-use crate::workers::WorkerRegistry;
+use crate::workers::{WireProtocol, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,14 +15,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// Production reconcile cadence. Workers that register without resolving
-/// their model IDs (a `/server_info` introspection that failed at `Added`
-/// time — e.g. the EndpointSlice flipped `ready=true` before the engine's
-/// scheduler-backed `/server_info` could answer) are re-introspected on
-/// this interval until they join their model pool. The worst-case
-/// "registered but invisible" window is about one interval plus the
-/// introspection round-trip; steady state costs one cheap registry scan
-/// per interval. See `reconcile_unresolved_workers` for the (benign)
-/// case of a worker that answers but never advertises a model name.
+/// their model IDs (an introspection that failed at `Added` time — e.g. the
+/// EndpointSlice flipped `ready=true` before the engine's HTTP server could
+/// answer) are re-introspected on this interval until they join their model
+/// pool. The worst-case "registered but invisible" window is about one
+/// interval plus the introspection round-trip; steady state costs one cheap
+/// registry scan per interval. See `reconcile_unresolved_workers` for the
+/// (benign) case of a worker that answers but never advertises a model name.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
@@ -42,6 +41,57 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
     None
 }
 
+/// Whether `worker_url` is one the router will dial in cleartext.
+///
+/// The scheme test cannot be `Url::parse(worker_url)?.scheme() == "http"`: a
+/// schemeless `worker-0.engines.svc:8000` parses with `worker-0.engines.svc`
+/// as the *scheme*, so that test answers "not cleartext" for a shape that is
+/// nothing of the sort. Normalize the way `parse_bootstrap_host` does — retry
+/// under an explicit `http://` — and read the scheme off that.
+///
+/// A schemeless URL therefore reads as cleartext here, which is deliberately
+/// more permissive than what the forward path accepts: `proxy::parse_worker_url`
+/// is a bare `Url::parse` with no prefix fallback, so such a worker is rejected
+/// as `WorkerMisconfigured` before any client is chosen and the protocol we
+/// resolved for it never reaches the wire. Answering `Some(true)` costs nothing
+/// today and stays correct if that path ever grows the same normalization;
+/// answering `None` would only mislabel the reason in the log.
+fn dials_cleartext(worker_url: &str) -> Option<bool> {
+    if worker_url.contains("://") {
+        return url::Url::parse(worker_url)
+            .ok()
+            .map(|u| u.scheme() == "http");
+    }
+    url::Url::parse(&format!("http://{worker_url}"))
+        .ok()
+        .map(|_| true)
+}
+
+/// Resolve the wire protocol for a worker from its `/model_info`
+/// (`enable_http2`) and whether the router dials it in cleartext
+/// (`dials_cleartext`, `None` when the URL did not parse).
+///
+/// Both inputs are fixed for the worker's lifetime, so this runs once per
+/// worker, before it is registered.
+///
+/// Upgrades to [`WireProtocol::H2c`] only when the engine self-reports
+/// `--enable-http2` **and** the worker URL is cleartext. h2c is HTTP/2 with
+/// prior knowledge — no negotiation — so sending it anywhere that is not
+/// known to serve it fails every request; the cleartext gate is what bounds
+/// that risk.
+///
+/// [`WireProtocol::Http1`] is the fallback for everything else, and it does
+/// not mean "HTTP/1.1 on the wire". It selects the default reqwest client,
+/// which advertises ALPN `h2, http/1.1` on TLS, so an `https://` worker
+/// running `--enable-http2` negotiates HTTP/2 over TLS on its own — the
+/// correct outcome, reached by negotiation rather than by assumption.
+fn resolve_protocol(enable_http2: Option<bool>, cleartext: Option<bool>) -> WireProtocol {
+    match (enable_http2, cleartext) {
+        (Some(true), Some(true)) => WireProtocol::H2c,
+        _ => WireProtocol::Http1,
+    }
+}
+
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
     run_with_config(rx, registry, None, None, None).await;
 }
@@ -51,6 +101,11 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// on every worker add / remove, and an optional active-load registry
 /// that is asked to forget per-worker counters on `Removed`.
 ///
+/// The forwarding wire protocol (HTTP/1.1 vs cleartext h2c) is resolved per
+/// worker from its `/model_info` and carried into the registered
+/// [`crate::workers::Worker`] at construction (see `register_one`), so the
+/// manager does not need a handle to the proxy.
+///
 /// When `kv_index` is `None`, KV-event and load-subscriber state is disabled; when
 /// `active_load` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
@@ -58,7 +113,7 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// `cfg` is `None` the default CB config is used for every worker
 /// (threshold = 3).
 ///
-/// Uses the default HTTP client (2-second timeout) for `/server_info`
+/// Uses the default HTTP client (2-second timeout) for worker
 /// introspection.  Tests that want a tighter timeout call
 /// [`run_with_introspector`] directly.
 pub async fn run_with_config(
@@ -303,17 +358,15 @@ async fn handle_discovery_event(
     }
 }
 
-/// Re-introspect workers that registered without resolving their model
-/// IDs.
+/// Re-introspect workers that registered without resolving their model IDs.
 ///
 /// A worker lands in the registry with empty `model_ids` when its
-/// `/server_info` introspection failed at `Added` time (e.g. the
-/// EndpointSlice flips `ready=true` before the engine can answer the
-/// scheduler-backed `/server_info` round-trip, and the introspector's
-/// bounded retry budget is exhausted). Such a worker is present in
-/// `by_id` but absent from every `by_model` pool, so it gets zero traffic
-/// — and it never recovers on its own: discovery re-lists carry the same
-/// empty `model_ids` the backend always emits, so they produce no new
+/// introspection failed at `Added` time (e.g. the EndpointSlice flips
+/// `ready=true` before the engine's HTTP server can answer, and the
+/// introspector's bounded retry budget is exhausted). Such a worker is
+/// present in `by_id` but absent from every `by_model` pool, so it gets zero
+/// traffic — and it never recovers on its own: discovery re-lists carry the
+/// same empty `model_ids` the backend always emits, so they produce no new
 /// `Added` event.
 ///
 /// This pass re-runs `register_one` (an idempotent registry upsert +
@@ -325,12 +378,11 @@ async fn handle_discovery_event(
 /// mid-reconcile awaits the in-flight handle before clearing the
 /// registry, so a worker that genuinely left is not resurrected.
 ///
-/// A worker that answers `/server_info` but never advertises a
-/// `served_model_name` also stays in this set and is re-introspected
-/// every interval. That is a benign, bounded poll (one cheap round-trip
-/// per worker per interval), not a leak — but it is also never escalated,
-/// so the per-attempt failure logging stays at `debug!`; the introspector
-/// itself emits the `warn!` that surfaces a persistently failing worker.
+/// A worker that answers but never advertises a `served_model_name` also
+/// stays in this set and is re-introspected every interval — a benign,
+/// bounded poll, not a leak. It is never escalated, so the per-attempt
+/// logging stays at `debug!`; the introspector emits the `warn!` that
+/// surfaces a persistently failing worker.
 fn reconcile_unresolved_workers(
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
@@ -348,35 +400,70 @@ fn reconcile_unresolved_workers(
             // finish rather than racing a second introspection.
             continue;
         }
-        // Rebuild a discovery-shaped spec: empty `model_ids` so
-        // `register_one` re-resolves them from `/server_info`; current
-        // mode + bootstrap_port as the seed (`register_one` re-applies
-        // any `/server_info` override).
+        let registry_t = registry.clone();
+        let introspector_t = introspector.clone();
+        let worker_url = worker.url.clone();
+        // Rebuild a discovery-shaped spec: empty `model_ids` so `register_one`
+        // re-resolves them; current mode + bootstrap_port as the seed
+        // (`register_one` re-applies any `/server_info` override).
         let spec = WorkerSpec {
             id: id.clone(),
-            url: worker.url.clone(),
+            url: worker_url.clone(),
             mode: worker.mode(),
             model_ids: Vec::new(),
             bootstrap_port: worker.bootstrap_port(),
         };
         // `debug!` not `info!`: this fires every interval for each
-        // still-unresolved worker, so info-level would spam for a worker
-        // that is permanently model-less. The introspector logs the
-        // underlying `/server_info` failure at `warn!` on each attempt,
-        // which is the operator-facing signal.
+        // still-unresolved worker, so info-level would spam for one that is
+        // permanently model-less. The introspector logs the underlying failure
+        // at `warn!` on each attempt, which is the operator-facing signal.
         tracing::debug!(
             worker_id = %id,
-            worker_url = %worker.url,
+            worker_url = %worker_url,
             "reconcile: re-introspecting worker that registered without model_ids",
         );
-        let registry_t = registry.clone();
         let cfg_t = cfg.clone();
         let kv_index_t = kv_index.clone();
-        let introspector_t = introspector.clone();
+        // Safe to go back through the registry upsert only because this worker
+        // is in no model pool: the fresh `Worker` it builds discards a breaker
+        // and load counters that a model-less worker has never accumulated.
         let handle = tokio::spawn(async move {
             register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
         });
         pending.insert(id, handle);
+    }
+}
+
+/// Explain a resolved protocol at the level an operator needs: h2c is a
+/// behaviour change worth an `info!`, and an engine that asked for HTTP/2 but
+/// did not get h2c should say why — a TLS worker gets it by ALPN anyway, an
+/// unparsable URL does not get it at all.
+///
+/// Takes the same `cleartext` that `resolve_protocol` was given, so the two
+/// cannot disagree about what the router would dial.
+fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, cleartext: Option<bool>) {
+    if enable_http2 != Some(true) {
+        return;
+    }
+    match cleartext {
+        Some(true) => tracing::info!(
+            worker_url = %worker_url,
+            "/model_info reports --enable-http2 on a cleartext worker; forwarding over h2c",
+        ),
+        // TLS worker: the default client advertises ALPN h2, so this engine
+        // still gets HTTP/2 — negotiated instead of assumed.
+        Some(false) => tracing::info!(
+            worker_url = %worker_url,
+            "/model_info reports --enable-http2 on a TLS worker; using the default \
+             client, which negotiates HTTP/2 over TLS via ALPN",
+        ),
+        // Unparsable: we cannot tell what we would dial, so we cannot justify
+        // prior-knowledge h2c. Worth an operator's attention.
+        None => tracing::warn!(
+            worker_url = %worker_url,
+            "/model_info reports --enable-http2 but the worker URL did not parse; \
+             cannot confirm a cleartext endpoint, staying on the default client",
+        ),
     }
 }
 
@@ -427,8 +514,13 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
+    let cleartext = dials_cleartext(&worker_url);
+    let protocol = resolve_protocol(info.enable_http2, cleartext);
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-    if let Err(e) = registry.add_with_cb(spec, cb) {
+    // `protocol` rides beside the spec rather than on it: `WorkerSpec` is the
+    // serde wire type for `DiscoveryEvent`, and no discovery backend can know
+    // a worker's protocol.
+    if let Err(e) = registry.add_with_cb(spec, cb, protocol) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
         // worker — the alternative (silently dropping into either pool)
@@ -442,6 +534,9 @@ async fn register_one(
         );
         return;
     }
+    // After the insert, so the log describes a worker that is actually taking
+    // traffic — a spec refused above never reaches the wire at all.
+    log_protocol_resolution(&worker_url, info.enable_http2, cleartext);
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
@@ -509,19 +604,54 @@ mod tests {
         assert_eq!(cb.cool_down, Duration::from_secs(60));
     }
 
-    /// Helper: spawn a tiny fake worker that returns the supplied JSON body
-    /// on `GET /server_info`. Returns the worker URL + a shutdown channel.
-    async fn spawn_fake_server_info_worker(body: Value) -> (String, oneshot::Sender<()>) {
-        let body = Arc::new(body);
+    #[test]
+    fn resolve_protocol_upgrades_to_h2c_only_for_cleartext_http2_engine() {
+        // The one case that gets h2c: engine self-reports --enable-http2 and
+        // we dial cleartext http://.
+        assert_eq!(
+            resolve_protocol(Some(true), dials_cleartext("http://10.0.0.1:30000")),
+            WireProtocol::H2c,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_for_https_even_with_http2() {
+        // A TLS engine with --enable-http2 serves h2-over-TLS, not cleartext
+        // h2c; the router dials cleartext, so it must stay on HTTP/1.1
+        // (which negotiates fine over TLS) rather than break every request.
+        assert_eq!(
+            resolve_protocol(Some(true), dials_cleartext("https://10.0.0.1:30000")),
+            WireProtocol::Http1,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_when_http2_disabled_or_unknown() {
+        // Explicit false (HTTP/1.1-only Uvicorn) and absent field (older
+        // SGLang) both keep the safe default.
+        assert_eq!(
+            resolve_protocol(Some(false), dials_cleartext("http://10.0.0.1:30000")),
+            WireProtocol::Http1,
+        );
+        assert_eq!(
+            resolve_protocol(None, dials_cleartext("http://10.0.0.1:30000")),
+            WireProtocol::Http1,
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_stays_http1_for_unparsable_url() {
+        assert_eq!(
+            resolve_protocol(Some(true), dials_cleartext("not a url")),
+            WireProtocol::Http1,
+        );
+    }
+
+    /// Serve `app` on an ephemeral port. Returns its base URL + a shutdown
+    /// channel; every fake worker in this module is a `Router` plus this.
+    async fn serve(app: Router) -> (String, oneshot::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = Router::new().route(
-            "/server_info",
-            get(move || {
-                let body = body.clone();
-                async move { Json((*body).clone()) }
-            }),
-        );
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app)
@@ -531,6 +661,19 @@ mod tests {
                 .await;
         });
         (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    /// Answers the supplied JSON body on `GET /server_info` only.
+    async fn spawn_fake_server_info_worker(body: Value) -> (String, oneshot::Sender<()>) {
+        let body = Arc::new(body);
+        serve(Router::new().route(
+            "/server_info",
+            get(move || {
+                let body = body.clone();
+                async move { Json((*body).clone()) }
+            }),
+        ))
+        .await
     }
 
     /// Reserve a TCP port and immediately drop the listener so subsequent
@@ -941,43 +1084,123 @@ mod tests {
         let _ = manager_handle.await;
     }
 
-    /// Fake `/server_info` worker whose readiness is switchable at
-    /// runtime. While `ready` is false it answers `503` (mimicking an
-    /// engine whose EndpointSlice flipped `ready=true` before its
-    /// scheduler-backed `/server_info` could answer); flip `ready` to
-    /// true and it serves `body`.
-    async fn spawn_switchable_server_info_worker(
+    /// Fake worker whose readiness is switchable at runtime. While `ready` is
+    /// false both introspection endpoints answer `503` (mimicking an engine
+    /// whose EndpointSlice flipped `ready=true` before its HTTP server could
+    /// answer anything); flip `ready` to true and both serve `body`.
+    async fn spawn_switchable_worker(
         body: Value,
         ready: Arc<std::sync::atomic::AtomicBool>,
     ) -> (String, oneshot::Sender<()>) {
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
         let body = Arc::new(body);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let app = Router::new().route(
-            "/server_info",
-            get(move || {
-                let body = body.clone();
-                let ready = ready.clone();
-                async move {
-                    if ready.load(std::sync::atomic::Ordering::SeqCst) {
-                        Json((*body).clone()).into_response()
-                    } else {
-                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+        let when_ready = move || {
+            let body = body.clone();
+            let ready = ready.clone();
+            async move {
+                if ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    Json((*body).clone()).into_response()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        };
+        serve(
+            Router::new()
+                .route("/model_info", get(when_ready.clone()))
+                .route("/server_info", get(when_ready)),
+        )
+        .await
+    }
+
+    /// Fake worker that answers `/model_info` and 503s `/server_info`.
+    ///
+    /// This is the warming-engine shape: `/model_info` is served from
+    /// manager-owned state, `/server_info` awaits a scheduler round-trip, so
+    /// the second can be unavailable for a long time while the first answers
+    /// immediately.
+    async fn spawn_model_info_only_worker(model_info_body: Value) -> (String, oneshot::Sender<()>) {
+        use axum::http::StatusCode;
+
+        let body = Arc::new(model_info_body);
+        serve(
+            Router::new()
+                .route(
+                    "/model_info",
+                    get(move || {
+                        let body = body.clone();
+                        async move { Json((*body).clone()) }
+                    }),
+                )
+                .route(
+                    "/server_info",
+                    get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "warming up") }),
+                ),
+        )
+        .await
+    }
+
+    /// The protocol must resolve at registration, from `/model_info` alone.
+    ///
+    /// Reading `enable_http2` off `/server_info` made the protocol depend on a
+    /// scheduler round-trip that a warming engine cannot serve, so a worker
+    /// could join its model pool — and start taking traffic — with its
+    /// protocol still unread. Reading it off `/model_info` resolves both
+    /// facts in one fetch: they now succeed or fail together.
+    ///
+    /// The reconcile interval here is far longer than the timeout, so a pass
+    /// cannot be the repair loop arriving late.
+    #[tokio::test]
+    async fn protocol_resolves_at_registration_without_server_info() {
+        let (worker_url, _shutdown) =
+            spawn_model_info_only_worker(json!({"served_model_name": "m", "enable_http2": true}))
+                .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_secs(600),
+        ));
+
+        let id = WorkerId("w-warming".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        }))
+        .await
+        .unwrap();
+
+        let resolved = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if !w.model_ids.is_empty() {
+                        return w.protocol();
                     }
                 }
-            }),
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            resolved.expect("worker must join its model pool"),
+            WireProtocol::H2c,
+            "a worker whose /server_info never answered must still forward over \
+             h2c: /model_info reported --enable-http2 in the same fetch that \
+             resolved its model",
         );
-        let (tx, rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = rx.await;
-                })
-                .await;
-        });
-        (format!("http://127.0.0.1:{port}"), tx)
+
+        drop(tx);
+        let _ = manager_handle.await;
     }
 
     /// A worker that registers with empty `model_ids` because
@@ -993,8 +1216,7 @@ mod tests {
 
         let ready = Arc::new(AtomicBool::new(false));
         let (worker_url, _shutdown) =
-            spawn_switchable_server_info_worker(json!({"served_model_name": "m"}), ready.clone())
-                .await;
+            spawn_switchable_worker(json!({"served_model_name": "m"}), ready.clone()).await;
 
         let registry = Arc::new(WorkerRegistry::default());
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
@@ -1060,6 +1282,94 @@ mod tests {
             registry.get(&id).unwrap().model_ids,
             vec![ModelId("m".into())],
             "recovered worker must carry the resolved model id",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    /// A worker whose introspection failed entirely (so it registered with no
+    /// model IDs and the HTTP/1.1 default) must come back as h2c once the
+    /// engine is ready and reports `enable_http2: true`. The repair is the
+    /// re-registration `reconcile_unresolved_workers` already performs for a
+    /// model-less worker: the fresh `Worker` it builds carries the protocol
+    /// resolved by that same fetch, so a transient startup failure does not
+    /// strand an h2c-capable engine on HTTP/1.1 forever.
+    #[tokio::test]
+    async fn reconcile_upgrades_worker_to_h2c_after_transient_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        // While not-ready the worker answers 503 (introspection fails → Http1,
+        // empty model_ids); once ready it reports a model AND enable_http2.
+        let ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) = spawn_switchable_worker(
+            json!({"served_model_name": "m", "enable_http2": true}),
+            ready.clone(),
+        )
+        .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(150),
+        ));
+
+        let id = WorkerId("w-warming".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        }))
+        .await
+        .unwrap();
+
+        // Phase 1: the warming worker is registered on the safe HTTP/1.1
+        // default (introspection failed → empty model_ids, no h2c).
+        let stuck = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() && w.protocol() == WireProtocol::Http1 {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stuck.is_ok(),
+            "a worker that failed initial introspection must register on the HTTP/1.1 default",
+        );
+
+        // The engine finishes coming up.
+        ready.store(true, Ordering::SeqCst);
+
+        // Phase 2: reconcile re-introspects and upgrades the worker to h2c.
+        let upgraded = timeout(Duration::from_secs(3), async {
+            loop {
+                if registry
+                    .get(&id)
+                    .is_some_and(|w| w.protocol() == WireProtocol::H2c)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            upgraded.is_ok(),
+            "reconcile must upgrade the worker to h2c once /model_info reports enable_http2; got {:?}",
+            registry.get(&id).map(|w| w.protocol()),
         );
 
         drop(tx);
