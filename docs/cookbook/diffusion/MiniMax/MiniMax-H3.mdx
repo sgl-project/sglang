@@ -28,7 +28,8 @@ reload the model.
 The Docker form installs the platform-specific diffusion extra from the source
 bundled in the image. For conditioned requests, set **Host media directory**
 under **Variables**; the builder mounts it read-only at `/data/minimax-h3`.
-AMD currently offers the Python form, while NVIDIA also offers Docker.
+AMD and Grace Blackwell currently offer the Python form; the other NVIDIA
+recipes also offer Docker.
 
 To use ModelScope through the same normal `sglang serve` path, prefix the copied
 command with `SGLANG_USE_MODELSCOPE=true` and replace the model path with
@@ -72,6 +73,29 @@ The builder accepts legal custom GPU counts and topologies, marking them
 Static H3 head or partition violations disable Copy before they reach
 `sglang serve`.
 
+### Grace Blackwell
+
+Select **GB300** or **GB200** in the builder. The default is one Linux ARM64
+host with four GPUs, Ulysses4, and resident weights. This follows the
+[four-GPU compute-tray layout](https://docs.nvidia.com/dgx/dgxgb200-user-guide/hardware.html);
+an NVL72 rack is not a single 72-GPU process host.
+
+For two four-GPU hosts, set **Nodes = 2** and **GPUs / node = 4**. The builder
+emits Ulysses4 inside each host, Ring2 across hosts, and replicated encoders.
+Set the same reachable **Head address** on both hosts and use node ranks 0 and
+1. Run the generated command once per host, with the same SGLang revision and
+dependencies. Let `sglang serve` resolve and download the selected weights.
+
+GB200 is a **derived, unverified recipe**, not a measured GB300-equivalent
+performance claim. Keep the native precision and platform-default attention
+for the baseline; the B200/B300 quantization measurements and H200 Cache-DiT
+quality audit do not establish coverage on Grace Blackwell.
+
+GB300 end-to-end coverage currently includes single-host FL2VA text-to-video
+with audio, native precision, eager execution, and `quality="lossless"`.
+Ref2VA and multi-host commands remain **Unverified**. See the
+[GB300 measurements](#gb300-single-host) for the tested workload.
+
 ### Checkpoint and adapter formats
 
 Start with the command emitted by the builder. Every row below is an overlay on
@@ -86,13 +110,16 @@ may be either a normal style adapter or a timestep-distilled Turbo adapter.
 | DiT | Official Diffusers component layout | `--component-paths.transformer MiniMaxAI/MiniMax-H3/transformer` (`fl2va`) or `.../transformer_ref` (`ref2va`) | Loads the official component through the native SGLang graph; no Diffusers runtime fallback. |
 | DiT | [AdaLN-pruned Diffusers component](https://huggingface.co/multimodalart/MiniMax-H3-Pruned) | `--component-paths.transformer multimodalart/MiniMax-H3-Pruned/transformer` or `.../transformer_ref` | Approximate curve-AdaLN architecture; its config and basis metadata are loaded natively. |
 | DiT | [Full or AdaLN-pruned](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models), or [LoRA-merged/remixed](https://huggingface.co/FX-FeiHou/MiniMax-H3-Remix) BF16 safetensors | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Weight-only override for a native full/pruned H3 layout. Match the FL2VA/Ref2VA partition; pruned, merged, or dtype-converted exports are approximate, and any author-specific sampler remains a separate requirement. |
+| DiT | FL/Ref hybrid fine-tunes, including [Singularity v1.3](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity) (full or pruned INT8) | Replace `--model-variant` with `hybrid`; add `--component-weights-paths.transformer OWNER/REPO/FILE.safetensors` | Explicit merged-weight deployment serving `t2va`, `fl2va`, and `ref2va` on one native pipeline. Quantization and pruning are detected from the file; INT8 requires `comfy-kitchen`. See [Singularity](#singularity-hybrid-weights). |
 | DiT | Comfy FP8 or self-describing MXFP8 safetensors | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Per-layer metadata selects static/dynamic FP8 or MXFP8 automatically. |
 | DiT | ConvRot INT8, W4A8, W4A4, or mixed W4A4+INT8 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; requires `comfy-kitchen`. TP must preserve each file's ConvRot group boundaries. |
 | DiT | [NVFP4, optionally mixed with INT8 or FP8](https://huggingface.co/Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; NVFP4 execution requires NVIDIA compute capability 10.0+. |
 | DiT | [AutoRound W4A16 component](https://huggingface.co/Ar4ikov/MiniMax-H3-transformer-W4A16-RTN) | `--component-paths.transformer Ar4ikov/MiniMax-H3-transformer-W4A16-RTN` | Self-describing Diffusers component; SGLang reuses the SRT GPTQ/Marlin backend. The linked export is FL2VA. |
 | DiT | GGUF, full or AdaLN-pruned ([full](https://huggingface.co/leejet/MiniMax-H3-GGUF), [pruned](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) | `--component-weights-paths.transformer OWNER/REPO/FILE.gguf` | CUDA capacity path; aligned TP and layerwise offload are supported, FSDP and LoRA are not. |
+| Text encoder | Architecture-compatible Qwen3-VL BF16 finetune ([Heretic example](https://huggingface.co/llmfan46/Qwen3-VL-32B-Instruct-ultra-uncensored-heretic)) | `--component-paths.text_encoder OWNER/REPO` | Reuses the native H3 extractor, including its vision tower and layer-50 hidden-state selection. Finetuning changes conditioning, not the sampling schedule. |
 | Text encoder | [Serialized FP8 component](https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct-FP8) | `--component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8` | Only eligible language-model linears use FP8; embeddings, norms, and the vision tower keep their declared precision. |
-| Text encoder | ConvRot INT8, W4A8, or W4A4 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Auto-detected; requires `comfy-kitchen`. Unmarked vision and embedding tensors keep their declared precision. |
+| Text encoder | ConvRot INT8, W4A8, or W4A4 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders), [Heretic INT8](https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Auto-detected; requires `comfy-kitchen`. INT8/W4A8 files may include a scalar-scale INT8 embedding. Unmarked tensors retain their declared precision. |
+| Text encoder | Comfy NVFP4 with dynamic activation quantization ([Heretic example](https://huggingface.co/sakamakismile/Qwen3-VL-32B-Heretic-MiniMax-H3-NVFP4)) | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Requires `comfy-kitchen` and NVIDIA compute capability 10.0+. Per-layer metadata selects native NVFP4 matmul; scalar/row-wise INT8 embeddings remain packed. |
 | Text encoder | [NVFP4-AWQ](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders) or [Quanto qint8](https://huggingface.co/DeepBeepMeep/MiniMax-H3/tree/main/Qwen3-VL-32B-Instruct) safetensors | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Memory-oriented formats: compressed storage is restored, then each active matrix uses BF16/FP16 compute. |
 | Text encoder | [GGUF Qwen3-VL](https://huggingface.co/DeepBeepMeep/MiniMax-H3/tree/main/Qwen3-VL-32B-Instruct) | `--component-weights-paths.text_encoder OWNER/REPO/FILE.gguf` | CUDA capacity path with encoder TP/layerwise support; encoder FSDP is not supported. |
 | Text encoder | [Compact Qwen3-VL 4B/8B + ClipProj](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3) | `--component-paths.text_encoder ENCODER_REPO --component-paths.conditioning_projection PROJECTION.safetensors` | Approximate conditioning replacement. A separate weight-only override may quantize the selected small encoder. |
@@ -102,6 +129,11 @@ may be either a normal style adapter or a timestep-distilled Turbo adapter.
 The rows compose rather than enumerate every cross-product. A Turbo-merged INT8
 ConvRot checkpoint, for example, must satisfy both the Turbo sampling contract
 and the ConvRot storage/backend contract.
+
+H3's Qwen3-VL text encoder also handles image understanding; there is no separate
+`image_encoder` component. Select the conditioning checkpoint, not an optional
+generation-tail file for prompt rewriting. The `uncensored` or `Heretic` label
+describes a weight modification, not a separate loader or a guarantee of output quality.
 
 For H3, the registered component names are `transformer`, `text_encoder`,
 `video_vae`, and `audio_vae`. The shorter `--transformer-weights-path` and
@@ -250,6 +282,39 @@ The current `torch.compile` path changes the model's numerical output, so no
 recommended lossless preset enables it implicitly. An explicit
 `--enable-torch-compile true` remains available for controlled experiments, but
 do not use it to generate consistency ground truth.
+
+### Singularity hybrid weights
+
+[Singularity](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity) is an
+FL/Ref fusion fine-tune, not a complete pipeline repository. Keep the official
+model ID for the encoders and VAEs, and select one exact transformer file:
+
+```bash 2×B300 hybrid checkpoint
+pip install comfy-kitchen
+
+WEIGHTS=WarmBloodAban/Minimax-h3_Singularity/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors
+sglang serve --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant hybrid \
+  --component-weights-paths.transformer "$WEIGHTS" \
+  --num-gpus 2 --ulysses-degree 2 --performance-mode speed \
+  --port 30000
+```
+
+For the full INT8 checkpoint, replace the filename with
+`Minimax-h3_Singularity_ref2va_v1.3_int8.safetensors`. SGLang downloads the
+selected file automatically. Do not add an online quantization override.
+`hybrid` requires an explicit weight override; it does not convert the official
+Ref2VA weights into a multimode model. Request `task` and `conditions` retain
+their [usual meanings](#4-generate-video-and-audio), including `conditions: []`
+for `t2va` and keyframes for `fl2va`.
+
+Start with `quality: "lossless"` and the standard 50-point schedule. Here
+`lossless` disables additional request-time approximations; it does not undo
+INT8 quantization, pruning, or fine-tuning. The author's recommended Ref2V
+Turbo LoRA is a separate optional adapter, not an automatically inferred
+4-step schedule. Reference fidelity can differ from the official model; see
+the [author's guidance](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity/discussions/1)
+before applying the [LoRA sampling contract](#5-lora-recipes).
 
 ### Advanced: precomputed AdaLN cache
 
@@ -1122,6 +1187,59 @@ benchmark latency as well as visual and audio quality on the target workload.
 
 </Tab>
 
+<Tab title="SubBlock sparse attention">
+
+SubBlock sparse attention applies training-free block sparsity to MiniMax-H3's
+long, non-causal DiT self-attention. The BF16 path supports CUDA SM90, SM100,
+and SM120. Other compute capabilities, including SM103/B300, are rejected.
+Ulysses sequence parallelism is supported; Ring parallelism is not.
+
+The global backend selects the H3 DiT lazily, so keep the Qwen text encoder on
+its compatible dense backend with a component override:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --attention-backend subblock_sparse_attn \
+  --component-attention-backends text_encoder=fa \
+  --attention-backend-config '{"sparsity": 0.75, "skip_first_steps": 10}' \
+  --port 30010
+```
+
+Use `text_encoder=torch_sdpa` on SM120. The default configuration drops at
+most 75% of key blocks after the first 10 denoise forwards; short sequences,
+cross-attention, and unsupported shapes continue on the dense path. Tune
+`sparsity` and `skip_first_steps` together with visual and audio quality checks.
+
+On H100/H200 (SM90), `compute_mode=sage_fp8` switches the sparse kernel to
+online INT8 Q/K and FP8 P/V compute. Install the optional kernel and add the
+compute mode:
+
+```bash Command
+pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation
+
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --attention-backend subblock_sparse_attn \
+  --component-attention-backends text_encoder=fa \
+  --attention-backend-config '{"compute_mode": "sage_fp8", "sparsity": 0.75}' \
+  --port 30010
+```
+
+<Warning>
+Both SubBlock routing and `sage_fp8` are approximate. Use dense BF16 attention
+for consistency ground truth, and validate the selected sparsity on the target
+resolution, duration, task, and checkpoint.
+</Warning>
+
+</Tab>
+
 <Tab title="Encoder scheduling">
 
 The picker explicitly writes `--encoder-parallel auto` in every single-node
@@ -1181,12 +1299,41 @@ the configurations with collected measurements:
 | --- | --- | --- |
 | B300 | 8× Ulysses8 resident | 8× FSDP + Ulysses8; the 8-GPU sweep is not a minimum-GPU claim. |
 | B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
+| GB300 | 4× Ulysses4 resident (FL2VA T2VA) | 2 nodes × 4× Ulysses4×Ring2 is unverified. |
+| GB200 | 4× Ulysses4 resident, derived/unverified | No performance measurements. |
 | H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2; 2 nodes × 8× Ulysses8×Ring2 cross-node |
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | Ascend NPU | 8 NPUs, TP2 + SP4, Laser Attention | 4 NPUs, TP2 + SP2, Laser Attention |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
 | RTX 4090 24 GB | 1× layerwise offload + `kitchen_int8` | Approximate attention backends are opt-in |
+
+### GB300 single-host
+
+Four requests on **1 host × 4 NVIDIA GB300**, using Linux ARM64, SGLang main
+[`15d2cbcc90fc`](https://github.com/sgl-project/sglang/commit/15d2cbcc90fc66b4d08745994cc707a45b067ffc),
+PyTorch 2.13.0+cu130, and NCCL 2.29.7. The source checkout was installed with
+`python3 -m pip install -e "python[diffusion]" --upgrade` inside
+`lmsysorg/sglang:latest`; this is a source-validation environment, not a claim
+that the image's bundled release contains that revision.
+
+The command matches the GB300 default in the builder: Ulysses4, resident
+weights, automatic encoder folding, native BF16/FP32, platform-default
+Dynamic cuDNN/FA attention, and eager execution. The model was downloaded by
+`sglang serve` from `MiniMaxAI/MiniMax-H3`.
+
+The workload uses the builder's cat-band prompt, FL2VA T2VA, a 5-second request
+at a 768-pixel short edge, 50 inference steps, `quality="lossless"`, one output,
+and seed 1101. Every MP4 contained video and audio and passed a full decode check.
+
+| First full request after server warmup | Following three requests | Warm median |
+| ---: | --- | ---: |
+| 35.16 s | 33.11 / 33.10 / 33.10 s | **33.10 s** |
+
+These are client-observed completion times, including up to one second of
+status-polling delay. Download, model loading, and server warmup are excluded.
+This is a deployment smoke/latency measurement, not a cross-framework quality
+audit, a minimum-GPU claim, or an extrapolation to GB200/NVL72 scaling.
 
 ### Ascend NPU topology comparison
 
@@ -1440,6 +1587,15 @@ surface. The [builder at the top of this page](#1-quick-start) has consumer
 cards and a Host RAM selector: pick your budget and it emits this command with
 your tier's measured expectations attached as comments. The table below is the
 same data in one view.
+
+**Unified-memory machines are the exception**: on a DGX Spark (GB10, 128 GB
+shared between CPU and GPU) launch with **no flags at all**. The deployment
+still exceeds the pool, automatic offload engages on its own, and its placement
+beat the explicit recipe above by 2.1× on the denoise (12.1 vs 25.8 s/it
+measured on the same box) — the VRAM/host split that justifies every flag in
+this section does not exist there. Expect ~12 min of load, a ~5.5 min text
+encoding stage per request (steady-state compute on this chip, not a stall),
+and ~12 min per warm 480P request.
 
 **Two budgets, and what each one buys**
 

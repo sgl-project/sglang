@@ -23,13 +23,15 @@ from sglang.srt.entrypoints.openai.serving_responses import (
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class InputMessageConstructionTestCase(CustomTestCase):
@@ -620,11 +622,44 @@ class MultimodalRequestTestCase(CustomTestCase):
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
+    def test_multimodal_token_first_specs_route_through_prompt_ids(self):
+        """Bug regression: token-first encoders leave prompt == "" with
+        non-empty prompt_ids; forwarding the empty text 400s in
+        _tokenize_texts, so the multimodal branch must forward prompt_ids."""
+        for spec in ("inkling", "kimi_k3"):
+            with self.subTest(spec=spec):
+                serving = make_serving(is_multimodal=True)
+                serving.chat_encoding_spec = spec
+                serving._process_messages = Mock(
+                    return_value=MessageProcessingResult(
+                        prompt="",
+                        prompt_ids=[4, 5, 6],
+                        image_data=None,
+                        audio_data=None,
+                        video_data=None,
+                        modalities=[],
+                        stop=[],
+                    )
+                )
+                request = ResponsesRequest(model="x", input="hi", store=False)
+
+                _, request_prompts, engine_prompts, _ = asyncio.run(
+                    serving._make_request(
+                        request, None, serving.tokenizer_manager.tokenizer
+                    )
+                )
+
+                self.assertEqual(engine_prompts, [[4, 5, 6]])
+                self.assertEqual(request_prompts, [[4, 5, 6]])
+
 
 class OutputItemsTestCase(CustomTestCase):
     def setUp(self):
         # qwen3_coder is the default for this class; the one no-native-parser
         # case overrides it.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.serving = make_serving()
         self.serving.tool_call_parser = "qwen3_coder"
 

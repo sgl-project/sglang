@@ -70,7 +70,7 @@ impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
         &self,
         tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
         unimplemented!()
@@ -119,6 +119,8 @@ fn finalize_match_result_default_returns_result_unchanged() {
     let out = DefaultComponentForTest.finalize_match_result_in_tree_core(
         &tc,
         result,
+        tc.arena.root(),
+        tc.arena.root(),
         &MatchPrefixParams {
             key: &Vec::new(),
             namespace: Default::default(),

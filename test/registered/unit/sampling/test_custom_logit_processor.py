@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 import json
@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_THINKING,
     END_MESSAGE,
@@ -26,6 +27,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -35,6 +37,48 @@ def _make_req(origin_input_ids=None, output_ids=None):
     req.origin_input_ids = array("q", origin_input_ids or [])
     req.output_ids = array("q", output_ids or [])
     return req
+
+
+class TestApplyCustomLogitProcessor(CustomTestCase):
+    def test_repeats_request_params_for_each_token(self):
+        batch_size = 3
+        num_tokens = 2
+        params = [{"value": 1.0}, {"value": 2.0}, {"value": 3.0}]
+
+        def processor(logits, custom_params):
+            self.assertEqual(
+                custom_params, [params[0], params[0], params[2], params[2]]
+            )
+            for row, param in zip(logits, custom_params, strict=True):
+                row.fill_(param["value"])
+            return logits
+
+        sampling_info = SamplingBatchInfo(
+            temperatures=torch.ones(batch_size, 1),
+            top_ps=torch.ones(batch_size),
+            top_ks=torch.zeros(batch_size, dtype=torch.int32),
+            min_ps=torch.zeros(batch_size),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=4,
+            has_custom_logit_processor=True,
+            custom_params=params,
+            custom_logit_processor={0: (processor, torch.tensor([True, False, True]))},
+            device="cpu",
+        )
+        logits = torch.zeros(batch_size * num_tokens, 4)
+
+        apply_custom_logit_processor(
+            logits, sampling_info, num_tokens_in_batch=num_tokens
+        )
+
+        expected = torch.tensor(
+            [[1.0] * 4, [1.0] * 4, [0.0] * 4, [0.0] * 4, [3.0] * 4, [3.0] * 4]
+        )
+        self.assertTrue(torch.equal(logits, expected))
 
 
 # Serialization round-trip
