@@ -423,14 +423,13 @@ def fused_kda_conv_gating_verify(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; the output,
-    # conv_state and conv-window caches stay bit-identical to the reference.
-    # Only the fp32 intermediate-ssm rollback cache differs: the tl.sum
-    # reduction-order delta (~1 ulp/step) compounds through the delta-rule
-    # recurrence — measured ~6e-8 at T=4 standard gate (the production MTP
-    # shape), ~1.5e-5 at T=4 safe gate, ~2e-3 at T=8 safe gate. num_warps=1
-    # reproduces the reference reduction order exactly (all buffers
-    # bit-identical) but is ~2.4x slower in-graph — numerics debugging only.
+    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; conv_state
+    # and the conv-window cache stay bit-identical to the reference, the bf16
+    # output within one ulp (the BV=4 tile reduces K in a different order).
+    # The fp32 intermediate-ssm rollback cache carries that ~1 ulp/step delta
+    # through the delta-rule recurrence — measured ~6e-8 at T=4 standard gate
+    # (the production MTP shape), ~1.5e-5 at T=4 safe gate, ~2e-3 at T=8 safe
+    # gate. num_warps=1 is ~2.4x slower in-graph — numerics debugging only.
     # The ReplaySSM ring values are bit-exact at any num_warps: they are
     # elementwise (conv FMA chain, gate, sigmoid), upstream of every tl.sum.
     num_warps: int = 4,

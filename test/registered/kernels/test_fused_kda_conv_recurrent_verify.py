@@ -217,7 +217,8 @@ def _compare_case(case, num_warps, use_ring=False):
 
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
-    assert torch.equal(o_ref_v, o_fus_v)
+    # One bf16 ulp: the fused and reference tiles reduce K in different orders.
+    torch.testing.assert_close(o_fus_v, o_ref_v, rtol=2**-7, atol=1e-7)
     assert torch.equal(conv_ref[touched_slots], conv_fus[touched_slots])
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
     if use_ring:
