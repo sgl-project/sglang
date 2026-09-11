@@ -29,7 +29,7 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:v0.5.19-cu130
+docker pull lmsysorg/sglang:v0.5.19
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -57,14 +57,13 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 <Deployment config={config} />
 
 <Note>
-  The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
-  Decoding / Serving Strategy / SSM dtype combination — were validated at
-  ISL 8192 / OSL 1024, concurrency 1; for DFLASH2, to that full standard on
-  NVFP4 and to boot-and-serve on the RTX PRO 6000 BF16/FP8 cells. The DGX Spark
-  cells cover the full combination set — DFLASH2 included — re-measured end to
-  end on `1cf2b8c`, but to a weaker standard: each of the 48 was confirmed to
-  **boot and serve** at ISL 8192 / OSL 1024, concurrency 1, with no throughput
-  or acceptance-length numbers taken.
+  Every cell above — RTX 5090, RTX PRO 6000 and DGX Spark, across all five
+  checkpoints and every Speculative Decoding / Serving Strategy / SSM dtype
+  combination — is measured on **v0.5.19**, the release the Install section
+  pins. That is 202 cells, each one served and scored on the full
+  1319-question GSM8K (93.18-95.15%). The serving envelope behind the pins is
+  ISL 8192 / OSL 1024 at concurrency 1; throughput and acceptance-length
+  numbers were not re-taken in that sweep.
 </Note>
 
 ### Mamba ratio calculator
@@ -232,12 +231,13 @@ row back to Auto.
   scheduler killed with `exit code -15` and no traceback (`journalctl -u
   earlyoom` shows the kill). At 0.85, 15 of the 48 cells were killed that way,
   and which cells is margin noise; at 0.80 every cell served on every attempt.
-  **Validated on SM121 / aarch64**: all 48 configurations (3 checkpoints x
+  **Validated on SM121 / aarch64**: all 80 configurations (5 checkpoints x
   Speculative Decoding x Serving Strategy x Mamba SSM Dtype, DFLASH2 included)
-  booted and served on GB10 at `1cf2b8c` at ISL 8192 / OSL 1024, concurrency 1.
-  That is boot-and-serve coverage only — no throughput or acceptance-length
-  numbers — and it includes the FlashInfer `plan` / `uniform_q_len` path above,
-  which raised no arity error on that build. Three host quirks when reproducing
+  served on GB10 on `v0.5.19` at ISL 8192 / OSL 1024, concurrency 1, and each
+  scored the full 1319-question GSM8K (93.18-95.15%); the float32 and bfloat16
+  halves ran on two separate GB10 boxes. No throughput or acceptance-length
+  numbers were re-taken. The sweep exercises the FlashInfer `plan` /
+  `uniform_q_len` path above, which raised no arity error on that build. Three host quirks when reproducing
   on GB10: docker GPU access is CDI-only (`--device nvidia.com/gpu=all`, as no
   `nvidia` runtime is registered); `nvidia-smi` reports `Not Supported` for
   memory because it is unified with the CPU — gate a relaunch on `MemAvailable`
@@ -291,8 +291,9 @@ row back to Auto.
   --mamba-radix-cache-strategy extra_buffer`, and disabled RadixCache for both
   baseline and DFlash2 to exclude cache warm-up and prefix reuse. The DFlash2
   run added the three flags shown above.
-  Accuracy used zero-shot GSM8K with greedy sampling, `max_new_tokens=2048`,
-  128 examples, and concurrency levels 1, 2, 4, 8, and 16.
+  That comparison's accuracy used zero-shot GSM8K with greedy sampling,
+  `max_new_tokens=2048`, 128 examples, and concurrency levels 1, 2, 4, 8
+  and 16 — a different protocol from this page's own sweep below.
   Validation: every SM12x cell on this page is measured end to end on
   v0.5.19 — 202 cells over the five checkpoints, four speculative options, two
   serving tiers and two GDN state dtypes, full 1319-question GSM8K on each,

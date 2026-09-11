@@ -102,7 +102,7 @@ export const config = {
             ...(["rtx5090", "rtx6000", "dgx-spark"].includes(sel.hw)
               ? ["--enable-linear-replayssm-spec"]
               : []),
-            // Measured on the 5090 at commit 1cf2b8c: fp32 serves at 0.94,
+            // Measured on the 5090 on v0.5.19: fp32 serves at 0.94,
             // bf16 at 0.93. bf16 moved UP from 0.92 with the dense-lm_head
             // checkpoint -- the heavier weights need a larger static budget
             // before the state pool fits.
@@ -147,7 +147,7 @@ export const config = {
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
             "--speculative-draft-attention-backend flashinfer",
-            // Measured on the 5090 at commit 1cf2b8c: bf16 serves at 0.88,
+            // Measured on the 5090 on v0.5.19: bf16 serves at 0.88,
             // below the 0.90 this recipe carried when it was measured on an
             // older build, because a draft model plus the automatic prefill
             // CUDA-graph capture no longer fit there. fp32 is greyed out by the
@@ -221,7 +221,7 @@ export const config = {
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
             "--speculative-num-draft-tokens 8",
-            // Measured on the 5090 at commit 1cf2b8c, the build the Install
+            // Measured on the 5090 on v0.5.19, the build the Install
             // accordion pins. This is the only cell on the page that also needs
             // a prefill chunk smaller than the engine default: at 0.91 the pools
             // fit but a 2048-token chunk's activations do not. The pair together
@@ -388,11 +388,13 @@ export const config = {
   dockerImages: {
     // Every recipe on this page is measured on this release. It is multi-arch
     // (linux/amd64 + linux/arm64), so it pulls natively on DGX Spark's GB10.
-    h200:    "lmsysorg/sglang:v0.5.19-cu130",
-    rtx6000: "lmsysorg/sglang:v0.5.19-cu130",
-    rtx5090: "lmsysorg/sglang:v0.5.19-cu130",
-    "dgx-spark": "lmsysorg/sglang:v0.5.19-cu130",
-    gb300:   "lmsysorg/sglang:v0.5.19-cu130",
+    // This tag and v0.5.19-cu130 are the same image (same digest); the sweep
+    // ran the -cu130 name.
+    h200:    "lmsysorg/sglang:v0.5.19",
+    rtx6000: "lmsysorg/sglang:v0.5.19",
+    rtx5090: "lmsysorg/sglang:v0.5.19",
+    "dgx-spark": "lmsysorg/sglang:v0.5.19",
+    gb300:   "lmsysorg/sglang:v0.5.19",
   },
 
   github: {
@@ -795,12 +797,12 @@ export const config = {
     // leaves ~8GB for the OS — exactly DGX OS earlyoom's SIGTERM threshold —
     // and the first long prefill or boot-time graph capture dips under it and
     // gets the scheduler killed (exit code -15, no traceback; check
-    // `journalctl -u earlyoom`). Re-measured on 1cf2b8c (2026-08-21): at 0.85,
+    // `journalctl -u earlyoom`). Re-measured on v0.5.19: at 0.85,
     // 15 of 48 cells were SIGTERMed, and which 15 is margin noise, biased
     // toward the big-state configs (bfloat16 SSM, DSPARK/DFLASH2 ratios); at
     // 0.80 every cell served on every attempt.
     //
-    // Validated on GB10 (SM121 / aarch64) at 1cf2b8c: all 48 configurations —
+    // Validated on GB10 (SM121 / aarch64) on v0.5.19: all 80 configurations —
     // DFLASH2 included — booted and served at ISL 8192 / OSL 1024,
     // concurrency 1. Boot-and-serve only -- no throughput or acceptance-length
     // numbers were taken, so this is a weaker standard than the SM120 pair's
@@ -810,7 +812,7 @@ export const config = {
     // 12-cell DFLASH2 pass.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-bf16-head", nodes: "single" },
-      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // All 16 overlay combinations served on GB10 on v0.5.19, DFLASH2
       // included — its selector folded into the draft CUDA graph in all four
       // of its cells here.
       verified: true,
@@ -832,7 +834,7 @@ export const config = {
       // Same recipe as the BF16-head cell above: the FP4 head is smaller,
       // so anything that fits the bf16 head fits here with room to spare.
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
-      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // All 16 overlay combinations served on GB10 on v0.5.19, DFLASH2
       // included — its selector folded into the draft CUDA graph in all four
       // of its cells here.
       verified: true,
@@ -852,8 +854,7 @@ export const config = {
     },
     {
       // NVIDIA's ModelOpt export of the same W4A4 body as the RadixArk FP4-head
-      // checkpoint, on that cell's recipe. It was not part of the 1cf2b8c GB10
-      // sweep, so it does not inherit that platform's boot-and-serve coverage.
+      // checkpoint, on that cell's recipe.
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
       // Re-measured against this export on v0.5.19: all 16 overlay
       // combinations serve at these pins and score 94.16-95.07% on the full
@@ -876,7 +877,7 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
-      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // All 16 overlay combinations served on GB10 on v0.5.19, DFLASH2
       // included. This checkpoint held the sweep's most earlyoom-prone cells
       // at 0.85 (every bfloat16-SSM pick was killed); all clean at 0.80.
       verified: true,
@@ -896,7 +897,7 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "bf16", nodes: "single" },
-      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // All 16 overlay combinations served on GB10 on v0.5.19, DFLASH2
       // included. Heaviest checkpoint (52GB, ~6.5 min to load its 18 shards
       // from NVMe — budget ~10 min to READY before calling a boot hung).
       verified: true,
