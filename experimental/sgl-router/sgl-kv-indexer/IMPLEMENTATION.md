@@ -32,6 +32,8 @@
 - 实测：`PYTHONPATH=python python -m pytest test/registered/unit/disaggregation/test_kv_snapshot_v2.py test/registered/unit/disaggregation/test_kv_events.py -q`，26 passed，22 subtests passed；存在基线 pytest 配置/torch 弃用警告。
 - Indexer：新增独立 KVReplica 协议与完整 flat placement，stream owner/session、staging chunks、barrier commit、sequence fencing、replay 缺口位置反馈、coverage、lease 和 stream 删除。旧无条件写 API 不可修改可恢复副本状态。
 - 实测：`cargo test -p sgl-kv-indexer`，80 library + 4 binary + 10 gRPC contract + 29 memory integration + 6 recovery tests 全部通过。
+- Bridge：`KV_BRIDGE_CONFIG` 指向 JSON 配置，包含一个 Indexer endpoint 与多个 Worker URL；定时重读配置、发现 DP streams，按 stream 订阅；256 条/32 MiB live 缓冲与每副本 snapshot 并发限制，overflow 重新恢复。缺口优先 Replay v2，不完整则 snapshot。
+- 实测：`PYTHONPATH=python .venv/bin/python -m pytest experimental/sgl-router/sgl-kv-indexer/tests/test_replica_processes.py -q`，1 passed（13.44s）；覆盖 2 production publishers + 2 Rust Bridge + 2 Rust Indexer、初始 snapshot、live 增删、kill/restart Indexer、第三副本加入、Worker epoch 更换与成员移除。此测试未启动 Router 或模型推理，不能代替最终 2 Worker/1 Router 验收。
 
 ## 验收证据
 

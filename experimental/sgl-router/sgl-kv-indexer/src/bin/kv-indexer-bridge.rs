@@ -12,6 +12,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    if let Ok(path) = std::env::var("KV_BRIDGE_CONFIG") {
+        tokio::select! {
+            result = sgl_kv_indexer::replica_bridge::run_file(&path) => result?,
+            _ = shutdown_signal() => {},
+        }
+        return Ok(());
+    }
     let config = BridgeConfig::from_env()?;
     run_bridge_until(config, shutdown_signal()).await?;
     Ok(())

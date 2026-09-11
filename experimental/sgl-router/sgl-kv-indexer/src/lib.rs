@@ -8,6 +8,7 @@
 pub mod bridge;
 pub mod client;
 pub mod replica;
+pub mod replica_bridge;
 
 pub mod pb {
     tonic::include_proto!("kv_indexer.v1");

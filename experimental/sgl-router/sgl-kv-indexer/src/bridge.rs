@@ -591,6 +591,14 @@ fn decode_event_batch_impl(
 }
 
 fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeError> {
+    decode_event_mode(event, actions, false)
+}
+
+fn decode_event_mode(
+    event: &Value,
+    actions: &mut EventActions,
+    v2: bool,
+) -> Result<(), BridgeError> {
     let event = expect_array(event, "KV event")?;
     let event_type = expect_str(
         event
@@ -613,6 +621,7 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
             // `component_types` is the trailing slot: a list of component labels
             // folded into a bitmask, or nil/absent for a legacy whole-block store.
             let mask = match event.get(7) {
+                Some(Value::Map(_)) if v2 => None, // cache_salt metadata extension
                 Some(value) => decode_component_mask(value)?,
                 None => None,
             };
@@ -620,6 +629,7 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
             // where the query path needs it to accumulate trailing windows.
             let block_size = match mask {
                 Some(_) => Some(decode_block_size(&event[4])?),
+                None if v2 => Some(decode_block_size(&event[4])?),
                 None => None,
             };
             actions.report(
@@ -647,6 +657,51 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
         }
     }
     Ok(())
+}
+
+/// Recoverable streams fail a batch as a whole on unknown data. Advancing the
+/// sequence after silently skipping a mutation would falsely certify coverage.
+pub(crate) fn decode_recoverable_batch(
+    payload: &[u8],
+    rank: u32,
+) -> Result<Vec<ExternalKvAction>, BridgeError> {
+    let mut cursor = Cursor::new(payload);
+    let value = read_value(&mut cursor).map_err(|e| BridgeError::Decode(e.to_string()))?;
+    if cursor.position() as usize != payload.len() {
+        return Err(BridgeError::Decode("trailing batch bytes".into()));
+    }
+    let batch = expect_array(&value, "KVEventBatch")?;
+    if batch.len() != 3 || batch[2].as_u64() != Some(rank as u64) {
+        return Err(BridgeError::Decode("batch DP rank mismatch".into()));
+    }
+    let mut actions = EventActions::default();
+    for event in expect_array(&batch[1], "events")? {
+        // Shared external storage is outside local HBM/DRAM/SSD placement.
+        let fields = expect_array(event, "event")?;
+        let tier_index = match fields.first().and_then(Value::as_str) {
+            Some("BlockStored") => Some(6),
+            Some("BlockRemoved") => Some(2),
+            _ => None,
+        };
+        if tier_index
+            .and_then(|i| fields.get(i))
+            .and_then(Value::as_str)
+            == Some("EXTERNAL")
+        {
+            continue;
+        }
+        decode_event_mode(event, &mut actions, true)?;
+    }
+    let config = BridgeConfig {
+        worker_id: String::new(),
+        worker_address: String::new(),
+        event_endpoint: String::new(),
+        event_topic: String::new(),
+        indexer_endpoint: String::new(),
+        clear_tiers: vec![1, 2, 3],
+        cache_spec: None,
+    };
+    Ok(build_apply_request(&config, 0, actions).actions)
 }
 
 fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {

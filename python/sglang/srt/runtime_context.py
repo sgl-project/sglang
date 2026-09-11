@@ -2211,7 +2211,17 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
         "topic": cfg.topic,
         "block_size": kv_event_block_size_of(resolved),
         "dp_size": resolved.dp_size,
+        "namespace": cfg.namespace,
+        "worker_id": cfg.worker_id,
+        "model": cfg.model,
+        "hash_schema_version": cfg.hash_schema_version,
+        "is_bigram": cfg.is_bigram,
+        "snapshot_versions": [1, 2],
     }
+    resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
+    if resolved_replay is not None:
+        descriptor["replay_endpoint_host"] = resolved_replay[0]
+        descriptor["replay_endpoint_port_base"] = resolved_replay[1]
     resolved_snapshot = parse_advertisable_tcp(cfg.snapshot_endpoint)
     if resolved_snapshot is not None:
         snapshot_host, snapshot_port = resolved_snapshot

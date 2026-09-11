@@ -8,6 +8,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
 
     tonic_prost_build::configure()
+        .type_attribute(
+            "WorkerCacheSpec",
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(default)]",
+        )
         .build_client(true)
         .build_server(true)
         .compile_with_config(config, &["proto/kv_indexer.proto"], &["proto"])?;
