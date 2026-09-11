@@ -705,6 +705,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            dsa_variant=(
+                self._resolve_dsa_variant(forward_batch)
+                if self.disable_padding
+                else None
+            ),
         )
 
         is_bs_supported = (

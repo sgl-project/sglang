@@ -1530,8 +1530,8 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
+                draft_num = forward_batch.input_ids.shape[0] // bs
                 bs = len(forward_batch.req_pool_indices)
-                draft_num = spec_info.draft_token_num
 
                 if self._use_unified_verify:
                     page_table, qo_indptr, max_q_len, swa_page_table = (
@@ -2797,7 +2797,9 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
+                        seqused_k=(
+                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        ),
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
