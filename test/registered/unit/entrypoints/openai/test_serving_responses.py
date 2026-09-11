@@ -629,9 +629,8 @@ class MultimodalRequestTestCase(CustomTestCase):
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
     def test_multimodal_token_first_specs_route_through_prompt_ids(self):
-        """Bug regression: token-first encoders leave prompt == "" with
-        non-empty prompt_ids; forwarding the empty text 400s in
-        _tokenize_texts, so the multimodal branch must forward prompt_ids."""
+        """Multimodal requests must preserve custom-encoder token IDs;
+        an empty text prompt must not replace them."""
         for spec in ("inkling", "kimi_k3", "custom_encoder"):
             with self.subTest(spec=spec):
                 serving = make_serving(is_multimodal=True)
