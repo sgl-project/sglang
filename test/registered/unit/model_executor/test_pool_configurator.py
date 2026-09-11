@@ -924,7 +924,7 @@ class TestFactory(CustomTestCase):
 
 
 class TestSWARequestSizing(CustomTestCase):
-    def _configurator(self, **overrides):
+    def _configurator(self, *, draft_cell_size=None, **overrides):
         fields = dict(
             is_hybrid_swa=True,
             full_attention_layer_ids=[0],
@@ -938,6 +938,9 @@ class TestSWARequestSizing(CustomTestCase):
         )
         fields.update(overrides)
         mr = _make_model_runner(self, **fields)
+        if draft_cell_size is not None:
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config.dflash_draft_cell_size_per_token = draft_cell_size
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
@@ -988,6 +991,15 @@ class TestSWARequestSizing(CustomTestCase):
                 self.assertRaisesRegex(ValueError, "request is unavailable"),
             ):
                 self._configurator(swa_sizing_policy="request", **fields)
+
+    def test_request_reservation_accounts_for_dflash_draft(self):
+        cfg = self._configurator(draft_cell_size=256)
+        budget = 8 << 20
+        sizes = cfg.calculate_pool_sizes(budget, 16)
+        used = sizes.max_total_num_tokens * (1024 + 256)
+        used += sizes.swa_max_total_num_tokens * 1024
+        self.assertLessEqual(used, budget)
+        self.assertGreater(used + 16 * (1024 + 256), budget)
 
     def test_token_limit_cannot_increase_either_pool(self):
         cfg = self._configurator()

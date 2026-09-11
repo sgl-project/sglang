@@ -922,7 +922,7 @@ class SWARequestPoolConfigurator(HybridSWAPoolConfigurator):
                 available_bytes, page_size, fixed_swa_tokens=swa_tokens
             )
         else:
-            full_cell_size = self._full_pool_bytes_per_token()
+            full_cell_size = self._full_pool_bytes_per_token() + self._draft_cell_size
             full_tokens = (
                 int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
             ) * page_size
