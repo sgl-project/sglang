@@ -86,7 +86,10 @@ export const config = {
           // DSpark starves runtime activations and wants it DOWN), so each
           // option strips the cell's value and re-pins its own.
           stripPrefixes: (sel) =>
-            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
+            sel.hw === "rtx5090"
+              ? ["--mem-fraction-static", "--mamba-full-memory-ratio",
+                 "--max-total-tokens"]
+              : [],
           flags: (sel) => [
             "--speculative-algorithm EAGLE",
             "--speculative-num-steps 3",
@@ -107,6 +110,22 @@ export const config = {
               ? [sel.ssmDtype === "float32"
                   ? "--mem-fraction-static 0.94"
                   : "--mem-fraction-static 0.93"]
+              : []),
+            // The dense-lm_head export is the one case where replayssm's tiny
+            // state pool still is not enough: its head costs ~3.2GB more at
+            // runtime, and at fp32 the default split leaves the pool short of
+            // its slots. Measured on v0.5.19 - the published pins alone, and
+            // the KV cap alone, both fail to boot here. Balanced ratio,
+            // r = S * token_equiv / L with D = 0 (replayssm moves the draft's
+            // intermediate states onto a fixed ring), S = 5 / 4 and
+            // token_equiv = 4923 for an fp32 state slot against an fp8 KV token.
+            ...(sel.hw === "rtx5090" &&
+                sel.quant === "nvfp4-bf16-head" &&
+                sel.ssmDtype === "float32"
+              ? ["--max-total-tokens 16384",
+                 sel.tier === "low-latency"
+                   ? "--mamba-full-memory-ratio 2.67"
+                   : "--mamba-full-memory-ratio 2.14"]
               : []),
           ],
         },

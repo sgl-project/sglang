@@ -192,8 +192,9 @@ NVIDIA's own export is that same W4A4 body with that same FP4 head: identical
 quantized-layer map (FP8 attention and GDN projections, NVFP4 MLPs), identical
 tensor set, identical 21.9 GB on disk. On GB300, RTX PRO 6000 and DGX Spark its
 cells reuse the FP4-head pins unchanged, and both SM12x grids have been
-re-measured against this export: all 16 overlay combinations per card serve and
-score 94.09-94.84% on the full 1319-question GSM8K.
+re-measured against this export on v0.5.19: all 16 overlay combinations per
+card serve and score 94.01-95.00% (RTX PRO 6000) and 94.16-95.07% (DGX Spark)
+on the full 1319-question GSM8K.
 
 The RTX 5090 is measured too — all 15 overlay combinations it offers serve and
 score 93.93-94.92% — and every winning launch command there is identical to the
