@@ -2283,15 +2283,11 @@ def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
     # copies do not fit: the mapping is re-read from the drive every pass
     manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
     assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
-    monkeypatch.setattr(
-        layerwise_offload_mod, "host_copies_would_not_fit", lambda _b: True
-    )
     assert manager._ensure_mapped_courier().direct_read
 
-    # the host can cache it: keep the page cache path
-    (tmp_path / "cached").mkdir()
-    cached = _mapped_manager(tmp_path / "cached", monkeypatch, available_gib=0.001)
+    # the same mapping on a host that can cache it keeps the page-cache path
     monkeypatch.setattr(
-        layerwise_offload_mod, "host_copies_would_not_fit", lambda _b: False
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: False
     )
-    assert not cached._ensure_mapped_courier().direct_read
+    manager._mapped_courier = None
+    assert not manager._ensure_mapped_courier().direct_read
