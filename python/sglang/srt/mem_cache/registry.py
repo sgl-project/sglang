@@ -263,6 +263,18 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             "option that selected another tree cache for this model."
         )
 
+    if get_memory().radix_eviction_policy == "tlru":
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # T-LRU's per-node tail bookkeeping only exists on the unified tree;
+        # any other cache would silently fall back to LRU ordering.
+        if not isinstance(cache, UnifiedRadixCache):
+            raise ValueError(
+                "--radix-eviction-policy tlru requires UnifiedRadixCache, but "
+                f"tree_cache is {type(cache).__name__}. Drop the flag or the "
+                "option that selected another tree cache for this model."
+            )
+
     hicache_attached = cache.cache_controller is not None
     streaming_wrapped = False
     if (

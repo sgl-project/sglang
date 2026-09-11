@@ -35,8 +35,11 @@ class Memory(msgspec.Struct):
             help=(
                 "The eviction policy of radix trees. 'lru' stands for Least "
                 "Recently Used, 'lfu' stands for Least Frequently Used, 'slru' "
-                "stands for Segmented Least Recently Used, and 'priority' evicts "
-                "lower-priority requests first. See "
+                "stands for Segmented Least Recently Used, 'priority' evicts "
+                "lower-priority requests first, and 'tlru' stands for "
+                "Tail-Optimized LRU (arXiv:2510.15152), which evicts the part of "
+                "a conversation that cannot affect tail TTFT before falling back "
+                "to LRU. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
@@ -48,10 +51,13 @@ class Memory(msgspec.Struct):
         Arg(
             help=(
                 "Tuning parameters for --radix-eviction-policy, as a json object "
-                "passed to the policy as keyword arguments. Only 'slru' takes any "
-                "today: protected_threshold (int, default 2), e.g. "
-                "'{\"protected_threshold\": 4}'. An unrecognized key fails at "
-                "startup, naming the key and the policy. See "
+                "passed to the policy as keyword arguments. 'slru' takes "
+                "protected_threshold (int, default 2), e.g. "
+                "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
+                "next_prompt_estimate (ints, tokens), e.g. "
+                "'{\"threshold\": 4096, \"next_prompt_estimate\": 512}'. An "
+                "unrecognized key fails at startup, naming the key and the "
+                "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
                 "for the full parameter list."
             ),

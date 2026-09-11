@@ -163,6 +163,24 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disable-priority-preemption when priority scheduling is enabled."
         )
 
+    if cfg.radix_eviction_policy == "tlru":
+        tlru_config = cfg.radix_eviction_policy_config or {}
+        threshold = tlru_config.get("threshold", 0)
+        next_prompt_estimate = tlru_config.get("next_prompt_estimate", 0)
+        if threshold < 0 or next_prompt_estimate < 0:
+            raise ValueError(
+                "--radix-eviction-policy tlru requires non-negative 'threshold' and "
+                "'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} and {next_prompt_estimate}."
+            )
+        if threshold <= next_prompt_estimate:
+            raise ValueError(
+                "--radix-eviction-policy tlru needs 'threshold' greater than "
+                f"'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} <= {next_prompt_estimate}; otherwise no tokens are "
+                "ever TEL-safe and T-LRU is exactly LRU."
+            )
+
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "

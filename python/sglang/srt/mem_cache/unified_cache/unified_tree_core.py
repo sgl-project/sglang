@@ -127,6 +127,10 @@ class UnifiedTreeNode:
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
+        # T-LRU only (0 under other policies): tokens root -> self, and the
+        # branch's high-water depth, which survives tail trimming.
+        self._tlru_cached_prefix_len = 0
+        self._tlru_history_len = 0
         self.external_cache_stored = False
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
@@ -172,6 +176,28 @@ class UnifiedTreeNode:
             chunks.append(node.hash_value)
             node = node.parent
         return [value for chunk in reversed(chunks) for value in chunk]
+
+
+def _set_tlru_lens_and_raise_history(
+    node: UnifiedTreeNode, parent: UnifiedTreeNode
+) -> None:
+    """Record a new node's path depth and raise the branch high-water mark.
+
+    The walk stops early only at an ancestor whose subtree already reached this
+    depth (e.g. under a deeper sibling); a conversation that keeps setting a new
+    high-water mark walks its whole root path, so an insert costs O(path nodes)
+    in the worst case. The path length is bounded by the number of node segments
+    (roughly extend/split operations, not tokens), and the walk only runs under
+    --radix-eviction-policy tlru.
+    """
+    assert node.key is not None
+    node._tlru_cached_prefix_len = parent._tlru_cached_prefix_len + len(node.key)
+    if node._tlru_history_len < node._tlru_cached_prefix_len:
+        node._tlru_history_len = node._tlru_cached_prefix_len
+    cur = parent
+    while cur is not None and cur._tlru_history_len < node._tlru_cached_prefix_len:
+        cur._tlru_history_len = node._tlru_cached_prefix_len
+        cur = cur.parent
 
 
 class UnifiedLRUList:
@@ -410,6 +436,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
         )
+        # The node _tlru_* lens are read only by TLRUStrategy.get_priority;
+        # every other policy skips the per-insert bookkeeping entirely.
+        self.tlru_bookkeeping = params.eviction_policy.lower() == "tlru"
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -1222,6 +1251,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time
+        if self.tlru_bookkeeping:
+            # A split adds no depth to the branch: the new parent sits at
+            # split_len tokens and inherits the branch's high-water mark, while
+            # child keeps its own depth because its path length is unchanged.
+            new_node._tlru_cached_prefix_len = (
+                new_node.parent._tlru_cached_prefix_len + split_len
+            )
+            new_node._tlru_history_len = child._tlru_history_len
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
 
@@ -1276,6 +1313,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
         new_node.key = key
+        if self.tlru_bookkeeping:
+            _set_tlru_lens_and_raise_history(new_node, parent)
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -2013,6 +2052,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node = self._new_node(priority=node.priority)
         new_node.parent = node
         new_node.key = key
+        if self.tlru_bookkeeping:
+            _set_tlru_lens_and_raise_history(new_node, node)
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node
