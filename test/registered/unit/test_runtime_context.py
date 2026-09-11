@@ -1591,19 +1591,26 @@ class TestDerivedWidths(_IsolatedOverrides):
             self.assertEqual(attn_dp_size, widths["attn_dp_size"])
 
     def test_recomputing_from_published_leaves_matches_the_publish_bag(self):
-        """§6e's precondition for deleting `initialize_model_parallel`'s full
-        stamp: does anything between that stamp and `publish` depend on the
-        stamp giving a *different* answer than the bag already has? It
-        cannot, for any of the three real callers -- every one of them
-        forwards leaves read off this same published bag
-        (`ps.attn_dp_size`/`ps.moe_ep_size`/etc. in `scheduler.py`, or the
-        daemon's own already-published config), through the very functions
-        (`derive_attention_widths`, `derive_parallel_widths`) the bag itself
-        was projected with. This pins that across the widths
+        """When a caller forwards leaves read off its own already-published
+        bag into `initialize_model_parallel` -- `scheduler.py`'s
+        `ps.attn_dp_size`/`ps.moe_ep_size`/etc, or the weight-cache daemon's
+        own already-published config -- the stamp it produces cannot differ
+        from what `publish` already put in the bag: same formula
+        (`derive_attention_widths`, `derive_parallel_widths`), same inputs.
+        This pins that agreement across the widths
         `test_the_rank_helper_agrees_with_the_stamp` does not vary --
-        moe_ep_size, moe_dp_size, and dcp_size -- using real `publish()`,
-        not bare integers, so a change to either the projection or a
-        caller's forwarding would surface here.
+        moe_ep_size, moe_dp_size, and dcp_size -- using real `publish()`.
+
+        This is *not* a general argument that the stamp is redundant and
+        safe to delete -- 16-field-registry-design.md §6e floated exactly
+        that, and it does not hold in general: see
+        `test_initialize_model_parallel_corrects_a_stale_publish` right
+        below, where a caller (this is the real shape of
+        `test/registered/eplb/test_lplb_distributed.py`'s harness, checked
+        on real 2-GPU hardware) publishes a placeholder config and then
+        builds real groups at a width the published bag never reflects. The
+        stamp is what makes `get_parallel().attn_tp_size` answer with the
+        width actually built in that case, not this one.
         """
         shapes = (
             dict(tp_size=8),
@@ -1640,6 +1647,68 @@ class TestDerivedWidths(_IsolatedOverrides):
                     dcp_enabled=parallel.dcp_size > 1,
                 )
                 self.assertEqual(published, recomputed)
+
+    def test_initialize_model_parallel_corrects_a_stale_publish(self):
+        """The counter-example to the test above, and to §6e's "delete the
+        full stamp" idea: publish a placeholder config (tp_size defaults to
+        1), then build real distributed groups at a width the published bag
+        never reflects -- exactly what
+        `test/registered/eplb/test_lplb_distributed.py` does, publishing
+        `ServerArgs(model_path="dummy")` and then calling
+        `initialize_model_parallel(tensor_model_parallel_size=world_size,
+        expert_model_parallel_size=world_size)`. Confirmed on real 2-GPU
+        hardware: without the stamp, `get_parallel().attn_tp_size` answers
+        1 (the stale published leaf) after building width-2 groups; with
+        it, 2 (what was actually built). Mocked here so the same guard
+        runs without GPUs.
+        """
+        from unittest.mock import Mock
+
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.assertEqual(get_parallel().attn_tp_size, 1)
+        self.assertEqual(get_parallel().moe_ep_size, 1)
+
+        world_size = 8
+        with (
+            patch.object(parallel_state, "_WORLD", None),
+            patch.object(parallel_state, "_TP", None),
+            patch.object(parallel_state, "_DCP", None),
+            patch.object(parallel_state, "_ATTN_CP", None),
+            patch.object(parallel_state, "_ATTN_TP", None),
+            patch.object(parallel_state, "_MOE_DP", None),
+            patch.object(parallel_state, "_MOE_EP", None),
+            patch.object(parallel_state, "_MOE_TP", None),
+            patch.object(parallel_state, "_PP", None),
+            patch.object(parallel_state, "_SELF_PP", None),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=world_size),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_backend", return_value="nccl"),
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                return_value=Mock(device_group=Mock()),
+            ),
+            patch.object(parallel_state, "get_world_group") as mock_world_group,
+        ):
+            mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=world_size,
+                expert_model_parallel_size=world_size,
+            )
+        self.addCleanup(parallel_state.destroy_model_parallel)
+
+        self.assertEqual(
+            get_parallel().attn_tp_size,
+            world_size,
+            "the stamp should have corrected the stale published leaf to "
+            "the width actually built",
+        )
+        self.assertEqual(get_parallel().moe_ep_size, world_size)
 
 
 class TestTheDerivedHalfIsDeclared(CustomTestCase):
