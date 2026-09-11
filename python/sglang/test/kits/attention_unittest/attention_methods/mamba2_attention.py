@@ -274,6 +274,7 @@ class TinyMamba2ModelConfig:
         self.swa_v_head_dim = case.head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False
