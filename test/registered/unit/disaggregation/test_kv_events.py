@@ -7,11 +7,16 @@ the router can subscribe per replica (the `dp_size` it reads from
 `/server_info`).
 """
 
+import atexit
+import tempfile
+import time
 import unittest
 
 import msgspec
+import zmq
 
 from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
     BlockStored,
     BlockStoredMetadata,
     BlockStoredWithMetadata,
@@ -183,6 +188,86 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
                     for a in range(dp_size)
                 }
                 self.assertEqual(len(ranks), dp_size)
+
+
+class TestIpcPublisherEndpoints(unittest.TestCase):
+    def test_endpoint_offsets(self):
+        for endpoint, rank_one in (
+            ("ipc:///tmp/kv-events.sock", "ipc:///tmp/kv-events.sock_dp1"),
+            ("ipc:///tmp/tcp-events.sock", "ipc:///tmp/tcp-events.sock_dp1"),
+            ("ipc:///tmp/inproc-events.sock", "ipc:///tmp/inproc-events.sock_dp1"),
+            ("inproc://cache", "inproc://cache_dp1"),
+            ("tcp://*:5557", "tcp://*:5558"),
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(
+                    ZmqEventPublisher.offset_endpoint_port(endpoint, 0), endpoint
+                )
+                self.assertEqual(
+                    ZmqEventPublisher.offset_endpoint_port(endpoint, 1), rank_one
+                )
+        self.assertIsNone(ZmqEventPublisher.offset_endpoint_port(None, 1))
+
+    @unittest.skipUnless(zmq.has("ipc"), "ZeroMQ IPC transport is unavailable")
+    def test_multiple_ranks_publish_and_replay_over_ipc(self):
+        # Keep paths short enough for Unix-domain sockets, including on macOS.
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="kv-ipc-") as directory:
+            endpoint = f"ipc://{directory}/events"
+            replay_endpoint = f"ipc://{directory}/replay"
+            publishers = []
+            sockets = []
+            try:
+                for rank in range(2):
+                    publisher = ZmqEventPublisher(
+                        attn_dp_rank=rank,
+                        endpoint=endpoint,
+                        replay_endpoint=replay_endpoint,
+                    )
+                    publishers.append(publisher)
+                    sub = zmq.Context.instance().socket(zmq.SUB)
+                    sockets.append(sub)
+                    sub.setsockopt(zmq.SUBSCRIBE, b"")
+                    sub.connect(endpoint if rank == 0 else f"{endpoint}_dp{rank}")
+                    replay = zmq.Context.instance().socket(zmq.DEALER)
+                    sockets.append(replay)
+                    replay.connect(
+                        replay_endpoint if rank == 0 else f"{replay_endpoint}_dp{rank}"
+                    )
+
+                for rank, publisher in enumerate(publishers):
+                    sub, replay = sockets[rank * 2 : rank * 2 + 2]
+                    deadline = time.monotonic() + 5
+                    # PUB/SUB has an asynchronous subscription handshake. Retry
+                    # within a deadline instead of relying on a startup sleep.
+                    while True:
+                        publisher.publish(
+                            KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+                        )
+                        if sub.poll(50):
+                            break
+                        self.assertLess(time.monotonic(), deadline)
+                    topic, seq, payload = sub.recv_multipart()
+                    self.assertEqual(topic, b"")
+                    batch = msgspec.msgpack.decode(payload, type=KVEventBatch)
+                    self.assertEqual(batch.attn_dp_rank, rank)
+                    self.assertEqual(batch.events, [AllBlocksCleared()])
+
+                    replay.send_multipart([b"", seq])
+                    replayed = []
+                    while True:
+                        self.assertTrue(replay.poll(5000), "Replay response timed out")
+                        delimiter, replay_seq, replay_payload = replay.recv_multipart()
+                        self.assertEqual(delimiter, b"")
+                        if replay_seq == ZmqEventPublisher.END_SEQ:
+                            break
+                        replayed.append((replay_seq, replay_payload))
+                    self.assertIn((seq, payload), replayed)
+            finally:
+                for sock in sockets:
+                    sock.close(linger=0)
+                for publisher in publishers:
+                    publisher.shutdown()
+                    atexit.unregister(publisher.shutdown)
 
 
 class TestBlockStoredWireFormat(CustomTestCase):
