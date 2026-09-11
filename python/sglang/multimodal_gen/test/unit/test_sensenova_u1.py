@@ -1333,7 +1333,7 @@ def test_sensenova_cache_dit_effective_defaults_reuse_mount(
     stage._maybe_enable_cache_dit(batch, SimpleNamespace())
     assert len(calls["enable"]) == 1
     assert calls["enable"][0][1].kwargs["residual_diff_threshold"] == 0.24
-    assert calls["refresh"] == [(transformer, 12)]
+    assert calls["refresh"] == [(transformer, 12, calls["enable"][0][1])]
     assert calls["disable"] == []
 
     batch.sampling_params.cache_dit_params = {"residual_diff_threshold": 0.1}

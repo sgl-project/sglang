@@ -417,6 +417,56 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertEqual(module.cache_dit.disable_calls, [adapter])
         self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
 
+    def test_partial_custom_mount_is_rolled_back_through_adapter(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+        mounted_adapter = None
+
+        def fail_after_pipeline_context(target, **_kwargs):
+            nonlocal mounted_adapter
+            mounted_adapter = target
+            target._is_normalized = True
+            target.pipe = types.SimpleNamespace()
+            target.pipe._is_cached = True
+            raise RuntimeError("block wrapper failed")
+
+        def disable_cache(target):
+            module.cache_dit.disable_calls.append(target)
+            if hasattr(target.pipe, "_is_cached"):
+                del target.pipe._is_cached
+
+        module.cache_dit.enable_cache = fail_after_pipeline_context
+        module.cache_dit.disable_cache = disable_cache
+
+        with self.assertRaisesRegex(RuntimeError, "block wrapper failed"):
+            module.enable_cache_on_transformer(transformer, config)
+
+        self.assertIs(transformer._sglang_cache_dit_adapter, mounted_adapter)
+        module.disable_cache_on_transformer(transformer)
+        self.assertEqual(module.cache_dit.disable_calls, [mounted_adapter])
+        self.assertFalse(hasattr(mounted_adapter.pipe, "_is_cached"))
+        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
+
+    def test_failed_custom_adapter_normalization_does_not_retain_adapter(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+
+        def fail_before_normalization(_target, **_kwargs):
+            raise RuntimeError("normalization failed")
+
+        module.cache_dit.enable_cache = fail_before_normalization
+
+        with self.assertRaisesRegex(RuntimeError, "normalization failed"):
+            module.enable_cache_on_transformer(transformer, config)
+
+        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
+
 
 if __name__ == "__main__":
     unittest.main()

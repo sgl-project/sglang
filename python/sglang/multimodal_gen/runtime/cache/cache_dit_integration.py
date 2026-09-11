@@ -550,14 +550,26 @@ def enable_cache_on_transformer(
             model_name,
             custom_adapter.forward_pattern,
         )
-    cache_dit.enable_cache(
-        target,
-        cache_config=cache_config,
-        calibrator_config=calibrator_config,
-        parallelism_config=None,
-    )
-    if custom_adapter is not None:
+        # Keep the adapter reachable while cache-dit performs its multi-stage
+        # mount. Cache-DiT creates state on the adapter's fake pipeline before
+        # wrapping transformer blocks, so rollback must retain the adapter.
         transformer._sglang_cache_dit_adapter = custom_adapter
+    try:
+        cache_dit.enable_cache(
+            target,
+            cache_config=cache_config,
+            calibrator_config=calibrator_config,
+            parallelism_config=None,
+        )
+    except Exception:
+        # Normalization precedes cache-dit's mutations. If normalization itself
+        # failed, the adapter cannot be passed to disable_cache and owns no
+        # pipeline state that needs releasing.
+        if custom_adapter is not None and not getattr(
+            custom_adapter, "_is_normalized", False
+        ):
+            del transformer._sglang_cache_dit_adapter
+        raise
 
     if parallelism_config is not None:
         context_manager = getattr(transformer, "_context_manager", None)
