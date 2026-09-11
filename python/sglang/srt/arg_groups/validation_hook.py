@@ -503,6 +503,22 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_sampling_mask_max_tokens(server_args: Any):
+    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
+            "Unset it. To enable sampling masks for disaggregated serving, set "
+            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
+            "--sampling-mask-max-tokens value on both prefill and decode servers."
+        )
+    cfg = resolving_view(server_args)
+    if cfg.sampling_mask_max_tokens <= 0:
+        raise ValueError(
+            "--sampling-mask-max-tokens must be positive "
+            f"(got {cfg.sampling_mask_max_tokens})."
+        )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with

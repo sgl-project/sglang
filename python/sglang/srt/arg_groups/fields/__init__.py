@@ -8,8 +8,10 @@ are declared beside them but are not collected into the record.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any, Dict, List, Tuple, get_type_hints
+
+import msgspec
+import msgspec.structs
 
 from sglang.srt.arg_groups.field_order import POSITIONAL_FIELD_ORDER
 
@@ -46,7 +48,7 @@ def collect_input_fields(
     defaults: Dict[str, Any] = {}
     for source in sources:
         hints = get_type_hints(source, include_extras=True)
-        for field in dataclasses.fields(source):
+        for field in msgspec.structs.fields(source):
             if field.name in annotations:
                 raise ValueError(
                     f"{field.name!r} is declared by both "
@@ -54,25 +56,11 @@ def collect_input_fields(
                     "a field belongs to exactly one namespace"
                 )
             annotations[field.name] = (source, hints[field.name])
-            if field.default is not dataclasses.MISSING:
-                defaults[field.name] = dataclasses.field(
-                    default=field.default,
-                    init=field.init,
-                    repr=field.repr,
-                    hash=field.hash,
-                    compare=field.compare,
-                    metadata=field.metadata,
-                    kw_only=field.kw_only,
-                )
-            elif field.default_factory is not dataclasses.MISSING:
-                defaults[field.name] = dataclasses.field(
-                    default_factory=field.default_factory,
-                    init=field.init,
-                    repr=field.repr,
-                    hash=field.hash,
-                    compare=field.compare,
-                    metadata=field.metadata,
-                    kw_only=field.kw_only,
+            if field.default is not msgspec.NODEFAULT:
+                defaults[field.name] = field.default
+            elif field.default_factory is not msgspec.NODEFAULT:
+                defaults[field.name] = msgspec.field(
+                    default_factory=field.default_factory
                 )
     known = [n for n in POSITIONAL_FIELD_ORDER if n in annotations]
     rest = [n for n in annotations if n not in set(POSITIONAL_FIELD_ORDER)]
