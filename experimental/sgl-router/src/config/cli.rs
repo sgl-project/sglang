@@ -10,12 +10,13 @@ use clap::Parser;
 use std::num::NonZeroU32;
 
 use crate::config::{
-    default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
-    CachePrefixProvider, CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend,
-    EligibilityConfig, FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig,
-    LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
-    SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
+    default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode,
+    ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig, CachePrefixProvider,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
+    FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -35,11 +36,26 @@ const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUE
 pub struct Cli {
     // ---- server ----
     /// Address to bind the HTTP server to.
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value_t = default_host())]
     pub host: String,
     /// Port to bind the HTTP server to.
-    #[arg(long, default_value_t = 30000)]
+    #[arg(long, default_value_t = default_port())]
     pub port: u16,
+    /// Seconds to keep serving after SIGTERM, with `/readyz` returning 503,
+    /// before the server stops accepting — so the endpoint removal reaches
+    /// kube-proxy first. Leave room under terminationGracePeriodSeconds for the
+    /// in-flight drain that follows. If you rely on a readiness probe (rather
+    /// than pod deletion) to deregister, size this above your
+    /// failureThreshold * periodSeconds. 0 disables the pause.
+    #[arg(long, default_value_t = default_shutdown_drain_secs())]
+    pub shutdown_drain_secs: u64,
+    /// The pod's terminationGracePeriodSeconds, if you have raised it from the
+    /// k8s default of 30. Only used to check --shutdown-drain-secs leaves room
+    /// for the in-flight drain at startup: the router cannot read its own pod
+    /// spec, so without this it warns against the default and a deliberately
+    /// long drain has no way to say it is safe.
+    #[arg(long)]
+    pub termination_grace_secs: Option<u64>,
 
     // ---- model (exactly one) ----
     /// Model id this router serves (the OpenAI `model` field).
@@ -581,6 +597,8 @@ impl Cli {
             server: ServerConfig {
                 host: self.host,
                 port: self.port,
+                shutdown_drain_secs: self.shutdown_drain_secs,
+                termination_grace_secs: self.termination_grace_secs,
             },
             observability: ObservabilityConfig {
                 log_level: self.log_level,
@@ -731,6 +749,70 @@ mod tests {
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+        assert_eq!(c.server.shutdown_drain_secs, 5);
+    }
+
+    /// Several values, not just the default: a clamp or a rescale in the
+    /// mapping satisfies any single-value assertion.
+    #[test]
+    fn shutdown_drain_secs_maps_into_config() {
+        for secs in ["0", "17", "1800"] {
+            let c = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://10.0.0.1:30000",
+                "--shutdown-drain-secs",
+                secs,
+            ]))
+            .unwrap();
+            let expected: u64 = secs.parse().unwrap();
+            assert_eq!(
+                c.server.shutdown_drain_secs, expected,
+                "--shutdown-drain-secs {secs} must map through unchanged",
+            );
+            assert_eq!(
+                c.server.shutdown_drain(),
+                std::time::Duration::from_secs(expected),
+                "the Duration accessor must agree with the configured seconds",
+            );
+        }
+    }
+
+    /// The ceiling is enforced on the CLI path, not only on a hand-built
+    /// `Config`: a drain carrying a fat-fingered extra digit must fail at
+    /// startup rather than turn every later termination into a SIGKILL.
+    #[test]
+    fn shutdown_drain_secs_past_the_ceiling_is_rejected() {
+        let error = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--shutdown-drain-secs",
+            "18000",
+        ]))
+        .expect_err("a drain past the ceiling must not start")
+        .to_string();
+        assert!(
+            error.contains("shutdown_drain_secs"),
+            "the error must name the flag to fix: {error}"
+        );
+    }
+
+    /// `--termination-grace-secs` exists only to feed the startup advisory, so
+    /// the one thing that matters is that it reaches the config — and that
+    /// omitting it stays `None` (assume the k8s default) rather than
+    /// defaulting to a number that would silently become the compared budget.
+    #[test]
+    fn termination_grace_secs_maps_into_config_and_defaults_to_none() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
+        assert_eq!(c.server.termination_grace_secs, None);
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--termination-grace-secs",
+            "120",
+        ]))
+        .unwrap();
+        assert_eq!(c.server.termination_grace_secs, Some(120));
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the

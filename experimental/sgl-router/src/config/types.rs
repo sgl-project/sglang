@@ -247,6 +247,58 @@ impl std::fmt::Display for StickyFallbackKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Seconds to keep serving after SIGTERM — with `/readyz` flipped to 503 —
+    /// before the HTTP server stops accepting. The default (5 s) is sized for
+    /// the endpoint removal reaching kube-proxy after the pod's
+    /// `deletionTimestamp` is stamped; it is not sized for probe-driven
+    /// deregistration, which needs `failureThreshold * periodSeconds` first —
+    /// raise this if you rely on that path. Must leave room under
+    /// `terminationGracePeriodSeconds` for the in-flight drain that follows.
+    /// 0 disables the pause.
+    pub shutdown_drain_secs: u64,
+    /// The pod's actual `terminationGracePeriodSeconds`, when the operator
+    /// declares it. The router cannot read its own pod spec, so without this
+    /// the startup advisory can only compare the drain against the k8s
+    /// default — and warns, wrongly, about a deployment that raised the grace
+    /// period on purpose. `None` means "assume the default".
+    pub termination_grace_secs: Option<u64>,
+}
+
+impl ServerConfig {
+    /// [`Self::shutdown_drain_secs`] as a `Duration`. Keeps the seconds-to-
+    /// `Duration` conversion in the library, where a test can pin it, rather
+    /// than in `main.rs` where a `from_secs`/`from_millis` slip would silently
+    /// shorten every drain by a factor of 1000.
+    pub fn shutdown_drain(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.shutdown_drain_secs)
+    }
+}
+
+pub fn default_host() -> String {
+    "127.0.0.1".into()
+}
+
+pub fn default_port() -> u16 {
+    30000
+}
+
+pub fn default_shutdown_drain_secs() -> u64 {
+    5
+}
+
+/// Exists so test fixtures can spell out only the fields they care about
+/// (`tests/` is a separate crate, so a `#[cfg(test)]` constructor cannot reach
+/// the integration fixtures). Keep `Cli::into_config` exhaustive so adding a
+/// field still forces a decision on the production path.
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+            termination_grace_secs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -331,6 +331,7 @@ mod tests {
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
             model: ModelConfig {

@@ -5,6 +5,61 @@ pub use types::*;
 
 use anyhow::{anyhow, Result};
 
+/// The k8s default `terminationGracePeriodSeconds`, assumed when the operator
+/// has not declared the pod's real one. A `shutdown_drain_secs` at or above the
+/// grace period leaves no time for the in-flight drain, so the pod is SIGKILLed
+/// before it finishes — the opposite of what the drain is for.
+pub const K8S_DEFAULT_GRACE_SECS: u64 = 30;
+
+/// Ceiling on `shutdown_drain_secs`, enforced by [`Config::validate`]. Sized
+/// for the workload rather than for the k8s default grace period: a single
+/// streaming completion can hold the router for many minutes, so a deployment
+/// that does not want terminations cutting one off runs a
+/// `terminationGracePeriodSeconds` in the tens of minutes and a drain to match.
+/// Deciding whether a particular drain fits a particular grace period is
+/// [`shutdown_drain_advisory`]'s job — advice, because the operator can raise
+/// the budget. This constant is the separate, harder gate: it rejects a value
+/// that is not a drain at all, an extra digit or seconds confused with
+/// milliseconds, which no grace period could ever service.
+pub const MAX_SHUTDOWN_DRAIN_SECS: u64 = 1800;
+
+/// A `shutdown_drain_secs` that leaves no room under the grace period for the
+/// in-flight drain that follows the pause. Carries the compared values as
+/// fields so the caller logs a static message with structured data rather than
+/// interpolating the numbers into the message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownDrainAdvisory {
+    pub shutdown_drain_secs: u64,
+    /// The budget the drain was compared against.
+    pub termination_grace_secs: u64,
+    /// Whether that budget came from the operator or from
+    /// [`K8S_DEFAULT_GRACE_SECS`]. An assumed budget makes the advisory a
+    /// guess; a declared one makes it a fact.
+    pub grace_declared: bool,
+}
+
+/// Advisory (not a hard error: the drain may well be right and the grace period
+/// raised to match) for a drain that leaves no room for the in-flight drain.
+/// The bound is `>=`, not `>`: a drain of exactly the grace period already
+/// consumes all of it.
+///
+/// `termination_grace_secs` is the pod's real `terminationGracePeriodSeconds`
+/// when the operator declared it. The router cannot read its own pod spec, so
+/// `None` falls back to the k8s default — which is why declaring the real value
+/// is the way to silence this on a deployment that raised the grace period
+/// deliberately, rather than lowering a drain that was correct.
+pub fn shutdown_drain_advisory(
+    shutdown_drain_secs: u64,
+    termination_grace_secs: Option<u64>,
+) -> Option<ShutdownDrainAdvisory> {
+    let grace = termination_grace_secs.unwrap_or(K8S_DEFAULT_GRACE_SECS);
+    (shutdown_drain_secs >= grace).then_some(ShutdownDrainAdvisory {
+        shutdown_drain_secs,
+        termination_grace_secs: grace,
+        grace_declared: termination_grace_secs.is_some(),
+    })
+}
+
 impl Config {
     /// Check invariants the type system and `clap` don't already enforce.
     /// Called by [`cli::Cli::into_config`] after assembling the `Config`
@@ -17,6 +72,16 @@ impl Config {
         }
         if let Some(bucket_config) = self.model.bucket_config.as_ref() {
             validate_bucket_config(bucket_config)?;
+        }
+        if self.server.shutdown_drain_secs > MAX_SHUTDOWN_DRAIN_SECS {
+            return Err(anyhow!(
+                "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \
+                 past the ceiling a value is a typo rather than a drain, and the pod \
+                 would be SIGKILLed long before the pause elapsed. A long but deliberate \
+                 drain is fine — declare --termination-grace-secs so startup can check \
+                 it against the pod's real budget",
+                self.server.shutdown_drain_secs,
+            ));
         }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
@@ -206,10 +271,7 @@ mod tests {
     /// the `cli` module tests; the k8s selector grammar in `types`.
     fn cfg(model_id: &str, urls: &[&str]) -> Config {
         Config {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 30000,
-            },
+            server: ServerConfig::default(),
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
                 id: model_id.into(),
@@ -478,5 +540,87 @@ mod tests {
             .expect_err("a misspelled capacity profile must fail startup")
             .to_string();
         assert!(error.contains("ttft_p95_at_capcity_ms"), "got: {error}");
+    }
+
+    #[test]
+    fn shutdown_drain_advisory_is_silent_below_the_k8s_default_grace() {
+        // The default drain (5 s) and anything strictly under the k8s default
+        // terminationGracePeriodSeconds (30 s) still leaves room for the
+        // in-flight drain, so it is safe without operator action.
+        assert!(shutdown_drain_advisory(default_shutdown_drain_secs(), None).is_none());
+        assert!(shutdown_drain_advisory(29, None).is_none());
+        assert!(shutdown_drain_advisory(0, None).is_none());
+    }
+
+    #[test]
+    fn shutdown_drain_advisory_warns_once_the_drain_consumes_the_whole_grace() {
+        // A drain of exactly the 30 s k8s default leaves zero seconds for the
+        // in-flight drain, so the pod is SIGKILLed mid-drain — the boundary
+        // itself must warn, not just values past it. The ceiling is in the list
+        // because it is startable: `validate` accepts it, so the advisory is
+        // the only thing left to say it does not fit the default grace period.
+        for drain in [K8S_DEFAULT_GRACE_SECS, 120, MAX_SHUTDOWN_DRAIN_SECS] {
+            let advisory = shutdown_drain_advisory(drain, None)
+                .unwrap_or_else(|| panic!("{drain}s must warn"));
+            assert_eq!(advisory.shutdown_drain_secs, drain);
+            assert_eq!(advisory.termination_grace_secs, K8S_DEFAULT_GRACE_SECS);
+            assert!(
+                !advisory.grace_declared,
+                "an undeclared grace period must be reported as assumed, not as fact",
+            );
+        }
+    }
+
+    /// The advisory's whole purpose is to be silenceable by declaring the real
+    /// budget: a 60 s drain under a 120 s grace period is a correct
+    /// configuration, and warning about it trains operators to ignore the line.
+    #[test]
+    fn shutdown_drain_advisory_respects_a_declared_grace_period() {
+        assert!(
+            shutdown_drain_advisory(60, Some(120)).is_none(),
+            "a drain with room under the declared grace period must not warn",
+        );
+        let advisory = shutdown_drain_advisory(60, Some(60))
+            .expect("a drain consuming the whole declared grace period must warn");
+        assert_eq!(advisory.termination_grace_secs, 60);
+        assert!(
+            advisory.grace_declared,
+            "a declared grace period must be reported as declared",
+        );
+        // ...and declaring a *shorter* budget than the k8s default must be able
+        // to warn about a drain the default would have waved through.
+        assert!(
+            shutdown_drain_advisory(10, Some(10)).is_some(),
+            "a short declared grace period must still be compared against",
+        );
+        // The configuration the ceiling was raised for: a completion streaming
+        // for minutes wants a drain of minutes, under a grace period declared
+        // to match. That is correct, not merely tolerated, so it must be silent.
+        assert!(
+            shutdown_drain_advisory(MAX_SHUTDOWN_DRAIN_SECS, Some(3600)).is_none(),
+            "a long drain under a grace period declared to cover it must not warn",
+        );
+    }
+
+    /// `validate` is the hard gate the advisory deliberately is not: past the
+    /// ceiling the value can only be a typo, and starting on it would make
+    /// every later termination a SIGKILL.
+    #[test]
+    fn validate_rejects_a_shutdown_drain_past_the_ceiling() {
+        let mut config = cfg("qwen3-0.6b", &["http://10.0.0.1:30000"]);
+        config.server.shutdown_drain_secs = MAX_SHUTDOWN_DRAIN_SECS;
+        config
+            .validate()
+            .expect("the ceiling itself must remain startable");
+
+        config.server.shutdown_drain_secs = MAX_SHUTDOWN_DRAIN_SECS + 1;
+        let error = config
+            .validate()
+            .expect_err("a drain past the ceiling must fail startup")
+            .to_string();
+        assert!(
+            error.contains("shutdown_drain_secs"),
+            "the error must name the flag to fix: {error}"
+        );
     }
 }
