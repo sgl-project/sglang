@@ -49,11 +49,40 @@ jobs:
             exit 1
           fi
 
+      - name: Verify push credential
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CHERRY_PICK_PUSH }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::warning::GH_PAT_FOR_CHERRY_PICK_PUSH is not set; falling back to GITHUB_TOKEN. Pushes are then subject to GitHub's pre-receive workflow scan (see the checkout step) and may be rejected."
+            exit 0
+          fi
+          if [[ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq .permissions.push)" != "true" ]]; then
+            echo "::error::GH_PAT_FOR_CHERRY_PICK_PUSH cannot push to ${GITHUB_REPOSITORY}. Grant it Contents: Write and Workflows: Write, or unset the secret to fall back to GITHUB_TOKEN."
+            exit 1
+          fi
+          echo "OK: GH_PAT_FOR_CHERRY_PICK_PUSH can push to ${GITHUB_REPOSITORY}."
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # actions/checkout persists this token as
+          # `http.https://github.com/.extraheader`, and that header overrides any
+          # credential embedded in a push URL -- so whatever is set here is what
+          # `git push` below authenticates with, and it is the only place a
+          # different push credential can be selected.
+          #
+          # GITHUB_TOKEN can never hold the `workflow` capability (`permissions:`
+          # has no `workflows` key), so every push it makes forces a server-side
+          # scan for workflow-file changes. That scan intermittently times out and
+          # rejects the push even when no workflow file is touched:
+          # https://github.com/actions/checkout/issues/2287. A token that already
+          # carries the capability has been reported to avoid it; that is what
+          # GH_PAT_FOR_CHERRY_PICK_PUSH is for. It is deliberately separate from
+          # GH_PAT_FOR_CHERRY_PICK, which opens the PR and is scoped read-only on
+          # contents. When it is unset, this falls back to today's behaviour.
+          token: ${{ secrets.GH_PAT_FOR_CHERRY_PICK_PUSH || secrets.GITHUB_TOKEN }}
 
       - name: Configure Git
         run: |
@@ -199,7 +228,28 @@ jobs:
         env:
           NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
         run: |
-          git push origin "$NEW_BRANCH"
+          # Retry: the pre-receive workflow scan described on the checkout step
+          # fails by timing out, which is transient. A permission denial is not,
+          # so stop on it rather than burning the remaining attempts.
+          PUSH_LOG="${RUNNER_TEMP}/push.log"
+          for attempt in 1 2 3 4; do
+            if git push origin "$NEW_BRANCH" > "$PUSH_LOG" 2>&1; then
+              cat "$PUSH_LOG"
+              exit 0
+            fi
+            cat "$PUSH_LOG"
+            if grep -qiE 'denied|403|not authorized' "$PUSH_LOG"; then
+              echo "::error::Push of ${NEW_BRANCH} was denied. This is a credential problem, not a transient one: check that the checkout token has Contents: Write on ${GITHUB_REPOSITORY}."
+              exit 1
+            fi
+            if [[ "$attempt" -lt 4 ]]; then
+              DELAY=$(( attempt * 60 ))
+              echo "::warning::Push of ${NEW_BRANCH} failed (attempt ${attempt}/4); retrying in ${DELAY}s."
+              sleep "$DELAY"
+            fi
+          done
+          echo "::error::Failed to push ${NEW_BRANCH} after 4 attempts; no branch was created and no PR was opened. Re-run this workflow, or cherry-pick and push by hand."
+          exit 1
 
       - name: Create Pull Request
         id: create_pr
