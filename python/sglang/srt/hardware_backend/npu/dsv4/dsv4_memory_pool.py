@@ -511,13 +511,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
         """
         item = self.layer_mapping[layer_id]
-        if item.compress_kv_pool is None:
+        if item.compress_ratio == 0:
             return None
         if from_indexer:
             indexer_pool = self._indexer_pool(item.compress_ratio)
             kv = indexer_pool.get_index_k(item.compress_layer_id)
         else:
-            kv = item.compress_kv_pool.kv_buffer[item.compress_layer_id]
+            compress_pool = item.compress_kv_pool
+            assert compress_pool is not None, "Missing compressed KV pool"
+            kv = compress_pool.kv_buffer[item.compress_layer_id]
         if loc is not None:
             kv = kv.flatten(0, 1)[loc]
         return kv
