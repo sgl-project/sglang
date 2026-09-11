@@ -368,6 +368,10 @@ class DeepseekSparseAttnBackend(
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
+        # Keep graph-captured buffers alive per stream.
+        self._triton_sparse_mla_workspaces: dict[
+            int, list[tuple[torch.Tensor, torch.Tensor]]
+        ] = {}
 
         # Hoisted per-call imports of set_dsa_prefill_impl. Module-scope
         # imports would cycle through model_executor (which imports the
@@ -2140,6 +2144,12 @@ class DeepseekSparseAttnBackend(
                 indices=page_table_1.unsqueeze(1),
                 sm_scale=layer.scaling,
                 d_v=layer.v_head_dim,
+                topk_length=None,
+                max_topk_length=(
+                    min(metadata.max_seq_len_k, page_table_1.shape[-1])
+                    if self.dsa_index_kpool <= 1
+                    else None
+                ),
             )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -3117,6 +3127,8 @@ class DeepseekSparseAttnBackend(
             triton_sparse_mla_decode_splitk,
         )
 
+        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
+        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
         return triton_sparse_mla_decode_splitk(
             q_nope=q_nope,
             q_rope=q_rope,
@@ -3124,6 +3136,7 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            workspace=workspace,
         )
 
     def _forward_intel_xpu_sparse_decode(
