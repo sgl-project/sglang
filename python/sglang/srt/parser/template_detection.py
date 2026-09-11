@@ -314,6 +314,18 @@ def _is_k2_v3(ctx):
     )
 
 
+def _is_granite_thinking_parser(ctx):
+    # Nemotron-3 templates share the same <parameter= tool-call block, so it
+    # cannot discriminate; defer_loading is Granite's deferred tool loading.
+    return (
+        ctx.has_text("truncate_history_thinking")
+        and ctx.has_text("defer_loading")
+        and ctx.reasoning_config is not None
+        and ctx.reasoning_config.toggle_param == "enable_thinking"
+        and ctx.reasoning_config.default_enabled is True
+    )
+
+
 def _is_nemotron_3(ctx):
     return ctx.has_text("truncate_history_thinking") and (
         ctx.reasoning_config is not None
@@ -502,6 +514,11 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
+    DetectionRule(
+        name="granite_thinking_parser",
+        value="granite_thinking_parser",
+        predicate=_is_granite_thinking_parser,
+    ),
     DetectionRule(name="nemotron_3", value="nemotron_3", predicate=_is_nemotron_3),
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
