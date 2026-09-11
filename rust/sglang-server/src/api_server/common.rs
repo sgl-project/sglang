@@ -12,17 +12,21 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use std::sync::Arc;
 
-use super::AppState;
+use super::app::AppState;
 use super::guard::AbortGuard;
 use super::submit::submit;
-use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
-use crate::runtime::ServerArgs;
+use crate::message::config::ServerArgs;
+use crate::message::ids::Rid;
+use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
+use crate::message::request::RequestKind;
+use crate::message::response::ResponseItem;
 
 /// The routes this module owns, mounted by `api_server::serve`.
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Control-plane: reuses the ingress FSM (no tokenization), returns one
+        // Control-plane: reuses the request FSM (no tokenization), returns one
         // non-streamed JSON result. Adding one = a route line + its struct tag.
         .route("/server_info", get(server_info))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
@@ -31,7 +35,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/model_info", get(model_info))
 }
 
-/// Submit a control request through the ingress FSM (no tokenization) and await the
+/// Submit a control request through the request FSM (no tokenization) and await the
 /// scheduler's single msgpack result (a `structs.asdict` named map). Returns the
 /// raw bytes, or an error `Response` to return as-is.
 async fn await_control_result(
@@ -50,34 +54,27 @@ async fn await_control_result(
         guard.disarm(&rid); // completed normally — nothing to abort
     }
     match received {
-        Some(EgressItem::Control(bytes)) => Ok(bytes),
-        Some(EgressItem::Error(e)) => {
+        Some(ResponseItem::Control(bytes)) => Ok(bytes),
+        Some(ResponseItem::Error(e)) => {
             let code =
                 StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Err((code, e.to_string()).into_response())
         }
         // A control request never receives generation frames or service-call data.
-        Some(EgressItem::Frame(_)) | Some(EgressItem::Done(_)) | Some(EgressItem::Data(_)) => {
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unexpected generation output for control request",
-            )
-                .into_response())
-        }
+        Some(ResponseItem::Frame(_))
+        | Some(ResponseItem::Done(_))
+        | Some(ResponseItem::Data(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected generation output for control request",
+        )
+            .into_response()),
         None => Err((StatusCode::from_u16(499).unwrap(), "request aborted").into_response()),
     }
 }
 
 /// `GET /get_model_info` (+ `/model_info` alias) — static model metadata from
 /// `server_args` (no scheduler round-trip); `is_generation` always true.
-///
-/// Under `SGLANG_RUST_SERVER=1` this is the only `/model_info` a client can
-/// reach — `launch_server` never mounts the Python app — so it answers the same
-/// keys. It answers them from the launch blob, which is the whole of this
-/// server's config knowledge: `server_args` is parsed once at boot and held
-/// behind an `Arc`, and no route mounted here changes weights or parsers, so
-/// the launch values are also the current ones.
-async fn model_info(State(state): State<AppState>) -> Response {
+async fn model_info(State(state): State<Arc<AppState>>) -> Response {
     let sa = &state.server_args;
     let body = serde_json::json!({
         "model_path": sa.model_path,
@@ -111,12 +108,10 @@ async fn model_info(State(state): State<AppState>) -> Response {
 /// `api_key`/`admin_api_key`; see [`shape_server_info`]).
 ///
 /// TODO(server_info): Python also includes `kv_events`; add once plumbed.
-async fn server_info(State(state): State<AppState>) -> Response {
+async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let bytes = match await_control_result(
         &state,
-        ControlRequest::GetInternalStateReq(GetInternalStateReq::new(
-            crate::ids::Rid::new().to_string(),
-        )),
+        ControlRequest::GetInternalStateReq(GetInternalStateReq::new(Rid::new().to_string())),
     )
     .await
     {
@@ -216,8 +211,13 @@ mod tests {
         let mut msgpack = Vec::new();
         rmpv::encode::write_value(&mut msgpack, &outer).unwrap();
 
-        let sa =
-            ServerArgs::from_json(r#"{"model_path": "/m", "api_key": "secret-token"}"#).unwrap();
+        // `api_key` is deliberately NOT a `ServerArgs` field — the typed schema
+        // cannot carry it — so the only place it could leak from is the raw
+        // scheduler dump shaped above.
+        let sa = ServerArgs {
+            model_path: "/m".into(),
+            ..Default::default()
+        };
         let out = shape_server_info(&msgpack, &sa).unwrap();
         let text = String::from_utf8(out.clone()).unwrap();
         // No secret leaks anywhere in the serialized response.

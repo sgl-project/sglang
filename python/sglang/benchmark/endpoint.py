@@ -10,6 +10,8 @@ import os
 import time
 from typing import Callable, Optional
 
+import msgspec
+import msgspec.structs
 import requests
 
 from sglang.srt.entrypoints.http_server import launch_server
@@ -21,7 +23,7 @@ DEFAULT_TIMEOUT = 600
 
 # Field defaults of ServerArgs, used to detect when --host/--port were set
 # explicitly (and would be silently ignored in connect mode).
-_SERVER_ARGS_DEFAULTS = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+_SERVER_ARGS_DEFAULTS = {f.name: f.default for f in msgspec.structs.fields(ServerArgs)}
 
 
 def server_is_up(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> bool:
@@ -48,6 +50,11 @@ def _launch_server_target(launch_server_func: Callable, server_args: ServerArgs)
 
 
 def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs):
+    # Resolve in the parent, before the fork. The pipeline probes the device
+    # (the default attention backend reads the CUDA capability), and a forked
+    # child cannot re-initialize CUDA once this process has.
+    server_args.resolve_once()
+
     base_url = resolve_base_url("", server_args.host, server_args.port)
 
     # Reuse an already-running server instead of forking a second one onto the

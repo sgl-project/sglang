@@ -9,7 +9,6 @@ PP_SIZE: int = 2
 
 
 class CanaryPPFixture(CanaryE2EBase):
-
     model_mode: ClassVar[str] = "swa"
     workload_n_batches: ClassVar[int] = 2
 

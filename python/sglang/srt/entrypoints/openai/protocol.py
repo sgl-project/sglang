@@ -50,6 +50,7 @@ from openai.types.responses.response_format_text_json_schema_config import (
 )
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -440,6 +441,22 @@ class SglExt(BaseModel):
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
         None
     )
+    input_ids: Optional[List[int]] = None
+    output_ids: Optional[List[List[int]]] = None
+
+    def split_ids(self) -> Tuple[Optional[SglExt], Optional[SglExt]]:
+        """Split set fields into (non_ids, ids); a side with no set fields is None."""
+        non_ids: Dict[str, Any] = {}
+        ids: Dict[str, Any] = {}
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            (ids if name in ("input_ids", "output_ids") else non_ids)[name] = value
+        return (
+            type(self)(**non_ids) if non_ids else None,
+            type(self)(**ids) if ids else None,
+        )
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -565,6 +582,10 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
+    max_tokens_per_frame: Optional[int] = None
+    max_image_tokens: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -582,9 +603,55 @@ class ChatCompletionMessageContentVideoPart(BaseModel):
     video_url: ChatCompletionMessageContentVideoURL
 
 
-class ChatCompletionMessageContentAudioPart(BaseModel):
+class ChatCompletionMessageContentInputAudio(BaseModel):
+    data: str
+    format: Literal["wav", "mp3"]
+
+
+_AUDIO_FORMAT_TO_MIME_TYPE = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+}
+
+
+class ChatCompletionMessageContentAudioURLPart(BaseModel):
     type: Literal["audio_url"]
     audio_url: ChatCompletionMessageContentAudioURL
+
+
+class ChatCompletionMessageContentAudioInlinePart(BaseModel):
+    type: Literal["input_audio"]
+    input_audio: ChatCompletionMessageContentInputAudio
+
+
+def _to_audio_url_part(
+    part: Union[
+        ChatCompletionMessageContentAudioURLPart,
+        ChatCompletionMessageContentAudioInlinePart,
+    ],
+) -> ChatCompletionMessageContentAudioURLPart:
+    if isinstance(part, ChatCompletionMessageContentAudioURLPart):
+        return part
+
+    audio = part.input_audio
+    return ChatCompletionMessageContentAudioURLPart(
+        type="audio_url",
+        audio_url=ChatCompletionMessageContentAudioURL(
+            url=f"data:{_AUDIO_FORMAT_TO_MIME_TYPE[audio.format]};base64,{audio.data}"
+        ),
+    )
+
+
+# Audio arrives by reference as `audio_url`, holding a URL or a data URI, or
+# inline as OpenAI's `input_audio`, holding base64. Inline audio is converted to
+# the equivalent data URI as it validates.
+ChatCompletionMessageContentAudioPart = Annotated[
+    Union[
+        ChatCompletionMessageContentAudioURLPart,
+        ChatCompletionMessageContentAudioInlinePart,
+    ],
+    AfterValidator(_to_audio_url_part),
+]
 
 
 class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
@@ -818,6 +885,8 @@ class ChatCompletionRequest(BaseModel):
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
+    return_input_ids_in_sglext: bool = False
+    return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
@@ -868,6 +937,7 @@ class ChatCompletionRequest(BaseModel):
     use_audio_in_video: bool = False
 
     images_config: Optional[Dict] = None
+    video_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -1994,6 +2064,7 @@ class MessageProcessingResult:
     tool_call_constraint: Optional[ToolCallConstraint] = None
     skip_special_tokens: bool = True
     require_reasoning: bool = False
+    reasoning_end_token_ids: Optional[List[int]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
