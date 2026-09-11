@@ -141,10 +141,11 @@ class UnifiedKvMetadata:
                 "verify_store_state_slot",
                 "c4_out_loc",
                 "c128_out_loc",
+                # Captured store_cache reads swa_loc by address, and the eager
+                # target-verify path builds it outside the graph.
+                "swa_loc",
             ],
-            # swa_loc is recomputed each forward (recorded inside cuda graphs),
-            # so it is rebound rather than copied across replays.
-            assign_fields=["swa_loc"],
+            assign_fields=[],
         )
 
 
