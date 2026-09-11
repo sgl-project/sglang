@@ -127,11 +127,19 @@ echo
 # shellcheck disable=SC2086  # AUDIT_DIRS is a whitespace-separated list.
 for extra in ${AUDIT_DIRS:-}; do
     echo "=== ${extra} ==="
-    if [[ -d "$extra" ]]; then
-        timeout 300 du -sh "$extra"/* 2>/dev/null | sort -rh | head -40 || true
-    else
+    if [[ ! -d "$extra" ]]; then
         echo "absent"
+        echo
+        continue
     fi
+    timeout 300 du -sh "$extra"/* 2>/dev/null | sort -rh | head -40 || true
+    # A directory whose contents matter is usually a payload next to a small
+    # sidecar describing it, and the sidecar is the part worth reading.
+    while IFS= read -r meta; do
+        echo "--- ${meta} ---"
+        head -c 2000 "$meta" 2>/dev/null || true
+        echo
+    done < <(find "$extra" -maxdepth 1 -type f -size -64k 2>/dev/null | sort | head -10)
     echo
 done
 
