@@ -1,28 +1,32 @@
-import base64
-import io
-import os
-import re
+import json
+import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
 
-import requests
-from PIL import Image
-
-from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+from sglang.test.run_eval import run_eval_once
+from sglang.test.simple_eval_common import make_report
+from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    is_in_ci,
+    popen_launch_server,
+    terminate_and_kill_process_tree,
+    write_github_step_summary,
+)
 
-register_cuda_ci(est_time=400, stage="extra-b", runner_config="8-gpu-h200")
+# Two cold server launches and a serialized MMMU baseline cost more than
+# the Step3.5 GSM8K test. This is an estimate pending the first GPU CI run.
+register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-h200")
 
 
-class TestStep3p7Flash(DefaultServerBase):
-    """Real-model regression coverage for batched Step3.7 image features."""
-
+class TestStep3p7Flash(CustomTestCase):
     model = "stepfun-ai/Step-3.7-Flash"
-    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
-    # Reuse the Step3.5 Flash E2E launch configuration. Keep these short
-    # requests in one prefill batch so all image items reach the encoder.
+    base_url = DEFAULT_URL_FOR_TEST
+    # Reuse the Step3.5 Flash E2E model-loading and TP configuration.
     other_args = [
         "--tp",
         "8",
@@ -33,92 +37,70 @@ class TestStep3p7Flash(DefaultServerBase):
         "0.75",
         "--chunked-prefill-size",
         "8192",
-        "--max-prefill-tokens",
-        "8192",
-        "--max-running-requests",
-        "8",
         "--disable-radix-cache",
         "--model-loader-extra-config",
         '{"enable_multithread_load": true, "num_threads": 64}',
     ]
 
-    @classmethod
-    def setUpClass(cls):
-        cls.tokenizer = get_tokenizer(cls.model, trust_remote_code=True)
-        # Hold scheduler input until the entire /generate batch has been
-        # preprocessed. Concurrent HTTP calls alone can run as singletons.
-        with patch.dict(os.environ, {"SGLANG_ENABLE_COLOCATED_BATCH_GEN": "1"}):
-            super().setUpClass()
+    def test_mmmu_serial_vs_concurrent(self):
+        # Reuse the nightly MMMU dataset selection, prompts, answer parser,
+        # and scorer. Sharing this object guarantees identical samples.
+        evaluator = MMMUVLMEval(num_examples=100, num_threads=64)
+        self.assertEqual(len(evaluator.samples), 100)
+        args = SimpleNamespace(model=self.model, max_tokens=1024, temperature=0)
+        report_dir = Path(tempfile.mkdtemp(prefix="step3p7_mmmu_"))
+        print(f"Step3.7 MMMU reports: {report_dir}")
+        scores = {}
 
-    def _make_request(self, images):
-        image_data = []
-        for color, size in images:
-            with io.BytesIO() as buffer:
-                Image.new("RGB", size, color).save(buffer, format="PNG")
-                encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-            image_data.append(f"data:image/png;base64,{encoded}")
+        for mode, max_running_requests in [("serial", 1), ("concurrent", 8)]:
+            # Restart for each mode: a warm vision embedding cache could hide
+            # the changed encoder path. The client workload is unchanged;
+            # only the scheduler's maximum request concurrency differs.
+            process = popen_launch_server(
+                self.model,
+                self.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
+                other_args=self.other_args
+                + ["--max-running-requests", str(max_running_requests)],
+            )
+            try:
+                result, latency, _ = run_eval_once(
+                    args, self.base_url + "/v1", evaluator
+                )
+                scores[mode] = result.score
+                (report_dir / f"{mode}.html").write_text(make_report(result))
+                (report_dir / f"{mode}.json").write_text(
+                    json.dumps(
+                        {
+                            "score": result.score,
+                            "latency": latency,
+                            "sample_ids": [s["id"] for s in evaluator.samples],
+                            "answers": [c[-1]["content"] for c in result.convos],
+                        },
+                        indent=2,
+                    )
+                )
+                self.assertEqual(len(result.convos), len(evaluator.samples))
+                self.assertTrue(
+                    all(c[-1]["content"].strip() for c in result.convos),
+                    f"{mode}: empty responses; see {report_dir}",
+                )
+                # Reject a vacuous comparison where both runs score zero.
+                self.assertGreater(result.score, 0, f"{mode}: {report_dir}")
+            finally:
+                terminate_and_kill_process_tree(process, wait_timeout=60)
 
-        prompt = self.tokenizer.apply_chat_template(
-            [
-                {
-                    "role": "user",
-                    "content": "<im_patch>\n"
-                    * len(images)
-                    + "Name the solid background color of each image in image order. "
-                    "Reply only with the color names separated by commas.",
-                }
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
+        summary = (
+            f"Step3.7 MMMU (100 samples): serial={scores['serial']:.4f}, "
+            f"concurrent={scores['concurrent']:.4f}. Reports: {report_dir}"
         )
-        # This checkpoint's template opens <think> unconditionally. Close it
-        # in the prefill so a simple color probe does not spend its token
-        # budget on reasoning (enable_thinking=False is not supported).
-        if prompt.endswith("<think>\n"):
-            prompt += "</think>\n"
-        return prompt, image_data
-
-    def _generate(self, cases, batched):
-        inputs = [self._make_request(case) for case in cases]
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": [text for text, _ in inputs] if batched else inputs[0][0],
-                "image_data": (
-                    [images for _, images in inputs] if batched else inputs[0][1]
-                ),
-                "sampling_params": {"temperature": 0, "max_new_tokens": 128},
-            },
-            timeout=180,
-        )
-        response.raise_for_status()
-        outputs = response.json() if batched else [response.json()]
-        self.assertEqual(len(outputs), len(cases))
-        for case, output in zip(cases, outputs):
-            with self.subTest(images=case, batched=batched):
-                self.assertEqual(output["meta_info"]["finish_reason"]["type"], "stop")
-                answer = output["text"].rsplit("</think>", 1)[-1].lower()
-                colors = re.findall(r"\b(?:red|green|blue)\b", answer)
-                self.assertEqual(colors, [color for color, _ in case], output["text"])
-
-    def test_batched_image_features(self):
-        # Fresh images: no earlier request can warm the embedding cache and
-        # bypass get_image_feature. Small squares have no local patches;
-        # large rectangles exercise patch + thumbnail assembly.
-        self._generate(
-            [
-                [("red", (224, 224))],
-                [("green", (1008, 504))],
-                [("blue", (1008, 504)), ("red", (280, 280))],
-                [("red", (336, 336)), ("blue", (504, 1008))],
-            ],
-            batched=True,
-        )
-
-    def test_single_image_features(self):
-        # Distinct sizes keep these inputs out of the batched test's cache.
-        for case in [[("green", (256, 256))], [("blue", (1008, 1008))]]:
-            self._generate([case], batched=False)
+        print(summary)
+        if is_in_ci():
+            write_github_step_summary(summary + "\n")
+        # No measured Step3.7 absolute threshold exists yet. Require no score
+        # regression relative to the same-checkpoint serialized control;
+        # inspect the paired reports if batch-dependent numerics change it.
+        self.assertGreaterEqual(scores["concurrent"], scores["serial"], summary)
 
 
 if __name__ == "__main__":
