@@ -162,7 +162,7 @@ class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.is_mrope_enabled:
+        if self.is_mrope_enabled and forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
