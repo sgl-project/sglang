@@ -53,6 +53,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
+    NPUCompressedTensorsW4A8mxfp4MoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
@@ -225,7 +226,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             # Detect MXFP4 before the scheme-based path: MXFP4 uses a
             # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
             # handles all MoE backends, bypassing the scheme abstraction.
-            if self._is_mxfp4_moe(layer_name=prefix):
+            # On NPU the dedicated Mxfp4MoEMethod does not apply, so fall
+            # through to the scheme-based path and let get_moe_scheme select
+            # NPUCompressedTensorsW4A8mxfp4MoE.
+            if self._is_mxfp4_moe(layer_name=prefix) and not _is_npu:
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
                 logger.info_once(
@@ -818,6 +822,14 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
+
+        # MXFP4 MoE on NPU is served by NPUCompressedTensorsW4A8mxfp4MoE. Detect
+        # it before the WNA16 branch: MXFP4 weights are FP4 (float) group-32 so
+        # `_is_wNa16_group_channel` / `_is_dynamic_token_w4a8` would otherwise
+        # misroute them to the INT4 WNA16 or W4A8-int8 schemes.
+        if _is_npu and self._is_mxfp4_moe(layer_name=layer_name):
+            logger.info_once("Using NPUCompressedTensorsW4A8mxfp4MoE")
+            return NPUCompressedTensorsW4A8mxfp4MoE()
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:

@@ -80,9 +80,40 @@ class SchedulerProfilerManager:
         self.profile_in_progress: bool = False
         self.merge_profiles = False
         self.detailed_annotations: bool = False
+        self.profile_ranks = self._parse_profile_ranks(
+            os.getenv("SGLANG_PROFILE_RANKS")
+        )
+        if self.profile_ranks is not None:
+            invalid_ranks = sorted(
+                rank for rank in self.profile_ranks if rank >= self.ps.tp_size
+            )
+            if invalid_ranks:
+                raise ValueError(
+                    "SGLANG_PROFILE_RANKS contains ranks outside the TP world "
+                    f"size {self.ps.tp_size}: {invalid_ranks}."
+                )
+        self.profile_this_rank = (
+            self.profile_ranks is None or self.ps.tp_rank in self.profile_ranks
+        )
 
         # For ROCM
         self.rpd_profiler = None
+
+    @staticmethod
+    def _parse_profile_ranks(raw: Optional[str]) -> Optional[set[int]]:
+        if raw is None or not raw.strip():
+            return None
+
+        ranks: set[int] = set()
+        for item in raw.split(","):
+            item = item.strip()
+            if not item or not item.isdigit():
+                raise ValueError(
+                    "SGLANG_PROFILE_RANKS must be a comma-separated list of "
+                    f"non-negative TP ranks, got {raw!r}."
+                )
+            ranks.add(int(item))
+        return ranks
 
     def _init_profile(
         self,
@@ -200,6 +231,17 @@ class SchedulerProfilerManager:
             activity_map[a] for a in activities if a in activity_map
         ]
 
+        if not self.profile_this_rank:
+            logger.info(
+                "Profiling collection skipped on TP rank %s; selected ranks: %s",
+                self.ps.tp_rank,
+                sorted(self.profile_ranks),
+            )
+            # Keep control state aligned across ranks so explicit and automatic
+            # stop requests succeed without constructing a profiler here.
+            self.profile_in_progress = True
+            return ProfileReqOutput(success=True, message="Succeeded")
+
         if "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl
 
@@ -222,7 +264,8 @@ class SchedulerProfilerManager:
                 schema.writeSchema(connection)
                 connection.commit()
                 del connection
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            if self.profile_ranks is None:
+                torch.distributed.barrier(self.dp_tp_cpu_group)
 
             self.rpd_profiler = rpdTracerControl()
             self.rpd_profiler.setPythonTrace(True)
@@ -323,6 +366,12 @@ class SchedulerProfilerManager:
                 message="Profiling is not in progress. Call /start_profile first.",
             )
 
+        if not self.profile_this_rank:
+            self.profile_in_progress = False
+            self.profiler_start_forward_ct = None
+            self._apply_detailed_annotations(False)
+            return ProfileReqOutput(success=True, message="Succeeded.")
+
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
 
         if self.profile_prefix:
@@ -356,14 +405,16 @@ class SchedulerProfilerManager:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            if self.profile_ranks is None:
+                torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
             self.rpd_profiler.flush()
 
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            if self.profile_ranks is None:
+                torch.distributed.barrier(self.dp_tp_cpu_group)
             if self.ps.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 

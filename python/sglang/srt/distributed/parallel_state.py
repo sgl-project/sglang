@@ -2092,6 +2092,7 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+_SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
@@ -2121,6 +2122,13 @@ def get_attn_tp_group() -> GroupCoordinator:
         "attention tensor model parallel group is not initialized"
     )
     return _ATTN_TP
+
+
+def get_shared_experts_tp_group() -> GroupCoordinator:
+    assert _SHARED_EXPERTS_TP is not None, (
+        "shared-expert tensor model parallel group is not initialized"
+    )
+    return _SHARED_EXPERTS_TP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
@@ -2213,7 +2221,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _ATTN_TP, _SHARED_EXPERTS_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2464,6 +2472,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    shared_experts_tensor_parallel_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2486,6 +2495,8 @@ def initialize_model_parallel(
             tensor-parallel group during decoding. Must be a divisor of
             tensor_model_parallel_size and is currently only supported on the
             AMD HIP platform.
+        shared_experts_tensor_parallel_size: optional shared-expert TP width.
+            Must divide attention TP; subgroups never cross attention replicas.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2551,6 +2562,21 @@ def initialize_model_parallel(
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) must be divisible by "
             f"decode_context_parallel_size ({decode_context_parallel_size})"
         )
+
+    if shared_experts_tensor_parallel_size is not None:
+        attn_width = (
+            tensor_model_parallel_size
+            // attention_data_parallel_size
+            // attention_context_model_parallel_size
+        )
+        if (
+            shared_experts_tensor_parallel_size < 1
+            or attn_width % shared_experts_tensor_parallel_size != 0
+        ):
+            raise ValueError(
+                "Shared-expert TP size must be a positive divisor of "
+                f"attention TP size ({attn_width})."
+            )
 
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
@@ -2705,6 +2731,34 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
+
+    global _SHARED_EXPERTS_TP
+    assert _SHARED_EXPERTS_TP is None, "shared-expert TP group already initialized"
+    if (
+        shared_experts_tensor_parallel_size is not None
+        and shared_experts_tensor_parallel_size > 1
+    ):
+        if shared_experts_tensor_parallel_size == attn_tp_size:
+            _SHARED_EXPERTS_TP = _ATTN_TP
+        else:
+            # Attention TP groups are contiguous, and the requested width
+            # divides each one. These groups also stay inside their PP stage.
+            shared_size = shared_experts_tensor_parallel_size
+            shared_group_ranks = [
+                list(range(start, start + shared_size))
+                for start in range(0, world_size, shared_size)
+            ]
+            _SHARED_EXPERTS_TP = init_model_parallel_group(
+                shared_group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_custom_allreduce=False,
+                use_torch_symm_mem_allreduce=False,
+                group_name="shared_experts_tp",
+                recovered_rank=recovered_rank,
+                rank_offset=rank_offset,
+                max_world_size=max_world_size,
+            )
 
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
@@ -3089,7 +3143,17 @@ def destroy_model_parallel():
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
 
+    global _SHARED_EXPERTS_TP
+    global _ATTN_TP
     global _TP
+    if (
+        _SHARED_EXPERTS_TP is not None
+        and _SHARED_EXPERTS_TP is not _ATTN_TP
+        and _SHARED_EXPERTS_TP is not _TP
+    ):
+        _SHARED_EXPERTS_TP.destroy()
+    _SHARED_EXPERTS_TP = None
+
     if _TP:
         _TP.destroy()
     _TP = None
@@ -3125,7 +3189,6 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
-    global _ATTN_TP
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None

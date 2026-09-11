@@ -34,7 +34,7 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa, is_kimi_k3
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
@@ -132,6 +132,42 @@ def uses_ssm_state(model_config) -> bool:
         or glm5_next_config(model_config) is not None
         or hybrid_lightning_config(model_config) is not None
     )
+
+
+def resolve_pd_decode_remote_mamba_state(
+    *,
+    model_config: ModelConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_hybrid_ssm: bool,
+    enable_hierarchical_cache: bool,
+) -> bool:
+    """Validate the narrow hybrid-SSM decode-radix mode.
+
+    Kimi-K3 + DSPARK can reuse decode-local per-token MLA/draft KV while
+    receiving the prompt-end KDA/conv state from prefill. Other recurrent
+    models remain rejected until their state protocol has the same contract.
+    """
+    disagg = get_disagg()
+    if not (
+        is_hybrid_ssm
+        and disagg.disaggregation_mode == "decode"
+        and disagg.disaggregation_decode_enable_radix_cache
+    ):
+        return False
+
+    if not (is_kimi_k3(model_config.hf_config) and spec_algorithm.is_dspark()):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache with Mamba/SSM is "
+            "currently supported only for Kimi-K3 with "
+            "--speculative-algorithm DSPARK."
+        )
+    if enable_hierarchical_cache:
+        raise ValueError(
+            "Kimi-K3 DSPARK PD decode radix cache currently supports only "
+            "device-resident prefix KV and is incompatible with "
+            "--enable-hierarchical-cache."
+        )
+    return True
 
 
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
@@ -248,6 +284,13 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
+    remote_mamba_state_authoritative = resolve_pd_decode_remote_mamba_state(
+        model_config=model_config,
+        spec_algorithm=spec_algorithm,
+        is_hybrid_ssm=is_hybrid_ssm,
+        enable_hierarchical_cache=enable_hierarchical_cache,
+    )
+
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
     # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
@@ -280,11 +323,6 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
-            )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
@@ -332,6 +370,7 @@ def build_kv_cache(
             is_hybrid_swa=is_hybrid_swa,
             full_tokens_per_layer=full_tokens_per_layer,
             is_hybrid_ssm=is_hybrid_ssm,
+            remote_mamba_state_authoritative=remote_mamba_state_authoritative,
             is_dsa=is_dsa,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,

@@ -39,6 +39,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -348,6 +349,12 @@ class _SinglePassGatherer(ABC):
                     rank,
                     elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
+            elif get_exec().moe.deepep_mode == "auto":
+                return _DeepepAutoSinglePassGatherer(
+                    expert_location_metadata,
+                    rank,
+                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
+                )
             else:
                 raise NotImplementedError
 
@@ -609,6 +616,48 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
                     (0, n - local_physical_count_of_layer.shape[0]),
                 )
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+
+class _DeepepAutoSinglePassGatherer(_SinglePassGatherer):
+    """Use the gatherer matching DeepEP AUTO's per-forward dispatch mode."""
+
+    def __init__(
+        self,
+        expert_location_metadata: ExpertLocationMetadata,
+        rank: int,
+        elastic_ep_enabled: bool = False,
+    ):
+        super().__init__(expert_location_metadata, rank)
+        self._normal = _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+        self._low_latency = _DeepepLowLatencySinglePassGatherer(
+            expert_location_metadata,
+            rank,
+            elastic_ep_enabled=elastic_ep_enabled,
+        )
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        # DeepEP AUTO resolves extend/prefill to NORMAL and decode to
+        # LOW_LATENCY using this same forward-local flag. For NORMAL, count
+        # the mapped physical TopK ids. For LOW_LATENCY, wait for the dispatch
+        # hook so padding/filtering is reflected by the actual receive counts.
+        if get_is_extend_in_batch():
+            self._normal.on_select_experts(layer_idx, topk_ids)
+
+    def on_deepep_dispatch_low_latency(
+        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        self._low_latency.on_deepep_dispatch_low_latency(
+            layer_idx, local_physical_count_of_layer
+        )
+
+    def reset(self):
+        self._normal.reset()
+        self._low_latency.reset()
+
+    def collect(self) -> Dict:
+        normal_count = self._normal.collect()["global_physical_count"]
+        low_latency_count = self._low_latency.collect()["global_physical_count"]
+        return dict(global_physical_count=normal_count + low_latency_count)
 
 
 def _convert_per_token_to_global_physical_count(

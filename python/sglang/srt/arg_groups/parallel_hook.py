@@ -114,6 +114,46 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
+def handle_shared_experts_tp(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.shared_experts_tp_size
+    if size is None:
+        return
+
+    from sglang.srt.runtime_context import derive_attention_widths
+
+    view = resolved_view(server_args)
+    _, attn_tp_size = derive_attention_widths(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        dp_size=cfg.dp_size,
+        enable_dp_attention=view.enable_dp_attention,
+    )
+    if size < 1 or attn_tp_size % size != 0:
+        raise ValueError(
+            f"--shared-experts-tp-size ({size}) must be a positive divisor "
+            f"of attention TP size ({attn_tp_size})."
+        )
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError(
+            "--shared-experts-tp-size requires a Kimi-K3 model configuration."
+        )
+    model_arch = model_config_of(server_args).hf_config.architectures[0]
+    if model_arch != "KimiK3ForConditionalGeneration":
+        raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
+    if cfg.moe_a2a_backend not in (
+        "deepep",
+        "megamoe",
+        "mooncake",
+        "ascend_fuseep",
+        "mori",
+    ):
+        raise ValueError(
+            "--shared-experts-tp-size requires an expert-parallel all-to-all "
+            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
+        )
+
+
 def handle_dcp_validation(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:

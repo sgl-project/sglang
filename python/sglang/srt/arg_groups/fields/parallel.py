@@ -207,6 +207,12 @@ class Parallel(msgspec.Struct):
         bool,
         "Shard shared expert weights across the attention TP group when using an expert-parallel all-to-all backend.",
     ] = False
+    shared_experts_tp_size: A[
+        Optional[int],
+        "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
+        "backend. Must divide attention TP size. Overrides "
+        "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
+    ] = None
     enable_dense_mlp_attn_tp: A[
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",

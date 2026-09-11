@@ -1132,12 +1132,10 @@ class KVCacheConfigurator:
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
             **ple_kwargs,
-            # A PD prefill server never runs TARGET_VERIFY, so skip the
-            # verify-only per-draft-token state snapshots (see the draft-head
-            # case above: None => the pool skips SpeculativeState).
+            # NPU keeps speculative buffers in both PD pools.
             speculative_num_draft_tokens=(
                 None
-                if get_disagg().disaggregation_mode == "prefill"
+                if get_disagg().disaggregation_mode == "prefill" and not _is_npu
                 else max_speculative_num_draft_tokens()
             ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,

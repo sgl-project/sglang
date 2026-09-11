@@ -19,8 +19,8 @@ capture/replay mechanics live in the backend. This class adds:
   - NPU-specific patch_model monkey-patch for the decode-Full +
     torch.compile path.
   - Profile context override (NPU profiler emits to disk, not in-mem).
-  - Replay override that issues an async NPUGraph.update for
-    seq_lens before replay (skipped for deepseek-nsa).
+  - Replay override that updates dynamic seq_lens before NPUGraph replay
+    (skipped for deepseek-nsa).
   - Smaller cache_loc dtype (int32 instead of int64).
 """
 
@@ -116,6 +116,10 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
+        self.use_fias_v2_bsnd = (
+            envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
+            and model_runner.spec_algorithm.is_dspark()
+        )
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -157,13 +161,21 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             out = run_once_fn()
         return out
 
+    def _uses_v2_seq_len_update(self):
+        # IDLE DP ranks replay the same target-verify graph as active ranks.
+        # Select the handler from the captured graph, not the runtime mode;
+        # a V1 update key is ignored by V2 and leaves stale KV lengths behind.
+        return self.if_use_v2 or (
+            self.use_fias_v2_bsnd and self.capture_forward_mode.is_target_verify()
+        )
+
     def _get_update_attr_name(self):
-        if self.if_use_v2:
+        if self._uses_v2_seq_len_update():
             return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
-        if self.if_use_v2:
+        if self._uses_v2_seq_len_update():
             return self.attr_type["TARGET_VERIFY"]
         return self.attr_type[AttentionArch.MLA]
 
@@ -240,7 +252,15 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
+                if self.model_runner.spec_algorithm.is_dspark():
+                    # DSpark publishes the final verify KV boundary on CPU.
+                    # Do not add the speculative width a second time.
+                    assert forward_batch.seq_lens_cpu is not None
+                    seq_lens_cpu = forward_batch.seq_lens_cpu[: self.raw_bs]
+                else:
+                    seq_lens_cpu = (
+                        forward_batch.seq_lens.cpu() + self.captured_req_width
+                    )
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
