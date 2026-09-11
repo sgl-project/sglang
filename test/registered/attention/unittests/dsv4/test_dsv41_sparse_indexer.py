@@ -52,6 +52,23 @@ def _reference_blocks(logits, lens, block_size=8):
 
 class TestSparseIndexer(CustomTestCase):
     def test_amax_topk_blocks_matches_reference(self):
+        # short rows: the block top-k skips its plan; 40 rows of 300K tokens:
+        # 37500 keys per row on a batch above the persistent pool, plan needed
+        self._check_amax_topk_blocks(
+            torch.tensor(
+                [1, 37, 16384, 16389, 40000, 131072], dtype=torch.int32, device="cuda"
+            ),
+            131072,
+        )
+        self._check_amax_topk_blocks(
+            torch.randint(200000, 300001, (40,), dtype=torch.int32, device="cuda"),
+            300000,
+        )
+
+    def _check_amax_topk_blocks(self, lens, width):
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_row_lens,
+        )
         from sglang.kernels.ops.attention.dsv4.topk import sort_candidate_blocks
         from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
             amax_topk_blocks,
@@ -59,10 +76,7 @@ class TestSparseIndexer(CustomTestCase):
         )
 
         torch.manual_seed(0)
-        lens = torch.tensor(
-            [1, 37, 16384, 16389, 40000, 131072], dtype=torch.int32, device="cuda"
-        )
-        bs, width = lens.numel(), 131072
+        bs = lens.numel()
         logits = torch.randn(bs, width, device="cuda")
         # the tail past the length is garbage in production: make it loud
         logits.masked_fill_(
@@ -72,9 +86,11 @@ class TestSparseIndexer(CustomTestCase):
         page_table = torch.stack(
             [torch.randperm(pages, device="cuda") for _ in range(bs)]
         ).to(torch.int32)
-        blocks = amax_topk_blocks(logits, lens, BLOCKS)
+        nblocks, valid = candidate_row_lens(lens, BLOCKS)
+        self.assertTrue(torch.equal(nblocks, (lens + 7) // 8))
+        self.assertTrue(torch.equal(valid, valid_lens(lens, BLOCKS)))
+        blocks = amax_topk_blocks(logits, lens, nblocks, BLOCKS)
         phys = sort_candidate_blocks(blocks, lens, page_table, PAGE)
-        valid = valid_lens(lens, BLOCKS)
         keys = logits.view(bs, -1, 8).amax(-1)
         bpp = PAGE // 8
         for b, ref in enumerate(_reference_blocks(logits, lens)):

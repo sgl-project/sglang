@@ -7,16 +7,13 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import (
-    topk_transform_paged,
-    topk_transform_paged_v2,
-)
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     fp4_paged_mqa_logits,
+    fp32_jit_paged_topk,
     select_candidate_blocks,
 )
 
@@ -149,24 +146,7 @@ class TorchCandidateIndexer:
             block_size=self.block_size,
             published=None,
         )
-        if metadata.use_topk_v2 and raw_indices is None:
-            topk_transform_paged_v2(
-                logits,
-                metadata.c4_seq_lens,
-                metadata.page_table,
-                page_indices,
-                metadata.c4_page_size,
-                metadata.topk_metadata,
-            )
-        else:
-            topk_transform_paged(
-                logits,
-                metadata.c4_seq_lens,
-                metadata.page_table,
-                page_indices,
-                metadata.c4_page_size,
-                raw_indices,
-            )
+        fp32_jit_paged_topk(logits, metadata, page_indices, raw_indices)
         return CandidateMasks(mask=mask)
 
     def select_decode(
@@ -200,25 +180,10 @@ class TorchCandidateIndexer:
             block_size=self.block_size,
             published=candidate_metadata.mask,
         )
+        # raw positions into `selected`; `page_indices` gets the unfiltered slots
+        # here and is rewritten with the masked selection just below
         selected = torch.empty_like(page_indices)
-        if metadata.use_topk_v2 and raw_indices is None:
-            topk_transform_paged_v2(
-                logits,
-                metadata.c4_seq_lens,
-                None,
-                selected,
-                page_size,
-                metadata.topk_metadata,
-            )
-        else:
-            topk_transform_paged(
-                logits,
-                metadata.c4_seq_lens,
-                metadata.page_table,
-                page_indices,
-                page_size,
-                selected,
-            )
+        fp32_jit_paged_topk(logits, metadata, page_indices, raw_indices=selected)
         if logits.is_cuda and torch.version.cuda is not None:
             # fused: drop the selections the mask zeroed, page-transform the rest
             from sglang.kernels.ops.attention.dsv4.indexer_postprocess import (

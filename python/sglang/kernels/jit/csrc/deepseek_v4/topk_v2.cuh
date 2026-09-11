@@ -530,6 +530,10 @@ struct TopKKernel {
     RuntimeCheck(metadata.size(0) == B.unwrap() + 1, "invalid metadata shape");
 #if SUPPORT_CLUSTER
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    // persistent cluster not supported
+    if (kNumPersistentClusters == 0) return;
+    // will not route to persistent cluster
+    if (batch_size <= kNumPersistentClusters || batch_size > kClusterMaxBatch) return;
     const auto device = device_.unwrap();
     LaunchKernel(1, kBlockSize, device)(  //
         topk_plan_cluster,

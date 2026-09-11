@@ -19,11 +19,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.dsv4 import (
-    topk_transform_paged,
-    topk_transform_paged_v2,
-    topk_transform_ragged_v2,
-)
+from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
@@ -79,6 +75,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
     fp4_paged_mqa_logits,
+    fp32_jit_paged_topk,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -3347,24 +3344,7 @@ class DeepseekV4AttnBackend(
             metadata.max_c4_seq_len,
         )
         # TODO(dark): add bf16 topk
-        if metadata.use_topk_v2 and raw_indices is None:
-            topk_transform_paged_v2(
-                logits,
-                metadata.c4_seq_lens,
-                metadata.page_table,
-                page_indices,
-                page_size,
-                metadata.topk_metadata,
-            )
-        else:
-            topk_transform_paged(
-                logits,
-                metadata.c4_seq_lens,
-                metadata.page_table,
-                page_indices,
-                page_size,
-                raw_indices,
-            )
+        fp32_jit_paged_topk(logits, metadata, page_indices, raw_indices)
 
     # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
     # top-k); move into the candidate indexer with the prefill paths.

@@ -1157,6 +1157,36 @@ def fp4_paged_mqa_logits(
     )
 
 
+def fp32_jit_paged_topk(
+    logits: torch.Tensor,
+    metadata,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Plain top-k of the dense paged ``logits``: pool slots into ``page_indices``
+    (``-1`` past the valid count) and, when given, positions into ``raw_indices``;
+    ``metadata`` is the ratio's ``PagedIndexerMetadata``."""
+    if metadata.use_topk_v2:
+        topk_transform_paged_v2(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            metadata.topk_metadata,
+            raw_indices,
+        )
+    else:
+        topk_transform_paged(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            raw_indices,
+        )
+
+
 def select_candidate_blocks(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,

@@ -5,19 +5,21 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import candidate_row_lens
 from sglang.kernels.ops.attention.dsv4.topk import (
     amax8_varlen,
     plan_topk_v2,
     sort_candidate_blocks,
     topk_transform_bf16_small,
-    topk_transform_paged,
     topk_transform_paged_v2,
 )
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
 )
-from sglang.srt.layers.attention.dsv4.indexer import fp4_paged_mqa_logits
+from sglang.srt.layers.attention.dsv4.indexer import (
+    fp4_paged_mqa_logits,
+)
 
 CANDIDATE_BLOCK_SIZE = 8  # positions per block; DeepGEMM accepts 8 or 16
 
@@ -33,11 +35,14 @@ class SparseBlockTable(CandidateMetadata):
     # top-k maps column j of the sparse row to slot phys_blocks[b, j // 8] * 8 + j % 8
     # with the plain page-table transform at page size 8
     phys_blocks: torch.Tensor
+    # [rows] int32: length of each row of the sparse logits (see `valid_lens`)
+    valid_lens: torch.Tensor
 
 
 def valid_lens(seq_lens: torch.Tensor, topk_blocks: int) -> torch.Tensor:
     """Length of each row of the sparse logits: the published blocks laid out
-    block by block, the newest (highest) block possibly partial."""
+    block by block, the newest (highest) block possibly partial. Torch reference
+    of ``candidate_row_lens``; the decode path takes the kernel's value."""
     block = CANDIDATE_BLOCK_SIZE
     num = ((seq_lens + block - 1) // block).clamp_max(topk_blocks)
     return block * (num - 1) + (seq_lens - 1) % block + 1
@@ -46,19 +51,19 @@ def valid_lens(seq_lens: torch.Tensor, topk_blocks: int) -> torch.Tensor:
 def amax_topk_blocks(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
+    nblocks: torch.Tensor,
     topk_blocks: int,
     max_seq_len: Optional[int] = None,
 ) -> torch.Tensor:
     """Per row the ``topk_blocks`` blocks of 8 positions with the largest block
     maximum among its first ``seq_lens[b]`` positions, the newest block always
     included: block ids in no particular order, ``-1`` past the row's count
-    (``sort_candidate_blocks`` turns them into the published table)."""
+    (``sort_candidate_blocks`` turns them into the published table). ``nblocks``
+    is ``ceil(seq_lens / 8)`` as int32, from ``candidate_row_lens``."""
     rows = logits.shape[0]
     block = CANDIDATE_BLOCK_SIZE
     if max_seq_len is None:
         max_seq_len = logits.shape[1]
-    # TODO(candidate): nblocks and the plan are per-forward constants -> metadata
-    nblocks = (seq_lens + (block - 1)) // block
     # NOTE: plan cannot be the previous kernel of topk_transform_paged_v2
     plan = plan_topk_v2(nblocks)
     # block maxima, the newest block +inf; the top-k reads each row up to nblocks
@@ -70,7 +75,7 @@ def amax_topk_blocks(
     return blocks
 
 
-def build_schedule(
+def build_sparse_indexer_schedule(
     blocks: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
@@ -142,7 +147,7 @@ def warmup(rows: int, topk_blocks: int, page_size: int, q_dtype: torch.dtype, de
     )
     blocks = torch.zeros(rows, topk_blocks, dtype=torch.int32, device=device)
     page_table = torch.zeros(rows, 1, dtype=torch.int32, device=device)
-    build_schedule(blocks, seq_lens, page_table, page_size, q_dtype)
+    build_sparse_indexer_schedule(blocks, seq_lens, page_table, page_size, q_dtype)
 
 
 class DeepGemmCandidateIndexer:
@@ -173,25 +178,18 @@ class DeepGemmCandidateIndexer:
             metadata.max_c4_seq_len,
         )
         # TODO(candidate): one kernel for both selections below (dense logits read once)
-        if metadata.use_topk_v2 and raw_indices is None:
-            topk_transform_paged_v2(
-                logits,
-                metadata.c4_seq_lens,
-                metadata.page_table,
-                page_indices,
-                metadata.c4_page_size,
-                metadata.topk_metadata,
-            )
-        else:
-            topk_transform_paged(
-                logits,
-                metadata.c4_seq_lens,
-                metadata.page_table,
-                page_indices,
-                metadata.c4_page_size,
-                raw_indices,
-            )
-        blocks = amax_topk_blocks(logits, seq_lens, self.topk_blocks)
+        topk_transform_paged_v2(
+            logits,
+            seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            metadata.topk_metadata,
+            out_raw_indices=raw_indices,
+        )
+        # per row: block count for the block top-k, sparse-row length for the consumers
+        nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
+        blocks = amax_topk_blocks(logits, seq_lens, nblocks, self.topk_blocks)
         # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
         phys_blocks = sort_candidate_blocks(
             blocks,
@@ -199,7 +197,7 @@ class DeepGemmCandidateIndexer:
             metadata.page_table,
             metadata.c4_page_size,
         )
-        schedule = build_schedule(
+        schedule = build_sparse_indexer_schedule(
             blocks,
             seq_lens,
             metadata.page_table,
@@ -210,6 +208,7 @@ class DeepGemmCandidateIndexer:
             blocks=blocks,
             schedule=schedule,
             phys_blocks=phys_blocks,
+            valid_lens=row_valid_lens,
         )
 
     def scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
@@ -236,9 +235,6 @@ class DeepGemmCandidateIndexer:
         given)."""
         assert raw_indices is None
         table = candidate_metadata
-        seq_lens = inputs.metadata.c4_seq_lens.reshape(-1)
         logits = self.scores(table, inputs)
         # decode carries no raw_indices; the kernel writes slots only
-        topk_transform_sparse(
-            logits, valid_lens(seq_lens, self.topk_blocks), table, page_indices
-        )
+        topk_transform_sparse(logits, table.valid_lens, table, page_indices)
