@@ -610,12 +610,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
 
-        if is_multimodal:
-            request_prompts = [processed_messages.prompt]
-            engine_prompts = [processed_messages.prompt]
-        else:
-            request_prompts = [processed_messages.prompt_ids]
-            engine_prompts = [processed_messages.prompt_ids]
+        _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
+        request_prompts = [engine_prompt]
+        engine_prompts = [engine_prompt]
 
         return messages, request_prompts, engine_prompts, processed_messages
 
