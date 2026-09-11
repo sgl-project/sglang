@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.pool_transfer import PoolName
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.hicache_spec_storage_common import HiCacheSpecStorageMixin

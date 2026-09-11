@@ -5,15 +5,15 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolHitPolicy,
-    PoolName,
-    PoolTransfer,
-)
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.pool_transfer import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -13,14 +13,14 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorageConfig,
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.pool_transfer import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
-)
-from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-    resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import (

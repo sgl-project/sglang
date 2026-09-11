@@ -14,11 +14,8 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorageConfig,
-    PoolName,
-    PoolTransfer,
-)
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.test.test_utils import CustomTestCase
 

@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-from sglang.srt.mem_cache.hicache_storage import (
+from sglang.srt.mem_cache.pool_transfer import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,

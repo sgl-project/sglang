@@ -37,15 +37,12 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolName,
-    PoolTransfer,
-    SidecarPoolSpec,
-)
+from sglang.srt.mem_cache.hicache_storage import SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (

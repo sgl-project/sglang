@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _SwaStrategy,
     register_stack_strategy,
 )
+from sglang.srt.mem_cache.pool_transfer import PoolName
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 

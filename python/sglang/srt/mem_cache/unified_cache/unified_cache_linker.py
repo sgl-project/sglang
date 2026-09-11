@@ -30,10 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolName,
-    PoolTransfer,
-)
+from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
