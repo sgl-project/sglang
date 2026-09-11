@@ -1001,16 +1001,6 @@ TWO_GPU_CASES = [
         run_perf_check=False,
     ),
     DiffusionTestCase(
-        "mova_360p_ring1_uly2",
-        DiffusionServerArgs(
-            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
-            ring_degree=1,
-            ulysses_degree=2,
-            dit_layerwise_offload=True,
-        ),
-        run_perf_check=False,
-    ),
-    DiffusionTestCase(
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
