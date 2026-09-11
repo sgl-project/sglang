@@ -292,6 +292,13 @@ class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
     metadata: BlockStoredMetadata
 
 
+class BlockStoredWithComponents(BlockStored, tag="BlockStored", kw_only=True):
+    """Optional resident component snapshot, in the established trailing slot."""
+
+    component_types: list[str]
+    metadata: Optional[BlockStoredMetadata] = None
+
+
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
@@ -345,19 +352,48 @@ class KVSnapshotHeader(
     record_count: int
 
 
+class KVSnapshotBlockV2(msgspec.Struct, frozen=True):
+    namespace: str
+    block_hash: int
+    parent_block_hash: Optional[int]
+    block_size: int
+    tier: int
+    component_mask: int
+
+
+class KVSnapshotHeaderV2(msgspec.Struct, frozen=True):
+    version: int
+    namespace: str
+    model: str
+    worker_id: str
+    dp_rank: int
+    worker_epoch: str
+    hash_schema_version: int
+    page_size: int
+    is_bigram: bool
+    barrier_seq: int
+    resume_seq: int
+    barrier_id: str
+    record_count: int
+    cache_spec: Optional[dict[str, int]]
+
+
 @dataclass(frozen=True, slots=True)
 class _KVPlacementSnapshot:
-    header: KVSnapshotHeader
-    blocks: list[KVSnapshotBlock]
+    header: Union[KVSnapshotHeader, KVSnapshotHeaderV2]
+    blocks: Union[list[KVSnapshotBlock], list[KVSnapshotBlockV2]]
 
 
 @dataclass(frozen=True, slots=True)
 class _SnapshotCaptureRequest:
     response: Queue
+    version: int = 1
 
 
 SNAPSHOT_PROTOCOL_VERSION = 1
 SNAPSHOT_REQUEST = b"snapshot-v1"
+SNAPSHOT_REQUEST_V2 = b"snapshot-v2"
+REPLAY_REQUEST_V2 = b"replay-v2"
 SNAPSHOT_HEADER = b"header"
 SNAPSHOT_CHUNK = b"chunk"
 SNAPSHOT_END = b"end"
@@ -469,6 +505,13 @@ class ZmqEventPublisher(EventPublisher):
         max_queue_size: int = 100_000,
         topic: str = "",
         epoch: Optional[str] = None,
+        namespace: str = "default",
+        model: str = "",
+        worker_id: str = "",
+        hash_schema_version: int = 1,
+        page_size: int = 1,
+        is_bigram: bool = False,
+        cache_spec: Optional[dict[str, int]] = None,
     ) -> None:
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
@@ -492,6 +535,13 @@ class ZmqEventPublisher(EventPublisher):
         # Payload
         self._next_seq = 0
         self._epoch = epoch or uuid.uuid4().hex
+        self._namespace = namespace
+        self._model = model
+        self._worker_id = worker_id
+        self._hash_schema_version = hash_schema_version
+        self._page_size = page_size
+        self._is_bigram = is_bigram
+        self._cache_spec = cache_spec
         self._topic_bytes = topic.encode("utf-8")
         # Preserve the exact legacy topic when snapshots are disabled. A
         # snapshot-capable publisher appends backward-compatible metadata to
@@ -506,6 +556,7 @@ class ZmqEventPublisher(EventPublisher):
         # placement mirror beside sequence assignment makes snapshot cuts
         # exact without traversing the scheduler's radix tree concurrently.
         self._snapshot_blocks: dict[int, KVSnapshotBlock] = {}
+        self._snapshot_blocks_v2: dict[tuple[str, int, int], KVSnapshotBlockV2] = {}
         # At most one capture may wait behind the publisher thread. This keeps
         # a stalled publisher from accumulating timed-out requests forever.
         self._snapshot_requests: Queue[_SnapshotCaptureRequest] = Queue(maxsize=1)
@@ -546,6 +597,12 @@ class ZmqEventPublisher(EventPublisher):
     def publish(self, events: EventBatch) -> None:
         if not self._running:
             raise RuntimeError("Publisher is closed")
+        for event in events.events:
+            components = getattr(event, "component_types", None)
+            if components is not None and any(
+                name.lower() not in ("full", "swa", "mamba") for name in components
+            ):
+                raise ValueError("Unknown KV component type")
         if events.attn_dp_rank is None:
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
@@ -623,6 +680,9 @@ class ZmqEventPublisher(EventPublisher):
         # 3) works in our non‑blocking poll loop alongside PUB
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
+            # A slow replica must never indefinitely stall the publisher.
+            self._replay.setsockopt(zmq.SNDTIMEO, 100)
+            self._replay.setsockopt(zmq.SNDHWM, 64)
             logger.debug(
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
@@ -686,17 +746,42 @@ class ZmqEventPublisher(EventPublisher):
         for event in batch.events:
             if isinstance(event, BlockStored):
                 parent = event.parent_block_hash
+                tier = self._placement_tier(event.medium)
+                components = getattr(event, "component_types", None)
+                mask = 0
+                if components is not None:
+                    for component in components:
+                        mask |= {"full": 1, "swa": 2, "mamba": 4}[component.lower()]
                 for block_hash in event.block_hashes:
                     self._snapshot_blocks[block_hash] = KVSnapshotBlock(
                         parent_block_hash=parent,
                         block_hashes=[block_hash],
                     )
+                    if tier is not None:
+                        key = (self._namespace, block_hash, tier)
+                        self._snapshot_blocks_v2[key] = KVSnapshotBlockV2(
+                            namespace=self._namespace,
+                            block_hash=block_hash,
+                            parent_block_hash=parent,
+                            block_size=event.block_size,
+                            tier=tier,
+                            component_mask=mask,
+                        )
                     parent = block_hash
             elif isinstance(event, BlockRemoved):
                 for block_hash in event.block_hashes:
                     self._snapshot_blocks.pop(block_hash, None)
+                    self._snapshot_blocks_v2.pop(
+                        (self._namespace, block_hash, self._placement_tier(event.medium)),
+                        None,
+                    )
             elif isinstance(event, AllBlocksCleared):
                 self._snapshot_blocks.clear()
+                self._snapshot_blocks_v2.clear()
+
+    @staticmethod
+    def _placement_tier(medium: Optional[str]) -> Optional[int]:
+        return {"GPU": 1, "CPU_PINNED": 2, "DISK": 3}.get(medium)
 
     def _service_snapshot_capture(self) -> None:
         try:
@@ -722,6 +807,30 @@ class ZmqEventPublisher(EventPublisher):
             self._buffer.append((barrier_seq, payload))
             self._next_seq = barrier_seq + 1
             blocks = list(self._snapshot_blocks.values())
+            if request.version == 2:
+                blocks = list(self._snapshot_blocks_v2.values())
+                request.response.put(
+                    _KVPlacementSnapshot(
+                        header=KVSnapshotHeaderV2(
+                            version=2,
+                            namespace=self._namespace,
+                            model=self._model,
+                            worker_id=self._worker_id,
+                            dp_rank=self._dp_rank,
+                            worker_epoch=self._epoch,
+                            hash_schema_version=self._hash_schema_version,
+                            page_size=self._page_size,
+                            is_bigram=self._is_bigram,
+                            barrier_seq=barrier_seq,
+                            resume_seq=self._next_seq,
+                            barrier_id=barrier_id,
+                            record_count=len(blocks),
+                            cache_spec=self._cache_spec,
+                        ),
+                        blocks=blocks,
+                    )
+                )
+                return
             request.response.put(
                 _KVPlacementSnapshot(
                     header=KVSnapshotHeader(
@@ -764,16 +873,19 @@ class ZmqEventPublisher(EventPublisher):
                     logger.warning("Invalid snapshot request: %s", frames)
                     continue
                 client_id, delimiter, command = frames
-                if delimiter or command != SNAPSHOT_REQUEST:
+                if delimiter or command not in (SNAPSHOT_REQUEST, SNAPSHOT_REQUEST_V2):
                     self._send_snapshot_error(
-                        sock, client_id, b"invalid snapshot-v1 request"
+                        sock, client_id, b"unsupported snapshot request"
                     )
                     continue
 
                 response: Queue = Queue(maxsize=1)
                 try:
                     self._snapshot_requests.put_nowait(
-                        _SnapshotCaptureRequest(response=response)
+                        _SnapshotCaptureRequest(
+                            response=response,
+                            version=2 if command == SNAPSHOT_REQUEST_V2 else 1,
+                        )
                     )
                 except queue.Full:
                     self._send_snapshot_error(
@@ -860,6 +972,27 @@ class ZmqEventPublisher(EventPublisher):
         assert self._replay is not None  # narrows type for mypy
 
         frame = self._replay.recv_multipart()
+        if len(frame) == 5 and frame[1] == b"" and frame[2] == REPLAY_REQUEST_V2:
+            client_id, _, _, expected_epoch, start_bytes = frame
+            if len(start_bytes) != 8 or expected_epoch != self._epoch.encode():
+                self._replay.send_multipart(
+                    (client_id, b"", b"error", b"epoch mismatch or invalid sequence")
+                )
+                return
+            start = int.from_bytes(start_bytes, "big")
+            # Capture the journal end on its sole writer thread. The header
+            # proves completeness even when the worker has become idle.
+            header = msgspec.msgpack.encode(
+                {"worker_epoch": self._epoch, "resume_seq": self._next_seq}
+            )
+            self._replay.send_multipart((client_id, b"", b"header", header))
+            for seq, payload in self._buffer:
+                if seq >= start:
+                    self._replay.send_multipart(
+                        (client_id, b"", seq.to_bytes(8, "big"), payload)
+                    )
+            self._replay.send_multipart((client_id, b"", b"end", b""))
+            return
         if len(frame) != 3:
             logger.warning("Invalid replay request: %s", frame)
             return
@@ -959,6 +1092,14 @@ class ZmqEventPublisherConfig(_LegacyEventPublisherConfig):
     Like ``endpoint`` and ``replay_endpoint``, the data-parallel replica rank
     is added to the configured base port.
     """
+
+    namespace: str = "default"
+    model: str = ""
+    worker_id: str = ""
+    hash_schema_version: int = 1
+    page_size: int = 1
+    is_bigram: bool = False
+    cache_spec: Optional[dict[str, int]] = None
 
 
 class NullEventPublisherConfig(BaseModel):

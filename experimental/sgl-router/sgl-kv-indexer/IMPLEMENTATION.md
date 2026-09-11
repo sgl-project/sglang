@@ -28,6 +28,8 @@
 ## 执行记录
 
 - 2026-09-11：重新拉取任务架构及目标分支，创建独立工作树，完成需求与源码差异核对。
+- Worker 第一阶段：新增 Snapshot v2、namespace/hash/tier 镜像、component 与 block size、带 epoch 和完整性边界的 Replay v2；v1 保持可用。Replay socket 发送超时避免慢消费者无限阻塞发布线程。
+- 实测：`PYTHONPATH=python python -m pytest test/registered/unit/disaggregation/test_kv_snapshot_v2.py test/registered/unit/disaggregation/test_kv_events.py -q`，26 passed，22 subtests passed；存在基线 pytest 配置/torch 弃用警告。
 
 ## 验收证据
 
