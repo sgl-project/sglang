@@ -88,7 +88,10 @@ def handle_model_specific_adjustments(server_args: Any):
         is_deepseek_dsa,
     )
 
-    if cfg.enable_deterministic_inference:
+    if (
+        cfg.enable_deterministic_inference
+        and cfg.flashinfer_allreduce_fusion_backend != "trtllm"
+    ):
         declare_resolution(
             server_args,
             "_handle_model_specific_adjustments",
