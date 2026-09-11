@@ -24,6 +24,10 @@ or batch a whole image directory into per-page markdown files (each named
     python examples/runtime/multimodal/deepseek_ocr2_server.py \
         --image-dir /path/to/pages --output /path/to/pred_md
 
+Pages whose <image-stem>.md already exists and is non-empty are skipped, so an
+interrupted batch can be resumed by re-running the same command; pass
+--overwrite to redo them.
+
 Why --max-new-tokens defaults to 8192: a 768px page expands to ~1100 image tokens
 (up to 6 local crops of 144 plus the 256-token global view). The request-side
 check counts the prompt *before* the image expands, so asking for 8192 alongside
@@ -130,6 +134,11 @@ def main():
         action="store_true",
         help="emit the raw model output instead of running postprocess() on it",
     )
+    ap.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="redo pages whose .md output already exists (default: skip them)",
+    )
     args = ap.parse_args()
     url = f"http://{args.host}:{args.port}{ROUTE}"
 
@@ -151,18 +160,33 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     failures = []
+    written = 0
+    skipped = 0
     for idx, name in enumerate(images, start=1):
+        out_path = os.path.join(args.output, md_name(name))
+        if (
+            not args.overwrite
+            and os.path.exists(out_path)
+            and os.path.getsize(out_path) > 0
+        ):
+            skipped += 1
+            print(f"[{idx}/{len(images)}] skip {md_name(name)}")
+            continue
         try:
             text = run_one(url, os.path.join(args.image_dir, name), args.max_new_tokens)
         except Exception as exc:  # one bad page must not discard the whole run
             failures.append((name, exc))
             print(f"[{idx}/{len(images)}] FAILED {name}: {exc}", file=sys.stderr)
             continue
-        with open(os.path.join(args.output, md_name(name)), "w", encoding="utf-8") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(text if args.raw else postprocess(text))
+        written += 1
         print(f"[{idx}/{len(images)}] wrote {md_name(name)}")
 
-    print(f"done: {len(images) - len(failures)}/{len(images)} pages -> {args.output}")
+    print(
+        f"done: {written} written, {skipped} skipped, {len(failures)} failed "
+        f"/ {len(images)} pages -> {args.output}"
+    )
     if failures:
         print(
             f"failed pages ({len(failures)}): "
