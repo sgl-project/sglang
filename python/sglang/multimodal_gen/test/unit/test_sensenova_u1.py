@@ -894,23 +894,13 @@ def test_sensenova_u1_shared_rope_tables_match_per_layer_computation():
     derive identical tables from the same `indexes`. If the tables ever become
     layer-dependent, sharing them would silently change every attention output.
     """
-    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
-        _build_neo_unify_rope_tables,
-    )
-
     torch.manual_seed(0)
     first, other = _tiny_dense_attention(0), _tiny_dense_attention(1)
     x = torch.randn(1, 5, _HIDDEN_DIM)
     indexes = torch.arange(3 * 5).reshape(3, 5) % 3
 
-    shared = _build_neo_unify_rope_tables(
-        first.rotary_emb, first.rotary_emb_hw, indexes, x
-    )
-    reference_modules = (
-        other.rotary_emb,
-        other.rotary_emb_hw,
-        other.rotary_emb_hw,
-    )
+    shared = first._resolve_rope_tables(indexes, x)
+    reference_modules = (other.rotary_emb, other.rotary_emb_hw, other.rotary_emb_hw)
     for (cos_shared, sin_shared), module, axis in zip(
         shared, reference_modules, (0, 1, 2)
     ):
@@ -919,64 +909,46 @@ def test_sensenova_u1_shared_rope_tables_match_per_layer_computation():
         assert torch.equal(sin_shared, sin_ref), f"sin differs on axis {axis}"
 
 
-class _RopeRebuildDetector(torch.nn.Module):
-    """An nn.Module so it can take over a registered submodule slot."""
+class _CountingRotaryEmbedding(torch.nn.Module):
+    """Delegates to a real rope module and records one entry per table computed."""
 
-    def forward(self, *args, **kwargs):
-        pytest.fail("rope tables rebuilt")
+    def __init__(self, inner, builds: list[int]):
+        super().__init__()
+        self.inner = inner
+        self.builds = builds
 
-
-def test_sensenova_u1_attention_reuses_passed_rope_tables(monkeypatch):
-    """Passing tables down must skip the per-layer rebuild.
-
-    The failure mode is silent: reintroducing the rebuild keeps every output
-    correct, so only this case notices that the sharing stopped happening.
-    """
-    attn = _tiny_dense_attention()
-    shared = ("t", "h", "w")
-    detector = _RopeRebuildDetector()
-    monkeypatch.setattr(attn, "rotary_emb", detector)
-    monkeypatch.setattr(attn, "rotary_emb_hw", detector)
-
-    x = torch.randn(1, 5, _HIDDEN_DIM)
-    indexes = torch.zeros(3, 5, dtype=torch.long)
-
-    assert attn._resolve_rope_tables(x, indexes, shared) is shared
+    def forward(self, x, position_ids):
+        self.builds.append(1)
+        return self.inner(x, position_ids)
 
 
 @pytest.mark.parametrize("image_gen", [True, False], ids=["gen", "und"])
-def test_sensenova_u1_model_builds_once_and_shares_with_every_layer(
-    monkeypatch, image_gen
-):
+def test_sensenova_u1_model_builds_once_and_shares_with_every_layer(image_gen):
     """One build per forward, reaching every layer on both dispatch paths.
 
     Guards the optimization itself: a dropped link, or a build moved back inside
     the layer loop, leaves every output correct, so only the call count notices.
+    Every layer's rope modules are wrapped by a counter, so it counts the real
+    table computations however they are reached: one build is 3 entries (t, h, w),
+    and any more means some layer computed its own.
     """
-    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
-        modeling_qwen3,
-    )
     from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
-        Qwen3Attention,
         Qwen3Model,
     )
 
     model = Qwen3Model(_tiny_dense_config()).eval()
-    received = []
-    builds = []
-    original_build = modeling_qwen3._build_neo_unify_rope_tables
-    original_resolve = Qwen3Attention._resolve_rope_tables
+    builds: list[int] = []
+    for layer in model.layers:
+        # Each slot keeps its own rope module: `rotary_emb` and `rotary_emb_hw`
+        # differ in head_dim, so sharing one wrapper across both builds h/w tables
+        # of the wrong width instead of failing this assertion.
+        for name in ("rotary_emb", "rotary_emb_hw"):
+            setattr(
+                layer.self_attn,
+                name,
+                _CountingRotaryEmbedding(getattr(layer.self_attn, name), builds),
+            )
 
-    def counting_build(*args, **kwargs):
-        builds.append(1)
-        return original_build(*args, **kwargs)
-
-    def spy(self, hidden_states, indexes, rope_tables):
-        received.append(rope_tables is not None)
-        return original_resolve(self, hidden_states, indexes, rope_tables)
-
-    monkeypatch.setattr(modeling_qwen3, "_build_neo_unify_rope_tables", counting_build)
-    monkeypatch.setattr(Qwen3Attention, "_resolve_rope_tables", spy)
     with torch.no_grad():
         model(
             inputs_embeds=torch.randn(1, 5, _HIDDEN_DIM),
@@ -985,9 +957,7 @@ def test_sensenova_u1_model_builds_once_and_shares_with_every_layer(
             attention_mask={"full_attention": None},
         )
 
-    assert builds == [1], f"rope tables built {len(builds)} times, want 1"
-    assert len(received) == _LAYERS, f"attention ran {len(received)} times"
-    assert all(received), f"layers that had to rebuild: {received}"
+    assert len(builds) == 3, f"expected one t/h/w build, got {len(builds)}"
 
 
 def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
@@ -1022,8 +992,8 @@ def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
     monkeypatch.setattr(
         Qwen3Attention,
         "_resolve_rope_tables",
-        lambda self, hidden_states, idx, tables: original(
-            self, hidden_states, idx, None
+        lambda self, indexes, hidden_states, embeddings=None: original(
+            self, indexes, hidden_states, None
         ),
     )
     per_layer = run()
