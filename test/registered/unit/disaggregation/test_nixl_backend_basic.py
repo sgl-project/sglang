@@ -848,10 +848,9 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.update_transfer_status.assert_called_once_with()
         mgr.record_failure.assert_not_called()
         mgr.update_status.assert_not_called()
-        self.assertNotIn(11, mgr.transfer_statuses)
 
     @patch("sglang.srt.disaggregation.nixl.conn.time.time")
-    def test_transfer_done_returns_success_and_cleans_room_state(self, mock_time):
+    def test_transfer_done_returns_success_and_clear_drops_room_state(self, mock_time):
         mock_time.return_value = 12.0
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
         receiver.started_transfer = True
@@ -864,9 +863,16 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.check_transfer_done.return_value = True
 
         self.assertEqual(receiver.poll(), KVPoll.Success)
+        self.assertEqual(receiver.conclude_state, KVPoll.Success)
+
+        # poll() only concludes now; dropping room state is left to clear(), the
+        # way mooncake and mori already do it. The scheduler calls clear() as
+        # soon as poll() reports Success or Failed, so both terminal paths clean
+        # up -- the cleanup that used to live in poll() ran on Success only.
+        receiver.clear()
+
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
-        self.assertEqual(receiver.conclude_state, KVPoll.Success)
 
 
 class TestNixlNodeFailure(CustomTestCase):
