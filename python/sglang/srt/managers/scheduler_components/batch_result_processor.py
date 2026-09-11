@@ -304,13 +304,26 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                drop_prefill_result = req.to_finish is not None and (not batch.decoding_reqs or req not in batch.decoding_reqs)
-                should_commit_output = not req.finished() and not req.is_retracted and req.inflight_middle_chunks <= 0
+                drop_prefill_result = req.to_finish is not None and (
+                    not batch.decoding_reqs or req not in batch.decoding_reqs
+                )
+                should_commit_output = (
+                    not req.finished()
+                    and not req.is_retracted
+                    and req.inflight_middle_chunks <= 0
+                )
                 sampling_mask_finish_reason = None
-                if should_commit_output and req.return_sampling_mask:
+                if (
+                    should_commit_output
+                    and not drop_prefill_result
+                    and req.return_sampling_mask
+                ):
+                    assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
-                    sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(status=status)
+                    sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
+                        status=status
+                    )
                 if (
                     batch.return_hidden_states
                     and logits_output.hidden_states is not None
@@ -323,7 +336,9 @@ class SchedulerBatchResultProcessor:
                         capture_hidden_mode=prefill_hidden_capture_mode,
                         extend_input_len=extend_input_len_per_req[i],
                         store=(
-                            should_commit_output and sampling_mask_finish_reason is None and not drop_prefill_result
+                            should_commit_output
+                            and sampling_mask_finish_reason is None
+                            and not drop_prefill_result
                         ),
                     )
 
@@ -355,7 +370,9 @@ class SchedulerBatchResultProcessor:
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
+
                         self._maybe_update_reasoning_tokens(req, next_token_id)
+
                         req.update_finish_state()
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
@@ -393,7 +410,8 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
-                            store=sampling_mask_finish_reason is None and not drop_prefill_result,
+                            store=sampling_mask_finish_reason is None
+                            and not drop_prefill_result,
                         )
 
                     if sampling_mask_finish_reason is not None:
