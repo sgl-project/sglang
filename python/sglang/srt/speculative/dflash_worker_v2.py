@@ -446,6 +446,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+        # Backends may opt into preserving the mask-filled tail across steps.
+        self._init_draft_mask_once = False
         target_model = self._target_worker.model_runner.model
         self._noise_embed_scale = (
             float(target_model.get_dflash_noise_embedding_scale())
@@ -560,6 +562,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
+        self._init_draft_mask_once = bool(
+            getattr(
+                self.draft_model_runner.attn_backend,
+                "dflash_init_mask_once",
+                False,
+            )
+        )
+        if self._init_draft_mask_once and self.ps.tp_rank == 0:
+            logger.info("DFLASH draft mask buffer will be initialized once and reused.")
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -910,6 +921,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_ids_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
         )
+        if self._init_draft_mask_once:
+            self._draft_block_ids_buf.fill_(int(self._mask_token_id))
         self._draft_block_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
@@ -2176,7 +2189,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
         else:
-            block_ids.fill_(int(self._mask_token_id))
+            if not self._init_draft_mask_once:
+                block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.bonus_tokens)
             torch.add(
                 prefix_lens.unsqueeze(1),

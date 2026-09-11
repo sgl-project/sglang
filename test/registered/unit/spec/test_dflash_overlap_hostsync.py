@@ -5,6 +5,7 @@ keep-list."""
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -59,6 +60,57 @@ class TestCompactSeqLensHostBound(CustomTestCase):
         self.assertLess(int(exact_reserved), int(exact_true))
         bound = _compact_lens_host(reserved, window, page).to(torch.int64)
         self.assertGreaterEqual(int(bound), int(exact_true))
+
+
+class TestDraftBlockBufferInit(CustomTestCase):
+    def _make_worker(self, *, init_mask_once):
+        return SimpleNamespace(
+            block_size=4,
+            device=torch.device("cpu"),
+            _mask_token_id=99,
+            _init_draft_mask_once=init_mask_once,
+            _draft_block_ids_buf=None,
+            _draft_block_positions_buf=None,
+            _draft_block_tokens_buf=None,
+            _draft_verify_out_cache_loc_buf=None,
+            _draft_block_end_buf=None,
+            _draft_seq_lens_cpu_buf=None,
+        )
+
+    def test_mask_tail_is_initialized_once_when_backend_opts_in(self):
+        from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+        worker = self._make_worker(init_mask_once=True)
+        worker_mod.DFlashWorkerV2._ensure_draft_block_buffers(worker, 3)
+
+        self.assertEqual(tuple(worker._draft_block_ids_buf.shape), (3, 4))
+        torch.testing.assert_close(
+            worker._draft_block_ids_buf,
+            torch.full((3, 4), 99, dtype=torch.long),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_mask_tail_init_can_be_deferred_to_each_step(self):
+        from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+        worker = self._make_worker(init_mask_once=False)
+        original_empty = torch.empty
+
+        def empty_with_sentinel(*args, **kwargs):
+            return original_empty(*args, **kwargs).fill_(-1)
+
+        with mock.patch.object(
+            worker_mod.torch, "empty", side_effect=empty_with_sentinel
+        ):
+            worker_mod.DFlashWorkerV2._ensure_draft_block_buffers(worker, 3)
+
+        torch.testing.assert_close(
+            worker._draft_block_ids_buf,
+            torch.full((3, 4), -1, dtype=torch.long),
+            rtol=0,
+            atol=0,
+        )
 
 
 class _FakeTpGroup:

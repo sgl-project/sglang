@@ -22,6 +22,29 @@ if is_npu():
     import torch_npu
 
 
+def _build_prefix_valid_write_locs(
+    loc_2d: torch.Tensor, commit_lens: torch.Tensor
+) -> torch.Tensor:
+    """Flatten prefix-valid locations without creating a dynamic-size tensor.
+
+    Slot 0 is reserved by the NPU KV pool for padded writes, so invalid suffix
+    rows can be redirected there instead of being packed with nonzero/index_select.
+    """
+    if loc_2d.ndim != 2:
+        raise ValueError(f"loc_2d must be rank-2, got {tuple(loc_2d.shape)}")
+    if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+        raise ValueError(
+            "commit_lens must match loc_2d batch size: "
+            f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
+        )
+
+    if commit_lens.device != loc_2d.device:
+        commit_lens = commit_lens.to(device=loc_2d.device, non_blocking=True)
+    row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+    valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+    return loc_2d.masked_fill(~valid_mask, 0).reshape(-1)
+
+
 def _init_npu_conv_state(
     conv_state_in,
     conv_state_shape,
@@ -78,6 +101,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
+        )
+        self.use_static_prefix_valid_write = get_bool_env_var(
+            "SGLANG_NPU_USE_STATIC_PREFIX_KV_CACHE_STORE", "True"
         )
         super().__init__(
             size=size,
@@ -276,15 +302,25 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         layer_id_override: Optional[int] = None,
     ):
         if not self.use_triton_prefix_kv_cache_store:
-            return super().set_kv_buffer_prefix_valid(
+            if not self.use_static_prefix_valid_write:
+                return super().set_kv_buffer_prefix_valid(
+                    layer,
+                    loc_2d,
+                    commit_lens,
+                    cache_k,
+                    cache_v,
+                    k_scale,
+                    v_scale,
+                    layer_id_override,
+                )
+            return self.set_kv_buffer(
                 layer,
-                loc_2d,
-                commit_lens,
+                _build_prefix_valid_write_locs(loc_2d, commit_lens),
                 cache_k,
                 cache_v,
                 k_scale,
                 v_scale,
-                layer_id_override,
+                layer_id_override=layer_id_override,
             )
 
         if layer_id_override is not None:
