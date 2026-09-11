@@ -29,10 +29,21 @@ dynamo-parsers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb
 
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }
-axum = { version = "0.8", features = ["macros", "tracing"] }
+# http2 on both sides: axum serves cleartext h2c on the inbound listener, reqwest
+# dials it outbound.
+#
+# axum's `http2` looks redundant and is not — please don't drop it. `axum::serve`
+# runs on hyper-util's auto Builder, whose HTTP/2 branch is compiled by
+# `hyper-util/http2`, and that arrives today only transitively, via
+# sgl-kv-indexer -> tonic "transport" -> tonic/server -> hyper-util/server-auto
+# (which is server + http1 + http2). So the listener speaks h2c whether or not
+# this line exists. Declaring it forwards `hyper-util/http2` from axum directly,
+# so inbound h2c no longer rides on a gRPC dependency it has nothing to do with,
+# and it enables HTTP/2 extended CONNECT for h2 websockets.
+axum = { version = "0.8", features = ["macros", "tracing", "http2"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
-reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2"], default-features = false }
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
 
 # Serialization
@@ -82,6 +93,9 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 [dev-dependencies]
 dirs = "5"
 http-body-util = "0.1"
+# HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

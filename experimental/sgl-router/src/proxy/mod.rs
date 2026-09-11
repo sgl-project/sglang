@@ -8,6 +8,7 @@ pub mod sse;
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
 use crate::server::header_utils::should_forward_request_header;
+use crate::workers::WireProtocol;
 use anyhow::Context;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
@@ -32,26 +33,66 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
 
 #[derive(Debug)]
 pub struct Proxy {
-    pub client: Client,
+    /// The negotiating client: HTTP/1.1 in cleartext, and ALPN `h2, http/1.1`
+    /// over TLS. Safe against any engine, which is why it is also the client
+    /// for side-channel admin traffic (`/flush_cache`).
+    default_client: Client,
+    /// Cleartext h2c (HTTP/2 prior knowledge). No negotiation happens, so this
+    /// is used only for workers whose `/model_info` reported `--enable-http2`
+    /// on a cleartext URL.
+    h2c_client: Client,
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
+}
+
+/// Build a forwarding client for `protocol`, sharing pool/connect tuning
+/// across protocols. The h2c variant pins HTTP/2 prior knowledge, which is
+/// what Granian's `HTTPModes.auto` serves on a plaintext port; plaintext has
+/// no ALPN, so prior knowledge is the only way to reach it.
+fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
+    let builder = Client::builder()
+        .pool_max_idle_per_host(64)
+        .connect_timeout(Duration::from_secs(5));
+    match protocol {
+        WireProtocol::Http1 => builder,
+        WireProtocol::H2c => builder.http2_prior_knowledge(),
+    }
+    .build()
+    .context("build reqwest client")
 }
 
 impl Proxy {
     /// Build a proxy. `request_timeout` is the per-request wall-clock budget for
     /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
+    ///
+    /// WHY both clients up front: protocol is a per-worker property resolved
+    /// from each engine's `/model_info`, so the request path must be able to
+    /// pick either one per request. Building them here reduces that to a
+    /// selection — no per-request client construction, and no single shared
+    /// client whose first writer decides the protocol for the whole fleet.
     pub fn new(request_timeout: Duration) -> Result<Self, anyhow::Error> {
-        let client = Client::builder()
-            .pool_max_idle_per_host(64)
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .context("build reqwest client")?;
         Ok(Self {
-            client,
+            default_client: build_client(WireProtocol::Http1)?,
+            h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
         })
+    }
+
+    /// The forwarding client for `protocol`, taken from the selected worker's
+    /// [`crate::workers::Worker::protocol`].
+    fn client_for(&self, protocol: WireProtocol) -> &Client {
+        match protocol {
+            WireProtocol::Http1 => &self.default_client,
+            WireProtocol::H2c => &self.h2c_client,
+        }
+    }
+
+    /// The client for side-channel admin traffic (e.g. `/flush_cache`), which
+    /// fans out across workers and so cannot use any one worker's protocol.
+    pub fn admin_client(&self) -> &Client {
+        &self.default_client
     }
 
     /// Classify a reqwest error into the right `ApiError` variant, given an
@@ -91,6 +132,7 @@ impl Proxy {
     pub async fn forward_json_to(
         &self,
         worker_url: &str,
+        protocol: WireProtocol,
         breaker: &CircuitBreaker,
         path: &str,
         headers: &HeaderMap,
@@ -105,7 +147,7 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client.post(url.clone()).body(body);
+        let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
             if should_forward_request_header(k) {
                 req = req.header(k, v);
@@ -164,13 +206,14 @@ impl Proxy {
     /// for the full streaming lifetime — without which a long-running SSE
     /// response would under-report load.
     // Each parameter is a distinct, required input to a single upstream
-    // forward (target, breaker, path, headers, body, plus the two
+    // forward (target, protocol, breaker, path, headers, body, plus the two
     // streaming-lifetime callbacks). Bundling them into a struct purely to
     // satisfy the arg-count heuristic would add indirection without clarity.
     #[allow(clippy::too_many_arguments)]
     pub async fn forward_streaming_to(
         &self,
         worker_url: &str,
+        protocol: WireProtocol,
         breaker: &Arc<CircuitBreaker>,
         path: &str,
         headers: &HeaderMap,
@@ -187,7 +230,7 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client.post(url.clone()).body(body);
+        let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
             if should_forward_request_header(k) {
                 req = req.header(k, v);
@@ -265,5 +308,25 @@ mod tests {
     async fn new_returns_result_not_panic() {
         let p = Proxy::new(Duration::from_secs(5)).unwrap();
         assert_eq!(p.request_timeout, Duration::from_secs(5));
+    }
+
+    /// `client_for` routes each protocol to its own field, and admin traffic
+    /// shares the default client. Asserting the two clients differ by address
+    /// would be vacuous — they are distinct struct fields, so that holds even
+    /// if `build_client` ignored its argument. What the selector must get right
+    /// is the mapping, so pin that instead; the on-the-wire difference between
+    /// the two clients is covered by tests/proxy/h2c_forward.rs.
+    #[tokio::test]
+    async fn client_for_maps_each_protocol_to_its_own_client() {
+        let p = Proxy::new(Duration::from_secs(5)).unwrap();
+        assert!(std::ptr::eq(
+            p.client_for(WireProtocol::Http1),
+            &p.default_client
+        ));
+        assert!(std::ptr::eq(p.client_for(WireProtocol::H2c), &p.h2c_client));
+        assert!(std::ptr::eq(
+            p.client_for(WireProtocol::Http1),
+            p.admin_client()
+        ));
     }
 }

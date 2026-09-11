@@ -854,6 +854,7 @@ pub async fn chat_completions(
         let bootstrap_room = bootstrap_room.expect("PD dispatch implies a resolved bootstrap room");
 
         let prefill_url = worker.url.clone();
+        let prefill_protocol = worker.protocol();
         let prefill_breaker = Arc::clone(&worker.breaker);
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
@@ -870,6 +871,7 @@ pub async fn chat_completions(
             match prefill_proxy
                 .forward_json_to(
                     &prefill_url,
+                    prefill_protocol,
                     &prefill_breaker,
                     "/v1/chat/completions",
                     &prefill_headers,
@@ -903,6 +905,7 @@ pub async fn chat_completions(
                 Box::new((decode_guard, decode_active_guard, make_duration_guard()));
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
+                decode_worker.protocol(),
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 &headers,
@@ -919,6 +922,7 @@ pub async fn chat_completions(
             let _decode_hold = (decode_guard, decode_active_guard);
             let fetch = ctx.proxy.forward_json_to(
                 &decode_worker.url,
+                decode_worker.protocol(),
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 &headers,
@@ -938,6 +942,7 @@ pub async fn chat_completions(
             Box::new((guard, active_guard, make_duration_guard()));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
+            worker.protocol(),
             &worker.breaker,
             "/v1/chat/completions",
             &headers,
@@ -966,6 +971,7 @@ pub async fn chat_completions(
         let _holds: (LoadGuard, _) = (guard, active_guard);
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
+            worker.protocol(),
             &worker.breaker,
             "/v1/chat/completions",
             &headers,
