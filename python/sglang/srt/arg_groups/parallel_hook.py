@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.linear_attn_cp_hook import resolve_linear_attn_cp
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dp_lm_head_validation,
@@ -66,6 +67,8 @@ def handle_context_parallelism(server_args: Any):
         raise ValueError(
             "--cp-strategy must be set when --enable-prefill-cp is enabled."
         )
+
+    resolve_linear_attn_cp(server_args)
 
     view = resolved_view(server_args)
     if view.attn_cp_size > 1:
