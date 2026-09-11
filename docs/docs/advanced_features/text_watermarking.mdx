@@ -40,10 +40,10 @@ python -m sglang.launch_server \
   Values passed with `--watermark-key` or `--watermark-key-b` are visible in the
   process command line, including `/proc/*/cmdline` on Linux. Use
   `--watermark-config` for the primary production key. SGLang redacts the key
-  arguments and config path from startup logs, request logs, and server
-  information responses and removes watermark secrets from crash dumps, but you
-  must still protect the file and the transport used by clients that send
-  per-request keys.
+  arguments and config path from startup logs, request logs, server information
+  responses, and request crash-dump payloads. Process and GPU core dumps may
+  contain in-memory keys. Protect those artifacts, the configuration file, and
+  the transport used by clients that send per-request keys.
 </Warning>
 
 The server arguments are:
