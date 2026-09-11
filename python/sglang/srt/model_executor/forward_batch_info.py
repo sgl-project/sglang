@@ -69,6 +69,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -91,11 +92,7 @@ def _build_forward_token_modalities(
     extend_seq_lens: Optional[List[int]],
     num_tokens: int,
     device: torch.device,
-    *,
-    required: bool,
 ) -> Optional[torch.Tensor]:
-    if not required:
-        return None
     if not mm_inputs or extend_prefix_lens is None or extend_seq_lens is None:
         return None
     if not (len(mm_inputs) == len(extend_prefix_lens) == len(extend_seq_lens)):
@@ -136,6 +133,25 @@ def _build_forward_token_modalities(
         dtype=torch.int8,
         pin_memory=is_pin_memory_available(device),
     ).to(device, non_blocking=True)
+
+
+def _maybe_build_forward_token_modalities(
+    model_config: ModelConfig,
+    mm_inputs: Optional[List[MultimodalInputs]],
+    extend_prefix_lens: Optional[List[int]],
+    extend_seq_lens: Optional[List[int]],
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not model_config.requires_mm_token_modalities:
+        return None
+    return _build_forward_token_modalities(
+        mm_inputs,
+        extend_prefix_lens,
+        extend_seq_lens,
+        num_tokens,
+        device,
+    )
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -919,20 +935,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         device = model_runner.device
 
-        ret.mm_token_modalities = _build_forward_token_modalities(
+        ret.mm_token_modalities = _maybe_build_forward_token_modalities(
+            model_runner.model_config,
             ret.mm_inputs,
             extend_prefix_lens if isinstance(extend_prefix_lens, list) else None,
             extend_seq_lens if isinstance(extend_seq_lens, list) else None,
             len(batch.input_ids) if batch.input_ids is not None else 0,
             device,
-            required=(
-                getattr(
-                    getattr(model_runner, "model", None),
-                    "requires_mm_token_modalities",
-                    False,
-                )
-                is True
-            ),
         )
 
         model_runner.kv_index_translator.rebind_write_loc(ret)

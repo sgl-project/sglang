@@ -32,6 +32,14 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.get_logger(__name__)
 
 
+def is_bailing_multi_gate_enabled(config: PretrainedConfig) -> bool:
+    """Select MultiRouter only when the checkpoint config declares it."""
+    return (
+        bool(getattr(config, "multi_gate", False))
+        or getattr(config, "router_type", "topN") == "MultiRouter"
+    )
+
+
 class HybridLayerType(enum.Enum):
     full_attention = "attention"
     linear_attention = "linear_attention"

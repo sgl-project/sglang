@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
@@ -36,7 +37,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe_v3 import (
     BailingMoeV3ForCausalLM,
-    is_bailing_multi_gate_enabled,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
@@ -83,7 +83,6 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
         text_config = config.text_config
         self.multi_gate_enabled = is_bailing_multi_gate_enabled(text_config)
-        self.requires_mm_token_modalities = self.multi_gate_enabled
         self.model = BailingMoeV3ForCausalLM(
             config=text_config,
             quant_config=quant_config,

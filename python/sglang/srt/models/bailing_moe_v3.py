@@ -18,6 +18,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
 )
 from sglang.srt.configs import KimiLinearConfig
+from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.distributed import (
     get_pp_group,
     moe_expert_parallel_all_reduce,
@@ -243,14 +244,6 @@ class DsV3MLA(DeepseekV2AttentionMLA):
 
 
 logger = logging.getLogger(__name__)
-
-
-def is_bailing_multi_gate_enabled(config: PretrainedConfig) -> bool:
-    """Select MultiRouter only when the checkpoint config declares it."""
-    return (
-        bool(getattr(config, "multi_gate", False))
-        or getattr(config, "router_type", "topN") == "MultiRouter"
-    )
 
 
 def is_linear_layer(layer_idx, layer_group_size):

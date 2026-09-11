@@ -8,11 +8,11 @@ import torch.nn as nn
 from sglang.srt.configs.bailing_hybrid import (
     BailingHybridConfig,
     BailingMoeV3VLConfig,
+    is_bailing_multi_gate_enabled,
 )
 from sglang.srt.models.bailing_mm_v3 import (
     BailingMoeV3VLForConditionalGeneration,
 )
-from sglang.srt.models.bailing_moe_v3 import is_bailing_multi_gate_enabled
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

@@ -26,6 +26,7 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
@@ -51,6 +52,14 @@ MIMO_V2_MODEL_ARCHS = (
 )
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
+BAILING_MULTI_GATE_MM_ARCHS = frozenset(
+    {
+        "BailingMMNativeForConditionalGeneration",
+        "BailingMM2NativeForConditionalGeneration",
+        "BailingMoeV3VLForConditionalGeneration",
+    }
+)
+
 SWA_SINK_ARCHS = frozenset(
     {
         "GptOssForCausalLM",
@@ -64,6 +73,17 @@ def _quant_config_to_dict(quant_config):
     if quant_config is not None and not isinstance(quant_config, dict):
         return quant_config.to_dict()
     return quant_config
+
+
+def requires_mm_token_modalities(
+    model_architectures: Optional[List[str]], hf_text_config: PretrainedConfig
+) -> bool:
+    """Whether a Bailing multimodal wrapper uses modality-specific routers."""
+    return bool(
+        model_architectures
+        and any(arch in BAILING_MULTI_GATE_MM_ARCHS for arch in model_architectures)
+        and is_bailing_multi_gate_enabled(hf_text_config)
+    )
 
 
 def unwrap_modelopt_quantization_config(quant_config: dict) -> dict:
@@ -436,6 +456,9 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.requires_mm_token_modalities = requires_mm_token_modalities(
+            self.hf_config.architectures, self.hf_text_config
+        )
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
         self.embedding_model_spec = resolve_embedding_model_spec(
             self.hf_config.architectures,

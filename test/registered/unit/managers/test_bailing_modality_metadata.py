@@ -1,9 +1,11 @@
 """Regression tests for Bailing modality metadata and per-token routing bias."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.configs.model_config import requires_mm_token_modalities
 from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 from sglang.srt.layers.multi_gate import create_multi_gate_mm_indices
 from sglang.srt.managers.schedule_batch import (
@@ -14,6 +16,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     _build_forward_token_modalities,
+    _maybe_build_forward_token_modalities,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -88,7 +91,6 @@ class TestBailingModalityMetadata(CustomTestCase):
                 extend_seq_lens=[3, 2],
                 num_tokens=5,
                 device=torch.device("cpu"),
-                required=True,
             )
             for _ in range(2)
         ]
@@ -96,30 +98,47 @@ class TestBailingModalityMetadata(CustomTestCase):
         for stage_map in stage_maps:
             torch.testing.assert_close(stage_map, expected)
 
+    def test_only_bailing_multirouter_requires_token_modalities(self):
+        bailing_arch = ["BailingMoeV3VLForConditionalGeneration"]
+        self.assertFalse(
+            requires_mm_token_modalities(
+                bailing_arch, SimpleNamespace(multi_gate=False, router_type="topN")
+            )
+        )
+        self.assertTrue(
+            requires_mm_token_modalities(
+                bailing_arch, SimpleNamespace(multi_gate=True, router_type="topN")
+            )
+        )
+        self.assertFalse(
+            requires_mm_token_modalities(
+                ["DeepseekV4ForCausalLM"],
+                SimpleNamespace(multi_gate=True, router_type="MultiRouter"),
+            )
+        )
+
     def test_unrelated_model_skips_mismatched_metadata(self):
-        """Only an explicitly opted-in MultiRouter model enforces the token map."""
         mm_inputs = [
             MultimodalInputs(mm_items=[], token_modalities=[Modality.IMAGE.value])
         ]
-
-        result = _build_forward_token_modalities(
+        result = _maybe_build_forward_token_modalities(
+            SimpleNamespace(requires_mm_token_modalities=False),
             mm_inputs,
             extend_prefix_lens=[0],
             extend_seq_lens=[1],
             num_tokens=6,
             device=torch.device("cpu"),
-            required=False,
         )
 
         self.assertIsNone(result)
         with self.assertRaisesRegex(ValueError, "does not match the forward batch"):
-            _build_forward_token_modalities(
+            _maybe_build_forward_token_modalities(
+                SimpleNamespace(requires_mm_token_modalities=True),
                 mm_inputs,
                 extend_prefix_lens=[0],
                 extend_seq_lens=[1],
                 num_tokens=6,
                 device=torch.device("cpu"),
-                required=True,
             )
 
     def test_mixed_modalities_select_reference_experts(self):
