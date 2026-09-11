@@ -316,8 +316,7 @@ class EngramHasher(nn.Module):
 
         if input_ids.is_cuda and torch.version.cuda is not None:
             if kmode == MODE_DECODE:
-                # Decode advances the history rows inside the kernel; out_cache_loc
-                # is what marks the CUDA-graph padded rows that must not write.
+                # out_cache_loc 0 marks the CUDA-graph padded rows that must not commit.
                 assert forward_batch.out_cache_loc is not None
                 return engram_hash_ids_and_commit(
                     input_ids,

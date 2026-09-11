@@ -202,9 +202,8 @@ def test_decode_reads_history_through_req_slots():
 
 
 def test_decode_commit_writes_live_rows_only():
-    # The commit entry point writes each live request's new history row (token
-    # plus its n - 2 newest predecessors, oldest first); a padded row
-    # (out_cache_loc 0) writes nothing. Hash ids still read the old history.
+    # Live rows commit (token + n - 2 newest predecessors, oldest first); the
+    # padded row (out_cache_loc 0) does not. Hash ids still read the old history.
     g = torch.Generator().manual_seed(6)
     bs, slots_total = 5, 9
     ids = torch.randint(0, VOCAB, (bs,), generator=g)
