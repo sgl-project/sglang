@@ -25,16 +25,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-# The fused and unfused verify kernels reduce the K axis with different tile
-# shapes (BV=4 vs BV=32), so their fp32 partial sums differ by ~1 ulp and the
-# bf16 output flips on rare rounding-boundary elements (1 in ~1k-8k, measured
-# on H100 and B300). Allow one bf16 ulp on cross-kernel output compares; the
-# rings, conv state/windows and the fused-vs-unfused committed state stay
-# bitwise (they are elementwise or share the same fold kernel).
+# One bf16 ulp: the fused and unfused kernels reduce K in different orders.
 _OUTPUT_TOL = dict(rtol=2**-7, atol=1e-7)
-# The ReplaySSM fold and the snapshot recurrence are different kernels and can
-# differ by ~1 fp32 ulp per element on some architectures (B300). A no-op or
-# wrong-step commit changes elements by >=1e-3, so 1e-5 still catches those.
+# Fold and snapshot recurrence differ by ~1 fp32 ulp; a wrong-step commit
+# moves elements by >= 1e-3, so 1e-5 still catches it.
 _SNAPSHOT_ORACLE_TOL = dict(rtol=0, atol=1e-5)
 
 
