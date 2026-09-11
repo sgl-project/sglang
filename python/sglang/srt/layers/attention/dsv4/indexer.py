@@ -28,6 +28,17 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_q_indexer_fp4,
     logits_rows_per_chunk,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_litetopk_hip import (
+    aiter_fp4_litetopk_supports_topk,
+    fp4_litetopk_ineligible_reason,
+    fp4_litetopk_must_dispatch,
+    fp4_litetopk_rows_per_chunk,
+    is_fp4_litetopk_prefill_workspace_compatible,
+    max_c4_context_from_seq_lens,
+    prepare_fp4_litetopk_scratch_for_dispatch,
+    run_aiter_fp4_litetopk_chunks,
+    validate_fp4_litetopk_static_configuration,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -688,7 +699,10 @@ class C4IndexerBackendMixin:
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
     ) -> None:
+        litetopk_required = envs.SGLANG_DSV4_FP4_LITETOPK_REQUIRED.get()
         if forward_batch.forward_mode.is_idle():
+            if not litetopk_required:
+                self.fp4_litetopk_scratch = None
             return
         token_to_kv_pool = self.token_to_kv_pool
 
@@ -702,6 +716,12 @@ class C4IndexerBackendMixin:
 
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
         use_aiter_fp4 = c4_indexer.use_fp4_indexer and is_hip()
+        if litetopk_required and not use_aiter_fp4:
+            raise RuntimeError(
+                "SGLANG_DSV4_FP4_LITETOPK_REQUIRED=1 requires the HIP AITER FP4 indexer"
+            )
+        if not use_aiter_fp4:
+            self.fp4_litetopk_scratch = None
 
         positions = core_metadata.positions
         if use_aiter_fp4:
@@ -826,6 +846,11 @@ class C4IndexerBackendMixin:
                 query_rows=query_rows,
             )
         if self.debug_use_external_c4_sparse_indices:
+            if litetopk_required:
+                raise RuntimeError(
+                    "SGLANG_DSV4_FP4_LITETOPK_REQUIRED=1 is incompatible with "
+                    "external C4 sparse indices"
+                )
             return
 
         indexer_capturer = get_global_indexer_capturer()
@@ -913,6 +938,134 @@ class C4IndexerBackendMixin:
                 c4_indexer.layer_id
             )
             k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
+
+            litetopk_enabled = envs.SGLANG_DSV4_FP4_LITETOPK.get()
+            use_litetopk = False
+            litetopk_capturing = False
+            prefill_workspace = metadata.fp4_prefill_workspace
+            if litetopk_enabled or litetopk_required:
+                max_c4_context = max_c4_context_from_seq_lens(
+                    forward_batch.seq_lens_cpu
+                )
+                device_properties = torch.cuda.get_device_properties(q_fp4.device)
+                arch = str(getattr(device_properties, "gcnArchName", "")).split(":")[0]
+                spec_algorithm = getattr(self, "spec_algorithm", None)
+                litetopk_capturing = torch.cuda.is_current_stream_capturing()
+                is_plain_extend = (
+                    forward_batch.forward_mode == ForwardMode.EXTEND
+                    and forward_batch._original_forward_mode is None
+                )
+                eligibility = {
+                    "enabled": litetopk_enabled or litetopk_required,
+                    "is_hip": is_hip(),
+                    "arch": arch,
+                    "is_extend": is_plain_extend,
+                    "batch_size": forward_batch.batch_size,
+                    "query_rows": query_rows,
+                    "heads": q_fp4.shape[1],
+                    "packed_head_dim": q_fp4.shape[2],
+                    "topk": c4_indexer.index_topk,
+                    "page_size": indexer_metadata.c4_page_size,
+                    "max_context": max_c4_context,
+                    "attn_cp_size": get_parallel().attn_cp_size,
+                    "use_sgl_topk": self.dsa_topk_backend.is_sgl_kernel(),
+                    "use_prefill_graph": indexer_metadata.use_prefill_cuda_graph,
+                    "capturing": litetopk_capturing,
+                    "in_piecewise_graph": is_in_tc_piecewise_cuda_graph(),
+                    "in_breakable_graph": is_in_breakable_cuda_graph(),
+                    "has_tbo_parent": forward_batch.tbo_parent_token_range is not None,
+                    "has_tbo_children": bool(
+                        getattr(forward_batch, "tbo_children", None)
+                    ),
+                    "has_spec_info": forward_batch.spec_info is not None,
+                    "has_spec_algorithm": spec_algorithm is not None
+                    and not spec_algorithm.is_none(),
+                    "enable_multi_stream": enable_multi_stream,
+                    "skip_compressor": skip_compressor,
+                    "has_hisparse": hisparse_coordinator is not None,
+                    "has_prefill_workspace": (
+                        is_fp4_litetopk_prefill_workspace_compatible(
+                            prefill_workspace,
+                            rows=query_rows,
+                            max_seq_len=max_c4_context,
+                            device=q_fp4.device,
+                        )
+                    ),
+                    "aiter_available": aiter_fp4_litetopk_supports_topk(
+                        c4_indexer.index_topk
+                    ),
+                }
+                reason = fp4_litetopk_ineligible_reason(**eligibility)
+                use_litetopk = reason is None
+                litetopk_must_dispatch = fp4_litetopk_must_dispatch(
+                    required=litetopk_required,
+                    is_plain_extend=is_plain_extend,
+                    max_context=max_c4_context,
+                )
+                if litetopk_must_dispatch and not use_litetopk:
+                    raise RuntimeError(
+                        "SGLANG_DSV4_FP4_LITETOPK_REQUIRED=1 rejected this "
+                        f"forward: {reason}"
+                    )
+            if use_litetopk:
+                rows_per_chunk = fp4_litetopk_rows_per_chunk()
+                existing_scratch = getattr(self, "fp4_litetopk_scratch", None)
+                device_index = q_fp4.device.index
+                if device_index is None:
+                    device_index = torch.cuda.current_device()
+                if existing_scratch is not None and (
+                    existing_scratch.rows < min(query_rows, rows_per_chunk)
+                    or existing_scratch.topk != c4_indexer.index_topk
+                    or existing_scratch.device_index != device_index
+                    or existing_scratch.stream_id
+                    != torch.cuda.current_stream(q_fp4.device).cuda_stream
+                ):
+                    self.fp4_litetopk_scratch = None
+                    existing_scratch = None
+                self.fp4_litetopk_scratch = prepare_fp4_litetopk_scratch_for_dispatch(
+                    rows=min(query_rows, rows_per_chunk),
+                    topk=c4_indexer.index_topk,
+                    device=q_fp4.device,
+                    scratch=existing_scratch,
+                    required=litetopk_must_dispatch,
+                )
+                use_litetopk = self.fp4_litetopk_scratch is not None
+            if (
+                not use_litetopk
+                and not litetopk_required
+                and getattr(self, "fp4_litetopk_scratch", None) is not None
+                and not litetopk_capturing
+            ):
+                self.fp4_litetopk_scratch = None
+            if use_litetopk:
+                assert prefill_workspace is not None
+                if raw_indices is None:
+                    raw_indices = torch.empty_like(c4_sparse_page_indices)
+                self.fp4_litetopk_scratch = run_aiter_fp4_litetopk_chunks(
+                    q_fp4=q_fp4,
+                    q_scale=q_scale,
+                    k_payload=k_payload,
+                    k_scale=k_scale,
+                    weights=weights,
+                    guarded_page_table=prefill_workspace.guarded_page_table,
+                    row_to_batch=prefill_workspace.row_to_batch,
+                    row_starts=prefill_workspace.local_starts,
+                    c4_seq_lens=c4_seq_lens,
+                    max_seq_len=max_c4_context,
+                    topk=c4_indexer.index_topk,
+                    weight_scale=c4_indexer.weight_scale,
+                    out_page_indices=c4_sparse_page_indices,
+                    out_raw_indices=raw_indices,
+                    rows_per_chunk=rows_per_chunk,
+                    scratch=self.fp4_litetopk_scratch,
+                )
+                core_metadata.c4_sparse_raw_indices = raw_indices
+                if capture_enabled:
+                    compress_layer_id = token_to_kv_pool.layer_mapping[
+                        c4_indexer.layer_id
+                    ].compress_layer_id
+                    indexer_capturer.capture(compress_layer_id, raw_indices)
+                return
 
             def run_fp4_indexer(rows: slice) -> None:
                 logits = aiter_fp4_paged_mqa_logits(
@@ -1035,6 +1188,27 @@ class C4Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.n_local_heads = self.n_heads
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        litetopk_required = envs.SGLANG_DSV4_FP4_LITETOPK_REQUIRED.get()
+        litetopk_arch = ""
+        if litetopk_required and is_hip():
+            litetopk_arch = str(
+                torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).gcnArchName
+            ).split(":")[0]
+        validate_fp4_litetopk_static_configuration(
+            required=litetopk_required,
+            is_hip_platform=is_hip(),
+            use_fp4_indexer=self.use_fp4_indexer,
+            arch=litetopk_arch,
+            heads=self.n_heads,
+            packed_head_dim=self.head_dim // 2,
+            topk=self.index_topk,
+            use_sgl_topk=DSATopKBackend(
+                get_exec().kernel.dsa_topk_backend
+            ).is_sgl_kernel(),
+            aiter_available=aiter_fp4_litetopk_supports_topk(self.index_topk),
+        )
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,

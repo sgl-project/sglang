@@ -37,6 +37,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_litetopk_hip import (
+    aiter_fp4_litetopk,
+    get_aiter_fp4_litetopk,
+)
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -694,6 +698,73 @@ def test_prefill_paged_mqa_logits(batch: int, seq_len: int) -> None:
     logits = _run_logits(case, is_decode=False, prefill_ws=workspace)
 
     _assert_logits_agree(logits, case)
+
+
+@pytest.mark.parametrize("topk", [512, 1024])
+def test_fp4_litetopk_adapter_maps_pages_and_reuses_scratch(topk: int) -> None:
+    if get_aiter_fp4_litetopk() is None:
+        pytest.skip("installed AITER does not expose status-aware FP4 LiteTopK")
+    torch.manual_seed(42)
+    seq_len = 65_536
+    case = _build_logits_case(1, seq_len, shuffle_pages=True)
+    prefill = prepare_fp4_prefill_workspace(case["page_table"], case["c4_seq_lens"])
+    rows = case["q_fp4"].shape[0]
+    dense_logits = _run_logits(case, is_decode=False, prefill_ws=prefill)
+    expected_raw_indices = dense_logits.topk(topk, dim=-1).indices.to(torch.int32)
+    row_to_batch = torch.zeros(rows, dtype=torch.int32, device=get_device())
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=get_device())
+    out_page_indices = torch.empty((rows, topk), dtype=torch.int32, device=get_device())
+    out_raw_indices = torch.empty_like(out_page_indices)
+
+    scratch = aiter_fp4_litetopk(
+        q_fp4=case["q_fp4"],
+        q_scale=case["q_scale"],
+        k_payload=case["payload"],
+        k_scale=case["scale"],
+        weights=case["weights"],
+        guarded_page_table=prefill.guarded_page_table,
+        row_to_batch=row_to_batch,
+        row_starts=row_starts,
+        c4_seq_lens=case["c4_seq_lens"],
+        max_seq_len=prefill.max_seq_len,
+        topk=topk,
+        weight_scale=case["weight_scale"],
+        out_page_indices=out_page_indices,
+        out_raw_indices=out_raw_indices,
+    )
+    candidate_ptr = scratch.workspace.candidate_values.data_ptr()
+    scratch = aiter_fp4_litetopk(
+        q_fp4=case["q_fp4"],
+        q_scale=case["q_scale"],
+        k_payload=case["payload"],
+        k_scale=case["scale"],
+        weights=case["weights"],
+        guarded_page_table=prefill.guarded_page_table,
+        row_to_batch=row_to_batch,
+        row_starts=row_starts,
+        c4_seq_lens=case["c4_seq_lens"],
+        max_seq_len=prefill.max_seq_len,
+        topk=topk,
+        weight_scale=case["weight_scale"],
+        out_page_indices=out_page_indices,
+        out_raw_indices=out_raw_indices,
+        scratch=scratch,
+    )
+    torch.cuda.synchronize()
+
+    assert scratch.workspace.candidate_values.data_ptr() == candidate_ptr
+    assert scratch.workspace.status_ok.item() == 1
+    assert torch.all((out_raw_indices >= 0) & (out_raw_indices < seq_len))
+    torch.testing.assert_close(
+        out_raw_indices.sort(dim=-1).values,
+        expected_raw_indices.sort(dim=-1).values,
+    )
+    assert torch.any(out_raw_indices >= 8192)
+    expected = (
+        case["page_table"][0, out_raw_indices.long() // PAGE_SIZE] * PAGE_SIZE
+        + out_raw_indices % PAGE_SIZE
+    )
+    torch.testing.assert_close(out_page_indices, expected)
 
 
 @pytest.mark.parametrize("is_decode", [True, False])
