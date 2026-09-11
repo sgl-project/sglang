@@ -15,11 +15,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import logging
 import unittest
 from unittest import mock
 
 import torch
 
+from sglang.srt.layers.quantization.compressed_tensors import compressed_tensors
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -31,6 +33,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.test.test_utils import CustomTestCase
 
 LINEAR_LAYER = "model.layers.0.self_attn.q_proj"
+# The module logger the downgrade warning is emitted on.
+SCHEME_LOGGER = compressed_tensors.logger
 
 NVFP4_WEIGHTS = {
     "num_bits": 4,
@@ -117,6 +121,28 @@ class TestFp4LinearSchemeSelection(CustomTestCase):
             _make_config("nvfp4-pack-quantized", NVFP4_WEIGHTS), (10, 0)
         )
         self.assertIsInstance(scheme, CompressedTensorsW4A16Fp4)
+
+    def test_hopper_downgrade_warns_and_a16_does_not(self):
+        """The silent-precision-downgrade warning is user-facing behavior.
+
+        warning_once is lru_cache-wrapped, so the message is emitted once per
+        process and an earlier test that triggered it would leave this one
+        asserting against a cache hit. Clear the cache to stay order-independent.
+        """
+        logging.Logger.warning_once.cache_clear()
+        self.addCleanup(logging.Logger.warning_once.cache_clear)
+
+        w4a4_config = _make_config(
+            "nvfp4-pack-quantized", NVFP4_WEIGHTS, dict(NVFP4_WEIGHTS, dynamic=True)
+        )
+        with self.assertLogs(SCHEME_LOGGER, level="WARNING") as captured:
+            _get_scheme(w4a4_config, (9, 0))
+        self.assertIn("weight-only", "\n".join(captured.output))
+
+        # nvfp4a16 drops no activation quantization, so it must stay silent.
+        with mock.patch.object(SCHEME_LOGGER, "warning_once") as warn:
+            _get_scheme(_make_config("nvfp4-pack-quantized", NVFP4_WEIGHTS), (9, 0))
+        warn.assert_not_called()
 
     def test_int4_pack_quantized_still_selects_wna16(self):
         """Guards the `type == INT` check added to _is_wNa16_group_channel."""
