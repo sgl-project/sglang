@@ -897,7 +897,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_dense_tokens = batch_size * draft_token_num
                 dense_token_indices = forward_metadata.ragged_verify_dense_indices
                 assert dense_token_indices is not None
-                dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+                # Only real packed positions are gathered back and committed.
+                dense = mixed_qkv.new_empty(num_dense_tokens + 1, mixed_qkv.shape[-1])
                 dense.index_copy_(0, dense_token_indices, mixed_qkv)
                 mixed_qkv_dense = dense[:num_dense_tokens].view(
                     batch_size, draft_token_num, -1
@@ -923,12 +924,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if dense_token_indices is None:
                 mixed_qkv = mixed_qkv_flat
             else:
-                # Graph-tier tail tokens gather from the discarded ghost row.
-                padded_flat = mixed_qkv_flat.new_zeros(
-                    batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
+                gather_indices = (
+                    forward_metadata.ragged_verify_dense_gather_indices
                 )
-                padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
-                mixed_qkv = padded_flat[dense_token_indices]
+                assert gather_indices is not None
+                mixed_qkv = mixed_qkv_flat[gather_indices]
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:

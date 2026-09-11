@@ -1064,7 +1064,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             num_dense_tokens = batch_size * draft_token_num
             dense_token_indices = forward_metadata.ragged_verify_dense_indices
             assert dense_token_indices is not None
-            dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+            # Only real packed positions are gathered back and committed.
+            dense = mixed_qkv.new_empty(num_dense_tokens + 1, mixed_qkv.shape[-1])
             dense.index_copy_(0, dense_token_indices, mixed_qkv)
             mixed_qkv_dense = dense[:num_dense_tokens].view(
                 batch_size, draft_token_num, -1
@@ -1092,12 +1093,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if dense_token_indices is None:
             mixed_qkv = mixed_qkv_flat
         else:
-            # Ghost row (zeros) so uncovered tail tokens gather finite values.
-            padded_flat = mixed_qkv_flat.new_zeros(
-                batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
-            )
-            padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
-            mixed_qkv = padded_flat[dense_token_indices]
+            gather_indices = forward_metadata.ragged_verify_dense_gather_indices
+            assert gather_indices is not None
+            mixed_qkv = mixed_qkv_flat[gather_indices]
 
         q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d

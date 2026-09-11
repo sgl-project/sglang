@@ -71,6 +71,7 @@ class ForwardMetadata:
     draft_token_num: int = 1
     # Shared by all linear-attention layers in one compact verify forward.
     ragged_verify_dense_indices: Optional[torch.Tensor] = None
+    ragged_verify_dense_gather_indices: Optional[torch.Tensor] = None
 
     # KDA fused-accept: the [N, T] slot-indexed scratch rows and the per-request
     # accept length that seed the verify kernel. Every KDA layer of a forward

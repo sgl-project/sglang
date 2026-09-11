@@ -327,6 +327,7 @@ class MambaAttnBackendBase(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         metadata = self.forward_metadata
         metadata.ragged_verify_dense_indices = None
+        metadata.ragged_verify_dense_gather_indices = None
         spec_info = forward_batch.spec_info
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -337,6 +338,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc=metadata.query_start_loc,
                 seq_len=forward_batch.input_ids.shape[0],
                 draft_token_num=spec_info.draft_token_num,
+            )
+            num_dense_tokens = (
+                (metadata.query_start_loc.shape[0] - 1) * spec_info.draft_token_num
+            )
+            metadata.ragged_verify_dense_gather_indices = torch.where(
+                metadata.ragged_verify_dense_indices < num_dense_tokens,
+                metadata.ragged_verify_dense_indices,
+                0,
             )
 
     def update_verify_buffers_to_fill_after_draft(
