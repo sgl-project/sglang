@@ -281,6 +281,36 @@ def two_level_decode_logits(
         # All requests fit the candidate budget; paged top-k masks their tails.
         return logits, None
 
+    if (
+        logits.is_cuda
+        and torch.version.cuda is not None
+        and logits.ndim == 2
+        and logits.stride(1) == 1
+        and seq_lens.device == logits.device
+        and seq_lens.dtype in (torch.int32, torch.int64)
+        and seq_lens.is_contiguous()
+        and seq_lens.shape in ((logits.shape[0],), (logits.shape[0], 1))
+        and logits.numel() > 0
+        and 0 < block_size <= 1024
+    ):
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_block_logits,
+        )
+
+        if not is_candidate_source:
+            assert (
+                torch.is_tensor(published)
+                and published.shape[0] == logits.shape[0]
+                and published.shape[1] >= logits.shape[1]
+            ), "candidate mask missing for decode"
+        return candidate_block_logits(
+            logits,
+            seq_lens,
+            topk_blocks=topk_blocks,
+            block_size=block_size,
+            published=None if is_candidate_source else published,
+        )
+
     lens_col = seq_lens if seq_lens.dim() > 1 else seq_lens.unsqueeze(-1)
     reachable = torch.arange(logits.shape[-1], device=logits.device) < lens_col
     logits = logits.float().masked_fill(~reachable, -torch.inf)
@@ -595,12 +625,12 @@ class DSV4AttnMetadata:
                 "c2_sparse_topk_lengths",
                 "c2_sparse_page_indices",
                 "c2_sparse_raw_indices",
+                "request_window_layout",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
-                "request_window_layout",
                 "c0_flashmla_metadata",
                 "c1_flashmla_metadata",
                 "c2_flashmla_metadata",
@@ -1849,6 +1879,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
+            num_groups=bs,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -1984,6 +2015,7 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=False,
             is_prefill=True,
+            num_groups=batch_size,
         )
         if swa_out_cache_loc is not None:
             # Captures store_cache's cached path instead of a per-layer
@@ -2784,7 +2816,16 @@ class DeepseekV4AttnBackend(
         if forward_batch.forward_mode.is_decode():
             self._low_ratio_compress_decode(layer, x, req, pos)
         else:
-            self._low_ratio_compress_torch(layer, x, req, pos)
+            self._low_ratio_compress_torch(
+                layer,
+                x,
+                req,
+                pos,
+                fuse_index_store=(
+                    forward_batch.forward_mode.is_target_verify()
+                    and layer.compressor.use_fused_compress
+                ),
+            )
 
     def _low_ratio_in_prefill_graph(self) -> bool:
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -2914,14 +2955,22 @@ class DeepseekV4AttnBackend(
                 ratio=layer.compress_ratio,
             )
 
-    def _low_ratio_compress_torch(self, layer, x, req, pos, projected=None) -> None:
+    def _low_ratio_compress_torch(
+        self, layer, x, req, pos, projected=None, *, fuse_index_store=False
+    ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
         kv, score = projected if projected is not None else layer.compressor.project(x)
         if not num_tokens:
             return
         if layer.compress_ratio == 1:
-            self._low_ratio_write_group(layer, kv, core.c1_out_loc[:num_tokens], pos)
+            self._low_ratio_write_group(
+                layer,
+                kv,
+                core.c1_out_loc[:num_tokens],
+                pos,
+                fuse_index_store=fuse_index_store,
+            )
             return
 
         partner_kv, partner_score = self._low_ratio_pair_partners(
@@ -2939,7 +2988,9 @@ class DeepseekV4AttnBackend(
         group_pos = torch.where(pos % 2 == 1, pos - 1, pos)
         out_loc = core.c2_out_loc[:num_tokens]
         slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
-        self._low_ratio_write_group(layer, pooled, slots, group_pos)
+        self._low_ratio_write_group(
+            layer, pooled, slots, group_pos, fuse_index_store=fuse_index_store
+        )
 
     def _low_ratio_pair_partners(
         self, *, layer_id, kv, score, req, pos, pad
@@ -2981,7 +3032,13 @@ class DeepseekV4AttnBackend(
         return partner_kv, partner_score
 
     def _low_ratio_write_group(
-        self, layer, pooled, slots, group_pos, *, fuse_index_store=False
+        self,
+        layer,
+        pooled,
+        slots,
+        group_pos,
+        *,
+        fuse_index_store=False,
     ) -> None:
         pool = self.token_to_kv_pool
         latent = layer.compressor.finish(pooled)

@@ -31,6 +31,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_gemv import wo_a_bf16_gemv
+from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
+    wo_a_bf16_small_batch,
+)
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -454,26 +457,53 @@ if _is_hip:
 
 
 def _apply_wo_a_bf16_matmul(
-    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
+    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool, is_target_verify: bool = False
 ) -> torch.Tensor:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
-    Single-token Blackwell decode uses a GEMV for the validated TP4 shape.
-    ROCm decode can use aiter batched GEMM; its first runtime failure disables
-    that path for the process. Other cases use torch.einsum.
+    Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
+    verify batches up to 384 rows write token-major output directly to avoid
+    the layout copy before wo_b. ROCm decode can use aiter batched GEMM;
+    other cases use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
-        is_decode
-        and _is_cuda
-        and (get_platform().is_blackwell or get_platform().is_sm90)
-        and o.shape == (1, 2, 4096)
+        _is_cuda
+        and (
+            (
+                is_decode
+                and o.shape[0] == 1
+                and (get_platform().is_blackwell or get_platform().is_sm90)
+            )
+            or (
+                is_target_verify
+                and 0 < o.shape[0] <= 384
+                and get_platform().is_blackwell
+            )
+        )
+        and o.shape[1:] == (2, 4096)
         and wo_a.shape == (2, 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
-        and o.is_contiguous()
+        and o.stride(2) == 1
+        and o.stride(1) == 4096
+        and o.stride(0) >= 8192
         and wo_a.is_contiguous()
     ):
-        return wo_a_bf16_gemv(o, wo_a)
+        if is_decode and o.shape[0] == 1:
+            return wo_a_bf16_gemv(o, wo_a)
+        if 2 <= o.shape[0] <= 8:
+            return wo_a_bf16_small_batch(o, wo_a)
+        result = torch.empty(
+            (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
+        )
+        # cuBLAS accepts the strided destination, preserving the einsum
+        # reduction while producing the contiguous layout consumed by wo_b.
+        # Draft warmup/capture can enter with grad tracking enabled.
+        with torch.no_grad():
+            torch.bmm(
+                o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
+            )
+        return result
     if (
         is_decode
         and _wo_a_aiter_batched_gemm_enabled
@@ -1498,7 +1528,15 @@ class MQALayer(MqaAttentionBase):
             and self.compress_ratio in (1, 2)
             and self.alt_streams is not None
             and (self.compressor is not None or self.indexer is not None)
-            and forward_batch.forward_mode.is_decode()
+            and (
+                forward_batch.forward_mode.is_decode()
+                or (
+                    forward_batch.forward_mode.is_target_verify()
+                    # Other MXFP8 backends may share mutable GEMM workspace.
+                    and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
+                    == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+                )
+            )
         )
         src_stream = None
         if early_sources:
@@ -2065,7 +2103,10 @@ class MQALayer(MqaAttentionBase):
                 if wo_a_weight is not None:
                     wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                     o = _apply_wo_a_bf16_matmul(
-                        o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                        o,
+                        wo_a,
+                        is_decode=forward_batch.forward_mode.is_decode(),
+                        is_target_verify=forward_batch.forward_mode.is_target_verify(),
                     )
                 else:
                     o = _apply_gguf_grouped_wo_a(
@@ -2125,6 +2166,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         compress_ratio_override: Optional[int] = None,
         engram_layout: Optional[EngramLayout] = None,
         hc_stats_stream: Optional[torch.cuda.Stream] = None,
+        moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hc_stats_stream = hc_stats_stream
@@ -2157,6 +2199,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             layer_id=self.layer_id,
             alt_stream=moe_alt_stream,
+            routed_quant_stream=moe_routed_quant_stream,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
         )
@@ -2412,7 +2455,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and self.hc_pre_from_prev_sublayer
             and self.hc_mult == 4
             and x.shape[1] == 5120
-            and x.shape[0] <= 64
+            and x.shape[0] <= 384
             and x.dtype == residual.dtype == torch.bfloat16
             and post.dtype == comb.dtype == torch.float32
             and all(t.is_contiguous() for t in (x, residual, post, comb))
@@ -2655,10 +2698,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
         apply_pre: Optional[torch.Tensor],
+        norm: RMSNorm,
         stats_stream: Optional[torch.cuda.Stream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mixing coefficients come from x; the sublayer input is x collapsed with
-        apply_pre (None selects copy 0). Returns (y, pre, post, comb)."""
+        apply_pre (None selects copy 0), then RMS-normalized.
+        Returns (y, pre, post, comb)."""
         from sglang.kernels.ops.layernorm.mhc import (
             hc_combine,
             hc_mix_stats,
@@ -2667,6 +2712,31 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         dtype = x.dtype
         x_flat = x.flatten(1)
+
+        def combine_and_norm():
+            if apply_pre is None:
+                return norm(x[:, 0, :].contiguous())
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+            if (
+                x.is_cuda
+                and get_platform().is_blackwell
+                and 0 < x.shape[0] <= 8
+                and self.hc_mult == 4
+                and x_flat.shape[1] == 20480
+                and x.dtype == norm.weight.dtype == torch.bfloat16
+                and apply_pre.stride(1) == 1
+                and not norm.cast_x_before_out_mul
+                and norm.variance_size_override is None
+                and not is_batch_invariant_mode_enabled()
+            ):
+                from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
+
+                return hc_combine_norm(
+                    x_flat, apply_pre, norm.weight, norm.variance_epsilon
+                )
+            return norm(hc_combine(x_flat, apply_pre, self.hc_mult, dtype))
+
         if (
             x.is_cuda
             and torch.version.cuda is not None
@@ -2679,6 +2749,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             # The split-K partial fixes the reduction order;
             # fusing the reduction and sinkhorn preserves batch invariance.
             main_stream = torch.cuda.current_stream()
+            # Avoid competing with the statistics projection for a tiny input;
+            # the coefficients still overlap the attention or FFN that follows.
+            y = (
+                combine_and_norm()
+                if stats_stream is not None and 0 < x.shape[0] <= 8
+                else None
+            )
             if stats_stream is not None:
                 stats_stream.wait_stream(main_stream)
                 x.record_stream(stats_stream)
@@ -2702,10 +2779,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # after the caller joins it, on the main stream.
                 for coefficient in (pre, post, comb):
                     coefficient.record_stream(main_stream)
-            if apply_pre is None:
-                y = x[:, 0, :].contiguous()
-            else:
-                y = hc_combine(x_flat, apply_pre, self.hc_mult, dtype)
+            if y is None:
+                y = combine_and_norm()
             return y, pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
             # Keep mixing and RMS reductions batch-invariant; cuBLAS/torch reductions can
@@ -2725,11 +2800,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        if apply_pre is None:
-            y = x[:, 0, :].contiguous()
-        else:
-            y = hc_combine(x_flat, apply_pre, self.hc_mult, dtype)
+        y = combine_and_norm()
         return y, pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
+
+    def _get_hc_stats_stream(self, hidden_states, forward_batch):
+        # Verify batches can also compute coefficients beside the
+        # sublayer; each branch joins before hc_post reads those coefficients.
+        return (
+            self.hc_stats_stream
+            if (
+                forward_batch.forward_mode.is_decode()
+                or (
+                    forward_batch.forward_mode.is_target_verify()
+                    and hidden_states.shape[0] > 0
+                )
+            )
+            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
+            else None
+        )
 
     def forward_hc_pre_from_prev(
         self,
@@ -2742,12 +2830,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layer forward where attention consumes the previous FFN's pre-mix and
         the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
-        stats_stream = (
-            self.hc_stats_stream
-            if forward_batch.forward_mode.is_decode()
-            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
-            else None
-        )
+        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
         x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
             hidden_states,
@@ -2755,9 +2838,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_scale,
             self.hc_attn_base,
             apply_pre=prev_pre,
+            norm=self.input_layernorm,
             stats_stream=stats_stream,
         )
-        x = self.input_layernorm(x)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(
                 x=x, positions=positions, forward_batch=forward_batch, x_quant=None
@@ -2773,9 +2856,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_scale,
             self.hc_ffn_base,
             apply_pre=attn_pre,
+            norm=self.post_attention_layernorm,
             stats_stream=stats_stream,
         )
-        x = self.post_attention_layernorm(x)
         x = self._run_moe_ffn_dp_sync(
             x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
         )
@@ -3334,6 +3417,14 @@ class DeepseekV4Model(nn.Module):
             if use_stream_pool
             else None
         )
+        # One stream for every layer's routed-MoE input pre-quant, separate from
+        # the attention/indexer streams and the shared expert's; each layer joins
+        # it (event wait) before its routed MoE op.
+        self.moe_routed_quant_stream = (
+            device_module.Stream()
+            if _is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            else None
+        )
         # One shared stream for all layers, separate from attention/indexer and
         # shared-expert streams. Every sublayer joins before reusing its residual.
         self.hc_stats_stream = (
@@ -3355,6 +3446,7 @@ class DeepseekV4Model(nn.Module):
                 alt_streams=self.alt_streams,
                 engram_layout=self.engram_layout,
                 hc_stats_stream=self.hc_stats_stream,
+                moe_routed_quant_stream=self.moe_routed_quant_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

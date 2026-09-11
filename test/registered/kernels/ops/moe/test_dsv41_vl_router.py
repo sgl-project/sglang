@@ -26,7 +26,13 @@ def route(
             e_score_correction_bias=text, e_score_correction_bias_vl=image
         ),
         config=SimpleNamespace(image_token_id=image_token_id),
-        topk=SimpleNamespace(topk_config=SimpleNamespace(**config)),
+        topk=SimpleNamespace(
+            topk_config=SimpleNamespace(
+                num_fused_shared_experts=0,
+                fused_shared_experts_scaling_factor=None,
+                **config,
+            )
+        ),
     )
     out = vision_topk(moe, logits, tokens, num_token_non_padded)
     return out.topk_weights, out.topk_ids

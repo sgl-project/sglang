@@ -1487,7 +1487,7 @@ class FusedMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        pre_quant_input: Optional[Tuple] = None,
     ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
@@ -1528,7 +1528,7 @@ class FusedMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        pre_quant_input: Optional[Tuple] = None,
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
@@ -1537,21 +1537,9 @@ class FusedMoE(torch.nn.Module):
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+        dispatch_output = self._dispatch_with_pre_quant(
+            hidden_states, topk_output, pre_quant_input
         )
-        if (
-            pre_quant_input is not None
-            and dispatch_output.format.is_standard()
-            and dispatch_output.hidden_states_scale is None
-        ):
-            # SGLANG_OPT_MOE_QUANT_ONCE: the standard dispatch was a pure
-            # passthrough, so the caller's pre-quantized (q, scale) pair still
-            # matches dispatch_output.hidden_states; attach it for the triton
-            # fused runner to skip its own activation quant.
-            dispatch_output = dispatch_output._replace(
-                hidden_states_pre_quant=pre_quant_input
-            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
@@ -1575,16 +1563,46 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
+    def _dispatch_with_pre_quant(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple],
+    ) -> DispatchOutput:
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+        if (
+            pre_quant_input is not None
+            and dispatch_output.format.is_standard()
+            and dispatch_output.hidden_states_scale is None
+        ):
+            # The standard dispatch was a pure passthrough, so the caller's
+            # pre-quantized activation still matches dispatch_output.hidden_states;
+            # attach it so the runner skips its own activation quant. Either the
+            # SGLANG_OPT_MOE_QUANT_ONCE (q, scale) pair for the triton fused
+            # runner, or Mxfp8RoutedInputPreQuant for the flashinfer_mxfp4
+            # TRT-LLM method (quantized on a side stream, joined on its event --
+            # dropping it here would leave that stream unjoined under CUDA-graph
+            # capture).
+            dispatch_output = dispatch_output._replace(
+                hidden_states_pre_quant=pre_quant_input
+            )
+        return dispatch_output
+
     def forward_deferred_finalize(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple] = None,
     ):
         assert self.quant_method is not None
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             flashinfer_trtllm_deferred_finalize_context,
         )
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+        dispatch_output = self._dispatch_with_pre_quant(
+            hidden_states, topk_output, pre_quant_input
         )
 
         with flashinfer_trtllm_deferred_finalize_context():

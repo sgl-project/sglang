@@ -3,6 +3,8 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
 
 class WindowLayout(msgspec.Struct, frozen=True):
     req: torch.Tensor
@@ -16,6 +18,22 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_valid: torch.Tensor
     commit_mask: torch.Tensor
     size: int
+
+    def copy_(self, other: "WindowLayout") -> None:
+        # Graph replay refreshes a captured layout in place: the captured copy
+        # kernels read these tensors by address, so their contents move, not
+        # the object.
+        assert self.size == other.size, (self.size, other.size)
+        self.req.copy_(other.req)
+        self.pos.copy_(other.pos)
+        self.write_loc.copy_(other.write_loc)
+        self.indices.copy_(other.indices)
+        self.lengths.copy_(other.lengths)
+        self.history_req.copy_(other.history_req)
+        self.history_pos.copy_(other.history_pos)
+        self.history_loc.copy_(other.history_loc)
+        self.history_valid.copy_(other.history_valid)
+        self.commit_mask.copy_(other.commit_mask)
 
 
 def _first_row_offsets(
@@ -175,7 +193,15 @@ class RequestWindow:
             return
         self.layout = layout
         self.prepared = None
-        self._ensure_workspace(layout.size)
+        if self.workspace is None:
+            self._ensure_workspace(layout.size)
+        elif self.workspace.size < layout.size:
+            # Captured graphs hold the workspace address; growing it here would
+            # leave them writing into a freed buffer. Size it at construction.
+            raise RuntimeError(
+                f"request-window workspace too small: {self.workspace.size} rows "
+                f"for a layout of {layout.size}"
+            )
 
     def initialize_dummy_history(self):
         layout = self.layout
@@ -194,12 +220,17 @@ class RequestWindow:
         )
 
     def buffer(self, layer):
-        if self.prepared != layer:
+        # The runner's capture scope includes eager warmups, before CUDA capture
+        # starts. Include the phase in the key so leaving that scope revalidates
+        # ownership even when the layout and layer have not changed.
+        in_capture = get_is_capture_mode() or _capturing()
+        prepared_key = (layer, in_capture)
+        if self.prepared != prepared_key:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
             src = self._history_src(layout)
-            if not _capturing():
+            if not in_capture:
                 valid = layout.history_valid
                 if not torch.equal(
                     self.tags[layer, src][valid], layout.history_pos[valid]
@@ -214,7 +245,7 @@ class RequestWindow:
                 layout.history_loc,
                 page_size=self.page_size,
             )
-            self.prepared = layer
+            self.prepared = prepared_key
         return self.workspace.kv_buffer[0]
 
     def commit(self, layer):

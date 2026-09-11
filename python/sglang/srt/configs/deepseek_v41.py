@@ -2,14 +2,6 @@
 
 from transformers import DeepseekV3Config, PretrainedConfig
 
-_FIELD_ALIASES = {
-    "dspark_n_activated_experts": "dspark_num_experts_per_tok",
-    "kv_source_layers": "kv_source_layer_ids",
-    "index_source_layers": "index_source_layer_ids",
-    "candidate_source_layer": "candidate_source_layer_id",
-    "engram_pad_id": "engram_pad_token_id",
-}
-
 _VISION_FIELDS = {
     "num_hidden_layers": "vision_n_layers",
     "hidden_size": "vision_dim",
@@ -24,40 +16,26 @@ _VISION_FIELDS = {
 }
 
 
-def normalize_deepseek_v4_fields(values):
-    values = dict(values)
-    for old, new in _FIELD_ALIASES.items():
-        if old in values:
-            legacy_value = values.pop(old)
-            values.setdefault(new, legacy_value)
-    return values
-
-
 def _config_dict(config):
     return config.to_dict() if isinstance(config, PretrainedConfig) else dict(config)
 
 
 def normalize_deepseek_v41_config(values):
-    values = normalize_deepseek_v4_fields(values)
+    values = dict(values)
     text = values.pop("text_config", None)
     vision = values.pop("vision_config", None)
     if text is not None:
-        text = normalize_deepseek_v4_fields(_config_dict(text))
+        text = _config_dict(text)
         text.pop("model_type", None)
         values = {**text, **values}
     if vision is not None:
         vision = _config_dict(vision)
-        if "max_num_tokens" in vision:
-            vision.setdefault("max_image_tokens", vision["max_num_tokens"])
         for source, target in _VISION_FIELDS.items():
             if source in vision:
                 values.setdefault(target, vision[source])
     if "model_type" in values:
         values["model_type"] = "deepseek_v41"
-    if values.get("architectures") in (
-        ["DeepseekV41ForCausalLM"],
-        ["DeepseekV41ForConditionalGeneration"],
-    ):
+    if values.get("architectures") == ["DeepseekV41ForCausalLM"]:
         values["architectures"] = ["DeepseekV4ForCausalLM"]
     return values
 
@@ -102,39 +80,9 @@ class DeepseekV41TextConfig(DeepseekV41Config):
 class DeepseekV41VisionConfig(PretrainedConfig):
     model_type = "deepseek_v41_vision"
 
-    def __init__(self, **kwargs):
-        if "max_num_tokens" in kwargs:
-            legacy_value = kwargs.pop("max_num_tokens")
-            kwargs.setdefault("max_image_tokens", legacy_value)
-        kwargs["model_type"] = "deepseek_v41_vision"
-        super().__init__(**kwargs)
-
-    def to_dict(self):
-        values = super().to_dict()
-        values["model_type"] = "deepseek_v41_vision"
-        return values
-
-
-class LegacyDeepseekV41Config(DeepseekV41Config):
-    model_type = "deepseek_v4.1"
-    __init__ = DeepseekV41Config.__init__
-
-
-class LegacyDeepseekV41TextConfig(DeepseekV41TextConfig):
-    model_type = "deepseek_v4.1_text"
-    __init__ = DeepseekV41Config.__init__
-
-
-class LegacyDeepseekV41VisionConfig(DeepseekV41VisionConfig):
-    model_type = "deepseek_v4.1_vision"
-    __init__ = DeepseekV41VisionConfig.__init__
-
 
 DEEPSEEK_V41_CONFIG_CLASSES = (
     DeepseekV41Config,
     DeepseekV41TextConfig,
     DeepseekV41VisionConfig,
-    LegacyDeepseekV41Config,
-    LegacyDeepseekV41TextConfig,
-    LegacyDeepseekV41VisionConfig,
 )

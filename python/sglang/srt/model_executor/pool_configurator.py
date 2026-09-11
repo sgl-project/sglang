@@ -945,6 +945,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         from sglang.srt.runtime_context import get_exec
 
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
+        self.paged_draft_layers = 0
+        if self.encoder_replay and kvc.spec_algorithm.is_dspark():
+            self.paged_draft_layers = int(
+                kvc.spec_aux_config.dflash_draft_num_layers or 0
+            )
+            assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
         self.request_window_bytes = 0
         if self.encoder_replay:
             slots = self.requested_max_running_requests_per_worker + 1
@@ -966,14 +972,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 + 4 * scratch * (self.kv_bytes + 16)
                 + slots * 3 * 16 * self.attn_head_dim * 8
             )
-            self.swa_ratio = 0
+            if not self.paged_draft_layers:
+                self.swa_ratio = 0
         self.swa_prefix_tails = self._resolve_swa_prefix_tails()
         self.swa_cap_tokens = (
-            0 if self.encoder_replay else self._resolve_swa_cap_tokens()
+            0
+            if self.encoder_replay and not self.paged_draft_layers
+            else self._resolve_swa_cap_tokens()
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.is_speculative and not self.encoder_replay:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
@@ -1082,6 +1091,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         The c4 compress state follows swa_tokens (c4_state_pool_size =
         swa_tokens / swa_page_size * ring), so it is priced per SWA slot too.
         """
+        if self.encoder_replay:
+            # Target SWA lives in the fixed request window; only the draft owns
+            # paged SWA bytes. DSpark's draft layers have no compressed state.
+            return self.kv_bytes * self.paged_draft_layers
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
         c4_state_bytes = 2 * 2 * self.attn_head_dim * c4_state_dtype_size
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
@@ -1124,11 +1137,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_swa_fixed_bytes(self) -> float:
         """Bias bytes the SWA pool takes in cap mode; 0 when sizing by ratio."""
-        if self.encoder_replay:
-            return self.request_window_bytes
-        if self.swa_cap_tokens is None:
-            return 0
-        return self.swa_cap_tokens * self.bytes_per_swa_token
+        paged_bytes = (
+            0
+            if self.swa_cap_tokens is None
+            else self.swa_cap_tokens * self.bytes_per_swa_token
+        )
+        return self.request_window_bytes + paged_bytes
 
     def _get_swa_tokens(self, full_token: int, page_size: int) -> int:
         # swa_cap_tokens was page-aligned at resolve time; page_size here is the
