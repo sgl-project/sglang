@@ -12,6 +12,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.multiplex.pdmux_context import decode_lane_attn_backend
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_npu
 
@@ -120,7 +121,10 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         elif not batch.forward_mode.is_idle():
-            target_worker.model_runner.attn_backend.init_forward_metadata(
+            # Verify belongs to the decode lane; plan into the backend the eager
+            # runner will resolve for it (the per-stream decode backend on the
+            # PDMux standard lane, the runner default everywhere else).
+            decode_lane_attn_backend(target_worker.model_runner).init_forward_metadata(
                 verify_forward_batch
             )
 

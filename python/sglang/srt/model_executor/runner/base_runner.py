@@ -231,6 +231,9 @@ class BaseRunner(ABC):
         self.dp_size = get_parallel().dp_size
         self.pp_size = get_parallel().pp_size
         self.enable_pdmux = get_disagg().enable_pdmux
+        self.pdmux_standard = (
+            self.enable_pdmux and get_disagg().pdmux_prefill_mode == "standard"
+        )
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
