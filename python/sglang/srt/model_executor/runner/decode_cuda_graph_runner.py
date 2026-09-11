@@ -132,6 +132,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_PERSISTENT_POOL_EXCLUSIONS = frozenset(
+    {
+        "next_token_logits_buffer",
+        "ngram_embedding_info.token_table",
+    }
+)
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -367,7 +374,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.capture_num_tokens is not None
             else self.max_bs * self.captured_req_width
         )
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self._init_attention_cuda_graph_state(self.attn_backend)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -391,10 +398,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
             # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
             # lora_manager.init_cuda_graph_moe_buffers().
-            self.model_runner.lora_manager.init_cuda_graph_batch_info(
-                max_bs_in_cuda_graph=self.max_bs,
-                num_tokens_per_req=self.captured_req_width,
-            )
+            with self.model_runner.cuda_graph_persistent_pool_context():
+                self.model_runner.lora_manager.init_cuda_graph_batch_info(
+                    max_bs_in_cuda_graph=self.max_bs,
+                    num_tokens_per_req=self.captured_req_width,
+                )
 
         enable_mamba_track = (
             get_exec().mamba.enable_mamba_extra_buffer
@@ -436,7 +444,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
         )
-        self.buffers.share_buffers()
+        self._share_input_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface for capture/replay.
@@ -556,7 +564,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+                self._init_attention_cuda_graph_state(attn_backend)
+
+    def _init_attention_cuda_graph_state(self, attn_backend: AttentionBackend) -> None:
+        with self.model_runner.cuda_graph_persistent_pool_context():
+            attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+
+    def _share_input_buffers(self) -> None:
+        self.buffers.share_buffers(
+            memory_pool=self.model_runner.cuda_graph_persistent_pool,
+            memory_pool_exclusions=_PERSISTENT_POOL_EXCLUSIONS,
+        )
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -1184,7 +1202,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            with self.model_runner.cuda_graph_persistent_pool_context():
+                attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
 
             def run_once():
                 # Graph-recordable metadata-prep hook. The unified memory pool

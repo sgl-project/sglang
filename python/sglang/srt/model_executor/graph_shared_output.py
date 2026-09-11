@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
@@ -23,9 +24,11 @@ class GraphSharedOutput:
         *,
         device: torch.device,
         max_rows: int,
+        memory_pool: Optional[torch.cuda.MemPool] = None,
     ) -> None:
         self.device = torch.device(device)
         self.max_rows = max_rows
+        self.memory_pool = memory_pool
         self._logits_buffers: Dict[int, torch.Tensor] = {}
 
     @classmethod
@@ -45,14 +48,20 @@ class GraphSharedOutput:
             return None
 
         device = torch.device(model_runner.device)
+        memory_pool = model_runner.cuda_graph_persistent_pool
         shared = cls._process_shared
         if (
             shared is not None
             and shared.device == device
             and shared.max_rows >= max_rows
+            and shared.memory_pool is memory_pool
         ):
             return shared
-        cls._process_shared = cls(device=device, max_rows=max_rows)
+        cls._process_shared = cls(
+            device=device,
+            max_rows=max_rows,
+            memory_pool=memory_pool,
+        )
         return cls._process_shared
 
     def get_logits_buffer(self, vocab_size: int, *, rows: int) -> torch.Tensor:
@@ -62,8 +71,16 @@ class GraphSharedOutput:
         )
         buffer = self._logits_buffers.get(vocab_size)
         if buffer is None:
-            buffer = torch.zeros(
-                (self.max_rows, vocab_size), dtype=torch.float, device=self.device
+            allocation_context = (
+                torch.cuda.use_mem_pool(self.memory_pool)
+                if self.memory_pool is not None
+                else contextlib.nullcontext()
             )
+            with allocation_context:
+                buffer = torch.zeros(
+                    (self.max_rows, vocab_size),
+                    dtype=torch.float,
+                    device=self.device,
+                )
             self._logits_buffers[vocab_size] = buffer
         return buffer[:rows]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Collection, Dict, Tuple
+from typing import AbstractSet, Collection, Dict, Optional, Tuple
 
 import torch
 
@@ -13,17 +13,21 @@ _PoolKey = Tuple[str, int, torch.dtype, torch.device]
 _forward_input_buffer_pool: Dict[_PoolKey, torch.Tensor] = {}
 
 
-def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
+def share_input_buffer(
+    name: str,
+    new_buffer: torch.Tensor,
+    memory_pool: Optional[torch.cuda.MemPool] = None,
+) -> torch.Tensor:
     """Coalesce a buffer by ``(name, size, dtype, device)`` into the
     process-wide input-buffer pool.
 
     Distinct callers that request the same field ``name`` with the same
     size/dtype/device share one physical allocation (and therefore one
-    ``data_ptr``): the first registrant's buffer becomes canonical and every
-    later identical request is returned as a view aliased onto it. Requests
-    that differ in size get their own allocation — they never reuse or displace
-    an existing entry — so the sharing *structure* is independent of
-    registration order and no already-captured buffer is ever repointed.
+    ``data_ptr``). When ``memory_pool`` is provided for the first registration,
+    clone the candidate into that pool before making it canonical. Later
+    identical requests are returned as views aliased onto the canonical tensor.
+    Requests that differ in size get their own allocation — they never reuse or
+    displace an existing entry — so no already-captured buffer is repointed.
 
     This pool is process-wide and governs *every* ``share_buffers()`` caller —
     including graph runners not yet on the registry (the speculative draft /
@@ -36,8 +40,12 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     key: _PoolKey = (name, new_buffer.numel(), new_buffer.dtype, new_buffer.device)
     canonical = _forward_input_buffer_pool.get(key, None)
     if canonical is None:
-        _forward_input_buffer_pool[key] = new_buffer
-        canonical = new_buffer
+        if memory_pool is not None and new_buffer.device.type == "cuda":
+            with torch.cuda.use_mem_pool(memory_pool):
+                canonical = new_buffer.clone()
+        else:
+            canonical = new_buffer
+        _forward_input_buffer_pool[key] = canonical
     return canonical.as_strided(new_buffer.size(), new_buffer.stride())
 
 
@@ -67,10 +75,19 @@ class ForwardInputBuffers:
             if buffer is not None:
                 buffer.zero_()
 
-    def share_buffers(self, *, exclude: Collection[str] = ()):
+    def share_buffers(
+        self,
+        memory_pool: Optional[torch.cuda.MemPool] = None,
+        memory_pool_exclusions: AbstractSet[str] = frozenset(),
+        *,
+        exclude: Collection[str] = (),
+    ):
         # disable share input buffer on npu due to accuracy issue
         if is_npu():
             return
+
+        def pool_for(name: str) -> Optional[torch.cuda.MemPool]:
+            return None if name in memory_pool_exclusions else memory_pool
 
         for f in fields(self):
             name = f.name
@@ -89,11 +106,12 @@ class ForwardInputBuffers:
                     assert isinstance(sub_buffer, torch.Tensor), (
                         f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
                     )
+                    qualified_name = f"{name}.{sub_name}"
                     buffer[sub_name] = share_input_buffer(
-                        f"{name}.{sub_name}", sub_buffer
+                        qualified_name, sub_buffer, pool_for(qualified_name)
                     )
             else:
                 assert isinstance(buffer, torch.Tensor), (
                     f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
                 )
-                setattr(self, name, share_input_buffer(name, buffer))
+                setattr(self, name, share_input_buffer(name, buffer, pool_for(name)))

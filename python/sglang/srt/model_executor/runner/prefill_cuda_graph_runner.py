@@ -42,7 +42,7 @@ import dataclasses
 import inspect
 import logging
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -362,7 +362,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
         )
-        self.buffers.share_buffers()
+        self._share_input_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
         # storage; same physical tensors, stable data_ptr for capture vs replay.
         self.buffer_registry: CudaGraphBufferRegistry = build_prefill_registry(
@@ -403,6 +403,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # TcPiecewise resolves by running a compile pass that calls back into
         # capture_prepare / _run_forward, so these fields must exist first.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
+        self._persistent_capture_global_num_tokens: Dict[
+            tuple[int, ...], torch.Tensor
+        ] = {}
         self.static_draft_hidden_states: Optional[torch.Tensor] = None
         self.layer_model = None
         self._capture_req_slots = 1
@@ -440,9 +443,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
         )
         if self._capture_lora:
-            model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
-                max_num_tokens=self.max_num_tokens
-            )
+            with model_runner.cuda_graph_persistent_pool_context():
+                model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
+                    max_num_tokens=self.max_num_tokens
+                )
             # Clamp Full's request slots to the LoRA segment-slot count
             # rather than fail capture.
             lora_max_bs = model_runner.lora_manager.prefill_cuda_graph_max_bs
@@ -489,7 +493,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._prefix_capture_variants = tuple(
                 n for n in _CHUNKED_PREFIX_VARIANTS if n // 2 < max_real_chunks
             )
-            self._prefix_capture_buffers = self._create_chunked_prefix_buffers()
+            self._prefix_capture_buffers = self._create_chunked_prefix_buffers(
+                memory_pool=model_runner.cuda_graph_persistent_pool
+            )
             logger.info(
                 "Full prefill CUDA graph cached-prefix chunks: "
                 "%d aggregate tokens/chunk (%d/request x %d slots), "
@@ -505,11 +511,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ),
             )
         if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
-            with torch.device(self.device):
-                self._prefill_static_buffers = {
-                    name: torch.zeros((self.max_bs,), dtype=torch.int64)
-                    for name in _PREFILL_STATIC_FIELDS
-                }
+            self._prefill_static_buffers = self._create_prefill_static_buffers()
 
         server_args = model_runner.server_args
         self.enable_cp_bcg_capture = isinstance(
@@ -587,6 +589,48 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
+
+    def _share_input_buffers(self) -> None:
+        self.buffers.share_buffers(
+            memory_pool=self.model_runner.cuda_graph_persistent_pool
+        )
+
+    def _create_prefill_static_buffers(self) -> Dict[str, torch.Tensor]:
+        with (
+            torch.device(self.device),
+            self.model_runner.cuda_graph_persistent_pool_context(),
+        ):
+            return {
+                name: torch.zeros((self.max_bs,), dtype=torch.int64)
+                for name in _PREFILL_STATIC_FIELDS
+            }
+
+    def _create_capture_global_num_tokens(
+        self, global_num_tokens_cpu: list[int]
+    ) -> torch.Tensor:
+        pool = self.model_runner.cuda_graph_persistent_pool
+        if pool is None:
+            return torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=self.device
+            )
+
+        # FullCudaGraphBackend does not retain capture_inputs, so keep each
+        # bucket's graph-read count tensor alive on the runner.
+        key = tuple(global_num_tokens_cpu)
+        if key in self._persistent_capture_global_num_tokens:
+            return self._persistent_capture_global_num_tokens[key]
+        with self.model_runner.cuda_graph_persistent_pool_context():
+            buffer = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=self.device
+            )
+        self._persistent_capture_global_num_tokens[key] = buffer
+        return buffer
+
+    def _init_full_cuda_graph_attention_metadata(
+        self, attn_backend: AttentionBackend, forward_batch: ForwardBatch
+    ) -> None:
+        with self.model_runner.cuda_graph_persistent_pool_context():
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
     def _input_embeds_hidden_size(self) -> int:
         """Width of the `input_embeds` the model writes inside the graph.
@@ -926,7 +970,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 variant = _chunked_prefix_variant(captured_n)
         return ShapeKey(size=num_tokens, variant_label=variant)
 
-    def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
+    def _create_chunked_prefix_buffers(
+        self, *, memory_pool: Optional[torch.cuda.MemPool] = None
+    ) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
         max_chunks = max(self._prefix_capture_variants)
         bs = self._capture_req_slots
@@ -935,22 +981,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             .unsqueeze(1)
             .repeat(1, bs)
         )
-        return _ChunkedPrefixCaptureBuffers(
-            starts=starts_cpu.to(self.device, copy=True),
-            seq_lens=torch.zeros(
-                (max_chunks, bs), dtype=torch.int32, device=self.device
-            ),
-            cu_seq_lens=torch.zeros(
-                (max_chunks, bs + 1), dtype=torch.int32, device=self.device
-            ),
-            starts_cpu=starts_cpu,
-            seq_lens_cpu=torch.zeros((max_chunks, bs), dtype=torch.int32),
-            kv_indices=torch.zeros(
-                (max_chunks, self._prefix_chunk_capacity),
-                dtype=torch.int32,
-                device=self.device,
-            ),
+        seq_lens_cpu = torch.zeros((max_chunks, bs), dtype=torch.int32)
+        allocation_context = (
+            torch.cuda.use_mem_pool(memory_pool)
+            if memory_pool is not None
+            else nullcontext()
         )
+        with allocation_context:
+            return _ChunkedPrefixCaptureBuffers(
+                starts=starts_cpu.to(self.device, copy=True),
+                seq_lens=torch.zeros(
+                    (max_chunks, bs), dtype=torch.int32, device=self.device
+                ),
+                cu_seq_lens=torch.zeros(
+                    (max_chunks, bs + 1), dtype=torch.int32, device=self.device
+                ),
+                starts_cpu=starts_cpu,
+                seq_lens_cpu=seq_lens_cpu,
+                kv_indices=torch.zeros(
+                    (max_chunks, self._prefix_chunk_capacity),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            )
 
     def _prepare_chunked_prefix_capture(
         self,
@@ -1328,8 +1381,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
-            num_tokens_tensor = torch.tensor(
-                global_num_tokens_cpu, dtype=torch.int32, device=self.device
+            num_tokens_tensor = self._create_capture_global_num_tokens(
+                global_num_tokens_cpu
             )
             global_num_tokens_gpu = num_tokens_tensor
             global_num_tokens_for_logprob_gpu = num_tokens_tensor
@@ -1494,8 +1547,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
         if self._is_full_backend:
             if not prefix_num_chunks:
-                attn_backend.init_forward_metadata_out_graph(
-                    forward_batch, in_capture=True
+                self._init_full_cuda_graph_attention_metadata(
+                    attn_backend, forward_batch
                 )
             # The prefix variant intentionally reuses the capture-stable
             # metadata object initialized by the suffix-only variant above.

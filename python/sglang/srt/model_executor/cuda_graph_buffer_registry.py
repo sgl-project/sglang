@@ -299,6 +299,7 @@ class CudaGraphBufferRegistry:
         max_bs: int,
         max_num_tokens: int,
         share_pool: bool = False,
+        memory_pool: Optional[torch.cuda.MemPool] = None,
     ) -> None:
         self.device = device
         self.max_bs = max_bs
@@ -306,6 +307,7 @@ class CudaGraphBufferRegistry:
         # Coalesce allocated slot buffers through the global pool; only applies
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
+        self.memory_pool = memory_pool
         self._slots: Dict[str, GraphSlot] = {}
 
     # ---- registration ------------------------------------------------------
@@ -356,7 +358,7 @@ class CudaGraphBufferRegistry:
             # Coalesce with any same-named buffer (e.g. the legacy
             # DecodeInputBuffers field) so capture and replay see one
             # physical allocation with a stable data_ptr.
-            buffer = share_input_buffer(slot.name, buffer)
+            buffer = share_input_buffer(slot.name, buffer, self.memory_pool)
         if (
             slot.padding_policy
             in (PaddingPolicy.FILL_SENTINEL, PaddingPolicy.FILL_ONCE)
@@ -526,6 +528,7 @@ def build_decode_registry(
     dp_size: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
+    memory_pool: Optional[torch.cuda.MemPool] = None,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
@@ -554,6 +557,7 @@ def build_decode_registry(
         max_bs=max_bs,
         max_num_tokens=max_num_token,
         share_pool=share_pool,
+        memory_pool=memory_pool,
     )
 
     def _tokens(_bs: int, mt: int) -> Tuple[int, ...]:
@@ -1009,6 +1013,7 @@ def build_eager_registry(
     encoder_len_fill_value: int = 0,
     encoder_lens_dtype: torch.dtype = torch.int32,
     dp_size: int = 1,
+    memory_pool: Optional[torch.cuda.MemPool] = None,
 ) -> CudaGraphBufferRegistry:
     """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
     decode and eager prefill.
@@ -1041,5 +1046,6 @@ def build_eager_registry(
         require_mlp_tp_gather=False,
         dp_size=dp_size,
         share_pool=True,
+        memory_pool=memory_pool,
         source=None,
     )
