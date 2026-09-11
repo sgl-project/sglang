@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -41,6 +42,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -756,6 +758,19 @@ class TritonAttnBackend(AttentionBackend):
             # Multi-step spec decode: kv buffers come from spec_info, not the
             # cuda-graph pool, so replay is not involved.
             if forward_mode.is_decode_or_idle() and spec_info is not None:
+                # This step's swa write ids, in the buffer the multi-step
+                # backend refills from the step's columns before replay.
+                swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(
+                    forward_batch, in_capture=True
+                )
+                assert not (
+                    self.use_sliding_window_kv_pool and swa_out_cache_loc is None
+                ), (
+                    "multi-step spec decode on a sliding-window KV pool could "
+                    "not derive swa_out_cache_loc; the window layers' writes "
+                    "have no target. The per-step out_cache_loc must fit "
+                    "cuda_graph_swa_out_cache_loc."
+                )
                 self.forward_metadata = ForwardMetadata(
                     attn_logits=self.cuda_graph_attn_logits,
                     attn_lse=self.cuda_graph_attn_lse,
@@ -777,6 +792,7 @@ class TritonAttnBackend(AttentionBackend):
                     window_num_kv_splits=None,
                     window_kv_offsets=None,
                     swa_attn_logits=self.cuda_graph_swa_attn_logits,
+                    swa_out_cache_loc=swa_out_cache_loc,
                     lean_Mp=self.cuda_graph_lean_Mp,
                     lean_Lp=self.cuda_graph_lean_Lp,
                     lean_Op=self.cuda_graph_lean_Op,
@@ -818,8 +834,9 @@ class TritonAttnBackend(AttentionBackend):
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ) -> Optional[torch.Tensor]:
         """Refill the SWA write-target buffer with the batch's write ids in the
-        sliding-window sub-pool, returning the [:n] view (None for non-SWA /
-        multi-step draft) so the captured store reads fresh slots on replay.
+        sliding-window sub-pool, returning the [:n] view (None for non-SWA) so
+        the captured store reads fresh slots on replay. A multi-step draft step
+        hands in a batch bound to its own columns of the window.
         """
         if not self.use_sliding_window_kv_pool:
             return None
@@ -2250,6 +2267,18 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
+            swa_loc = self.forward_metadata.swa_out_cache_loc
+            if (
+                self.is_draft_runner
+                and forward_batch.spec_info is not None
+                and swa_loc is not None
+            ):
+                # KVWriteLoc keeps a longer swa_loc's prefix, but a draft step's
+                # slice of the window is not a prefix of it.
+                assert swa_loc.shape[0] == forward_batch.out_cache_loc.shape[0], (
+                    f"draft step swa_out_cache_loc has {swa_loc.shape[0]} "
+                    f"entries for {forward_batch.out_cache_loc.shape[0]} tokens"
+                )
             if self.use_mla:
                 if layer.k_scale is not None:
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
@@ -2562,6 +2591,33 @@ class TritonMultiStepDraftBackend:
                 ]
             call_fn(i, forward_batch)
 
+    @contextlib.contextmanager
+    def _step_writes(self, forward_batch, step: int):
+        """Bind draft step ``step``'s slice of the batch's write ids, as
+        `EagleWorkerV2.draft_forward` slices them, and its columns of the
+        iteration's write window, while a per-step backend derives its write
+        targets (the swa ids included) from the batch."""
+        loc, cols = forward_batch.out_cache_loc, forward_batch.kv_loc_cols
+        if loc is None or not self.attn_backends[step].use_sliding_window_kv_pool:
+            yield
+            return
+        num_steps = self.speculative_num_steps
+        if cols is None:
+            # The draft's own window, each row laid out (topk, num_steps).
+            step_cols = slice(step, None, num_steps)
+        else:
+            # A chain draft writes the leading columns of the verify window.
+            assert self.topk == 1 and isinstance(cols, slice) and cols.step is None
+            step_cols = slice(cols.start + step, cols.start + step + 1)
+        forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
+            loc, forward_batch.batch_size, self.topk, num_steps
+        )[step]
+        forward_batch.kv_loc_cols = step_cols
+        try:
+            yield
+        finally:
+            forward_batch.out_cache_loc, forward_batch.kv_loc_cols = loc, cols
+
     def _fill_window_rail(
         self,
         forward_batch: ForwardBatch,
@@ -2648,7 +2704,8 @@ class TritonMultiStepDraftBackend:
                 forward_batch.spec_info.window_kv_indices = (
                     forward_batch.spec_info.window_kv_indices.clone()
                 )
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            with self._step_writes(forward_batch, i):
+                self.attn_backends[i].init_forward_metadata(forward_batch)
 
         self.common_template(
             forward_batch,
@@ -2705,9 +2762,10 @@ class TritonMultiStepDraftBackend:
             )
 
             def call_fn(i, _forward_batch):
-                self.attn_backends[i].init_forward_metadata_out_graph(
-                    inner_fb, in_capture=True
-                )
+                with self._step_writes(inner_fb, i):
+                    self.attn_backends[i].init_forward_metadata_out_graph(
+                        inner_fb, in_capture=True
+                    )
 
             self.common_template(forward_batch, None, call_fn)
         else:
@@ -2725,6 +2783,14 @@ class TritonMultiStepDraftBackend:
                 self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
                 forward_batch.seq_lens[:bs],
             )
+            if self.attn_backends[0].use_sliding_window_kv_pool:
+                # Each captured step writes its window layers through its own
+                # backend's swa buffer: refill it from that step's columns.
+                for i in range(self.speculative_num_steps - 1):
+                    with self._step_writes(forward_batch, i):
+                        self.attn_backends[i]._fill_cuda_graph_swa_out_cache_loc(
+                            forward_batch
+                        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:
