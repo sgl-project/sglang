@@ -149,17 +149,20 @@ def topk_transform_paged_v2(
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
-    Two output modes, chosen by whether ``page_tables`` is given and resolved to
-    a device-side template parameter, so an unused page-table gather is compiled
-    out rather than skipped at runtime:
+    Output mode is chosen from ``page_tables`` and ``out_raw_indices`` and
+    resolved to a device-side template parameter, so an unused page-table gather
+    is compiled out rather than skipped at runtime:
 
     * ``page_tables=None`` -- ``out_page_indices`` receives the raw selected
       indices and no page table is read.
     * ``page_tables`` given -- ``out_page_indices`` receives the page-table
       transform of them.
+    * Both outputs given -- ``out_page_indices`` receives the page-table
+      transform and ``out_raw_indices`` receives the selected raw indices.
 
     NOTE: every entry of `seq_lens` must be NON-NEGATIVE, and `metadata` must
     come from :func:`plan_topk_v2` over the same `seq_lens` values.
@@ -167,6 +170,16 @@ def topk_transform_paged_v2(
     trivial path and the output is guaranteed to be all -1.
     """
     if is_xpu():
+        if out_raw_indices is not None:
+            topk_transform_paged(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+            return
         torch.ops.sgl_kernel.topk_transform_paged(
             scores,
             seq_lens,
@@ -184,4 +197,5 @@ def topk_transform_paged_v2(
         out_page_indices,
         page_size,
         metadata,
+        out_raw_indices,
     )
