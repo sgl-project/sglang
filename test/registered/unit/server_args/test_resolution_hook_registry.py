@@ -6,6 +6,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import ast
 import json
 import os
 import shutil
@@ -13,9 +14,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.arg_groups import pipeline as pipeline_module
 from sglang.srt.arg_groups import resolution_hooks as hooks_module
 from sglang.srt.arg_groups.overrides import resolution_result
-from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook, run_hook
+from sglang.srt.arg_groups.resolution_hooks import (
+    _OVERRIDABLE_HOOKS,
+    register_resolution_hook,
+    run_hook,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +68,40 @@ class TestWhitelist(_IsolatedRegistry):
         self.assertIn(_fn, hooks_module._HOOKS["handle_cuda_graph_config"])
 
 
+class TestWhitelistMatchesThePipeline(CustomTestCase):
+    """The whitelist and `pipeline.py` are two hand-written lists that have to
+    agree; nothing keeps them in sync on its own. This derives both sides
+    fresh and asserts they are the same set, so a name added to one without
+    the other fails here instead of surfacing as "my override never runs" or
+    "this step nobody can ever replace" months later."""
+
+    def _run_hook_call_targets(self) -> set:
+        """The first argument of every `run_hook(...)` call in pipeline.py,
+        statically -- the set of steps the pipeline actually dispatches
+        through the registry."""
+        tree = ast.parse(open(pipeline_module.__file__).read())
+        names = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "run_hook"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+            ):
+                names.add(node.args[0].id)
+        return names
+
+    def test_every_whitelisted_hook_has_a_call_site(self):
+        called = self._run_hook_call_targets()
+        self.assertEqual(
+            (sorted(_OVERRIDABLE_HOOKS - called), sorted(called - _OVERRIDABLE_HOOKS)),
+            ([], []),
+            "(whitelisted but never called, called but not whitelisted) -- "
+            "both should be empty",
+        )
+
+
 class TestRunHook(_IsolatedRegistry):
     """``run_hook`` reads the name off the function it is handed
     (``builtin.__name__``), so every ``builtin`` stand-in below that needs to
@@ -73,6 +113,48 @@ class TestRunHook(_IsolatedRegistry):
         calls = []
         run_hook(calls.append, "sa")
         self.assertEqual(calls, ["sa"])
+
+    def test_a_zero_argument_step_can_be_overridden(self):
+        """`handle_hardware_runtime_validation` is the one real step that
+        takes no arguments at all -- `previous` takes none either."""
+        order = []
+
+        @register_resolution_hook("handle_hardware_runtime_validation")
+        def _wraps(previous):
+            order.append("before")
+            previous()
+            order.append("after")
+
+        def handle_hardware_runtime_validation():
+            order.append("builtin")
+
+        run_hook(handle_hardware_runtime_validation)
+        self.assertEqual(order, ["before", "builtin", "after"])
+
+    def test_a_two_argument_step_forwards_both(self):
+        """`handle_gpu_memory_settings(server_args, gpu_mem)` is the one real
+        step that takes more than `server_args` -- `previous` takes the same
+        two positional arguments."""
+        order = []
+
+        @register_resolution_hook("handle_gpu_memory_settings")
+        def _wraps(server_args, gpu_mem, previous):
+            order.append(("before", server_args, gpu_mem))
+            previous(server_args, gpu_mem)
+            order.append(("after", server_args, gpu_mem))
+
+        def handle_gpu_memory_settings(server_args, gpu_mem):
+            order.append(("builtin", server_args, gpu_mem))
+
+        run_hook(handle_gpu_memory_settings, "sa", 16.0)
+        self.assertEqual(
+            order,
+            [
+                ("before", "sa", 16.0),
+                ("builtin", "sa", 16.0),
+                ("after", "sa", 16.0),
+            ],
+        )
 
     def test_an_override_that_calls_previous_wraps_the_builtin(self):
         order = []

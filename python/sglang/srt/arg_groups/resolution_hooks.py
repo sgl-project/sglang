@@ -1,4 +1,4 @@
-"""Out-of-tree replacement for one named step of the resolution pipeline.
+"""Out-of-tree replacement for a named step of the resolution pipeline.
 
 `run_resolution_pipeline` calls its steps by name, hardcoded, with no
 per-step dispatch through `self` -- there is nothing on `ServerArgs` left to
@@ -16,37 +16,133 @@ unqualified name collision in this exact pipeline (`_parse_cuda_graph_config`
 and `_handle_cuda_graph_config` merged under one rename and the dispatcher
 called itself). A name that is not on the list fails loudly at import time,
 not silently at the call site three modules away.
+
+Steps do not share one signature -- most take `(server_args)`, one takes
+`(server_args, gpu_mem)`, one takes no arguments at all -- so `run_hook`
+forwards `*args` rather than assuming `server_args` is the only thing there.
+An override's own signature always matches its target's, plus `previous`
+last: `def mine(server_args, gpu_mem, previous)` for a step that takes
+`(server_args, gpu_mem)`. `previous` itself is always called the same way
+regardless -- with whatever `*args` the step was invoked with.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, FrozenSet, List
 
-# The only step open to replacement so far. Add a name here only alongside
-# the call site's own switch to `run_hook` -- an entry with no matching
-# `run_hook(...)` call is a name nothing will ever look up.
-_OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset({"handle_cuda_graph_config"})
+# Every step this pipeline runs by name that a downstream package may replace.
+# Add a name here only alongside the call site's own switch to `run_hook` --
+# an entry with no matching `run_hook(...)` call is a name nothing will ever
+# look up. `test_every_whitelisted_hook_has_a_call_site` in
+# test_resolution_hook_registry.py holds the two directions of this equal by
+# construction, so this list cannot drift from `pipeline.py` silently.
+#
+# `handle_offload_compatibility` runs at two different points in the pipeline
+# (once before model-specific adjustments, once after -- see the comments at
+# its call sites). An override registered for it applies at both, identically;
+# there is no way to target "just the second call" through this mechanism,
+# because the name is all `run_hook` has to key on.
+_OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
+    {
+        "handle_mega_moe",
+        "handle_return_hidden_states_mode",
+        "handle_media_url_security",
+        "handle_hicache_ratio_default",
+        "handle_offload_compatibility",
+        "validate_prefill_decode_interval",
+        "default_unset_prefill_decode_interval",
+        "validate_sampling_mask_max_tokens",
+        "validate_prefill_cp_platform",
+        "handle_hardware_runtime_validation",
+        "handle_model_source_paths",
+        "handle_multimodal",
+        "handle_ssl_validation",
+        "handle_asr_validation",
+        "handle_deprecated_args",
+        "handle_prefill_delayer_env_compat",
+        "handle_missing_default_values",
+        "handle_expert_pack",
+        "handle_pd_disaggregation",
+        "validate_prefill_only_disable_kv_cache_args",
+        "handle_decode_context_parallelism",
+        "apply_inkling_prefill_cuda_graph_default",
+        "apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
+        "handle_dwdp",
+        "handle_cuda_graph_config",
+        "apply_glm5_chunked_prefill_default",
+        "handle_hpu_backends",
+        "handle_cpu_backends",
+        "handle_npu_backends",
+        "handle_mps_backends",
+        "handle_xpu_backends",
+        "handle_symm_mem_device_support",
+        "handle_platform_defaults",
+        "handle_gpu_memory_settings",
+        "handle_model_specific_adjustments",
+        "handle_deterministic_inference",
+        "handle_attention_backend_compatibility",
+        "disable_prefill_cuda_graph_for_deepseek_trtllm_mla",
+        "handle_mamba_backend",
+        "handle_int8_mamba_checkpoint",
+        "handle_linear_attn_backend",
+        "apply_glm5_prefill_cuda_graph_policy",
+        "handle_kv4_compatibility",
+        "handle_mxfp8_kv_cache_compatibility",
+        "handle_amd_specifics",
+        "handle_nccl_pre_warm",
+        "handle_grammar_backend",
+        "handle_multi_item_scoring",
+        "handle_prefill_only_disable_kv_cache",
+        "handle_hicache",
+        "handle_data_parallelism",
+        "handle_load_balance_method",
+        "handle_context_parallelism",
+        "handle_moe_kernel_config",
+        "handle_a2a_moe",
+        "handle_eplb_and_dispatch",
+        "handle_expert_distribution_metrics",
+        "handle_elastic_ep",
+        "validate_experimental_sgl_marlin",
+        "handle_speculative_decoding",
+        "handle_layernorm_sp",
+        "validate_cutedsl_a2a_token_budget",
+        "handle_load_format",
+        "handle_encoder_disaggregation",
+        "handle_tokenizer_batching",
+        "handle_environment_variables",
+        "handle_cache_compatibility",
+        "handle_page_major_kv_layout",
+        "handle_unified_memory_pool",
+        "handle_dllm_inference",
+        "handle_crash_dump_env",
+        "handle_debug_utils",
+        "handle_other_validations",
+        "handle_model_capability_adjustments",
+        "validate_deepep_v2_speculative_draft",
+        "validate_deepep_v2_dispatch_token_budget",
+    }
+)
 
-# name -> registered overrides, oldest first. Each takes `(server_args,
-# previous)`, where `previous` is the callable it wraps -- the built-in on
-# the first registration, the previous registrant's override on every one
-# after. Process-global as a `dict[str, list]` so a test isolates it the way
-# `test_model_overrides.py` isolates `_MODEL_OVERRIDE_FNS`: `patch.dict(...,
-# clear=True)`.
-_HOOKS: Dict[str, List[Callable[[Any, Callable[[Any], None]], None]]] = {}
+# name -> registered overrides, oldest first. Each takes `(*args, previous)`,
+# where `args` are whatever the step itself is called with and `previous` is
+# the callable it wraps -- the built-in on the first registration, the
+# previous registrant's own wrapper on every one after. Process-global as a
+# `dict[str, list]` so a test isolates it the way test_model_overrides.py
+# isolates `_MODEL_OVERRIDE_FNS`: `patch.dict(..., clear=True)`.
+_HOOKS: Dict[str, List[Callable[..., Any]]] = {}
 
 
 def register_resolution_hook(name: str):
     """Replace (or wrap) the pipeline step named ``name``.
 
-    The decorated function is called as ``fn(server_args, previous)``.
-    ``previous`` is a plain ``server_args -> None`` callable: the built-in
-    step on the first registration for this name, or the previous
-    registrant's own wrapper on every registration after that. Call it to
-    run what would have run without this override -- the `super().handle_x()`
-    shape, expressed as an explicit argument instead of a method-resolution
-    lookup, because there is no class hierarchy here for `super()` to walk.
-    Not calling it is a full replacement.
+    The decorated function is called as ``fn(*args, previous)``, where
+    ``args`` match whatever the step itself is invoked with (most take just
+    ``server_args``; a few take more, or none) and ``previous`` is always
+    last. Call ``previous(*args)`` to run what would have run without this
+    override -- the ``super().handle_x()`` shape, expressed as an explicit
+    argument instead of a method-resolution lookup, because there is no class
+    hierarchy here for ``super()`` to walk. Not calling it is a full
+    replacement.
 
     Registering twice for the same name does not replace the first
     registration; it wraps it. The **last** registration is outermost --
@@ -79,7 +175,7 @@ def register_resolution_hook(name: str):
     return decorator
 
 
-def run_hook(builtin: Callable[[Any], None], server_args: Any) -> None:
+def run_hook(builtin: Callable[..., Any], *args: Any) -> Any:
     """Run ``builtin`` -- the registered chain if anything overrode it under
     its name, ``builtin`` directly otherwise.
 
@@ -89,6 +185,10 @@ def run_hook(builtin: Callable[[Any], None], server_args: Any) -> None:
     exact "two copies that can silently disagree" shape this project keeps
     removing elsewhere. ``builtin`` must therefore be a plain, named
     function -- every real call site is -- not a lambda or a bound method.
+
+    ``*args`` are forwarded exactly as given, to `builtin` and to every
+    registered override -- this makes no assumption that a step takes
+    `server_args` and only `server_args`.
 
     Called from the step's fixed position in `run_resolution_pipeline`. The
     chain is rebuilt from the registry on every call rather than cached at
@@ -100,11 +200,11 @@ def run_hook(builtin: Callable[[Any], None], server_args: Any) -> None:
     step = builtin
     for fn in _HOOKS.get(builtin.__name__, ()):
         step = _bind(fn, step)
-    step(server_args)
+    return step(*args)
 
 
 def _bind(fn, previous):
-    def wrapped(server_args):
-        fn(server_args, previous)
+    def wrapped(*args):
+        return fn(*args, previous)
 
     return wrapped
