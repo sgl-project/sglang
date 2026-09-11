@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=1800,
-    suite="nightly-8-npu-a3",
+    suite="full-8-npu-a3",
     nightly=True,
     disabled="accuracy testcase",
 )
@@ -23,6 +23,7 @@ ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "4400",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
@@ -63,7 +64,7 @@ OTHER_ARGS = [
     "deepep",
     "--deepep-mode",
     "auto",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     "--disable-radix-cache",
     "--speculative-algorithm",
@@ -92,7 +93,6 @@ MODEL_CONFIG = {
 
 
 class TestNPUKimiK2_6_W4A8_16P_AIME2025(TestNpuAccuracyMultiNodePdMixTestCaseBase):
-
     model_config = MODEL_CONFIG
     accuracy = 0.961
     datasets = ["aime25"]

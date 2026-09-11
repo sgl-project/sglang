@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sglang.srt.runtime_context import attention_backends, get_disagg, get_exec
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,7 +68,6 @@ def configure_aux_hidden_state_capture(
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     """Init attention kernel backend."""
-    server_args = model_runner.server_args
 
     # TODO: Refactor device-specific init branches into platform interface (separate PR).
     if model_runner.device in ("cuda", "musa"):
@@ -81,7 +82,7 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         ),
     )
 
-    if server_args.enable_pdmux:
+    if get_disagg().enable_pdmux:
         attn_backend = _build_resolved_backend(
             model_runner=model_runner, resolved=resolved, init_new_workspace=True
         )
@@ -91,10 +92,12 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
                 resolved=resolved,
                 init_new_workspace=False,
             )
-            for _ in range(server_args.sm_group_num)
+            for _ in range(get_disagg().sm_group_num)
         ]
         decode_attn_backend = decode_attn_backend_group[0]
-    elif server_args.enable_two_batch_overlap and not model_runner.is_draft_worker:
+    elif (
+        get_exec().overlap.enable_two_batch_overlap and not model_runner.is_draft_worker
+    ):
         attn_backend = TboAttnBackend.init_new(
             lambda: _build_resolved_backend(
                 model_runner=model_runner,
@@ -161,7 +164,6 @@ def resolve_attention_backend_strs(
     target and draft coexist in one process, so it cannot come from the
     process-wide config.
     """
-    server_args = model_runner.server_args
     is_draft_worker = model_runner.is_draft_worker
     draft_attn_backend = model_runner.draft_attention_backend
     if is_draft_worker and draft_attn_backend:
@@ -172,7 +174,7 @@ def resolve_attention_backend_strs(
             decode=draft_attn_backend,
             is_draft_override=True,
         )
-    prefill, decode = server_args.get_attention_backends()
+    prefill, decode = attention_backends()
     return ResolvedAttentionBackendStr(prefill=prefill, decode=decode)
 
 

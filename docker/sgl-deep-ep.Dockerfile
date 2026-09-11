@@ -6,19 +6,16 @@ FROM ${BASE_IMAGE}:cuda${CUDA_VERSION}
 ARG ARCHITECTURE=x86_64
 ARG CUDA_TAG=cu130
 ARG CUDA_VERSION=13.0
-ARG GDRCOPY_VERSION=2.5.1
+ARG NCCL_VERSION=2.30.7
 ARG PYTHON_TAG=cp312-cp312
 ARG TORCH_VERSION=2.13.0
 
 ENV CUDA_HOME=/usr/local/cuda
-ENV GDRCOPY_HOME=/usr/local
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 ENV PATH=/opt/python/${PYTHON_TAG}/bin:${PATH}
 ENV PYTHON_BIN=/opt/python/${PYTHON_TAG}/bin/python
 
 # These mirror the build and RDMA dependencies used by ci_install_deepep.sh.
-# The image builds only GDRCopy's user-space library: the host owns gdrdrv and
-# passes /dev/gdrdrv through at runtime.
 RUN yum install -y --nogpgcheck --enablerepo=powertools \
         cmake \
         curl \
@@ -51,14 +48,6 @@ RUN set -eux; \
     ln -sf "${cuda_stub}" /usr/lib64/libcuda.so; \
     ln -sf "${cuda_stub}" "/usr/lib/${ARCHITECTURE}-linux-gnu/libcuda.so"
 
-RUN git clone --depth 1 --branch "v${GDRCOPY_VERSION}" \
-        https://github.com/NVIDIA/gdrcopy.git /opt/gdrcopy \
-    && make -C /opt/gdrcopy CUDA="${CUDA_HOME}" prefix=/usr/local lib_install \
-    && printf '%s\n' /usr/local/lib > /etc/ld.so.conf.d/gdrcopy.conf \
-    && ldconfig \
-    && test -f /usr/local/include/gdrapi.h \
-    && ldconfig -p | grep -q libgdrapi
-
 RUN --mount=type=cache,id=sgl-deep-ep-pip-${CUDA_TAG}-${PYTHON_TAG}-${ARCHITECTURE},target=/root/.cache/pip \
     set -eux; \
     "${PYTHON_BIN}" -m pip uninstall -y deep-ep sgl-deep-ep || true; \
@@ -66,6 +55,8 @@ RUN --mount=type=cache,id=sgl-deep-ep-pip-${CUDA_TAG}-${PYTHON_TAG}-${ARCHITECTU
     "${PYTHON_BIN}" -m pip install --force-reinstall \
         "torch==${TORCH_VERSION}" \
         --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"; \
+    "${PYTHON_BIN}" -m pip install --force-reinstall --no-deps \
+        "nvidia-nccl-cu13==${NCCL_VERSION}"; \
     "${PYTHON_BIN}" -m pip install \
         "auditwheel>=6.0" \
         build \

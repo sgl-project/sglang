@@ -8,12 +8,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.cuda_vmm_utils import (
-    VmmReservation,
-    get_device_granularity,
-    make_device_allocation_prop,
-    tensor_from_pointer,
-)
 from sglang.srt.layers.moe.dwdp.layout import (
     EdgeInfo,
     LayerWeightSpecs,
@@ -21,6 +15,12 @@ from sglang.srt.layers.moe.dwdp.layout import (
     PageAlignedLayout,
 )
 from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
+from sglang.srt.utils.cuda_vmm_utils import (
+    VmmReservation,
+    get_device_granularity,
+    make_device_allocation_prop,
+    tensor_from_pointer,
+)
 
 logger = logging.getLogger(__name__)
 

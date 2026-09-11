@@ -219,29 +219,6 @@ def replace_parameter(
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
 
 
-def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
-    assert a.shape == b.shape
-    assert a.dtype == b.dtype == torch.float8_e4m3fn
-
-    a_u8 = a.view(torch.uint8)
-    b_u8 = b.view(torch.uint8)
-    diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
-
-    numel = a.numel()
-
-    count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum().item()
-    count_tiny_diff = (diff_u8 >= 1).sum().item()
-    count_large_diff = (diff_u8 >= 2).sum().item()
-
-    assert (
-        (count_diff_sign == 0)
-        and (count_tiny_diff / numel < 0.005)
-        and (count_large_diff == 0)
-    ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=}"
-
-
-# Match dynamic rules with module name (prefix) and override quantize
-# config if module (prefix) matches a rule
 def override_config(config: QuantizationConfig, prefix: str):
     weight_bits = get_dynamic_override(config, prefix, "bits", config.weight_bits)
     if isinstance(weight_bits, int):
@@ -453,9 +430,9 @@ def quantize_weights(
     zero_points: bool = False,
     ref_zero_points_after_scales: bool = False,
 ):
-    assert (
-        quant_type.is_integer()
-    ), "Floating point quantization may work but has not been tested"
+    assert quant_type.is_integer(), (
+        "Floating point quantization may work but has not been tested"
+    )
     assert not zero_points or group_size is not None, (
         "to have group zero points, group_size must be provided "
         "(-1 group_size is channelwise)"
@@ -555,12 +532,12 @@ def gptq_quantize_weights(
     size_k, _ = w.shape
 
     assert w.is_floating_point(), "w must be float"
-    assert (
-        quant_type in SUPPORTED_GPTQ_QUANT_TYPES
-    ), f"Unsupported gptq type = {quant_type}"
-    assert group_size in SUPPORTED_GROUP_SIZES + [
-        size_k
-    ], f"Unsupported groupsize = {group_size}"
+    assert quant_type in SUPPORTED_GPTQ_QUANT_TYPES, (
+        f"Unsupported gptq type = {quant_type}"
+    )
+    assert group_size in SUPPORTED_GROUP_SIZES + [size_k], (
+        f"Unsupported groupsize = {group_size}"
+    )
 
     w_ref, w_q, w_s, _ = quantize_weights(w, quant_type, group_size)
 
@@ -568,10 +545,10 @@ def gptq_quantize_weights(
     g_idx = torch.empty(0, dtype=torch.int, device=w.device)
     rand_perm = torch.empty(0, dtype=torch.int, device=w.device)
     if act_order:
-        assert (
-            group_size < size_k
-        ), "For act_order, groupsize = {} must be less than size_k = {}".format(
-            group_size, size_k
+        assert group_size < size_k, (
+            "For act_order, groupsize = {} must be less than size_k = {}".format(
+                group_size, size_k
+            )
         )
 
         w_ref, w_q, g_idx, rand_perm = permute_rows(w_q, w_ref, group_size, test_perm)
@@ -615,7 +592,7 @@ def swizzle_blockscale(scale: torch.Tensor):
     assert cols % 4 == 0
     padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
     swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-    swizzled_scale = swizzled_scale.contiguous().cuda()
+    swizzled_scale = swizzled_scale.contiguous().to(scale.device)
     return (
         swizzled_scale.reshape(M_padded, K_padded)
         if scale_ndim == 2
@@ -674,18 +651,14 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     )  # packed fp4
     gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, gemm1_rows, hidden_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, gemm1_rows, hidden_size // 16)  # fp8 scaling factors
 
     gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
         num_experts, hidden_size, intermediate_size // 2
     )  # packed fp4
     gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, hidden_size, intermediate_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, hidden_size, intermediate_size // 16)  # fp8 scaling factors
 
     # Pre-allocate output tensors so per-expert shuffles write directly into
     # contiguous slices instead of building lists + torch.stack().  This avoids

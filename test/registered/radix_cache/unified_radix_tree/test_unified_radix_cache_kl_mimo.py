@@ -3,7 +3,6 @@
 import random
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_test_utils import (
     _extract_output_logprobs,
@@ -16,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 MIMO_MODEL = "XiaomiMiMo/MiMo-V2.5"
@@ -97,7 +97,7 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     @classmethod
     def _prompt(cls, seed: int) -> list[int]:

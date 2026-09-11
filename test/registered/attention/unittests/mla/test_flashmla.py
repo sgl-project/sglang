@@ -1,16 +1,10 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 import triton
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     build_mla_attention_fixture,
@@ -33,6 +27,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_mla_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 MLA_SHAPE_KWARGS = dict(
     kv_lora_rank=512,
@@ -63,8 +58,8 @@ _DECODE_SKIP_REASON = (
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -384,8 +379,9 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
         )
 
         fixture = self._build_target_verify_metadata_fixture(case)
-        with torch.no_grad(), forward_context(
-            ForwardContext(attn_backend=fixture.backend)
+        with (
+            torch.no_grad(),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
         ):
             fixture.backend.init_forward_metadata(fixture.forward_batch)
 

@@ -8,6 +8,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     LogProbs,
+    SpecTokensDetails,
     StreamOptions,
 )
 
@@ -152,6 +153,53 @@ def process_cached_tokens_details_from_ret(
         return None
 
     return cached_tokens_details_from_dict(details)
+
+
+def spec_tokens_details_from_meta_info(
+    meta_info: Dict[str, Any],
+) -> Optional[SpecTokensDetails]:
+    """Build speculative decoding details from canonical or legacy metrics."""
+    details = dict(meta_info)
+
+    metric_keys = (
+        "spec_accept_rate",
+        "spec_accept_length",
+        "spec_cap_length",
+        "spec_block_accept_length",
+        "spec_num_correct_drafts",
+        "spec_num_proposed_drafts",
+        "spec_verify_ct",
+        "spec_correct_drafts_histogram",
+        "spec_cap_lens_histogram",
+    )
+    if not any(key in details for key in metric_keys):
+        return None
+
+    return SpecTokensDetails(
+        spec_accept_rate=details.get("spec_accept_rate") or 0.0,
+        spec_accept_length=details.get("spec_accept_length") or 0.0,
+        spec_cap_length=details.get("spec_cap_length") or 0.0,
+        spec_block_accept_length=details.get("spec_block_accept_length") or 0.0,
+        spec_num_correct_drafts=details.get("spec_num_correct_drafts") or 0,
+        spec_num_proposed_drafts=details.get("spec_num_proposed_drafts") or 0,
+        spec_verify_ct=details.get("spec_verify_ct") or 0,
+        spec_correct_drafts_histogram=details.get("spec_correct_drafts_histogram")
+        or [],
+        spec_cap_lens_histogram=details.get("spec_cap_lens_histogram") or [],
+    )
+
+
+def process_spec_tokens_details_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Optional[SpecTokensDetails]:
+    """Process speculative decoding details from a response item."""
+    if not getattr(request, "return_spec_tokens_details", False):
+        return None
+    return spec_tokens_details_from_meta_info(ret_item["meta_info"])
 
 
 def convert_embeds_to_tensors(
