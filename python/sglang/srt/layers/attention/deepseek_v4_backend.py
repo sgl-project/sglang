@@ -2807,6 +2807,22 @@ class DeepseekV4AttnBackend(
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
             self._low_ratio_compress_decode(layer, x, req, pos)
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.is_dspark_draft
+            and layer.compress_ratio == 2
+            and layer.compressor.use_fused_compress
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens > 1
+            and x.shape[0]
+            == forward_batch.batch_size * self.speculative_num_draft_tokens
+        ):
+            # Static verify is request-major with consecutive positions. Compact
+            # verify has variable block lengths and must retain the general path.
+            self._low_ratio_compress_fused(
+                layer, x, req, pos, draft_len=self.speculative_num_draft_tokens
+            )
         else:
             self._low_ratio_compress_torch(
                 layer,
@@ -2830,7 +2846,7 @@ class DeepseekV4AttnBackend(
         # Projection layout and fused-write support are fixed together at load time;
         # HIP and pre-Blackwell use split projections.
         if layer.compressor.use_fused_compress:
-            self._low_ratio_compress_decode_fused(layer, x, req, pos)
+            self._low_ratio_compress_fused(layer, x, req, pos)
             return
         if layer.compress_ratio == 1:
             core = self.forward_metadata.core_metadata
@@ -2879,12 +2895,15 @@ class DeepseekV4AttnBackend(
             fuse_index_store=_is_sm100_or_newer(),
         )
 
-    def _low_ratio_compress_decode_fused(self, layer, x, req, pos) -> None:
+    def _low_ratio_compress_fused(self, layer, x, req, pos, *, draft_len=1) -> None:
         """Fused compressor write, index-key projection, then fused index-key write.
         Both write kernels consume metadata dtypes directly and suppress padded stores.
         """
         from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
-        from sglang.kernels.ops.attention.dsv4.c2 import c2_decode_norm_rope_store
+        from sglang.kernels.ops.attention.dsv4.c2 import (
+            c2_decode_norm_rope_store,
+            c2_verify_norm_rope_store,
+        )
         from sglang.kernels.ops.attention.dsv4.fp4_rope import (
             index_k_norm_rope_pack_store,
         )
@@ -2916,7 +2935,13 @@ class DeepseekV4AttnBackend(
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
-            latent = c2_decode_norm_rope_store(
+            c2_compress = (
+                c2_verify_norm_rope_store
+                if draft_len > 1
+                else c2_decode_norm_rope_store
+            )
+            verify_args = {"draft_len": draft_len} if draft_len > 1 else {}
+            latent = c2_compress(
                 compressor.project_fused(x),
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
@@ -2928,6 +2953,7 @@ class DeepseekV4AttnBackend(
                 kv_cache,
                 page_size=page_size,
                 ring_size=state.ring_size,
+                **verify_args,
             )
             out_loc = core.c2_out_loc
 
