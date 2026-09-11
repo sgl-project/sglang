@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Annotated,
     Any,
@@ -2037,6 +2037,13 @@ class RequestResponseMetadata(BaseModel):
 
 @dataclass
 class MessageProcessingResult:
+    """Rendered messages with an explicit engine input.
+
+    ``prompt`` and ``prompt_ids`` remain available to the tokenization endpoint;
+    generation consumes only ``engine_prompt``, selected by the renderer.
+    """
+
+    engine_prompt: Union[str, List[int]] = field(kw_only=True)
     prompt: str
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]

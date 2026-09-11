@@ -78,6 +78,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_spec_tokens_details_from_ret,
     should_include_usage,
     spec_tokens_details_from_meta_info,
+    to_generate_prompt_kwargs,
     to_openai_style_logprobs,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
@@ -1043,22 +1044,6 @@ class OpenAIServingChat(OpenAIServingBase):
             f"received unsupported content type '{media_type}'."
         )
 
-    def _engine_prompt(
-        self, processed_messages: MessageProcessingResult, is_multimodal: bool
-    ) -> tuple[str, Any]:
-        """Standard VLMs render a text prompt (with placeholder strings) for
-        the MM processor to tokenize. Token-first encoders instead produce
-        pre-rendered input_ids with single placeholder ids and leave the text
-        empty; pass those through rather than re-tokenizing an empty prompt.
-        """
-        if is_multimodal and not chat_encoding.spec_renders_prompt_ids(
-            self.chat_encoding_spec
-        ):
-            return "text", processed_messages.prompt
-        if isinstance(processed_messages.prompt_ids, str):
-            return "text", processed_messages.prompt_ids
-        return "input_ids", processed_messages.prompt_ids
-
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -1125,14 +1110,7 @@ class OpenAIServingChat(OpenAIServingBase):
             sampling_params, processed_messages.reasoning_end_token_ids
         )
 
-        # Handle single vs multiple requests
-        if request.input_ids is not None:
-            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        else:
-            prompt_key, prompt_value = self._engine_prompt(
-                processed_messages, is_multimodal
-            )
-            prompt_kwargs = {prompt_key: prompt_value}
+        prompt_kwargs = to_generate_prompt_kwargs(processed_messages.engine_prompt)
 
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
@@ -1280,6 +1258,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
             result = MessageProcessingResult(
+                engine_prompt=request.input_ids,
                 prompt="",
                 prompt_ids=request.input_ids,
                 image_data=None,
@@ -1371,6 +1350,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if prompt_ids is not None:
+            engine_prompt = prompt_ids
             if self.chat_encoding_spec in ("inkling", "kimi_k3"):
                 for message in request.messages:
                     msg_dict = message.model_dump()
@@ -1458,6 +1438,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
                 )
+            engine_prompt = prompt_ids
         else:
             if self.template_manager.jinja_template_may_reorder_tool_results:
                 messages = self._canonicalize_tool_message_order(messages)
@@ -1562,6 +1543,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             if is_multimodal:
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+            engine_prompt = prompt if is_multimodal else prompt_ids
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -1569,6 +1551,7 @@ class OpenAIServingChat(OpenAIServingBase):
         video_data = video_data if video_data else None
         modalities = modalities if modalities else []
         return MessageProcessingResult(
+            engine_prompt=engine_prompt,
             prompt=prompt,
             prompt_ids=prompt_ids,
             image_data=image_data,
@@ -1635,6 +1618,7 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
         return MessageProcessingResult(
+            engine_prompt=prompt if is_multimodal else prompt_ids,
             prompt=prompt,
             prompt_ids=prompt_ids,
             image_data=image_data,

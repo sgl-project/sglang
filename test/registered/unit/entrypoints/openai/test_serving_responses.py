@@ -12,10 +12,12 @@ from utils import make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
     MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
 )
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
@@ -174,6 +176,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
                 modalities=[],
                 stop=["</s>"],
                 tool_call_constraint=("json_schema", {"type": "object"}),
+                engine_prompt=[1, 2, 3],
             )
 
         serving._process_messages = Mock(side_effect=fake_process)
@@ -301,6 +304,7 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
             modalities=[],
             stop=[],
             reasoning_end_token_ids=[41, 42],
+            engine_prompt=[1, 2, 3],
         )
         captured = {}
 
@@ -369,6 +373,7 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
             video_data=None,
             modalities=[],
             stop=[],
+            engine_prompt=[1, 2, 3],
         )
         captured = {}
 
@@ -567,6 +572,7 @@ class MultimodalRequestTestCase(CustomTestCase):
                 video_data=None,
                 modalities=["image"],
                 stop=[],
+                engine_prompt="rendered multimodal prompt",
             )
         )
 
@@ -626,21 +632,12 @@ class MultimodalRequestTestCase(CustomTestCase):
         """Bug regression: token-first encoders leave prompt == "" with
         non-empty prompt_ids; forwarding the empty text 400s in
         _tokenize_texts, so the multimodal branch must forward prompt_ids."""
-        for spec in ("inkling", "kimi_k3"):
+        for spec in ("inkling", "kimi_k3", "custom_encoder"):
             with self.subTest(spec=spec):
                 serving = make_serving(is_multimodal=True)
                 serving.chat_encoding_spec = spec
-                serving._process_messages = Mock(
-                    return_value=MessageProcessingResult(
-                        prompt="",
-                        prompt_ids=[4, 5, 6],
-                        image_data=None,
-                        audio_data=None,
-                        video_data=None,
-                        modalities=[],
-                        stop=[],
-                    )
-                )
+                serving.template_manager.chat_template_name = None
+                serving._encode_messages = Mock(return_value=[4, 5, 6])
                 request = ResponsesRequest(model="x", input="hi", store=False)
 
                 _, request_prompts, engine_prompts, _ = asyncio.run(
@@ -651,6 +648,80 @@ class MultimodalRequestTestCase(CustomTestCase):
 
                 self.assertEqual(engine_prompts, [[4, 5, 6]])
                 self.assertEqual(request_prompts, [[4, 5, 6]])
+
+
+class EnginePromptTestCase(CustomTestCase):
+    def test_renderers_select_the_same_input_for_both_endpoints(self):
+        for template_name in (None, "chatml"):
+            for is_multimodal in (False, True):
+                with self.subTest(
+                    template_name=template_name, is_multimodal=is_multimodal
+                ):
+                    serving = make_serving(is_multimodal=is_multimodal)
+                    serving.template_manager.chat_template_name = template_name
+                    tokenizer = serving.tokenizer_manager.tokenizer
+                    tokenizer.apply_chat_template.return_value = "rendered prompt"
+                    tokenizer.decode.return_value = "decoded prompt"
+                    request = ResponsesRequest(model="x", input="hi", store=False)
+
+                    _, request_prompts, engine_prompts, processed = asyncio.run(
+                        serving._make_request(request, None, tokenizer)
+                    )
+                    expected = processed.prompt if is_multimodal else [1, 2, 3]
+                    self.assertEqual(processed.engine_prompt, expected)
+                    self.assertEqual(request_prompts, [expected])
+                    self.assertEqual(engine_prompts, [expected])
+
+                    chat_request = ChatCompletionRequest(
+                        model="x", messages=[{"role": "user", "content": "hi"}]
+                    )
+                    adapted, _ = OpenAIServingChat._convert_to_internal_request(
+                        serving, chat_request
+                    )
+                    self.assertEqual(adapted.text, expected if is_multimodal else None)
+                    self.assertEqual(
+                        adapted.input_ids, None if is_multimodal else expected
+                    )
+
+    def test_endpoints_use_the_explicit_prompt_without_model_routing(self):
+        for engine_prompt in ("chosen text", [4, -1, 6]):
+            with self.subTest(engine_prompt=engine_prompt):
+                serving = make_serving(is_multimodal=True)
+                serving.chat_encoding_spec = "custom_encoder"
+                serving._process_messages = Mock(
+                    return_value=MessageProcessingResult(
+                        engine_prompt=engine_prompt,
+                        prompt="unused text",
+                        prompt_ids=[99],
+                        image_data=["image-data"],
+                        audio_data=None,
+                        video_data=None,
+                        modalities=["image"],
+                        stop=[],
+                    )
+                )
+                request = ResponsesRequest(model="x", input="hi", store=False)
+                _, request_prompts, engine_prompts, _ = asyncio.run(
+                    serving._make_request(
+                        request, None, serving.tokenizer_manager.tokenizer
+                    )
+                )
+                self.assertEqual(request_prompts, [engine_prompt])
+                self.assertEqual(engine_prompts, [engine_prompt])
+
+                chat_request = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "hi"}]
+                )
+                adapted, _ = OpenAIServingChat._convert_to_internal_request(
+                    serving, chat_request
+                )
+                if isinstance(engine_prompt, str):
+                    self.assertEqual(adapted.text, engine_prompt)
+                    self.assertIsNone(adapted.input_ids)
+                else:
+                    self.assertEqual(adapted.input_ids, engine_prompt)
+                    self.assertIsNone(adapted.text)
+                self.assertEqual(adapted.image_data, ["image-data"])
 
 
 class OutputItemsTestCase(CustomTestCase):

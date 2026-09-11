@@ -513,6 +513,7 @@ class ServingChatTestCase(unittest.TestCase):
                 [],
                 ["</s>"],
                 None,
+                engine_prompt=[1, 2, 3],
             )
 
             self.basic_req.return_sampling_mask = True
@@ -546,7 +547,7 @@ class ServingChatTestCase(unittest.TestCase):
         body = request.model_dump()
 
         processed_messages = MessageProcessingResult(
-            "Test prompt", [1, 2, 3], None, None, [], [], None
+            "Test prompt", [1, 2, 3], None, None, [], [], None, engine_prompt=[1, 2, 3]
         )
         with (
             envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.override(True),
@@ -694,6 +695,7 @@ class ServingChatTestCase(unittest.TestCase):
                 [],
                 None,
                 require_reasoning=True,
+                engine_prompt=[1, 2, 3],
             )
 
             adapted, _ = self.chat._convert_to_internal_request(req)
@@ -718,6 +720,7 @@ class ServingChatTestCase(unittest.TestCase):
             video_data=None,
             modalities=[],
             stop=[],
+            engine_prompt=[1, 2, 3],
         )
 
         with patch.object(
@@ -757,13 +760,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         with patch.object(self.chat, "_process_messages") as proc_mock:
             proc_mock.return_value = MessageProcessingResult(
-                "",
-                [1, 2, 3],
-                None,
-                None,
-                [],
-                [],
-                None,
+                "", [1, 2, 3], None, None, [], [], None, engine_prompt=[1, 2, 3]
             )
 
             adapted, _ = self.chat._convert_to_internal_request(req)
@@ -3353,6 +3350,7 @@ class ServingChatTestCase(unittest.TestCase):
             [],
             ["</s>"],
             None,
+            engine_prompt=[1, 2, 3],
         )
 
         with patch.object(

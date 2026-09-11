@@ -68,7 +68,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.openai.utils import (
+    to_generate_prompt_kwargs,
+    to_openai_style_logprobs,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -419,10 +422,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context = SimpleContext()
 
                     # Create GenerateReqInput for SGLang
-                    if isinstance(engine_prompt, str):
-                        prompt_kwargs = {"text": engine_prompt}
-                    else:
-                        prompt_kwargs = {"input_ids": engine_prompt}
+                    prompt_kwargs = to_generate_prompt_kwargs(engine_prompt)
 
                     logprob_kwargs = (
                         {
@@ -610,7 +610,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
 
-        _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
+        engine_prompt = processed_messages.engine_prompt
         request_prompts = [engine_prompt]
         engine_prompts = [engine_prompt]
 

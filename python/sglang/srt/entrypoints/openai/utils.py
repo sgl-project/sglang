@@ -15,6 +15,12 @@ from sglang.srt.entrypoints.openai.protocol import (
 logger = logging.getLogger(__name__)
 
 
+def to_generate_prompt_kwargs(
+    prompt: Union[str, List[int]],
+) -> Dict[str, Union[str, List[int]]]:
+    return {"text" if isinstance(prompt, str) else "input_ids": prompt}
+
+
 def to_openai_style_logprobs(
     input_token_logprobs=None,
     output_token_logprobs=None,
