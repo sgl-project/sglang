@@ -12,17 +12,22 @@ torchrun --nproc_per_node gpu \
 --master_port $MASTER_PORT benchmark/kernels/all_reduce/benchmark_mscclpp.py
 """
 
+import argparse
 import os
 from contextlib import nullcontext
-from typing import List
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.runtime_context import publish
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.device_communicators.pymscclpp import PyMscclppCommunicator
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     get_tensor_model_parallel_group,
@@ -50,14 +55,21 @@ def pynccl_allreduce(
     return msccl_input
 
 
-def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
-    graph_input = inp_randn.clone()
-    graph_input_snapshot = inp_randn.clone()
+def _bench_graph_time(
+    func,
+    inp_randn,
+    tp_group,
+    warmup_loop=2,
+    graph_loop=100,
+    test_loop=10,
+):
+    with use_symmetric_memory(tp_group):
+        graph_input = inp_randn.clone()
     with graph_capture() as graph_capture_context:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
             for _ in range(graph_loop):
-                graph_input.copy_(graph_input_snapshot)
+                graph_input.copy_(inp_randn)
                 graph_out = func(graph_input)
 
     graph.replay()
@@ -70,7 +82,7 @@ def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=1
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
-    latencies: List[float] = []
+    latencies = []
     for _ in range(test_loop):
         torch.cuda.synchronize()
         dist.barrier()
@@ -84,8 +96,9 @@ def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=1
     return func_output, func_cost_us
 
 
-def _bench_eager_time(func, inp_randn, warmup_loop=2, test_loop=10):
-    eager_input = inp_randn.clone()
+def _bench_eager_time(func, inp_randn, tp_group, warmup_loop=2, test_loop=10):
+    with use_symmetric_memory(tp_group):
+        eager_input = inp_randn.clone()
     eager_output = func(eager_input)
     func_output = eager_output.clone()
 
@@ -155,56 +168,79 @@ def print_markdown_table(data):
 if __name__ == "__main__":
     import logging
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--enable-symm-mem",
+        action="store_true",
+        help="Allocate collective inputs from NCCL symmetric memory.",
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.cuda.current_device()
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(
+            backend="nccl", device_id=torch.device("cuda", local_rank)
+        )
     world, world_size = dist.group.WORLD, dist.get_world_size()
     rank = dist.get_rank()
-    torch.cuda.set_device(rank % 8)
-    device = torch.cuda.current_device()
     set_mscclpp_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
-        local_rank=rank % 8,
+        local_rank=local_rank,
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
-    group = get_tensor_model_parallel_group().device_group
-    cpu_group = get_tensor_model_parallel_group().cpu_group
-    pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
-    pymscclpp_comm = get_tensor_model_parallel_group().pymscclpp_comm
+    publish(
+        ServerArgs(model_path="dummy", enable_symm_mem=args.enable_symm_mem),
+        role="scheduler",
+    )
+    initialize_model_parallel(
+        tensor_model_parallel_size=world_size,
+        enable_symm_mem=args.enable_symm_mem,
+    )
+    tp_group = get_tensor_model_parallel_group()
+    group = tp_group.device_group
+    pynccl_comm = tp_group.pynccl_comm
+    pymscclpp_comm = tp_group.pymscclpp_comm
     dist.barrier()
     profile = False
     dtype = torch.bfloat16
     ctx = get_torch_prof_ctx(profile)
     result = []
+    max_message_bytes = 1 << 20
 
     with ctx:
         for i in range(10, 20):
             sz = 2**i
-            if sz * dtype.itemsize > 2**20:
+            if sz * dtype.itemsize > max_message_bytes:
                 break
-            inp_randn = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
+            inp_randn = torch.randint(0, 2, (sz,), dtype=dtype, device=device)
 
-            memory = torch.empty_like(inp_randn)
-            memory_out = torch.empty_like(memory)
             torch_eager_output, torch_eager_time = _bench_eager_time(
-                lambda inp: torch_allreduce(inp, group), inp_randn
+                lambda inp: torch_allreduce(inp, group), inp_randn, tp_group
             )
             msccl_eager_output, msccl_eager_time = _bench_eager_time(
-                lambda inp: msccl_allreduce(inp, pymscclpp_comm), inp_randn
+                lambda inp: msccl_allreduce(inp, pymscclpp_comm),
+                inp_randn,
+                tp_group,
             )
             msccl_graph_output, msccl_graph_time = _bench_graph_time(
-                lambda inp: msccl_allreduce(inp, pymscclpp_comm), inp_randn
+                lambda inp: msccl_allreduce(inp, pymscclpp_comm),
+                inp_randn,
+                tp_group,
             )
             # since pynccl is inplace op, this return result is not correct if graph loop > 1
             _, pynccl_graph_time = _bench_graph_time(
-                lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
+                lambda inp: pynccl_allreduce(inp, pynccl_comm),
+                inp_randn,
+                tp_group,
             )
             torch.testing.assert_close(torch_eager_output, msccl_graph_output)
             torch.testing.assert_close(torch_eager_output, msccl_eager_output)
