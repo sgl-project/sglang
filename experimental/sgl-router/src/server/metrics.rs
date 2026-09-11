@@ -50,6 +50,7 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
+use crate::proxy::sse::StreamEnd;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -106,7 +107,7 @@ impl RequestOutcome {
 }
 
 /// Final outcome of a 2xx SSE stream.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamOutcome {
     /// Stream ended without errors.
     Ok,
@@ -116,6 +117,15 @@ pub enum StreamOutcome {
     UpstreamError,
     /// The client disconnected before the stream finished.
     ClientDisconnect,
+}
+
+pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
+    match (end.transport_ok, end.saw_error_event, end.client_disconnect) {
+        (false, _, _) => StreamOutcome::UpstreamError,
+        (_, true, _) => StreamOutcome::StreamErrorEvent,
+        (_, _, true) => StreamOutcome::ClientDisconnect,
+        _ => StreamOutcome::Ok,
+    }
 }
 
 impl StreamOutcome {
@@ -1225,6 +1235,29 @@ mod tests {
                 )),
                 "missing engine-aligned TTFT bucket le={le}; got:\n{out}",
             );
+        }
+    }
+
+    #[test]
+    fn stream_outcome_precedence() {
+        use StreamOutcome::*;
+
+        for (transport_ok, saw_error_event, client_disconnect, expected) in [
+            (false, false, false, UpstreamError),
+            (false, false, true, UpstreamError),
+            (false, true, false, UpstreamError),
+            (false, true, true, UpstreamError),
+            (true, false, false, Ok),
+            (true, false, true, ClientDisconnect),
+            (true, true, false, StreamErrorEvent),
+            (true, true, true, StreamErrorEvent),
+        ] {
+            let end = StreamEnd {
+                transport_ok,
+                saw_error_event,
+                client_disconnect,
+            };
+            assert_eq!(classify_stream_end(end), expected, "{end:?}");
         }
     }
 

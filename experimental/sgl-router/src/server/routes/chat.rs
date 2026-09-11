@@ -21,8 +21,8 @@ use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
-    StreamOutcome, WorkerModeLabel,
+    classify_stream_end, MetricsRegistry, PolicySelectionFailureReason, RequestOutcome,
+    StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -771,18 +771,7 @@ pub async fn chat_completions(
         let metrics = Arc::clone(&ctx.metrics);
         let model = metrics_model.clone();
         Box::new(move |end| {
-            // Transport truth first, so the label agrees with the breaker
-            // (proxy/mod.rs records failure from `transport_ok` alone).
-            let outcome = if !end.transport_ok {
-                StreamOutcome::UpstreamError
-            } else if end.saw_error_event {
-                StreamOutcome::StreamErrorEvent
-            } else if end.client_disconnect {
-                StreamOutcome::ClientDisconnect
-            } else {
-                StreamOutcome::Ok
-            };
-            metrics.record_stream_outcome(&worker_url, &model, outcome);
+            metrics.record_stream_outcome(&worker_url, &model, classify_stream_end(end));
         })
     };
 
