@@ -104,6 +104,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       modelIds: ["jdopensource/JoyAI-Image-Edit-Diffusers"],
     },
     {
+      name: "SenseNova-U1.5",
+      modelIds: ["sensenova/SenseNova-U1.5-8B-MoT"],
+      cookbook: "/cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT",
+    },
+    {
       name: "GLM-Image",
       modelIds: ["zai-org/GLM-Image"],
       note: "Resolved by the GLM-Image family detector.",
