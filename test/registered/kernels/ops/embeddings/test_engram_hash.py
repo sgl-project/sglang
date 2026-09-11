@@ -7,6 +7,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
     engram_hash_ids,
+    engram_hash_ids_and_commit,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -201,8 +202,8 @@ def test_decode_reads_history_through_req_slots():
 
 
 def test_decode_commit_writes_live_rows_only():
-    # With commit_out_loc the kernel writes each live request's new history row
-    # (token plus its n - 2 newest predecessors, oldest first); a padded row
+    # The commit entry point writes each live request's new history row (token
+    # plus its n - 2 newest predecessors, oldest first); a padded row
     # (out_cache_loc 0) writes nothing. Hash ids still read the old history.
     g = torch.Generator().manual_seed(6)
     bs, slots_total = 5, 9
@@ -229,23 +230,16 @@ def test_decode_commit_writes_live_rows_only():
     )
     dev = {k: (v.cuda() if torch.is_tensor(v) else v) for k, v in kw.items()}
     hist_dev = history.cuda()
-    got_ids, got_toks = engram_hash_ids(
+    got_ids = engram_hash_ids_and_commit(
         ids.cuda(),
         pos.cuda(),
-        mode=MODE_DECODE,
         history=hist_dev,
-        num_real=bs,
         req_slots=req_slots.cuda(),
-        block=1,
-        row=None,
-        starts=None,
+        out_cache_loc=out_loc.cuda(),
         mm_pad_shift=MM_PAD_SHIFT,
-        commit_out_loc=out_loc.cuda(),
         **dev,
     )
-    assert torch.equal(got_ids.cpu(), want_ids) and torch.equal(
-        got_toks.cpu(), want_toks
-    )
+    assert torch.equal(got_ids.cpu(), want_ids)
     expect = before.clone()
     for t in range(bs - 1):  # row 4 is padding
         expect[req_slots[t]] = want_toks[t, : N - 1].flip(0)
@@ -271,18 +265,13 @@ def test_decode_commit_across_programs():
     before = history.clone()
     dev = {k: (v.cuda() if torch.is_tensor(v) else v) for k, v in kw.items()}
     hist_dev = history.cuda()
-    got_ids, got_toks = engram_hash_ids(
+    got_ids = engram_hash_ids_and_commit(
         ids.cuda(),
         pos.cuda(),
-        mode=MODE_DECODE,
         history=hist_dev,
-        num_real=bs,
         req_slots=req_slots.cuda(),
-        block=1,
-        row=None,
-        starts=None,
+        out_cache_loc=out_loc.cuda(),
         mm_pad_shift=MM_PAD_SHIFT,
-        commit_out_loc=out_loc.cuda(),
         **dev,
     )
     want_ids, want_toks = naive(
@@ -299,7 +288,6 @@ def test_decode_commit_across_programs():
     )
     # Live rows read the old history and hash identically to the oracle.
     assert torch.equal(got_ids[:live].cpu(), want_ids[:live])
-    assert torch.equal(got_toks[:live].cpu(), want_toks[:live])
     expect = before.clone()
     for t in range(live):
         expect[req_slots[t]] = want_toks[t, : N - 1].flip(0)
