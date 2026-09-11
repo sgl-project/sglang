@@ -166,6 +166,34 @@ export const benchmarks = [
   },
 
   // ====================================================================
+  // GB10 + MXFP4 (TP1, DGX Spark sm121)
+  // ====================================================================
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 2f85329efe",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 2172.03, tpot_ms: 9.48, tokens_per_sec_per_gpu: 580 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 71292.20, tpot_ms: 38.09, tokens_per_sec_per_gpu: 1157 },
+    ],
+    accuracy: { gsm8k_pct: 96.36 },
+    notes: "Full GSM8K stop rate 99.55%; single-chip memory ceiling makes c=16 prefill the bottleneck.",
+  },
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
+    sglang_version: "PR #33561 @ 2f85329efe",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 2068.91, tpot_ms: 25.76, tokens_per_sec_per_gpu: 324 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 21649.69, tpot_ms: 106.51, tokens_per_sec_per_gpu: 1129 },
+    ],
+    accuracy: { gsm8k_pct: 96.82 },
+    notes: "Full GSM8K stop rate 99.62%.",
+  },
+
+  // ====================================================================
   // GB300 + BF16 (TP4)
   // ====================================================================
   // TODO: both cells are `verified: true` (gated on the final head) but the GSM8K

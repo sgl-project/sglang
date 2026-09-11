@@ -371,6 +371,12 @@ class DiffusersPipeline(ComposedPipelineBase):
         loaded_modules: dict[str, torch.nn.Module] | None = None,
         executor: PipelineExecutor | None = None,
     ):
+        if server_args.has_requested_component_attention_backends():
+            raise ValueError(
+                "--component-attention-backends is supported only by native "
+                "SGLang diffusion pipelines; use --attention-backend with the "
+                "Diffusers backend"
+            )
         self.server_args = server_args
         self.model_path = model_path
         self._stages: list[PipelineStage] = []

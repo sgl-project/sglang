@@ -73,6 +73,7 @@ class WeightCacheTransportBackend(ABC):
         config: Dict[str, Any],
         entries: Dict[str, Dict[str, Any]],
         pid: int,
+        preloaded_weights_bytes: int = 0,
     ) -> None:
         """Send a successful fetch_state response."""
 
@@ -112,6 +113,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         config: Dict[str, Any],
         entries: Dict[str, Dict[str, Any]],
         pid: int,
+        preloaded_weights_bytes: int = 0,
     ) -> None:
         send_msg(
             conn,
@@ -121,6 +123,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
                 "entries": entries,
                 "pid": pid,
                 "transport_backend": self.name,
+                "preloaded_weights_bytes": preloaded_weights_bytes,
             },
         )
 
@@ -171,6 +174,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         config: Dict[str, Any],
         entries: Dict[str, Dict[str, Any]],
         pid: int,
+        preloaded_weights_bytes: int = 0,
     ) -> None:
         self._raise_not_implemented()
 

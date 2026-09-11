@@ -19,9 +19,9 @@ def naive_flash_decode_with_topk_idx(
     init_blocks: int = 0,
     local_blocks: int = 0,
 ):
-    assert (
-        kv_cache.shape[2] % block_size == 0
-    ), "max cache len must be divisible by block size"
+    assert kv_cache.shape[2] % block_size == 0, (
+        "max cache len must be divisible by block size"
+    )
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
     original_dtype = q.dtype
