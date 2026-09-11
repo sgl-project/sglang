@@ -800,6 +800,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.append((src_addr, dst_addr, length))
             return transfer_blocks
 
+        # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
             return self._transfer_data(mooncake_session_id, transfer_blocks)
@@ -811,13 +812,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
-        if (
-            self.enable_custom_mem_pool
-            and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
-        ):
+        if self.enable_custom_mem_pool:
             futures = [
-                executor.submit(process_layer, src_ptr, dst_ptr, item_len)
-                for src_ptr, dst_ptr, item_len in layers_params
+                executor.submit(
+                    process_layer,
+                    src_ptr,
+                    dst_ptr,
+                    item_len,
+                )
+                for (src_ptr, dst_ptr, item_len) in layers_params
             ]
             return self._await_transfer_futures(futures)
         else:
