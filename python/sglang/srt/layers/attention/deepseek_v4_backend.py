@@ -3539,10 +3539,11 @@ class DeepseekV4AttnBackend(
             else compact_topk_metadata
         )
         if topk_metadata is not None:
+            topk_seq_lens = metadata.c4_seq_lens if positions is None else score_lens
             selected = torch.empty_like(page_indices)
             topk_transform_paged_v2(
                 s,
-                score_lens,
+                topk_seq_lens,
                 None,
                 selected,
                 1,

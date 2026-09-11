@@ -816,6 +816,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             return logits, block_scores, block_lens
 
         def topk_v2(scores, lens, page_table, out, page_size, metadata):
+            self.assertEqual(lens.dtype, torch.int32)
             out.fill_(-1)
             k = min(out.shape[1], scores.shape[1])
             out[:, :k] = scores.topk(k, dim=-1, sorted=False).indices.to(torch.int32)
@@ -848,7 +849,12 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 req_to_token[req_rows[:, None], positions.clamp_max(width - 1) * ratio]
                 // ratio
             ).masked_fill(~valid, 0)
-            return positions, slots, valid.sum(dim=-1), torch.empty(0)
+            return (
+                positions,
+                slots,
+                valid.sum(dim=-1).to(torch.int32),
+                torch.empty(0),
+            )
 
         def finalize_topk(
             selected,
