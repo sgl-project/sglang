@@ -114,23 +114,6 @@ class TestRunHook(_IsolatedRegistry):
         run_hook(calls.append, "sa")
         self.assertEqual(calls, ["sa"])
 
-    def test_a_zero_argument_step_can_be_overridden(self):
-        """`handle_hardware_runtime_validation` is the one real step that
-        takes no arguments at all -- `previous` takes none either."""
-        order = []
-
-        @register_resolution_hook("handle_hardware_runtime_validation")
-        def _wraps(previous):
-            order.append("before")
-            previous()
-            order.append("after")
-
-        def handle_hardware_runtime_validation():
-            order.append("builtin")
-
-        run_hook(handle_hardware_runtime_validation)
-        self.assertEqual(order, ["before", "builtin", "after"])
-
     def test_an_override_that_calls_previous_wraps_the_builtin(self):
         order = []
 

@@ -17,15 +17,11 @@ and `_handle_cuda_graph_config` merged under one rename and the dispatcher
 called itself). A name that is not on the list fails loudly at import time,
 not silently at the call site three modules away.
 
-Steps do not share one signature -- nearly all take `(server_args)`, but
-`handle_hardware_runtime_validation` takes no arguments at all. `run_hook`
-takes `server_args` as an ordinary, optional parameter (default `None`) for
-that reason, not a generic `*args`: the call site for that one step omits it
-entirely (`run_hook(handle_hardware_runtime_validation)`), and `run_hook`
-calls the whole chain with no arguments when it is missing. An override's
-own signature always matches its target's, plus `previous` last: `def
-mine(previous)` for that zero-argument step, `def mine(server_args,
-previous)` for everything else.
+Every step takes exactly `(server_args)`, `handle_hardware_runtime_validation`
+included -- it does not read `server_args` (see the comment at its
+definition), but it takes the parameter anyway so `run_hook` never has to
+special-case an arity. An override's own signature always matches: `def
+mine(server_args, previous)`.
 """
 
 from __future__ import annotations
@@ -126,26 +122,25 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
 )
 
 # name -> registered overrides, oldest first. Each takes `(server_args,
-# previous)`, or just `(previous)` for the one step that takes no arguments
-# at all, where `previous` is the callable it wraps -- the built-in on the
-# first registration, the previous registrant's own wrapper on every one
+# previous)`, where `previous` is the callable it wraps -- the built-in on
+# the first registration, the previous registrant's own wrapper on every one
 # after. Process-global as a `dict[str, list]` so a test isolates it the way
 # test_model_overrides.py isolates `_MODEL_OVERRIDE_FNS`:
 # `patch.dict(..., clear=True)`.
-_HOOKS: Dict[str, List[Callable[..., Any]]] = {}
+_HOOKS: Dict[str, List[Callable[[Any, Callable[[Any], None]], None]]] = {}
 
 
 def register_resolution_hook(name: str):
     """Replace (or wrap) the pipeline step named ``name``.
 
-    The decorated function is called as ``fn(server_args, previous)`` -- or
-    just ``fn(previous)`` for the one step, `handle_hardware_runtime_validation`,
-    that takes no arguments at all -- with ``previous`` always last. Call
-    ``previous(server_args)`` (or ``previous()``) to run what would have run
-    without this override -- the ``super().handle_x()`` shape, expressed as
-    an explicit argument instead of a method-resolution lookup, because there
-    is no class hierarchy here for ``super()`` to walk. Not calling it is a
-    full replacement.
+    The decorated function is called as ``fn(server_args, previous)``.
+    ``previous`` is a plain ``server_args -> None`` callable: the built-in
+    step on the first registration for this name, or the previous
+    registrant's own wrapper on every registration after that. Call it to
+    run what would have run without this override -- the `super().handle_x()`
+    shape, expressed as an explicit argument instead of a method-resolution
+    lookup, because there is no class hierarchy here for `super()` to walk.
+    Not calling it is a full replacement.
 
     Registering twice for the same name does not replace the first
     registration; it wraps it. The **last** registration is outermost --
@@ -178,7 +173,7 @@ def register_resolution_hook(name: str):
     return decorator
 
 
-def run_hook(builtin: Callable[..., Any], server_args: Any = None) -> Any:
+def run_hook(builtin: Callable[[Any], None], server_args: Any) -> None:
     """Run ``builtin`` -- the registered chain if anything overrode it under
     its name, ``builtin`` directly otherwise.
 
@@ -188,13 +183,6 @@ def run_hook(builtin: Callable[..., Any], server_args: Any = None) -> Any:
     exact "two copies that can silently disagree" shape this project keeps
     removing elsewhere. ``builtin`` must therefore be a plain, named
     function -- every real call site is -- not a lambda or a bound method.
-
-    ``server_args`` defaults to ``None``, meaning "this step takes no
-    arguments at all" -- the one real case is
-    ``handle_hardware_runtime_validation``, called as plain
-    ``run_hook(handle_hardware_runtime_validation)``. Every other call site
-    passes its ``server_args`` explicitly, and every registered override for
-    it takes ``(server_args, previous)``.
 
     Called from the step's fixed position in `run_resolution_pipeline`. The
     chain is rebuilt from the registry on every call rather than cached at
@@ -206,15 +194,11 @@ def run_hook(builtin: Callable[..., Any], server_args: Any = None) -> Any:
     step = builtin
     for fn in _HOOKS.get(builtin.__name__, ()):
         step = _bind(fn, step)
-    if server_args is None:
-        return step()
-    return step(server_args)
+    step(server_args)
 
 
 def _bind(fn, previous):
-    def wrapped(server_args=None):
-        if server_args is None:
-            return fn(previous)
-        return fn(server_args, previous)
+    def wrapped(server_args):
+        fn(server_args, previous)
 
     return wrapped

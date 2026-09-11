@@ -20,11 +20,13 @@ from sglang.srt.utils.common import is_host_cpu_arm64
 logger = logging.getLogger(__name__)
 
 
-def handle_hardware_runtime_validation():
-    # This is intentionally independent of `server_args.device`: setting
-    # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
-    # the environment cannot honor that request. With the flag unset,
-    # use_mlx() remains lazy and does not import MLX.
+def handle_hardware_runtime_validation(server_args: Any):
+    # `server_args` is accepted, not read: every resolution-hook step takes
+    # it, uniformly, so `run_hook` never has to special-case an arity. The
+    # check below is intentionally independent of `server_args.device`:
+    # setting SGLANG_USE_MLX opts into the MLX backend and must fail
+    # immediately if the environment cannot honor that request. With the
+    # flag unset, use_mlx() remains lazy and does not import MLX.
     use_mlx()
 
 

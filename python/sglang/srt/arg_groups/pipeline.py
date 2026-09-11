@@ -115,7 +115,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(validate_prefill_cp_platform, server_args)
-    run_hook(handle_hardware_runtime_validation)
+    run_hook(handle_hardware_runtime_validation, server_args)
     if cfg.model_path.lower() in ["none", "dummy"]:
         return
 
