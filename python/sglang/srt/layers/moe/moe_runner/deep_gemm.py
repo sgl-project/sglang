@@ -211,6 +211,8 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    psum_layout: bool = False
+    rows_end: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -333,6 +335,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
+        psum_kwargs = (
+            dict(
+                use_psum_layout=True,
+                expected_m_for_psum_layout=runner_input.expected_m,
+            )
+            if runner_input.psum_layout
+            else {}
+        )
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (hidden_states, hidden_states_scale),
             w13_weight_fp8,
@@ -340,6 +350,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            **psum_kwargs,
         )
 
         dispose_tensor(hidden_states)
@@ -349,7 +360,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             situ_beta = self.config.gemm1_alpha
             situ_linear_beta = self.config.gemm1_clamp_limit
             assert situ_beta is not None and situ_linear_beta is not None
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and runner_input.psum_layout:
+                down_input_fp8, down_input_scale = _moonep_situ_mul_quant_rows(
+                    gateup_output,
+                    runner_input.rows_end,
+                    scale_block_size,
+                    situ_beta,
+                    situ_linear_beta,
+                )
+                del gateup_output
+            elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
                 # Fused SiTU + per-group fp8 quant over the compacted rows,
                 # then the proven round-up e8m0 cast (mn-major packed layout).
                 rows = gateup_output.shape[0]
@@ -481,6 +501,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            **psum_kwargs,
         )
 
         return down_output
@@ -1295,6 +1316,269 @@ def _moonep_finalize_rows(
     )
 
 
+def _moonep_local_segments(
+    pool, cu_seqlens: torch.Tensor, plan, num_global_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    epn = pool.num_local_experts
+    home = pool.ep_rank * epn
+    device = cu_seqlens.device
+    idx = torch.cat(
+        [
+            torch.arange(home, home + epn, device=device),
+            torch.arange(
+                num_global_experts,
+                num_global_experts + pool.num_prefetch_slots,
+                device=device,
+            ),
+        ]
+    )
+    ends = cu_seqlens[idx]
+    starts = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens[:-1]])[idx]
+    n_pad = plan.zero_fill_ranges[idx, 1]
+    return (
+        starts.to(torch.int32).contiguous(),
+        (ends - starts - n_pad).to(torch.int32).contiguous(),
+    )
+
+
+def _moonep_psum_layout(
+    seg_start: torch.Tensor, seg_len: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    psum = (seg_start + seg_len).to(torch.int32).contiguous()
+    rows_end = ((psum[-1:] + 127) // 128 * 128).to(torch.int32).contiguous()
+    return psum, rows_end
+
+
+_MOONEP_ROW_PROGRAMS = 304  # persistent row loops: 2 programs per SM on GB200
+
+
+@triton.jit
+def _e8m0_round_up(x):
+    bits = x.to(tl.int32, bitcast=True)
+    exp = (bits >> 23) & 0xFF
+    mant = bits & 0x7FFFFF
+    is_ru = (mant > 0) & (exp != 0xFE) & ~((exp == 0) & (mant <= 0x400000))
+    return exp + is_ru.to(tl.int32)
+
+
+@triton.jit
+def _pack_e8m0_bytes(e8):
+    shifts = tl.arange(0, 4)[None, :] * 8
+    return tl.sum(e8 << shifts, axis=1)
+
+
+@triton.jit
+def _moonep_quant_rows_kernel(
+    x_ptr,  # [rows, K] bf16
+    q_ptr,  # [rows, K] fp8 out
+    s_ptr,  # int32, column-major packed: (row, kg4) at kg4 * S_STRIDE + row
+    end_ptr,  # int32 [1]: rows to process
+    K,
+    S_STRIDE,
+    GROUP: tl.constexpr,
+    KG: tl.constexpr,
+    KG_POW2: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    end = tl.load(end_ptr)
+    rows2d = tl.arange(0, KG_POW2)[:, None]
+    cols = tl.arange(0, GROUP)[None, :]
+    offs = rows2d * GROUP + cols
+    mask = rows2d < KG
+    for row in range(pid, end, NUM_PROGRAMS):
+        r = row.to(tl.int64)
+        x = tl.load(x_ptr + r * K + offs, mask=mask, other=0.0).to(tl.float32)
+        amax = tl.clamp(tl.max(tl.abs(x), axis=1), min=1e-10, max=float("inf"))
+        # UE8M0: quantize with the power-of-two scale itself, so the packed
+        # exponent describes exactly the scale the values were divided by.
+        scale = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+        q = tl.clamp(x / scale[:, None], -448.0, 448.0).to(tl.float8e4nv)
+        tl.store(q_ptr + r * K + offs, q, mask=mask)
+        e8 = tl.reshape(_e8m0_round_up(scale), [KG_POW2 // 4, 4])
+        packed = _pack_e8m0_bytes(e8)
+        g4 = tl.arange(0, KG_POW2 // 4)
+        tl.store(s_ptr + g4.to(tl.int64) * S_STRIDE + r, packed, mask=g4 < KG // 4)
+
+
+@triton.jit
+def _moonep_situ_mul_quant_rows_kernel(
+    g_ptr,  # [rows, 2N] bf16, non-interleaved [gate; up] halves
+    q_ptr,  # [rows, N] fp8 out
+    s_ptr,  # int32, column-major packed: (row, kg4) at kg4 * S_STRIDE + row
+    end_ptr,  # int32 [1]: rows to process
+    N,
+    S_STRIDE,
+    situ_beta,
+    situ_linear_beta,
+    GROUP: tl.constexpr,
+    KG: tl.constexpr,
+    KG_POW2: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    end = tl.load(end_ptr)
+    rows2d = tl.arange(0, KG_POW2)[:, None]
+    cols = tl.arange(0, GROUP)[None, :]
+    offs = rows2d * GROUP + cols
+    mask = rows2d < KG
+    for row in range(pid, end, NUM_PROGRAMS):
+        r = row.to(tl.int64)
+        gate = tl.load(g_ptr + r * 2 * N + offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(g_ptr + r * 2 * N + N + offs, mask=mask, other=0.0).to(tl.float32)
+        # tanh(x) == 2*sigmoid(2x) - 1 (avoids a libdevice dependency)
+        gate_t = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+        gate = situ_beta * gate_t * tl.sigmoid(gate)
+        up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+        y = gate * situ_linear_beta * up_t
+        amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
+        # Same quantization as _situ_mul_quant_contig_kernel followed by
+        # _cast_to_e8m0_with_rounding_up, fused: values scaled by 448/amax,
+        # scale byte the round-up exponent of amax/448.
+        q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+        tl.store(q_ptr + r * N + offs, q, mask=mask)
+        e8 = tl.reshape(_e8m0_round_up(amax / 448.0), [KG_POW2 // 4, 4])
+        packed = _pack_e8m0_bytes(e8)
+        g4 = tl.arange(0, KG_POW2 // 4)
+        tl.store(s_ptr + g4.to(tl.int64) * S_STRIDE + r, packed, mask=g4 < KG // 4)
+
+
+@triton.jit
+def _moonep_finalize_shard_kernel(
+    down_ptr,  # [NvS, H] bf16, DeepGEMM's w2 output in NvS row order
+    shard_ptr,  # [NvS, H] bf16, MoonEP's dispatch/combine shard
+    w_ptr,  # [NvS] fp32 route weights
+    seg_start_ptr,  # [G] int32
+    seg_len_ptr,  # [G] int32
+    H,
+    HAS_WEIGHTS: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    g = tl.program_id(0)
+    seg_len = tl.load(seg_len_ptr + g)
+    row0 = tl.program_id(1) * ROWS
+    if row0 >= seg_len:
+        return
+    seg_start = tl.load(seg_start_ptr + g)
+    col = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    cmask = col < H
+    for i in range(ROWS):
+        rr = row0 + i
+        if rr < seg_len:
+            dst = (seg_start + rr).to(tl.int64)
+            x = tl.load(down_ptr + dst * H + col, mask=cmask).to(tl.float32)
+            if HAS_WEIGHTS:
+                x = x * tl.load(w_ptr + dst)
+            tl.store(
+                shard_ptr + dst * H + col, x.to(shard_ptr.dtype.element_ty), mask=cmask
+            )
+
+
+def _moonep_quant_rows(
+    hidden_states: torch.Tensor,
+    rows_end: torch.Tensor,
+    group_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        create_per_token_group_quant_fp8_output_scale,
+    )
+
+    rows, k = hidden_states.shape
+    kg = k // group_size
+    assert kg % 4 == 0, "packed e8m0 scales need K/group_size % 4 == 0"
+    x_q = torch.empty((rows, k), device=hidden_states.device, dtype=torch.float8_e4m3fn)
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=(rows, k),
+        device=hidden_states.device,
+        group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    _moonep_quant_rows_kernel[(_MOONEP_ROW_PROGRAMS,)](
+        hidden_states,
+        x_q,
+        x_s,
+        rows_end,
+        k,
+        x_s.stride(1),
+        GROUP=group_size,
+        KG=kg,
+        KG_POW2=triton.next_power_of_2(kg),
+        NUM_PROGRAMS=_MOONEP_ROW_PROGRAMS,
+        num_warps=8,
+    )
+    return x_q, x_s
+
+
+def _moonep_situ_mul_quant_rows(
+    gateup_output: torch.Tensor,
+    rows_end: torch.Tensor,
+    group_size: int,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    rows, two_n = gateup_output.shape
+    half_n = two_n // 2
+    kg = half_n // group_size
+    assert kg % 4 == 0, "packed e8m0 scales need N/group_size % 4 == 0"
+    down_input_fp8 = torch.empty(
+        (rows, half_n), device=gateup_output.device, dtype=torch.float8_e4m3fn
+    )
+    # Same storage as _cast_to_e8m0_with_rounding_up returns: [kg/4, rows]
+    # int32 viewed as [rows, kg/4].
+    down_input_scale = torch.empty(
+        (kg // 4, rows), device=gateup_output.device, dtype=torch.int32
+    ).t()
+    _moonep_situ_mul_quant_rows_kernel[(_MOONEP_ROW_PROGRAMS,)](
+        gateup_output,
+        down_input_fp8,
+        down_input_scale,
+        rows_end,
+        half_n,
+        rows,
+        situ_beta,
+        situ_linear_beta,
+        GROUP=group_size,
+        KG=kg,
+        KG_POW2=triton.next_power_of_2(kg),
+        NUM_PROGRAMS=_MOONEP_ROW_PROGRAMS,
+        num_warps=8,
+    )
+    return down_input_fp8, down_input_scale
+
+
+def _moonep_finalize_into_shard(
+    down_output: torch.Tensor,
+    shard: torch.Tensor,
+    route_weights_nvs: Optional[torch.Tensor],
+    seg_start: torch.Tensor,
+    seg_len: torch.Tensor,
+    max_rows_per_group: int,
+) -> torch.Tensor:
+    rows, hidden_size = down_output.shape
+    ROWS, BLOCK = 32, 1024
+    grid = (
+        seg_start.numel(),
+        triton.cdiv(max_rows_per_group, ROWS),
+        triton.cdiv(hidden_size, BLOCK),
+    )
+    _moonep_finalize_shard_kernel[grid](
+        down_output,
+        shard,
+        route_weights_nvs,
+        seg_start,
+        seg_len,
+        hidden_size,
+        HAS_WEIGHTS=route_weights_nvs is not None,
+        ROWS=ROWS,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+    return shard
+
+
 @register_pre_permute("moonep", "deep_gemm")
 def pre_permute_moonep_to_deep_gemm(
     dispatch_output: MoonEPDispatchOutput,
@@ -1334,44 +1618,60 @@ def pre_permute_moonep_to_deep_gemm(
             ),
             num_sms=get_moonep_num_sms(),
         )
-        quant_info.w13_weight = pool.ranges[moonep_weights.W13_WEIGHT].view(torch.int8)
-        quant_info.w2_weight = pool.ranges[moonep_weights.W2_WEIGHT].view(torch.int8)
-        quant_info.w13_scale = pool.ranges[moonep_weights.W13_SCALE].permute(0, 2, 1)
-        quant_info.w2_scale = pool.ranges[moonep_weights.W2_SCALE].permute(0, 2, 1)
-
-        expert_ids = moonep_weights.group_rows(
-            layer_id, expert_ids, runner_config.num_experts
+        quant_info.w13_weight = pool.block_view(
+            moonep_weights.W13_WEIGHT, layer_id
+        ).view(torch.int8)
+        quant_info.w2_weight = pool.block_view(moonep_weights.W2_WEIGHT, layer_id).view(
+            torch.int8
+        )
+        quant_info.w13_scale = pool.block_view(
+            moonep_weights.W13_SCALE, layer_id
+        ).permute(0, 2, 1)
+        quant_info.w2_scale = pool.block_view(
+            moonep_weights.W2_SCALE, layer_id
+        ).permute(0, 2, 1)
+        seg_start, seg_len = _moonep_local_segments(
+            pool,
+            dispatch_output.cu_seqlens,
+            dispatch_output.plan,
+            runner_config.num_experts,
+        )
+        psum, rows_end = _moonep_psum_layout(seg_start, seg_len)
+        running_state["moonep_segments"] = (
+            seg_start,
+            seg_len,
+            dispatch_output.hidden_states,
+            int(dispatch_output.capacity) * runner_config.top_k,
+        )
+        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        running_state["mxfp8_act_gran_k"] = block_k
+        hidden_states_fp8, hidden_states_scale = _moonep_quant_rows(
+            hidden_states, rows_end, block_k
+        )
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states_fp8,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=False,
+            m_indices=psum,
+            psum_layout=True,
+            rows_end=rows_end,
+            expected_m=max(
+                1,
+                ceil_div(
+                    dispatch_output.num_tokens * runner_config.top_k * pool.ep_size,
+                    runner_config.num_experts,
+                ),
+            ),
         )
 
+    assert quant_info.w13_weight.dtype == torch.bfloat16, quant_info.w13_weight.dtype
     m_indices = _moonep_m_indices(dispatch_output.cu_seqlens, expert_ids, all_tokens)
     running_state["m_indices"] = m_indices
-
-    if quant_info.w13_weight.dtype == torch.bfloat16:
-        return DeepGemmRunnerInput(
-            hidden_states=hidden_states,
-            hidden_states_scale=torch.empty(
-                (all_tokens, 1), device=hidden_states.device, dtype=torch.float32
-            ),
-            use_masked_gemm=False,
-            m_indices=m_indices,
-        )
-
-    from sglang.kernels.ops.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
-
-    block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
-    running_state["mxfp8_act_gran_k"] = block_k
-    hidden_states_fp8, hidden_states_scale = sglang_per_token_group_quant_fp8(
-        hidden_states,
-        block_k,
-        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
     return DeepGemmRunnerInput(
-        hidden_states=hidden_states_fp8,
-        hidden_states_scale=hidden_states_scale,
+        hidden_states=hidden_states,
+        hidden_states_scale=torch.empty(
+            (all_tokens, 1), device=hidden_states.device, dtype=torch.float32
+        ),
         use_masked_gemm=False,
         m_indices=m_indices,
     )
@@ -1388,7 +1688,21 @@ def post_permute_deep_gemm_to_moonep(
 
     hidden_states = runner_output.hidden_states
     route_weights_nvs = running_state["route_weights_nvs"]
-    _moonep_finalize_rows(hidden_states, running_state["m_indices"], route_weights_nvs)
+    segments = running_state.get("moonep_segments")
+    if segments is not None:
+        seg_start, seg_len, shard, max_rows_per_group = segments
+        hidden_states = _moonep_finalize_into_shard(
+            hidden_states,
+            shard,
+            route_weights_nvs,
+            seg_start,
+            seg_len,
+            max_rows_per_group,
+        )
+    else:
+        _moonep_finalize_rows(
+            hidden_states, running_state["m_indices"], route_weights_nvs
+        )
 
     return MoonEPCombineInput(
         hidden_states=hidden_states,
