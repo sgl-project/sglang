@@ -1,4 +1,6 @@
 import logging
+import re
+from typing import List
 
 from sglang.srt.environ import envs
 
@@ -13,12 +15,17 @@ def patch_tokenizer(tokenizer):
         logger.info(
             f"Applying special tokens cache patch for Kimi tokenizer: {type(tokenizer)}"
         )
-        return _SpecialTokensCachePatcher.patch(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
+        logger.info(
+            f"Applying encode-piece fast path patch for Kimi tokenizer: {type(tokenizer)}"
+        )
+        return _EncodePieceFastPathPatcher.patch(tokenizer)
 
     return tokenizer
 
 
 def unpatch_tokenizer(tokenizer):
+    _EncodePieceFastPathPatcher.unpatch(tokenizer)
     return _SpecialTokensCachePatcher.unpatch(tokenizer)
 
 
@@ -115,6 +122,96 @@ class _SpecialTokensCachePatcher:
 
         logger.info(f"Unpatched special tokens cache for {tokenizer_cls.__name__}")
         return tokenizer
+
+
+class _EncodePieceFastPathPatcher:
+    """Short-circuit ``TikTokenTokenizer._encode_text_piece`` for the two segment
+    shapes that dominate Kimi-K3 chat encoding.
+
+    ``encoding_k3.build_chat_segments`` renders a conversation into tens of
+    thousands of tiny segments (one per control token, tag name, or tool-call
+    attribute) and ``_encode_text_piece`` is called once per segment.  Two costs
+    make that path CPU-bound on the API server for agentic conversations:
+
+    * control segments call ``tiktoken.Encoding.encode(allowed_special="all")``,
+      which rebuilds the allowed-special set on every call -- ~30us per call
+      regardless of text length -- for what is a dictionary lookup;
+    * text segments run a pure-Python per-character splitter that is a no-op
+      for anything shorter than ``MAX_NO_WHITESPACES_CHARS``.
+
+    The patched method keeps the original as the fallback, so token ids are
+    unchanged: a special-token literal inside a text segment, a control segment
+    that is not exactly one special token, and long text all take the original
+    path.
+    """
+
+    _PATCHED_FLAG = "_sglang_encode_piece_patched"
+    # Mirrors MAX_NO_WHITESPACES_CHARS in tokenization_kimi.py: below this length
+    # the original splitter yields the input unchanged, so skipping it is exact.
+    _MAX_UNSPLIT_TEXT_CHARS = 25_000
+
+    @classmethod
+    def patch(cls, tokenizer):
+        tokenizer_cls = type(tokenizer)
+
+        if getattr(tokenizer_cls, cls._PATCHED_FLAG, False):
+            return tokenizer
+
+        original_encode_text_piece = tokenizer_cls._encode_text_piece
+        max_unsplit_text_chars = cls._MAX_UNSPLIT_TEXT_CHARS
+
+        def patched_encode_text_piece(
+            self, text: str, allow_special_tokens: bool = True
+        ) -> List[int]:
+            if allow_special_tokens:
+                special_id = self.special_tokens.get(text)
+                if special_id is not None:
+                    return [special_id]
+                return original_encode_text_piece(self, text, allow_special_tokens)
+            if len(text) <= max_unsplit_text_chars and not _special_literal_regex(
+                self
+            ).search(text):
+                # disallowed_special=() encodes special literals as plain text,
+                # so with none present encode() == encode_ordinary().
+                return self.model._core_bpe.encode_ordinary(text)
+            return original_encode_text_piece(self, text, allow_special_tokens)
+
+        tokenizer_cls._original_encode_text_piece = original_encode_text_piece
+        tokenizer_cls._encode_text_piece = patched_encode_text_piece
+        setattr(tokenizer_cls, cls._PATCHED_FLAG, True)
+        return tokenizer
+
+    @classmethod
+    def unpatch(cls, tokenizer):
+        tokenizer_cls = type(tokenizer)
+
+        if not getattr(tokenizer_cls, cls._PATCHED_FLAG, False):
+            return tokenizer
+
+        tokenizer_cls._encode_text_piece = tokenizer_cls._original_encode_text_piece
+        del tokenizer_cls._original_encode_text_piece
+        delattr(tokenizer_cls, cls._PATCHED_FLAG)
+        if hasattr(tokenizer, _SPECIAL_LITERAL_REGEX_ATTR):
+            delattr(tokenizer, _SPECIAL_LITERAL_REGEX_ATTR)
+
+        logger.info(f"Unpatched encode-piece fast path for {tokenizer_cls.__name__}")
+        return tokenizer
+
+
+_SPECIAL_LITERAL_REGEX_ATTR = "_sglang_special_literal_regex"
+
+
+def _special_literal_regex(tokenizer):
+    regex = getattr(tokenizer, _SPECIAL_LITERAL_REGEX_ATTR, None)
+    if regex is None:
+        regex = re.compile(
+            "|".join(
+                re.escape(token)
+                for token in sorted(tokenizer.special_tokens, key=len, reverse=True)
+            )
+        )
+        setattr(tokenizer, _SPECIAL_LITERAL_REGEX_ATTR, regex)
+    return regex
 
 
 def _make_cached_property(cache_attr, original_fn):

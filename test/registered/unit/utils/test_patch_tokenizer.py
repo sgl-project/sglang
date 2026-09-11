@@ -5,11 +5,13 @@ from contextlib import contextmanager
 from transformers import AutoTokenizer
 
 from sglang.srt.utils.patch_tokenizer import (
+    _EncodePieceFastPathPatcher,
     _SpecialTokensCachePatcher,
     decode_without_hf_kwargs,
     unpatch_tokenizer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=16, suite="stage-b-test-cpu-intel")
@@ -164,6 +166,124 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
             "a<special>b",
         )
         self.assertEqual(tokenizer.decode_calls, [[1, 2], [1, 99, 2]])
+
+
+class TestEncodePieceFastPathPatcher(CustomTestCase):
+    """The fast path must be a pure shortcut: every segment shape it handles
+    (or declines) has to encode to the same ids as the original method."""
+
+    def test_encode_piece_matches_original_on_every_segment_shape(self):
+        tokenizer = _load_tokenizer()
+        specials = list(tokenizer.special_tokens)
+        rng = random.Random(0)
+        random_texts = [
+            _random_text_from_tokens(tokenizer, num_tokens=n, rng=rng)
+            for n in (1, 7, 100, 1000)
+        ]
+        segments = [
+            # exactly one special token -> table lookup
+            *[(tok, True) for tok in specials],
+            # special token with a suffix / two specials -> original path
+            *[(tok + "x", True) for tok in specials[:8]],
+            (specials[0] + specials[1], True),
+            # plain text -> encode_ordinary
+            *[(text, False) for text in random_texts],
+            ("", False),
+            ("", True),
+            (" " * 40, False),
+            # special literal inside plain text -> original path
+            *[(f"user wrote {tok} literally", False) for tok in specials[:8]],
+            # longer than MAX_NO_WHITESPACES_CHARS -> original splitter path
+            ("b" * 30_000 + " tail", False),
+            ("b" * 30_000 + " tail", True),
+        ]
+        original = type(tokenizer)._encode_text_piece
+        _EncodePieceFastPathPatcher.patch(tokenizer)
+        try:
+            for text, allow_special in segments:
+                self.assertEqual(
+                    original(tokenizer, text, allow_special),
+                    tokenizer._encode_text_piece(text, allow_special),
+                    (text[:40], allow_special),
+                )
+        finally:
+            _EncodePieceFastPathPatcher.unpatch(tokenizer)
+
+    def test_chat_template_ids_unchanged_for_tool_call_conversation(self):
+        # Kimi-K3's encoding_k3 renders one segment per control token and per
+        # tool-call attribute; this is the shape the fast path exists for.
+        tokenizer = AutoTokenizer.from_pretrained(
+            "moonshotai/Kimi-K3", trust_remote_code=True
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "deploy it"},
+        ]
+        for i in range(300):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{i}",
+                            "type": "function",
+                            "function": {
+                                "name": "Bash",
+                                "arguments": '{"command": "ls -la /tmp/%d"}' % i,
+                            },
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{i}",
+                    "content": f"total 0\n<|im_end|> literal in tool output {i}",
+                }
+            )
+        kwargs = dict(tools=tools, tokenize=True, add_generation_prompt=True)
+        expected = tokenizer.apply_chat_template(messages, **kwargs)
+
+        _EncodePieceFastPathPatcher.patch(tokenizer)
+        try:
+            self.assertEqual(
+                expected, tokenizer.apply_chat_template(messages, **kwargs)
+            )
+        finally:
+            _EncodePieceFastPathPatcher.unpatch(tokenizer)
+
+    def test_unpatch_restores_encode_piece(self):
+        tokenizer = _load_tokenizer()
+        cls = type(tokenizer)
+        original = cls._encode_text_piece
+
+        _EncodePieceFastPathPatcher.patch(tokenizer)
+        self.assertIsNot(cls._encode_text_piece, original)
+        _EncodePieceFastPathPatcher.patch(tokenizer)  # idempotent
+        _EncodePieceFastPathPatcher.unpatch(tokenizer)
+
+        self.assertIs(cls._encode_text_piece, original)
+        self.assertFalse(hasattr(cls, "_original_encode_text_piece"))
+        self.assertFalse(hasattr(tokenizer, "_sglang_special_literal_regex"))
+
+
+def _random_text_from_tokens(tokenizer, num_tokens, rng):
+    token_ids = [rng.randint(0, tokenizer.vocab_size - 1) for _ in range(num_tokens)]
+    return tokenizer.decode(token_ids)
 
 
 def _get_class_attr_ids(cls):
