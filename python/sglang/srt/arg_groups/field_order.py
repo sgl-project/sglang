@@ -72,7 +72,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_unified_memory",
     "disable_chunked_prefix_cache",
     "disable_overlap_schedule",
-    "num_continuous_decode_steps",
     "scheduler_recv_interval",
     "enable_mixed_chunk",
     "nccl_port",
