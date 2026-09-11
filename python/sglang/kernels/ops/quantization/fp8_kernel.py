@@ -68,6 +68,9 @@ if _is_musa:
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
 
+if _is_xpu:
+    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+
 if _is_musa:
     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
