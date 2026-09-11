@@ -22,11 +22,8 @@
 #                                                 it, GPU-faults at PD warmup /
 #                                                 backup on non-SVM host kernels)
 #
-# VALIDATION STATUS: the two features were each validated SEPARATELY on 2026-08-29
-# (HiSparse-on-decode GSM8K 0.960; HiCache-on-prefill GSM8K 0.950), both 0 GPU
-# faults. The COMBINED config in this recipe (both at once) has not yet been run
-# end-to-end -- this leg is its first exercise. If it regresses, split back into
-# the per-feature recipes to isolate which side breaks.
+# Measured 2026-09-09, 2-node 1P1D on mia1-p02-g29 + g53, exactly as configured
+# here: GSM8K 0.950, 0 invalid, 0 ibv_reg_mr failures.
 #
 # The launcher auto-adds --enable-dp-attention/--dp-size, --moe-a2a-backend/
 # --deepep-mode, and the DSV4 parser flags; only the feature flags below are
@@ -124,7 +121,14 @@ runtime:
       SGLANG_MORI_RANK_LOCAL_IB_DEVICE: 1
       SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES: 268435456
       SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: 0
-      SGLANG_HUGEPAGE_STRICT: 0
+      # One ionic pd holds about 1M 4K page-table entries, roughly 4 GiB. The host
+      # pool is larger, so ibv_reg_mr fails with errno:22 and decode aborts. On
+      # 2MiB pages it registers clean: 100 GiB on one pd against 3.75 GiB on 4K.
+      # STRICT=1 because a silent fallback to 4K pages brings the crash back
+      # quietly. Needs HugePages_Total set on the node; a reboot clears it.
+      # Prefill stays on 4K pages -- its HiCache pool does not fit the reservation.
+      SGLANG_HUGEPAGE_SIZE: 2MB
+      SGLANG_HUGEPAGE_STRICT: 1
 
 bench:
   concurrencies: [1, 8, 16, 32, 64, 128, 256]

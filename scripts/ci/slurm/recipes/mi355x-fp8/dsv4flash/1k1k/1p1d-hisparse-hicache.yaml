@@ -19,11 +19,9 @@
 #                                                 it, GPU-faults at PD warmup /
 #                                                 backup on non-SVM host kernels)
 #
-# VALIDATION STATUS: the two features were each validated SEPARATELY on 2026-08-29
-# (HiSparse-on-decode GSM8K 0.960; HiCache-on-prefill GSM8K 0.950), both 0 GPU
-# faults. The COMBINED config in this recipe (both at once) has not yet been run
-# end-to-end -- this leg is its first exercise. If it regresses, split back into
-# the per-feature recipes to isolate which side breaks.
+# Measured 2026-09-10, 2-node 1P1D on mia1-p02-g29 + g53, exactly as configured
+# here: GSM8K 0.950, 0 invalid, 0 ibv_reg_mr failures, 149 decode batches. The
+# three Flash-only settings below are all needed; Pro's values kill both roles.
 #
 # The launcher auto-adds --enable-dp-attention/--dp-size, --moe-a2a-backend/
 # --deepep-mode, and the DSV4 parser flags; only the feature flags below are
@@ -73,10 +71,20 @@ runtime:
     # PREFILL: HiCache. hicache-ratio 2 matched validation; if the PD device pool
     # makes the host budget too large ("Not enough host memory"), switch to an
     # absolute --hicache-size (GB per rank) as the dsr1 leg does.
-    prefill_extra_flags: "--enable-hierarchical-cache --hicache-ratio 2 --hicache-io-backend kernel --hicache-mem-layout layer_first"
+    # At ratio 2 the pool leaves 3.67 GB for the c4 indexer pool and prefill dies.
+    # --hicache-size is not an alternative: the DSV4 path rejects it.
+    prefill_extra_flags: "--enable-hierarchical-cache --hicache-ratio 1.2 --hicache-io-backend kernel --hicache-mem-layout layer_first"
     # DECODE: HiSparse. device_buffer_size 2048 sizes the device C4 pool so
     # requests admit (hisparse_req_budget > 0).
-    decode_extra_flags: "--disable-overlap-schedule --enable-hisparse --hisparse-config '{\"top_k\":1024,\"device_buffer_size\":2048,\"host_to_device_ratio\":2}'"
+    # Host pool = token budget / 4. Flash budgets 26.2M against Pro's 12.3M, so an
+    # uncapped decode wants 174 GB per rank, 1.4 TB over eight -- past the
+    # reservation. At Pro's budget the pool is 65 GB per rank and fits.
+    decode_extra_flags: "--max-total-tokens 12253440 --disable-overlap-schedule --enable-hisparse --hisparse-config '{\"top_k\":1024,\"device_buffer_size\":2048,\"host_to_device_ratio\":2}'"
+    # At 0.85 Flash prefill is left with ~0.5 GiB of VRAM and the first lazily
+    # loaded Triton kernel has no room; hipModuleLoadData then reports
+    # hipErrorNoBinaryForGpu, which is about space, not the arch. Decode is fine
+    # at the shared value.
+    prefill_mem_fraction_static: 0.78
     prefill_extra_env:
       SGLANG_HACK_FLASHMLA_BACKEND: unified_kv_triton
       MORI_RDMA_TC: 104
@@ -121,7 +129,14 @@ runtime:
       SGLANG_MORI_RANK_LOCAL_IB_DEVICE: 1
       SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES: 268435456
       SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: 0
-      SGLANG_HUGEPAGE_STRICT: 0
+      # One ionic pd holds about 1M 4K page-table entries, roughly 4 GiB. The host
+      # pool is larger, so ibv_reg_mr fails with errno:22 and decode aborts. On
+      # 2MiB pages it registers clean: 100 GiB on one pd against 3.75 GiB on 4K.
+      # STRICT=1 because a silent fallback to 4K pages brings the crash back
+      # quietly. Needs HugePages_Total set on the node; a reboot clears it.
+      # Prefill stays on 4K pages -- its HiCache pool does not fit the reservation.
+      SGLANG_HUGEPAGE_SIZE: 2MB
+      SGLANG_HUGEPAGE_STRICT: 1
 
 bench:
   concurrencies: [1, 8, 16, 32, 64, 128, 256]
