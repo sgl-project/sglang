@@ -309,7 +309,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -456,6 +455,8 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
+        # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
+        self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog()
 
@@ -971,10 +972,11 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        # For the MM models, check the text_config for MoE settings
-        config_to_check = getattr(
-            self.model_config.hf_config, "text_config", self.model_config.hf_config
-        )
+        config_to_check = self.model_config.hf_config
+        if hasattr(self.model_config.hf_config, "text_config"):
+            config_to_check = self.model_config.hf_config.text_config
+        elif hasattr(self.model_config, "hf_text_config"):
+            config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
@@ -992,7 +994,7 @@ class Scheduler(
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config()
         initialize_fp4_gemm_config()
-        initialize_bf16_gemm_config(self.server_args)
+        initialize_bf16_gemm_config()
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync()
@@ -1092,7 +1094,7 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        if self.server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
@@ -1114,10 +1116,16 @@ class Scheduler(
                 self.draft_worker.prewarm_sampling()
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
-            model_runner.post_capture_resize_kv_pool()
+            model_runner.post_capture_resize_kv_pool(
+                draft_runners=(
+                    self.draft_worker._draft_model_runners()
+                    if self.draft_worker is not None
+                    else ()
+                )
+            )
             self.kv_cache_allocation_time += time.perf_counter() - tic
 
-        if self.server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()
 
         # Adaptive/speculative graphs and post-capture KV sizing can consume
@@ -1501,6 +1509,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -1547,6 +1556,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -1806,21 +1816,6 @@ class Scheduler(
             ]
         )
 
-    def _abort_on_running_timeout(self, running_batch: ScheduleBatch):
-        # NOTE: this should be called before a batch is launched.
-        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
-        if timeout_s <= 0:
-            return
-        if running_batch.is_empty():
-            return
-
-        deadline = time.perf_counter() - timeout_s
-        for req in running_batch.reqs:
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
-                req.to_finish = FINISH_ABORT(
-                    "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
-                )
-
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
 
@@ -1910,10 +1905,7 @@ class Scheduler(
                 break
 
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            if recv_reqs:
-                self.metrics_reporter.record_scheduler_active()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -1957,10 +1949,7 @@ class Scheduler(
                 break
 
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            if recv_reqs:
-                self.metrics_reporter.record_scheduler_active()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2065,6 +2054,25 @@ class Scheduler(
         """
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
+
+    def ingest_requests(self) -> List:
+        """Receive, broadcast and dispatch this iteration's external input.
+
+        The one place a new per-iteration input source belongs; the return
+        value exists for the pipeline stages that relay requests onward.
+        """
+        local_reqs = []
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            local_reqs = self._poll_timeout_aborts()
+        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        if recv_reqs:
+            self.metrics_reporter.record_scheduler_active()
+        self.process_input_requests(recv_reqs)
+        return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -2884,30 +2892,29 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if (
-            req.return_sampling_mask
-            and self.disaggregation_mode != DisaggregationMode.NULL
-            and not self.disagg_metadata_buffers.enable_sampling_mask
-        ):
-            error_msg = (
-                "return_sampling_mask with disaggregation requires "
-                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
-        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
-            error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+        if req.return_sampling_mask:
+            if (
+                self.disaggregation_mode != DisaggregationMode.NULL
+                and not self.disagg_metadata_buffers.enable_sampling_mask
+            ):
+                self._reject_sampling_mask_request(
+                    req,
+                    "return_sampling_mask requires "
+                    "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
+                    "decode servers when using disaggregated serving.",
+                )
+                return
+            top_k = req.sampling_params.top_k
+            sampling_mask_cap = self.server_args.sampling_mask_max_tokens
+            if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
+                error_msg = (
+                    "return_sampling_mask requires top_k=1 for greedy sampling "
+                    f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
+                    f"{top_k}. Lower top_k or increase "
+                    "--sampling-mask-max-tokens."
+                )
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             # Spec workers do not emit one sampling support per accepted token, so
@@ -2916,9 +2923,7 @@ class Scheduler(
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
@@ -2928,9 +2933,7 @@ class Scheduler(
                 "return_sampling_mask is not supported with the ascend "
                 "sampling backend."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         # Handle multimodal inputs
@@ -3154,6 +3157,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3168,6 +3172,13 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
+        """Return a sampling-mask validation error without running the model."""
+        logger.error(f"{error_msg}, {req.rid=}")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -3249,34 +3260,58 @@ class Scheduler(
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
-    def _abort_on_waiting_timeout(self):
-        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
-            return
+    def _poll_timeout_aborts(self) -> List[AbortReq]:
+        """Emit aborts only; every rank must drop the same requests in the
+        same iteration, or the extend-vs-decode decision splits and the
+        collectives hang.
+        """
+        aborts: List[AbortReq] = []
 
-        deleted_reqs = set()
-        deadline = time.perf_counter() - timeout_s
-        for req in self.waiting_queue:
-            entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
-                self._release_aborted_request(req.rid)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(
-                        req,
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request waiting timeout reached.",
-                        },
-                    ),
-                    req,
-                )
-                deleted_reqs.add(req)
-                self.beam_coordinator.retire_group(req)
+        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
+            deadline = time.perf_counter() - timeout_s
+            for req in self.waiting_queue:
+                entry_time = req.time_stats.wait_queue_entry_time
+                if 0 < entry_time < deadline:
+                    aborts.append(
+                        AbortReq(
+                            rid=req.rid,
+                            abort_message="Request waiting timeout reached.",
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Request waiting timeout reached.",
+                            },
+                        )
+                    )
 
-        if deleted_reqs:
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in deleted_reqs
-            ]
+        if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
+            deadline = time.perf_counter() - timeout_s
+            if self.ps.pp_size == 1:
+                inflight_batches = [self.running_batch, self.last_batch]
+            else:
+                inflight_batches = [*self.running_mbs, *self.mbs]
+            seen_rids = set()
+            for batch in inflight_batches:
+                if batch is None:
+                    continue
+                for req in batch.reqs:
+                    if req.rid in seen_rids or req.finished():
+                        continue
+                    seen_rids.add(req.rid)
+                    if 0 < req.time_stats.forward_entry_time < deadline:
+                        aborts.append(
+                            AbortReq(
+                                rid=req.rid,
+                                abort_message="Request running timeout reached.",
+                                finished_reason={
+                                    "type": "abort",
+                                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                    "message": "Request running timeout reached.",
+                                },
+                            )
+                        )
+
+        return aborts
 
     def handle_embedding_request(
         self,
@@ -3478,8 +3513,6 @@ class Scheduler(
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
-        self._abort_on_waiting_timeout()
-        self._abort_on_running_timeout(running_batch)
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -3724,7 +3757,11 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, running_batch)
+        self.policy.calc_priority(
+            self.waiting_queue,
+            running_batch,
+            processed_tokens=self.processed_tokens_counter,
+        )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4181,6 +4218,10 @@ class Scheduler(
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -5161,7 +5202,11 @@ class Scheduler(
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
             self.beam_coordinator.retire_group(req)
-            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+            # Without the initiator's reason the tokenizer falls back to a
+            # generic abort message.
+            self.ipc_channels.send_to_tokenizer.send_output(
+                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+            )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -5280,7 +5325,13 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                if recv_req.abort_message:
+                    # Timeout aborts carry an SLA message + 503 for the client.
+                    req.to_finish = FINISH_ABORT(
+                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+                else:
+                    req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

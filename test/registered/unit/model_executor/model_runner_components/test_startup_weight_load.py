@@ -4,7 +4,7 @@ import dataclasses
 import re
 import unittest
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 from torch import nn
@@ -158,6 +158,9 @@ class _TiedWeightModel(nn.Module):
 
 class TestStartupWeightLoadSelector(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.load_config = LoadConfig(load_format=LoadFormat.SAFETENSORS)
         self.loader = DefaultModelLoader(self.load_config)
         self.device_config = DeviceConfig("cuda", 0)
@@ -324,6 +327,12 @@ class TestStartupWeightLoadSelector(CustomTestCase):
 
 
 class TestStartupWeightLoadManager(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _manager(self, loader):
         return StartupWeightLoadManager(
             loader=loader,
@@ -512,6 +521,12 @@ class TestStartupWeightLoadManager(CustomTestCase):
 
 
 class TestModelStorageManifest(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_in_place_updates_preserve_the_manifest(self):
         model = _TiedWeightModel()
         manifest = ModelStorageManifest.capture(model)
@@ -554,6 +569,12 @@ class TestModelStorageManifest(CustomTestCase):
 
 
 class TestCaptureSafeWeightInitialization(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_only_parameters_are_filled(self):
         model = _TiedWeightModel()
 
@@ -576,6 +597,12 @@ class _LifecycleRunner:
 
 
 class TestStartupWeightLoadFanout(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_primary_and_multi_runner_extras_are_started_once(self):
         trace = []
         primary = _LifecycleRunner("primary", trace)
@@ -629,6 +656,12 @@ class _RunnerStartupManager:
 
 
 class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     @staticmethod
     def _runner(manager):
         runner = ModelRunner.__new__(ModelRunner)
@@ -678,7 +711,9 @@ class _SchedulerWorker:
             forward_stream=object(),
             prewarm_sampling=lambda: trace.append("prewarm"),
             token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
-            post_capture_resize_kv_pool=lambda: trace.append("resize"),
+            post_capture_resize_kv_pool=Mock(
+                side_effect=lambda *, draft_runners: trace.append("resize")
+            ),
         )
 
     def start_startup_weight_load(self):
@@ -689,14 +724,21 @@ class _SchedulerWorker:
 
 
 class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
-    @staticmethod
-    def _scheduler(worker, trace, *, mode, draft_worker=None):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def _scheduler(self, worker, trace, *, mode, draft_worker=None):
         from sglang.srt.managers.scheduler import Scheduler
 
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.server_args = SimpleNamespace(
-            is_startup_weight_load_overlap=mode == "overlap"
+        # The schedule reads the mode from the bags, so the test states it by
+        # publishing a record rather than by standing one in.
+        reset_context()
+        publish(
+            ServerArgs(model_path="dummy", startup_weight_load_mode=mode),
+            role="scheduler",
         )
+        scheduler = Scheduler.__new__(Scheduler)
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker
@@ -710,7 +752,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         trace = []
         worker = _SchedulerWorker(trace, post_capture_active=True)
         draft_worker = (
-            SimpleNamespace(prewarm_sampling=lambda: trace.append("draft_prewarm"))
+            SimpleNamespace(
+                prewarm_sampling=lambda: trace.append("draft_prewarm"),
+                _draft_model_runners=lambda: (worker.model_runner,),
+            )
             if use_draft_worker
             else None
         )
@@ -755,6 +800,9 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         ):
             scheduler.init_model_worker()
 
+        worker.model_runner.post_capture_resize_kv_pool.assert_called_once_with(
+            draft_runners=(worker.model_runner,) if use_draft_worker else ()
+        )
         return trace
 
     def test_serial_path_skips_overlap_hooks(self):
