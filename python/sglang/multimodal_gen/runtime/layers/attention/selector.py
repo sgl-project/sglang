@@ -8,6 +8,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import cache
+from pkgutil import resolve_name
 from typing import NamedTuple, cast
 
 import torch
@@ -20,9 +21,10 @@ from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qualname
 
 logger = init_logger(__name__)
+
+STR_BACKEND_ENV_VAR = "SGLANG_DIFFUSION_ATTENTION_BACKEND"
 
 
 def backend_name_to_enum(backend_name: str) -> AttentionBackendEnum | None:
@@ -430,7 +432,7 @@ def _cached_get_attn_backend(
         raise ValueError(
             f"Invalid attention backend for {current_platform.device_name}"
         )
-    return cast(type[AttentionBackend], resolve_obj_by_qualname(attention_cls))
+    return cast(type[AttentionBackend], resolve_name(attention_cls))
 
 
 def _is_backend_supported(

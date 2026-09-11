@@ -144,7 +144,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 _FakePlatform,
             ),
             patch(
-                f"{_SELECTOR}.resolve_obj_by_qualname",
+                f"{_SELECTOR}.resolve_name",
                 side_effect=_FAKE_BACKENDS.__getitem__,
             ),
             component_attn_backend_context_manager(

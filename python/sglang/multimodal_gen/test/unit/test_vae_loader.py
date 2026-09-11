@@ -317,7 +317,7 @@ class TestDirectGPUVAEState(unittest.TestCase):
                 "optimize_vae",
                 side_effect=lambda vae: vae,
             ),
-            patch.object(vae_loader, "safetensors_load_file") as legacy_load,
+            patch("safetensors.torch.load_file") as legacy_load,
         ):
             safetensors_save_file(
                 {"proj.weight": expected_weight, "scale": expected_scale},
