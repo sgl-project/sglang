@@ -465,8 +465,12 @@ jobs:
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     # Temporarily enabled: only run glm_5_2 w8a8 16p GPQA (9.0.0 multi-node mix).
+    # NOTE: needs is temporarily reduced to set-image-config because skipped
+    # (disabled) jobs would otherwise cascade-skip this job.
     # if: ${{ false }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    needs: [set-image-config]
+    # Original needs (restore when re-enabling all jobs):
+    # needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
