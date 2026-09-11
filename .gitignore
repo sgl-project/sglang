@@ -175,6 +175,12 @@ benchmark/llava_bench/mme_pack
 tmp*.txt
 /tmp/
 
+# Written into the checkout by scripts/ci/amd/reclaim_and_seed_hf_cache.sh,
+# which runs with the repo as its working directory so the workflow can upload
+# them as artifacts.
+/hf-cache-listing.txt
+/hf-cache-sizes.txt
+
 # Torch Compile logs
 tl_out/
 
