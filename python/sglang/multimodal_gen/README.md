@@ -84,6 +84,8 @@ loaded component:
 
 - `resident` keeps the complete component on the accelerator.
 - `component-offload` stores the complete component on CPU between uses.
+- `snapshot-offload` keeps a CPU weight snapshot while the complete component
+  runs on the accelerator, avoiding a weight copy back to CPU after each use.
 - `layerwise-offload` streams the component's declared layers from CPU.
 
 `COMPONENT` can be an exact `model_index.json` key or one of `all`, `dit`,

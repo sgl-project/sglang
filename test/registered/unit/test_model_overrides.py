@@ -1124,6 +1124,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertNotIn("attention_backend", overrides)
         self.assertNotIn("speculative_draft_attention_backend", overrides)
 
+    def test_nemotron_h_omni_uses_inner_text_config(self):
+        outer_config = SimpleNamespace(
+            architectures=["NemotronH_Omni_Reasoning_V3"],
+            quantization_config={"quant_algo": "NVFP4"},
+        )
+        model_config = SimpleNamespace(
+            quantization="modelopt",
+            hf_config=outer_config,
+            hf_text_config=SimpleNamespace(mlp_hidden_act="relu2"),
+        )
+        server_args = SimpleNamespace(
+            quantization=None,
+            moe_runner_backend="auto",
+            moe_a2a_backend="none",
+            attention_backend=None,
+            _model_config=model_config,
+        )
+
+        with (
+            override_platform(is_blackwell=False),
+            override_platform(is_sm100=False),
+            override_platform(is_cuda=False),
+        ):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "NemotronH_Omni_Reasoning_V3",
+                    server_args,
+                    outer_config,
+                ),
+                [
+                    (
+                        "_nemotron_h_overrides",
+                        {
+                            "quantization": "modelopt_fp4",
+                            "moe_runner_backend": "flashinfer_cutlass",
+                        },
+                    )
+                ],
+            )
+
     def test_nemotron_h_w4a16_moe_rejects_a2a_backend(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
@@ -1938,12 +1978,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             override_platform(is_hip=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 4)),
         ):
-            # ROCm with both unset -> tilelang
+            # ROCm with both unset -> Triton for FP8 and BF16 KV cache.
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
                 {
-                    "dsa_prefill_backend": "tilelang",
-                    "dsa_decode_backend": "tilelang",
+                    "dsa_prefill_backend": "triton",
+                    "dsa_decode_backend": "triton",
                 },
             )
 
@@ -1977,6 +2017,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         ):
             self.assertEqual(
                 _flashinfer_allreduce_fusion_auto_enable(_view()),
+                {"flashinfer_allreduce_fusion_backend": "auto"},
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(arch="NemotronH_Omni_Reasoning_V3")
+                ),
                 {"flashinfer_allreduce_fusion_backend": "auto"},
             )
             # guards: unsupported arch / tp==1 / dp attention / a2a backend
@@ -2341,13 +2387,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         # NemotronH routes through the pass (covered by the guard union,
         # not the branch chain — its hook invokes the handler)
-        self.assertEqual(
-            _mamba_radix_cache_resolution(_view("NemotronHForCausalLM")),
-            {
-                "uses_mamba_radix_cache": True,
-                "mamba_radix_cache_strategy": "extra_buffer",
-            },
-        )
+        for architecture in (
+            "NemotronHForCausalLM",
+            "NemotronH_Omni_Reasoning_V3",
+        ):
+            with self.subTest(architecture=architecture):
+                self.assertEqual(
+                    _mamba_radix_cache_resolution(_view(architecture)),
+                    {
+                        "uses_mamba_radix_cache": True,
+                        "mamba_radix_cache_strategy": "extra_buffer",
+                    },
+                )
         # GraniteMoeHybrid is guarded on mamba layer types
         self.assertEqual(
             _mamba_radix_cache_resolution(

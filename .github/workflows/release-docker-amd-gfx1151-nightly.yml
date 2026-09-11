@@ -1,0 +1,63 @@
+name: Release Docker Images Nightly gfx1151 (AMD)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Stagger this build from the CDNA ROCm nightlies at 12:00 UTC.
+    - cron: "0 14 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: amd-docker-scale
+    environment: prod
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set date
+        run: echo "DATE=$(date +%Y%m%d)" >> "$GITHUB_ENV"
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and push to rocm/sgl-dev
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          IMAGE_TAG="v${VERSION}-rocm724-gfx1151-${DATE}"
+          docker build . \
+            -f docker/rocm-gfx1151.Dockerfile \
+            --no-cache \
+            --progress=plain \
+            -t "rocm/sgl-dev:${IMAGE_TAG}"
+          docker push "rocm/sgl-dev:${IMAGE_TAG}"
+          echo "Published rocm/sgl-dev:${IMAGE_TAG}" >> "$GITHUB_STEP_SUMMARY"
