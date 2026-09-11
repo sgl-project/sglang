@@ -628,6 +628,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
+                if draft_probs is not None:
+                    # draft_probs is the one graph output read after the target
+                    # forward rather than by it, and it points into the graph's
+                    # private memory pool. The pool recycles that block in the
+                    # meantime -- in practice the DSA top-k mask lands there and
+                    # eagle_sample sees -inf. Copy out at the boundary.
+                    draft_probs = draft_probs.clone()
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
