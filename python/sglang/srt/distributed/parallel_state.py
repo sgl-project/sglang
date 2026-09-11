@@ -645,7 +645,51 @@ class GroupCoordinator:
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
             with maybe_pynccl_context, maybe_pymscclpp_context:
-                yield graph_capture_context
+                # The Gluon TP AR+norm collective publishes each captured call
+                # site's activation buffer over IPC rather than copying into a
+                # staging buffer. That pointer exchange is collective and cannot
+                # run mid-capture, but it does not need to: the kernel reads its
+                # peers out of a table *tensor*, and the captured launch bakes in
+                # that table's address, not its contents. So record sites during
+                # capture and fill the tables here, before any replay.
+                gluon_ar = getattr(self, "_gluon_tp_ar_state", None)
+                if gluon_ar is None:
+                    # Build it now rather than lazily on first use: first use may
+                    # itself be inside this capture, and a state created then
+                    # would not have its capture bookkeeping armed, silently
+                    # falling back to the staging copy for every captured site.
+                    try:
+                        from sglang.srt.distributed.device_communicators import (
+                            gluon_tp_ar_norm_quant as _g,
+                        )
+
+                        dev = torch.device("cuda", torch.cuda.current_device())
+                        if _g.is_available(self.world_size, dev):
+                            gluon_ar = _g.GluonTpArNormQuantState(
+                                group=self.device_group,
+                                device=dev,
+                                max_rows=max(_g.SUPPORTED_M),
+                            )
+                            self._gluon_tp_ar_state = gluon_ar
+                    except Exception as exc:
+                        logger.warning(
+                            "Gluon TP AR+norm pre-capture setup failed, disabling: %s",
+                            exc,
+                        )
+                        self._gluon_tp_ar_state = False
+                        gluon_ar = None
+                if not gluon_ar:  # None, or False when permanently disabled
+                    gluon_ar = None
+                if gluon_ar is not None:
+                    gluon_ar.begin_capture()
+                try:
+                    yield graph_capture_context
+                except BaseException:
+                    if gluon_ar is not None:
+                        gluon_ar.abort_capture()
+                    raise
+                if gluon_ar is not None:
+                    gluon_ar.finish_capture()
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
