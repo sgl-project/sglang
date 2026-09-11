@@ -43,5 +43,5 @@ pub(super) fn error_payload(status: StatusCode, message: impl Into<String>) -> s
     } else {
         "BadRequestError"
     };
-    crate::openai::response::error_payload(status.as_u16(), message, error_type)
+    crate::openai::error_payload(status.as_u16(), message, error_type)
 }

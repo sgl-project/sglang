@@ -44,12 +44,8 @@ pub(crate) async fn prepare_request(
         .is_some_and(|options| options.include_usage)
         || renderer.config().stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
-    let (response_id, request) =
-        lower_chat_request(renderer.config(), request).map_err(ResponseError::from)?;
-    let chat = renderer
-        .prepare_chat(request)
-        .await
-        .map_err(ResponseError::from)?;
+    let (response_id, request) = lower_chat_request(renderer.config(), request)?;
+    let chat = renderer.prepare_chat(request).await?;
     Ok((
         chat,
         ChatResponseContext {

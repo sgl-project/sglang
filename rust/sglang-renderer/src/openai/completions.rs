@@ -111,8 +111,7 @@ pub(crate) async fn prepare_request(
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     let (response_id, requests, metadata) = if text_prompt {
         let (response_id, completion_requests) =
-            lower_text_completion_request(renderer.config(), &request)
-                .map_err(ResponseError::from)?;
+            lower_text_completion_request(renderer.config(), &request)?;
         let metadata = completion_requests
             .iter()
             .enumerate()
@@ -132,13 +131,11 @@ pub(crate) async fn prepare_request(
             .collect();
         let requests = renderer
             .prepare_text_request_groups(completion_requests)
-            .await
-            .map_err(ResponseError::from)?;
+            .await?;
         (response_id, requests, metadata)
     } else {
         let (response_id, token_requests) =
-            lower_token_ids_completion_request(renderer.config(), &request)
-                .map_err(ResponseError::from)?;
+            lower_token_ids_completion_request(renderer.config(), &request)?;
         let mut metadata = Vec::with_capacity(token_requests.len());
         let mut prompt_echo = String::new();
         for (index, request) in token_requests.iter().enumerate() {
@@ -152,9 +149,7 @@ pub(crate) async fn prepare_request(
             }
             metadata.push((index, prompt_index, prompt_echo.clone()));
         }
-        let requests = renderer
-            .prepare_token_ids_requests(token_requests)
-            .map_err(ResponseError::from)?;
+        let requests = renderer.prepare_token_ids_requests(token_requests)?;
         (response_id, requests, metadata)
     };
     Ok(PreparedCompletion {

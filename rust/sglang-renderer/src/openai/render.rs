@@ -17,12 +17,8 @@ pub(crate) async fn render_chat(
             message: "the standalone chat renderer currently requires n=1".into(),
         });
     }
-    let (_, request) =
-        lower_chat_request(renderer.config(), request).map_err(ResponseError::from)?;
-    let mut chat = renderer
-        .prepare_chat(request)
-        .await
-        .map_err(ResponseError::from)?;
+    let (_, request) = lower_chat_request(renderer.config(), request)?;
+    let mut chat = renderer.prepare_chat(request).await?;
     Ok(chat
         .requests
         .pop()
@@ -35,15 +31,13 @@ pub(crate) async fn render_completions(
 ) -> Result<Vec<GenerateRequest>, ResponseError> {
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     if text_prompt {
-        let (_, requests) = lower_text_completion_request(renderer.config(), &request)
-            .map_err(ResponseError::from)?;
+        let (_, requests) = lower_text_completion_request(renderer.config(), &request)?;
         renderer
             .prepare_text_request_groups(requests)
             .await
             .map_err(ResponseError::from)
     } else {
-        let (_, requests) = lower_token_ids_completion_request(renderer.config(), &request)
-            .map_err(ResponseError::from)?;
+        let (_, requests) = lower_token_ids_completion_request(renderer.config(), &request)?;
         renderer
             .prepare_token_ids_requests(requests)
             .map_err(ResponseError::from)

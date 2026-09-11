@@ -28,10 +28,7 @@ pub(crate) async fn tokenize(
             let add_special_tokens = request.add_special_tokens;
             match prompt {
                 OneOrMany::One(text) => {
-                    let tokens = renderer
-                        .tokenize_prompt(text, add_special_tokens)
-                        .await
-                        .map_err(ResponseError::from)?;
+                    let tokens = renderer.tokenize_prompt(text, add_special_tokens).await?;
                     (json!(tokens), json!(tokens.len()))
                 }
                 OneOrMany::Many(texts) => {
@@ -40,21 +37,15 @@ pub(crate) async fn tokenize(
                             .into_iter()
                             .map(|text| renderer.tokenize_prompt(text, add_special_tokens)),
                     )
-                    .await
-                    .map_err(ResponseError::from)?;
+                    .await?;
                     let count = tokens.iter().map(Vec::len).collect::<Vec<_>>();
                     (json!(tokens), json!(count))
                 }
             }
         }
         None => {
-            let request = request
-                .into_chat(&renderer.config().served_model_name)
-                .map_err(ResponseError::from)?;
-            let tokens = renderer
-                .tokenize_chat(request)
-                .await
-                .map_err(ResponseError::from)?;
+            let request = request.into_chat(&renderer.config().served_model_name)?;
+            let tokens = renderer.tokenize_chat(request).await?;
             (json!(tokens), json!(tokens.len()))
         }
     };

@@ -56,8 +56,9 @@ fn fold_output(collected: &mut GenerationOutput, output: GenerationOutput) {
 mod tests {
     use futures::{StreamExt, stream};
 
+    use super::super::test_utils::position;
     use super::{fold_output, merge_indexed};
-    use crate::{GenerationOutput, GenerationOutputExtras, PositionLogprobs, TokenLogprob};
+    use crate::{GenerationOutput, GenerationOutputExtras};
 
     #[test]
     fn unary_output_appends_generated_logprobs_and_replaces_prompt_logprobs() {
@@ -67,8 +68,8 @@ mod tests {
                 &mut collected,
                 GenerationOutput {
                     extras: Some(Box::new(GenerationOutputExtras {
-                        output_logprobs: vec![position(output_token, -0.1)],
-                        input_logprobs: vec![position(input_token, -0.2)],
+                        output_logprobs: vec![position(output_token, -0.1, &[])],
+                        input_logprobs: vec![position(input_token, -0.2, &[])],
                     })),
                     ..Default::default()
                 },
@@ -78,17 +79,6 @@ mod tests {
         assert_eq!(extras.output_logprobs[0].token.token_id, 1);
         assert_eq!(extras.output_logprobs[1].token.token_id, 2);
         assert_eq!(extras.input_logprobs[0].token.token_id, 20);
-    }
-
-    fn position(token_id: i32, logprob: f32) -> PositionLogprobs {
-        PositionLogprobs {
-            token: TokenLogprob {
-                logprob: Some(logprob),
-                token_id,
-                text: None,
-            },
-            top: Vec::new(),
-        }
     }
 
     #[tokio::test]
