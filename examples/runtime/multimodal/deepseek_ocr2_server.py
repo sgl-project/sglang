@@ -1,23 +1,14 @@
 """
 Serve DeepSeek-OCR-2 (and DeepSeek-OCR) with SGLang, and run pages through it.
 
-# Start the server. Pick one of the two context settings:
-
-# (A) Official setting: total input+output stays within the model's 8192-token
-#     window, which is what the official vLLM recipe does and what makes the
-#     numbers comparable to it. No env var is needed: the scheduler clamps each
-#     page's output budget down to `8192 - expanded_input` (see below).
+# Start the server on the model's official 8192-token window: total input+output
+# stays within it, which is what the official vLLM recipe does and what makes the
+# numbers comparable to it. `--allow-auto-truncate` lets the scheduler clamp each
+# page's output budget down to the remaining context (see below), so the full
+# 8192 ceiling can still be requested.
 python -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-OCR-2 --enable-multimodal \
     --context-length 8192 --allow-auto-truncate --enable-custom-logit-processor
-
-# (B) Full output budget on long pages. Any --context-length above the derived
-#     8192 needs this env var (9000 needs it exactly as much as 16384 does), and
-#     pages whose input+output actually exceed 8192 then run past the trained
-#     window, so their scores are not comparable to the official ones.
-SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server \
-    --model-path deepseek-ai/DeepSeek-OCR-2 --enable-multimodal \
-    --context-length 16384 --enable-custom-logit-processor
 
 # Ascend NPU (add the Ascend flags):
 #   --device npu --mm-attention-backend ascend_attn --attention-backend ascend \
@@ -34,13 +25,13 @@ or batch a whole image directory into per-page markdown files (each named
         --image-dir /path/to/pages --output /path/to/pred_md
 
 Why --max-new-tokens defaults to 8192: a 768px page expands to ~1100 image tokens
-(up to 6 local crops of 144 plus the 256-token global view). Under setting (A)
-(`--context-length 8192`) run the server with `--allow-auto-truncate`: sglang then
-clamps each request's output budget to the remaining context
-(`context_len - expanded_input`), which is the official "total <= 8192" semantics
-and lets the full 8192 ceiling be requested. Without `--allow-auto-truncate` a
-request whose `max_new_tokens + expanded_input` exceeds the context length is
-rejected (400); lower the ceiling to fit if you need to run without the flag.
+(up to 6 local crops of 144 plus the 256-token global view). The request-side
+check counts the prompt *before* the image expands, so asking for 8192 alongside
+any prompt exceeds the 8192 context and the request is rejected outright;
+`--allow-auto-truncate` lowers that request's ceiling instead of rejecting it, and
+the scheduler then clamps the output budget to the remaining context
+(`context_len - expanded_input`). That is the official "total <= 8192" semantics
+and lets the full 8192 ceiling be requested.
 
 The DeepSeek-OCR-2 processor geometry (768px local crops) is applied
 automatically by the server for OCR-2; DeepSeek-OCR stays at 640px.
