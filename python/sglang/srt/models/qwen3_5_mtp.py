@@ -91,6 +91,12 @@ def _mtp_quant_config(quant_config):
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    # The loader reads this off the model class and hands it to the quant
+    # config, which needs it to expand fused module names (qkv_proj ->
+    # q/k/v_proj) before matching them against an exclude list. Without it an
+    # excluded attention projection is not recognised as excluded.
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
