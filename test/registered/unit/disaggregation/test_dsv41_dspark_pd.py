@@ -279,6 +279,59 @@ class TestDSV41DSparkPD(CustomTestCase):
         self.assertEqual(sorted(owned), pages.tolist())
         self.assertEqual(len(owned), len(set(owned)))
 
+    def test_prefill_cp_uses_torch_indexer_before_sm100(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        backend._use_dense_fp4_prefill_indexer = Mock(return_value=True)
+        backend._low_ratio_index_topk_dense = Mock()
+        backend._low_ratio_index_topk_torch = Mock()
+        layer = SimpleNamespace(compressor=None, indexer=object())
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=8),
+            extend_seq_lens_cpu=[8],
+            extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+            req_pool_indices=torch.tensor([7], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
+            positions=torch.arange(8),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        x = torch.zeros(4, 8)
+        q_lora = torch.zeros(4, 4)
+        positions = torch.arange(4)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+                return_value=SimpleNamespace(attn_cp_rank=0, attn_cp_size=2),
+            ),
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm100_or_newer",
+                return_value=False,
+            ),
+        ):
+            backend._forward_low_ratio_sources_cp(
+                layer=layer,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                run_compressor=False,
+                run_indexer=True,
+            )
+
+        backend._low_ratio_index_topk_dense.assert_not_called()
+        args = backend._low_ratio_index_topk_torch.call_args.args
+        self.assertIs(args[0], layer)
+        torch.testing.assert_close(args[1], x)
+        torch.testing.assert_close(args[2], q_lora)
+        torch.testing.assert_close(args[3], torch.full((4,), 7, dtype=torch.int64))
+        torch.testing.assert_close(args[4], positions.to(torch.int64))
+
     def test_c2_handoff_keeps_request_ring_indexing(self):
         pool = SimpleNamespace(kv_pools={2: object()})
         self.assertEqual(
