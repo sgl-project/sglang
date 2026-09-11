@@ -271,6 +271,7 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
+    return_lse=False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
         f"dim={dim} must be a power of 2 or a multiple of 64"
@@ -318,13 +319,8 @@ def sparse_attention_fwd_kernel_v1(
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
-    @T.prim_func
-    def main(
-        Q: T.Tensor(q_shape, dtype),  # type: ignore
-        KV: T.Tensor(kv_shape, dtype),  # type: ignore
-        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        Output: T.Tensor(o_shape, dtype),  # type: ignore
-    ):
+    @T.macro
+    def body(Q, KV, Indices, Output, LSE):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
             bx,
             by,
@@ -419,12 +415,44 @@ def sparse_attention_fwd_kernel_v1(
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                if return_lse:
+                    # A DCP rank can own none of this query's selected tokens.
+                    # Its partial must be zero, with -inf LSE, for the merge.
+                    acc_o[h_i, d_i] /= T.if_then_else(sumexp[h_i] > 0, sumexp[h_i], 1)
+                else:
+                    acc_o[h_i, d_i] /= sumexp[h_i]
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+            if return_lse:
+                T.copy(sumexp, LSE[b_i, s_i, H0:H1])
 
             T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+
+    if return_lse:
+
+        @T.prim_func
+        def main(
+            Q: T.Tensor(q_shape, dtype),
+            KV: T.Tensor(kv_shape, dtype),
+            Indices: T.Tensor(indices_shape, indices_dtype),
+            LSE: T.Tensor([batch, seq_len, num_heads], accum_dtype),
+            Output: T.Tensor(o_shape, dtype),
+        ):
+            body(Q, KV, Indices, Output, LSE)
+
+    else:
+
+        @T.prim_func
+        def main(
+            Q: T.Tensor(q_shape, dtype),
+            KV: T.Tensor(kv_shape, dtype),
+            Indices: T.Tensor(indices_shape, indices_dtype),
+            Output: T.Tensor(o_shape, dtype),
+        ):
+            # The LSE branch is eliminated at trace time; no extra allocation
+            # or kernel argument is needed on the ordinary sparse path.
+            body(Q, KV, Indices, Output, Output)
 
     return main
 
@@ -1328,13 +1356,25 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
+
+    if return_lse:
+        assert not _is_hip and tail_dim == 0, "Sparse DCP LSE requires CUDA NoPE MLA"
+        kernel = sparse_attention_fwd_kernel_v1(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, return_lse=True
+        )
+        lse = torch.empty(
+            (1, q.shape[0], num_heads), dtype=torch.float32, device=q.device
+        )
+        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), lse)
+        return out, lse
 
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)

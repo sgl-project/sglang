@@ -312,6 +312,7 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
+    _dcp_sharded_kv: bool = False
 
     def __init__(
         self,
@@ -351,11 +352,16 @@ class DeepseekSparseAttnBackend(
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self._dcp_sharded_kv = (
+            get_parallel().dcp_enabled and not model_runner.is_draft_worker
+        )
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.supports_mha_one_shot: bool = True
+        # The dense MHA model path gathers DCP-sharded prefix KV. DSA draft
+        # KV is replicated, so use sparse MLA for both target and draft.
+        self.supports_mha_one_shot: bool = not get_parallel().dcp_enabled
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
@@ -431,6 +437,25 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
+        if self._dcp_sharded_kv:
+            if (
+                not is_cuda()
+                or self.dsa_prefill_impl != "tilelang"
+                or self.dsa_decode_impl != "tilelang"
+                or model_runner.kv_cache_dtype != torch.bfloat16
+                or self.qk_rope_head_dim != 0
+                or not self.use_fused_topk
+                or self.dsa_topk_backend.is_torch()
+                or self.hisparse_coordinator is not None
+                or is_dsa_enable_prefill_cp()
+            ):
+                raise ValueError(
+                    "DSA decode context parallelism currently requires CUDA NoPE MLA, "
+                    "BF16 KV, tilelang prefill/decode, and fused top-k; "
+                    "HiSparse and prefill CP cannot be combined with it."
+                )
+            # Gathered sparse prefill uses the host lengths to assemble prefixes.
+            self.needs_cpu_seq_lens = True
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -1050,8 +1075,10 @@ class DeepseekSparseAttnBackend(
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
+                # The indexer consumes virtual locations into replicated index-K.
                 kv_cache_capacity = (
-                    self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
+                    self.token_to_kv_pool.index_buf_size
+                    + self.token_to_kv_pool.page_size
                 )
                 if forward_batch.seq_lens_sum > kv_cache_capacity:
                     max_idx = page_table_1_flattened.max().item()
@@ -2072,7 +2099,15 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        if (
+            self._dcp_sharded_kv
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            assert topk_indices is not None and k is not None
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            kv_cache = self._dcp_gather_extend_kv(layer, forward_batch, k)
+            page_table_1 = topk_indices
+        elif self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2107,6 +2142,9 @@ class DeepseekSparseAttnBackend(
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
+        if self._dcp_sharded_kv and forward_batch.forward_mode.is_target_verify():
+            page_table_1 = self._dcp_localize_page_table(page_table_1)
+
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
             # flash_mla_sparse_fwd / tilelang require int32 page indices.
@@ -2127,6 +2165,10 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=(
+                    self._dcp_sharded_kv
+                    and forward_batch.forward_mode.is_target_verify()
+                ),
             )
         elif dsa_impl == "triton":
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
@@ -2387,6 +2429,9 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        if self._dcp_sharded_kv:
+            page_table_1 = self._dcp_localize_page_table(page_table_1)
+
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2436,6 +2481,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=self._dcp_sharded_kv,
             )
         elif dsa_impl == "triton":
             return self._forward_triton_decode(
@@ -3073,6 +3119,39 @@ class DeepseekSparseAttnBackend(
             causal=causal,
         )
 
+    def _dcp_localize_page_table(self, page_table: torch.Tensor) -> torch.Tensor:
+        """Partition sparse selections by owner and address each rank's KV rows."""
+        parallel = get_parallel()
+        owned = (page_table >= 0) & (
+            page_table % parallel.attn_dcp_size == parallel.attn_dcp_rank
+        )
+        return torch.where(owned, page_table // parallel.attn_dcp_size, -1)
+
+    def _dcp_gather_extend_kv(
+        self, layer: RadixAttention, forward_batch: ForwardBatch, k: torch.Tensor
+    ) -> torch.Tensor:
+        from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_mha_extend
+
+        metadata = forward_batch.attn_dcp_metadata
+        assert metadata is not None, "DCP sparse extend requires prefix metadata"
+        kv_a = k.view(k.shape[0], -1)
+        # NoPE get_mla_kv_buffer returns None for the positional component.
+        k_pe = kv_a.new_empty((kv_a.shape[0], 1, 0))
+        kv_full, _ = all_gather_kv_cache_for_mha_extend(
+            self.token_to_kv_pool,
+            layer,
+            metadata.dcp_local_prefix_kv_indices,
+            forward_batch.seq_lens,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_seq_lens,
+            kv_a,
+            k_pe,
+        )
+        # Fused RAGGED top-k uses cu_seqlens_k offsets into precisely this
+        # per-request [prefix; extend] layout. Extend has no LSE reduction.
+        return kv_full.view(kv_full.shape[0], 1, -1)
+
     def _forward_tilelang(
         self,
         q_all: torch.Tensor,
@@ -3080,7 +3159,8 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
@@ -3096,13 +3176,18 @@ class DeepseekSparseAttnBackend(
                 dim=-1,
             )
 
-        return tilelang_sparse_fwd(
+        result = tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            return_lse=return_lse,
         )
+        if return_lse:
+            out, lse = result
+            return out, lse.squeeze(0)
+        return result
 
     def _forward_triton_decode(
         self,
@@ -3669,6 +3754,12 @@ class DeepseekSparseAttnBackend(
         SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
+        if (
+            self._dcp_sharded_kv
+            and forward_mode is not None
+            and forward_mode.is_extend_without_speculative()
+        ):
+            return TopkTransformMethod.RAGGED
         if (
             # disable for MTP
             self.dsa_kv_cache_store_fp8

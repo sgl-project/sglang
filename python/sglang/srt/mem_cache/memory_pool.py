@@ -3796,6 +3796,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        index_buf_size: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -3881,6 +3882,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                index_buf_size=index_buf_size,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -3937,6 +3939,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def index_head_dim(self) -> Optional[int]:
         return getattr(self.full_kv_pool, "index_head_dim", None)
+
+    @property
+    def index_buf_size(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "index_buf_size", None)
 
     @property
     def quant_block_size(self) -> Optional[int]:
@@ -4433,11 +4439,17 @@ class MLATokenToKVPool(KVCache):
     # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
     # full-attention layer is translated with blocks_per_page 1.
     write_loc_is_dcp_resolved = False
+    # Draft pools back the entire allocator address space on every rank.
+    dcp_replicated = False
 
     @property
     def _write_loc_dcp_span(self) -> int:
         """How many logical ids one stored row spans in the write-loc space."""
-        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+        return (
+            1
+            if self.write_loc_is_dcp_resolved or self.dcp_replicated
+            else get_parallel().attn_dcp_size
+        )
 
     def _scatter_mla_rows(
         self,
@@ -4446,7 +4458,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if self.write_loc_is_dcp_resolved:
+        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
