@@ -778,6 +778,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             "FlashInfer TRTLLM backend, and bypassed TopK"
         )
 
+    # FlashInfer supports do_finalize=False for the FP8 block-scale kernel
+    # too; deferring finalize folds the finalize kernel into the shared-
+    # expert add (moe_finalize_fuse_shared) and skips the symmetric-output
+    # workaround copy (flashinfer#2703).
+    defer_finalize = (
+        _deferred_finalize_enabled.get()
+        and not use_routed_topk
+        and quant_info.block_quant
+        and not quant_info.use_mxfp8
+        and TopKOutputChecker.format_is_bypassed(topk_output)
+    )
+
     if quant_info.block_quant:
         assert quant_info.weight_block_k is not None
         assert quant_info.w13_weight_scale_inv is not None
@@ -806,9 +818,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert a_sf_t.dtype == torch.uint8
             assert a_sf_t.shape[1] == hidden_states.shape[1] // 32
         else:
-            a_q, a_sf = per_token_group_quant_fp8(
-                hidden_states, quant_info.weight_block_k, column_major_scales=True
-            )
+            prequant = getattr(hidden_states, "_sglang_prequant_fp8", None)
+            if prequant is not None and quant_info.weight_block_k == 128:
+                a_q, a_sf = prequant
+            else:
+                a_q, a_sf = per_token_group_quant_fp8(
+                    hidden_states, quant_info.weight_block_k, column_major_scales=True
+                )
             a_sf_t = a_sf.t()
 
         symm_output = None
