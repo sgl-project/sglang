@@ -857,8 +857,23 @@ class HiCacheNixl(HiCacheStorage):
         host_indices: torch.Tensor,
         buffer_sizes: List[int],
         elapsed_ms: float,
+        results: List[bool],
     ) -> None:
         total_bytes = sum(s for s in buffer_sizes if s is not None)
+        # Bytes moved are unknown unless every entry succeeded.
+        num_ok = sum(1 for ok in results if ok)
+        if num_ok < len(results):
+            outcome = (
+                "failed"
+                if num_ok == 0
+                else f"partially transferred {num_ok}/{len(results)}"
+            )
+            logger.debug(
+                f"HiCacheNixl {op_name} {outcome}: {num_keys} keys (pages), "
+                f"{host_indices.numel()} host_indices, {total_bytes} bytes "
+                f"requested, total time: {elapsed_ms:.3f} ms"
+            )
+            return
         bw = total_bytes / (elapsed_ms / 1000) / (1024 * 1024) if elapsed_ms else 0.0
         logger.debug(
             f"HiCacheNixl {op_name} transferred: {num_keys} keys (pages), "
@@ -891,6 +906,7 @@ class HiCacheNixl(HiCacheStorage):
             host_indices,
             [s for _, s in host_buffers],
             elapsed_ms,
+            results,
         )
 
         return self._batch_get_postprocess(host_indices, results)
@@ -927,6 +943,7 @@ class HiCacheNixl(HiCacheStorage):
             host_indices,
             [s for _, s in host_buffers],
             elapsed_ms,
+            results,
         )
 
         return results
@@ -1019,6 +1036,7 @@ class HiCacheNixl(HiCacheStorage):
                 transfer.host_indices,
                 [size for _, size in host_buffers],
                 elapsed_ms,
+                transfer_results,
             )
             ctx = self._hybrid_pool_ctx[transfer.name]
             page_results = self._page_results(transfer_results, key_multiplier)
@@ -1057,6 +1075,7 @@ class HiCacheNixl(HiCacheStorage):
                 transfer.host_indices,
                 [size for _, size in host_buffers],
                 elapsed_ms,
+                transfer_results,
             )
             results[transfer.name] = self._page_results(
                 transfer_results, key_multiplier
