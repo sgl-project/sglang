@@ -77,6 +77,7 @@ class _TokenToKVPool:
         )
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
         self.swa_window_size = page_size
+        self.swa_page_size = page_size
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
         _ = layer_id
