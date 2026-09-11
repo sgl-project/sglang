@@ -20,9 +20,14 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_
     window_mask_reference,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
+# torch.cuda.is_available() is also True under ROCm, but the backend lives on the
+# CUDA platform only (RocmPlatform rejects hybrid_window_attn_h3 outright and has
+# no _prepare_flash_attention_for_blackwell), so gate on the platform itself.
 requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="hybrid_window_attn_h3 kernels need CUDA"
+    not current_platform.is_cuda(),
+    reason="hybrid_window_attn_h3 kernels need NVIDIA CUDA",
 )
 
 # ragged on purpose: 70 and 100 are not tile multiples, 12 frames is not a chunk multiple

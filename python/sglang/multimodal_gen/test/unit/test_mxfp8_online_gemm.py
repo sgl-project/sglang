@@ -100,12 +100,14 @@ def test_fp16_layer_falls_back_to_channelwise() -> None:
 
 def test_unaligned_layer_falls_back_to_channelwise() -> None:
     """The block-scaled GEMM needs K % 32 == 0; such a layer keeps the
-    per-channel fp8 path and still answers a forward."""
+    per-channel fp8 path and still answers a forward. K is 16 rather than a
+    smaller odd size because the fallback's scaled GEMM still wants K % 16 == 0
+    (ROCm rejects anything else outright)."""
     _init_parallel()
-    layer = _layer(8, 128, bias=True)
+    layer = _layer(16, 128, bias=True)
     layer.quant_method.process_weights_after_loading(layer)
     assert not layer.mxfp8 and not layer.quant_method.accepts_mxfp8_input(layer)
-    out, _ = layer(torch.randn(4, 8, device="cuda", dtype=torch.bfloat16))
+    out, _ = layer(torch.randn(4, 16, device="cuda", dtype=torch.bfloat16))
     assert out.shape == (4, 128)
 
 

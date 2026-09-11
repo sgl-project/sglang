@@ -39,10 +39,18 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
     run_scans,
     vdn_h3_layout_from_packed,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 VDN_MODEL_ID = "OpenVDN/vdn-minimax-h3"
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+# admission resolves hybrid_window_attn_h3, which only the CUDA platform registers
+requires_cuda_backend = pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="hybrid_window_attn_h3 admission needs NVIDIA CUDA",
+)
 
 
 # --------------------------------------------------------------------------
@@ -110,6 +118,7 @@ def _server_args(**overrides) -> SimpleNamespace:
     return ns
 
 
+@requires_cuda_backend
 def test_vdn_h3_pipeline_config_rejections() -> None:
     config = VDNH3PipelineConfig()
     with pytest.raises(ValueError, match="--model-variant does not apply"):
@@ -131,6 +140,7 @@ def test_vdn_h3_pipeline_config_rejections() -> None:
     assert args.attention_backend == "hybrid_window_attn_h3"
 
 
+@requires_cuda_backend
 def test_vdn_h3_quantization_defaults_to_mxfp8_on_blackwell(monkeypatch) -> None:
     """Online MXFP8 is the default on SM100+ (SM120 included) and what `fp8`
     maps to there; `bf16` opts out; before SM100 the block-scaled GEMM does
