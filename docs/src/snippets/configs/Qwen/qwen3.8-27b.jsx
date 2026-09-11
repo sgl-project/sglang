@@ -120,7 +120,10 @@ export const config = {
           disableReason:
             "On the 32GB RTX 5090 the DSpark draft model only fits on top of the NVFP4 weights",
           stripPrefixes: (sel) =>
-            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
+            sel.hw === "rtx5090"
+              ? ["--mem-fraction-static", "--mamba-full-memory-ratio",
+                 "--chunked-prefill-size", "--max-total-tokens"]
+              : [],
           flags: (sel) => [
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
@@ -136,26 +139,42 @@ export const config = {
             // 0.89 on the balanced ratio (pool 25,911 / K=6 low-latency,
             // 29,490 / K=5 high-throughput). fp32 on the BF16-head export is
             // greyed out by the SSM dtype row.
+            // On the 32GB 5090 this row owns the pools outright. Two things
+            // fail if it does not: the KV pool sizes itself for concurrency
+            // --max-running-requests 1 forbids (127,332 tokens against the
+            // 9,216 one 8192-in/1024-out request needs), and the engine's
+            // default split leaves the GDN state pool a fraction of what it
+            // needs once the draft model's 3.64GB is counted against
+            // --mem-fraction-static, so boot dies with
+            // `max_mamba_cache_size=0 ... max_num_reqs=0`.
+            //
+            // Ratios are the calculator's balanced values,
+            // r = S * token_equiv / L, with S = 5 (extra_buffer) or 4
+            // (extra_buffer_lazy), token_equiv = 2398 (bf16 state slot vs fp8
+            // KV token) or 4923 (fp32), and L = 8192 + 1024. The mem-fraction
+            // and prefill-chunk values below are measured on v0.5.19; the two
+            // FP4-head exports share one set of pins, the dense-lm_head export
+            // needs its own because its head costs ~3.2GB more at runtime.
             ...(sel.hw === "rtx5090"
-              ? [sel.ssmDtype === "float32"
-                  ? "--mem-fraction-static 0.89"
-                  : "--mem-fraction-static 0.88"]
-              : []),
-            // The NVIDIA export on the 5090 needs the pool split pinned as well
-            // as the cell's KV cap. Left to the engine's default split the GDN
-            // state pool gets ~1/7 of what it needs once the 3.64GB draft model
-            // is counted against --mem-fraction-static (draft weights are
-            // counted as of #38375), and boot fails with
-            // `max_mamba_cache_size=0 ... max_num_reqs=0`. These are the
-            // calculator's balanced ratios: r = S * token_equiv / L, with S = 5
-            // (extra_buffer) or 4 (extra_buffer_lazy), token_equiv = 2398 for a
-            // bf16 state slot against an fp8 KV token, and L = 8192 + 1024.
-            ...(sel.hw === "rtx5090" &&
-                sel.quant === "nvfp4-nvidia" &&
-                sel.ssmDtype === "bfloat16"
-              ? [sel.tier === "low-latency"
-                  ? "--mamba-full-memory-ratio 3.38"
-                  : "--mamba-full-memory-ratio 3.12"]
+              ? [
+                  "--max-total-tokens 16384",
+                  ...(sel.quant === "nvfp4-bf16-head"
+                    ? ["--mem-fraction-static 0.92",
+                       "--chunked-prefill-size 512",
+                       sel.tier === "low-latency"
+                         ? "--mamba-full-memory-ratio 3.38"
+                         : "--mamba-full-memory-ratio 2.71"]
+                    : sel.ssmDtype === "float32"
+                      ? ["--mem-fraction-static 0.91",
+                         "--chunked-prefill-size 1024",
+                         sel.tier === "low-latency"
+                           ? "--mamba-full-memory-ratio 6.94"
+                           : "--mamba-full-memory-ratio 5.56"]
+                      : ["--mem-fraction-static 0.88",
+                         sel.tier === "low-latency"
+                           ? "--mamba-full-memory-ratio 3.38"
+                           : "--mamba-full-memory-ratio 3.12"]),
+                ]
               : []),
           ],
         },
@@ -200,6 +219,15 @@ export const config = {
                    "--mamba-full-memory-ratio 10"]
                 : ["--mem-fraction-static 0.91",
                    "--chunked-prefill-size 1024"]
+              : []),
+            // The dense-lm_head export carries ~3.2GB more weight at runtime,
+            // which is the difference between serving at the pins above and
+            // needing the pools pinned outright. Measured on v0.5.19.
+            ...(sel.hw === "rtx5090" && sel.quant === "nvfp4-bf16-head"
+              ? ["--max-total-tokens 16384",
+                 sel.tier === "low-latency"
+                   ? "--mamba-full-memory-ratio 3.38"
+                   : "--mamba-full-memory-ratio 3.12"]
               : []),
           ],
         },
@@ -339,16 +367,13 @@ export const config = {
   ],
 
   dockerImages: {
-    h200:    "lmsysorg/sglang:qwen38-27b",
-    // Both SM120 cards are validated on this image (built from 1cf2b8c, the
-    // commit every pin on those cards was measured against).
-    rtx6000: "lmsysorg/sglang:dev-qwen38-27b-dflash2",
-    rtx5090: "lmsysorg/sglang:dev-qwen38-27b-dflash2",
-    // Multi-arch: this tag ships both linux/amd64 and linux/arm64, so it pulls
-    // natively on DGX Spark (GB10 is aarch64).
-    // Multi-arch (linux/amd64 + linux/arm64), so GB10 pulls it natively.
-    "dgx-spark": "lmsysorg/sglang:dev-qwen38-27b-dflash2",
-    gb300:   "lmsysorg/sglang:dev",
+    // Every recipe on this page is measured on this release. It is multi-arch
+    // (linux/amd64 + linux/arm64), so it pulls natively on DGX Spark's GB10.
+    h200:    "lmsysorg/sglang:v0.5.19-cu130",
+    rtx6000: "lmsysorg/sglang:v0.5.19-cu130",
+    rtx5090: "lmsysorg/sglang:v0.5.19-cu130",
+    "dgx-spark": "lmsysorg/sglang:v0.5.19-cu130",
+    gb300:   "lmsysorg/sglang:v0.5.19-cu130",
   },
 
   github: {
@@ -581,9 +606,9 @@ export const config = {
     {
       // NVIDIA's ModelOpt export of the same W4A4 body and FP4 lm_head as the
       // RadixArk FP4-head checkpoint above, so it reuses that recipe verbatim.
-      // Re-measured against this export on db272201a2: all 16 overlay
+      // Re-measured against this export on v0.5.19: all 16 overlay
       // combinations (spec x tier x state dtype) serve at these pins and score
-      // 94.09-94.77% on the full 1319-question GSM8K.
+      // 94.01-95.00% on the full 1319-question GSM8K.
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
       verified: true,
       env: [],
@@ -710,12 +735,11 @@ export const config = {
       // mem-fraction pin the overlay rows apply carry over unchanged. Those
       // pins were measured on the RadixArk export, not this one, hence the badge.
       match: { hw: "rtx5090", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
-      verified: false,
-      // bfloat16 GDN state is measured end to end on this card against this
-      // export (full 1319-question GSM8K); the float32 rows are not published
-      // yet and keep the badge.
-      verificationStatus: (sel) =>
-        sel.ssmDtype === "bfloat16" ? "verified" : "in-progress",
+      // Measured on v0.5.19 against this export: all 15 offered overlay
+      // combinations serve and score 93.93-94.92% on the full 1319-question
+      // GSM8K. Every winning launch command is identical to the FP4-head
+      // export's, which is what "reuses that recipe verbatim" above is claiming.
+      verified: true,
       // Rendered with the cell so nobody ships the bs=1 pins into a
       // multi-user deployment unaware.
       warn:
@@ -734,14 +758,6 @@ export const config = {
         "--attention-backend flashinfer",
         "--max-running-requests 1",
         "--cuda-graph-max-bs-decode 1",
-        // The pools size themselves for concurrency this recipe forbids: left
-        // uncapped the KV pool takes 127,332 tokens where one 8192-in/1024-out
-        // request needs 9,216, and prefill CUDA-graph capture then dies with
-        // `num_active_captures_ > 0 INTERNAL ASSERT FAILED` (a
-        // cudaErrorMemoryAllocation inside an open capture). Capping KV to the
-        // single-stream envelope returns ~3.6GB and the cell boots at the same
-        // mem-fraction. Raise this with --max-running-requests, not instead of it.
-        "--max-total-tokens 16384",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -820,8 +836,8 @@ export const config = {
       // checkpoint, on that cell's recipe. It was not part of the 1cf2b8c GB10
       // sweep, so it does not inherit that platform's boot-and-serve coverage.
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
-      // Re-measured against this export on db272201a2: all 16 overlay
-      // combinations serve at these pins and score 94.16-94.84% on the full
+      // Re-measured against this export on v0.5.19: all 16 overlay
+      // combinations serve at these pins and score 94.16-95.07% on the full
       // 1319-question GSM8K (float32 and bfloat16 halves run on two separate
       // GB10 boxes).
       verified: true,
