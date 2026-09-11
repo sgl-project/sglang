@@ -319,6 +319,17 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
         )
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        if self.accept_lens_pool is None or self.forward_metadata is None:
+            return
+        # KDA shares these lists across layers of one forward. Graph warmup and
+        # capture reuse the same metadata, so drop the warmup lists here to
+        # record their construction in the graph. Otherwise replay keeps using
+        # the warmup slot indices and accepted lengths.
+        self.forward_metadata.fused_accept_state_indices = None
+        self.forward_metadata.fused_accept_num_accepted = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
 
