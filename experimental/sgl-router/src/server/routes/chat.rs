@@ -1306,17 +1306,14 @@ fn build_outgoing_body(
 ///     engine rewrites/strips the final assistant turn; the encoder renders it
 ///     verbatim.
 ///
-/// NOTE: the router's chat encoder renders in the engine's default
-/// (non-thinking) mode. Current sglang derives thinking from the request
-/// (`chat_template_kwargs`), which this guard already omits, so a plain request
-/// the router rendered matches the engine. The only way to diverge is an engine
-/// build that applies a non-default thinking mode the router can't observe from
-/// the request — the same router↔engine tokenization-parity assumption that
-/// cache-aware routing already depends on. The same assumption covers
-/// `add_special_tokens`: the router renders specials via the chat template, which
-/// matches the engine on tokenizers that auto-add them (the common case); a
-/// tokenizer that does not would diverge by a leading special, again undetectable
-/// from the request.
+/// NOTE: the encoder threads `chat_template_kwargs` for routing hashes, but
+/// the guard still omits them: Python's DeepSeek-V4 `reasoning_effort`
+/// handling differs from Dynamo's, so a plain request is the only one whose
+/// render is known to match the engine. The same router-engine
+/// tokenization-parity assumption covers `add_special_tokens`: the router
+/// renders specials via the chat template, which matches tokenizers that
+/// auto-add them (the common case); one that does not would diverge by a
+/// leading special, undetectable from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value) || request_is_multimodal(value) {
         return false;
