@@ -2,6 +2,7 @@ import functools
 import json
 import unittest
 import warnings
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -2280,6 +2281,172 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "submit")
         self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
+
+    # ------------------------------------------------------------------
+    # Bug 1: Exception handler must NOT clear buffer — retain for retry
+    # ------------------------------------------------------------------
+
+    def test_streaming_error_does_not_clear_buffer(self):
+        """A parser failure must retain the buffer so the next chunk can retry.
+        The buffer is NOT cleared — only transient tool state is reset."""
+        text = '<｜DSML｜tool_calls><｜DSML｜invoke name="search">'
+        with patch.object(
+            self.detector,
+            "_parse_parameters_from_xml",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertLogs(
+                "sglang.srt.function_call.deepseekv32_detector", level="ERROR"
+            ):
+                result = self.detector.parse_streaming_increment(text, self.tools)
+
+        # Buffer should NOT be empty — text retained for retry
+        self.assertNotEqual(self.detector._buffer, "")
+        # Transient tool state should be reset
+        self.assertEqual(self.detector.current_tool_id, -1)
+
+    def test_exception_does_not_lose_tool_call_text(self):
+        """On exception, the buffered tool call text must still be processable
+        by a subsequent chunk that completes the invoke."""
+        detector = DeepSeekV4Detector()
+        chunk1 = '<｜DSML｜tool_calls><｜DSML｜invoke name="search">'
+        with patch.object(
+            detector,
+            "_parse_parameters_from_xml",
+            side_effect=RuntimeError("transient"),
+        ):
+            with self.assertLogs(
+                "sglang.srt.function_call.deepseekv32_detector", level="ERROR"
+            ):
+                detector.parse_streaming_increment(chunk1, self.tools)
+
+        chunk2 = (
+            '<｜DSML｜parameter name="query" string="true">hello</｜DSML｜parameter>'
+            "</｜DSML｜invoke></｜DSML｜tool_calls>"
+        )
+        result = detector.parse_streaming_increment(chunk2, self.tools)
+        names = [c.name for c in result.calls if c.name]
+        self.assertIn("search", names)
+
+    # ------------------------------------------------------------------
+    # Bug 2: rstrip character-set bug — use removesuffix instead
+    # ------------------------------------------------------------------
+
+    def test_rstrip_does_not_truncate_streaming_param(self):
+        """Intermediate streaming parameter values ending with chars in
+        {p,a,r,m,e,t} must not be truncated by rstrip(partial_tag)."""
+        detector = DeepSeekV4Detector()
+        detector.parse_streaming_increment(
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">',
+            self.tools,
+        )
+        detector.parse_streaming_increment(
+            '<｜DSML｜parameter name="query" string="true">find /tmp',
+            self.tools,
+        )
+        intermediate_args = detector.prev_tool_call_arr[0].get("arguments", "")
+        self.assertIn("find /tmp", intermediate_args)
+
+    def test_rstrip_does_not_truncate_opt(self):
+        """Intermediate streaming value ending with 'opt' — 'p','t' in char set."""
+        detector = DeepSeekV4Detector()
+        detector.parse_streaming_increment(
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">', self.tools
+        )
+        detector.parse_streaming_increment(
+            '<｜DSML｜parameter name="query" string="true">ls /opt',
+            self.tools,
+        )
+        intermediate_args = detector.prev_tool_call_arr[0].get("arguments", "")
+        self.assertIn("ls /opt", intermediate_args)
+
+    # ------------------------------------------------------------------
+    # Bug 3: potentially_dsml trap + missing finish() flush
+    # ------------------------------------------------------------------
+
+    def test_dsml_subtag_in_response_does_not_trap_subsequent_text(self):
+        """When a DSML sub-tag (not a tool call) appears in response text,
+        subsequent non-DSML text must still be flushed as normal_text."""
+        detector = DeepSeekV4Detector()
+        detector.parse_streaming_increment(
+            'Here is the format: <｜DSML｜parameter name="x">value uses DSML.',
+            self.tools,
+        )
+        r2 = detector.parse_streaming_increment(
+            "Now let me find the file.",
+            self.tools,
+        )
+        self.assertEqual(r2.normal_text, "Now let me find the file.")
+
+    def test_finish_flushes_trapped_buffer_as_normal_text(self):
+        """finish() clears the buffer at stream end."""
+        detector = DeepSeekV4Detector()
+        detector.parse_streaming_increment("response text<｜DSML｜tool", self.tools)
+        detector.parse_streaming_increment("_calls>", self.tools)
+        self.assertTrue(hasattr(detector, "finish"))
+        result = detector.finish(self.tools)
+        self.assertEqual(detector._buffer, "")
+
+    def test_finish_with_clean_buffer_returns_empty(self):
+        """finish() on a clean buffer should return empty result."""
+        detector = DeepSeekV4Detector()
+        result = detector.finish(self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+
+    def test_finish_after_successful_tool_call(self):
+        """finish() after a successful tool call should not re-emit text."""
+        detector = DeepSeekV4Detector()
+        chunks = [
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="search">',
+            '<｜DSML｜parameter name="query" string="true">hello</｜DSML｜parameter>',
+            "</｜DSML｜invoke></｜DSML｜tool_calls>",
+        ]
+        for chunk in chunks:
+            detector.parse_streaming_increment(chunk, self.tools)
+        result = detector.finish(self.tools)
+        self.assertEqual(result.normal_text, "")
+
+    def test_finish_does_not_leak_dsml_tool_calls_tag(self):
+        """finish() must not emit <｜DSML｜tool_calls> as normal_text."""
+        detector = DeepSeekV4Detector()
+        detector.parse_streaming_increment(
+            "Let me find the file.<｜DSML｜tool_calls>", self.tools
+        )
+        result = detector.finish(self.tools)
+        self.assertIn("Let me find the file.", result.normal_text)
+        self.assertNotIn("｜DSML｜", result.normal_text)
+
+    def test_finish_does_not_leak_partial_invoke_tag(self):
+        """finish() must not emit <｜DSML｜invoke...> as normal_text."""
+        detector = DeepSeekV4Detector()
+        detector.parse_streaming_increment(
+            'response text<｜DSML｜tool_calls><｜DSML｜invoke name="search"', self.tools
+        )
+        result = detector.finish(self.tools)
+        self.assertIn("response text", result.normal_text)
+        self.assertNotIn("｜DSML｜", result.normal_text)
+
+    def test_chunk_boundary_on_tool_calls_tag_does_not_leak(self):
+        """<｜DSML｜tool_calls> split across chunks must not leak the DSML
+        tag into normal_text, regardless of where the split occurs."""
+        bot = "<｜DSML｜tool_calls>"
+        invoke = '<｜DSML｜invoke name="search">'
+        param = '<｜DSML｜parameter name="query" string="true">hi</｜DSML｜parameter>'
+        close = "</｜DSML｜invoke></｜DSML｜tool_calls>"
+
+        for split in range(1, len(bot)):
+            chunk1 = f"response text{bot[:split]}"
+            chunk2 = f"{bot[split:]}{invoke}{param}{close}"
+            detector = DeepSeekV4Detector()
+            r1 = detector.parse_streaming_increment(chunk1, self.tools)
+            r2 = detector.parse_streaming_increment(chunk2, self.tools)
+            all_normal = (r1.normal_text or "") + (r2.normal_text or "")
+            self.assertNotIn(
+                "｜DSML｜tool_calls",
+                all_normal,
+                f"DSML tag leaked at split={split}, chunk1={repr(chunk1[-20:])}",
+            )
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
