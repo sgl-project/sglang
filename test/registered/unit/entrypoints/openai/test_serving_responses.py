@@ -525,6 +525,41 @@ class FullResponseUsageTestCase(CustomTestCase):
 
 
 class MultimodalRequestTestCase(CustomTestCase):
+    def test_dsv41_multimodal_request_preserves_encoded_prompt_ids(self):
+        for with_image in (False, True):
+            with self.subTest(with_image=with_image):
+                serving = make_serving(is_multimodal=True)
+                serving.chat_encoding_spec = "dsv41"
+                serving.default_chat_template_kwargs = {}
+                serving.template_manager.chat_template_name = None
+                serving._dsv41_default_reasoning_effort = "high"
+                tokenizer = serving.tokenizer_manager.tokenizer
+                tokenizer.convert_ids_to_tokens.return_value = "<image>"
+                content = [{"type": "input_text", "text": "describe it"}]
+                images = []
+                if with_image:
+                    images = ["http://example.com/cat.png"]
+                    content.append({"type": "input_image", "image_url": images[0]})
+                request = ResponsesRequest(
+                    model="x",
+                    input=[{"role": "user", "content": content}],
+                    reasoning={"effort": "high"},
+                    store=False,
+                )
+
+                _, request_prompts, engine_prompts, processed = asyncio.run(
+                    serving._make_request(request, None, tokenizer)
+                )
+
+                self.assertEqual(processed.prompt, "")
+                self.assertEqual(request_prompts, [[1, 2, 3]])
+                self.assertEqual(engine_prompts, [[1, 2, 3]])
+                self.assertEqual(processed.image_data, images or None)
+                rendered_prompt = tokenizer.encode.call_args.args[0]
+                self.assertIn("describe it", rendered_prompt)
+                if with_image:
+                    self.assertIn("<image>", rendered_prompt)
+
     def test_text_only_create_responses_rejects_media_before_generation(self):
         serving = make_serving()
         serving._process_messages = Mock()

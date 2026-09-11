@@ -609,7 +609,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
 
-        if is_multimodal:
+        if is_multimodal and self.chat_encoding_spec != "dsv41":
             request_prompts = [processed_messages.prompt]
             engine_prompts = [processed_messages.prompt]
         else:
