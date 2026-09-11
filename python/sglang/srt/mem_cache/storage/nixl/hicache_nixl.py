@@ -42,6 +42,13 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+# O_DIRECT alignment is FS-dependent (some allow 512 B); 4 KiB is the safe lower
+# bound all known FSes accept, and real page sizes are multiples of it.
+_OS_PAGE_BYTES = 4096
+# Only these layouts make a pool's per-page slots directly addressable, which is
+# what zero-copy needs; see HostKVCache.get_page_buffer_meta().
+_ZERO_COPY_LAYOUTS = ("page_first", "page_first_direct")
+
 
 def _parse_storage_dirs(raw: Optional[str]) -> List[str]:
     """Split NIXL FILE storage directory config into ordered unique paths."""
@@ -153,8 +160,9 @@ class HiCacheNixl(HiCacheStorage):
         self.needs_page_alignment = nixlconfig.needs_page_alignment()
         if self.needs_page_alignment:
             logger.info(
-                "HiCacheNixl: O_DIRECT is active with a file-based backend (%s). "
-                "Page-aligned host buffers are required (needs_page_alignment=True).",
+                "HiCacheNixl: O_DIRECT requested with a file-based backend (%s); "
+                "host buffers are probed at pool registration and O_DIRECT is "
+                "dropped if the kernel cannot pin them.",
                 self.backend_selector.backend_name,
             )
         # Pre-registered host regions (set by register_mem_pool_host):
@@ -345,17 +353,41 @@ class HiCacheNixl(HiCacheStorage):
     ) -> bool:
         raise NotImplementedError("deprecated; use batch_set_v1")
 
+    # Probes ``buf`` itself, not a scratch buffer: get_user_pages() pinnability depends
+    # on the allocator, and XPU pinned host memory fails it with EFAULT.
+    def _fall_back_if_direct_io_unusable(self, buf: torch.Tensor) -> None:
+        if not self.needs_page_alignment:
+            return
+        try:
+            addr = buf.data_ptr()
+            aligned = addr + (-addr) % _OS_PAGE_BYTES
+            nbytes = buf.numel() * buf.element_size()
+            if aligned - addr + _OS_PAGE_BYTES > nbytes:
+                # Too small to source an aligned page, so O_DIRECT cannot use it
+                # at all; probing past its end would fault for the wrong reason.
+                error = (
+                    f"a {nbytes}-byte source buffer at {addr:#x} cannot hold a "
+                    f"page-aligned {_OS_PAGE_BYTES}-byte block"
+                )
+            else:
+                error = self.file_manager.direct_io_error(aligned, _OS_PAGE_BYTES)
+        except Exception as e:
+            # Buffered I/O is always correct, so a probe that cannot run falls back too.
+            error = f"the O_DIRECT probe could not run: {e!r}"
+        if error is None:
+            return
+        self.file_manager.disable_direct_io(error)
+        self.needs_page_alignment = False
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
         self._logical_anchor = False
 
         # enable zero-copy automatically if mem layout is page_first or page_first_direct
-        self.is_zero_copy = self.mem_pool_host.layout in [
-            "page_first",
-            "page_first_direct",
-        ]
+        self.is_zero_copy = self.mem_pool_host.layout in _ZERO_COPY_LAYOUTS
 
-        kv = getattr(mem_pool_host, "kv_buffer", None)
+        pin_memory = mem_pool_host.pin_memory
+        kv = mem_pool_host.kv_buffer
         if kv is None:
             # DeepSeek V4 uses a LogicalHostPool as the KV anchor. It has no
             # actual KV bytes; component pools carry the data through v2 APIs.
@@ -363,8 +395,7 @@ class HiCacheNixl(HiCacheStorage):
             # use the anchor key to gate sidecar lookups.
             self.is_zero_copy = False
             self._logical_anchor = True
-            marker_numel = 4096 if self.needs_page_alignment else 1
-            pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
+            marker_numel = _OS_PAGE_BYTES if self.needs_page_alignment else 1
             self._bounce_page_bytes = marker_numel
             self._bounce_page_numel = marker_numel
             self._bounce_set = self._alloc_registered(
@@ -374,6 +405,7 @@ class HiCacheNixl(HiCacheStorage):
                 marker_numel, torch.uint8, pin_memory, "logical_anchor_get"
             )
             self._bounce_set.fill_(1)
+            self._fall_back_if_direct_io_unusable(self._bounce_set)
             logger.info(
                 "HiCacheNixl: registered logical anchor pool with %d-byte markers",
                 self._bounce_page_bytes,
@@ -386,9 +418,7 @@ class HiCacheNixl(HiCacheStorage):
             # is page-aligned. The base is whatever torch.empty() happened to give
             # us -- it is not guaranteed to be page-aligned. Fall back to copy mode
             # if either condition fails.
-            # 4096: O_DIRECT alignment is FS-dependent (some allow 512 B); 4 KiB
-            # is the safe lower bound all known FSes accept, and real page-sizes meet it.
-            if not self.mem_pool_host.is_stride_page_aligned(4096):
+            if not self.mem_pool_host.is_stride_page_aligned(_OS_PAGE_BYTES):
                 logger.warning(
                     "HiCacheNixl: O_DIRECT is active but the host kv_buffer is "
                     "not OS-page-aligned (base or per-page stride). Falling back "
@@ -397,6 +427,9 @@ class HiCacheNixl(HiCacheStorage):
                 self.is_zero_copy = False
 
         if self.is_zero_copy:
+            # Probe after the alignment decision: a pool that lost zero-copy sources
+            # its transfers from the bounce buffer below, not from kv_buffer.
+            self._fall_back_if_direct_io_unusable(kv)
             self._pre_register_host(kv.data_ptr(), self._span_bytes(kv), "kv_buffer")
         else:
             # One bounce buffer per direction so set/get run lock-free across
@@ -409,13 +442,13 @@ class HiCacheNixl(HiCacheStorage):
             self._bounce_page_numel = page_numel
             self._bounce_page_bytes = slot_numel * sample.element_size()
             del sample
-            pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
             self._bounce_set = self._alloc_registered(
                 slot_numel, page_dtype, pin_memory, "bounce_set"
             )
             self._bounce_get = self._alloc_registered(
                 slot_numel, page_dtype, pin_memory, "bounce_get"
             )
+            self._fall_back_if_direct_io_unusable(self._bounce_set)
 
         logger.info(
             f"HiCacheNixl: pre-registered host regions for "
@@ -430,6 +463,8 @@ class HiCacheNixl(HiCacheStorage):
         is_zero_copy = self._hybrid_pool_supports_zero_copy(host_pool, host_pool_name)
         if is_zero_copy:
             for i, buf in enumerate(host_pool.get_hybrid_pool_buffer()):
+                if buf.numel() == 0:
+                    continue
                 self._pre_register_host(
                     buf.data_ptr(),
                     self._span_bytes(buf),
@@ -447,13 +482,14 @@ class HiCacheNixl(HiCacheStorage):
             slot_bytes = slot_numel * sample.element_size()
             del sample
 
-            pin_memory = bool(getattr(host_pool, "pin_memory", False))
+            pin_memory = host_pool.pin_memory
             bounce_set = self._alloc_registered(
                 slot_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_set"
             )
             bounce_get = self._alloc_registered(
                 slot_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_get"
             )
+            self._fall_back_if_direct_io_unusable(bounce_set)
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool,
                 is_zero_copy=False,
@@ -480,13 +516,32 @@ class HiCacheNixl(HiCacheStorage):
         buffers = host_pool.get_hybrid_pool_buffer()
         if not buffers:
             return False
-        if self.needs_page_alignment and not host_pool.is_stride_page_aligned(4096):
+        # Ask the pool, not a fixed layout list: each is_stride_page_aligned rejects
+        # layouts its get_page_buffer_meta cannot serve (MHA also serves page_head,
+        # unified envelopes any layout). A 1-byte stride drops only the alignment
+        # part, which matters solely under O_DIRECT and may be turned off later.
+        if not host_pool.is_stride_page_aligned(1):
+            logger.info(
+                "HiCacheNixl: hybrid pool %s cannot move layout %s in place. "
+                "Using bounce buffers.",
+                host_pool_name,
+                host_pool.layout,
+            )
+            return False
+        if self.needs_page_alignment and not host_pool.is_stride_page_aligned(
+            _OS_PAGE_BYTES
+        ):
             logger.warning(
                 "HiCacheNixl: O_DIRECT is active but hybrid pool %s is not "
                 "OS-page-aligned. Falling back to bounce buffers.",
                 host_pool_name,
             )
             return False
+        # Probe after the alignment decision; each component is its own allocation,
+        # and a 0-element one (conv-only mamba) sources no transfer.
+        for buf in buffers:
+            if buf.numel() > 0:
+                self._fall_back_if_direct_io_unusable(buf)
         return True
 
     def _bounce_slot_numel(self, page_numel: int, element_size: int) -> int:

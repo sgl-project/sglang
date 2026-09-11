@@ -1328,6 +1328,14 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         element_size_list = [element_size] * len(ptr_list)
         return ptr_list, element_size_list
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        # Same layouts and per-page stride as get_page_buffer_meta.
+        if self.layout not in ("page_first", "page_first_direct"):
+            return False
+        stride = self.page_size * self.layout_dim
+        base_aligned = self.k_buffer.data_ptr() % page_size_bytes == 0
+        return base_aligned and stride % page_size_bytes == 0
+
 
 class HiSparseMHATokenToKVPoolHost(HiSparseHostPoolMixin, MHATokenToKVPoolHost):
     """Layer-first MHA host pool with page-granular HiSparse allocation."""
