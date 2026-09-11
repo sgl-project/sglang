@@ -12,7 +12,9 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 def _cache(num_tokens=16, num_layers=2, topk=3):
-    return BaseHostCache(num_tokens, num_layers, topk, name="test")
+    # These tests exercise CPU-side metadata only; avoid leaking repeated
+    # cudaHostRegister allocations across short-lived cache instances.
+    return BaseHostCache(num_tokens, num_layers, topk, name="test", device="npu")
 
 
 def test_hicache_restore_remaps_experts_to_new_kv_slots():
