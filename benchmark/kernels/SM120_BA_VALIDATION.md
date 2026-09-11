@@ -15,8 +15,10 @@ PYTHONPATH=python python test/registered/kernel/gemm/test_sm120_ba_gemm.py -v
 PYTHONPATH=python python benchmark/kernels/benchmark_sm120_ba_gemm.py --device 0 --repeats 20
 ```
 
-The GPU test is registered in `base-b-test-1-gpu-small`; this repository maps
+The GPU test is registered in `base-b-kernel-unit-test-1-gpu-small`; this repository maps
 `1-gpu-small` to `1-gpu-5090`. A non-SM120 machine skips the numerical GPU tests.
+The JIT-kernel workflow includes a 5090 job for this kernel suite, under the
+same caller authorization gate as the existing kernel jobs.
 The CPU dispatch suite is `base-a-test-cpu`. A single-GPU runner cannot exercise
 the optional second-device test; that case was covered in the local two-GPU run.
 The microbenchmark measures graph-replayed operator latency, not serving TPS.

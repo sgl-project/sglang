@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # This runner maps to RTX 5090 (SM120), unlike 1-gpu-large (H100).
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 class TestSm120BaCpuFallback(unittest.TestCase):

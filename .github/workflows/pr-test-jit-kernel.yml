@@ -43,6 +43,48 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
 
 jobs:
+  jit-kernel-sm120-unit-test:
+    # Keep the caller's CI gate; SM120 tests would skip on the H100 job below.
+    runs-on: 1-gpu-5090
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Cleanup
+        if: inputs.sgl_kernel == 'true'
+        run: |
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: python/sglang/kernels/aot/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda13.0
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run SM120 tests
+        timeout-minutes: 15
+        run: |
+          cd test/
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-small
+
   jit-kernel-unit-test:
     # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
     # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
