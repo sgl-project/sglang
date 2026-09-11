@@ -44,6 +44,16 @@ Two things intentionally differ from AgentX:
   uses real verification and reports the achieved accept length. Set
   ``AGENTIC_SIMULATE_ACC_LEN`` to restore the AgentX behaviour.
 
+Reference point. AgentX's own sweep of this recipe at this concurrency
+(InferenceX run 33298482346, tp4 + MTP + DRAM HiCache at c48, sglang
+v0.5.18-rocm720-mi35x) measured 1,464 output tok/s at a 17.10 ms median ITL,
+against 1,380 tok/s and 16.93 ms here. The two harnesses disagree by more on
+the prompt side -- AgentX reports a 94.7% prompt-cache read rate against 83.4%
+here -- because it starts each trajectory mid-trace behind a 30-minute warmup
+grace period and measures an hour of steady state, where this run flushes the
+cache and measures the cold prefill burst as well. Decode-side agreement is
+what makes the number worth tracking; the prompt-side gap is the harness.
+
 Everything is env-overridable so the AMD CI owners can retune the workload
 without touching the recipe.
 
