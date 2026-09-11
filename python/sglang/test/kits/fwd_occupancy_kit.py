@@ -51,9 +51,7 @@ class FwdOccupancyMixin:
     # Measurement: one long single-batch request -- max_new_tokens must
     # span several decode_log_interval windows for enough samples.
     fwd_occupancy_max_new_tokens: int = 2048
-    fwd_occupancy_prompt: str = (
-        "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
-    )
+    fwd_occupancy_prompt: str = "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
 
     def _scrape_fwd_occupancy(self):
         """Max non-NaN gauge value across exposed labels (e.g. dp ranks);

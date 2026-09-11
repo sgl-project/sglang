@@ -47,6 +47,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX23PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    FastH3PipelineConfig,
     MiniMaxH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
@@ -54,6 +55,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
+    SenseNovaU1PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
@@ -86,6 +90,7 @@ __all__ = [
     "PipelineConfig",
     "SanaPipelineConfig",
     "SanaVideoPipelineConfig",
+    "SenseNovaU1PipelineConfig",
     "SlidingTileAttnConfig",
     "MOVAPipelineConfig",
     "Pi05PipelineConfig",
@@ -101,5 +106,6 @@ __all__ = [
     "LingBotWorldCausalDMDConfig",
     "LingBotWorldV2CausalDMDConfig",
     "LingBotVideoMoEPipelineConfig",
+    "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
 ]

@@ -23,6 +23,11 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ: bool = False
+    SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
+    SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
+    SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -33,9 +38,16 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
+    SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
+        "~/.cache/sglang/diffusion/host_spill"
+    )
+    SGLANG_DIFFUSION_DISABLE_HOST_SPILL: bool = False
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -84,6 +96,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
+    SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
+    SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS: int = 3
+    SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS: int = 3
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -249,6 +264,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER"
     ),
+    # Where transformed weight copies (fused q/k/v, reordered rows) live as
+    # file mappings when host copies must stay reclaimable; reused across
+    # starts of the same checkpoint.
+    "SGLANG_DIFFUSION_HOST_SPILL_DIR": _lazy_str(
+        "SGLANG_DIFFUSION_HOST_SPILL_DIR",
+        os.path.expanduser("~/.cache/sglang/diffusion/host_spill"),
+    ),
+    "SGLANG_DIFFUSION_DISABLE_HOST_SPILL": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_HOST_SPILL"
+    ),
     # Test hook: make the host memory budget behave as if the machine had this
     # many GiB of RAM (available = this figure minus the process's own
     # anonymous memory). CI uses it to exercise the constrained placement
@@ -267,6 +292,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Kill-switch for the warmup-calibrated auto residency promotion that runs
+    # under `--performance-mode auto` with server warmup. Set to disable the
+    # promotion without giving up the rest of the auto performance policy.
+    "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    ),
+    # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
+    # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
+    # up to num_inference_steps - 1 slots; the default covers the 50-step
+    # serving schedule, so this is an escape hatch, not a deployment knob.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
+    ),
+    # Experimental: compute the online AdaLN rebuild projections once in fp32
+    # (TF32 off) before the bf16 store. Not bit-comparable to resident
+    # adaln_proj weights; keep off until an e2e trajectory gate clears it.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
+    ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
@@ -285,6 +329,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory instead of a file-backed cache mapping the page cache can drop.
     "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE"
+    ),
+    # Kill-switch: do not madvise(MADV_WILLNEED) mapped layers ahead of the
+    # courier; their pages arrive at fault-time readahead beats instead.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED"
+    ),
+    # Kill-switch: on a shared host/device pool the courier reads mapped layers
+    # from their checkpoint files with O_DIRECT instead of through the page
+    # cache. This forces the mmap path.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ"
+    ),
+    # Debug: after auto residency settles, log where this process's host memory
+    # sits -- per component and per kind (anonymous, mapped, pinned) -- next to
+    # the kernel's view of the process.
+    "SGLANG_DIFFUSION_DEBUG_HOST_MEMORY": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_HOST_MEMORY"
+    ),
+    # Debug: at the end of every layerwise stage, log where the courier and the
+    # compute thread spent their time (populate, memcpy, H2D, waits).
+    "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING"
+    ),
+    # Kill-switch: keep LoRA-merged weights in anonymous host memory instead
+    # of the file-backed LoRA merge cache.
+    "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
@@ -361,6 +432,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory is low or when this flag is disabled.
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
+    ),
+    # Run the first/last denoising steps of a ModelOpt FP8 (W8A8) Cosmos3 DiT
+    # as W8A16 when the checkpoint's diffusion_step_policy asks for it; the
+    # same FP8 weights are dequantized per call and fed to a 16-bit GEMM.
+    # Kill-switch: set 0 to run pure W8A8 regardless of the checkpoint.
+    "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION", "true"
+    ),
+    # Manual overrides for experiments: setting either explicitly overrides
+    # that field of the checkpoint policy, or force-enables mixed precision
+    # on a checkpoint without one (the other field then takes the default
+    # below). When neither is set, the checkpoint fully owns the behavior.
+    "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS": _lazy_int(
+        "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS", 3
+    ),
+    "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS": _lazy_int(
+        "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS", 3
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
