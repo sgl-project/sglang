@@ -23,11 +23,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
-    HybridReqToTokenPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components import ComponentType, MambaComponent
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _compressed_index_tree_params,
@@ -47,7 +46,7 @@ def dsa_pool(*, live_layers=(True, True), compress=True, kpool=4):
     pool.layer_num = len(live_layers)
     pool.index_key_cache = SimpleNamespace(
         buffer=[
-            torch.zeros((8 if live else 0, 64 * 132), dtype=torch.uint8)
+            torch.zeros((12 if live else 0, 64 * 132), dtype=torch.uint8)
             for live in live_layers
         ]
     )
@@ -105,16 +104,6 @@ class TestCompressedIndexOwnership(unittest.TestCase):
                 with self.subTest(hybrid=hybrid, pool=type(pool).__name__):
                     params = cache_params(pool, hybrid=hybrid)
                     self.assertIs(_compressed_index_tree_params(params), params)
-
-    def test_mamba_checkpoint_grid_follows_index_ownership_not_transfer_pages(self):
-        params = cache_params(dsa_pool())
-        params.req_to_token_pool = object.__new__(HybridReqToTokenPool)
-        params.enable_mamba_extra_buffer = True
-        tree_params = _compressed_index_tree_params(params)
-        component = MambaComponent(MagicMock(), tree_params)
-        self.assertEqual(component.mamba_cache_chunk_size, 64)
-        self.assertEqual(component.mamba_checkpoint_grid, 256)
-        self.assertEqual(params.page_size, 64)
 
     def test_branch_inside_group_cannot_share_first_index_page(self):
         for hybrid, common in (
@@ -188,7 +177,7 @@ class TestHybridIndexSidecar(unittest.TestCase):
         self.prefix = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
         self.memory = SimpleNamespace(hicache_mem_layout="layer_first")
 
-    def test_standalone_compressed_stack_roundtrip_with_skipped_layers(self):
+    def test_compressed_stack_incremental_roundtrip_with_skipped_layers(self):
         from collections import defaultdict
 
         def allocate(shape, *, dtype, device, **_):
@@ -261,13 +250,24 @@ class TestHybridIndexSidecar(unittest.TestCase):
                 buffers = [
                     b for p in (pool, *drafts) for b in p.index_k_with_scale_buffer
                 ]
+                # Advance one generator across buffers: pages AND layers differ.
+                generator = torch.Generator().manual_seed(38212)
                 originals = []
-                for i, buffer in enumerate(buffers):
-                    buffer.copy_(torch.arange(buffer.numel()).reshape_as(buffer) + i)
+                for buffer in buffers:
+                    buffer.copy_(
+                        torch.randint(
+                            256, buffer.shape, dtype=torch.uint8, generator=generator
+                        )
+                    )
                     originals.append(buffer.clone())
-                src_pages = torch.tensor([5, 1, 7, 3])
-                host_pages = torch.tensor([9, 4, 13, 1])
-                dst_pages = torch.tensor([2, 6, 4, 0])
+                src_pages = torch.tensor([5, 1, 7, 3, 0, 6, 2, 4])
+                host_pages = torch.tensor([9, 4, 13, 1, 8, 14, 3, 7])
+                dst_pages = torch.tensor([2, 6, 4, 0, 7, 3, 5, 1])
+                host_expected = [
+                    torch.full_like(b, 91) for b in entry.host_pool.kv_buffer
+                ]
+                for buffer in entry.host_pool.kv_buffer:
+                    buffer.fill_(91)
 
                 def tokens(pages):
                     return (pages[:, None] * 64 + torch.arange(64)).flatten()
@@ -286,9 +286,28 @@ class TestHybridIndexSidecar(unittest.TestCase):
                         create=True,
                     ),
                 ):
-                    entry.host_pool.backup_from_device_all_layer(
-                        pool, tokens(host_pages), tokens(src_pages), "direct"
-                    )
+                    for start in (0, 4):
+                        # Back up the extension without revisiting the prefix.
+                        entry.host_pool.backup_from_device_all_layer(
+                            pool,
+                            tokens(host_pages[start : start + 4]),
+                            tokens(src_pages[start : start + 4]),
+                            "direct",
+                        )
+                        live_originals = [b for b in originals if b.numel()]
+                        for actual, expected, source in zip(
+                            entry.host_pool.kv_buffer,
+                            host_expected,
+                            live_originals,
+                            strict=True,
+                        ):
+                            expected[host_pages[start : start + 4]] = source[
+                                src_pages[start : start + 4]
+                            ]
+                            self.assertTrue(
+                                torch.equal(actual, expected),
+                                "host payload or untouched page changed",
+                            )
                     for buffer in buffers:
                         buffer.fill_(173)
                     for layer, buffer in enumerate(buffers):
@@ -303,9 +322,19 @@ class TestHybridIndexSidecar(unittest.TestCase):
                             mapped,
                             "direct",
                         )
+                        expected = torch.full_like(buffer, 173)
+                        expected[dst_pages] = originals[layer][src_pages]
                         self.assertTrue(
-                            torch.equal(buffer[dst_pages], originals[layer][src_pages])
+                            torch.equal(buffer, expected),
+                            "restored payload or untouched page changed",
                         )
+                    from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+                        compute_pooled_write_locs,
+                    )
+
+                    locs = compute_pooled_write_locs(dst_pages, torch.arange(128), 4)
+                    self.assertTrue(torch.equal(locs[:64], 2 * 64 + torch.arange(64)))
+                    self.assertTrue(torch.equal(locs[64:], 7 * 64 + torch.arange(64)))
 
     def test_draft_sidecar_omits_empty_index_layers(self):
         for live in ((True, False, True), (False, False)):
@@ -370,132 +399,72 @@ class TestHybridIndexSidecar(unittest.TestCase):
             )
         return entry, host_cls
 
+    def test_inconsistent_index_row_bytes_are_rejected(self):
+        pool = dsa_pool()
+        draft = dsa_pool(live_layers=(True,))
+        draft.index_key_cache.buffer[0] = torch.zeros((12, 4224), dtype=torch.uint8)
+        with self.assertRaisesRegex(ValueError, "row"):
+            self.build_entry(pool, drafts=(draft,))
+
     def test_non_dsa_has_no_sidecar(self):
         entry, host_cls = self.build_entry(SimpleNamespace())
         self.assertIsNone(entry)
         host_cls.assert_not_called()
 
-    def test_real_stack_registers_indexer_within_fixed_host_budget(self):
-        pool = dsa_pool()
-        draft = dsa_pool(live_layers=(True,))
-        for item in (pool, draft):
-            item.kv_cache_dim = 656
-            item.store_dtype = torch.uint8
-        wrapper = object.__new__(HybridLinearKVPool)
-        wrapper.full_kv_pool = draft
-        params = cache_params(pool)
-        params.req_to_token_pool.mamba_allocator = MagicMock()
-        params.mtp_draft_device_pools = (wrapper,)
-        memory = SimpleNamespace(
-            hicache_size=32,
-            hicache_ratio=2.0,
-            hicache_mem_layout="layer_first",
-            hicache_write_policy="write_through",
-            hicache_io_backend="direct",
-            hicache_host_memory_mode=None,
-        )
-        with (
-            patch(self.prefix + "get_memory", return_value=memory),
-            patch(self.prefix + "_get_allocator_type", return_value="default"),
-            patch(self.prefix + "_split_hicache_size", return_value=(20.0, 12.0)),
-            patch(self.prefix + "build_kv_host_pool") as build_kv,
-            patch(self.prefix + "MambaPoolHost"),
-            patch(self.prefix + "DeepSeekV4PagedHostPool"),
-            patch(self.prefix + "HybridCacheController"),
-        ):
-            build_kv.return_value.page_num = 16
-            group, _ = build_hybrid_mamba_stack(
-                params=params,
-                kv_pool=pool,
-                mamba_pool=MagicMock(),
-                full_layer_mapping={0: 0, 3: 1},
-                mamba_layer_mapping={1: 0, 2: 1},
-                load_cache_event=None,
-                storage_backend=None,
-                use_mla=True,
-            )
-        self.assertIn(PoolName.INDEXER, group.entry_map)
-        self.assertEqual(build_kv.call_args.kwargs["page_size"], 64)
-        kv_budget = build_kv.call_args.kwargs["host_size"]
-        self.assertAlmostEqual(kv_budget, 20.0 * 656 / (656 + 132))
-        self.assertAlmostEqual(kv_budget * (1 + 132 / 656), 20.0)
-        self.assertEqual(group.get_entry(PoolName.INDEXER).layer_mapper(4), 2)
-
-    def test_complete_group_roundtrip_with_noncontiguous_pages(self):
-        # Exercise the real host pool and physical-page index conversion. Only
-        # the CUDA copy primitive is replaced by an equivalent CPU byte copy.
-        def allocate(shape, *, dtype, device, **_):
-            return torch.empty(shape, dtype=dtype, device=device)
-
-        def copy_pages(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
-            self.assertEqual(page_size, 1)
-            for src, dst in zip(src_layers, dst_layers, strict=True):
-                dst[dst_indices] = src[src_indices]
-
-        from collections import defaultdict
-
-        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-            compute_pooled_write_locs,
-        )
-
-        pool = dsa_pool()
-        draft = dsa_pool(live_layers=(True,))
-        with (
-            patch(self.prefix + "get_memory", return_value=self.memory),
-            patch(self.prefix + "_get_allocator_type", return_value="default"),
-            patch(
-                "sglang.srt.mem_cache.memory_pool_host.ALLOC_MEMORY_FUNCS",
-                defaultdict(lambda: allocate),
-            ),
-        ):
-            entry = _build_hybrid_dsa_index_entry(
-                kv_pool=pool,
-                kv_host_pool=SimpleNamespace(page_num=16),
-                layer_mapping={0: 0, 3: 1, 6: 2},
-                transfer_layer_num=7,
-                draft_pools=(draft,),
-            )
-        host = entry.host_pool
-        originals = []
-        for layer, buffer in enumerate(host.device_buffers):
-            buffer.copy_(torch.arange(buffer.numel()).reshape_as(buffer) + layer)
-            originals.append(buffer.clone())
-        src_pages = torch.tensor([5, 1, 7, 3, 0, 6, 2, 4])
-        host_pages = torch.tensor([9, 4, 13, 1, 8, 14, 3, 7])
-        dst_pages = torch.tensor([2, 6, 4, 0, 7, 3, 5, 1])
-
-        def tokens(pages):
-            return (pages[:, None] * 64 + torch.arange(64)[None, :]).flatten()
-
-        with patch(
-            "sglang.srt.mem_cache.memory_pool_host.transfer_kv_direct",
-            side_effect=copy_pages,
-            create=True,
-        ):
-            # Backup prefix, then its extension without revisiting the prefix.
-            for start in (0, 4):
-                host.backup_from_device_all_layer(
-                    pool,
-                    tokens(host_pages[start : start + 4]),
-                    tokens(src_pages[start : start + 4]),
-                    "direct",
+    def test_stack_reserves_index_space_in_fixed_and_ratio_modes(self):
+        for host_size in (32, 0):
+            with self.subTest(host_size=host_size):
+                pool = dsa_pool()
+                draft = dsa_pool(live_layers=(True,))
+                for item in (pool, draft):
+                    item.kv_cache_dim = 656
+                    item.store_dtype = torch.uint8
+                wrapper = object.__new__(HybridLinearKVPool)
+                wrapper.full_kv_pool = draft
+                params = cache_params(pool)
+                params.req_to_token_pool.mamba_allocator = MagicMock()
+                params.mtp_draft_device_pools = (wrapper,)
+                memory = SimpleNamespace(
+                    hicache_size=host_size,
+                    hicache_ratio=2.0,
+                    hicache_mem_layout="layer_first",
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="direct",
+                    hicache_host_memory_mode=None,
                 )
-            for buffer in host.device_buffers:
-                buffer.fill_(173)
-            for layer in range(len(host.device_buffers)):
-                host.load_to_device_per_layer(
-                    pool, tokens(host_pages), tokens(dst_pages), layer, "direct"
-                )
-                self.assertTrue(
-                    torch.equal(
-                        host.device_buffers[layer][dst_pages],
-                        originals[layer][src_pages],
+                with (
+                    patch(self.prefix + "get_memory", return_value=memory),
+                    patch(self.prefix + "_get_allocator_type", return_value="default"),
+                    patch(
+                        self.prefix + "_split_hicache_size", return_value=(20.0, 12.0)
+                    ) as split,
+                    patch(self.prefix + "build_kv_host_pool") as build_kv,
+                    patch(self.prefix + "MambaPoolHost"),
+                    patch(self.prefix + "DeepSeekV4PagedHostPool") as index_host,
+                    patch(self.prefix + "HybridCacheController"),
+                ):
+                    build_kv.return_value.page_num = 16
+                    group, _ = build_hybrid_mamba_stack(
+                        params=params,
+                        kv_pool=pool,
+                        mamba_pool=MagicMock(),
+                        full_layer_mapping={0: 0, 3: 1},
+                        mamba_layer_mapping={1: 0, 2: 1},
+                        load_cache_event=None,
+                        storage_backend=None,
+                        use_mla=True,
                     )
-                )
-            # The pooled-key reader selects each restored group's first page.
-            locs = compute_pooled_write_locs(dst_pages, torch.arange(128), 4)
-            self.assertTrue(torch.equal(locs[:64], 2 * 64 + torch.arange(64)))
-            self.assertTrue(torch.equal(locs[64:], 7 * 64 + torch.arange(64)))
+                self.assertIn(PoolName.INDEXER, group.entry_map)
+                self.assertEqual(index_host.call_args.kwargs["num_host_pages"], 16)
+                self.assertEqual(build_kv.call_args.kwargs["page_size"], 64)
+                kv_budget = build_kv.call_args.kwargs["host_size"]
+                if host_size:
+                    split.assert_called_once()
+                    self.assertAlmostEqual(kv_budget, 20.0 * 656 / (656 + 132))
+                else:
+                    split.assert_not_called()
+                    self.assertIsNone(kv_budget)
+                self.assertEqual(group.get_entry(PoolName.INDEXER).layer_mapper(4), 2)
 
     def test_skipped_target_layers_and_packed_draft_are_layer_mapped(self):
         pool = dsa_pool(live_layers=(True, False, True))

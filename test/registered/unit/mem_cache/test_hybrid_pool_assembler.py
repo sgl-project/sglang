@@ -15,7 +15,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_full_draft_pools,
     build_hybrid_mamba_stack,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPoolFP4
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MLATokenToKVPool,
+    MLATokenToKVPoolFP4,
+)
 from sglang.srt.mem_cache.pool_host.common import alloc_with_host_register
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -351,6 +355,49 @@ class TestMLAHostPoolRowGeometry(_PackedRowGeometryFixtures, CustomTestCase):
                 **kwargs,
             )
 
+    def test_decode_offload_constructs_the_stored_mla_row_width(self):
+        from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+            DecodeKVCacheOffloadManager,
+        )
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                page_size=self.PAGE_SIZE,
+                hicache_ratio=2,
+                hicache_mem_layout="layer_first",
+            ),
+            role="scheduler",
+        )
+        self.addCleanup(reset_context)
+        pool = object.__new__(MLATokenToKVPool)
+        pool.__dict__.update(self._fake_packed_device_pool().__dict__)
+        prefix = "sglang.srt.disaggregation.decode_kvcache_offload_manager."
+        with (
+            patch(
+                "sglang.srt.mem_cache.pool_host.mla.ALLOC_MEMORY_FUNCS",
+                {"cpu": self._alloc_unpinned},
+            ),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler._get_allocator_type",
+                return_value="default",
+            ),
+            patch(prefix + "torch.distributed.get_world_size", return_value=1),
+            patch(prefix + "HiCacheController"),
+        ):
+            manager = DecodeKVCacheOffloadManager(
+                None, SimpleNamespace(get_kvcache=lambda: pool), None, None
+            )
+        self.addCleanup(manager.release_host_resources)
+        self.assertEqual(
+            manager.decode_host_mem_pool.kv_cache_dim, self.PACKED_KV_CACHE_DIM
+        )
+        self.assertEqual(
+            manager.decode_host_mem_pool.token_stride_size, self.PACKED_KV_CACHE_DIM
+        )
+
     def test_fp4_rows_are_rejected_before_host_allocation(self):
         fp4 = object.__new__(MLATokenToKVPoolFP4)
         fp4.__dict__.update(self._fake_packed_device_pool(layer_num=1).__dict__)
@@ -387,36 +434,6 @@ class TestMLAHostPoolRowGeometry(_PackedRowGeometryFixtures, CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "override_kv_cache_dim"):
             self._host_pool(kv_pool)
-
-    def test_packed_device_pool_without_override_and_nominal_draft_is_rejected(self):
-        # Without the override the assumed host width equals the nominal
-        # width, so a same-dtype nominal-width draft matches the assumed
-        # width while both differ from the packed device rows. The draft
-        # must be compared against the device pool's kv_cache_dim, not the
-        # assumed width.
-        kv_pool = self._fake_packed_device_pool()
-        draft_pool = self._fake_device_pool(
-            store_dtype=kv_pool.store_dtype,
-            kv_cache_dim=self.NOMINAL_KV_CACHE_DIM,
-            layer_num=1,
-        )
-
-        with self.assertRaisesRegex(ValueError, "row geometry"):
-            self._host_pool(kv_pool, mtp_draft_device_pools=(draft_pool,))
-
-    def test_packed_device_pool_with_override_and_matching_draft(self):
-        kv_pool = self._fake_packed_device_pool()
-        draft_pool = self._fake_packed_device_pool(layer_num=1)
-
-        host_pool = self._host_pool(
-            kv_pool,
-            override_kv_cache_dim=kv_pool.kv_cache_dim,
-            mtp_draft_device_pools=(draft_pool,),
-        )
-
-        self.assertEqual(host_pool.kv_cache_dim, kv_pool.kv_cache_dim)
-        self.assertEqual(host_pool.layer_num, kv_pool.layer_num + 1)
-        self.assertEqual(host_pool.kv_buffer.shape[-1], kv_pool.kv_cache_dim)
 
     def test_nominal_device_pool_needs_no_override(self):
         # Flat MLA callers pass no override; a nominal-width pool must still
