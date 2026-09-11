@@ -333,16 +333,23 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                # graph.update must carry the exact KV length already
-                # computed in forward_metadata.seq_lens_cpu_list (it already
-                # includes the draft block for DFlash); do not recompute and
-                # double-add here.
                 _attn = self._replay_attn_backend()
-                _meta_list = _attn.forward_metadata.seq_lens_cpu_list
-                if _meta_list is None:
-                    # Should not happen after init_forward_metadata_out_graph.
-                    _meta_list = self.buffers.seq_lens[: self.raw_bs].cpu().tolist()
-                seq_lens = list(_meta_list)
+                _meta = getattr(_attn, "forward_metadata", None)
+                _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
+                if _meta_list is not None:
+                    # graph.update must carry the exact KV length already
+                    # computed in forward_metadata.seq_lens_cpu_list (it
+                    # already includes the draft block for DFlash); do not
+                    # recompute and double-add here.
+                    seq_lens = list(_meta_list)
+                else:
+                    # Wrapper backends (e.g. hybrid linear attention) keep
+                    # forward_metadata only on their children, so it stays
+                    # None here; fall back to the pre-DFlash computation.
+                    seq_lens_cpu = (
+                        forward_batch.seq_lens.cpu() + self.captured_req_width
+                    )
+                    seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
