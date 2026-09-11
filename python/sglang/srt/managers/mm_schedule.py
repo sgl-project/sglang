@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
-from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.evs import EVSEmbeddingResult, VideoEVSDataItem
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
@@ -569,7 +569,12 @@ def _get_chunked_prefill_embedding(
             extend_seq_len=extend_seq_len,
         )
 
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
+        # EVS must process all frames together to compute temporal similarity
+        # and returns EVSEmbeddingResult rather than a plain tensor.
+        is_per_image = all(
+            len(item.offsets) == 1 and not isinstance(item, VideoEVSDataItem)
+            for item in embedding_items_per_req
+        )
         if is_per_image:
             if _is_hip or _is_npu or _is_xpu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep
