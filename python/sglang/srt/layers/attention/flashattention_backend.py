@@ -451,6 +451,20 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         )
 
+    @property
+    def supports_draft_extend_metadata_staging(self) -> bool:
+        return (
+            self.topk == 1
+            and not self.kv_index_translator.is_translating
+            and self.draft_extend_metadata_captured_in_graph()
+        )
+
+    def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
+        self.forward_metadata = self.draft_extend_metadata[forward_batch.batch_size]
+        self.forward_metadata.max_seq_len_k = self.max_context_len
+        self.forward_metadata_spec_decode_expand = None
+        self.init_forward_metadata_in_graph(forward_batch)
+
     def _in_graph_full_to_swa_index_mapping(self) -> Optional[torch.Tensor]:
         # The in-graph SWA translation needs the raw mapping tensor; v2p-table
         # pools (UnifiedSWAKVPool) keep it None and must stay on the eager

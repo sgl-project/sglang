@@ -40,6 +40,7 @@ dependencies = [
   "openai-harmony==0.0.4",
   "orjson",
   "outlines==0.1.11",
+  "outlines_core==0.1.26",
   "packaging",
   "partial_json_parser",
   "pillow",
@@ -54,8 +55,8 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sglang-kernel-xpu @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
-  "smg-grpc-servicer>=0.5.0",
+  "sglang-kernel-xpu @ https://github.com/sgl-project/whl/releases/download/v0.2.0+xpu/sglang_kernel_xpu-0.2.0-cp310-abi3-manylinux_2_38_x86_64.whl",
+  "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -72,6 +73,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+checkpoint-engine = ["checkpoint-engine @ git+https://github.com/MoonshotAI/checkpoint-engine.git@f772d1858204fa82bdb0436fdfec137f5de2972c"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",
@@ -108,6 +110,7 @@ test = [
   "pandas",
   "parameterized",
   "peft>=0.18.0",
+  "polars",
   "pytest",
   "sentence_transformers",
   "tabulate",
