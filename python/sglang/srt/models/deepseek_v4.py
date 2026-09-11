@@ -78,7 +78,9 @@ from sglang.srt.layers.communicator_dsa_cp import (
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
+    cp_interleave_input_ids,
     cp_materialize_global_token_order,
+    cp_shard_hidden_states,
     is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
@@ -4166,6 +4168,11 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        local_input_ids = (
+            cp_shard_hidden_states(forward_batch.input_ids, forward_batch)
+            if cp_extend
+            else input_ids
+        )
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
@@ -4218,12 +4225,17 @@ class DeepseekV4Model(nn.Module):
                 # Past the last kv_source layer a layer only owes its window KV,
                 # and decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                hidden_states, prev_pre, input_ids, input_ids_global = (
-                    tail.rows(hidden_states),
-                    tail.rows(prev_pre),
-                    tail.rows(input_ids),
-                    tail.rows(input_ids_global),
-                )
+                hidden_states = tail.rows(hidden_states)
+                prev_pre = tail.rows(prev_pre)
+                local_input_ids = tail.rows(local_input_ids)
+                if tail.cp_metadata is not None:
+                    tail_input_ids = forward_batch.input_ids[tail.output_token_indices]
+                    input_ids = cp_interleave_input_ids(tail_input_ids, forward_batch)
+                    input_ids_global = input_ids
+                else:
+                    input_ids = tail.rows(input_ids)
+                    input_ids_global = tail.rows(input_ids_global)
+                    local_input_ids = input_ids
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4251,7 +4263,7 @@ class DeepseekV4Model(nn.Module):
                     and self.config.vision_n_layers > 0
                 ):
                     hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
+                        (local_input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,
                         hidden_states,
                     )
