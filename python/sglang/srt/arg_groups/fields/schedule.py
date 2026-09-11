@@ -9,11 +9,12 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import (
     List,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -22,8 +23,7 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.utils.common import human_readable_int
 
 
-@dataclasses.dataclass
-class Schedule:
+class Schedule(msgspec.Struct):
     """Namespace ``schedule``."""
 
     _NS_PATH = "schedule"

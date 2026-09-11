@@ -794,7 +794,7 @@ class TestSWA(unittest.TestCase):
         req.extra_key = None
         req.cache_salt = None
         req.last_node = tree.root_node
-        req.swa_uuid_for_lock = None
+        req.lock_receipt = DecLockRefParams()
         req.kv.swa_evicted_seqlen = 0
         req.kv.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
@@ -832,7 +832,7 @@ class TestSWA(unittest.TestCase):
         req2.extra_key = None
         req2.cache_salt = None
         req2.last_node = tree.root_node
-        req2.swa_uuid_for_lock = None
+        req2.lock_receipt = DecLockRefParams()
         req2.kv.swa_evicted_seqlen = 0
         req2.kv.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
@@ -1322,7 +1322,7 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
         req.cache_salt = None
         req.kv.cache_protected_len = 0
         req.last_node = tree.root_node
-        req.swa_uuid_for_lock = None
+        req.lock_receipt = DecLockRefParams()
         req.prefix_indices = torch.empty(0, dtype=torch.int64, device=tree.device)
         req.kv.swa_evicted_seqlen = evicted
 

@@ -175,6 +175,8 @@ pub struct Node<K: ChildKeyType> {
     /// Per-page hash chain; None when the node was never hashed.
     /// TODO: Store raw digests and hex-encode only at the Python or storage boundary.
     pub hash_value: Option<Vec<String>>,
+    /// Whether this node is available through the direct external-cache linker.
+    pub external_cache_stored: bool,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
     /// Load-back anchor currently reading this node's host slots.
@@ -280,6 +282,12 @@ impl<K: ChildKeyType> Node<K> {
     /// Copy the component's device lock refcount from `src_node`.
     pub fn copy_device_lock_ref(&mut self, component_type: ComponentType, src_node: &Node<K>) {
         let slot = ValueSlotIdx::device(component_type);
+        self.set_lock_ref_(slot, src_node.lock_ref_(slot));
+    }
+
+    /// Copy the component's host lock refcount from `src_node`.
+    pub fn copy_host_lock_ref(&mut self, component_type: ComponentType, src_node: &Node<K>) {
+        let slot = ValueSlotIdx::host(component_type);
         self.set_lock_ref_(slot, src_node.lock_ref_(slot));
     }
 
@@ -390,6 +398,7 @@ impl<K: ChildKeyType> Node<K> {
             swa_uuid: None,
             swa_host_uuid: None,
             hash_value: Some(Vec::new()),
+            external_cache_stored: false,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
@@ -412,6 +421,7 @@ impl<K: ChildKeyType> Node<K> {
             swa_uuid: None,
             swa_host_uuid: None,
             hash_value: None,
+            external_cache_stored: false,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
@@ -747,6 +757,24 @@ pub enum TreeCoreRuntimeError {
     #[cfg(any(test, feature = "inspection"))]
     #[error("{0}")]
     InspectionAssertion(String),
+    /// Direct external-cache linking does not support this tree component.
+    #[error("external cache linker does not support component {component_type:?}")]
+    ExternalCacheLinkerUnsupportedComponent { component_type: ComponentType },
+    /// The existing device anchor must be on the restored endpoint's root path.
+    #[error("node {until_node_id} is not an ancestor of node {from_node_id}")]
+    ExternalCachePathNotAncestor {
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    },
+    /// External offload lifecycle calls must observe valid state transitions.
+    #[error(
+        "invalid external offload state for node {node_id}: stored={stored}, pending={pending_id:?}"
+    )]
+    InvalidExternalCacheOffloadState {
+        node_id: NodeId,
+        stored: bool,
+        pending_id: Option<NodeId>,
+    },
 }
 
 // Unigram and bigram child keys.

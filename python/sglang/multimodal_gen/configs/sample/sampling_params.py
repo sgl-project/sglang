@@ -17,8 +17,9 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
+from sglang.multimodal_gen.configs.utils import expand_path_fields
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
 logger = init_logger(__name__)
 

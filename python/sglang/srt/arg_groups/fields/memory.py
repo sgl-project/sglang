@@ -9,13 +9,14 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from typing import (
     Any,
     Dict,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -24,8 +25,7 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.arg_groups.choices import RADIX_EVICTION_POLICY_CHOICES
 
 
-@dataclasses.dataclass
-class Memory:
+class Memory(msgspec.Struct):
     """Namespace ``memory``."""
 
     _NS_PATH = "memory"
