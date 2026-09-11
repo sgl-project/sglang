@@ -242,10 +242,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         if self.token_allocation_ready(num_tokens):
             return True
-        # Preserve per-component recovery before moving the shared layout.
+        # Movement can open a short band, but cannot free occupied logical slots.
         if (
-            self.full_available_size() < num_tokens
-            or self.swa_available_size() < num_tokens
+            self._conserve_full_available_size() < num_tokens
+            or self._conserve_swa_available_size() < num_tokens
         ):
             return False
         if self._token_allocation_byte_shortfall(num_tokens) > 0:
