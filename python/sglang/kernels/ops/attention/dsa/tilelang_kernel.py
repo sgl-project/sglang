@@ -449,7 +449,6 @@ def sparse_attention_fwd_kernel_v1(
             Indices: T.Tensor(indices_shape, indices_dtype),
             Output: T.Tensor(o_shape, dtype),
         ):
-            # NOTE(kpham-sgl): LSE is unused here; Output is only a placeholder for it.
             body(Q, KV, Indices, Output, Output)
 
     return main
