@@ -11,6 +11,8 @@ from sglang.srt.lora.utils import (
     get_batch_token_counts,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import LoRABatchLayout
+from sglang.srt.utils.common import empty_device_cache
 
 
 class BaseLoRABackend(LoRABackendLmHeadMixing):
@@ -29,6 +31,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and
     # honor use_prefill_cuda_graph in prepare_lora_batch().
     supports_prefill_cuda_graph: bool = False
+    # Supporting backends must handle both eager execution and decode CUDA graphs.
+    supports_dp_attention: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
@@ -45,6 +49,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # Request/token caps for serving a batch from the static metadata.
         self.prefill_cuda_graph_max_bs: int | None = None
         self.prefill_cuda_graph_max_tokens: int | None = None
+        self._moe_cg_buffer_init_args: tuple[int, torch.dtype, object] | None = None
+        self._moe_cg_buffer_max_bs: int | None = None
 
     def reset_batch_state(self):
         """Idle-forward counterpart of prepare_lora_batch(): clears all
@@ -54,6 +60,22 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
+
+    def get_batch_info(
+        self, layout: LoRABatchLayout | None = None
+    ) -> Optional[LoRABatchInfo]:
+        """Return routing metadata for the requested token layout.
+
+        Backends that support multiple layouts override this method.
+        """
+        return self.batch_info
+
+    def prepare_global_lora_batch(self, forward_batch: ForwardBatch) -> None:
+        """Prepare routing for TP-global sections of a DP-attention forward."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} must implement "
+            "prepare_global_lora_batch() to support DP attention."
+        )
 
     def validate_lora_targets(
         self,
@@ -199,6 +221,13 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
+    def init_dp_attention_cuda_graph_batch_info(self, max_num_tokens: int) -> None:
+        """Allocate backend-specific TP-global metadata for decode graphs."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support DP attention "
+            "in the decode CUDA graph."
+        )
+
     def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
         """Allocate static LoRA batch metadata for the prefill CUDA graph,
         sized for the largest captured token bucket. Called before capture."""
@@ -231,6 +260,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         fused Triton kernel (TritonRunnerCoreWithLoRA) regardless of which
         dense LoRA backend is selected.
         """
+        self._moe_cg_buffer_init_args = (max_loras, compute_dtype, moe_layer)
+        self._moe_cg_buffer_max_bs = max_bs
+
         base = moe_layer.base_layer
         top_k = base.top_k
         qinfo = moe_layer._quant_info
@@ -297,6 +329,18 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
                 (max_bs,), -1, dtype=torch.int32, device=device
             ),
         }
+
+    def resize_cuda_graph_moe_buffers(self, max_bs: int) -> bool:
+        """Shrink the provisional pre-profile buffers to the captured token cap."""
+        if self._moe_cg_buffer_max_bs is None or max_bs >= self._moe_cg_buffer_max_bs:
+            return False
+
+        assert self._moe_cg_buffer_init_args is not None
+        max_loras, compute_dtype, moe_layer = self._moe_cg_buffer_init_args
+        self.moe_cg_buffers.clear()
+        empty_device_cache()
+        self.init_cuda_graph_moe_buffers(max_bs, max_loras, compute_dtype, moe_layer)
+        return True
 
     def _add_moe_lora_info(
         self, forward_batch: ForwardBatch, batch_info: LoRABatchInfo

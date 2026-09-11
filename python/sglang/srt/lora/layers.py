@@ -26,7 +26,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import LoRABatchLayout, get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -66,7 +66,7 @@ class BaseLayerWithLoRA(nn.Module):
         has LoRA batch metadata. batch_info is None on DP-attention idle
         forwards (see LoRAManager.prepare_lora_batch), so idle forwards take
         the base path."""
-        batch_info = self.lora_backend.batch_info
+        batch_info = self.lora_backend.get_batch_info()
         return (
             self.set_lora
             and batch_info is not None
@@ -225,7 +225,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Extra tokens (tokens >= vocab_size) are now handled efficiently
         in the backend's run_lora_a_embedding method.
         """
-        batch_info = self.lora_backend.batch_info
+        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.DP_LOCAL)
 
         # Get base embedding output
         # For tokens >= vocab_size, base_layer will clamp or handle them
@@ -340,7 +340,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         (chunked logprobs), _lm_head_pass_idx selects a precomputed
         per-pass batch_info.  Otherwise the full-pruned batch_info is used.
 
-        Returns None when no lm_head pruning applies (decode, no LoRA, etc.).
+        Returns None when no separate lm_head routing applies.
         """
         pass_idx = self.lora_backend._lm_head_pass_idx
         if (
@@ -362,9 +362,9 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                 raise RuntimeError(
                     f"lm_head LoRA input token count mismatch: got "
                     f"{num_tokens} tokens but lm_head_batch_info expects "
-                    f"{batch_info.expected_tokens}. This likely means "
-                    f"a pruning step in LogitsProcessor._get_pruned_states is "
-                    f"not reflected in get_lm_head_pruned_lens()."
+                    f"{batch_info.expected_tokens}. This likely means the "
+                    f"routing metadata does not match the rows gathered by "
+                    f"LogitsProcessor."
                 )
 
         return batch_info
@@ -807,11 +807,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
-            tp_rank = get_parallel().tp_rank
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.base_layer.tp_size
             )
-            input_parallel = splitted_input[tp_rank].contiguous()
+            input_parallel = splitted_input[self.base_layer.tp_rank].contiguous()
 
         lora_active = self.lora_active
         if lora_active:
@@ -1106,7 +1105,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """Build LoRAInfo for the current batch."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
 
-        batch_info = self.lora_backend.batch_info
+        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL)
+        assert batch_info is not None
 
         lora_ranks = batch_info.lora_ranks
         max_lora_rank = self.down_lora_a_weights.shape[2]
@@ -1159,7 +1159,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         2. After down projection, before final reduction
         """
         # DP-attention idle forward: no batch_info, run the base MoE path.
-        if self.lora_backend.batch_info is None:
+        if self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None:
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch

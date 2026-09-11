@@ -1547,6 +1547,8 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+        if self.lora_manager is not None and self.lora_manager.enable_dp_attention:
+            self.lora_manager.prepare_lora_batch(forward_batch)
 
         # Derive the LOCAL num_token_non_padded from the GLOBAL scalar. sharded is
         # cleared for DSACPLayerCommunicator-style CP (DSA, MLA): those flavors

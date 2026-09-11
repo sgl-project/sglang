@@ -75,6 +75,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    LoRABatchLayout,
     get_exec,
     get_forward,
     get_parallel,
@@ -662,6 +663,8 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        if get_parallel().enable_dp_attention:
+            get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
         # residual is None marks the first decoder layer, where the SP region
         # opens: re-evaluated per forward so a crash mid-loop cannot leak into
         # the next one.
@@ -864,6 +867,15 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        if get_parallel().enable_dp_attention:
+            get_forward().set(
+                "lora_batch_layout",
+                (
+                    LoRABatchLayout.TP_GLOBAL
+                    if self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
+                    else LoRABatchLayout.DP_LOCAL
+                ),
+            )
         if self._sp_variant is not None and get_forward().sp_active:
             return self._sp_variant.prepare_mlp(
                 hidden_states, residual, forward_batch, cache
