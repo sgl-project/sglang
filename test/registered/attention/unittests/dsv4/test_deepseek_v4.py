@@ -699,6 +699,23 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
 
 class TestDSV41SM90CandidateSlots(CustomTestCase):
+    def test_target_verify_uses_decode_compressor_path(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as module
+
+        backend = object.__new__(module.DeepseekV4AttnBackend)
+        backend._low_ratio_compress_decode = mock.Mock()
+        backend._low_ratio_compress_torch = mock.Mock()
+        layer = SimpleNamespace()
+        x = torch.empty(6, 1)
+        req = torch.empty(6, dtype=torch.int64)
+        pos = torch.empty(6, dtype=torch.int64)
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+        backend._low_ratio_compress(layer, x, req, pos, forward_batch)
+
+        backend._low_ratio_compress_decode.assert_called_once_with(layer, x, req, pos)
+        backend._low_ratio_compress_torch.assert_not_called()
+
     def test_ragged_verify_metadata_preserves_low_ratio_row_mapping(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as module
 

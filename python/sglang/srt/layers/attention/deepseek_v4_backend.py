@@ -2813,7 +2813,10 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
-        if forward_batch.forward_mode.is_decode():
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             self._low_ratio_compress_decode(layer, x, req, pos)
         else:
             self._low_ratio_compress_torch(
