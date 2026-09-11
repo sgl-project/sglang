@@ -74,10 +74,8 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolWritePlan,
 )
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_prefill_cp_round_robin_split,
+    can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
-    dsa_cp_round_robin_split_data,
-    dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     pad_dsa_cache_seqlens,
@@ -88,15 +86,10 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_position,
-)
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -104,13 +97,6 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 
-logger = logging.getLogger(__name__)
-
-# Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
-# per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
-# TP4: 16 heads, d_v=512, tail=64). Reads q_nope/q_rope directly (skips the
-# concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
-_DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
 
 if is_cuda():
@@ -120,24 +106,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
-
-
-def _all_gather_dsa_trtllm_fp8_kv(
-    forward_batch: ForwardBatch,
-    k: torch.Tensor,
-    k_rope: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    kv_lora_rank = k.shape[-1]
-    qk_rope_head_dim = k_rope.shape[-1]
-    kv_dtype = k.dtype
-    kv = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
-    kv = cp_all_gather_rerange_output(
-        kv,
-        get_parallel().attn_cp_size,
-        forward_batch,
-        torch.cuda.current_stream(),
-    ).view(kv_dtype)
-    return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
 
 
 def prepare_kv_for_attention(
@@ -152,7 +120,7 @@ def prepare_kv_for_attention(
     if (
         defer_materialization
         or not dsa_use_prefill_cp(forward_batch)
-        or not is_cp_v2_active(forward_batch)
+        or not is_cp_active(forward_batch)
     ):
         return k_nope, k_pe
     strategy = get_cp_strategy()
@@ -163,28 +131,6 @@ def prepare_kv_for_attention(
         k_nope,
         k_pe,
     )
-
-
-def materialize_full_kv_cp(
-    attn_mla,
-    forward_batch: ForwardBatch,
-    latent_cache: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_pe: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize generic CP KV, retaining the ROCm DSA fallback."""
-    if is_cp_v2_active(forward_batch):
-        strategy = get_cp_strategy()
-        assert strategy is not None
-        return strategy.materialize_full_mla_kv(
-            forward_batch,
-            attn_mla.attn_mqa,
-            k_nope,
-            k_pe,
-        )
-
-    assert is_hip(), "Legacy DSA KV materialization is HIP-only"
-    return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
 
 
 _is_hip = is_hip()
@@ -348,6 +294,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "triton",
     "trtllm",
     "intel_xpu",
 ]
@@ -1051,20 +998,12 @@ class DeepseekSparseAttnBackend(
                 )
                 kpool_inputs.full_seqlens_expanded = seqlens_expanded
 
-            if can_dsa_prefill_cp_round_robin_split(forward_batch):
-                if is_cp_v2_active(forward_batch):
-                    strategy = get_cp_strategy()
-                    seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
-                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                        strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
-                    )
-                else:
-                    seqlens_expanded = dsa_cp_round_robin_split_data(seqlens_expanded)
-                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                        dsa_cp_round_robin_split_q_seqs(
-                            extend_seq_lens_cpu, extend_seq_lens
-                        )
-                    )
+            if can_dsa_prefill_cp_interleave(forward_batch):
+                strategy = get_cp_strategy()
+                seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
+                extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
+                    strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
+                )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
@@ -1276,12 +1215,8 @@ class DeepseekSparseAttnBackend(
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
-            assert can_dsa_prefill_cp_round_robin_split(forward_batch)
-            split_per_token = (
-                get_cp_strategy().shard_local_tokens
-                if is_cp_v2_active(forward_batch)
-                else dsa_cp_round_robin_split_data
-            )
+            assert can_dsa_prefill_cp_interleave(forward_batch)
+            split_per_token = get_cp_strategy().shard_local_tokens
             ks = split_per_token(ks)
             ke = split_per_token(ke)
             token_to_batch_idx = split_per_token(token_to_batch_idx)
@@ -2181,32 +2116,6 @@ class DeepseekSparseAttnBackend(
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
-                # Triton prefill kernel reads q_nope/q_rope directly, skipping
-                # the concat (it splits q into main/tail internally anyway).
-                # Gated to gfx950 + the validated shape (16 heads, d_v=512,
-                # tail=64, topk=2048); everything else uses TileLang.
-                if (
-                    _DSA_TRITON_PREFILL
-                    and _IS_GFX95
-                    and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-                    and layer.tp_q_head_num == 16
-                    and layer.v_head_dim == 512
-                    and (layer.head_dim - layer.v_head_dim) == 64
-                    and page_table_1.shape[-1] == 2048
-                    and q_nope.shape[0] >= 512
-                ):
-                    from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
-                        triton_sparse_mla_fwd,
-                    )
-
-                    return triton_sparse_mla_fwd(
-                        q_nope=q_nope,
-                        q_rope=q_rope,
-                        kv=kv_cache,
-                        indices=page_table_1.unsqueeze(1),
-                        sm_scale=layer.scaling,
-                        d_v=layer.v_head_dim,
-                    )
                 # Cat-skip, as in forward_decode: q_rope=None means the caller
                 # already handed us the concatenated form and q_all is a
                 # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
@@ -2218,6 +2127,19 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "triton":
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+                triton_sparse_mla_fwd,
+            )
+
+            return triton_sparse_mla_fwd(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=layer.scaling,
+                d_v=layer.v_head_dim,
             )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -2514,6 +2436,15 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "triton":
+            return self._forward_triton_decode(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -3173,6 +3104,28 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
         )
 
+    def _forward_triton_decode(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        return triton_sparse_mla_decode_splitk(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv=kv_cache,
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+        )
+
     def _forward_intel_xpu_sparse_decode(
         self,
         q_nope: torch.Tensor,
@@ -3500,14 +3453,9 @@ class DeepseekSparseAttnBackend(
             else:
                 rope_positions = forward_batch.positions
                 if dsa_use_prefill_cp(forward_batch):
-                    if is_cp_v2_active(forward_batch):
-                        rope_positions = get_cp_strategy().shard_position_ids(
-                            rope_positions, forward_batch
-                        )
-                    else:
-                        rope_positions = cp_split_and_rebuild_position(
-                            forward_batch, rope_positions
-                        )
+                    rope_positions = get_cp_strategy().shard_position_ids(
+                        rope_positions, forward_batch
+                    )
 
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -3521,14 +3469,9 @@ class DeepseekSparseAttnBackend(
                     self.qk_rope_head_dim,
                 )
                 if save_kv_cache and dsa_use_prefill_cp(forward_batch):
-                    if is_cp_v2_active(forward_batch):
-                        k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
-                            forward_batch, k, k_rope
-                        )
-                    else:
-                        k, k_rope = _all_gather_dsa_trtllm_fp8_kv(
-                            forward_batch, k, k_rope
-                        )
+                    k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
+                        forward_batch, k, k_rope
+                    )
             merge_query = False
 
             # Save KV cache if requested

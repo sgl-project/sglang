@@ -101,6 +101,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
+    SenseNovaU1PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -181,6 +184,9 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SenseNovaU1SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
@@ -199,6 +205,11 @@ from sglang.multimodal_gen.configs.sample.wan import (
 from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
     ZImageTurboSamplingParams,
+)
+from sglang.multimodal_gen.configs.sensenova_u1 import (
+    SENSENOVA_U1_MODEL_IDS,
+    is_sensenova_u1_adapter_only_model,
+    is_sensenova_u1_model,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -458,17 +469,24 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
     _ensure_registry_initialized()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
+    if is_sensenova_u1_model(model_path):
+        return True
+
     if model_path in _MODEL_HF_PATH_TO_NAME:
         return True
 
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
         if registered_model_name in model_short_name:
             return True
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
@@ -502,6 +520,13 @@ def _get_config_info(
             "falling back to automatic detection."
         )
 
+    # SenseNova Hub IDs require an exact match, while local checkpoints are
+    # identified from their config metadata rather than their directory name.
+    if is_sensenova_u1_model(model_path):
+        for registered_hf_id in all_model_hf_paths:
+            if registered_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+                return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
         model_id = _MODEL_HF_PATH_TO_NAME[model_path]
@@ -511,6 +536,8 @@ def _get_config_info(
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
         if registered_model_name in model_short_name:
@@ -529,6 +556,8 @@ def _get_config_info(
     # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
@@ -660,6 +689,16 @@ def get_model_info(
         backend = Backend.AUTO
     elif isinstance(backend, str):
         backend = Backend.from_string(backend)
+
+    if is_sensenova_u1_adapter_only_model(model_path):
+        logger.error(
+            "SenseNova-U1 adapter-only checkpoint '%s' does not contain base "
+            "model weights or config. SenseNova-U1 adapters are not supported "
+            "yet; use the base checkpoint 'sensenova/SenseNova-U1.5-8B-MoT' "
+            "directly.",
+            model_path,
+        )
+        return None
 
     # Handle explicit diffusers backend
     if backend == Backend.DIFFUSERS:
@@ -978,6 +1017,13 @@ def _register_configs():
             lambda model_id: (
                 "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
             )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=SenseNovaU1SamplingParams,
+        pipeline_config_cls=SenseNovaU1PipelineConfig,
+        hf_model_paths=[
+            "sensenova/SenseNova-U1.5-8B-MoT",
         ],
     )
     register_configs(
@@ -1392,6 +1438,9 @@ def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
+    if is_sensenova_u1_model(model_path):
+        return "SenseNovaU1Pipeline"
+
     normalized_model_path = _normalize_hf_cache_path(model_path)
     model_short_name = get_model_short_name(normalized_model_path)
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():

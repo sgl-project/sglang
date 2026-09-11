@@ -1,7 +1,6 @@
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -115,10 +114,7 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
 
     # Strategy CP gathers latent KV in the backend's absorbed MLA path;
     # normal MHA would write rank-local KV against full cache locations.
-    # Protected platform CP retains its model-side materialization path.
-    if is_cp_v2_active(forward_batch) or (
-        not enable_cp_v2() and mla_use_prefill_cp(forward_batch)
-    ):
+    if is_cp_active(forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
@@ -158,10 +154,6 @@ def handle_attention_fa3(attn, forward_batch):
 
 def handle_attention_flashmla(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "flashmla")
-
-
-def handle_attention_cutlass_mla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "cutlass_mla")
 
 
 def handle_attention_fa4(attn, forward_batch):
@@ -236,7 +228,6 @@ def _can_use_triton_dense_fp8_prefill(attn, forward_batch) -> bool:
         and attn.v_head_dim == 128
         and attn.kv_lora_rank == 512
         and not get_parallel().dcp_enabled
-        and not mla_use_prefill_cp(forward_batch)
         and forward_batch.forward_mode.is_extend_without_speculative()
         and prefix_lens is not None
         and any(prefix_lens)
@@ -273,7 +264,6 @@ AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
 AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
-AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
 AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("tokenspeed_mla", handle_attention_tokenspeed_mla)
