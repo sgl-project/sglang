@@ -39,6 +39,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_platform,
     get_spec,
 )
 
@@ -1253,6 +1254,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
+        if replayssm_on and (batch_size != 1 or not get_platform().is_sm90):
+            # The runtime still uses BV=4, not the benchmark's best-BV sweep.
+            # On H20-3e, fused+ring wins at B=1 but regresses at B=4/16/64.
+            # Keep the new ring path conservative until other batch/architecture
+            # combinations are measured with the actual runtime configuration.
+            # The existing snapshot path and the separate CuTe path are unchanged.
+            return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim
             + layer.num_v_heads * layer.head_v_dim
