@@ -111,7 +111,17 @@ MODE = os.environ.get("AGENTIC_MODE", "replay")
 TP_SIZE = int(os.environ.get("AGENTIC_TP", "4"))
 EP_SIZE = int(os.environ.get("AGENTIC_EP_SIZE", "1"))
 CONCURRENCY = int(os.environ.get("AGENTIC_CONCURRENCY", "48"))
-NUM_CONVERSATIONS = int(os.environ.get("AGENTIC_NUM_CONVERSATIONS", "96"))
+# AgentX runs every concurrency for the same wall-clock duration, so its low
+# concurrencies simply serve fewer turns. This replay is closed-loop instead, so
+# one fixed corpus would take concurrency 1 about ten hours and concurrency 32
+# about twenty minutes. Sizing the corpus to the concurrency gives every point
+# the same per-channel work, which keeps the sweep comparable and each point
+# inside the job timeout; the floor keeps the lowest concurrencies from
+# measuring a handful of turns. The default lands on 96 at c48, which is what
+# the tp4 reference point below measured.
+NUM_CONVERSATIONS = int(
+    os.environ.get("AGENTIC_NUM_CONVERSATIONS") or max(8, 2 * CONCURRENCY)
+)
 # AgentX runs to a wall-clock duration; sglang's replay is closed-loop, so the
 # run is bounded by conversations x turns instead. 16 turns already carries each
 # trajectory past 80k tokens of context, which is where this config is aimed.
