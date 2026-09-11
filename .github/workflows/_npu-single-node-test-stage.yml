@@ -67,6 +67,10 @@ on:
         description: 'If true, delegate test execution to scripts/run_tests_with_coverage.sh instead of running via run_suite.py directly'
         type: boolean
         default: false
+      upload_test_logs:
+        description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
+        type: boolean
+        default: false
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -450,7 +454,7 @@ jobs:
           exit ${test_exit_code}
 
       - name: Upload test logs
-        if: always() && inputs.use_coverage_runner != 'true'
+        if: always() && inputs.use_coverage_runner != 'true' && inputs.upload_test_logs == true
         uses: actions/upload-artifact@v7
         with:
           name: selected-test-logs-${{ inputs.test_suite }}-part${{ matrix.partition }}

@@ -25,6 +25,9 @@ from pathlib import Path
 import regex as re
 
 # ==================== Configuration ====================
+BASE_DIR = Path(__file__).resolve().parent
+SOURCE_PACKAGE_REL = "sglang"
+
 # Repository name: used for filtering and path normalization
 # vllm-ascend: "vllm_ascend"  |  sglang: "sglang"
 REPO_NAME = "sglang"
@@ -36,6 +39,32 @@ REPO_NAME = "sglang"
 #   -> PRODUCT_PREFIX = "python/sglang/"
 # After stripping this prefix, both sides produce the same relative path (e.g. srt/models/qwen3_vl.py)
 PRODUCT_PREFIX = "python/sglang/"
+
+
+def resolve_source_path(source_dir: Path, filename: str) -> Path | None:
+    """
+    Resolve a product-code relative path (e.g. 'srt/models/qwen3_vl.py') to an actual source file.
+
+    Fixed structure: <source_dir>/<SOURCE_PACKAGE_REL>/<filename>
+    (e.g. covstub/sglang/srt/models/qwen3_vl.py)
+    Fallback: <source_dir>/<filename> (when source_dir already points at the package root)
+
+    Args:
+        source_dir: Source code directory (e.g. covstub)
+        filename: Product-code relative path (e.g. 'srt/models/qwen3_vl.py')
+
+    Returns:
+        Path object if found, None otherwise
+    """
+    candidates = [
+        source_dir / SOURCE_PACKAGE_REL / filename,
+        source_dir / filename,
+    ]
+    for source_path in candidates:
+        if source_path.exists():
+            return source_path
+    return None
+
 
 # Directory prefix of test case folders under coverage data dir.
 # - vllm-ascend: "tests__" (e.g. tests__e2e__pull_request__...)
@@ -148,7 +177,9 @@ def _get_deleted_test_files_from_pr(diff_file: str, test_case_map: dict) -> list
 class CoverageSelector:
     """Coverage-based test selector"""
 
-    def __init__(self, coverage_data_dir: str = None, source_dir: str = None):
+    def __init__(
+        self, coverage_data_dir: str | None = None, source_dir: str | None = None
+    ):
         """
         Args:
             coverage_data_dir: Coverage data directory (only needed for building map)
@@ -168,6 +199,11 @@ class CoverageSelector:
         - sglang: <test_case>/coverage.* (coverage files directly under test case dir)
         """
         test_cases = []
+        if not self.coverage_data_dir or not self.coverage_data_dir.exists():
+            print(
+                f"  Warning: Coverage data directory not found: {self.coverage_data_dir}"
+            )
+            return test_cases
         for item in self.coverage_data_dir.iterdir():
             if not item.is_dir():
                 continue
@@ -192,12 +228,6 @@ class CoverageSelector:
     def normalize_test_name(test_name: str) -> str:
         """
         Convert test case directory name to standard script name format.
-
-        vllm-ascend:
-        - tests__e2e__... -> tests/e2e/... (file-level) -> tests/e2e/....py (with .py suffix)
-        - tests__e2e__...--test_foo -> tests/e2e/...::test_foo (function-level, no .py suffix)
-        - cpu-ut -> cpu-ut (unchanged)
-
         sglang (GitHub Actions encoded dir name: /__w/sglang/sglang/test/... -> ____w__sglang__sglang__test__...):
         - ____w__sglang__sglang__test__registered__npu__xxx__test_foo.py
           -> test/registered/npu/xxx/test_foo.py (file-level)
@@ -410,6 +440,31 @@ class CoverageSelector:
             pass
         return docstring_lines
 
+    @staticmethod
+    def _get_blank_lines(filepath: str) -> set[int]:
+        """
+        Get line numbers of all blank/whitespace-only lines in file.
+
+        Coverage arc data can record blank lines as control-flow nodes
+        (e.g., block boundaries after if/return statements). These lines
+        are not executable and must be filtered out to avoid false matches.
+
+        Args:
+            filepath: Source file path
+
+        Returns:
+            Set of line numbers that are blank or whitespace-only
+        """
+        blank_lines = set()
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    if not line.strip():
+                        blank_lines.add(line_no)
+        except Exception:
+            pass
+        return blank_lines
+
     def _filter_noise_lines(self, filepath: str, lines: set[int]) -> set[int]:
         """
         Filter out invalid noise lines from coverage data:
@@ -417,6 +472,7 @@ class CoverageSelector:
         2. Function definition lines (def line only)
         3. Class definition lines
         4. Docstring lines
+        5. Blank/whitespace-only lines
 
         Args:
             filepath: Source file path
@@ -434,8 +490,9 @@ class CoverageSelector:
             def_lines = self._get_function_def_lines(filepath)
             class_lines = self._get_class_def_lines(filepath)
             docstring_lines = self._get_docstring_lines(filepath)
+            blank_lines = self._get_blank_lines(filepath)
             self._noise_lines_cache[filepath] = (
-                import_lines | def_lines | class_lines | docstring_lines
+                import_lines | def_lines | class_lines | docstring_lines | blank_lines
             )
 
         return lines - self._noise_lines_cache[filepath]
@@ -443,6 +500,9 @@ class CoverageSelector:
     def _resolve_source_file(self, filename: str) -> Path | None:
         """
         Resolve source file path from relative filename.
+
+        Fixed structure: <source_dir>/<SOURCE_PACKAGE_REL>/<filename>
+        (e.g. covstub/sglang/srt/models/qwen3_vl.py)
 
         Args:
             filename: Relative file path (e.g., 'srt/models/qwen3_vl.py')
@@ -452,18 +512,7 @@ class CoverageSelector:
         """
         if not self.source_dir:
             return None
-
-        # vllm-ascend: source_dir/vllm_ascend/xxx.py
-        # sglang: source_dir/python/sglang/xxx.py  OR  source_dir/sglang/xxx.py (flat covstub layout)
-        candidates = [
-            self.source_dir / PRODUCT_PREFIX.rstrip("/") / filename,
-            self.source_dir / PRODUCT_PREFIX.rstrip("/").split("/")[-1] / filename,
-            self.source_dir / filename,
-        ]
-        for source_path in candidates:
-            if source_path.exists():
-                return source_path
-        return None
+        return resolve_source_path(self.source_dir, filename)
 
     def build_test_case_map(self) -> dict:
         """Build test case -> covered files mapping (with line numbers)"""
@@ -526,7 +575,7 @@ class CoverageSelector:
                 "line_count": data["line_count"],
             }
 
-        with open(output_path, "w", encoding="utf-8") as f:
+        with open(output_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(serializable_map, f, indent=2, ensure_ascii=False)
         print(f"\nTest case mapping saved to: {output_path}")
 
@@ -553,6 +602,15 @@ class CodeChangeDetector:
         self.source_dir = Path(source_dir)
         self.file_hashes = {}
 
+    def _product_code_root(self) -> Path:
+        """
+        Product code root: <source_dir>/<SOURCE_PACKAGE_REL> (e.g. covstub/sglang).
+
+        Hash scanning uses this root so relative paths (e.g. srt/xxx.py) match
+        the keys in test_case_map.json (which are relative to python/sglang/).
+        """
+        return self.source_dir / SOURCE_PACKAGE_REL
+
     def compute_file_hash(self, filepath: str) -> str:
         """Calculate MD5 hash of file"""
         hasher = hashlib.md5()
@@ -565,10 +623,14 @@ class CodeChangeDetector:
             return ""
 
     def scan_source_files(self) -> dict[str, str]:
-        """Scan source files, compute hashes"""
+        """Scan product code files, compute hashes"""
         self.file_hashes = {}
-        for py_file in self.source_dir.rglob("*.py"):
-            rel_path = py_file.relative_to(self.source_dir).as_posix()
+        root = self._product_code_root()
+        if not root.exists():
+            print(f"  Warning: Product code root not found: {root}")
+            return self.file_hashes
+        for py_file in root.rglob("*.py"):
+            rel_path = py_file.relative_to(root).as_posix()
             self.file_hashes[rel_path] = self.compute_file_hash(str(py_file))
         return self.file_hashes
 
@@ -577,8 +639,13 @@ class CodeChangeDetector:
         changed_files = {}
         current_hashes = {}
 
-        for py_file in self.source_dir.rglob("*.py"):
-            rel_path = py_file.relative_to(self.source_dir).as_posix()
+        root = self._product_code_root()
+        if not root.exists():
+            print(f"  Warning: Product code root not found: {root}")
+            return changed_files
+
+        for py_file in root.rglob("*.py"):
+            rel_path = py_file.relative_to(root).as_posix()
             current_hashes[rel_path] = self.compute_file_hash(str(py_file))
 
         baseline_path = self.source_dir / ".file_hashes.json"
@@ -662,8 +729,8 @@ class CodeChangeDetector:
                     old_count = int(match.group(2)) if match.group(2) else 1
                     # Rule: start line = old_start + 2, end line = old_start + old_count - 3
                     start_line = old_start + 2
-                    end_line = old_start + old_count - 3
-                    if end_line <= start_line:
+                    end_line = old_start + old_count - 4
+                    if end_line < start_line:
                         end_line = old_start + old_count
                     # Collect all lines in hunk, check if there are new lines (starting with +)
                     hunk_lines = []
@@ -684,7 +751,6 @@ class CodeChangeDetector:
                     )
                     if not has_addition:
                         start_line += 1
-                        end_line -= 1
                     for line_no in range(start_line, end_line + 1):
                         changed_files[current_file].add(line_no)
 
@@ -952,30 +1018,10 @@ class TestSelector:
             changed_functions = {}  # {filepath: {func_name: Set[linenos]}}
 
             for changed_file, changed_lines in normalized_changed.items():
-                possible_paths = [
-                    Path(source_dir) / changed_file,
-                    Path(source_dir) / REPO_NAME / changed_file,
-                    Path(source_dir) / PRODUCT_PREFIX.rstrip("/") / changed_file,
-                    Path(source_dir) / "covstub" / REPO_NAME / changed_file,
-                    Path(source_dir) / changed_file.replace("/", os.sep),
-                    Path(source_dir) / REPO_NAME / changed_file.replace("/", os.sep),
-                    Path(source_dir)
-                    / PRODUCT_PREFIX.rstrip("/")
-                    / changed_file.replace("/", os.sep),
-                    Path(source_dir)
-                    / "covstub"
-                    / REPO_NAME
-                    / changed_file.replace("/", os.sep),
-                ]
-
-                source_file = None
-                for p in possible_paths:
-                    if p.exists():
-                        source_file = str(p)
-                        break
-
-                if not source_file:
+                source_path = resolve_source_path(Path(source_dir), changed_file)
+                if not source_path:
                     continue
+                source_file = str(source_path)
 
                 # Get function mapping for changed lines
                 line_to_function = FunctionParser.get_lines_functions(
@@ -1005,31 +1051,12 @@ class TestSelector:
 
                         for func_name in func_to_lines:
                             # Get full line range of this function
-                            possible_paths = [
-                                Path(source_dir) / changed_file,
-                                Path(source_dir) / REPO_NAME / changed_file,
-                                Path(source_dir)
-                                / PRODUCT_PREFIX.rstrip("/")
-                                / changed_file,
-                                Path(source_dir) / "covstub" / REPO_NAME / changed_file,
-                                Path(source_dir) / changed_file.replace("/", os.sep),
-                                Path(source_dir)
-                                / REPO_NAME
-                                / changed_file.replace("/", os.sep),
-                                Path(source_dir)
-                                / "covstub"
-                                / REPO_NAME
-                                / changed_file.replace("/", os.sep),
-                            ]
-
-                            source_file = None
-                            for p in possible_paths:
-                                if p.exists():
-                                    source_file = str(p)
-                                    break
-
-                            if not source_file:
+                            source_path = resolve_source_path(
+                                Path(source_dir), changed_file
+                            )
+                            if not source_path:
                                 continue
+                            source_file = str(source_path)
 
                             # Filter out import statement lines (for display)
                             if enable_skip_imports:
@@ -1135,30 +1162,10 @@ class TestSelector:
             changed_functions = {}  # {filepath: {func_name: Set[linenos]}}
 
             for changed_file, changed_lines in normalized_changed.items():
-                possible_paths = [
-                    Path(source_dir) / changed_file,
-                    Path(source_dir) / REPO_NAME / changed_file,
-                    Path(source_dir) / PRODUCT_PREFIX.rstrip("/") / changed_file,
-                    Path(source_dir) / "covstub" / REPO_NAME / changed_file,
-                    Path(source_dir) / changed_file.replace("/", os.sep),
-                    Path(source_dir) / REPO_NAME / changed_file.replace("/", os.sep),
-                    Path(source_dir)
-                    / PRODUCT_PREFIX.rstrip("/")
-                    / changed_file.replace("/", os.sep),
-                    Path(source_dir)
-                    / "covstub"
-                    / REPO_NAME
-                    / changed_file.replace("/", os.sep),
-                ]
-
-                source_file = None
-                for p in possible_paths:
-                    if p.exists():
-                        source_file = str(p)
-                        break
-
-                if not source_file:
+                source_path = resolve_source_path(Path(source_dir), changed_file)
+                if not source_path:
                     continue
+                source_file = str(source_path)
 
                 # Get function mapping for changed lines
                 line_to_function = FunctionParser.get_lines_functions(
@@ -1421,8 +1428,8 @@ def main():
     parser.add_argument(
         "--source-dir",
         "-s",
-        default="covstub",
-        help="Source code directory (default: covstub)",
+        required=True,
+        help="Source code directory (required, passed from outside; relative paths resolve against script dir)",
     )
     parser.add_argument(
         "--map-file",
@@ -1433,8 +1440,11 @@ def main():
     parser.add_argument(
         "--coverage-dir",
         "-c",
-        default="coverage",
-        help="Coverage data directory (default: ./coverage)",
+        default=None,
+        help=(
+            "Coverage data directory (only needed when building the map; relative paths "
+            "resolve against script dir)"
+        ),
     )
     parser.add_argument(
         "--build-map", "-b", action="store_true", help="Rebuild test case mapping"
@@ -1493,16 +1503,35 @@ def main():
     args.enable_function_match = not args.disable_function_match
     args.enable_file_match = not args.disable_file_match
 
-    # 1. Build or load test case mapping
-    selector = CoverageSelector(args.coverage_dir, args.source_dir)
+    # Resolve relative paths against BASE_DIR (fixed structure), keep absolute paths as-is
+    def _resolve_abs(base: Path, p: str) -> Path:
+        path = Path(p)
+        return path if path.is_absolute() else base / path
 
-    if args.build_map or not Path(args.map_file).exists():
+    coverage_dir = (
+        _resolve_abs(BASE_DIR, args.coverage_dir) if args.coverage_dir else None
+    )
+    source_dir = _resolve_abs(BASE_DIR, args.source_dir)
+    map_file = _resolve_abs(BASE_DIR, args.map_file)
+
+    # 1. Build or load test case mapping
+    selector = CoverageSelector(
+        str(coverage_dir) if coverage_dir else None, str(source_dir)
+    )
+
+    if args.build_map or not map_file.exists():
+        # Coverage data dir is required only when building the map
+        if not coverage_dir:
+            print(
+                "Error: --coverage-dir is required when building the test case map (no map file found)"
+            )
+            exit(1)
         print("\n=== Building Test Case Mapping ===")
         selector.build_test_case_map()
-        selector.save_map(args.map_file)
+        selector.save_map(str(map_file))
     else:
         print("\n=== Loading Test Case Mapping ===")
-        selector.load_map(args.map_file)
+        selector.load_map(str(map_file))
 
     # If only need to generate map file, exit directly
     if args.build_map and not args.github_pr:
@@ -1511,7 +1540,7 @@ def main():
 
     # 2. Parse code changes
     print("\n=== Parsing Code Changes ===")
-    change_detector = CodeChangeDetector(args.source_dir)
+    change_detector = CodeChangeDetector(str(source_dir))
 
     diff_file = None
     if args.github_pr:
@@ -1662,7 +1691,7 @@ def main():
             selected, expand_reason = test_selector.select_tests(
                 normal_files,
                 min_affected_lines=args.min_affected,
-                source_dir=args.source_dir,
+                source_dir=str(source_dir),
                 enable_line_match=args.enable_line_match,
                 enable_function_match=args.enable_function_match,
                 enable_file_match=args.enable_file_match,
@@ -1676,7 +1705,7 @@ def main():
             rename_selected, rename_expand = test_selector.select_tests(
                 rename_files,
                 min_affected_lines=args.min_affected,
-                source_dir=args.source_dir,
+                source_dir=str(source_dir),
                 enable_line_match=False,  # Disable line match for renames
                 enable_function_match=False,  # Disable function match for renames
                 enable_file_match=True,  # Enable file match for renames
@@ -1745,11 +1774,12 @@ def main():
     else:
         print("\n=== No Test Cases Recommended ===")
 
-    # Always write output file (even if empty)
-    with open("recommended_pytest_paths.txt", "w", encoding="utf-8") as f:
+    # Always write output file (even if empty), next to the script
+    output_file = BASE_DIR / "recommended_pytest_paths.txt"
+    with open(output_file, "w", encoding="utf-8") as f:
         for test_name in test_names:
             f.write(test_name + "\n")
-    print("\nResults saved to: recommended_pytest_paths.txt")
+    print(f"\nResults saved to: {output_file}")
 
 
 if __name__ == "__main__":

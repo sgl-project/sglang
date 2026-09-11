@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-analyze_failure_report.py  (NEW FILE - add to .github/workflows/scripts/)
+analyze_failure_report.py
 
 Cross-reference CI test failures with test recommendations.
 
@@ -51,14 +51,14 @@ def clean_line(line):
 # ============================================================
 
 
-# Match pytest-style FAILED/ERROR lines with either tests/ (vllm) or test/ (sglang) prefix.
-FAILED_PATTERN = re.compile(r"^(?:FAILED|ERROR)\s+((?:tests?)/\S+?\.py(?:::\S+?)?)\s")
+# Match pytest-style FAILED/ERROR lines with the test/ prefix (sglang convention).
+FAILED_PATTERN = re.compile(r"^(?:FAILED|ERROR)\s+(test/\S+?\.py(?:::\S+?)?)\s")
 SUMMARY_SEPARATOR_PATTERN = re.compile(r"^=+\s")
 CPU_LOG_PATH_PATTERN = re.compile(r"(?:^|-)cpu-\d+card(?:-|$)", re.IGNORECASE)
 CPU_FAILURE_LABEL = "cpu-ut"
 
-# ci_utils.py summary: "✗ FAILED:" section lines like "  srt/test_xxx.py (exit code 1)".
-# Paths are relative to the test/ directory (no leading "test/" prefix).
+# ci_utils.py summary: "✗ FAILED:" section lines like "  /path/to/test/registered/test_xxx.py (exit code 1)".
+# Paths are absolute (from os.path.abspath in run_suite.py's glob).
 CI_UTILS_FAILED_PATTERN = re.compile(r"^[✗X]\s*FAILED:\s*$")
 CI_UTILS_FAILED_LINE_PATTERN = re.compile(r"^\s{2,}(\S+\.py)\s*\(")
 
@@ -104,11 +104,14 @@ def _extract_from_ci_utils_summary(lines):
             break
         match = CI_UTILS_FAILED_LINE_PATTERN.match(line)
         if match:
-            # Paths in this section are relative to test/ (e.g. "srt/test_xxx.py").
-            # Normalize to "test/srt/test_xxx.py" for consistent matching.
+            # Paths in this section are absolute (e.g. "/__w/sglang/sglang/test/registered/test_xxx.py").
+            # Strip everything up to and including the "/sglang/" marker to get
+            # the repo-relative form (e.g. "test/registered/test_xxx.py").
             path = match.group(1)
-            if not path.startswith("test/"):
-                path = "test/" + path
+            marker = "/sglang/"
+            idx = path.rfind(marker)
+            if idx >= 0:
+                path = path[idx + len(marker) :]
             failed.append(path)
     return failed
 
@@ -224,8 +227,8 @@ def extract_failed_from_logs(log_dir):
 def read_recommended(recommendations_file):
     """
     recommended_pytest_paths.txt contains one pytest path per line, e.g.:
-        tests/ops/test_matmul.py::test_bf16
-        tests/layers/test_attention.py
+        test/ops/test_matmul.py::test_bf16
+        test/layers/test_attention.py
     """
     path = Path(recommendations_file)
     if not path.exists():
@@ -257,9 +260,9 @@ def normalize_test_path(test_path):
 def match_failed_vs_recommended(failed, recommended):
     """
     Two-level matching:
-      Level 1 - File-level: recommended "tests/foo.py" (no function)
-                  matches failed "tests/foo.py::anything"
-      Level 2 - Exact: "tests/foo.py::test_bar" in both lists
+      Level 1 - File-level: recommended "test/foo.py" (no function)
+                  matches failed "test/foo.py::anything"
+      Level 2 - Exact: "test/foo.py::test_bar" in both lists
 
     Returns {"hit": [...], "miss": [...], "untested": [...]}
       hit:       failed AND recommended
@@ -452,17 +455,11 @@ def main():
         description="Cross-reference CI test failures with test recommendations"
     )
     parser.add_argument(
-        "--log-dir", required=True, help="Directory containing CI .txt log files"
+        "--log-dir", required=True, help="Directory containing CI .log files"
     )
     parser.add_argument(
         "--recommendations-file",
         help="Path to recommended_pytest_paths.txt",
-    )
-    parser.add_argument(
-        "--hitest-file",
-        dest="recommendations_file",
-        default=argparse.SUPPRESS,
-        help="(Deprecated alias) same as --recommendations-file",
     )
     parser.add_argument(
         "--output",
@@ -475,16 +472,10 @@ def main():
         choices=["committed", "output", "none"],
         help="Where recommendations came from",
     )
-    parser.add_argument(
-        "--hitest-source",
-        dest="recommendations_source",
-        default=argparse.SUPPRESS,
-        help="(Deprecated alias) same as --recommendations-source",
-    )
     args = parser.parse_args()
 
     if not args.recommendations_file:
-        parser.error("one of --recommendations-file or --hitest-file is required")
+        parser.error("--recommendations-file is required")
 
     # For Windows console: force UTF-8 if possible
     if sys.platform == "win32":

@@ -112,6 +112,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      upload_test_logs: true
     secrets: inherit
 
   base-b-test-2-npu-a3:
@@ -124,6 +125,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      upload_test_logs: true
     secrets: inherit
 
   base-b-test-4-npu-a3:
@@ -137,6 +139,7 @@ jobs:
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
       partitions: '{"size":2,"arr":[0, 1]}'
+      upload_test_logs: true
     secrets: inherit
 
   base-b-test-8-npu-a3:
@@ -149,6 +152,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      upload_test_logs: true
     secrets: inherit
 
   base-b-test-16-npu-a3:
@@ -161,6 +165,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
+      upload_test_logs: true
     secrets: inherit
 
   multimodal-gen-test-1-npu-a3:
@@ -304,6 +309,7 @@ jobs:
       install_sglang_deps: true
       device_type_for_deps: 'a3'
       partitions: '{"size":2,"arr":[0,1]}'
+      upload_test_logs: true
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
@@ -317,6 +323,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      upload_test_logs: true
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
@@ -330,6 +337,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      upload_test_logs: true
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
@@ -344,6 +352,7 @@ jobs:
       install_sglang_deps: true
       device_type_for_deps: 'a3'
       test_timeout_minutes: '180'
+      upload_test_logs: true
 
 
   # ==================== Recommend Tests from Coverage ==================== #
