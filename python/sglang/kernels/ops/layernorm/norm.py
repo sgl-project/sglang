@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.opauto import can_use_or_demote
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -99,15 +100,18 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
 @torch.compiler.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
-    if head_dim not in [64, 128, 256, 512, 1024]:
-        logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
-        return False
-    try:
-        _jit_qknorm_module(head_dim, dtype)
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to load JIT QK-Norm kernel: {e}")
-        return False
+    def _probe() -> bool:
+        if head_dim not in [64, 128, 256, 512, 1024]:
+            logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
+            return False
+        try:
+            _jit_qknorm_module(head_dim, dtype)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load JIT QK-Norm kernel: {e}")
+            return False
+
+    return can_use_or_demote("layernorm.qknorm", _probe, backend="jit")
 
 
 @debug_kernel_api

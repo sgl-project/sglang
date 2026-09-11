@@ -95,14 +95,39 @@ if _is_cuda:
         (jit_fn if _jit_act_supported(out) else sgl_fn)(input, out)
         return out
 
+    def _native_act_and_mul(act_fn, input: torch.Tensor, out=None) -> torch.Tensor:
+        d = input.shape[-1] // 2
+        result = act_fn(input[..., :d]) * input[..., d:]
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+
+    def _prefer_native_act(op_id: str) -> bool:
+        # Turing / missing AOT cubins: OpAuto cold policy prefers torch over
+        # doomed CUDA JIT and incomplete sgl_kernel wheels.
+        from sglang.kernels.opauto import should_prefer_native_aot_fallback
+
+        return should_prefer_native_aot_fallback(op_id)
+
     def silu_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
+        if _prefer_native_act("activation.silu_and_mul"):
+            return _native_act_and_mul(F.silu, input, out)
         return _act_and_mul(_jit_silu_and_mul, _sgl_silu_and_mul, input, out)
 
     def gelu_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
+        if _prefer_native_act("activation.gelu_and_mul"):
+            return _native_act_and_mul(F.gelu, input, out)
         return _act_and_mul(_jit_gelu_and_mul, _sgl_gelu_and_mul, input, out)
 
     def gelu_tanh_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
-        return _act_and_mul(_jit_gelu_tanh_and_mul, _sgl_gelu_tanh_and_mul, input, out)
+        if _prefer_native_act("activation.gelu_tanh_and_mul"):
+            return _native_act_and_mul(
+                lambda t: F.gelu(t, approximate="tanh"), input, out
+            )
+        return _act_and_mul(
+            _jit_gelu_tanh_and_mul, _sgl_gelu_tanh_and_mul, input, out
+        )
 
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul

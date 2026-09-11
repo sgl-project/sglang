@@ -551,7 +551,15 @@ class BaseFusedOp(nn.Module, ABC):
         # 4) Optimized kernel backends by priority.
         candidates = self._auto_backend_candidates()
         if candidates:
-            if self._defined_method("backend_eligible") is not None:
+            from sglang.kernels.opauto import get_policy, is_enabled
+
+            if is_enabled():
+                candidates = get_policy().pick(
+                    self.op or type(self).__name__,
+                    candidates,
+                    priority=self.priority,
+                )
+            if candidates and self._defined_method("backend_eligible") is not None:
                 # Per-call shape/dtype gates: keep selection dynamic.
                 self._dynamic_backend_candidates = candidates
                 return self._forward_backend_dynamic
@@ -568,7 +576,16 @@ class BaseFusedOp(nn.Module, ABC):
 
     def _forward_backend_dynamic(self, *args, **kwargs):
         """Per-call backend selection for ops with input-dependent gates."""
-        for backend in self._dynamic_backend_candidates:
+        from sglang.kernels.opauto import get_policy, is_enabled
+
+        candidates = self._dynamic_backend_candidates
+        if is_enabled():
+            candidates = get_policy().pick(
+                self.op or type(self).__name__,
+                candidates,
+                priority=self.priority,
+            )
+        for backend in candidates:
             if self.backend_eligible(backend, *args, **kwargs):
                 return getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
         method = self._platform_method(_platform_key())

@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.opauto import can_use_or_demote
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -137,15 +138,19 @@ def can_use_fused_inplace_qknorm_rope(
     pack_kv: bool = False,
     cache_has_full_width: bool = False,
 ) -> bool:
-    return _can_use_fused_qknorm_rope(
-        head_dim,
-        rope_dim,
-        is_neox,
-        dtype,
-        cache_dtype,
-        round_norm_before_rope,
-        pack_kv,
-        cache_has_full_width,
+    return can_use_or_demote(
+        "diffusion.fused_inplace_qknorm_rope",
+        lambda: _can_use_fused_qknorm_rope(
+            head_dim,
+            rope_dim,
+            is_neox,
+            dtype,
+            cache_dtype,
+            round_norm_before_rope,
+            pack_kv,
+            cache_has_full_width,
+        ),
+        backend="jit",
     )
 
 
