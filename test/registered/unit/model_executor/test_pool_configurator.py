@@ -29,8 +29,8 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
     """Mock GPU-dependent functions for CPU-only testing.
 
     swa_eviction_interval pins SGLANG_SWA_EVICTION_INTERVAL (decode batches between
-    SWA evictions) to a small value so the chunk-cap formula stays hand-computable;
-    only SWAChunkCapPoolConfigurator reads it.
+    SWA evictions) to a small value so the request-budget formula stays hand-computable;
+    only SWARequestPoolConfigurator reads it.
     """
     from sglang.srt.environ import envs
 
@@ -49,10 +49,14 @@ def _publish_config(testcase, **fields):
     case cannot leave a partial publish for a later file in a monolithic run.
     """
     from sglang.srt.runtime_context import get_context
+    from sglang.srt.server_args import ServerArgs
 
-    override = get_context().override_server_args(**fields)
+    override = get_context().override_server_args()
     override.install()
     testcase.addCleanup(override.restore)
+    server_args = ServerArgs(model_path="dummy", **fields)
+    server_args.resolve_once()
+    get_context().set_server_args(server_args)
 
 
 def _make_model_runner(
@@ -70,6 +74,7 @@ def _make_model_runner(
     swa_head_dim=None,
     swa_v_head_dim=None,
     swa_full_tokens_ratio=0.5,
+    swa_sizing_policy="auto",
     page_size=1,
     mambaish_config=None,
     disable_radix_cache=False,
@@ -139,6 +144,7 @@ def _make_model_runner(
         testcase,
         max_total_tokens=None,
         swa_full_tokens_ratio=swa_full_tokens_ratio,
+        swa_sizing_policy=swa_sizing_policy,
         page_size=page_size,
         disable_radix_cache=disable_radix_cache,
         chunked_prefill_size=chunked_prefill_size,
@@ -439,7 +445,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             int(config.full_max_total_num_tokens * 0.5),
         )
 
-    def test_chunk_cache_cap_accounts_for_spec_topk_page_rounding(self):
+    def test_request_budget_accounts_for_spec_topk_page_rounding(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -447,7 +453,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
+            swa_full_tokens_ratio=None,
             disable_radix_cache=True,
             chunked_prefill_size=4,
             sliding_window_size=8,
@@ -474,7 +480,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 104)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
+    def test_request_budget_doubles_decode_alloc_for_spec_v2_overlap(self):
         # Overlap on -> spec-v2: decode_alloc = 2 * get_alloc_len_per_decode =
         # 2 * max(steps*topk, max_draft) = 2 * max(6, 5) = 12 (page=1, since the
         # v2 allocator does not support page>1 & topk>1). trailing = 8 + 20 +
@@ -487,7 +493,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
+            swa_full_tokens_ratio=None,
             disable_radix_cache=True,
             chunked_prefill_size=4,
             sliding_window_size=8,
@@ -510,7 +516,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 91)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_accounts_for_draft_swa_layers(self):
+    def test_request_budget_accounts_for_draft_swa_layers(self):
         """Draft SWA tensors consume the same fixed-capacity pool as target SWA."""
         available = 1_000_000
         mr = _make_model_runner(
@@ -519,6 +525,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
+            swa_full_tokens_ratio=None,
             disable_radix_cache=True,
             chunked_prefill_size=4,
             sliding_window_size=8,
@@ -544,7 +551,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
-    def test_chunk_cache_cap_drops_prefill_for_disagg_decode(self):
+    def test_request_budget_drops_prefill_for_disagg_decode(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -552,7 +559,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
+            swa_full_tokens_ratio=None,
             disable_radix_cache=True,
             chunked_prefill_size=1000,
             sliding_window_size=4,
@@ -572,7 +579,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 100)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_prefill_holds_window_plus_chunk(self):
+    def test_request_budget_prefill_holds_window_plus_chunk(self):
         # Non-decode (prefill) engine: each request keeps its decode footprint, while
         # in-flight chunked-prefill tokens are a global batch budget -- two chunks
         # under overlap.
@@ -583,7 +590,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
+            swa_full_tokens_ratio=None,
             disable_radix_cache=True,
             chunked_prefill_size=16,
             sliding_window_size=8,
@@ -606,7 +613,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 76)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_disagg_decode_pre_alloc(self):
+    def test_request_budget_disagg_decode_pre_alloc(self):
         # decode adds disaggregation_decode_extra_slots in-transfer slots to the
         # request count (num_reserved_decode_tokens is a full-pool concern, not SWA).
         available = 2_000_000
@@ -616,7 +623,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
             swa_num_kv_heads=4,
-            swa_full_tokens_ratio=0.5,
+            swa_full_tokens_ratio=None,
             disable_radix_cache=True,
             chunked_prefill_size=1000,
             sliding_window_size=4,
@@ -886,8 +893,8 @@ class TestFactory(CustomTestCase):
             cfg = create_memory_pool_configurator(mr)
         self.assertIsInstance(cfg, HybridSWAPoolConfigurator)
 
-    def test_chunk_cap_configurator_selection(self):
-        # SWAChunkCapPoolConfigurator is selected only when max_running_requests is set.
+    def test_request_configurator_selection(self):
+        # SWARequestPoolConfigurator is selected only when max_running_requests is set.
         def _cfg(max_running_requests):
             mr = _make_model_runner(
                 self,
@@ -899,6 +906,7 @@ class TestFactory(CustomTestCase):
                 chunked_prefill_size=4,
                 sliding_window_size=8,
                 max_running_requests=max_running_requests,
+                swa_full_tokens_ratio=None,
             )
             with mock_cpu_env():
                 from sglang.srt.model_executor.pool_configurator import (
@@ -908,11 +916,196 @@ class TestFactory(CustomTestCase):
                 return create_memory_pool_configurator(mr)
 
         from sglang.srt.model_executor.pool_configurator import (
-            SWAChunkCapPoolConfigurator,
+            SWARequestPoolConfigurator,
         )
 
-        self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
-        self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+        self.assertIsInstance(_cfg(2), SWARequestPoolConfigurator)
+        self.assertNotIsInstance(_cfg(None), SWARequestPoolConfigurator)
+
+
+class TestSWARequestSizing(CustomTestCase):
+    def _configurator(self, **overrides):
+        fields = dict(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            disable_radix_cache=True,
+            chunked_prefill_size=64,
+            sliding_window_size=128,
+            page_size=16,
+            max_running_requests=4,
+            swa_full_tokens_ratio=None,
+        )
+        fields.update(overrides)
+        mr = _make_model_runner(self, **fields)
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        with mock_cpu_env():
+            return create_memory_pool_configurator(mr)
+
+    def test_explicit_ratio_overrides_automatic_request_selection(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            HybridSWAPoolConfigurator,
+            SWARequestPoolConfigurator,
+        )
+
+        self.assertIsInstance(self._configurator(), SWARequestPoolConfigurator)
+        for fields in (
+            {"swa_full_tokens_ratio": 0.8},
+            {"swa_sizing_policy": "ratio"},
+        ):
+            with self.subTest(fields=fields):
+                cfg = self._configurator(**fields)
+                self.assertIs(type(cfg), HybridSWAPoolConfigurator)
+                sizes = cfg.calculate_pool_sizes_from_max_tokens(4096, 16)
+                self.assertEqual(sizes.swa_max_total_num_tokens, 3264)
+
+    def test_request_reservation_is_independent_of_available_memory(self):
+        cfg = self._configurator()
+        # 4 * (window + eviction lag + alignment + decode) + 2 chunks + padding.
+        expected_swa = 4 * (128 + 4 + 16 + 16) + 2 * 64 + 16
+        expected_swa = (expected_swa + 15) // 16 * 16
+        for budget in (8 << 20, 16 << 20):
+            with self.subTest(budget=budget):
+                sizes = cfg.calculate_pool_sizes(budget, 16)
+                self.assertEqual(sizes.swa_max_total_num_tokens, expected_swa)
+                # Each pool has one bf16 layer with 4 heads of 64+64 elements.
+                expected_full = (budget // 1024 - expected_swa) // 16 * 16
+                self.assertEqual(sizes.max_total_num_tokens, expected_full)
+
+    def test_request_rejects_unsupported_configurations(self):
+        for fields in (
+            {"max_running_requests": None},
+            {"max_running_requests": 0},
+            {"disable_radix_cache": False},
+            {"chunked_prefill_size": -1},
+            {"full_attention_layer_ids": []},
+        ):
+            with (
+                self.subTest(fields=fields),
+                self.assertRaisesRegex(ValueError, "request is unavailable"),
+            ):
+                self._configurator(swa_sizing_policy="request", **fields)
+
+    def test_token_limit_cannot_increase_either_pool(self):
+        cfg = self._configurator()
+        original = cfg.calculate_pool_sizes(8 << 20, 16)
+        for limit in (4096, 256, 128):
+            with self.subTest(limit=limit):
+                limited = cfg.calculate_pool_sizes_from_max_tokens(limit, 16)
+                self.assertLessEqual(
+                    limited.full_max_total_num_tokens,
+                    original.full_max_total_num_tokens,
+                )
+                self.assertLessEqual(
+                    limited.swa_max_total_num_tokens,
+                    original.swa_max_total_num_tokens,
+                )
+
+
+class TestDSV4SizingPolicy(CustomTestCase):
+    def _configurator(self, *, unified=False, **fields):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mr = _make_model_runner(
+            self,
+            num_layers=2,
+            is_hybrid_swa=True,
+            sliding_window_size=128,
+            max_running_requests=16,
+            **fields,
+        )
+        mc = mr.model_config
+        mc.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        mc.compress_ratios = [4, 128]
+        mc.qk_nope_head_dim = 128
+        mc.qk_rope_head_dim = 64
+        mc.index_head_dim = 128
+        mc.window_size = 128
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
+                return_value=unified,
+            ),
+            envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(False),
+        ):
+            return create_memory_pool_configurator(mr)
+
+    def test_layout_dispatch_and_explicit_ratio_validation(self):
+        cfg = self._configurator(unified=True, swa_full_tokens_ratio=None)
+        self.assertEqual(cfg.swa_sizing_policy, "request")
+        cfg = self._configurator(unified=False, swa_full_tokens_ratio=None)
+        self.assertEqual(cfg.swa_sizing_policy, "ratio")
+        with self.assertRaisesRegex(ValueError, "Ratio sizing is unavailable"):
+            self._configurator(unified=True, swa_full_tokens_ratio=0.1)
+        with self.assertRaisesRegex(ValueError, "request is unavailable"):
+            self._configurator(
+                unified=False, swa_full_tokens_ratio=None, swa_sizing_policy="request"
+            )
+
+    def test_ring_budget_does_not_depend_on_model_default_ratio(self):
+        cfg = self._configurator(unified=True, swa_full_tokens_ratio=None)
+        first = cfg.calculate_pool_sizes(128 << 20, 128)
+        cfg.swa_ratio = 0.1
+        cfg.bytes_per_full_token = cfg._get_bytes_per_full_token()
+        second = cfg.calculate_pool_sizes(128 << 20, 128)
+        self.assertEqual(first.max_total_num_tokens, second.max_total_num_tokens)
+        for config in (first, second):
+            config.max_running_requests = 16
+            cfg.finalize_with_max_running_requests(config)
+        self.assertEqual(first.c4_state_pool_size, second.c4_state_pool_size)
+        self.assertEqual(first.c128_state_pool_size, second.c128_state_pool_size)
+
+    def test_paged_cost_matches_main_budget_equation(self):
+        from sglang.srt.environ import envs
+
+        for dtype, itemsize in (("float32", 4), ("bfloat16", 2)):
+            for ratio in (0.1, 0.5, 0.8, 1.0):
+                with (
+                    self.subTest(dtype=dtype, ratio=ratio),
+                    envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.override(dtype),
+                    envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(False),
+                ):
+                    cfg = self._configurator(swa_full_tokens_ratio=ratio)
+                    # Main's original per-full-token equation, with one C4
+                    # and one C128 layer, and FP8 KV with bf16 RoPE.
+                    kv_bytes = 128 + 64 * 2 + 8
+                    legacy = ratio * kv_bytes * 2
+                    legacy += kv_bytes / 4 + kv_bytes / 128
+                    legacy += cfg.indexer_bytes_per_token / 4
+                    legacy += ratio * cfg.c4_ring_size / 128 * 4 * 192 * itemsize
+                    legacy += ratio * cfg.c4_ring_size / 128 * 4 * 128 * itemsize
+                    self.assertAlmostEqual(cfg.bytes_per_full_token, legacy)
+                    budget = 128 << 20
+                    fixed = cfg._get_c128_state_fixed_bytes(16)
+                    expected = int((budget - fixed) / legacy) // 128 * 128
+                    actual = cfg.calculate_pool_sizes(budget, 128)
+                    self.assertEqual(actual.max_total_num_tokens, expected)
+
+    def test_ratio_rounding_preserves_capacity_at_a_page_boundary(self):
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.override("float32"),
+            envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(False),
+        ):
+            cfg = self._configurator(swa_full_tokens_ratio=0.1)
+            cfg.qk_nope_head_dim = 512
+            cfg.attn_head_dim = 576
+            cfg.c4_ring_size = 8
+            cfg.indexer_bytes_per_token = 132
+            cfg.bytes_per_full_token = cfg._get_bytes_per_full_token()
+            # Main's left-to-right sum is just above 400.0625 bytes/token.
+            # Re-associating that sum would grow this capacity by one page.
+            budget = 512080000 + cfg._get_c128_state_fixed_bytes(16)
+            config = cfg.calculate_pool_sizes(budget, 128)
+            self.assertEqual(config.max_total_num_tokens, 1279872)
 
 
 class TestDflashDraftKvBudget(CustomTestCase):

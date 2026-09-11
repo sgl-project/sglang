@@ -101,6 +101,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_swa_sizing_policy(
+    *,
+    request_supported: bool,
+    ratio_supported: bool,
+    layout: str,
+    request_requirements: str = "This layout currently only supports ratio sizing.",
+) -> str:
+    """Select a sizing rule after the layout's capabilities are known."""
+    requested = get_schedule().swa_sizing_policy
+    policy = requested
+    if policy == "auto":
+        policy = "request" if request_supported else "ratio"
+    if policy == "request" and not request_supported:
+        raise ValueError(
+            f"--swa-sizing-policy=request is unavailable for {layout}. "
+            f"{request_requirements}"
+        )
+    if policy == "ratio" and not ratio_supported:
+        raise ValueError(
+            f"Ratio sizing is unavailable for {layout}. Remove "
+            "--swa-full-tokens-ratio and use --swa-sizing-policy=auto or request."
+        )
+    logger.info(
+        "SWA sizing policy: %s (requested=%s, layout=%s)", policy, requested, layout
+    )
+    return policy
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
 
@@ -689,12 +717,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
         else:
             self._cell_size = (
-                self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
-                + self._swa_per_token * self._draft_swa_full_layers_num
-                + self._swa_full_tokens_ratio
-                * self._swa_per_token
-                * (self._swa_layers_num + self._draft_swa_layers_num)
+                self._full_pool_bytes_per_token()
+                + self._swa_pool_bytes(self._swa_full_tokens_ratio)
                 + self._draft_cell_size
             )
 
@@ -704,6 +728,20 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._swa_per_token
             * (self._draft_swa_layers_num + self._draft_swa_full_layers_num)
             + self._draft_cell_size
+        )
+
+    def _full_pool_bytes_per_token(self) -> int:
+        """Cost that grows with full capacity, independent of SWA sizing."""
+        return (
+            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+            + self._swa_per_token * self._draft_swa_full_layers_num
+        )
+
+    def _swa_pool_bytes(self, swa_tokens: float) -> float:
+        return (
+            swa_tokens
+            * self._swa_per_token
+            * (self._swa_layers_num + self._draft_swa_layers_num)
         )
 
     def _max_unified_full_tokens(
@@ -804,12 +842,12 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
-class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
-    """Hybrid SWA configurator with the SWA pool sized from a fixed token cap.
+class SWARequestPoolConfigurator(HybridSWAPoolConfigurator):
+    """Hybrid SWA configurator with a request-based SWA reservation.
 
     When max_running_requests is explicit, the SWA pool's worst-case
     footprint is bounded per request. The SWA pool is sized tightly from that
-    cap and the freed memory is redirected to the full pool, instead of sizing
+    reservation and the remaining memory goes to the full pool, instead of sizing
     both pools by swa_full_tokens_ratio.
     """
 
@@ -846,13 +884,13 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
 
         num_reqs = get_schedule().max_running_requests // kvc.ps.attn_dp_size
         if get_disagg().disaggregation_mode == "decode":
-            self._swa_cap = (
+            self._swa_request_tokens = (
                 per_request * num_reqs
                 + (window + page_size) * get_disagg().disaggregation_decode_extra_slots
             )
         else:
             chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
-            self._swa_cap = (
+            self._swa_request_tokens = (
                 per_request * num_reqs
                 + chunks_in_flight * get_schedule().chunked_prefill_size
                 + page_size
@@ -861,11 +899,14 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
         """True when SWAChunkCache can be sized from explicit max requests."""
-        if get_schedule().max_running_requests is None:
+        if (
+            get_schedule().max_running_requests is None
+            or get_schedule().max_running_requests // kvc.ps.attn_dp_size <= 0
+        ):
             return False
         if not get_memory().disable_radix_cache:
             return False
-        if get_schedule().chunked_prefill_size is None:
+        if (get_schedule().chunked_prefill_size or 0) <= 0:
             return False
         if kvc.sliding_window_size is None:
             return False
@@ -874,29 +915,20 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        # SWA pool sized tightly from the cap; the rest of the budget goes to full.
-        swa_tokens = ceil_align(self._swa_cap, page_size)
-        fixed_swa_bytes = (
-            swa_tokens
-            * self._swa_per_token
-            * (self._swa_layers_num + self._draft_swa_layers_num)
-        )
+        swa_tokens = ceil_align(self._swa_request_tokens, page_size)
+        fixed_swa_bytes = self._swa_pool_bytes(swa_tokens)
         if self._enable_unified_memory and self._draft_pool_bytes_per_token() > 0:
             full_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size, fixed_swa_tokens=swa_tokens
             )
         else:
-            full_cell_size = (
-                self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
-                + self._swa_per_token * self._draft_swa_full_layers_num
-            )
+            full_cell_size = self._full_pool_bytes_per_token()
             full_tokens = (
                 int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
             ) * page_size
         if full_tokens <= 0:
             raise RuntimeError(
-                f"SWA pool cap ({swa_tokens} tokens, "
+                f"SWA request reservation ({swa_tokens} tokens, "
                 f"{fixed_swa_bytes / (1 << 30):.2f} GiB) leaves no room for the full "
                 f"KV pool within the available {available_bytes / (1 << 30):.2f} GiB. "
                 f"Reduce --max-running-requests, lower SGLANG_SWA_EVICTION_INTERVAL, "
@@ -911,8 +943,8 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        # Constrained max_total goes to the full pool; SWA stays at its cap.
-        swa_tokens = ceil_align(self._swa_cap, page_size)
+        # A global token limit also bounds the useful request reservation.
+        swa_tokens = ceil_align(self._swa_request_tokens, page_size)
         full_tokens = (max_total_num_tokens // page_size) * page_size
         return MemoryPoolConfig(
             max_total_num_tokens=full_tokens,
@@ -999,6 +1031,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
         self._unified = is_unified_kv_triton()
+        self.swa_sizing_policy = _resolve_swa_sizing_policy(
+            request_supported=self._unified,
+            ratio_supported=not self._unified,
+            layout="DSV4 request-owned ring" if self._unified else "DSV4 paged SWA",
+        )
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # swa_page_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
@@ -1071,66 +1108,50 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"get_compress_state_ring_size()."
             )
 
-    def _get_bytes_per_full_token(self) -> float:
+    def _kv_bytes_per_token(self) -> int:
         if self._unified:
-            # Unified_kv stores the whole latent in bf16.
-            kv_bytes = self.attn_head_dim * 2
-        else:
-            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+            return self.attn_head_dim * 2  # bf16 latent
+        return self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
-        attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        c4_state_dtype_size, c128_state_dtype_size = (
-            _get_dsv4_compress_state_dtype_sizes()
-        )
-        c4_state_bytes = 2 * 2 * attn_head_dim * c4_state_dtype_size
-        # Online c128 stores (max, sum, kv) per slot (3*head_dim) instead of
-        # raw (kv, score) (2*head_dim). Combined with ring_size=1 this still
-        # nets a large reduction (~3/256x) but the per-slot bytes go up.
-        c128_online = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-        c128_state_bytes = (
-            (3 if c128_online else 2 * 1) * attn_head_dim * c128_state_dtype_size
-        )
-        c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
-
-        c4_state_ratio = self.c4_ring_size / self.swa_page_size
-        # C128 state is request-scoped and is finalized after
-        # max_running_requests is known, so it should not scale with
-        # full-token capacity here.
-        c128_state_ratio = 0
-
-        c4_frac = 1 / (4 * self.c4_shrink_factor)
+    def _compressed_costs_per_full_token(self) -> tuple[float, float, float]:
+        kv_bytes = self._kv_bytes_per_token()
+        c4_fraction = 1 / (4 * self.c4_shrink_factor)
         return (
-            # Ring mode: SWA is a fixed per-request pool (see _fixed_swa_bytes).
-            (
-                0.0
-                if self._unified
-                else self.swa_ratio * kv_bytes * self.num_layers_total
-            )
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
-            + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
-            # Ring mode: C4 state is per-request too (see _fixed_c4_state_bytes).
-            + (
-                0.0
-                if self._unified
-                else self.swa_ratio
-                * c4_state_ratio
-                * c4_state_bytes
-                * self.num_layers_ca4
-            )
-            + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
-            + (
-                0.0
-                if self._unified
-                else self.swa_ratio
-                * c4_state_ratio
-                * c4_indexer_state_bytes
-                * self.num_layers_ca4
-            )
+            c4_fraction * kv_bytes * self.num_layers_ca4,
+            1 / 128 * kv_bytes * self.num_layers_ca128,
+            1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4,
         )
+
+    def _paged_swa_costs(self, swa_tokens: float) -> tuple[float, float, float]:
+        """Price SWA KV, C4 attention state, and C4 indexer state separately.
+
+        For ratio sizing, swa_tokens is the SWA capacity per full token.
+        A fixed request reservation can be priced with its token count instead.
+        """
+        c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
+        c4_state_bytes = 4 * self.attn_head_dim * c4_state_dtype_size
+        c4_indexer_state_bytes = 4 * self.indexer_head_dim * c4_state_dtype_size
+        c4_state_ratio = self.c4_ring_size / self.swa_page_size
+        return (
+            swa_tokens * self._kv_bytes_per_token() * self.num_layers_total,
+            swa_tokens * c4_state_ratio * c4_state_bytes * self.num_layers_ca4,
+            swa_tokens * c4_state_ratio * c4_indexer_state_bytes * self.num_layers_ca4,
+        )
+
+    def _get_bytes_per_full_token(self) -> float:
+        c4_kv, c128_kv, indexer = self._compressed_costs_per_full_token()
+        if self._unified:
+            # SWA and C4 state are request-owned; charged in the fixed budget.
+            swa_kv, c4_state, c4_indexer_state = 0.0, 0.0, 0.0
+        else:
+            swa_kv, c4_state, c4_indexer_state = self._paged_swa_costs(self.swa_ratio)
+        # Keep the accumulation order: rounding can change capacity by one page.
+        return swa_kv + c4_kv + c128_kv + indexer + c4_state + c4_indexer_state
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
+        # Ring mode retains this legacy nominal size until the allocator replaces
+        # it with size_swa. Physical ring capacity and cost are request-scoped.
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
         if not self._unified:
             # Ring mode: the paged SWA pool is vestigial, so its floor does not apply.
@@ -1313,8 +1334,20 @@ def create_memory_pool_configurator(
     if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
         return DSV4PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:
-        if SWAChunkCapPoolConfigurator.is_applicable(kvc):
-            return SWAChunkCapPoolConfigurator(kvc)
+        policy = _resolve_swa_sizing_policy(
+            request_supported=SWARequestPoolConfigurator.is_applicable(kvc),
+            ratio_supported=True,
+            layout="hybrid paged SWA",
+            request_requirements=(
+                "Paged request sizing requires full-attention layers, "
+                "--disable-radix-cache, positive --max-running-requests per worker, "
+                "and positive --chunked-prefill-size."
+            ),
+        )
+        if policy == "request":
+            return SWARequestPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if get_schedule().swa_sizing_policy == "request":
+        raise ValueError("--swa-sizing-policy=request requires a hybrid SWA pool.")
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

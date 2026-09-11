@@ -101,6 +101,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     validate_prefill_decode_interval(server_args)
     validate_sampling_mask_max_tokens(server_args)
 
+    from sglang.srt.arg_groups.kv_cache_hook import handle_swa_sizing_policy
+
+    handle_swa_sizing_policy(server_args)
+
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
     from sglang.srt.arg_groups.parallel_hook import validate_prefill_cp_platform

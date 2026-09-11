@@ -146,6 +146,21 @@ class Schedule(msgspec.Struct):
         int,
         "The physical page size of the NPU DSV4 C128 KV cache. Must be a positive multiple of 16.",
     ] = 16
+    swa_sizing_policy: A[
+        str,
+        Arg(
+            help=(
+                "How to size the hybrid SWA pool. 'auto' uses ratio when "
+                "--swa-full-tokens-ratio is explicit, otherwise selects the "
+                "layout's supported request-based budget or falls back to ratio. "
+                "'ratio' scales SWA capacity with full-token capacity. 'request' "
+                "reserves SWA capacity from concurrency and requires a supported "
+                "layout and configuration."
+            ),
+            choices=["auto", "ratio", "request"],
+            resolvable=True,
+        ),
+    ] = "auto"
     swa_full_tokens_ratio: A[
         Optional[float],
         Arg(
@@ -153,7 +168,8 @@ class Schedule(msgspec.Struct):
                 "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
                 "of the number of swa:full layers. It should be between 0 and 1. "
                 "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
-                "layer has 100 tokens."
+                "layer has 100 tokens. Setting this explicitly selects ratio "
+                "sizing and is incompatible with --swa-sizing-policy=request."
             ),
             resolvable=True,
             fallback=0.8,

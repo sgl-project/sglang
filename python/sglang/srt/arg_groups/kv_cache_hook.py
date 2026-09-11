@@ -22,6 +22,26 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def handle_swa_sizing_policy(server_args: Any) -> None:
+    """Resolve user intent before model defaults fill in the effective ratio."""
+    policy = server_args.swa_sizing_policy
+    ratio = server_args.swa_full_tokens_ratio
+    if policy not in ("auto", "ratio", "request"):
+        raise ValueError("--swa-sizing-policy must be auto, ratio, or request.")
+    if ratio is not None:
+        if not 0 < ratio <= 1:
+            raise ValueError("--swa-full-tokens-ratio must be in (0, 1].")
+        if policy == "request":
+            raise ValueError(
+                "--swa-full-tokens-ratio cannot be combined with "
+                "--swa-sizing-policy=request."
+            )
+        if policy == "auto":
+            declare_resolution(
+                server_args, "explicit_swa_ratio", swa_sizing_policy="ratio"
+            )
+
+
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
     cfg = resolving_view(server_args)
