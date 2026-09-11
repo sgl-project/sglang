@@ -664,15 +664,6 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
-- Cutlass MLA
-```bash Command
-python3 -m sglang.launch_server \
-  --tp 8 \
-  --model deepseek-ai/DeepSeek-R1 \
-  --attention-backend cutlass_mla \
-  --trust-remote-code
-```
-
 - Ascend
 ```bash Command
 python3 -m sglang.launch_server \
@@ -699,13 +690,6 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend flex_attention
-```
-
-- Dual Chunk FlashAttention
-```bash Command
-python3 -m sglang.launch_server \
-  --model Qwen/Qwen2.5-14B-Instruct-1M \
-  --attention-backend dual_chunk_flash_attn
 ```
 
 - Torch Native

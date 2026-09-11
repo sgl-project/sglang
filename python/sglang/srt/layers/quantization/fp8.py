@@ -23,6 +23,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -65,6 +66,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    unshuffle_aiter_fp8_weight,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -143,6 +145,13 @@ def _require_fp4_dtype():
             "DeepSeek-V4 FP4 experts require torch.float4_e2m1fn_x2 support."
         )
     return fp4_dtype
+
+
+def unshuffle_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Restore the logical layout of a backend-shuffled FP8 weight."""
+    if not _use_aiter:
+        raise RuntimeError("FP8 weight unshuffle requires AITER")
+    return unshuffle_aiter_fp8_weight(weight)
 
 
 if _use_aiter or _use_hip_int4:
@@ -245,6 +254,7 @@ class Fp8Config(QuantizationConfig):
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
+        scale_fmt: Optional[str] = None,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -269,6 +279,7 @@ class Fp8Config(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        self.scale_fmt = scale_fmt
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -336,6 +347,7 @@ class Fp8Config(QuantizationConfig):
         kv_cache_quant_algo = cls.get_from_keys_or(
             config, ["kv_cache_quant_algo"], None
         )
+        scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
             if weight_block_size is not None and weight_block_size != [1, 32]:
@@ -352,6 +364,7 @@ class Fp8Config(QuantizationConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
             kv_cache_quant_algo=kv_cache_quant_algo,
+            scale_fmt=scale_fmt,
         )
 
     def get_quant_method(
@@ -395,6 +408,13 @@ class Fp8Config(QuantizationConfig):
                     f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
                 )
                 return fp8_method
+
+            if self.is_fp4_experts and is_npu_arch35():
+                from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
+                    NPUW4A4Fp4MoEMethod,
+                )
+
+                return NPUW4A4Fp4MoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
@@ -688,6 +708,17 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
+        elif _is_npu and is_npu_arch35():
+            from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
+                process_npu_arch35_mxfp8_linear_weights,
+            )
+
+            process_npu_arch35_mxfp8_linear_weights(
+                layer,
+                self.weight_block_size,
+                scale_fmt=getattr(self.quant_config, "scale_fmt", None),
+            )
+            return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -748,6 +779,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 # it so a consumer that needs the row-major layout can assert
                 # instead of silently reading a permuted weight.
                 layer.aiter_bpreshuffled = True
+                layer.weight.is_shuffled = True
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
@@ -1643,6 +1675,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+            return
+        elif self.use_mxfp8 and get_moe_a2a_backend().is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                prepare_mxfp8_moe_weights_for_flashinfer_megamoe,
+            )
+
+            prepare_mxfp8_moe_weights_for_flashinfer_megamoe(layer)
             return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
@@ -1681,6 +1722,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
         elif _use_aiter:
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))
@@ -1689,6 +1732,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             t = shuffle_weight(layer.w2_weight, (16, 16))
             layer.w2_weight.copy_(t)
             del t
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
         elif _is_cpu:
             assert _is_cpu_amx_available, (
                 "Fp8MoEMethod on CPU requires that CPU has AMX support"
@@ -1737,6 +1782,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
 
                     build_mega_moe_experts_weights(layer)
+                    return
+
+                if get_moe_a2a_backend().is_flashinfer_megamoe():
+                    from sglang.srt.layers.moe.flashinfer_megamoe import (
+                        prepare_fp4_moe_weights_for_flashinfer_megamoe,
+                    )
+
+                    prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
                     return
 
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
@@ -2223,7 +2276,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+            layer.dispatcher.set_quant_config(
+                {
+                    "weight_dtype": layer.w13_weight.dtype,
+                    "use_mxfp8": self.use_mxfp8,
+                }
+            )
 
     def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
@@ -2417,6 +2475,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
+            or moe_runner_backend.is_flashinfer_megamoe()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
@@ -2575,7 +2634,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if self.runner.runner_backend.is_deep_gemm():
+        if self.runner.runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                FlashInferMegaMoeQuantInfo,
+                ensure_fp4_moe_layer_for_flashinfer_megamoe,
+                ensure_mxfp8_moe_layer_for_flashinfer_megamoe,
+            )
+
+            if self.use_mxfp8:
+                ensure_megamoe_layer = ensure_mxfp8_moe_layer_for_flashinfer_megamoe
+            elif self.is_fp4_expert:
+                ensure_megamoe_layer = ensure_fp4_moe_layer_for_flashinfer_megamoe
+            else:
+                raise ValueError(
+                    "FlashInfer MegaMOE does not support standard FP8 MoE "
+                    "weights; use MXFP8, NVFP4, or an FP4-expert checkpoint."
+                )
+            mega = ensure_megamoe_layer(layer)
+            quant_info = FlashInferMegaMoeQuantInfo(
+                mega=mega,
+                mega_forward=layer._flashinfer_megamoe_forward,
+                apply_routed_scaling_factor=(
+                    not layer.should_fuse_routed_scaling_factor_in_topk
+                ),
+            )
+        elif self.runner.runner_backend.is_deep_gemm():
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 

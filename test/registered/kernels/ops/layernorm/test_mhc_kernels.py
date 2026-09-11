@@ -19,7 +19,7 @@ def test_mhc_fused_post_pre_matches_unfused(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TileLang mHC kernels")
 
-    monkeypatch.setattr(mhc, "is_dsa_prefill_cp_round_robin_split", lambda: False)
+    monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
     # This is a single-process kernel unit test with no TP group initialized.
     # mhc_pre / mhc_fused_post_pre allocate the MoE input in the symmetric-memory
     # pool via use_symmetric_memory(get_tp_group(), ...); bypass that path so the
