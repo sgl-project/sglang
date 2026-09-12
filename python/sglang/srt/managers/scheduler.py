@@ -2528,7 +2528,7 @@ class Scheduler(
         ):
 
             def fits_shared_pool(candidate: int) -> bool:
-                full_tokens = paged_input_len + candidate + self.page_size
+                full_tokens = input_len + candidate + self.page_size
                 swa_tokens = estimate_swa_kv_tokens(
                     input_len,
                     candidate,

@@ -982,11 +982,7 @@ class PrefillAdder:
         full_ever_tokens = unified_swa_tokens = None
         if self.is_unified_swa:
             full_input_tokens = len(req.full_untruncated_fill_ids)
-            full_ever_tokens = (
-                self.ceil_paged_tokens(full_input_tokens)
-                + max_new_tokens
-                + self.page_size
-            )
+            full_ever_tokens = full_input_tokens + max_new_tokens + self.page_size
             unified_swa_tokens = self._swa_budget_for_req(
                 full_input_tokens, max_new_tokens
             )
