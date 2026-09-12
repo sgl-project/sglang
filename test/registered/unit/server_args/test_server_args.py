@@ -2293,15 +2293,14 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "instance connector"):
             handle_a2a_moe(args)
 
-    def test_deterministic_inference_rejected(self):
+    def test_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
             enable_deterministic_inference=True,
         )
-        with self.assertRaisesRegex(ValueError, "deterministic sorting"):
-            handle_a2a_moe(args)
+        handle_a2a_moe(args)
 
-    def test_rl_on_policy_deterministic_inference_rejected(self):
+    def test_rl_on_policy_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
             rl_on_policy_target="fsdp",
@@ -2314,8 +2313,7 @@ class TestDeepEPv2Args(CustomTestCase):
             ),
         ):
             handle_deterministic_inference(args)
-        with self.assertRaisesRegex(ValueError, "deterministic sorting"):
-            handle_a2a_moe(args)
+        handle_a2a_moe(args)
 
     def test_deterministic_inference_does_not_affect_legacy_deepep(self):
         args = self._args(

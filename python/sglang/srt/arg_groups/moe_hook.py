@@ -189,13 +189,6 @@ def handle_a2a_moe(server_args: Any):
 
     if a2a_backend == "deepep_v2":
         validate_deepep_v2_model_architecture(server_args)
-        if resolved_view(server_args).enable_deterministic_inference:
-            raise ValueError(
-                "DeepEP v2 does not forward deterministic=True to "
-                "ElasticBuffer, so deterministic sorting remains disabled. "
-                "Disable --enable-deterministic-inference or use "
-                "--moe-a2a-backend deepep."
-            )
         # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         # Respect model-level runner declarations before resolving auto.
