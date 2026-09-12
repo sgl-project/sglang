@@ -244,6 +244,24 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
+class DisaggKVChecksumLevel(IntEnum):
+    """KV-cache integrity checking across a PD transfer (see
+    ``srt/disaggregation/kv_checksum.py``).
+
+    OFF: no KV digest; only the bootstrap_room metadata check runs.
+    SAMPLED: digest a per-request rotating subset of the KV buffers
+        (``SGLANG_DISAGGREGATION_KV_CHECKSUM_BUFFERS`` of them). Cheap enough
+        to leave on: a whole-row clobber from slot reuse hits every buffer, so
+        a small sample catches it, and the rotation sweeps the rest over time.
+    FULL: digest every KV buffer. Complete coverage, proportionally more
+        memory traffic; for debugging a suspected corruption.
+    """
+
+    OFF = 0
+    SAMPLED = 1
+    FULL = 2
+
+
 class DsparkFoldedSampling(IntEnum):
     """Sampling support in the graph-folded DSpark draft proposal: OFF =
     greedy-only folding, AUTO = on when its buffers fit in free GPU memory,
@@ -406,6 +424,9 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+    # Decode-side fault injection: corrupt this fraction of transferred
+    # requests' KV before verification, to prove the checksum detects it.
+    SGLANG_TEST_DISAGG_KV_CORRUPT_PROB = EnvFloat(0.0)
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
@@ -689,6 +710,13 @@ class Envs:
     # below fires. Off by default (no behavior/perf impact when disabled).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # KV-cache integrity check across the transfer: prefill digests the KV it
+    # hands off, decode re-digests what landed in its own slots and aborts the
+    # request on a mismatch. Set independently on P and D -- a side that leaves
+    # it OFF simply contributes no digest, and the other side skips the check.
+    SGLANG_DISAGGREGATION_KV_CHECKSUM = EnvInt(DisaggKVChecksumLevel.OFF)
+    # Buffers sampled per request at SAMPLED level (k/v count separately).
+    SGLANG_DISAGGREGATION_KV_CHECKSUM_BUFFERS = EnvInt(2)
 
     # ===================================================================
     # Distributed and model-parallel runtime

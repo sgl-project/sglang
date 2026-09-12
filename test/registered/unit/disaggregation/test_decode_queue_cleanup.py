@@ -353,6 +353,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
+        queue.kv_checksummer = None
         queue._clean_hicache_prefetch_resources = MagicMock()
 
         scheduler = MagicMock()
