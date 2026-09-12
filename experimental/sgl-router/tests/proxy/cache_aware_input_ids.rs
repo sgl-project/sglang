@@ -74,6 +74,7 @@ async fn plain_chat_forwards_input_ids_and_keeps_messages() {
         json!({
             "model": MODEL,
             "messages": [{"role": "user", "content": "hello there friend"}],
+            "input_ids": null,
         }),
     )
     .await;
@@ -89,6 +90,36 @@ async fn plain_chat_forwards_input_ids_and_keeps_messages() {
         body.get("messages").is_some(),
         "messages must be retained alongside input_ids; got {body}"
     );
+}
+
+#[tokio::test]
+async fn caller_input_ids_are_used_for_routing_and_preserved() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    for (ids, expected) in [
+        (json!([7, 8]), Some(vec![7, 8])),
+        (json!([]), Some(vec![])),
+        (json!([7, -1]), None),
+    ] {
+        let request = json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "input_ids": ids,
+        });
+        let tokens = sgl_router::policies::resolve_request_tokens(
+            &ctx.tokenizers,
+            &ModelId(MODEL.into()),
+            &request,
+        );
+        assert!(!tokens.as_ref().is_some_and(|t| t.chat_rendered));
+        assert_eq!(tokens.map(|t| t.ids), expected, "input_ids: {ids}");
+        assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
+        assert_eq!(captured(&mock), request);
+    }
+    assert!(!ctx
+        .metrics
+        .render()
+        .contains("sgl_router_ingress_tokenize_errors_total{"));
 }
 
 #[tokio::test]
@@ -109,7 +140,7 @@ async fn guarded_requests_render_without_forwarding_ids() {
             .as_object_mut()
             .unwrap()
             .extend(options.as_object().unwrap().clone());
-        let tokens = sgl_router::policies::request_tokens_for(
+        let tokens = sgl_router::policies::resolve_request_tokens(
             &ctx.tokenizers,
             &ModelId(MODEL.into()),
             &request,

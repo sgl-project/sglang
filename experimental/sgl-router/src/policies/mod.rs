@@ -33,7 +33,7 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
-    /// Whether the IDs came from chat rendering rather than raw-text fallback.
+    /// Whether the IDs came from chat rendering rather than the caller or raw text.
     pub chat_rendered: bool,
 }
 
@@ -44,12 +44,19 @@ pub struct ExternalPrefixSignal {
     pub query_blocks: usize,
 }
 
-/// Render and tokenize for routing; forwarding eligibility is checked separately.
-pub fn request_tokens_for(
+/// Use caller IDs or render/tokenize for routing; check forwarding separately.
+pub fn resolve_request_tokens(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
+    // Caller IDs take precedence; malformed values are left for engine validation.
+    if let Some(ids) = value.get("input_ids").filter(|v| !v.is_null()) {
+        return Some(RequestTokens {
+            ids: serde_json::from_value(ids.clone()).ok()?,
+            chat_rendered: false,
+        });
+    }
     if value.get("messages").is_some_and(|m| m.is_array()) {
         if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
             return Some(RequestTokens {
@@ -491,7 +498,7 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     /// Whether this policy's routing decision needs request tokens (i.e.
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
     /// gated on this — that is a model property (`has_chat_encoder`) decided at
-    /// ingress via [`request_tokens_for`]. This flag is the EXTRA gate that
+    /// ingress via [`resolve_request_tokens`]. This flag is the EXTRA gate that
     /// keeps the cache-aware policy's RAW-prompt routing path alive: a
     /// cache-aware model with no chat encoder still wants its `/v1/completions`
     /// /`text` prompt tokenized for tree matching, which `has_chat_encoder`

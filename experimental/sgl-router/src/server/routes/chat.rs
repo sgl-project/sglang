@@ -14,7 +14,7 @@ use crate::policies::decode::{
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{
-    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
+    resolve_request_tokens, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
     SelectionContext,
 };
 use crate::server::app_context::AppContext;
@@ -248,7 +248,7 @@ pub async fn chat_completions(
     // Routing can use these IDs even when engine forwarding is blocked.
     let request_tokens = request_value
         .as_ref()
-        .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+        .and_then(|v| resolve_request_tokens(&ctx.tokenizers, &model_id, v));
     let external_prefix = match (
         ctx.prefix_index.as_ref(),
         request_tokens.as_ref(),
@@ -1238,8 +1238,9 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if messages_need_engine_render(value) {
         return false;
     }
-    // These options need engine-specific normalization or parity verification.
+    // Preserve caller IDs and defer options needing engine-specific processing.
     for key in [
+        "input_ids",
         "chat_template",
         "chat_template_kwargs",
         "reasoning",
@@ -1269,8 +1270,10 @@ fn ingress_tokenize_offload_failed(
     if !has_chat_encoder {
         return false;
     }
-    let chat_request =
-        request_value.is_some_and(|v| v.get("messages").is_some_and(|m| m.is_array()));
+    let chat_request = request_value.is_some_and(|v| {
+        v.get("messages").is_some_and(|m| m.is_array())
+            && v.get("input_ids").is_none_or(|ids| ids.is_null())
+    });
     if !chat_request {
         return false;
     }

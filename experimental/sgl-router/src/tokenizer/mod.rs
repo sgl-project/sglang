@@ -443,7 +443,7 @@ mod tests {
             "tools": [{"type": "function", "function": {"name": "hello"}}],
             "chat_template_kwargs": {"greeting": "world"}
         });
-        let tokens = crate::policies::request_tokens_for(
+        let tokens = crate::policies::resolve_request_tokens(
             &reg,
             &crate::discovery::ModelId("tiny".into()),
             &request,
