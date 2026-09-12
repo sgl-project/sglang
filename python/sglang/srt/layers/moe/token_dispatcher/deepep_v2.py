@@ -182,6 +182,11 @@ class DeepEPv2Buffer:
 
         # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
+        # ElasticBuffer's `deterministic=True` sort is deliberately not enabled.
+        # The expert GEMM is row-independent and combine follows the handle's
+        # slot pointers, so sorting receive rows is unnecessary for batch
+        # invariance. The sort also uses dynamic indexing that cannot be
+        # captured by the decode CUDA graph.
         buffer = ElasticBuffer(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
