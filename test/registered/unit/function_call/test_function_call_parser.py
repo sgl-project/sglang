@@ -3804,6 +3804,63 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                 )
                 self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
 
+    def test_incomplete_composition_branches_allow_arguments(self):
+        city = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": False,
+        }
+        country = {
+            "type": "object",
+            "properties": {"country": {"type": "string"}},
+            "required": ["country"],
+            "additionalProperties": False,
+        }
+        branches = [
+            {"$ref": "#/$defs/by_country"},
+            {"patternProperties": {"^country$": {"type": "string"}}},
+            {"properties": {"region": {"type": "string"}}, "allOf": [country]},
+            {"additionalProperties": {"type": "string"}},
+            True,
+            {},
+            {"properties": {}},
+        ]
+        text = "<tool_call>alpha<arg_key>country</arg_key><arg_value>France</arg_value></tool_call>"
+        for branch in branches:
+            for nested in (False, True):
+                with self.subTest(branch=branch, nested=nested):
+                    schema = {
+                        "type": "object",
+                        "anyOf": [
+                            city,
+                            {"allOf": [{"oneOf": [branch]}]} if nested else branch,
+                        ],
+                        "$defs": {"by_country": country},
+                    }
+                    grammar = self._compile(schema, choice="required", parallel=False)
+                    self.assertTrue(self._accepts(grammar, text))
+                    self.assertFalse(
+                        self._accepts(grammar, text.replace("</arg_key>", ""))
+                    )
+                    self.assertFalse(self._accepts(grammar, text + text))
+
+    def test_complete_compositions_restrict_argument_names(self):
+        schema = {
+            "allOf": [
+                {"properties": {"city": {"type": "string"}}},
+                {
+                    "anyOf": [
+                        {"oneOf": [{"properties": {"country": {"type": "string"}}}]}
+                    ]
+                },
+            ]
+        }
+        grammar = self._compile(schema, choice="required", parallel=False)
+        for key, accepted in (("city", True), ("country", True), ("unknown", False)):
+            text = f"<tool_call>alpha<arg_key>{key}</arg_key><arg_value>Paris</arg_value></tool_call>"
+            self.assertEqual(self._accepts(grammar, text), accepted)
+
     def test_escaped_property_names(self):
         for key in ['a"b', "path\\name", "line\nbreak", "tab\tkey", "control\x01key"]:
             with self.subTest(key=key):

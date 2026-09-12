@@ -905,6 +905,40 @@ def _glm_handle_type(prop: dict) -> str:
     return _GLM_TYPE_MAPPING.get(prop_type, "text_without_special_tokens")
 
 
+def _glm_has_complete_properties(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return schema is False
+    if any(
+        keyword in schema
+        for keyword in (
+            "$ref",
+            "$dynamicRef",
+            "patternProperties",
+            "dependentSchemas",
+            "if",
+            "then",
+            "else",
+        )
+    ) or any(
+        schema.get(keyword, False) is not False
+        for keyword in ("additionalProperties", "unevaluatedProperties")
+    ):
+        return False
+    branches = [
+        branch
+        for keyword in ("allOf", "anyOf", "oneOf")
+        for branch in schema.get(keyword, [])
+    ]
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        return not branches and (
+            bool(properties) or schema.get("additionalProperties") is False
+        )
+    if branches:
+        return all(_glm_has_complete_properties(branch) for branch in branches)
+    return schema.get("additionalProperties") is False
+
+
 def _glm_build_tool_call_rules(
     non_terminal_name: str,
     functions: list[Any],
@@ -947,14 +981,7 @@ def _glm_build_tool_call_rules(
         namehash = _glm_hash_name(func.name + str(function_index))
         params = func.parameters or {}
         properties = get_schema_properties(params)
-        if isinstance(params, dict) and (
-            "$ref" in params
-            or "patternProperties" in params
-            or (
-                "properties" in params
-                and any(keyword in params for keyword in ("allOf", "anyOf", "oneOf"))
-            )
-        ):
+        if not _glm_has_complete_properties(params):
             properties = {}
 
         prop_kv_pairs = {}
