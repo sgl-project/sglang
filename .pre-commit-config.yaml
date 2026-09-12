@@ -8,7 +8,10 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
+        # git apply needs the byte-exact context lines, blank ones included
+        exclude: ^docker/patches/
       - id: end-of-file-fixer
+        exclude: ^docker/patches/
       - id: check-yaml
         args: [--allow-multiple-documents]
         # Helm chart templates embed Go template syntax ({{- ... -}})
