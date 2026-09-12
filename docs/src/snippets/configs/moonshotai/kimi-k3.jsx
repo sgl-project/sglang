@@ -81,7 +81,7 @@ export const config = {
       const [hw, pdMode] = k.split("|");
       return {
         when: { hw: [hw], pdMode: [pdMode], strategy: [...strategies],
-                hicache: ["l2"], spec: ["none"] },
+                hicache: ["l2"], spec: ["none", "dspark"] },
         reason: "This recipe runs DCP, and a storage backend (L3) under DCP is rejected at startup. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2.",
       };
     });
@@ -115,10 +115,8 @@ export const config = {
     const cell = config.cellFor(s);
     const pp = config.sizeOf(cell, "--pp-size");
     const out = [`--tp-size ${config.sizeOf(cell, "--tp-size") * pp}`];
-    // HiCache under DCP rejects speculative decoding, so when a host tier is on
-    // the DCP half is dropped instead of scaled (the HiCache options' own
-    // stripPrefixes reach cell flags only, never these overlay flags).
-    if (config.flagOf(cell, "--dcp-size") && s.hicache !== "l2" && s.hicache !== "l3") {
+    // L3 rejects DCP at startup, so under L3 the DCP half is dropped, not scaled.
+    if (config.flagOf(cell, "--dcp-size") && s.hicache !== "l3") {
       out.push(`--dcp-size ${config.sizeOf(cell, "--dcp-size") * pp}`);
     }
     if (config.flagOf(cell, "--ep-size")) {
@@ -355,26 +353,17 @@ export const config = {
           flags: [
             "--enable-hierarchical-cache",
           ],
-          // L1/L2 host tiering IS supported under DCP, so DCP stays — except with
-          // speculative decoding, which HiCache under DCP rejects at startup (the
-          // draft host pool has no DCP index translation). There the DCP operating
-          // point is dropped instead of blocking the option, same as L3 does. The
-          // ratio calculator reads --dcp-size off this command, so dropping it also
-          // re-solves --mamba-full-memory-ratio for the plain-TP shape.
-          //
-          // Which cells carry DCP is read off the cells themselves, so adding or
-          // reshaping a DCP recipe needs no edit here.
           stripPrefixes: (s) =>
-            s.spec !== "none" && config.hasDcp(s)
+            !["none", "dspark"].includes(s.spec) && config.hasDcp(s)
               ? ["--dcp-size", "--dcp-comm-backend"]
               : [],
           hints: (s) =>
-            s.spec !== "none" && config.hasDcp(s)
+            !["none", "dspark"].includes(s.spec) && config.hasDcp(s)
               ? [
-                  "HiCache under DCP rejects speculative decoding, so this recipe drops DCP",
-                  "and serves the MLA KV TP-replicated (any PP/EP in the cell stays).",
-                  "Per-request context is far shorter than the DCP",
-                  "version — DCP is what buys KV capacity. Run the cell NOSPEC to keep DCP.",
+                  "HiCache under DCP only accepts DSPARK speculative decoding, so this",
+                  "recipe drops DCP and serves the MLA KV TP-replicated (any PP/EP in the",
+                  "cell stays). Per-request context is far shorter than the DCP version —",
+                  "DCP is what buys KV capacity. Run the cell NOSPEC or DSPARK to keep DCP.",
                 ]
               : [],
         },
@@ -976,10 +965,6 @@ export const config = {
               {
                 when: { hicache: ["l3"] },
                 reason: "L3 storage keys are not dcp_rank-aware, so DCP and L3 cannot run together. Use Peak Throughput, or switch HiCache to L1+L2.",
-              },
-              {
-                when: { hicache: ["l2"], spec: ["dspark"] },
-                reason: "HiCache under DCP rejects speculative decoding, so this preset cannot add DCP here. Use Peak Throughput, or run the cell NOSPEC.",
               },
             ],
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=20480"],

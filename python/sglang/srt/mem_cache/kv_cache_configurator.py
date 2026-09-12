@@ -1026,6 +1026,22 @@ class KVCacheConfigurator:
                     mamba_layer_ids.append(layer_id)
         return mamba_layer_ids
 
+    def _get_ple_req_pool_kwargs(self) -> dict[str, Any]:
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        if not isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            return {}
+        return {
+            "short_conv_layer_ids": [
+                i
+                for i in self.mambaish_config.short_conv_layer_ids
+                if self.layer_info.start_layer <= i < self.layer_info.end_layer
+            ],
+            "short_conv_state_shape": self.mambaish_config.short_conv_state_shape,
+            "ngram_context_len": self.mambaish_config.ngram_context_len,
+            "ngram_eos_token_id": int(self.mambaish_config.eos_token_id),
+        }
+
     def _build_hybrid_mamba_decode_req_pool(
         self,
         *,
@@ -1051,6 +1067,7 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            **self._get_ple_req_pool_kwargs(),
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
@@ -1108,20 +1125,6 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
-        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
-
-        ple_kwargs = {}
-        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
-            ple_kwargs = dict(
-                short_conv_layer_ids=[
-                    i
-                    for i in self.mambaish_config.short_conv_layer_ids
-                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
-                ],
-                short_conv_state_shape=self.mambaish_config.short_conv_state_shape,
-                ngram_context_len=self.mambaish_config.ngram_context_len,
-                ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
-            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -1133,7 +1136,7 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-            **ple_kwargs,
+            **self._get_ple_req_pool_kwargs(),
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
             # case above: None => the pool skips SpeculativeState).
