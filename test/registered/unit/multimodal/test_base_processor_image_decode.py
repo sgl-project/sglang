@@ -69,6 +69,40 @@ def _is_decoded(img: Image.Image) -> bool:
 
 
 class TestLoadSingleItemImageDecode(CustomTestCase):
+    def test_loading_paths_use_instance_decode_mode(self):
+        data = _jpeg_bytes()
+        for mode in (False, True, "nvjpeg_fancy"):
+            for legacy in (False, True):
+                with self.subTest(mode=mode, legacy=legacy):
+                    processor = object.__new__(_StubProcessor)
+                    processor.gpu_image_decode = mode
+                    expected = Image.new("RGB", (8, 8))
+                    with (
+                        concurrent.futures.ThreadPoolExecutor(
+                            max_workers=1
+                        ) as executor,
+                        patch(
+                            "sglang.srt.multimodal.processors.base_processor.load_image",
+                            return_value=(expected, None),
+                        ) as load_image,
+                    ):
+                        processor.io_executor = executor
+                        if legacy:
+                            tokens = Mock()
+                            tokens.get_modality_of_token.return_value = Modality.IMAGE
+                            futures, _ = processor.submit_data_loading_tasks(
+                                ["<image>"], tokens, {Modality.IMAGE: iter([data])}
+                            )
+                            future = futures[0]
+                        else:
+                            tasks = processor._submit_mm_data_loading_tasks_simple(
+                                [data], Modality.IMAGE, None, True
+                            )
+                            future = tasks[0][2]
+                        self.assertIs(future.result(), expected)
+                        load_image.assert_called_once_with(data, mode)
+                    self.assertFalse(_StubProcessor.gpu_image_decode)
+
     def test_plain_open_is_lazy(self):
         # Documents why the fix matters: a bare Image.open is not decoded yet, so
         # without the fix the decode would land on the caller (main) thread.

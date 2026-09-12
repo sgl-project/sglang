@@ -639,13 +639,18 @@ def _k3_preprocess_config(
 
 
 @pytest.mark.parametrize(
-    ("processor_cls", "wrapper_cls"),
+    ("processor_cls", "wrapper_cls", "backend", "legacy_disable", "use_gpu"),
     [
-        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper),
-        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "auto", False, True),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "torchvision", False, True),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "pil", False, False),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "auto", True, False),
+        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper, "auto", False, True),
     ],
 )
-def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
+def test_kimi_processor_workers_clone_the_gpu_wrapper(
+    processor_cls, wrapper_cls, backend, legacy_disable, use_gpu
+):
     server_args = SimpleNamespace(
         base_gpu_id=0,
         rl_on_policy_target=None,
@@ -655,8 +660,8 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         mm_feature_transport="cpu",
         mm_process_config={},
         allowed_media_domains=[],
-        image_processor_backend="auto",
-        disable_fast_image_processor=False,
+        image_processor_backend=backend,
+        disable_fast_image_processor=legacy_disable,
         skip_tokenizer_init=False,
         mm_io_worker_num=0,
         mm_processor_worker_num=0,
@@ -678,6 +683,17 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
             assert isinstance(processor._processor, wrapper_cls)
             assert isinstance(worker_processor, wrapper_cls)
             assert worker_processor is not processor._processor
+            if processor_cls is KimiK2_5VLImageProcessor:
+                assert processor.gpu_image_decode is use_gpu
+                for wrapper in (processor._processor, worker_processor):
+                    with (
+                        patch("torch.cuda.is_available", return_value=True),
+                        patch.object(wrapper, "_gpu_call") as gpu_call,
+                        patch.object(wrapper, "_cpu_call") as cpu_call,
+                    ):
+                        wrapper(text="<|media_pad|>", images=[Image.new("RGB", (8, 8))])
+                    assert gpu_call.call_count == int(use_gpu)
+                    assert cpu_call.call_count == int(not use_gpu)
             if processor_cls is KimiK3ImageProcessor:
                 fingerprint_config = processor.preprocess_fingerprint_payload()[
                     "wrapped_processor"
