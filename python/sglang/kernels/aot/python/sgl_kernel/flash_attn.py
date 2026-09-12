@@ -152,6 +152,7 @@ def flash_attn_with_kvcache(
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
         score_mod [optional]: A callable that takes the attention scores and applies a modification.
         aux_tensors [optional]: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        ver: FlashAttention implementation version. Only 3 is supported by this module.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
@@ -159,6 +160,9 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+
+    if ver != 3:
+        raise ValueError(f"sgl_kernel.flash_attn only supports ver=3, got {ver!r}")
 
     if v_cache is None:
         raise ValueError("v_cache must be provided")
@@ -302,6 +306,10 @@ def flash_attn_varlen_func(
     ver=3,
     out=None,
 ):
+    """Variable-length FlashAttention-3; other ``ver`` values are unsupported."""
+
+    if ver != 3:
+        raise ValueError(f"sgl_kernel.flash_attn only supports ver=3, got {ver!r}")
 
     if not is_fa3_supported():
         raise NotImplementedError(
