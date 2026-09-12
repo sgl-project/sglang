@@ -112,6 +112,7 @@ class TestGLM53FlashH200HighThroughput(
         "8",
         "--moe-a2a-backend",
         "deepep",
+        "--mm-enable-dp-encoder",
     ]
 
 
