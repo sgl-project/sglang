@@ -142,7 +142,8 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
     assert result.hidden_states is output
 
 
-def test_adapter_requests_workspace_output_view(monkeypatch):
+@pytest.mark.parametrize("supports_output_view", [False, True])
+def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_view):
     module = _load_megamoe_module(monkeypatch)
 
     class FakeMoEEpTensors:
@@ -162,7 +163,6 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
     output = torch.randn_like(hidden_states)
 
     class Mega:
-        supports_output_view = True
         _workspace = object()
 
         def forward(self, tensors, *, return_workspace_view=False):
@@ -171,6 +171,7 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
             return output
 
     mega = Mega()
+    mega.supports_output_view = supports_output_view
     dispatch_output = types.SimpleNamespace(
         hidden_states=hidden_states,
         topk_output=types.SimpleNamespace(
@@ -188,7 +189,7 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
     assert result.hidden_states is output
     assert mega.tensors.topk_ids.data_ptr() == topk_ids.data_ptr()
     assert mega.tensors.topk_ids.dtype == torch.int32
-    assert mega.return_workspace_view is True
+    assert mega.return_workspace_view is supports_output_view
 
 
 def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
@@ -281,11 +282,10 @@ def test_w4a16_rejects_non_swiglu(monkeypatch, is_gated, activation):
         module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
 
 
-@pytest.mark.parametrize("use_w4a16", [False, True], ids=["w4a4", "w4a16"])
-def test_nvfp4_reload_preserves_prepared_weight_storage(monkeypatch, use_w4a16):
+def test_w4a16_reload_preserves_layer_and_prepared_weight_storage(monkeypatch):
     module = _load_megamoe_module(monkeypatch)
     monkeypatch.setattr(
-        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: use_w4a16
+        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: True
     )
     # Import the real parameter-binding helper without the full runtime.
     spec = importlib.util.spec_from_file_location(
@@ -295,13 +295,13 @@ def test_nvfp4_reload_preserves_prepared_weight_storage(monkeypatch, use_w4a16):
     common = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, common)
     spec.loader.exec_module(common)
-    hidden, intermediate = (32, 64) if use_w4a16 else (128, 128)
+    hidden, intermediate = 32, 64
     layer = torch.nn.Module()
     layer.hidden_size = hidden
     layer.intermediate_size_per_partition = intermediate
     layer.num_local_experts = layer.num_experts = 2
     layer.moe_ep_size = 1
-    layer.quant_config = types.SimpleNamespace(use_per_token_activation=use_w4a16)
+    layer.quant_config = types.SimpleNamespace(use_per_token_activation=True)
     layer.moe_runner_config = types.SimpleNamespace(
         is_gated=True,
         activation="silu",
@@ -342,19 +342,25 @@ def test_nvfp4_reload_preserves_prepared_weight_storage(monkeypatch, use_w4a16):
                 weight.clone().view(torch.float4_e2m1fn_x2).transpose(1, 2),
                 padded,
             )
-            result.append((*parts, torch.ones(2)) if use_w4a16 else parts)
+            result.append((*parts, torch.ones(2)))
         return tuple(result)
 
     fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
     fake_moe_ep.MoEWeightPack = types.SimpleNamespace
     fake_moe_ep.preprocess_w4a16_cutedsl_mega_weights = preprocess
-    fake_moe_ep.preprocess_nvfp4_cutedsl_mega_weights = preprocess
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
     module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
     prepared = {
         name: (p.shape, p.stride(), p.dtype, p.data_ptr())
         for name, p in layer.named_parameters()
     }
+    mega = types.SimpleNamespace(
+        _workspace=object(),
+        _transformed_weights={name: p.data for name, p in layer.named_parameters()},
+    )
+    forward = object()
+    layer._flashinfer_megamoe_layer = mega
+    layer._flashinfer_megamoe_forward = forward
 
     def load(param, value):
         for name, p in layer.named_parameters():
@@ -365,11 +371,13 @@ def test_nvfp4_reload_preserves_prepared_weight_storage(monkeypatch, use_w4a16):
     for value in (1, 2):
         for param in layer.parameters():
             loader(param, value)
-        layer._flashinfer_megamoe_layer = object()
         module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
-        assert layer._flashinfer_megamoe_layer is None
+        assert layer._flashinfer_megamoe_layer is mega
+        assert layer._flashinfer_megamoe_forward is forward
         for name, p in layer.named_parameters():
             assert (p.shape, p.stride(), p.dtype, p.data_ptr()) == prepared[name]
+            # Views held by the live backend and captured graphs see new bytes.
+            p = mega._transformed_weights[name]
             if p.dtype == torch.float4_e2m1fn_x2:
                 assert (p.view(torch.uint8) == value).all()
             else:
