@@ -4,8 +4,9 @@
 #    /root/.cache/tests/precise-test/{run_id}-attempt-{attempt}/).
 # 2. setup-covstub assembles the outputs: sglang source snapshot (covstub),
 #    test_case_map.json (test case -> covered lines), outputs.tar.gz.
-# 3. Upload the package and the map to OBS (ci/precision-test) for the
-#    downstream precision test selector.
+# 3. Upload the package and the map to OBS (bucket root, same objects as the
+#    download URLs in pr-test-npu.yml) for the downstream precision test
+#    selector.
 # pr-test-npu-finish is the final gate: it runs after both the tests and the
 # coverage collection, so a green check implies coverage data is uploaded.
 #
@@ -281,19 +282,20 @@ jobs:
           import os
           from obs import ObsClient
 
-          OBS_BUCKET = 'sglang'
-          OBS_PREFIX = 'ci/precision-test'
+          # Must match the download URLs in pr-test-npu.yml:
+          # https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/{outputs.tar.gz,test_case_map.json}
+          OBS_BUCKET = 'sglang-ascend'
           run_dir = os.environ['RUN_DIR']
 
           client = ObsClient(
               access_key_id=os.environ['OBS_ACCESS_KEY'],
               secret_access_key=os.environ['OBS_SECRET_KEY'],
-              server='https://obs.cn-north-4.myhuaweicloud.com'
+              server='https://obs.cn-east-3.myhuaweicloud.com'
           )
 
           uploads = [
-              (os.path.join(run_dir, 'outputs.tar.gz'), f'{OBS_PREFIX}/outputs.tar.gz'),
-              (os.path.join(run_dir, 'test_case_map.json'), f'{OBS_PREFIX}/test_case_map.json'),
+              (os.path.join(run_dir, 'outputs.tar.gz'), 'outputs.tar.gz'),
+              (os.path.join(run_dir, 'test_case_map.json'), 'test_case_map.json'),
           ]
           for local_path, obs_path in uploads:
               resp = client.putFile(OBS_BUCKET, obs_path, local_path)
