@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
+from gguf import dequantize as gguf_dequantize
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
@@ -62,8 +63,6 @@ elif _is_musa:
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
-elif _is_npu:
-    from gguf import dequantize as gguf_dequantize
 else:
     if not _is_hip:
         warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
