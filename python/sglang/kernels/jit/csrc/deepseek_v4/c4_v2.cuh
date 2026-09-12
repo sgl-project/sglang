@@ -20,6 +20,7 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/deepseek_v4/c4_compress_core.cuh>
 #include <sgl_kernel/deepseek_v4/compress_v2.cuh>
 
 #include <dlpack/dlpack.h>
@@ -65,6 +66,11 @@ struct Compress4PrefillParams {
 
 template <int64_t kHeadDim_>
 struct C4Trait {
+  // Literal (not a reference to the file-level ::sglang::kTileElements): a device
+  // constexpr initialized from a host-scope constexpr poisons kTileDim's device
+  // emission ("const variable cannot be emitted on device side"). Kept in sync
+  // with the file-level kTileElements = 4 above.
+  static constexpr int32_t kTileElements = 4;
   static constexpr int64_t kTileDim = kTileElements * device::kWarpThreads;  // 128
   static constexpr int64_t kHeadDim = kHeadDim_;
   static constexpr int64_t kOverlapOffset = kHeadDim;
@@ -86,171 +92,20 @@ SGL_DEVICE void c4_forward(
     const int32_t buffer_len) {
   using namespace device;
 
-  using StorageIn = AlignedVector<InputFloat, kTileElements>;
-  const auto gmem_in = tile::Memory<StorageIn>::warp();
-  StorageIn kv[8];
-  StorageIn score[8];
-  StorageIn bias[8];
+  const auto result = c4_compress_core<Trait, BufferFloat, InputFloat>(
+      kv_buf_0, kv_buf_1, kv_src, score_bias, should_overlap, buffer_len);
 
-#pragma unroll
-  for (int32_t i = 0; i < 8; ++i) {
-    bias[i] = gmem_in.load(score_bias + i * Trait::kHeadDim);
-  }
-
-  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
-    if (should_overlap) {
-      const auto kv_start = kv_src - 7 * Trait::kElementSize;  // point to start
-#pragma unroll
-      for (int32_t i = 0; i < 4; ++i) {
-        const auto src = i < buffer_len ? kv_buf_0 : kv_start;
-        const auto base = src + i * Trait::kElementSize;
-        kv[i] = gmem_in.load(base);
-        score[i] = gmem_in.load(base + Trait::kScoreOffset);
-      }
-    } else {
-      [[unlikely]];
-      constexpr float kFloatNegInf = -FLT_MAX;
-#pragma unroll
-      for (int32_t i = 0; i < 4; ++i) {
-        kv[i].fill(cast<InputFloat>(0.0f));
-        score[i].fill(cast<InputFloat>(kFloatNegInf));
-      }
-    }
-
-    const auto kv_start = kv_src - 3 * Trait::kElementSize;  // point to start
-#pragma unroll
-    for (int32_t i = 0; i < 4; ++i) {
-      const auto src = i + 4 < buffer_len ? kv_buf_1 : kv_start;
-      const auto base = src + i * Trait::kElementSize + Trait::kOverlapOffset;
-      kv[i + 4] = gmem_in.load(base);
-      score[i + 4] = gmem_in.load(base + Trait::kScoreOffset);
-    }
-  } else {  // mixed dtype
-    using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
-    const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
-    const auto kv_start_0 = kv_src - 7 * Trait::kElementSize;  // point to start
-
-#pragma unroll
-    for (int32_t i = 0; i < 4; ++i) {
-      if (should_overlap && i < buffer_len) {
-        const auto base = kv_buf_0 + i * Trait::kElementSize;
-        const auto kv_tmp = gmem_buffer.load(base);
-        const auto score_tmp = gmem_buffer.load(base + Trait::kScoreOffset);
-#pragma unroll
-        for (int32_t j = 0; j < kTileElements; ++j) {
-          kv[i][j] = cast<InputFloat>(kv_tmp[j]);
-          score[i][j] = cast<InputFloat>(score_tmp[j]);
-        }
-      } else if (should_overlap) {
-        const auto base = kv_start_0 + i * Trait::kElementSize;
-        kv[i] = gmem_in.load(base);
-        score[i] = gmem_in.load(base + Trait::kScoreOffset);
-      } else {
-        [[unlikely]];
-        constexpr float kFloatNegInf = -FLT_MAX;
-        kv[i].fill(cast<InputFloat>(0.0f));
-        score[i].fill(cast<InputFloat>(kFloatNegInf));
-      }
-    }
-
-    const auto kv_start = kv_src - 3 * Trait::kElementSize;  // point to start
-#pragma unroll
-    for (int32_t i = 0; i < 4; ++i) {
-      if (i + 4 < buffer_len) {
-        const auto base = kv_buf_1 + i * Trait::kElementSize + Trait::kOverlapOffset;
-        const auto kv_tmp = gmem_buffer.load(base);
-        const auto score_tmp = gmem_buffer.load(base + Trait::kScoreOffset);
-#pragma unroll
-        for (int32_t j = 0; j < kTileElements; ++j) {
-          kv[i + 4][j] = cast<InputFloat>(kv_tmp[j]);
-          score[i + 4][j] = cast<InputFloat>(score_tmp[j]);
-        }
-      } else {
-        const auto base = kv_start + i * Trait::kElementSize + Trait::kOverlapOffset;
-        kv[i + 4] = gmem_in.load(base);
-        score[i + 4] = gmem_in.load(base + Trait::kScoreOffset);
-      }
-    }
-  }
-
-  /// NOTE: part 2: safe online softmax + weighted sum
-  using StorageOut = AlignedVector<OutFloat, kTileElements>;
+  using StorageOut = AlignedVector<OutFloat, Trait::kTileElements>;
   const auto gmem_out = tile::Memory<StorageOut>::warp();
-  StorageOut result;
-
-  // consume 32 fp registers
-  float score_fp32[kTileElements][8];
-
-  // convert to fp32 and apply bias first
+  StorageOut out_vec;
 #pragma unroll
-  for (int32_t i = 0; i < kTileElements; ++i) {
-#pragma unroll
-    for (int32_t j = 0; j < 8; ++j) {
-      score_fp32[i][j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);
-    }
-  }
-
-#pragma unroll
-  for (int32_t i = 0; i < kTileElements; ++i) {
-    const auto& score = score_fp32[i];
-    float max_value = score[0];
-    float sum_exp_value = 0.0f;
-
-#pragma unroll
-    for (int32_t j = 1; j < 8; ++j) {
-      const auto fp32_score = score[j];
-      max_value = fmaxf(max_value, fp32_score);
-    }
-
-    float sum_product = 0.0f;
-#pragma unroll
-    for (int32_t j = 0; j < 8; ++j) {
-      const auto fp32_score = score[j];
-      const auto exp_score = __expf(fp32_score - max_value);
-      sum_product += cast<float>(kv[j][i]) * exp_score;
-      sum_exp_value += exp_score;
-    }
-
-    result[i] = cast<OutFloat>(sum_product / sum_exp_value);
+  for (int32_t i = 0; i < Trait::kTileElements; ++i) {
+    out_vec[i] = cast<OutFloat>(result[i]);
   }
 
   // overlap the store with the next iteration's load
   PDLTriggerSecondary<kUsePDL>();
-  gmem_out.store(kv_out, result);
-}
-
-template <typename Trait, typename BufferFloat, typename InputFloat>
-SGL_DEVICE void c4_write_decode(BufferFloat* kv_buf, const InputFloat* kv_src) {
-  using namespace device;
-
-  using StorageInput = AlignedVector<InputFloat, kTileElements>;
-  const auto gmem_input = tile::Memory<StorageInput>::warp();
-
-  StorageInput data[4];
-#pragma unroll
-  for (int32_t i = 0; i < 4; ++i) {
-    data[i] = gmem_input.load(kv_src + Trait::kHeadDim * i);
-  }
-
-  if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
-#pragma unroll
-    for (int32_t i = 0; i < 4; ++i) {
-      gmem_input.store(kv_buf + Trait::kHeadDim * i, data[i]);
-    }
-  } else {
-    using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
-    const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
-
-    StorageBuffer data_cast[4];
-#pragma unroll
-    for (int32_t i = 0; i < 4; ++i) {
-#pragma unroll
-      for (int32_t j = 0; j < kTileElements; ++j) {
-        data_cast[i][j] = cast<BufferFloat>(data[i][j]);
-      }
-      gmem_buffer.store(kv_buf + Trait::kHeadDim * i, data_cast[i]);
-    }
-  }
+  gmem_out.store(kv_out, out_vec);
 }
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>

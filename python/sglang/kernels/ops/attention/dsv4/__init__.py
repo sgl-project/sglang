@@ -11,6 +11,7 @@ from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
+    compress_forward_norm_rope_store,
     compress_norm_rope_store,
 )
 from .compress_old import fused_norm_rope_inplace
@@ -39,6 +40,7 @@ __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
     "compress_forward",
+    "compress_forward_norm_rope_store",
     "compress_norm_rope_store",
     "clear_unaccepted_c128_draft_states",
     "fused_norm_rope_inplace",
