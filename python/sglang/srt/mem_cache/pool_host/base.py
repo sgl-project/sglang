@@ -298,6 +298,17 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def get_page_buffer_element_size(self, split_factor: int = 1) -> Optional[int]:
+        """Byte size of one storage element, or None for a logical anchor."""
+        indices = torch.zeros(self.page_size, dtype=torch.int64)
+        meta = (
+            self.get_split_heads_page_buffer_meta(indices, split_factor)
+            if split_factor != 1
+            else self.get_page_buffer_meta(indices)
+        )
+        sizes = meta[1] if meta else None
+        return int(sizes[0]) if sizes else None
+
     def prepare_transfer_indices(
         self, host_indices, device_indices, io_backend
     ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -2612,14 +2612,26 @@ class UnifiedRadixCache(BasePrefixCache):
             if host_indices is None and shared_domain is None:
                 self.evict_host(alloc_len)
                 host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
-            if host_indices is None and not buffer_mode and shared_domain is None:
+            if host_indices is None and not buffer_mode:
                 # Memory-pressure fallback: a shorter page-aligned prefix.
                 # (Cache mode only — buffer mode parks for the full hit.)
-                available_size = cc.mem_pool_host.available_size()
-                alloc_len = min(
-                    hit_tokens,
-                    available_size - (available_size % self.page_size),
-                )
+                if shared_domain is not None:
+                    low, high = 0, hit_tokens // self.page_size
+                    while low < high:
+                        mid = (low + high + 1) // 2
+                        if cc.can_fit_prefetch_host_buffers(
+                            operation, mid * self.page_size, empty=False
+                        ):
+                            low = mid
+                        else:
+                            high = mid - 1
+                    alloc_len = low * self.page_size
+                else:
+                    available_size = cc.mem_pool_host.available_size()
+                    alloc_len = min(
+                        hit_tokens,
+                        available_size - (available_size % self.page_size),
+                    )
                 if alloc_len >= self.prefetch_threshold:
                     host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
             if host_indices is None:

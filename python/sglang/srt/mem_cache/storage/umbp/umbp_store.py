@@ -650,35 +650,15 @@ class UMBPStore(HiCacheStorage):
                 page_byte_size = int(extra["dram_page_size"])
             elif mem_pool_host is not None:
                 split_factor = 1
-                if storage_config is not None and getattr(
-                    storage_config, "should_split_heads", False
+                if (
+                    not self.is_mla_backend
+                    and storage_config is not None
+                    and getattr(storage_config, "should_split_heads", False)
                 ):
                     split_factor = storage_config.tp_lcm_size // storage_config.tp_size
-                element_size_getter = getattr(
-                    mem_pool_host, "get_page_buffer_element_size", None
+                page_byte_size = mem_pool_host.get_page_buffer_element_size(
+                    split_factor
                 )
-                if element_size_getter is not None:
-                    page_byte_size = element_size_getter(split_factor)
-                else:
-                    # Probe element_size from the same buffer-meta helper that
-                    # batch_preprocess will actually use; this matches per-call
-                    # Put/Get size byte-for-byte for MHA / MHA-split / MLA / NSA
-                    # without per-case formulas (NSA in particular:
-                    # get_ksize_per_token would over-count by the indexer buffer
-                    # that is never put to UMBP).
-                    dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
-                    if self.is_mla_backend:
-                        meta = mem_pool_host.get_page_buffer_meta(dummy)
-                    elif split_factor != 1:
-                        meta = mem_pool_host.get_split_heads_page_buffer_meta(
-                            dummy, split_factor
-                        )
-                    else:
-                        meta = mem_pool_host.get_page_buffer_meta(dummy)
-                    # A hybrid logical anchor returns None here by design; leave
-                    # dram_page_size at 0 and let the per-pool v2 sizes handle it.
-                    esz = meta[1] if meta else None
-                    page_byte_size = int(esz[0]) if esz else 0
 
             if (
                 page_byte_size is not None

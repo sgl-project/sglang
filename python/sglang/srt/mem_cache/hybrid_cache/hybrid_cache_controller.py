@@ -587,11 +587,6 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[list[tuple[PoolName, int]], list[PoolTransfer]]:
         anchor = self.mem_pool_host.anchor_entry
         pool_transfers = operation.pool_transfers or []
-        self._sync_trailing_keys(
-            pool_transfers,
-            operation.hash_value,
-            need_size // self.page_size,
-        )
         requests = [(anchor.name, need_size)]
         independent_transfers = []
         for transfer in pool_transfers:
@@ -604,19 +599,18 @@ class HybridCacheController(BaseHiCacheController):
             entry = self.mem_pool_host.entry_map.get(transfer.name)
             if entry is None:
                 continue
-            requests.append(
-                (transfer.name, len(transfer.keys or []) * entry.host_pool.page_size)
-            )
+            num_pages = len(transfer.keys or [])
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                num_pages = min(num_pages or 1, need_size // self.page_size)
+            requests.append((transfer.name, num_pages * entry.host_pool.page_size))
             independent_transfers.append(transfer)
         return requests, independent_transfers
 
     def can_fit_prefetch_host_buffers(
-        self, operation: StorageOperation, need_size: int
+        self, operation: StorageOperation, need_size: int, *, empty: bool = True
     ) -> bool:
         anchor = self.mem_pool_host.anchor_entry
-        if self.host_memory_mode != "buffer_only" or not self._uses_shared_host_layout(
-            anchor.host_pool
-        ):
+        if not self._uses_shared_host_layout(anchor.host_pool):
             return super().can_fit_prefetch_host_buffers(operation, need_size)
         domain = anchor.host_pool.shared_allocation_domain
         requests, _ = self._shared_prefetch_requests(operation, need_size)
@@ -624,7 +618,12 @@ class HybridCacheController(BaseHiCacheController):
             (self.mem_pool_host.entry_map[name].host_pool.pool_label, size)
             for name, size in requests
         ]
-        return domain.can_fit_many_then(domain_requests, (), empty=True)
+        fits = domain.can_fit_many_then(domain_requests, (), empty=empty)
+        if not empty:
+            fits = self._sync_shared_host_value(
+                int(fits), torch.distributed.ReduceOp.MIN
+            )
+        return bool(fits)
 
     def prefetch_rate_limited(self) -> bool:
         if self.host_memory_mode == "buffer_only" and self._uses_shared_host_layout(
@@ -649,6 +648,11 @@ class HybridCacheController(BaseHiCacheController):
         allocated = self._alloc_shared_host_requests_with_reclaim(requests)
         if allocated is None:
             return None
+        self._sync_trailing_keys(
+            operation.pool_transfers or [],
+            operation.hash_value,
+            need_size // self.page_size,
+        )
         for transfer, indices in zip(independent_transfers, allocated[1:], strict=True):
             transfer.host_indices = indices
         return allocated[0]

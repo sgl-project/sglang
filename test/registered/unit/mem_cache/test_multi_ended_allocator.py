@@ -602,6 +602,58 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         )
         return pool, allocator, kvcache
 
+    def test_reclaim_plan_matches_exhaustive_page_targets(self):
+        page_size = 4
+        _, allocator, _ = self._build(
+            n_full_slots=40, n_swa_slots=24, page_size=page_size
+        )
+        allocator.lazy_compaction = True
+        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+            sub_pool.lazy_compaction = True
+            sub_pool.disagg_move_gate = lambda: False
+        live = allocator.alloc(16)
+        self.assertIsNotNone(live)
+        allocator.free(live[4:8])
+        allocator.free_swa(live[8:12])
+
+        for compacted in (False, True):
+            for sub_pool in (
+                allocator.full_attn_allocator,
+                allocator.swa_attn_allocator,
+            ):
+                sub_pool.disagg_move_gate = lambda: compacted
+            for full_evictable, swa_evictable in ((0, 0), (7, 5), (12, 8), (100, 100)):
+                max_full = min(12, full_evictable) // page_size
+                max_swa = min(8, swa_evictable) // page_size
+                for full_pages in range(9):
+                    for swa_pages in range(full_pages + 1):
+                        feasible = [
+                            (full * page_size, swa * page_size)
+                            for swa in range(max_swa + 1)
+                            for full in range(max_full + 1)
+                            if allocator._fits_page_demand(
+                                full_pages,
+                                swa_pages,
+                                full_reclaim_pages=full,
+                                swa_reclaim_pages=swa,
+                                compacted=compacted,
+                            )
+                        ]
+                        with self.subTest(
+                            compacted=compacted,
+                            evictable=(full_evictable, swa_evictable),
+                            pages=(full_pages, swa_pages),
+                        ):
+                            self.assertEqual(
+                                allocator.reclaim_plan(
+                                    full_pages * page_size,
+                                    swa_pages * page_size,
+                                    full_evictable_tokens=full_evictable,
+                                    swa_evictable_tokens=swa_evictable,
+                                ),
+                                feasible[0] if feasible else None,
+                            )
+
     def test_empty_pool_reservation_matches_packed_byte_boundary(self):
         page_size = 4
         _, allocator, _ = self._build(

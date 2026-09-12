@@ -1822,6 +1822,51 @@ def test_write_through_threshold_assignment_reaches_the_core():
     assert any(isinstance(action, BackupKV) for action in result.cache_actions)
 
 
+def test_unified_swa_backup_when_full_already_has_a_host_copy():
+    from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+
+    bundle = init_unified_swa_pools(
+        device="cpu",
+        kv_cache_dtype=torch.float16,
+        head_num=1,
+        head_dim=4,
+        v_head_dim=4,
+        swa_head_num=1,
+        swa_head_dim=4,
+        swa_v_head_dim=4,
+        page_size=1,
+        start_layer=0,
+        end_layer=2,
+        swa_attention_layer_ids=[1],
+        full_attention_layer_ids=[0],
+        total_bytes=4096,
+        enable_memory_saver=False,
+        need_sort=False,
+        lazy_compaction=False,
+    )
+    allocator = bundle.token_to_kv_pool_allocator
+    padding = allocator.alloc(4)
+    values = allocator.alloc(4)
+    core = _swa_tree_core(window=4, token_to_kv_pool_allocator=allocator)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    node = _insert(core, [1, 2, 3, 4], values.tolist()).last_device_node
+    core.set_component_device_value(
+        node, ComponentType.SWA, allocator.translate_swa_indices_for_transfer(values)
+    )
+    core.commit_backup(node, torch.tensor([100, 101, 102, 103]), {})
+    allocator.free(padding)
+
+    full_indices, transfers = core.build_backup_spec(node)
+
+    assert full_indices.numel() == 0
+    (swa_transfer,) = transfers[ComponentType.SWA]
+    assert torch.equal(
+        swa_transfer.device_indices,
+        allocator.translate_swa_indices_for_transfer(values),
+    )
+
+
 def test_swa_prefetch_commit_end_to_end():
     from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 

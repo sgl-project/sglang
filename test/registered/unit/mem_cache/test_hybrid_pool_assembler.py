@@ -7,6 +7,11 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+    PrefetchOperation,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
@@ -14,6 +19,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_full_draft_pools,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
@@ -172,6 +178,52 @@ def _build_unified_host_pair(bundle):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_shorter_prefetch_reserves_full_and_swa_without_mutating_probe_keys(self):
+        page_size = 4
+        full_pool, swa_pool = _build_unified_host_pair(
+            _build_unified_swa_pool(page_size)
+        )
+        self.addCleanup(full_pool.destroy)
+        self.addCleanup(swa_pool.destroy)
+        cc = HybridCacheController.__new__(HybridCacheController)
+        cc.page_size = page_size
+        cc.host_memory_mode = "cache"
+        cc.attn_cp_group = cc.attn_tp_group = cc.tp_group = None
+        cc.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry(PoolName.KV, full_pool, None, None),
+                PoolEntry(PoolName.SWA, swa_pool, None, None),
+            ]
+        )
+        hit_tokens = full_pool.available_size()
+        hashes = [str(i) for i in range(hit_tokens // page_size)]
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            keys=hashes[-2:],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        operation = PrefetchOperation(
+            "r", list(range(hit_tokens)), pool_transfers=[transfer]
+        )
+        operation.hash_value = hashes
+        self.assertIsNone(cc.alloc_prefetch_host_buffers(operation, hit_tokens))
+        fitting = [
+            n
+            for n in range(page_size, hit_tokens + 1, page_size)
+            if cc.can_fit_prefetch_host_buffers(operation, n, empty=False)
+        ]
+        self.assertTrue(fitting)
+        self.assertEqual(transfer.keys, hashes[-2:])
+        length = max(fitting)
+        self.assertLess(length, hit_tokens)
+        host_indices = cc.alloc_prefetch_host_buffers(operation, length)
+        self.assertEqual(host_indices.numel(), length)
+        self.assertEqual(transfer.host_indices.numel(), 2 * page_size)
+        self.assertEqual(
+            transfer.keys, hashes[length // page_size - 2 : length // page_size]
+        )
+        cc.free_prefetch_host_buffers(operation, host_indices)
+
     def test_shared_arena_can_reuse_bytes_across_sides(self):
         page_size = 4
         full_pool, swa_pool = _build_unified_host_pair(
