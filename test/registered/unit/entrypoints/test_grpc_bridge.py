@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -41,6 +41,39 @@ def _make_runtime_handle(responses):
     handle = RuntimeHandle.__new__(RuntimeHandle)
     handle.tokenizer_manager = _FakeTokenizerManager(responses)
     return handle
+
+
+class TestNativeGrpcProfiling(CustomTestCase):
+    def test_profile_step_limit_reaches_tokenizer_manager(self):
+        from unittest.mock import AsyncMock
+
+        maybe_stub_sgl_kernel()
+        from sglang.srt.managers.io_struct import ProfileReq
+
+        for output_dir, num_steps in (
+            (None, None),
+            ("", None),
+            ("/tmp/profile", 1),
+            (None, 10),
+        ):
+            with self.subTest(output_dir=output_dir, num_steps=num_steps):
+                handle = RuntimeHandle.__new__(RuntimeHandle)
+                handle.tokenizer_manager = SimpleNamespace(start_profile=AsyncMock())
+                handle._submit_on_tm_loop = asyncio.run
+                callback = _RecordingCallback()
+                if num_steps is None:
+                    # Preserve the old two-argument Python call as well.
+                    handle.start_profile(output_dir, callback)
+                else:
+                    handle.start_profile(output_dir, callback, num_steps)
+                handle.tokenizer_manager.start_profile.assert_awaited_once()
+                req = handle.tokenizer_manager.start_profile.call_args.args[0]
+                self.assertIsInstance(req, ProfileReq)
+                self.assertEqual(req.num_steps, num_steps)
+                self.assertEqual(req.output_dir, output_dir or None)
+                self.assertEqual(
+                    callback.calls, [(b'{"message": "Profiling started."}', True, None)]
+                )
 
 
 class TestNativeGrpcParallelResponses(CustomTestCase):
