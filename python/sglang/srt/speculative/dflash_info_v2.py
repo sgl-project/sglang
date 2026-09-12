@@ -2,17 +2,27 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    mamba_track_positions_from_reqs,
+)
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.invariants import (
+    Bucket,
+    Invariant,
+    IsTrue,
+    expect,
+    resolve_level,
+)
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -32,6 +42,208 @@ def _get_overlap_plan_stream(
     return stream, torch.get_device_module(device_str).stream(stream)
 
 
+# A skipped H2D whose device track row no longer matches the host plan steers
+# the verify's mamba state write at a stale ping-pong slot: no containment.
+_PLAN_STAGING_CLEAN = Invariant(
+    "dflash.plan_staging_clean", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)
+
+_PLAN_ROW_CUR_KV_LENS = 0
+_PLAN_ROW_NXT_KV_LENS = 1
+_PLAN_ROW_TRACK_POSITIONS = 2
+_PLAN_ROWS = 3
+
+
+class DecodePlanHostRows(NamedTuple):
+    """This step's host-side plan rows, sliced to the batch."""
+
+    seq_lens: torch.Tensor  # int64: committed lens (seeds batch.seq_lens_cpu)
+    cur_kv_lens: torch.Tensor  # int32
+    nxt_kv_lens: torch.Tensor  # int32
+    track_positions: torch.Tensor  # int32
+
+
+class DecodePlanDeviceRows(NamedTuple):
+    """Device views of the plan rows, sliced to the batch."""
+
+    cur_kv_lens: torch.Tensor
+    nxt_kv_lens: torch.Tensor
+    track_positions: Optional[torch.Tensor]
+
+
+class DecodePlanStaging:
+    """Host->device staging of the per-step DFLASH decode plan, one per device.
+
+    Rows: cur/nxt_kv_lens (page-aligned allocation bounds, read on device only
+    by alloc_for_spec_decode when num_needed_tokens > 0) and the mamba
+    ping-pong track positions (read by every verify). Owned per device rather
+    than per DFlashDraftInputV2 because the worker builds a fresh draft input
+    every step; owning the buffers there meant three allocations and a fill
+    kernel per step.
+
+    The host rows are a two-deep ring. The H2D of step N reads its pinned slot
+    asynchronously and may still be pending while the host prepares N+1 (the
+    host runs ahead of the device); step N-1's copy is done by then because the
+    overlap loop synchronizes copy_done(N-1) -- which fences forward(N-1) and
+    the schedule-stream work before it -- before preparing N+1. The ring also
+    keeps the host views handed out for step N (batch.seq_lens_cpu,
+    nxt_kv_lens_cpu) intact while N's result is processed. A deeper pipeline
+    needs a deeper ring: under SGLANG_INVARIANT_CHECK every shipped slot
+    records an event and reacquiring a slot whose copy has not drained fails
+    loudly; the default path carries no event traffic.
+
+    The H2D is skipped when the device rows are already current: rows 0/1 are
+    consumed only on allocation rounds, row 2 only changes with the track
+    positions, and any change of request set or batch size re-ships all rows.
+    Under SGLANG_INVARIANT_CHECK the copy is unconditional and a round the
+    predicate called clean has its device track row compared against the host
+    plan, so a missed writer fails loudly (dflash.plan_staging_clean).
+    """
+
+    RING_DEPTH = 2
+
+    def __init__(self, device: torch.device | str):
+        self.device = torch.device(device)
+        self._device_module = torch.get_device_module(self.device.type)
+        self._pin_memory = is_pin_memory_available(self.device)
+        self._use_events = self.device.type != "cpu"
+        self.capacity = 0
+        self._slot = 0
+        self._host_seq_lens: list[torch.Tensor] = []
+        self._host_lens: list[torch.Tensor] = []
+        self._slot_copied: list[Optional[torch.Event]] = []
+        self.lens_gpu: Optional[torch.Tensor] = None
+        self._device_stale = True
+        self._shipped_track_positions: Optional[List[int]] = None
+        self._shipped_req_ids: Optional[tuple[str, ...]] = None
+        # Diagnostics: how sparse the gated H2D is over a decode.
+        self.stage_ct = 0
+        self.h2d_copy_ct = 0
+
+    def _grow(self, bs: int) -> None:
+        self.capacity = max(bs, 32, self.capacity * 2)
+        # Old pinned slots may still back a pending copy; the caching host
+        # allocator tracks that on free, and the old device buffer stays alive
+        # through the views the in-flight batch snapshot holds.
+        self._host_seq_lens = [
+            torch.empty((self.capacity,), dtype=torch.int64, device="cpu")
+            for _ in range(self.RING_DEPTH)
+        ]
+        self._host_lens = [
+            torch.zeros(
+                (_PLAN_ROWS, self.capacity),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self._pin_memory,
+            )
+            for _ in range(self.RING_DEPTH)
+        ]
+        self._slot_copied = [None] * self.RING_DEPTH
+        self.lens_gpu = torch.zeros(
+            (_PLAN_ROWS, self.capacity), dtype=torch.int32, device=self.device
+        )
+        self._device_stale = True
+
+    def acquire(self, bs: int) -> DecodePlanHostRows:
+        """Take the next host slot for a step of `bs` requests."""
+        if bs > self.capacity:
+            self._grow(bs)
+        self._slot = (self._slot + 1) % self.RING_DEPTH
+        copied = self._slot_copied[self._slot]
+        assert copied is None or copied.query(), (
+            f"plan slot {self._slot} reacquired before its H2D drained: the ring "
+            f"assumes copy_done(N-1) is synchronized before step N+1 is prepared"
+        )
+        lens = self._host_lens[self._slot]
+        return DecodePlanHostRows(
+            seq_lens=self._host_seq_lens[self._slot][:bs],
+            cur_kv_lens=lens[_PLAN_ROW_CUR_KV_LENS, :bs],
+            nxt_kv_lens=lens[_PLAN_ROW_NXT_KV_LENS, :bs],
+            track_positions=lens[_PLAN_ROW_TRACK_POSITIONS, :bs],
+        )
+
+    def ship(
+        self,
+        *,
+        bs: int,
+        num_needed_tokens: int,
+        track_positions: Optional[List[int]],
+        req_ids: tuple[str, ...],
+    ) -> DecodePlanDeviceRows:
+        """Publish the acquired slot to the device on the current stream when
+        its consumed rows changed since the last copy."""
+        lens_gpu = self.lens_gpu
+        assert lens_gpu is not None, "acquire() must precede ship()"
+        self.stage_ct += 1
+        dirty = (
+            self._device_stale
+            or num_needed_tokens > 0
+            or req_ids != self._shipped_req_ids
+            or track_positions != self._shipped_track_positions
+        )
+        checking = resolve_level() >= InvariantCheckLevel.WARN
+        track_row = lens_gpu[_PLAN_ROW_TRACK_POSITIONS, :bs]
+        previous_track_row = (
+            track_row.clone()
+            if checking and not dirty and track_positions is not None
+            else None
+        )
+        if dirty or checking:
+            lens_gpu.copy_(self._host_lens[self._slot], non_blocking=True)
+            if checking and self._use_events:
+                copied = self._device_module.Event()
+                copied.record()
+                self._slot_copied[self._slot] = copied
+            self.h2d_copy_ct += 1
+            self._device_stale = False
+            self._shipped_req_ids = req_ids
+            self._shipped_track_positions = (
+                None if track_positions is None else list(track_positions)
+            )
+        if previous_track_row is not None:
+            expect(
+                _PLAN_STAGING_CLEAN,
+                (previous_track_row == track_row).all(),
+                msg="device track row diverged from a round the dirty predicate "
+                "skipped",
+            )
+        return DecodePlanDeviceRows(
+            cur_kv_lens=lens_gpu[_PLAN_ROW_CUR_KV_LENS, :bs],
+            nxt_kv_lens=lens_gpu[_PLAN_ROW_NXT_KV_LENS, :bs],
+            track_positions=None if track_positions is None else track_row,
+        )
+
+
+_DECODE_PLAN_STAGINGS: dict[str, DecodePlanStaging] = {}
+
+
+def get_decode_plan_staging(device: torch.device | str) -> DecodePlanStaging:
+    key = str(device)
+    staging = _DECODE_PLAN_STAGINGS.get(key)
+    if staging is None:
+        staging = DecodePlanStaging(device)
+        _DECODE_PLAN_STAGINGS[key] = staging
+    return staging
+
+
+def spec_track_positions(batch: ScheduleBatch) -> Optional[List[int]]:
+    """This step's per-req mamba ping-pong write positions, or None when the
+    extra-buffer cache is off. Lazy: the plan mamba_lazy_spec_prepare made;
+    otherwise mamba_next_track_idx, which nothing advances between decode
+    prep and the verify prep of the same step (results are processed after
+    run_batch), so the verify may read the staged copy."""
+    if not get_exec().mamba.enable_mamba_extra_buffer:
+        return None
+    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+        positions = batch.mamba_lazy_spec_track_positions_cpu
+        assert positions is not None and len(positions) == len(batch.reqs), (
+            "lazy spec decode without a track plan: mamba_lazy_spec_prepare "
+            "must run before DFlashDraftInputV2.prepare_for_decode"
+        )
+        return positions
+    return mamba_track_positions_from_reqs(batch.reqs)
+
+
 @dataclass
 class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations (spec-v2)."""
@@ -46,12 +258,6 @@ class DFlashDraftInputV2(SpecInput):
     uniform_top_k_value: Optional[int] = None
     nxt_kv_lens_cpu: Optional[torch.Tensor] = None
     nxt_kv_lens_sum: Optional[int] = None
-    _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
-    # Per-step plan vectors, rows [cur_kv_lens, nxt_kv_lens, mamba track
-    # positions], staged in one pinned buffer and shipped to the device in a
-    # single copy per decode step.
-    _prepare_lens_cpu_buf: Optional[torch.Tensor] = None
-    _prepare_lens_gpu_buf: Optional[torch.Tensor] = None
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
@@ -63,33 +269,6 @@ class DFlashDraftInputV2(SpecInput):
         # Spec v2 draft state itself does not change token accounting.
         self.num_tokens_per_req = 1
         self.num_tokens_for_logprob_per_req = 1
-
-    def _ensure_prepare_length_buffers(
-        self, bs: int, device: torch.device | str
-    ) -> None:
-        gpu_buf = self._prepare_lens_gpu_buf
-        if (
-            gpu_buf is not None
-            and gpu_buf.shape[1] >= bs
-            and str(gpu_buf.device) == str(device)
-        ):
-            return
-        current = 0 if gpu_buf is None else int(gpu_buf.shape[1])
-        capacity = max(bs, 32, current * 2)
-        # The staging rows and their device mirror share one capacity so the
-        # whole staging buffer moves in one contiguous copy.
-        self._prepare_batch_seq_lens_cpu_buf = torch.empty(
-            (capacity,), dtype=torch.int64, device="cpu"
-        )
-        self._prepare_lens_cpu_buf = torch.zeros(
-            (3, capacity),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=is_pin_memory_available(device),
-        )
-        self._prepare_lens_gpu_buf = torch.zeros(
-            (3, capacity), dtype=torch.int32, device=device
-        )
 
     @classmethod
     def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
@@ -118,18 +297,6 @@ class DFlashDraftInputV2(SpecInput):
 
         batch.maybe_evict_swa()
 
-        self._ensure_prepare_length_buffers(bs, batch.device)
-        assert self._prepare_batch_seq_lens_cpu_buf is not None
-        assert self._prepare_lens_cpu_buf is not None
-        assert self._prepare_lens_gpu_buf is not None
-        batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
-        lens_cpu = self._prepare_lens_cpu_buf
-        cur_kv_lens_cpu_t = lens_cpu[0, :bs]
-        nxt_kv_lens_cpu_t = lens_cpu[1, :bs]
-        track_positions = batch.mamba_lazy_spec_track_positions_cpu
-        if track_positions is not None:
-            lens_cpu[2, :bs] = torch.tensor(track_positions, dtype=torch.int32)
-
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_spec().speculative_num_draft_tokens)
         if block_size <= 0:
@@ -144,22 +311,15 @@ class DFlashDraftInputV2(SpecInput):
             reserve=reserve,
             page_size=page_size,
         )
+        track_positions = spec_track_positions(batch)
 
         max_top_k = 1
         uniform_top_k_value = None
         uniform_top_k = True
-        nxt_kv_lens_sum = 0
-        committed_seq_lens_sum = 0
-        for i, (req, cur, nxt) in enumerate(zip(batch.reqs, cur_kv_lens, nxt_kv_lens)):
-            committed_len = int(req.kv.kv_committed_len)
-            committed_seq_lens_sum += committed_len
+        committed_lens: List[int] = []
+        for i, req in enumerate(batch.reqs):
+            committed_lens.append(int(req.kv.kv_committed_len))
             top_k = int(req.sampling_params.top_k)
-
-            batch_seq_lens_cpu_t[i] = committed_len
-            cur_kv_lens_cpu_t[i] = cur
-            nxt_kv_lens_cpu_t[i] = nxt
-
-            nxt_kv_lens_sum += nxt
             if top_k > max_top_k:
                 max_top_k = top_k
             if i == 0:
@@ -169,6 +329,14 @@ class DFlashDraftInputV2(SpecInput):
 
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
+
+        staging = get_decode_plan_staging(batch.device)
+        host = staging.acquire(bs)
+        host.seq_lens.copy_(torch.tensor(committed_lens, dtype=torch.int64))
+        host.cur_kv_lens.copy_(torch.tensor(cur_kv_lens, dtype=torch.int32))
+        host.nxt_kv_lens.copy_(torch.tensor(nxt_kv_lens, dtype=torch.int32))
+        if track_positions is not None:
+            host.track_positions.copy_(torch.tensor(track_positions, dtype=torch.int32))
 
         caller_stream = None
         if plan_stream is not None:
@@ -181,22 +349,24 @@ class DFlashDraftInputV2(SpecInput):
                 # The plan stream must wait for those writes before reading them.
                 plan_stream.wait_stream(caller_stream)
 
-            lens_gpu = self._prepare_lens_gpu_buf
-            lens_gpu.copy_(lens_cpu, non_blocking=True)
-            cur_kv_lens = lens_gpu[0, :bs]
-            nxt_kv_lens = lens_gpu[1, :bs]
-            if track_positions is not None:
-                batch.mamba_lazy_spec_track_positions = lens_gpu[2, :bs]
+            device_rows = staging.ship(
+                bs=bs,
+                num_needed_tokens=num_needed_tokens,
+                track_positions=track_positions,
+                req_ids=tuple(req.rid for req in batch.reqs),
+            )
+            if device_rows.track_positions is not None:
+                batch.mamba_spec_track_positions = device_rows.track_positions
 
             alloc_for_spec_decode(
                 batch.tree_cache,
                 batch.req_to_token_pool,
                 reqs=batch.reqs,
                 req_pool_indices=batch.req_pool_indices,
-                cur_kv_lens=cur_kv_lens,
-                cur_kv_lens_cpu=cur_kv_lens_cpu_t,
-                nxt_kv_lens=nxt_kv_lens,
-                nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
+                cur_kv_lens=device_rows.cur_kv_lens,
+                cur_kv_lens_cpu=host.cur_kv_lens,
+                nxt_kv_lens=device_rows.nxt_kv_lens,
+                nxt_kv_lens_cpu=host.nxt_kv_lens,
                 num_needed_tokens=num_needed_tokens,
                 batch=batch,
             )
@@ -208,10 +378,10 @@ class DFlashDraftInputV2(SpecInput):
         for req in batch.reqs:
             req.decode_batch_idx += 1
         # Seed committed; overlap's resolve overwrites it with the published value.
-        batch.seq_lens_cpu = batch_seq_lens_cpu_t
-        batch.seq_lens_sum = committed_seq_lens_sum
-        self.nxt_kv_lens_cpu = nxt_kv_lens_cpu_t
-        self.nxt_kv_lens_sum = nxt_kv_lens_sum
+        batch.seq_lens_cpu = host.seq_lens
+        batch.seq_lens_sum = sum(committed_lens)
+        self.nxt_kv_lens_cpu = host.nxt_kv_lens
+        self.nxt_kv_lens_sum = sum(nxt_kv_lens)
 
     def filter_batch(
         self,

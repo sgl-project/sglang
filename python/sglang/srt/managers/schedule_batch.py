@@ -2058,6 +2058,18 @@ def mamba_lazy_spec_in_window(
     return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
 
 
+def mamba_track_positions_from_reqs(reqs: List[Req]) -> List[int]:
+    """Per-req ping-pong position the next tracked state is written to.
+
+    mamba_next_track_idx is None for requests that have not gone through
+    _alloc_ping_pong_buffer yet (e.g. the spec v2 verify path); slot 0 then.
+    """
+    return [
+        req.kv.mamba_next_track_idx if req.kv.mamba_next_track_idx is not None else 0
+        for req in reqs
+    ]
+
+
 def set_mamba_track_indices_from_reqs(
     batch,
     track_positions: Optional[List[int]] = None,
@@ -2067,24 +2079,15 @@ def set_mamba_track_indices_from_reqs(
 
     track_positions: optional per-req ping-pong position override (the lazy
     spec track plan, see mamba_lazy_spec_prepare). track_positions_gpu: the
-    same positions already staged on device, which saves the per-step H2D copy.
+    same positions already staged on device (batch.mamba_spec_track_positions),
+    which saves the per-step H2D copy.
     """
     req_to_token_pool = batch.req_to_token_pool
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
         batch.req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
     if track_positions is None:
-        # Guard: mamba_next_track_idx may be None for requests that haven't
-        # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
-        # Default to 0 (first ping-pong slot) to avoid TypeError.
-        track_positions = [
-            (
-                req.kv.mamba_next_track_idx
-                if req.kv.mamba_next_track_idx is not None
-                else 0
-            )
-            for req in batch.reqs
-        ]
+        track_positions = mamba_track_positions_from_reqs(batch.reqs)
     batch.mamba_track_buffer_indices = list(track_positions)
     if track_positions_gpu is not None:
         idx = track_positions_gpu.to(torch.int64)
@@ -2303,9 +2306,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Lazy + spec: this iteration's per-req scatter positions
     # (see mamba_lazy_spec_prepare).
     mamba_lazy_spec_track_positions_cpu: Optional[List[int]] = None  # shape: [b]
-    # Device staging of the same positions when the spec plan ships them with
-    # its own per-step copy (DFlashDraftInputV2.prepare_for_decode).
-    mamba_lazy_spec_track_positions: Optional[torch.Tensor] = None  # shape: [b], int32
+    # This iteration's per-req ping-pong positions staged on device by the spec
+    # decode plan (DFlashDraftInputV2.prepare_for_decode; lazy plan or
+    # mamba_next_track_idx), so the verify prep needs no H2D of its own.
+    mamba_spec_track_positions: Optional[torch.Tensor] = None  # shape: [b], int32
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -3514,7 +3518,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
-        self.mamba_lazy_spec_track_positions = None
+        self.mamba_spec_track_positions = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -3581,7 +3585,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
-        self.mamba_lazy_spec_track_positions = None
+        self.mamba_spec_track_positions = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
             self.token_ids_logprobs = self.token_ids_logprobs + other.token_ids_logprobs
@@ -3645,7 +3649,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
             mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
             mamba_lazy_spec_track_positions_cpu=self.mamba_lazy_spec_track_positions_cpu,
-            mamba_lazy_spec_track_positions=self.mamba_lazy_spec_track_positions,
+            mamba_spec_track_positions=self.mamba_spec_track_positions,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

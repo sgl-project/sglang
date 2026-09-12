@@ -776,11 +776,14 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
 
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
+
+    The DFLASH decode plan stages this step's positions on device
+    (batch.mamba_spec_track_positions) in both modes, so no H2D here; plans
+    that stage nothing (eagle/ngram) fall back to the per-step copy.
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
     track_positions = None
-    track_positions_gpu = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
@@ -789,8 +792,9 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
             "must run in prepare_for_decode for every spec decode iteration"
         )
-        track_positions_gpu = batch.mamba_lazy_spec_track_positions
-    set_mamba_track_indices_from_reqs(batch, track_positions, track_positions_gpu)
+    set_mamba_track_indices_from_reqs(
+        batch, track_positions, batch.mamba_spec_track_positions
+    )
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
 

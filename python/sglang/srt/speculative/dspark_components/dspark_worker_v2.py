@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -65,11 +66,13 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
+    AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -675,9 +678,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        # batch.seq_lens needs no record_stream: the overlap scheduler pins the
+        # post-resolve SB snapshot for two iterations (record_batch_in_overlap)
+        # and synchronizes copy_done(N) before that slot is recycled, so the
+        # tensor cannot be freed while this forward still reads it.
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
@@ -873,6 +877,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
 
+        return self._build_decode_result(
+            accept=accept,
+            layout=layout,
+            logits_output=logits_output,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def _build_decode_result(
+        self,
+        *,
+        accept: AcceptOuts,
+        layout: Optional[RaggedVerifyLayout],
+        logits_output: LogitsProcessorOutput,
+        can_run_cuda_graph: bool,
+    ) -> GenerationBatchResult:
+        """The one translation from the accept outcome to the scheduler's result;
+        subclasses whose accept lands in their own buffers override it."""
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
