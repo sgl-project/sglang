@@ -1307,6 +1307,32 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
+        self._ensure_multi_ctas_kv_counter_capacity(max(max_bs, max_num_tokens))
+
+    def _ensure_multi_ctas_kv_counter_capacity(self, query_rows: int) -> None:
+        """Size the persistent multi-CTAs KV counter for ``query_rows``.
+
+        The counter is indexed by query rows, and target verify / draft extend
+        expand each request into ``speculative_num_draft_tokens`` of them, so the
+        ``max_running_requests`` used at construction undercounts what capture
+        asks for. Call this before the first capture: once a graph has recorded
+        the buffer's address, growing it would free the allocation that graph
+        replays against.
+
+        Grow-only. Each ``init_cuda_graph_state`` runs before its own capture,
+        but a shrink would discard a buffer an earlier graph already captured.
+        """
+        if self._multi_ctas_kv_counter_buffer is None:
+            return
+        self._multi_ctas_kv_counter_buffer = (
+            grow_multi_ctas_kv_counter_buffer_if_needed(
+                self._multi_ctas_kv_counter_buffer,
+                torch.device(self.device),
+                self.num_q_heads,
+                query_rows,
+            )
+        )
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
