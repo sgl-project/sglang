@@ -22,13 +22,13 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
+    _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
-        return WeightsMapper(
-            orig_to_new_substr={
-                f"model.layers.{text_config.num_hidden_layers}": "model.decoder",
-            },
+        return _Glm5NextNWeightNameMapper(
+            num_hidden_layers=text_config.num_hidden_layers,
         )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
@@ -75,6 +75,37 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         return Glm5NextForConditionalGeneration.load_weights(
             self, nextn_weights, is_nextn=True
         )
+
+
+class _Glm5NextNWeightNameMapper(WeightsMapper):
+    """Map GLM-5.3 NextN weight names into the Deepseek NextN runtime layout.
+
+    The NextN config replaces the base GLM mapper entirely, so checkpoint
+    names may use either ``model.layers.<N>`` or the outer model prefix
+    ``model.language_model.layers.<N>``. Decoder-block tensors live at
+    ``model.decoder.*``; the special NextN tensors at ``model.*``.
+    """
+
+    def __init__(self, num_hidden_layers: int):
+        super().__init__()
+        self._layer_prefixes = (
+            f"model.layers.{num_hidden_layers}",
+            f"model.language_model.layers.{num_hidden_layers}",
+        )
+
+    def _map_name(self, key: str):
+        for prefix in self._layer_prefixes:
+            if key == prefix:
+                return "model.decoder"
+            if key.startswith(prefix + "."):
+                tail = key[len(prefix) + 1 :]
+                if any(
+                    spec_name in tail
+                    for spec_name in Glm5NextForConditionalGenerationNextN._NEXTN_SPEC_WEIGHT_NAMES
+                ):
+                    return f"model.{tail}"
+                return f"model.decoder.{tail}"
+        return key
 
 
 EntryClass = [Glm5NextForConditionalGenerationNextN]
