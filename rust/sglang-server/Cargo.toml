@@ -44,7 +44,8 @@ dynamo-tokenizers = "1.7.0"
 # small service helpers.
 dynamo-parsers = "7.0.1"
 dynamo-protocols = "5.1.0"
-dynamo-renderer = "5.0.0"
+dynamo-renderer = "5.1.2"
+minijinja = "2.24"
 flume = "0.12.0"
 hf-hub = { version = "0.4", default-features = false }
 itertools = "0.14"
