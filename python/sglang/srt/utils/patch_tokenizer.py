@@ -16,10 +16,11 @@ def patch_tokenizer(tokenizer):
             f"Applying special tokens cache patch for Kimi tokenizer: {type(tokenizer)}"
         )
         _SpecialTokensCachePatcher.patch(tokenizer)
-        logger.info(
-            f"Applying encode-piece fast path patch for Kimi tokenizer: {type(tokenizer)}"
-        )
-        return _EncodePieceFastPathPatcher.patch(tokenizer)
+        if _EncodePieceFastPathPatcher.applies_to(tokenizer):
+            logger.info(
+                f"Applying encode-piece fast path patch for Kimi tokenizer: {type(tokenizer)}"
+            )
+            _EncodePieceFastPathPatcher.patch(tokenizer)
 
     return tokenizer
 
@@ -129,20 +130,28 @@ class _EncodePieceFastPathPatcher:
     shapes that dominate Kimi-K3 chat encoding.
 
     ``encoding_k3.build_chat_segments`` renders a conversation into tens of
-    thousands of tiny segments (one per control token, tag name, or tool-call
-    attribute) and ``_encode_text_piece`` is called once per segment.  Two costs
-    make that path CPU-bound on the API server for agentic conversations:
+    thousands of tiny segments -- one per control token or tag name, and four
+    text segments per tool-call attribute (`` key``, ``="``, value, ``"``) --
+    and ``_encode_text_piece`` is called once per segment.  Every call first
+    runs a pure-Python per-character splitter over the segment (control
+    segments included); it yields the input unchanged below
+    ``MAX_NO_WHITESPACES_CHARS`` but still costs O(len) Python per call.  Then:
 
     * control segments call ``tiktoken.Encoding.encode(allowed_special="all")``,
-      which rebuilds the allowed-special set on every call -- ~30us per call
-      regardless of text length -- for what is a dictionary lookup;
-    * text segments run a pure-Python per-character splitter that is a no-op
-      for anything shorter than ``MAX_NO_WHITESPACES_CHARS``.
+      which passes the cached 256-entry special-token set through the
+      Python/Rust boundary on every call -- a fixed ~15-30us per call that
+      dominates for tiny segments -- for what is a dictionary lookup;
+    * text segments call ``encode(disallowed_special=())``, which for text
+      with no special-token literal is exactly ``encode_ordinary``.
 
     The patched method keeps the original as the fallback, so token ids are
     unchanged: a special-token literal inside a text segment, a control segment
     that is not exactly one special token, and long text all take the original
     path.
+
+    Only the Kimi-K3 tokenizer has ``_encode_text_piece``; the K2 family
+    inlines the same loop into ``encode``, so ``applies_to`` must be checked
+    before ``patch``.
     """
 
     _PATCHED_FLAG = "_sglang_encode_piece_patched"
@@ -151,10 +160,19 @@ class _EncodePieceFastPathPatcher:
     _MAX_UNSPLIT_TEXT_CHARS = 25_000
 
     @classmethod
+    def applies_to(cls, tokenizer) -> bool:
+        return callable(getattr(type(tokenizer), "_encode_text_piece", None))
+
+    @classmethod
     def patch(cls, tokenizer):
         tokenizer_cls = type(tokenizer)
 
         if getattr(tokenizer_cls, cls._PATCHED_FLAG, False):
+            return tokenizer
+        if not cls.applies_to(tokenizer):
+            logger.info(
+                f"Skipping encode-piece fast path: {tokenizer_cls.__name__} has no _encode_text_piece"
+            )
             return tokenizer
 
         original_encode_text_piece = tokenizer_cls._encode_text_piece
@@ -172,8 +190,10 @@ class _EncodePieceFastPathPatcher:
                 self
             ).search(text):
                 # disallowed_special=() encodes special literals as plain text,
-                # so with none present encode() == encode_ordinary().
-                return self.model._core_bpe.encode_ordinary(text)
+                # so with none present encode() == encode_ordinary().  Go through
+                # the public method, not _core_bpe, to keep tiktoken's
+                # UnicodeEncodeError fix-up for lone surrogates in the text.
+                return self.model.encode_ordinary(text)
             return original_encode_text_piece(self, text, allow_special_tokens)
 
         tokenizer_cls._original_encode_text_piece = original_encode_text_piece

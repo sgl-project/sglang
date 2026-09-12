@@ -4,10 +4,12 @@ from contextlib import contextmanager
 
 from transformers import AutoTokenizer
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.patch_tokenizer import (
     _EncodePieceFastPathPatcher,
     _SpecialTokensCachePatcher,
     decode_without_hf_kwargs,
+    patch_tokenizer,
     unpatch_tokenizer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -173,7 +175,7 @@ class TestEncodePieceFastPathPatcher(CustomTestCase):
     (or declines) has to encode to the same ids as the original method."""
 
     def test_encode_piece_matches_original_on_every_segment_shape(self):
-        tokenizer = _load_tokenizer()
+        tokenizer = _load_k3_tokenizer()
         specials = list(tokenizer.special_tokens)
         rng = random.Random(0)
         random_texts = [
@@ -193,6 +195,10 @@ class TestEncodePieceFastPathPatcher(CustomTestCase):
             (" " * 40, False),
             # special literal inside plain text -> original path
             *[(f"user wrote {tok} literally", False) for tok in specials[:8]],
+            # lone surrogate (json.loads('"\\ud83d"') in a tool result) ->
+            # tiktoken's UnicodeEncodeError fix-up must still apply
+            ("tool output \ud83d broken", False),
+            ("tool output \ud83d broken", True),
             # longer than MAX_NO_WHITESPACES_CHARS -> original splitter path
             ("b" * 30_000 + " tail", False),
             ("b" * 30_000 + " tail", True),
@@ -210,11 +216,10 @@ class TestEncodePieceFastPathPatcher(CustomTestCase):
             _EncodePieceFastPathPatcher.unpatch(tokenizer)
 
     def test_chat_template_ids_unchanged_for_tool_call_conversation(self):
-        # Kimi-K3's encoding_k3 renders one segment per control token and per
-        # tool-call attribute; this is the shape the fast path exists for.
-        tokenizer = AutoTokenizer.from_pretrained(
-            "moonshotai/Kimi-K3", trust_remote_code=True
-        )
+        # Kimi-K3's encoding_k3 renders one segment per control token or tag
+        # name and four text segments per tool-call attribute; this is the
+        # shape the fast path exists for.
+        tokenizer = _load_k3_tokenizer()
         tools = [
             {
                 "type": "function",
@@ -267,7 +272,7 @@ class TestEncodePieceFastPathPatcher(CustomTestCase):
             _EncodePieceFastPathPatcher.unpatch(tokenizer)
 
     def test_unpatch_restores_encode_piece(self):
-        tokenizer = _load_tokenizer()
+        tokenizer = _load_k3_tokenizer()
         cls = type(tokenizer)
         original = cls._encode_text_piece
 
@@ -279,6 +284,26 @@ class TestEncodePieceFastPathPatcher(CustomTestCase):
         self.assertIs(cls._encode_text_piece, original)
         self.assertFalse(hasattr(cls, "_original_encode_text_piece"))
         self.assertFalse(hasattr(tokenizer, "_sglang_special_literal_regex"))
+
+    def test_k2_tokenizer_without_encode_text_piece_is_skipped(self):
+        # The K2 family shares the TikTokenTokenizer class/module name but
+        # inlines the segment loop into encode(); patch_tokenizer must still
+        # apply the special-tokens cache and skip the encode-piece fast path.
+        tokenizer = _load_tokenizer()
+        cls = type(tokenizer)
+        self.assertFalse(hasattr(cls, "_encode_text_piece"))
+        self.assertFalse(_EncodePieceFastPathPatcher.applies_to(tokenizer))
+
+        expected = tokenizer.encode("hello <|im_end|> world")
+        with envs.SGLANG_PATCH_TOKENIZER.override(True):
+            patched = patch_tokenizer(tokenizer)
+        try:
+            self.assertIs(patched, tokenizer)
+            self.assertTrue(getattr(cls, "_sglang_special_tokens_patched", False))
+            self.assertFalse(getattr(cls, "_sglang_encode_piece_patched", False))
+            self.assertEqual(patched.encode("hello <|im_end|> world"), expected)
+        finally:
+            unpatch_tokenizer(tokenizer)
 
 
 def _random_text_from_tokens(tokenizer, num_tokens, rng):
@@ -297,6 +322,11 @@ def _load_tokenizer():
     return AutoTokenizer.from_pretrained(
         "nvidia/Kimi-K2-Thinking-NVFP4", trust_remote_code=True
     )
+
+
+def _load_k3_tokenizer():
+    # Only Kimi-K3's tokenization_kimi.py has _encode_text_piece / encoding_k3.
+    return AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True)
 
 
 @contextmanager
