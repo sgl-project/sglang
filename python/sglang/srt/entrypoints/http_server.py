@@ -827,20 +827,31 @@ async def server_info():
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    return msgspec_to_builtins(
-        {
-            **server_args.resolved_dict(),
-            "launch_command": server_args.launch_command,
-            **_global_state.scheduler_info,
-            "startup_time": _global_state.tokenizer_manager.startup_time,
-            "internal_states": internal_states,
-            "version": __version__,
-            # Structured KV-event publisher descriptor for KV-aware routers.
-            # `None` when publishing is disabled or misconfigured; see
-            # `runtime_context.describe_kv_events_publisher` for the contract.
-            "kv_events": describe_kv_events_publisher(server_args),
-        }
-    )
+    result = {
+        **server_args.resolved_dict(),
+        "launch_command": server_args.launch_command,
+        **_global_state.scheduler_info,
+        "startup_time": _global_state.tokenizer_manager.startup_time,
+        "internal_states": internal_states,
+        "version": __version__,
+        # Structured KV-event publisher descriptor for KV-aware routers.
+        # `None` when publishing is disabled or misconfigured; see
+        # `runtime_context.describe_kv_events_publisher` for the contract.
+        "kv_events": describe_kv_events_publisher(server_args),
+    }
+
+    # `max_running_requests` is the requested startup value. Hybrid models
+    # can reduce it after sizing the Mamba/linear-attention state cache, so
+    # expose the value the scheduler can actually serve at the top level too.
+    effective_values = [
+        state["effective_max_running_requests_per_dp"]
+        for state in internal_states
+        if state.get("effective_max_running_requests_per_dp") is not None
+    ]
+    if effective_values:
+        result["effective_max_running_requests"] = min(effective_values)
+
+    return msgspec_to_builtins(result)
 
 
 @app.get("/get_load")
