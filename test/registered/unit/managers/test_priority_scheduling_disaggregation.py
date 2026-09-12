@@ -11,6 +11,7 @@ import torch
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
+    _PreallocPlan,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
@@ -138,12 +139,24 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue._update_handshake_waiters = MagicMock()
         queue._allocatable_tokens = MagicMock(return_value=1000)
 
-        def pre_alloc_mock(req, prefix_indices=None, prefix_len=0, total_prefix_len=0):
-            return torch.arange(
-                len(req.origin_input_ids) - prefix_len, dtype=torch.int64
+        def plan_prealloc_mock(
+            req, prefix_indices=None, prefix_len=0, total_prefix_len=0, **_
+        ):
+            fill_len = len(req.origin_input_ids)
+            return _PreallocPlan(
+                req=req,
+                prefix_indices=prefix_indices,
+                prefix_len=prefix_len or 0,
+                total_prefix_len=total_prefix_len or 0,
+                fill_len=fill_len,
+                delta_len=fill_len - (total_prefix_len or 0),
+                uses_swa_tail=False,
+                swa_tail_len=fill_len,
+                kv_loc=torch.arange(fill_len - (prefix_len or 0), dtype=torch.int64),
             )
 
-        queue._pre_alloc = MagicMock(side_effect=pre_alloc_mock)
+        queue._plan_prealloc = MagicMock(side_effect=plan_prealloc_mock)
+        queue._alloc_planned = MagicMock()
 
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 100

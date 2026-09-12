@@ -20,7 +20,7 @@ mem_cache/common.py unpacks ``out_full_loc`` and stashes the bundle on
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -413,7 +413,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
-        swa_tail_len: int,
+        swa_tail_lens: Sequence[int],
         *,
         req_pool_indices: Optional[torch.Tensor] = None,
         req_to_token_pool=None,
@@ -431,7 +431,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
-            swa_tail_len,
+            swa_tail_lens,
         )
         return self._wrap_full_alloc(
             out_full_loc,

@@ -1,8 +1,12 @@
 import logging
+from typing import Sequence
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    pinned_int64_pair,
+)
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -294,18 +298,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
-        swa_tail_len: int,
+        swa_tail_lens: Sequence[int],
     ):
-        """Allocate full KV for the whole extend and SWA KV only for the tail."""
+        """Allocate full KV for the whole extend and SWA KV only for each
+        request's tail (``swa_tail_lens[i]`` trailing tokens of request i)."""
         assert self.page_size > 1
-        assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
-        assert len(prefix_lens_cpu) == 1
-        assert 0 <= swa_tail_len <= extend_num_tokens
+        bs = len(seq_lens_cpu)
+        assert len(prefix_lens_cpu) == bs and len(swa_tail_lens) == bs
+        deltas = (seq_lens_cpu - prefix_lens_cpu).tolist()
+        assert sum(deltas) == extend_num_tokens
+        assert all(0 <= t <= d for t, d in zip(swa_tail_lens, deltas))
 
+        ps = self.page_size
         num_full_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+            seq_lens=seq_lens_cpu, page_size=ps, prefix_lens=prefix_lens_cpu
         )
-        num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
+        num_swa_pages = sum((t + ps - 1) // ps for t in swa_tail_lens)
         if not self.new_pages_available(num_full_pages, num_swa_pages):
             return None
 
@@ -332,15 +340,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_full_indices is not None
 
-        if swa_tail_len == 0:
+        tails = [t for t in swa_tail_lens if t > 0]
+        if not tails:
             return alloc_full_indices
 
         device = self.device
-        swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
-        swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
-        swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
-        swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
-        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+        n = len(tails)
+        swa_prefix_lens = torch.zeros((n,), dtype=torch.int64, device=device)
+        swa_prefix_lens_cpu = torch.zeros((n,), dtype=torch.int64)
+        swa_seq_lens_cpu, swa_seq_lens = pinned_int64_pair(tails, device)
+        _, swa_last_loc = pinned_int64_pair([-1] * n, device)
 
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             swa_prefix_lens,
@@ -348,16 +357,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_seq_lens,
             swa_seq_lens_cpu,
             swa_last_loc,
-            swa_tail_len,
+            sum(tails),
             num_new_pages=num_swa_pages,
         )
         assert alloc_swa_indices is not None
 
-        self.set_full_to_swa_mapping(
-            alloc_full_indices[-swa_tail_len:], alloc_swa_indices
-        )
-        if swa_tail_len < extend_num_tokens:
-            self.clear_full_to_swa_mapping(alloc_full_indices[:-swa_tail_len])
+        # Per request the full extend is one contiguous run of the output; the
+        # tail is its last `swa_tail_lens[i]` tokens, the head has no SWA pair.
+        tail_parts = []
+        head_parts = []
+        offset = 0
+        for delta, tail in zip(deltas, swa_tail_lens):
+            run = alloc_full_indices[offset : offset + delta]
+            if tail > 0:
+                tail_parts.append(run[delta - tail :])
+            if tail < delta:
+                head_parts.append(run[: delta - tail])
+            offset += delta
+        self.set_full_to_swa_mapping(torch.cat(tail_parts), alloc_swa_indices)
+        if head_parts:
+            self.clear_full_to_swa_mapping(torch.cat(head_parts))
         return alloc_full_indices
 
     def alloc_decode(

@@ -423,8 +423,8 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
                 last_device_node=req.last_node,
             )
         )
-        queue._pre_alloc = MagicMock(
-            side_effect=AssertionError("_pre_alloc should not run")
+        queue._plan_prealloc = MagicMock(
+            side_effect=AssertionError("_plan_prealloc should not run")
         )
         queue.transfer_queue = MagicMock(queue=[], enable_staging=False)
         queue.tree_cache = MagicMock()
@@ -466,7 +466,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
-        queue._pre_alloc.assert_not_called()
+        queue._plan_prealloc.assert_not_called()
         queue.tree_cache.dec_swa_lock_only.assert_called_once_with(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=123),
