@@ -21,6 +21,11 @@ from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.tree_component import TreeComponent
+from sglang.srt.runtime_context import (
+    get_exec,
+    mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
+)
 
 _CACHE_ATTRS = ("offset", "lengths", "left_padding")
 _MISSING = object()
@@ -344,6 +349,11 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         TreeComponent.__init__(self, cache, params)
         self.enable_mamba_extra_buffer = False
         self._mamba_pool_host = None
+        # Mirrors MambaComponent.__init__ (mamba_component.py:73-77): the
+        # inherited match/insert paths read these instance attributes.
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
+        self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
+        self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
 
     @staticmethod
     def _tracked_value(req) -> tuple[object | None, bool]:
