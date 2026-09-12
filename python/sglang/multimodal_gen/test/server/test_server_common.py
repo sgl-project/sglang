@@ -24,6 +24,7 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.runner.perf_diagnostics import record_request
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     RealtimeChunkStats,
     pop_realtime_key_frames,
@@ -583,6 +584,7 @@ class DiffusionServerBase:
             )
 
         self._perf_results.append(result)
+        record_request({**result, "perf_check_enabled": case.run_perf_check})
 
     def _print_performance_log(
         self,

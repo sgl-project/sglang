@@ -8,6 +8,8 @@ from typing import Sequence
 
 import tabulate
 
+from sglang.multimodal_gen.test.runner.perf_diagnostics import AttemptDiagnostics
+
 
 def collect_test_items(
     files: Sequence[str], filter_expr: str | None = None
@@ -97,24 +99,30 @@ def parse_junit_xml_for_case_results(xml_path: str) -> dict[str, str]:
     return case_results
 
 
-def _run_pytest_attempt(cmd: list[str]) -> tuple[int, str]:
+def _run_pytest_attempt(cmd: list[str], attempt: int = 1) -> tuple[int, str]:
+    diagnostics = AttemptDiagnostics(attempt)
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
+        env=diagnostics.environment(),
     )
-
+    diagnostics.start(process.pid)
     output_bytes = bytearray()
-    while True:
-        chunk = process.stdout.read(4096)
-        if not chunk:
-            break
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.buffer.flush()
-        output_bytes.extend(chunk)
+    try:
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            output_bytes.extend(chunk)
+            diagnostics.observe(chunk)
 
-    process.wait()
+        process.wait()
+    finally:
+        diagnostics.finish(process.returncode)
     return process.returncode, output_bytes.decode("utf-8", errors="replace")
 
 
@@ -298,7 +306,7 @@ def run_pytest(
             f"for {len(files)} assigned item(s)"
         )
 
-        returncode, full_output = _run_pytest_attempt(cmd)
+        returncode, full_output = _run_pytest_attempt(cmd, attempt=i + 1)
         retryable = returncode not in (0, 5) and _is_retryable_failure(full_output)
         attempt_reports.append(
             {

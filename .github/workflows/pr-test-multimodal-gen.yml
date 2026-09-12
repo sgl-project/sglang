@@ -333,6 +333,7 @@ jobs:
           DIFFUSION_TOTAL_PARTITIONS: ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }}
           DIFFUSION_PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+          SGLANG_DIFFUSION_DIAGNOSTICS_DIR: ${{ github.workspace }}/diffusion-diagnostics
         run: |
           python3 test/run_suite.py \
             --hw cuda \
@@ -348,6 +349,15 @@ jobs:
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
           retention-days: 1
+
+      - name: Upload diffusion performance diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-diagnostics-2gpu-${{ matrix.part }}-${{ github.run_attempt }}
+          path: diffusion-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload diffusion failure artifacts
         if: always()
