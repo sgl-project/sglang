@@ -87,41 +87,47 @@ def _init_compressed_attn_metadata_kernel(
     c128_page_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     COMPUTE_PAGE_INDICES: tl.constexpr,
+    ITERS_PER_PROGRAM: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     if batch_id >= bs:
         return
 
     seq_len = tl.load(seq_lens_ptr + batch_id)
-    position = tl.load(positions_ptr + batch_id)
-    is_write_token = batch_id < num_write_tokens
-    raw_out_loc = tl.load(raw_out_loc_ptr + batch_id, mask=is_write_token, other=0)
-
-    c4_should_compress = (seq_len % 4) == 0
-    c4_out_loc = tl.where(c4_should_compress, raw_out_loc // 4, 0)
-    c4_positions = position & (~3)
-    c4_seq_lens_raw = seq_len // 4
-    c4_seq_lens_clamp1 = tl.maximum(c4_seq_lens_raw, 1)
-
-    tl.store(c4_out_loc_ptr + batch_id, c4_out_loc, mask=is_write_token)
-    tl.store(c4_positions_ptr + batch_id, c4_positions)
-    tl.store(c4_seq_lens_raw_ptr + batch_id, c4_seq_lens_raw)
-    tl.store(c4_seq_lens_clamp1_ptr + batch_id, c4_seq_lens_clamp1)
-
-    c128_should_compress = (seq_len % 128) == 0
-    c128_out_loc = tl.where(c128_should_compress, raw_out_loc // 128, 0)
-    c128_positions = position & (~127)
     c128_seq_lens_raw = seq_len // 128
-    c128_seq_lens_clamp1 = tl.maximum(c128_seq_lens_raw, 1)
+    # the row is split over program_id(1); only its first program writes the per-row scalars
+    if tl.program_id(1) == 0:
+        position = tl.load(positions_ptr + batch_id)
+        is_write_token = batch_id < num_write_tokens
+        raw_out_loc = tl.load(raw_out_loc_ptr + batch_id, mask=is_write_token, other=0)
 
-    tl.store(c128_out_loc_ptr + batch_id, c128_out_loc, mask=is_write_token)
-    tl.store(c128_positions_ptr + batch_id, c128_positions)
-    tl.store(c128_seq_lens_raw_ptr + batch_id, c128_seq_lens_raw)
-    tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
+        c4_should_compress = (seq_len % 4) == 0
+        c4_out_loc = tl.where(c4_should_compress, raw_out_loc // 4, 0)
+        c4_positions = position & (~3)
+        c4_seq_lens_raw = seq_len // 4
+        c4_seq_lens_clamp1 = tl.maximum(c4_seq_lens_raw, 1)
+
+        tl.store(c4_out_loc_ptr + batch_id, c4_out_loc, mask=is_write_token)
+        tl.store(c4_positions_ptr + batch_id, c4_positions)
+        tl.store(c4_seq_lens_raw_ptr + batch_id, c4_seq_lens_raw)
+        tl.store(c4_seq_lens_clamp1_ptr + batch_id, c4_seq_lens_clamp1)
+
+        c128_should_compress = (seq_len % 128) == 0
+        c128_out_loc = tl.where(c128_should_compress, raw_out_loc // 128, 0)
+        c128_positions = position & (~127)
+        c128_seq_lens_clamp1 = tl.maximum(c128_seq_lens_raw, 1)
+
+        tl.store(c128_out_loc_ptr + batch_id, c128_out_loc, mask=is_write_token)
+        tl.store(c128_positions_ptr + batch_id, c128_positions)
+        tl.store(c128_seq_lens_raw_ptr + batch_id, c128_seq_lens_raw)
+        tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
 
     if COMPUTE_PAGE_INDICES:
         page_indices_base = batch_id * c128_cur_max_seq_len
-        for block_start in tl.range(0, c128_cur_max_seq_len, BLOCK_SIZE):
+        chunk_start = tl.program_id(1) * (ITERS_PER_PROGRAM * BLOCK_SIZE)
+        for block_start in tl.range(
+            chunk_start, chunk_start + ITERS_PER_PROGRAM * BLOCK_SIZE, BLOCK_SIZE
+        ):
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
             mask = offsets < c128_cur_max_seq_len
 
@@ -208,7 +214,12 @@ def _init_compressed_attn_metadata_triton(
         if page_table is None:
             page_table = torch.empty(0, dtype=torch.int32, device=device)
 
-    grid = (bs,)
+    # blocks of the page-index row per program: a long capture context is not one serial loop
+    ITERS_PER_PROGRAM = 4
+    grid = (
+        bs,
+        max(1, triton.cdiv(c128_cur_max_seq_len, ITERS_PER_PROGRAM * BLOCK_SIZE)),
+    )
     _init_compressed_attn_metadata_kernel[grid](
         seq_lens,
         positions,
@@ -234,6 +245,7 @@ def _init_compressed_attn_metadata_triton(
         c128_page_size,
         BLOCK_SIZE,
         compute_page_indices,
+        ITERS_PER_PROGRAM,
     )
 
     return (
