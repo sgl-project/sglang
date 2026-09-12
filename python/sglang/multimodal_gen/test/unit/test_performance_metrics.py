@@ -8,6 +8,9 @@ import torch
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 import sglang.multimodal_gen.runtime.managers.memory_managers.component_manager as component_manager_module
 import sglang.multimodal_gen.runtime.utils.perf_logger as perf_logger_module
+from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
+    _deserialize_request_metrics,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     WarmupPhasePeak,
@@ -85,6 +88,7 @@ def test_request_metrics_attributes_steps_and_iterations_to_active_stage():
     }
 
 
+@pytest.mark.parametrize("roundtrip", [False, True])
 @pytest.mark.parametrize(
     "stage_class,profile_name,is_denoising",
     [
@@ -98,7 +102,7 @@ def test_request_metrics_attributes_steps_and_iterations_to_active_stage():
     ],
 )
 def test_stage_role_reaches_performance_guard(
-    stage_class, profile_name, is_denoising, monkeypatch, tmp_path
+    stage_class, profile_name, is_denoising, roundtrip, monkeypatch, tmp_path
 ):
     # skip model construction and kernels, retaining the real stage role,
     # call boundary, profiler, log writer/reader and threshold validator
@@ -124,6 +128,10 @@ def test_stage_role_reaches_performance_guard(
     with patch.object(perf_logger_module.time, "perf_counter", side_effect=[10, 11.5]):
         assert stage(batch, stage.server_args) is batch
     metrics.total_duration_ms = 1500
+    if roundtrip:
+        metrics = _deserialize_request_metrics(
+            json.loads(json.dumps(metrics.to_dict()))
+        )
     PerformanceLogger.log_request_summary(metrics)
     (record,) = read_perf_logs(tmp_path / "performance.log")
     assert record.stages == [

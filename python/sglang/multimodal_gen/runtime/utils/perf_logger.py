@@ -112,6 +112,7 @@ class RequestMetrics:
         return {
             "request_id": self.request_id,
             "stages": self.stages,
+            "denoising_stages": sorted(self.denoising_stages),
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
             "memory_snapshots": {
