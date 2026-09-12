@@ -524,6 +524,11 @@ class DeepseekSparseAttnBackend(
             decode_impl=self.dsa_decode_impl,
         )
 
+        # Captured TRT-LLM graphs retain the address of their counter buffer.
+        # Eager prefills may need a larger buffer later; keep previous buffers
+        # alive for this backend's lifetime so those graphs can still replay.
+        self._retired_multi_ctas_kv_counter_buffers: list[torch.Tensor] = []
+
         if uses_flashinfer_sparse_mla:
             self.workspace_buffer = get_buffer(
                 "dsa_flashinfer_sparse_mla_workspace",
@@ -3541,14 +3546,7 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
-        self._multi_ctas_kv_counter_buffer = (
-            grow_multi_ctas_kv_counter_buffer_if_needed(
-                self._multi_ctas_kv_counter_buffer,
-                torch.device(self.device),
-                self.num_q_heads,
-                batch_size,
-            )
-        )
+        self._ensure_multi_ctas_kv_counter_buffer(batch_size)
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
@@ -3574,6 +3572,15 @@ class DeepseekSparseAttnBackend(
         )
 
         return out
+
+    def _ensure_multi_ctas_kv_counter_buffer(self, batch_size: int) -> None:
+        previous = self._multi_ctas_kv_counter_buffer
+        current = grow_multi_ctas_kv_counter_buffer_if_needed(
+            previous, torch.device(self.device), self.num_q_heads, batch_size
+        )
+        if current is not previous:
+            self._retired_multi_ctas_kv_counter_buffers.append(previous)
+            self._multi_ctas_kv_counter_buffer = current
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
