@@ -3353,5 +3353,99 @@ class TestNoneMeansUnset(CustomTestCase):
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
+class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
+    """The graph-captured TP LM-head all-to-all must not run with NCCL's
+    graph buffer registration: registered graph-pool temporaries deadlock the
+    exchange under DP-rank ramps."""
+
+    def _resolve(self, **kwargs):
+        # The handler reads the DP-adjusted prefill knobs the pipeline would
+        # have settled by then; the dummy-model pipeline itself returns early.
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_dp_attention=True,
+            tp_size=2,
+            dp_size=2,
+            chunked_prefill_size=8192,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+            **kwargs,
+        )
+        parallel_hook.handle_data_parallelism(server_args)
+        return server_args
+
+    def test_pure_dp_decode_node_disables_nccl_graph_register(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            server_args = self._resolve(disaggregation_mode="decode")
+            self.assertTrue(
+                resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+            )
+            self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
+    def test_explicit_nccl_graph_register_is_kept(self):
+        with patch.dict(os.environ, {"NCCL_GRAPH_REGISTER": "1"}, clear=False):
+            with self.assertLogs(parallel_hook.logger, level="WARNING") as logs:
+                self._resolve(disaggregation_mode="decode")
+            self.assertEqual(os.environ["NCCL_GRAPH_REGISTER"], "1")
+            self.assertIn("NCCL_GRAPH_REGISTER=1", "\n".join(logs.output))
+
+    def test_without_all_to_all_env_is_untouched(self):
+        # Unified serving keeps the all-to-all off by default, and a decode
+        # node with the DP LM head never takes the all-to-all.
+        for kwargs in (
+            {},
+            {"disaggregation_mode": "decode", "enable_dp_lm_head": True},
+        ):
+            with self.subTest(**kwargs), patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("NCCL_GRAPH_REGISTER", None)
+                server_args = self._resolve(**kwargs)
+                self.assertFalse(
+                    resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+                )
+                self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
+
+
+class TestDcpCommBackendDefault(CustomTestCase):
+    def _resolved(self, **fields):
+        args = ServerArgs(model_path="dummy", tp_size=8, **fields)
+        parallel_hook.handle_decode_context_parallelism(args)
+        return resolution_result(args, "dcp_comm_backend")
+
+    def test_no_dcp_is_ag_rs(self):
+        self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_fi_a2a_where_supported(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "fi_a2a")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_a2a_on_cuda_without_mnnvl(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "a2a")
+
+    @override_platform(is_cuda=False, is_hip=False)
+    def test_ag_rs_off_cuda(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_explicit_value_wins(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(
+                self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
