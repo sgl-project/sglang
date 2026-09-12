@@ -1,9 +1,10 @@
 """Unit tests for srt/sampling/custom_logit_processor.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 import json
 import unittest
