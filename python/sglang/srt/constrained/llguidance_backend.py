@@ -193,7 +193,12 @@ class GuidanceGrammar(BaseGrammarObject):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_token_bitmask_inplace(logits, vocab_mask)
+        if logits.device.type == "npu":
+            import sgl_kernel_npu  # noqa: F401
+
+            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        else:
+            apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
         # Cache templates are pristine, so cloning their matcher creates a fresh
