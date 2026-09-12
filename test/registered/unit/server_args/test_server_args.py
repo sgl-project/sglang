@@ -357,6 +357,19 @@ class TestPrepareServerArgs(CustomTestCase):
         finally:
             os.unlink(config_file)
 
+    def test_config_boolean_optional_actions(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        merger = ConfigArgumentMerger(parser)
+
+        enabled = merger._convert_config_to_args({"dllm-fdfo": True})
+        disabled = merger._convert_config_to_args({"dllm-fdfo": False})
+
+        self.assertEqual(enabled, ["--dllm-fdfo"])
+        self.assertEqual(disabled, ["--no-dllm-fdfo"])
+        self.assertTrue(parser.parse_args(enabled).dllm_fdfo)
+        self.assertFalse(parser.parse_args(disabled).dllm_fdfo)
+
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
