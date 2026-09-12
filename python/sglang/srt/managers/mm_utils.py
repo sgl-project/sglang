@@ -27,6 +27,7 @@ from sglang.srt.managers.io_struct import (
 # Preserve the existing initialization import for downstream callers.
 from sglang.srt.managers.mm_schedule import (
     DataEmbeddingFunc,
+    _offload_items_to_host,
     get_embedding_and_mask,
 )
 from sglang.srt.managers.mm_schedule import (
@@ -469,6 +470,11 @@ def embed_mm_inputs(
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
             )
+            # The current forward no longer needs any raw feature of this
+            # modality on the device: items in this chunk were encoded, hit
+            # the cache, or were deduplicated onto another item's encode, and
+            # items outside the chunk are not read again this forward.
+            _offload_items_to_host(items)
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
@@ -717,10 +723,11 @@ def general_mm_embed_routine(
             if mm_inputs_list:
                 for mm_input_obj in mm_inputs_list:
                     if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
+                        # The helper holds no reference to the device tensor
+                        # once it returns, so nothing lingers across the
+                        # language model call below.
+                        _offload_items_to_host(mm_input_obj.mm_items)
                         for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
                             if get_disagg().language_only:
                                 precomputed_embeddings = getattr(
                                     mm_item, "precomputed_embeddings", None
