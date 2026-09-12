@@ -338,7 +338,7 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
                 if advise_cold is not None:
                     paged_out += int(advise_cold(room_bytes=room_bytes) or 0)
             if paged_out:
-                logger.info(
+                logger.debug(
                     "Layerwise offload: paged out the first %.1f GiB of %s so the "
                     "next request's stream fits the %.1f GiB the cache can give it.",
                     paged_out / 1024**3,

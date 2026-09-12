@@ -951,13 +951,7 @@ def prefetch_staging_reqs(
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
 
     for session_id, tinfo in transfer_infos[room].items():
-        # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
-        # as a method (it consults decode_prefix_len). Normalize via callable()
-        # so this shared helper works for either backend; treating a bound
-        # method as truthy (the previous behavior) silently dropped every
-        # STAGING_REQ on NIXL and deadlocked the prefill transfer worker.
-        is_dummy_attr = tinfo.is_dummy
-        if is_dummy_attr() if callable(is_dummy_attr) else is_dummy_attr:
+        if tinfo.is_dummy:
             continue
         total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:
