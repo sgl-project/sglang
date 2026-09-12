@@ -56,12 +56,6 @@ class TestSeparateReasoningExecution(CustomTestCase):
         for event in self.events:
             event.set()
 
-    def tearDown(self):
-        super().tearDown()
-        # wake up all threads
-        for ev in self.events:
-            ev.set()
-
     @patch("sglang.srt.parser.reasoning_parser.ReasoningParser")
     def test_execute_separate_reasoning(self, mock_parser_class):
         """Test that _execute_separate_reasoning correctly calls the ReasoningParser."""

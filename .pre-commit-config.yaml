@@ -111,6 +111,23 @@ repos:
         entry: python3 scripts/lint/check_no_bare_pytest_main.py
         language: system
         files: ^(python|test)/.*\.py$
+      - id: check-no-shadowed-defs
+        name: reject methods shadowed by a later def in the same class
+        # Pre-existing offenders, excluded while they are handled separately:
+        #   qwen3_5_text.py            -> #38096
+        #   hybrid_attn_backend.py     -> history in #20812 and #34303
+        #   test_scripted_runtime_core -> the shadowed script is a coverage gap
+        #     rather than dead code, and confirming the fix needs a GPU run
+        # Drop each exclusion as it is resolved.
+        entry: python3 scripts/lint/check_no_shadowed_defs.py
+        language: system
+        files: ^(python|test|scripts)/.*\.py$
+        exclude: |
+          (?x)^(
+          python/sglang/srt/models/qwen3_5_text\.py|
+          python/sglang/srt/layers/attention/hybrid_attn_backend\.py|
+          test/registered/scripted_runtime/test_scripted_runtime_core\.py
+          )$
       - id: check-lint-script-tests
         name: unit tests for lint checkers
         entry: python3 -m unittest discover -s scripts/lint -p 'test_check_*.py'
