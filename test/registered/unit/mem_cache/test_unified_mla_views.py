@@ -22,9 +22,9 @@ Covers, CPU-only (pure torch -- no GPU / Triton kernels):
     the reserved sink floor covers the whole page-0 envelope;
   - `UnifiedMLATokenToKVPool`: buffer wiring, V-as-prefix-slice, and the
     page-envelope `move_kv_cache` (physical token ids, page-major runs);
-  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: identical to the
-    physical translate, tombstone clamp to the sink, `out=` contract, the
-    pinned multiplier, and correctness across eager compaction.
+  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: the same id as the
+    physical translate, tombstone clamp to the sink, `out=` contract, and
+    correctness across eager compaction.
 
 GPU parity of the actual read/write kernels (set_mla_kv_buffer TMA path etc.)
 lives in the server-level tests, not here.
@@ -333,7 +333,7 @@ class _FakeKVCache:
 
 
 class TestTranslateKvLocForKernel(unittest.TestCase):
-    def _build(self, ps=1, n_full_tokens=64, multiplier=None):
+    def _build(self, ps=1, n_full_tokens=64):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
         full_alloc = MultiEndedAllocator(
             kvcache=_FakeKVCache(pool.max_slots("full")),
@@ -342,7 +342,6 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
             device=_DEV,
             is_id_owner=True,
             page_size=ps,
-            kernel_page_multiplier=multiplier,
         )
         mamba_alloc = MultiEndedAllocator(
             kvcache=_FakeKVCache(pool.max_slots("mamba")),
@@ -387,12 +386,6 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
             x = v.clone()
             alloc.translate_kv_loc_for_kernel(x, out=x)
             self.assertTrue(torch.all(x == no_out))
-
-    def test_multiplier_is_pinned_to_one(self):
-        self.assertEqual(self._build(ps=1).kernel_page_multiplier, 1)
-        self.assertEqual(self._build(ps=1, multiplier=1).kernel_page_multiplier, 1)
-        with self.assertRaises(AssertionError):
-            self._build(ps=1, multiplier=_L)
 
     def test_kernel_id_follows_compaction(self):
         alloc = self._build(ps=1)
