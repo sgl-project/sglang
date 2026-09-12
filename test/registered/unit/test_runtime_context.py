@@ -19,7 +19,9 @@ import msgspec.structs
 
 import sglang as _sglang
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups import prefill_buffer_ceiling
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
 )
@@ -44,7 +46,9 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_parallel,
+    get_schedule,
     get_server_args,
+    max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     publish,
     publish_role,
@@ -1203,6 +1207,46 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                                 max_prefill_buffer_tokens_of(args),
                                 max_prefill_buffer_tokens(),
                             )
+
+    def test_prefill_buffer_ceiling_hook_honored_across_tiers(self):
+        args = _FakeResolvedArgs(
+            chunked_prefill_size=8192,
+            enable_dynamic_chunking=True,
+            pp_size=4,
+            max_prefill_tokens=16384,
+        )
+
+        def provider(record, default_ceiling):
+            self.assertIs(record, args)
+            return default_ceiling + 5
+
+        with patch.object(prefill_buffer_ceiling, "_prefill_buffer_ceiling_fn", None):
+            register = prefill_buffer_ceiling.register_prefill_buffer_ceiling
+            self.assertEqual(max_prefill_buffer_tokens_of(args), 16384)
+            self.assertIs(register(provider), provider)
+            register(provider)
+            with self.assertRaisesRegex(RuntimeError, "already registered"):
+                register(lambda record, default_ceiling: default_ceiling)
+            for record_or_view in (args, resolving_view(args), resolved_view(args)):
+                self.assertEqual(max_prefill_buffer_tokens_of(record_or_view), 16389)
+            get_context().set_server_args(args)
+            self.assertEqual(max_prefill_buffer_tokens(), 16389)
+            with get_schedule().override(max_prefill_tokens=32768):
+                self.assertEqual(max_prefill_buffer_tokens(), 32773)
+            self.assertEqual(args.max_prefill_tokens, 16384)
+
+    def test_prefill_buffer_ceiling_provider_can_preserve_defaults(self):
+        args = _FakeResolvedArgs(chunked_prefill_size=4096)
+
+        def provider(record, default_ceiling):
+            return default_ceiling
+
+        with patch.object(prefill_buffer_ceiling, "_prefill_buffer_ceiling_fn", None):
+            prefill_buffer_ceiling.register_prefill_buffer_ceiling(provider)
+            for record_or_view in (args, resolving_view(args), resolved_view(args)):
+                self.assertEqual(max_prefill_buffer_tokens_of(record_or_view), 4096)
+            get_context().set_server_args(args)
+            self.assertEqual(max_prefill_buffer_tokens(), 4096)
 
     def test_activation_reserve_matches_the_member(self):
         from types import SimpleNamespace

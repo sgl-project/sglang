@@ -57,6 +57,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import msgspec
 
+from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner_utils.pool import GraphPoolBorrowState
     from sglang.srt.server_args import ServerArgs
@@ -1788,13 +1790,13 @@ def max_prefill_buffer_tokens() -> int:
     """The prefill-buffer ceiling: ``chunked_prefill_size``, except PP dynamic
     chunking can grow chunks toward ``max_prefill_tokens`` and probe at 1.25x.
 
-    Every input is a published leaf (``schedule`` plus the configured PP size),
-    so this derives from the bags and follows a post-publish override;
+    The default derives from published leaves (``schedule`` plus the configured
+    PP size), so it follows post-publish overrides;
     ``overrides.max_prefill_buffer_tokens`` is the pre-publish equivalent and
-    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal. Records with
+    a registered ceiling provider (see ``register_prefill_buffer_ceiling``)
+    answer through it.
     """
-    import math
-
     schedule = get_schedule()
     chunked = (
         schedule.chunked_prefill_size
@@ -1806,7 +1808,7 @@ def max_prefill_buffer_tokens() -> int:
         tokens = max(
             tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
         )
-    return tokens
+    return prefill_buffer_ceiling_of(get_server_args(), tokens)
 
 
 def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
