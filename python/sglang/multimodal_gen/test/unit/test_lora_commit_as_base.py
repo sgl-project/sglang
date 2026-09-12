@@ -6,6 +6,7 @@ invariants are checked on CPU with a plain nn.Linear base (the parallel forward
 path needs a distributed runtime and is covered by the diffusion server tests).
 """
 
+import pytest
 import torch
 from torch import nn
 
@@ -45,6 +46,24 @@ def test_commit_merged_as_base_promotes_weights_and_resets_state():
     assert layer.disable_lora is True
     assert layer.lora_weights_list == []
     assert layer.lora_A is None and layer.lora_B is None
+
+
+def test_lora_output_offset_tracks_dynamic_and_merged_scale():
+    layer = _make_layer(torch.zeros(1, 2), rank=1, alpha=2)
+    inputs = torch.zeros(3, 2)
+    layer.set_lora_weights(
+        torch.zeros(1, 2),
+        torch.zeros(1, 1),
+        output_offset=torch.tensor([3.0]),
+        strength=0.5,
+        clear_existing=True,
+        merge_weights=False,
+    )
+    torch.testing.assert_close(layer(inputs), torch.full((3, 1), 3.0))
+    layer.merge_lora_weights()
+    torch.testing.assert_close(layer(inputs), torch.full((3, 1), 3.0))
+    with pytest.raises(ValueError, match="constant output offset"):
+        layer.commit_merged_as_base()
 
 
 def test_dynamic_delta_after_commit_does_not_unmerge_base():

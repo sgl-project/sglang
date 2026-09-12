@@ -1,3 +1,4 @@
+import itertools
 import math
 import sys
 
@@ -7,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from scipy.linalg import hadamard
 
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.quantization.hadamard import (
     hadamard_transform,
     hadamard_transform_12n,
@@ -16,7 +18,8 @@ from sglang.kernels.ops.quantization.hadamard import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=128, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=32, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=128, stage="nightly", runner_config="1-gpu-large")
 
 # Exact M×N Hadamard matrices (±1 entries) copied from
 # python/sglang/kernels/jit/csrc/fast-hadamard-transform/code_gen.py.
@@ -218,12 +221,42 @@ def hadamard_transform_mn_ref(x, multiple, scale=1.0):
     return x[..., : x_shape[-1]].reshape(*x_shape)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "dim",
-    # Power-of-2 dims from python/sglang/kernels/aot/tests/test_hadamard.py (old AOT test)
-    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
+_POWER_OF_TWO_DIMS = [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+]
+_POWER_OF_TWO_CASES = get_ci_test_range(
+    list(itertools.product(_POWER_OF_TWO_DIMS, _DTYPES)),
+    [
+        (1, torch.float32),
+        (2, torch.float16),
+        (4, torch.bfloat16),
+        (32, torch.bfloat16),
+        (256, torch.float32),
+        (2048, torch.float16),
+        (8192, torch.bfloat16),
+        (16384, torch.float32),
+        (32768, torch.float16),
+    ],
 )
+
+
+@pytest.mark.parametrize("dim,dtype", _POWER_OF_TWO_CASES)
 def test_hadamard_transform(dim, dtype):
     device = "cuda"
 
@@ -248,13 +281,18 @@ def test_hadamard_transform(dim, dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "dim",
-    # Non-power-of-2 dims to test the padding path
-    # (137 from python/sglang/kernels/aot/tests/test_hadamard.py, 500/1000 added for coverage)
-    [137, 500, 1000],
+_NON_POWER_OF_TWO_CASES = get_ci_test_range(
+    list(itertools.product([137, 500, 1000], _DTYPES)),
+    [
+        (137, torch.float32),
+        (137, torch.bfloat16),
+        (500, torch.float16),
+        (1000, torch.bfloat16),
+    ],
 )
+
+
+@pytest.mark.parametrize("dim,dtype", _NON_POWER_OF_TWO_CASES)
 def test_hadamard_transform_non_power_of_two(dim, dtype):
     device = "cuda"
 
@@ -327,8 +365,18 @@ _28N_DIMS = [28 * (2**k) for k in range(2, 9)]  # 112, 224, ... , 7168
 _40N_DIMS = [40 * (2**k) for k in range(2, 9)]  # 160, 320, ... , 10240
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dim", _12N_DIMS)
+def _mn_cases(dims):
+    return get_ci_test_range(
+        list(itertools.product(dims, _DTYPES)),
+        [
+            (dims[0], torch.float32),
+            (dims[len(dims) // 2], torch.float16),
+            (dims[-1], torch.bfloat16),
+        ],
+    )
+
+
+@pytest.mark.parametrize("dim,dtype", _mn_cases(_12N_DIMS))
 def test_hadamard_transform_12n(dim, dtype):
     device = "cuda"
 
@@ -351,8 +399,7 @@ def test_hadamard_transform_12n(dim, dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dim", _20N_DIMS)
+@pytest.mark.parametrize("dim,dtype", _mn_cases(_20N_DIMS))
 def test_hadamard_transform_20n(dim, dtype):
     device = "cuda"
 
@@ -375,8 +422,7 @@ def test_hadamard_transform_20n(dim, dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dim", _28N_DIMS)
+@pytest.mark.parametrize("dim,dtype", _mn_cases(_28N_DIMS))
 def test_hadamard_transform_28n(dim, dtype):
     device = "cuda"
 
@@ -399,8 +445,7 @@ def test_hadamard_transform_28n(dim, dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dim", _40N_DIMS)
+@pytest.mark.parametrize("dim,dtype", _mn_cases(_40N_DIMS))
 def test_hadamard_transform_40n(dim, dtype):
     device = "cuda"
 

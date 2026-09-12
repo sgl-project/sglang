@@ -15,7 +15,7 @@ export const config = {
   // re-lays the same 16 as flat TP16 / DCPEP16), GB200 (4×4 TP16 MNNVL),
   // H200 (2×8 TP16/EP16, or 4×8 TP32/EP32 for High-Throughput), H100
   // (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have serving recipes.
-  supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x"],
+  supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a3"],
 
   // ---- Cell introspection (config-internal; the engines ignore these keys) ----
   //
@@ -81,7 +81,7 @@ export const config = {
       const [hw, pdMode] = k.split("|");
       return {
         when: { hw: [hw], pdMode: [pdMode], strategy: [...strategies],
-                hicache: ["l2"], spec: ["none"] },
+                hicache: ["l2"], spec: ["none", "dspark"] },
         reason: "This recipe runs DCP, and a storage backend (L3) under DCP is rejected at startup. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2.",
       };
     });
@@ -115,10 +115,8 @@ export const config = {
     const cell = config.cellFor(s);
     const pp = config.sizeOf(cell, "--pp-size");
     const out = [`--tp-size ${config.sizeOf(cell, "--tp-size") * pp}`];
-    // HiCache under DCP rejects speculative decoding, so when a host tier is on
-    // the DCP half is dropped instead of scaled (the HiCache options' own
-    // stripPrefixes reach cell flags only, never these overlay flags).
-    if (config.flagOf(cell, "--dcp-size") && s.hicache !== "l2" && s.hicache !== "l3") {
+    // L3 rejects DCP at startup, so under L3 the DCP half is dropped, not scaled.
+    if (config.flagOf(cell, "--dcp-size") && s.hicache !== "l3") {
       out.push(`--dcp-size ${config.sizeOf(cell, "--dcp-size") * pp}`);
     }
     if (config.flagOf(cell, "--ep-size")) {
@@ -138,8 +136,18 @@ export const config = {
       title: "PD Mode",
       options: [
         { id: "unified", label: "Unified"  },
-        { id: "prefill", label: "Prefill"  },
-        { id: "decode",  label: "Decode"   },
+        {
+          id: "prefill",
+          label: "Prefill",
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3" ? "Only Unified PD is supported on this recipe." : ""),
+        },
+        {
+          id: "decode",
+          label: "Decode",
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3" ? "Only Unified PD is supported on this recipe." : ""),
+        },
       ],
     },
     {
@@ -148,9 +156,21 @@ export const config = {
       id: "strategy",
       title: "Strategy",
       options: [
-        { id: "low-latency",     label: "Low-Latency",     showWhen: (s) => s.pdMode !== "prefill" },
+        {
+          id: "low-latency",
+          label: "Low-Latency",
+          showWhen: (s) => s.pdMode !== "prefill",
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3" ? "Only the Balanced operating point is supported on this recipe." : ""),
+        },
         { id: "balanced",        label: "Balanced",        showWhen: (s) => s.pdMode !== "prefill" },
-        { id: "high-throughput", label: "High-Throughput", showWhen: (s) => s.pdMode !== "prefill" },
+        {
+          id: "high-throughput",
+          label: "High-Throughput",
+          showWhen: (s) => s.pdMode !== "prefill",
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3" ? "Only the Balanced operating point is supported on this recipe." : ""),
+        },
         { id: "default",         label: "Default",         showWhen: (s) => s.pdMode === "prefill" },
         { id: "long-context",    label: "Long-Context",    showWhen: (s) => s.pdMode === "prefill" },
       ],
@@ -173,7 +193,17 @@ export const config = {
       title: "Quantization",
       default: "mxfp4",
       options: [
-        { id: "mxfp4", label: "MXFP4", subtitle: "Moonshot AI checkpoint" },
+        { id: "mxfp4", label: "MXFP4", subtitle: "Moonshot AI checkpoint",
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3" ? "Only Modelslim (W4A8) is supported on this recipe." : ""),
+        },
+        {
+          // A3 only (NPU W4A8 checkpoint); hidden on the GPU recipes.
+          id: "modelslim",
+          label: "Modelslim (W4A8)",
+          subtitle: "ModelScope NPU checkpoint",
+          showWhen: (s) => s.hw === "a3",
+        },
         {
           id: "nvfp4",
           label: "NVFP4",
@@ -197,7 +227,7 @@ export const config = {
       id: "mmTransport",
       title: "VLM Transport",
       default: "auto",
-      showWhen: (s) => s.pdMode !== "decode",
+      showWhen: (s) => s.pdMode !== "decode" && s.hw !== "a3",
       options: [
         {
           id: "auto",
@@ -234,7 +264,11 @@ export const config = {
       title: "Spec Decode",
       default: "dspark",
       options: [
-        { id: "none", label: "Non-Spec" },
+        { id: "none", label: "Non-Spec",
+          env: (s) => (["mi350x", "mi355x"].includes(s.hw) ? ["SGLANG_MLA_DECODE_TUNE=1"] : []),
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3" ? "Only DSPARK is supported on this recipe." : ""),
+        },
         {
           id: "dspark",
           label: "DSPARK",
@@ -257,17 +291,29 @@ export const config = {
             config.specCollapses(s)
               ? ["--tp-size", "--pp-size", "--dcp-size", "--ep-size"]
               : [],
-          // Every DSPARK recipe layers ReplaySSM on: it moves the per-draft
-          // intermediate SSM states onto a fixed ring, lifting the concurrency
-          // the state pool admits (needs the Triton decode kernel, the K3
-          // default). Only the PD prefill role opts out — it never runs verify
-          // and rejects the flag at startup.
           flags: (s) => [
             ...(config.specCollapses(s) ? config.specCollapsedFlags(s) : []),
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Kimi-K3-DSpark",
             "--speculative-dspark-block-size 7",
-            ...(s.pdMode === "prefill" ? [] : ["--enable-linear-replayssm-spec"]),
+            // The NPU recipe adds the NPU draft path's own knobs (draft
+            // attention backend, topk 1, unquantized draft weights) on top of
+            // the common trio.
+            ...(s.hw === "a3"
+              ? [
+                  "--speculative-draft-attention-backend ascend",
+                  "--speculative-eagle-topk 1",
+                  "--speculative-draft-model-quantization unquant",
+                ]
+              : []),
+            // ReplaySSM moves the per-draft intermediate SSM states onto a
+            // fixed ring, lifting the concurrency the state pool admits (needs
+            // the Triton decode kernel, the K3 default). It is CUDA-only, and
+            // the PD prefill role opts out — it never runs verify and rejects
+            // the flag at startup.
+            ...(s.hw !== "a3" && s.pdMode !== "prefill"
+              ? ["--enable-linear-replayssm-spec"]
+              : []),
           ],
         },
         {
@@ -300,35 +346,34 @@ export const config = {
         {
           id: "l2",
           label: "L1+L2 (host)",
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3"
+            ? "NPU HiCache does not support mamba cache (K3's KDA state is one)."
+            : ""),
           flags: [
             "--enable-hierarchical-cache",
           ],
-          // L1/L2 host tiering IS supported under DCP, so DCP stays — except with
-          // speculative decoding, which HiCache under DCP rejects at startup (the
-          // draft host pool has no DCP index translation). There the DCP operating
-          // point is dropped instead of blocking the option, same as L3 does. The
-          // ratio calculator reads --dcp-size off this command, so dropping it also
-          // re-solves --mamba-full-memory-ratio for the plain-TP shape.
-          //
-          // Which cells carry DCP is read off the cells themselves, so adding or
-          // reshaping a DCP recipe needs no edit here.
           stripPrefixes: (s) =>
-            s.spec !== "none" && config.hasDcp(s)
+            !["none", "dspark"].includes(s.spec) && config.hasDcp(s)
               ? ["--dcp-size", "--dcp-comm-backend"]
               : [],
           hints: (s) =>
-            s.spec !== "none" && config.hasDcp(s)
+            !["none", "dspark"].includes(s.spec) && config.hasDcp(s)
               ? [
-                  "HiCache under DCP rejects speculative decoding, so this recipe drops DCP",
-                  "and serves the MLA KV TP-replicated (any PP/EP in the cell stays).",
-                  "Per-request context is far shorter than the DCP",
-                  "version — DCP is what buys KV capacity. Run the cell NOSPEC to keep DCP.",
+                  "HiCache under DCP only accepts DSPARK speculative decoding, so this",
+                  "recipe drops DCP and serves the MLA KV TP-replicated (any PP/EP in the",
+                  "cell stays). Per-request context is far shorter than the DCP version —",
+                  "DCP is what buys KV capacity. Run the cell NOSPEC or DSPARK to keep DCP.",
                 ]
               : [],
         },
         {
           id: "l3",
           label: "+ L3 (Mooncake)",
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3"
+            ? "NPU HiCache does not support mamba cache (K3's KDA state is one)."
+            : ""),
           flags: [
             "--enable-hierarchical-cache",
             "--hicache-storage-backend mooncake",
@@ -367,6 +412,7 @@ export const config = {
   modelNames: {
     default: "moonshotai/Kimi-K3",
     nvfp4: "nvidia/Kimi-K3-NVFP4",
+    a3: "sgl-npu/Kimi-K3-W4A8",
   },
 
   placeholders: {
@@ -397,7 +443,7 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} --random-range-ratio 1.0 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --flush-cache`,
+  --warmup-requests 64 --flush-cache`,
     // num_prompts = 5 × concurrency (measured floor 16).
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
   },
@@ -411,14 +457,17 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    mi350x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
-    mi355x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
+    // 20260903 or newer: the AITER SiTU A4W4/A8W4 layout fix (sgl-project/sglang#33838,
+    // merged Sep 3) and the fused gfx950 KDA decode boundary (#34198) first ship here.
+    mi350x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
     // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
     // image is cut from that PR's head (CUDA 13).
     "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "gb300|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "b200|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "gb200|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
+    a3:     "quay.io/ascend/sglang:main-cann9.0.0-a3",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
@@ -435,10 +484,23 @@ export const config = {
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
-          null, 8,
+          null,
+          {
+            value: 8,
+            get disable() { return [
+              {
+                when: { hw: ["a3"] },
+                reason: "Only TP64 is supported on this recipe.",
+              },
+            ]; },
+          },
           {
             value: 16,
             get disable() { return [
+              {
+                when: { hw: ["a3"] },
+                reason: "Only TP64 is supported on this recipe.",
+              },
               {
                 when: { hw: ["b300", "gb300"] },
                 reason: "TP=16 needs 16 ranks; the B300 and GB300 recipes have 8 ranks.",
@@ -450,13 +512,41 @@ export const config = {
               ...config.pipelinedKnobDisableRules,
             ]; },
           },
+          {
+            // A3 only: 64 ranks (4 nodes × 8 cards × 2 dies); hidden on the GPU recipes.
+            value: 64,
+            hide: { hw: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x"] },
+          },
         ]},
         { id: "dpAttn", label: "DP-Attention",
           values: [
-            null, false, 2, 4,
+            null,
+            {
+              value: false,
+              get disable() { return [
+                {
+                  when: { hw: ["a3"] },
+                  reason: "Only DP-Attention=4 is supported on this recipe.",
+                },
+              ]; },
+            },
+            {
+              value: 2,
+              get disable() { return [
+                {
+                  when: { hw: ["a3"] },
+                  reason: "Only DP-Attention=4 is supported on this recipe.",
+                },
+              ]; },
+            },
+            4,
             {
               value: 8,
               get disable() { return [
+                {
+                  when: { hw: ["a3"] },
+                  reason: "Only DP-Attention=4 is supported on this recipe.",
+                },
                 {
                   when: { hw: ["b300", "gb300"] },
                   reason: "On an 8-rank deployment (B300 1×8, GB300 2×4) dp=8 leaves attn_tp=1, so each rank holds the full unsharded MLA KV and OOMs — prefer dp=2/attn_tp=4.",
@@ -471,6 +561,10 @@ export const config = {
             {
               value: 16,
               get disable() { return [
+                {
+                  when: { hw: ["a3"] },
+                  reason: "Only DP-Attention=4 is supported on this recipe.",
+                },
                 {
                   when: { hw: ["b300", "gb300"] },
                   reason: "DP-Attention=16 needs 16 TP ranks; the B300 and GB300 recipes have 8.",
@@ -500,8 +594,12 @@ export const config = {
             requiresHw: ["b200", "b300", "gb200", "gb300"] },
           // Blackwell-only: runs FlashInfer's official trtllm-gen SiTU kernels.
           { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"],
-            requiresHw: ["b200", "b300", "gb200", "gb300"] },
-          { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"] },
+            requiresHw: ["b200", "b300", "gb200", "gb300"],
+            disable: [{ when: { hw: ["a3"] },
+              reason: "FlashInfer is a CUDA kernel and is not supported on NPU." }] },
+          { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"],
+            disable: [{ when: { hw: ["a3"] },
+              reason: "Marlin is a CUDA kernel and is not supported on NPU." }] },
         ],
       },
       // MegaMoE quantization sub-select — shown only when backend === "megamoe".
@@ -511,37 +609,40 @@ export const config = {
           { id: "w4a8", label: "W4A8",
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
           { id: "w4a4", label: "W4A4",
-            env: [
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
-            ] },
+            flags: ["--enable-w4a4-mxfp4-megamoe"],
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
         ],
       },
-      ep: { label: "EP", values: [
-        null, 1, 2, 4, 8,
-        {
-          value: 16,
-          get disable() { return [
-            {
-              when: { hw: ["b300", "gb300"] },
-              reason: "EP=16 needs 16 TP ranks; the B300 and GB300 recipes have 8.",
-            },
-            {
-              when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
-              reason: "With Spec Decode off, the B200 Unified recipes use TP8 within each PP2 stage, so EP cannot exceed 8. Switch Spec Decode to DSPARK for the flat TP16 shape.",
-            },
-            ...config.pipelinedKnobDisableRules,
-          ]; },
-        },
-      ]},
+      ep: {
+        showWhen: (b) => b.hw !== "a3",
+        label: "EP",
+        values: [
+          null, 1, 2, 4, 8,
+          {
+            value: 16,
+            get disable() { return [
+              {
+                when: { hw: ["b300", "gb300"] },
+                reason: "EP=16 needs 16 TP ranks; the B300 and GB300 recipes have 8.",
+              },
+              {
+                when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
+                reason: "With Spec Decode off, the B200 Unified recipes use TP8 within each PP2 stage, so EP cannot exceed 8. Switch Spec Decode to DSPARK for the flat TP16 shape.",
+              },
+              ...config.pipelinedKnobDisableRules,
+            ]; },
+          },
+        ],
+      },
     },
 
     // ----- Card: "Parsers" -----
     parsers: {
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser kimi_k3" },
-        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser kimi_k3" },
+        // Tool calling is not yet supported on the NPU, so the item hides on a3.
+        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser kimi_k3",
+          hide: { hw: ["a3"] } },
       ],
     },
 
@@ -618,7 +719,8 @@ export const config = {
         //   EAGLE   --speculative-num-steps N           (chain; topk>1 is a tree)
         // Only DSPARK is selectable today, so only its form is emitted.
         id: "proposedDraftTokens", title: "Proposed Draft Tokens",
-        showWhen: (b) => b.spec === "dspark",
+        // The A3 recipe pins the shipped block size (7).
+        showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         control: "slider",
         stripPrefixes: [
           "--speculative-dspark-block-size",
@@ -641,9 +743,10 @@ export const config = {
         // Spec-only, so gate the row on DSPARK; every DSPARK recipe (except the PD
         // prefill role) turns it on in the base, so this row derives to On and
         // exists mainly as the opt-out.
-        // Needs the Triton linear-attn decode backend (the K3 default).
+        // Needs the Triton linear-attn decode backend (the K3 default); the A3
+        // script never sets it.
         id: "replaySsm", title: "ReplaySSM (spec)",
-        showWhen: (b) => b.spec === "dspark",
+        showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         stripPrefixes: ["--enable-linear-replayssm-spec"],
         options: [
           { id: "off", label: "Off" },
@@ -663,7 +766,8 @@ export const config = {
         // without --speculative-dspark-sps-table-path (every step still
         // verifies full width); fails fast with ReplaySSM or DCP > 1.
         id: "raggedVerify", title: "Ragged Verify Mode (spec)",
-        showWhen: (b) => b.spec === "dspark",
+        // The A3 recipe pins static.
+        showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         stripEnv: ["SGLANG_RAGGED_VERIFY_MODE"],
         options: [
           { id: "static",  label: "Auto (static)" },
@@ -672,6 +776,7 @@ export const config = {
       },
       {
         id: "kvCacheDtype", title: "KV Cache Precision",
+        showWhen: (b) => b.hw !== "a3",
         stripPrefixes: ["--kv-cache-dtype"],
         options: [
           { id: "auto", label: "Auto (BF16)" },
@@ -680,6 +785,7 @@ export const config = {
       },
       {
         id: "mambaSsmDtype", title: "KDA State Precision",
+        showWhen: (b) => b.hw !== "a3",
         stripPrefixes: ["--mamba-ssm-dtype"],
         options: [
           { id: "auto", label: "Auto (FP32)" },
@@ -694,6 +800,7 @@ export const config = {
         // Off suits prefix-free traffic (offline batch, evals): 1 state slot
         // per request instead of 4-5.
         id: "prefixCache", title: "Prefix Cache",
+        showWhen: (b) => b.hw !== "a3",
         stripPrefixes: ["--disable-radix-cache"],
         options: [
           { id: "on",  label: "On" },
@@ -705,7 +812,8 @@ export const config = {
         // prefix cache off, so the row hides (and stops emitting) there.
         // Slot cost per request: extra_buffer 5, extra_buffer_lazy 4.
         id: "mambaRadix", title: "KDA Radix Cache Strategy",
-        showWhen: (b, v, d) => (((v && v.prefixCache) ?? (d && d.prefixCache)) !== "off"),
+        showWhen: (b, v, d) => (b.hw !== "a3")
+          && ((((v && v.prefixCache) ?? (d && d.prefixCache)) !== "off")),
         stripPrefixes: ["--mamba-radix-cache-strategy"],
         options: [
           { id: "auto",  label: "Auto (extra_buffer)" },
@@ -719,6 +827,7 @@ export const config = {
         // (extra_buffer 5→4, extra_buffer_lazy 4→3; no_buffer stays 3). Off by
         // default. Env var, not a flag, so it emits via env/stripEnv.
         id: "mambaSlotSaving", title: "KDA Slot Saving (experimental)",
+        showWhen: (b) => b.hw !== "a3",
         stripEnv: ["SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK"],
         options: [
           { id: "off", label: "Off" },
@@ -726,8 +835,35 @@ export const config = {
         ],
       },
       {
+        // AITER SiTU v2 activation-quant mode (ROCm only). A8W4 rides AITER's
+        // GU-interleaved preshuffled weights, A4W4 the generic separated layout;
+        // SGLang mirrors AITER's precedence (A8W4 wins when both are set), so the
+        // row emits exactly one. Needs AITER >= ROCm/aiter#4534.
+        id: "situActMode", title: "SiTU MoE Activation Quant (AMD)",
+        showWhen: (b) => ["mi350x", "mi355x"].includes(b.hw),
+        stripEnv: ["AITER_SITUV2_A8W4", "AITER_SITUV2_A4W4"],
+        options: [
+          { id: "a8w4", label: "A8W4 (default)", env: ["AITER_SITUV2_A8W4=1"] },
+          { id: "a4w4", label: "A4W4 — correct, ~1% slower", env: ["AITER_SITUV2_A4W4=1"] },
+        ],
+      },
+      {
+        // Opt-in fused gfx950 KDA decode boundary (f_b + conv + recurrence +
+        // gated RMSNorm). Fail-closed: init arms it only on gfx950 with the
+        // FlyDSL kernels importable, and every decode step re-validates before
+        // dispatch. Env var, not a flag, so it emits via env/stripEnv.
+        id: "kdaFusedDecode", title: "Fused KDA Decode (AMD gfx950)",
+        showWhen: (b) => ["mi350x", "mi355x"].includes(b.hw),
+        stripEnv: ["SGLANG_K3_KDA_FUSED_BACKEND"],
+        options: [
+          { id: "off",   label: "Off" },
+          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_K3_KDA_FUSED_BACKEND=aiter"] },
+        ],
+      },
+      {
         // Only meaningful with EP a2a on (MoE card or a large-scale preset).
         id: "eplb", title: "Expert Rebalancing (EPLB)",
+        showWhen: (b) => b.hw !== "a3",
         stripPrefixes: ["--enable-eplb"],
         options: [
           { id: "off", label: "Off" },
@@ -739,6 +875,7 @@ export const config = {
         // Validated on the no-a2a MXFP4 runner; untested against SBO (EP a2a)
         // and DP attention.
         id: "prefillGraph", title: "Prefill CUDA Graph",
+        showWhen: (b) => b.hw !== "a3",
         stripPrefixes: ["--cuda-graph-backend-prefill"],
         options: [
           { id: "auto", label: "Auto (off)" },
@@ -761,7 +898,7 @@ export const config = {
         // resolves it into the full parallelism shape (tp/ep/dp/dcp; attn-tp =
         // tp/dp); pool sizing rides the calculator-driven ratio.
         id: "lsGpus", title: "Cluster Size (large-scale)",
-        showWhen: (b) => b.pdMode === undefined || b.pdMode === "unified",
+        showWhen: (b) => (b.hw !== "a3") && (b.pdMode === undefined || b.pdMode === "unified"),
         // Default follows the base cell's own GPU count (tp8 lanes -> 8,
         // tp16 lanes -> 16), so a preset starts from "same hardware, new shape".
         default: (b) =>
@@ -777,7 +914,7 @@ export const config = {
       },
       {
         id: "lsPreset", title: "Large-Scale Preset",
-        showWhen: (b) => b.pdMode === undefined || b.pdMode === "unified",
+        showWhen: (b) => (b.hw !== "a3") && (b.pdMode === undefined || b.pdMode === "unified"),
         stripPrefixes: [
           "--tp-size", "--tp", "--tensor-parallel-size",
           "--ep-size", "--ep", "--expert-parallel-size",
@@ -829,10 +966,6 @@ export const config = {
                 when: { hicache: ["l3"] },
                 reason: "L3 storage keys are not dcp_rank-aware, so DCP and L3 cannot run together. Use Peak Throughput, or switch HiCache to L1+L2.",
               },
-              {
-                when: { hicache: ["l2"], spec: ["dspark"] },
-                reason: "HiCache under DCP rejects speculative decoding, so this preset cannot add DCP here. Use Peak Throughput, or run the cell NOSPEC.",
-              },
             ],
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=20480"],
             flags: (v, b) => {
@@ -865,8 +998,7 @@ export const config = {
     {
       match: { hw: "b300", pdMode: "unified", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       // No --enable-symm-mem: it makes the fused all-reduce auto-probe skip.
       flags: [
@@ -883,8 +1015,7 @@ export const config = {
     {
       match: { hw: "b300", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1037,7 +1168,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--host {{HOST_IP}}",
@@ -1064,7 +1195,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--host {{HOST_IP}}",
@@ -1813,7 +1944,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--disaggregation-mode decode",
@@ -1841,7 +1972,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--disaggregation-mode decode",
@@ -2188,6 +2319,63 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
+    {
+      match: { hw: "a3", pdMode: "unified", strategy: "balanced" },
+      nnodes: 4,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_USE_MODELSCOPE=1",
+        "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "HCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "STREAMS_PER_DEVICE=32",
+        "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128",
+        "HCCL_BUFFSIZE=200",
+        "HCCL_OP_EXPANSION_MODE=AIV",
+        "DEEPEP_NORMAL_LONG_SEQ_ROUND=64",
+        "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512",
+        "DEEPEP_HCCL_BUFFSIZE=1800",
+        "SGLANG_K3_SHARED_EXPERTS_ATTN_TP=1",
+        "SGLANG_K3_DENSE_MLP_ATTN_TP=1",
+        "SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1",
+        "SGLANG_ENABLE_SPEC_V2=1",
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+        "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
+        "SGLANG_DSPARK_FOLDED_SAMPLING=0",
+        "SGLANG_DSPARK_STACKED_CTX_KV=0",
+        "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path {{MODEL_NAME}}",
+        "--attention-backend ascend",
+        "--device npu",
+        "--quantization modelslim",
+        "--dtype bfloat16",
+        "--tp-size 64",
+        "--enable-dp-attention",
+        "--dp-size 4",
+        "--enable-dp-lm-head",
+        "--mem-fraction-static 0.78",
+        "--chunked-prefill-size 16384",
+        "--cuda-graph-bs-decode 2 4 8 16",
+        "--max-running-requests 64",
+        "--max-mamba-cache-size 64",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode auto",
+        "--reasoning-parser kimi_k3",
+        "--watchdog-timeout 9000",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
   ],
 
   // Cross-node fabric env (substitute the NIC used by every rank).
@@ -2221,6 +2409,14 @@ export const config = {
       "  GLOO_SOCKET_IFNAME=<your-nic>   # e.g. bond0",
       "  NCCL_SOCKET_IFNAME=<your-nic>   # force NCCL off kube-ipvs0",
       "  SGLANG_HOST_IP=<this-node-ip>",
+    ],
+    a3: [
+      "Run the same command on all four nodes with --node-rank 0/1/2/3.",
+      "NPU collectives use HCCL. Pin the cross-node NIC on EVERY node:",
+      "  GLOO_SOCKET_IFNAME=<your-nic>   # bootstrap interface",
+      "  HCCL_SOCKET_IFNAME=<your-nic>   # HCCL transport interface",
+      "  SGLANG_HOST_IP=<this-node-ip>   # this node's IP on that NIC",
+      "If running outside the official image, source set_env.sh on every node first.",
     ],
   },
 };

@@ -13,6 +13,7 @@ from .modelslim_mxfp4 import ModelSlimMXFP4Scheme
 from .modelslim_mxfp8_moe import ModelSlimMXFP8MoEScheme
 from .modelslim_w4a4_int4 import ModelSlimW4A4Int4
 from .modelslim_w4a4_int4_moe import ModelSlimW4A4Int4MoE
+from .modelslim_w4a4_mxfp4_moe import ModelSlimW4A4MXFP4MoE
 from .modelslim_w4a8_int8_moe import ModelSlimW4A8Int8MoE
 from .modelslim_w4a8_mxfp4_moe import ModelSlimW4A8MXFP4MoE
 from .modelslim_w8a8_int8 import ModelSlimW8A8Int8
@@ -25,6 +26,7 @@ __all__ = [
     "ModelSlimMXFP4W4A8Scheme",
     "ModelSlimMXFP4Scheme",
     "ModelSlimMXFP8MoEScheme",
+    "ModelSlimW4A4MXFP4MoE",
     "ModelSlimW4A8MXFP4MoE",
     "ModelSlimW8A8Int8",
     "ModelSlimW4A4Int4",

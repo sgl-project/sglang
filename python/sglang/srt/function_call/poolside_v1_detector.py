@@ -11,7 +11,10 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import safe_literal_eval
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    safe_literal_eval,
+)
 
 
 class _ParseState(Enum):
@@ -150,7 +153,7 @@ class PoolsideV1Detector(BaseFormatDetector):
                     and tool.function.name == func_name
                     and isinstance(tool.function.parameters, dict)
                 ):
-                    return tool.function.parameters.get("properties", {})
+                    return get_schema_properties(tool.function.parameters)
             except AttributeError:
                 continue
         return {}

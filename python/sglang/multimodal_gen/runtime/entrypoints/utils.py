@@ -18,7 +18,6 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from copy import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Union
 
@@ -41,9 +40,16 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs as expand_request_outputs,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds as normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -159,49 +165,6 @@ def _close_cached_cuda_video_buffer() -> None:
 atexit.register(_close_cached_cuda_video_buffer)
 
 
-@dataclass
-class SetLoraReq:
-    lora_nickname: Union[str, List[str]]
-    lora_path: Optional[Union[str, List[Optional[str]]]] = None
-    target: Union[str, List[str]] = "all"
-    strength: Union[float, List[float]] = 1.0
-    merge_mode: Optional[str] = None
-    lora_alpha: Optional[Union[int, List[Optional[int]]]] = None
-
-
-@dataclass
-class MergeLoraWeightsReq:
-    target: str = "all"
-    strength: float = 1.0
-
-
-@dataclass
-class UnmergeLoraWeightsReq:
-    target: str = "all"
-
-
-@dataclass
-class ListLorasReq:
-    pass
-
-
-@dataclass
-class ShutdownReq:
-    pass
-
-
-@dataclass
-class ReleaseRealtimeSessionReq:
-    session_id: str
-
-
-@dataclass
-class GetDisaggStatsReq:
-    """Request to get disagg pipeline metrics from the scheduler."""
-
-    pass
-
-
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],
@@ -254,129 +217,6 @@ class MaterializedOutput:
     frames: list[Any]
     audio: Any = None
     fps: int = 0
-
-
-def normalize_output_seeds(
-    seed: int | list[int],
-    *,
-    num_outputs_per_prompt: int,
-    num_prompts: int = 1,
-    prompt_index: int = 0,
-) -> list[int]:
-    """
-    return a list of seed with size equal to `num_outputs_per_prompt`
-    """
-    if num_outputs_per_prompt <= 0:
-        raise ValueError(
-            f"num_outputs_per_prompt must be positive, got {num_outputs_per_prompt}"
-        )
-
-    if isinstance(seed, list):
-        seeds = [int(item) for item in seed]
-        total_outputs = num_outputs_per_prompt * num_prompts
-        if len(seeds) == num_outputs_per_prompt:
-            return seeds
-        if len(seeds) == total_outputs:
-            start = prompt_index * num_outputs_per_prompt
-            return seeds[start : start + num_outputs_per_prompt]
-        raise ValueError(
-            "seed list length must match num_outputs_per_prompt "
-            f"({num_outputs_per_prompt}) or total outputs ({total_outputs}), "
-            f"got {len(seeds)}"
-        )
-
-    base_seed = int(seed)
-    return [base_seed + i for i in range(num_outputs_per_prompt)]
-
-
-def _with_output_index_suffix(output_file_name: str, output_index: int) -> str:
-    base, ext = os.path.splitext(output_file_name)
-    return f"{base}_{output_index}{ext}"
-
-
-def _copy_trace_ctx_for_output(req: Req, request_id: str | None, output_index: int):
-    trace_ctx = req.trace_ctx
-    if output_index == 0 or not trace_ctx.tracing_enable:
-        return trace_ctx
-
-    output_trace_ctx = TraceReqContext(
-        rid=request_id,
-        module_name=trace_ctx.module_name,
-        external_trace_header=trace_ctx.external_trace_header,
-    )
-    output_trace_ctx.trace_req_start()
-    return output_trace_ctx
-
-
-def _copy_req_for_output(
-    req: Req,
-    *,
-    request_id: str | None,
-    output_index: int,
-) -> Req:
-    """Create a lightweight per-output ``Req`` without deep-copying tensors."""
-    output_req = copy(req)
-    output_req.sampling_params = copy(req.sampling_params)
-    output_req.extra = dict(req.extra)
-    output_req.condition_inputs = dict(req.condition_inputs)
-    output_req.trace_ctx = _copy_trace_ctx_for_output(req, request_id, output_index)
-    return output_req
-
-
-def expand_request_outputs(
-    req: Req,
-    *,
-    num_prompts: int = 1,
-    prompt_index: int = 0,
-) -> list[Req]:
-    """
-    Expand a req to a list with size equal to `num_prompts`
-    """
-    num_outputs = int(req.num_outputs_per_prompt)
-    # each req must has different seed
-    seeds = normalize_output_seeds(
-        req.seed,
-        num_outputs_per_prompt=num_outputs,
-        num_prompts=num_prompts,
-        prompt_index=prompt_index,
-    )
-
-    if num_outputs == 1:
-        req.seed = seeds[0]
-        req.seeds = None
-        req.generator = None
-        req.sampling_params.refresh_request_extra_after_output_expansion(req)
-        return [req]
-
-    expanded: list[Req] = []
-    for output_index, seed in enumerate(seeds):
-        output_request_id = (
-            f"{req.request_id}:{output_index}" if req.request_id is not None else None
-        )
-        output_req = _copy_req_for_output(
-            req, request_id=output_request_id, output_index=output_index
-        )
-        output_req.seed = seed
-        output_req.num_outputs_per_prompt = 1
-        output_req.seeds = None
-        output_req.generator = None
-        output_req.extra["parent_request_id"] = req.request_id
-        output_req.extra["output_index"] = output_index
-
-        if output_request_id is not None:
-            output_req.request_id = output_request_id
-
-        if req.output_file_name:
-            output_req.output_file_name = _with_output_index_suffix(
-                req.output_file_name, output_index
-            )
-        output_req.sampling_params.refresh_request_extra_after_output_expansion(
-            output_req
-        )
-        output_req.validate()
-        expanded.append(output_req)
-
-    return expanded
 
 
 def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
@@ -610,21 +450,29 @@ def _try_save_cuda_video_direct(
                     assert buffer.tensor is not None
                     for start in range(0, num_frames, chunk_frames):
                         end = min(start + chunk_frames, num_frames)
-                        frames = (
-                            (video[:, start:end] * 255).clamp_(0, 255).to(torch.uint8)
-                        )
-                        frames = frames.permute(1, 2, 3, 0).contiguous()
-                        buffer.tensor[: end - start].copy_(frames, non_blocking=True)
-                        torch.cuda.current_stream(video.device).synchronize()
-                        del frames
-                        _sendfile_all(
-                            process.stdin.fileno(),
-                            buffer.fd,
-                            (end - start) * height * width * 3,
-                        )
-                process.stdin.close()
-                process.stdin = None
-                returncode = process.wait()
+                        with maybe_record_function(
+                            f"VIDEO_CHUNK frames {start}-{end} convert+pipe_to_x264"
+                        ):
+                            frames = (
+                                (video[:, start:end] * 255)
+                                .clamp_(0, 255)
+                                .to(torch.uint8)
+                            )
+                            frames = frames.permute(1, 2, 3, 0).contiguous()
+                            buffer.tensor[: end - start].copy_(
+                                frames, non_blocking=True
+                            )
+                            torch.cuda.current_stream(video.device).synchronize()
+                            del frames
+                            _sendfile_all(
+                                process.stdin.fileno(),
+                                buffer.fd,
+                                (end - start) * height * width * 3,
+                            )
+                with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
+                    process.stdin.close()
+                    process.stdin = None
+                    returncode = process.wait()
             finally:
                 if process.stdin is not None:
                     process.stdin.close()
@@ -887,9 +735,13 @@ def prepare_request(
     """
     Create a Req object with sampling_params as a parameter.
     """
+    attention_backend_config = server_args.attention_backend_config or {}
+    vsa_sparsity = attention_backend_config.get(
+        "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+    )
     req = Req(
         sampling_params=sampling_params,
-        VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+        VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
     if getattr(sampling_params, "max_sequence_length", None) is not None:
@@ -899,8 +751,17 @@ def prepare_request(
     if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
         req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
-    if not isinstance(req.prompt, str):
-        raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
+    action_prompt = (
+        req.data_type == DataType.ACTION
+        and isinstance(req.prompt, list)
+        and bool(req.prompt)
+        and all(isinstance(item, str) for item in req.prompt)
+    )
+    if not isinstance(req.prompt, str) and not action_prompt:
+        raise TypeError(
+            "`prompt` must be a string, or a non-empty list of strings for "
+            f"batched action requests, but got {type(req.prompt)}"
+        )
 
     req_width = getattr(req, "width", None)
     req_height = getattr(req, "height", None)

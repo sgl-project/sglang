@@ -73,6 +73,10 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.runtime_context import get_serving
+from sglang.srt.sampling.sampling_params import (
+    set_request_reasoning_end_token_ids,
+)
 from sglang.srt.utils import random_uuid
 
 if TYPE_CHECKING:
@@ -333,8 +337,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         ):
             return self.create_error_response(
-                "MCP tool server is not supported in background mode and "
-                "streaming mode"
+                "MCP tool server is not supported in background mode and streaming mode"
             )
 
         # Schedule the request and get the result generator
@@ -394,6 +397,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    if processed_messages is not None:
+                        set_request_reasoning_end_token_ids(
+                            sampling_params,
+                            processed_messages.reasoning_end_token_ids,
+                        )
                     # _process_messages set skip_special_tokens on a chat_request
                     # we then discard, so re-apply it to the engine sampling dict.
                     if processed_messages is not None and (
@@ -427,6 +435,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         else {}
                     )
 
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request, request.routed_dp_rank
+                    )
+
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
                         **logprob_kwargs,
@@ -456,6 +468,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         session_id=request.session_id,
                         extra_key=request.extra_key,
                         cache_salt=request.cache_salt,
+                        bootstrap_host=request.bootstrap_host,
+                        bootstrap_port=request.bootstrap_port,
+                        bootstrap_room=request.bootstrap_room,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
@@ -540,17 +557,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     require_reasoning=require_reasoning,
                 )
             try:
-                result: Union[ORJSONResponse, ResponsesResponse] = (
-                    await self.responses_full_generator(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                        require_reasoning=require_reasoning,
-                    )
+                result: Union[
+                    ORJSONResponse, ResponsesResponse
+                ] = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    require_reasoning=require_reasoning,
                 )
                 return result
             except Exception as e:
@@ -592,13 +609,19 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
+        # ``_process_messages`` merges server defaults into the temporary Chat
+        # request before rendering. Response parsing happens later from the
+        # original request, so carry over the exact template kwargs that selected
+        # the wire-format delimiters.
+        request.chat_template_kwargs = (
+            dict(chat_request.chat_template_kwargs)
+            if chat_request.chat_template_kwargs is not None
+            else None
+        )
 
-        if is_multimodal:
-            request_prompts = [processed_messages.prompt]
-            engine_prompts = [processed_messages.prompt]
-        else:
-            request_prompts = [processed_messages.prompt_ids]
-            engine_prompts = [processed_messages.prompt_ids]
+        _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
+        request_prompts = [engine_prompt]
+        engine_prompts = [engine_prompt]
 
         return messages, request_prompts, engine_prompts, processed_messages
 
@@ -609,7 +632,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         if request.tool_choice != "auto":
             raise NotImplementedError(
-                "Only 'auto' tool_choice is supported in " "response API"
+                "Only 'auto' tool_choice is supported in response API"
             )
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
@@ -859,6 +882,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_required = request.tool_choice == "required"
         tool_call_items: list[ResponseFunctionToolCall] = []
         parsed_via_native = False
+        detector_owns_format = False
         if (
             content
             and chat_tools
@@ -870,9 +894,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
-            should_try_native = (
-                not is_required or parser.detector.supports_structural_tag()
+            detector_owns_format = (
+                parser.detector.supports_structural_tag()
+                or parser.detector.parses_required_natively()
             )
+            should_try_native = not is_required or detector_owns_format
             if should_try_native and parser.has_tool_call(content):
                 try:
                     content, call_info_list = parser.parse_non_stream(content)
@@ -891,7 +917,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 except Exception as e:
                     logger.error("Tool call parsing error: %s", e)
 
-        if content and chat_tools and is_required and not parsed_via_native:
+        if (
+            content
+            and chat_tools
+            and is_required
+            and not parsed_via_native
+            and not detector_owns_format
+        ):
             try:
                 tool_call_data = orjson.loads(content)
                 if isinstance(tool_call_data, dict):
@@ -1324,9 +1356,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]
                 del prev_msgs[prev_final_msg_idx + 1 :]
                 for msg in recent_turn_msgs:
-                    if (
-                        hasattr(msg, "channel") and msg.channel != "analysis"
-                    ):  # type: ignore[union-attr]
+                    if hasattr(msg, "channel") and msg.channel != "analysis":  # type: ignore[union-attr]
                         prev_msgs.append(msg)
             messages.extend(prev_msgs)
         # Append the new input.
@@ -1480,8 +1510,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Get event type from the event's type field if it exists
             event_type = getattr(event, "type", "unknown")
             return (
-                f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
             )
 
         current_content_index = 0
@@ -1910,8 +1939,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             event_type = getattr(event, "type", "unknown")
             return (
-                f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
             )
 
         # The streaming Response* event models echo ``tools`` through a
@@ -2010,7 +2038,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         finish_reason: Optional[dict[str, Any]] = None
         flushed = False
         stream_offset = 0
-        incremental = self.tokenizer_manager.server_args.incremental_streaming_output
+        incremental = get_serving().incremental_streaming_output
 
         def _open_reasoning_item() -> str:
             nonlocal current_output_index

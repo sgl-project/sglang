@@ -23,10 +23,15 @@ from sglang.srt.entrypoints.openai.serving_responses import (
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import (
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
+)
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class InputMessageConstructionTestCase(CustomTestCase):
@@ -246,6 +251,38 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(request_prompts, [[4, 5, 6]])
         self.assertEqual(engine_prompts, [[4, 5, 6]])
 
+    def test_k2_output_parser_reuses_effective_template_default(self):
+        serving = make_serving()
+        serving.reasoning_parser = "k2_horizon"
+        serving.default_chat_template_kwargs = {"reasoning_effort": "low"}
+        serving.template_manager.chat_template_name = None
+        serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [4, 5, 6]
+        request = ResponsesRequest(
+            model="IFM/K2-Horizon-7B",
+            input="hi",
+            # Template kwargs are the final render inputs, so the server default
+            # below takes precedence over this API convenience field.
+            reasoning={"effort": "medium"},
+            store=False,
+        )
+
+        asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        render_call = serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+        self.assertEqual(render_call.kwargs["reasoning_effort"], "low")
+        self.assertEqual(request.chat_template_kwargs["reasoning_effort"], "low")
+
+        output_items = serving._make_response_output_items(
+            request,
+            "work</ifm|think_faster>\nanswer",
+            tokenizer=Mock(),
+            require_reasoning=True,
+        )
+        self.assertEqual(output_items[0].content[0].text, "work")
+        self.assertEqual(output_items[1].content[0].text, "\nanswer")
+
 
 class ReasoningRequestForwardingTestCase(unittest.TestCase):
     def test_create_responses_uses_processed_reasoning_state(self):
@@ -263,6 +300,7 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
             video_data=None,
             modalities=[],
             stop=[],
+            reasoning_end_token_ids=[41, 42],
         )
         captured = {}
 
@@ -308,6 +346,12 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
 
         self.assertEqual(response.status, "completed")
         self.assertFalse(captured["adapted_request"].require_reasoning)
+        self.assertEqual(
+            captured["adapted_request"].sampling_params["custom_params"][
+                REQUEST_REASONING_END_TOKEN_IDS_KEY
+            ],
+            [41, 42],
+        )
         self.assertFalse(parser_cls.call_args.kwargs["force_reasoning"])
 
 
@@ -578,11 +622,44 @@ class MultimodalRequestTestCase(CustomTestCase):
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
+    def test_multimodal_token_first_specs_route_through_prompt_ids(self):
+        """Bug regression: token-first encoders leave prompt == "" with
+        non-empty prompt_ids; forwarding the empty text 400s in
+        _tokenize_texts, so the multimodal branch must forward prompt_ids."""
+        for spec in ("inkling", "kimi_k3"):
+            with self.subTest(spec=spec):
+                serving = make_serving(is_multimodal=True)
+                serving.chat_encoding_spec = spec
+                serving._process_messages = Mock(
+                    return_value=MessageProcessingResult(
+                        prompt="",
+                        prompt_ids=[4, 5, 6],
+                        image_data=None,
+                        audio_data=None,
+                        video_data=None,
+                        modalities=[],
+                        stop=[],
+                    )
+                )
+                request = ResponsesRequest(model="x", input="hi", store=False)
+
+                _, request_prompts, engine_prompts, _ = asyncio.run(
+                    serving._make_request(
+                        request, None, serving.tokenizer_manager.tokenizer
+                    )
+                )
+
+                self.assertEqual(engine_prompts, [[4, 5, 6]])
+                self.assertEqual(request_prompts, [[4, 5, 6]])
+
 
 class OutputItemsTestCase(CustomTestCase):
     def setUp(self):
         # qwen3_coder is the default for this class; the one no-native-parser
         # case overrides it.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.serving = make_serving()
         self.serving.tool_call_parser = "qwen3_coder"
 
@@ -690,6 +767,44 @@ class OutputItemsTestCase(CustomTestCase):
             [item for item in output_items if isinstance(item, ResponseOutputMessage)],
             [],
         )
+
+    def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
+        """muse reports parses_required_natively, so required output must not
+        be pushed through the orjson JSON-array fallback (mirrors chat)."""
+        serving = self.serving
+        serving.tool_call_parser = "muse"
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            tool_choice="required",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+            store=False,
+        )
+        raw = '[{"name": "get_weather", "parameters": {"city": "Beijing"}}]'
+
+        output_items = serving._make_response_output_items(
+            request, raw, tokenizer=Mock(), require_reasoning=False
+        )
+
+        self.assertEqual(
+            [
+                item
+                for item in output_items
+                if isinstance(item, ResponseFunctionToolCall)
+            ],
+            [],
+        )
+        message_items = [
+            item for item in output_items if isinstance(item, ResponseOutputMessage)
+        ]
+        self.assertEqual(len(message_items), 1)
+        self.assertEqual(message_items[0].content[0].text, raw)
 
     def test_no_tool_call_extraction_when_tool_choice_none(self):
         serving = self.serving
@@ -807,7 +922,7 @@ class EnginePassthroughTestCase(CustomTestCase):
     """Both flags cross hops with no type contract, and dropping either fails
     silently."""
 
-    def _capture(self, serving, request):
+    def _capture(self, serving, request, raw_request=None):
         # Let the real _process_messages run: it is the hop that turns
         # skip_special_tokens off, so mocking it would make that assertion vacuous.
         # chat_template_name=None routes it through the tokenizer's template
@@ -839,8 +954,34 @@ class EnginePassthroughTestCase(CustomTestCase):
             yield context
 
         serving._generate_with_builtin_tools = fake_generate
-        asyncio.run(serving.create_responses(request))
+        asyncio.run(serving.create_responses(request, raw_request=raw_request))
         return captured
+
+    def test_pd_routing_fields_forwarded_to_engine(self):
+        serving = make_serving()
+        raw_request = Mock(headers={"x-data-parallel-rank": "2"}, state=Mock())
+
+        captured = self._capture(
+            serving,
+            ResponsesRequest(
+                model="x",
+                input="hi",
+                bootstrap_host="10.0.0.1",
+                bootstrap_port=8998,
+                bootstrap_room=42,
+                routed_dp_rank=1,
+                disagg_prefill_dp_rank=0,
+                store=False,
+            ),
+            raw_request=raw_request,
+        )
+
+        adapted_request = captured["adapted_request"]
+        self.assertEqual(adapted_request.bootstrap_host, "10.0.0.1")
+        self.assertEqual(adapted_request.bootstrap_port, 8998)
+        self.assertEqual(adapted_request.bootstrap_room, 42)
+        self.assertEqual(adapted_request.routed_dp_rank, 2)
+        self.assertEqual(adapted_request.disagg_prefill_dp_rank, 0)
 
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()

@@ -122,6 +122,25 @@ python -m sglang.launch_server \
 
 **Important**: `--dp-size` must be greater than 1 for DPA to work. When `dp_size == 1` (default), `--enable-dp-attention` is automatically disabled. The constraint `tp_size % dp_size == 0` must also be satisfied.
 
+### TP LMHead with all-to-all
+
+`dp-lm-head` keeps full weight and computes the local batch, making the gemm inefficient when batchsize per-rank is small. The existing `tp-lm-head` improves the gemm efficiency but introduce heavy allgather communication on full vocabulary.
+
+Therefore, all-to-all can be applied to eliminate the heavy allgather while retaining the gemm efficiency under small per-rank batchsize. Each rank will send and receive only the local rows with sharded vocab, which is more lightweight.
+
+This optimization is **enabled by default for decode node and pure DPA**. Users can use `--no-enable-tp-lm-head-all-to-all` to opt out, or `--enable-tp-lm-head-all-to-all` for force enabling.
+
+```bash
+python -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --disaggregation-mode decode \
+    --tp 8 \
+    --dp-size 8 \
+    --enable-dp-attention
+```
+
+Prefill / colocated workers will fallback to TP LMHead with allgather, as well as other parallel strategies. More details can be found in [PR #32313](https://github.com/sgl-project/sglang/pull/32313).
+
 ### Standard DP for MLA models
 
 Note that MLA models, of course, also support DP. Suppose you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG. A detailed explanation of SMG is as follows.
