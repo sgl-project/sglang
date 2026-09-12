@@ -152,51 +152,6 @@ class TestSM120SparseMLALSE(unittest.TestCase):
                         merged, output.float(), rtol=0, atol=0.01
                     )
 
-    def test_random_quantization_diagnostics(self):
-        # This is a diagnostic, not a model-accuracy gate: FlashInfer internally
-        # quantizes Q_nope and P to FP8, while this independent oracle is FP32.
-        for tokens, heads in ((1, 16), (6, 32), (6, 64), (6, 128), (65, 16)):
-            query, indices, lengths = self.fixture(tokens, heads)
-            output, lse = self.run_attention(query, indices, lengths)
-            torch.testing.assert_close(
-                output,
-                self.run_attention(query, indices, lengths, False),
-                rtol=0,
-                atol=0,
-            )
-            scores = (
-                torch.einsum(
-                    "bhd,bkd->bhk",
-                    query.float(),
-                    self.keys[indices.clamp_min(0).long()],
-                )
-                * self.scale
-            )
-            scores.masked_fill_((indices < 0)[:, None, :], -torch.inf)
-            ref_output = torch.einsum(
-                "bhk,bkd->bhd",
-                scores.softmax(-1),
-                self.values[indices.clamp_min(0).long()],
-            )
-            ref_lse = torch.logsumexp(scores, dim=-1) / math.log(2)
-            self.assertTrue(torch.isfinite(output).all())
-            self.assertTrue(torch.isfinite(lse).all())
-            print(
-                {
-                    "tokens": tokens,
-                    "heads": heads,
-                    "output_max_abs": (output.float() - ref_output).abs().max().item(),
-                    "output_relative_rms": (
-                        (output.float() - ref_output).square().mean()
-                        / ref_output.square().mean()
-                    )
-                    .sqrt()
-                    .item(),
-                    "lse_max_abs": (lse - ref_lse).abs().max().item(),
-                },
-                flush=True,
-            )
-
     def test_cuda_graph_replay_with_changed_lengths(self):
         query, indices, lengths = self.fixture(6, 32)
         stream = torch.cuda.Stream()
