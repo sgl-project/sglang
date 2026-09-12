@@ -65,7 +65,7 @@ class SDPAImpl(AttentionImpl):
 
     def _sdpa_context(self, query: torch.Tensor):
         if self.allow_cudnn_sdp and query.device.type == "cuda":
-            return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
         return nullcontext()
 
     def forward(

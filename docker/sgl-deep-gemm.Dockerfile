@@ -15,7 +15,9 @@ ARG PYTORCH_MIRROR=download.pytorch.org
 ENV PYTHON_ROOT_PATH=/opt/python/${PYTHON_TAG}
 ENV PATH=${PYTHON_ROOT_PATH}/bin:${PATH}
 
+# DeepJIT's exception handling requires elfutils/libdwfl.h and libelf headers.
 RUN yum install -y --nogpgcheck git wget tar gcc gcc-c++ make \
+    elfutils-devel elfutils-libelf-devel \
  && yum clean all && rm -rf /var/cache/yum
 
 RUN set -eux; \
