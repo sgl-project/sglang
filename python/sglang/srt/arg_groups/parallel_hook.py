@@ -22,7 +22,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.common import is_fi_a2a_supported, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -114,19 +114,13 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
-def _is_fi_a2a_supported(**topology: int) -> bool:
-    from sglang.srt.layers.dcp.comm import is_fi_a2a_supported
-
-    return is_fi_a2a_supported(**topology)
-
-
 def _dcp_comm_backend_default(view: Any) -> dict:
     if view.dcp_comm_backend is not None:
         return {}
     if view.dcp_size <= 1:
         return {"dcp_comm_backend": "ag_rs"}
     platform = get_platform()
-    if _is_fi_a2a_supported(
+    if is_fi_a2a_supported(
         dcp_size=view.dcp_size,
         tp_size=view.tp_size,
         pp_size=view.pp_size,
