@@ -33,6 +33,63 @@ class LogprobStage(Enum):
     DECODE = auto()
 
 
+def get_logprobs_topk_normalize() -> int:
+    topk = envs.SGLANG_LOGPROBS_TOPK_NORMALIZE.get()
+    if topk < 0:
+        raise ValueError(
+            "SGLANG_LOGPROBS_TOPK_NORMALIZE must be zero or a positive "
+            f"integer, got {topk}."
+        )
+    return topk
+
+
+def materialize_topk_normalized_logprobs(
+    scores: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Normalize over global top-k and floor every other token at kth place.
+
+    ``scores`` may be raw logits or full-vocabulary logprobs: subtracting a
+    row-wise constant does not affect either the selected tokens or the
+    top-k-only softmax. The dense result preserves existing SGLang logprob
+    processor interfaces with bounded-logprob semantics.
+    """
+    dense, _ = _materialize_topk_normalized_logprobs(scores, topk)
+    return dense
+
+
+def _materialize_topk_normalized_logprobs(
+    scores: torch.Tensor, topk: int
+) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    if topk <= 0 or topk >= scores.shape[-1]:
+        return (
+            torch.nn.functional.log_softmax(scores, dim=-1, dtype=torch.float32),
+            None,
+        )
+
+    topk_scores, topk_indices = torch.topk(scores, topk, dim=-1)
+    topk_logprobs = torch.nn.functional.log_softmax(
+        topk_scores, dim=-1, dtype=torch.float32
+    )
+    dense = topk_logprobs[..., -1:].expand_as(scores).clone()
+    dense.scatter_(-1, topk_indices, topk_logprobs)
+    return dense, (topk_logprobs, topk_indices)
+
+
+def get_top_logprobs_from_precomputed(
+    precomputed_topk: Tuple[torch.Tensor, torch.Tensor],
+    top_logprobs_nums: List[int],
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    values, indices = precomputed_topk
+    if top_logprobs_nums and max(top_logprobs_nums) > values.shape[-1]:
+        raise ValueError(
+            "requested top logprobs exceeds " "SGLANG_LOGPROBS_TOPK_NORMALIZE support"
+        )
+    return (
+        [values[i, :k] for i, k in enumerate(top_logprobs_nums)],
+        [indices[i, :k] for i, k in enumerate(top_logprobs_nums)],
+    )
+
+
 @dataclasses.dataclass
 class LogprobResult:
     """Logprob fields produced by Input/OutputLogprobProcessor.
@@ -242,6 +299,8 @@ def get_top_logprobs_chunk(
         values_tensor = (values_tensor.float() - row_max[:, None]) - row_log_sum[
             :, None
         ]
+    elif precomputed_topk is not None:
+        values_tensor, indices_tensor = precomputed_topk
     else:
         values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
     if copy_to_pinned_cpu:
@@ -391,9 +450,9 @@ def compute_spec_logprobs(
     accept_index: Optional[torch.Tensor] = None,
     chain_stride: Optional[int] = None,
 ):
-    assert (accept_index is None) != (chain_stride is None), (
-        "pass exactly one of accept_index / chain_stride"
-    )
+    assert (accept_index is None) != (
+        chain_stride is None
+    ), "pass exactly one of accept_index / chain_stride"
 
     bs = len(batch.seq_lens)
     next_token_logits = logits_output.next_token_logits
@@ -415,16 +474,22 @@ def compute_spec_logprobs(
         accepted_token_ids = predict
 
     if batch.sampling_info.is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
-        gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
+        gathered_logprobs = gathered_logits
     else:
         temperatures = torch.repeat_interleave(
             batch.sampling_info.temperatures,
             max_accept,
             dim=0,
         )
-        gathered_logprobs = torch.nn.functional.log_softmax(
-            gathered_logits / temperatures, dim=-1
+        gathered_logprobs = gathered_logits / temperatures
+    topk_normalize = get_logprobs_topk_normalize()
+    normalized_topk = None
+    if topk_normalize:
+        gathered_logprobs, normalized_topk = _materialize_topk_normalized_logprobs(
+            gathered_logprobs, topk_normalize
         )
+    else:
+        gathered_logprobs = torch.nn.functional.log_softmax(gathered_logprobs, dim=-1)
     gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
 
     logits_output.next_token_logprobs = gathered_logprobs.gather(
@@ -435,12 +500,20 @@ def compute_spec_logprobs(
         top_logprobs_nums_expanded = [
             num for num in batch.top_logprobs_nums for _ in range(max_accept)
         ]
-        (
-            logits_output.next_token_top_logprobs_val,
-            logits_output.next_token_top_logprobs_idx,
-        ) = get_top_logprobs(
-            gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
-        )
+        if normalized_topk is not None:
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs_from_precomputed(
+                normalized_topk, top_logprobs_nums_expanded
+            )
+        else:
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(
+                gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
+            )
 
     if batch.token_ids_logprobs and any(
         x is not None for x in batch.token_ids_logprobs
@@ -491,6 +564,7 @@ class InputLogprobProcessor:
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGPROB_CHUNK_SIZE.get()
+        self.logprobs_topk_normalize = get_logprobs_topk_normalize()
         # Compute input logprobs from logits + logsumexp, skipping the
         # full-vocab log-softmax materialization. Deterministic inference
         # keeps the exact log_softmax path: the fused logsumexp reduces in a
@@ -559,7 +633,13 @@ class InputLogprobProcessor:
         # A TP gather can hold the local projection, gathered tensor, and its
         # contiguous reshape together. Scoring alone needs at most two matrices.
         matrices_per_chunk = (
-            3 if borrow_logits else (1 if self.enable_fast_input_logprobs else 2)
+            3
+            if borrow_logits
+            else (
+                1
+                if self.enable_fast_input_logprobs and not self.logprobs_topk_normalize
+                else 2
+            )
         )
         bytes_per_row = matrices_per_chunk * self.vocab_size * 4
 
@@ -675,6 +755,7 @@ class InputLogprobProcessor:
                         dtype=(
                             torch.float32
                             if self.enable_fast_input_logprobs
+                            or self.logprobs_topk_normalize
                             else chunk_logits.dtype
                         ),
                         device="cpu",
@@ -705,7 +786,15 @@ class InputLogprobProcessor:
                 )
 
                 chunk_precomputed_topk = None
-                if self.enable_fast_input_logprobs:
+                if self.logprobs_topk_normalize:
+                    (
+                        chunk_logprobs,
+                        chunk_precomputed_topk,
+                    ) = _materialize_topk_normalized_logprobs(
+                        chunk_logprobs, self.logprobs_topk_normalize
+                    )
+                    chunk_log_normalizer = None
+                elif self.enable_fast_input_logprobs:
                     # Every consumer below needs only small gathers / top-k plus a
                     # per-row normalizer, so keep the raw logits and skip the
                     # full-vocab log-softmax materialization entirely. When top-k
@@ -738,6 +827,15 @@ class InputLogprobProcessor:
                 # Get the logprob of top-k tokens
                 if logits_metadata.extend_return_top_logprob:
                     top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
+                    if (
+                        self.logprobs_topk_normalize
+                        and chunk_precomputed_topk is not None
+                        and max(top_k_nums) > chunk_precomputed_topk[0].shape[-1]
+                    ):
+                        raise ValueError(
+                            "requested top logprobs exceeds "
+                            "SGLANG_LOGPROBS_TOPK_NORMALIZE support"
+                        )
                     pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
                         chunk_slice
                     ]
@@ -791,9 +889,9 @@ class InputLogprobProcessor:
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
         if num_chunks > 1 and hasattr(lm_head, "reset_lm_head_pass"):
-            assert hasattr(lm_head, "set_lm_head_pass"), (
-                "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
-            )
+            assert hasattr(
+                lm_head, "set_lm_head_pass"
+            ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
             lm_head.reset_lm_head_pass()
 
         input_copy_done = None
@@ -922,15 +1020,29 @@ class OutputLogprobProcessor:
         token_ids_logprobs: List[List[int]],
         batch_next_token_ids: torch.Tensor,
     ) -> LogprobResult:
+        topk_normalize = get_logprobs_topk_normalize()
+        normalized_topk = None
+        if topk_normalize:
+            logprobs, normalized_topk = _materialize_topk_normalized_logprobs(
+                logprobs, topk_normalize
+            )
         # clamp to avoid -inf values
         logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
 
         result = LogprobResult()
         if any(x > 0 for x in top_logprobs_nums):
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            if normalized_topk is not None:
+                (
+                    result.top_logprobs_val,
+                    result.top_logprobs_idx,
+                ) = get_top_logprobs_from_precomputed(
+                    normalized_topk, top_logprobs_nums
+                )
+            else:
+                (
+                    result.top_logprobs_val,
+                    result.top_logprobs_idx,
+                ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
         if any(x is not None for x in token_ids_logprobs):
             (
@@ -978,15 +1090,30 @@ class OutputLogprobProcessor:
         logits = preprocess_fn(next_token_logits)
 
         # Compute logprobs
-        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+        topk_normalize = get_logprobs_topk_normalize()
+        normalized_topk = None
+        if topk_normalize:
+            logprobs, normalized_topk = _materialize_topk_normalized_logprobs(
+                logits, topk_normalize
+            )
+        else:
+            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
 
         result = LogprobResult()
         # Handle top logprobs if requested
         if needs_top_logprobs:
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            if normalized_topk is not None:
+                (
+                    result.top_logprobs_val,
+                    result.top_logprobs_idx,
+                ) = get_top_logprobs_from_precomputed(
+                    normalized_topk, top_logprobs_nums
+                )
+            else:
+                (
+                    result.top_logprobs_val,
+                    result.top_logprobs_idx,
+                ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:

@@ -397,6 +397,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOGPROBS_TOPK_NORMALIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When positive, normalize returned logprobs over the global top-k logits and assign tokens outside that support the normalized kth-place logprob. Set <code>50</code> for top-50 comparisons. Sampling is unchanged. Requests for more than k top logprobs are rejected when k is smaller than the vocabulary; k at or above the vocabulary size uses full-vocabulary normalization. Tail flooring means the full-vocabulary values do not sum to a probability distribution.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_COLOCATED_BATCH_GEN</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable colocated batch generation.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

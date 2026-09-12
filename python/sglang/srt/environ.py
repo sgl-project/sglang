@@ -1358,6 +1358,10 @@ class Envs:
     # Logits and log-probability processing
     # ===================================================================
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    # If positive, normalize reported logprobs over only the global top-k
+    # logits. Tokens outside that support receive the kth token's normalized
+    # logprob for bounded logprob comparisons.
+    SGLANG_LOGPROBS_TOPK_NORMALIZE = EnvInt(0)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
