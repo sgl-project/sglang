@@ -595,6 +595,19 @@ class Glm5NextLinearAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
+def _use_mnnvl_cutedsl_fusion(config: Glm5NextTextConfig, is_nextn: bool) -> bool:
+    """GLM-5-Next drives the residual-free MNNVL CuTe DSL AllReduce.
+
+    The draft (nextn) stack stays on the ordinary path: it is one layer, and a
+    second forward shape would need its own compiled workspace.
+    """
+    return bool(
+        not is_nextn
+        and config.mhc
+        and envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
+    )
+
+
 class Glm5NextDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -676,6 +689,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
+                enable_deferred_finalize=_use_mnnvl_cutedsl_fusion(config, is_nextn),
             )
         else:
             if enable_moe_dense_fully_dp():
@@ -746,7 +760,15 @@ class Glm5NextDecoderLayer(nn.Module):
                     else None
                 ),
             )
-            self.layer_communicator = MHCLayerCommunicator(
+            if _use_mnnvl_cutedsl_fusion(config, is_nextn):
+                from sglang.srt.layers.moe.glm5_next_flashinfer_fusion import (
+                    Glm5NextFlashInferMHCLayerCommunicator,
+                )
+
+                communicator_cls = Glm5NextFlashInferMHCLayerCommunicator
+            else:
+                communicator_cls = MHCLayerCommunicator
+            self.layer_communicator = communicator_cls(
                 **shared_kwargs,
                 **mhc_kwargs,
             )
@@ -898,6 +920,19 @@ class Glm5NextDecoderLayer(nn.Module):
             )
         )
 
+        # The MNNVL path reduces the MLP output inside postprocess_layer, so the
+        # MLP must not reduce it first; unlike the fused-with-next-layer case,
+        # postprocess_layer still runs.
+        defer_mlp_allreduce = self.layer_communicator.should_defer_mlp_allreduce(
+            forward_batch
+        )
+        # Both suppress the MLP's own all-reduce, and their postconditions are
+        # mutually exclusive: one hands the reduction to the next layer and skips
+        # postprocess_layer, the other needs postprocess_layer to perform it.
+        # Together they would skip the reduction entirely and leave nothing to
+        # clear the deferral for the next forward.
+        assert not (should_allreduce_fusion and defer_mlp_allreduce)
+
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -917,7 +952,7 @@ class Glm5NextDecoderLayer(nn.Module):
             _mlp_ctx = nullcontext()
 
         with get_forward().scoped(
-            fuse_mlp_allreduce=should_allreduce_fusion,
+            fuse_mlp_allreduce=should_allreduce_fusion or defer_mlp_allreduce,
             mlp_reduce_scatter=use_reduce_scatter,
         ):
             with _mlp_ctx:
@@ -988,6 +1023,35 @@ class Glm5NextModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+
+        self.flashinfer_mnnvl_cutedsl_fusion = None
+        if _use_mnnvl_cutedsl_fusion(config, is_nextn=False):
+            if self.pp_group.world_size != 1:
+                raise RuntimeError(
+                    "GLM-5-Next FlashInfer MNNVL CuTe DSL fusion requires PP=1"
+                )
+            from sglang.srt.layers.moe.glm5_next_flashinfer_fusion import (
+                Glm5NextFlashInferFusionService,
+                Glm5NextFlashInferMHCLayerCommunicator,
+            )
+
+            self.flashinfer_mnnvl_cutedsl_fusion = Glm5NextFlashInferFusionService(
+                hidden_size=config.hidden_size,
+                top_k=config.num_experts_per_tok,
+                rms_epsilon=config.rms_norm_eps,
+            )
+            for layer in self.layers:
+                communicator = layer.layer_communicator
+                if not isinstance(communicator, Glm5NextFlashInferMHCLayerCommunicator):
+                    raise RuntimeError(
+                        "GLM-5-Next fusion-enabled layer has the wrong communicator"
+                    )
+                communicator.fusion_service = self.flashinfer_mnnvl_cutedsl_fusion
+            logger.info(
+                "Installed one GLM-5-Next FlashInfer fusion handle for %d layers",
+                len(self.layers),
+            )
+
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -1040,6 +1104,15 @@ class Glm5NextModel(nn.Module):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        if self.flashinfer_mnnvl_cutedsl_fusion is None:
+            return
+        from sglang.srt.layers.moe.glm5_next_flashinfer_fusion import (
+            prepare_glm5_next_flashinfer_fusion,
+        )
+
+        prepare_glm5_next_flashinfer_fusion(self, model_runner)
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -1274,6 +1347,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
             self.config.rope_scaling or {}
         )
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        if self.model is not None:
+            self.model.prepare_before_cuda_graph_capture(model_runner)
 
     def get_input_embeddings(self) -> nn.Embedding:
         if self.model is None:
