@@ -12,7 +12,6 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _FakeFileConnector:
-
     def __init__(self, local_dir: str, files: dict[str, str]):
         self.local_dir = local_dir
         self.files = files
@@ -30,7 +29,6 @@ class _FakeFileConnector:
 
 
 class _FakeRedisConnection:
-
     def __init__(self, pages: list[tuple[int, list[bytes]]]):
         self.pages = iter(pages)
         self.scan_calls = []
@@ -44,7 +42,6 @@ class _FakeRedisConnection:
 
 
 class TestRedisConnector(CustomTestCase):
-
     def test_pull_files_applies_allow_then_ignore_patterns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix = "model/files/"
