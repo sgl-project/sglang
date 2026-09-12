@@ -1407,6 +1407,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+                global_num_tokens_for_logprob_cpu=global_num_tokens_for_logprob_cpu,
                 global_num_tokens_cpu=global_num_tokens_cpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=global_dp_buffer_len,

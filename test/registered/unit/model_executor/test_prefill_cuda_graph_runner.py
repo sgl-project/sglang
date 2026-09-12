@@ -8,6 +8,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -23,7 +24,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -289,6 +290,51 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._prepare_forward_metadata_for_replay = lambda *_args: None
         runner._compact_moe_counts_gpu = None
         return runner
+
+    def test_capture_logits_gather_uses_request_rows_not_token_bucket(self):
+        # No-logprob capture needs one LM-head row per request. Losing the CPU
+        # counts instead allocates [token_bucket * dp_size, vocab_size] logits.
+        runner = self._make_load_runner()
+        runner.device = torch.device("cpu")
+        runner.max_bs = runner._capture_req_slots = 3
+        runner.dp_size = 8
+        runner.require_mlp_tp_gather = True
+        runner.require_attn_tp_gather = False
+        runner.capture_hidden_mode = CaptureHiddenMode.FULL
+        runner._capture_lora = False
+        runner.tbo_plugin = SimpleNamespace(capture_one_batch_size=lambda *a, **k: None)
+        runner.model_runner.model_config = SimpleNamespace(context_len=16)
+        runner.model_runner.attn_backend = object()
+
+        for backend, context_len, expected_requests in (
+            (Backend.TC_PIECEWISE, 16, 1),
+            (Backend.TC_PIECEWISE, 2, 2),
+            (Backend.FULL, 16, 3),
+        ):
+            with (
+                self.subTest(backend=backend, context_len=context_len),
+                get_parallel().override(attn_dp_rank=0),
+                get_flags().dp.override(
+                    buffer_hidden_size=4,
+                    buffer_dtype=torch.bfloat16,
+                    buffer_device=torch.device("cpu"),
+                ),
+            ):
+                runner.prefill_backend_name = backend
+                runner.model_runner.model_config.context_len = context_len
+                batch, _ = runner.capture_prepare(num_tokens=4)
+                metadata = LogitsMetadata.from_forward_batch(batch)
+                metadata.compute_dp_attention_metadata()
+
+                self.assertEqual(batch.batch_size, expected_requests)
+                self.assertEqual(
+                    metadata.gathered_buffer.shape, (8 * expected_requests, 4)
+                )
+                self.assertEqual(metadata.dp_local_num_tokens.item(), expected_requests)
+                # The logits allocation must not change the transformer's DP
+                # padding or its counts, including FULL's sentinel request slots.
+                self.assertEqual(batch.global_dp_buffer_len, 32)
+                self.assertEqual(batch.global_num_tokens_cpu, [4] * 8)
 
     def test_static_batch_preserves_consumed_multimodal_embeddings(self):
         runner = self._make_load_runner()
