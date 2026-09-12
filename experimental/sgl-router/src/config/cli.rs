@@ -145,6 +145,19 @@ pub struct Cli {
     /// the published queue sums across a worker's DP ranks.
     #[arg(long)]
     pub worker_queue_limit: Option<u64>,
+    /// Saturation floor for `--worker-queue-limit` diversions: when no
+    /// cache candidate survives both the queue limit and hard admission,
+    /// at least one was over the limit, AND no worker in the routable
+    /// fleet has a fresh queue reading strictly below this floor, the
+    /// diverted request would wait wherever it lands, so it stays with the
+    /// least-pressured prefix owner instead — same wait, but prefilled
+    /// from cache instead of a full cold prefill that evicts other
+    /// prefixes and manufactures the next round of misses. Unset disables
+    /// the pin. Requires `--worker-queue-limit` (there is no diversion to
+    /// cancel without it) and must be at most the limit; scale with
+    /// `--dp-size` like the limit.
+    #[arg(long)]
+    pub saturation_queue_floor: Option<u64>,
 
     // ---- score composition ----
     /// Policies to sum, spelled exactly as `--policy` spells them and each
@@ -332,7 +345,8 @@ impl Cli {
             || self.cache_candidate_ratio.is_some()
             || self.cache_candidate_max_workers.is_some()
             || self.cache_switch_margin_tokens.is_some()
-            || self.worker_queue_limit.is_some();
+            || self.worker_queue_limit.is_some()
+            || self.saturation_queue_floor.is_some();
         if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
                 "cache candidate tuning flags require --policy cache_aware"
@@ -340,6 +354,28 @@ impl Cli {
         }
         if self.worker_queue_limit == Some(0) {
             return Err(anyhow!("--worker-queue-limit must be at least 1"));
+        }
+        if let Some(floor) = self.saturation_queue_floor {
+            // The floor modifies the gate's diversion; without the gate
+            // there is no diversion to cancel and the knob would sit dead.
+            let Some(limit) = self.worker_queue_limit else {
+                return Err(anyhow!(
+                    "--saturation-queue-floor requires --worker-queue-limit (there is no \
+                     diversion to cancel without it)"
+                ));
+            };
+            if floor == 0 {
+                return Err(anyhow!("--saturation-queue-floor must be at least 1"));
+            }
+            // floor <= limit keeps the saturation label readable: a floor
+            // above the limit would declare the fleet saturated while
+            // workers the gate still admits exist.
+            if floor > limit {
+                return Err(anyhow!(
+                    "--saturation-queue-floor ({floor}) must be at most --worker-queue-limit \
+                     ({limit})"
+                ));
+            }
         }
         if (self.pressure_abs_threshold_tokens.is_some()
             || self.pressure_abs_threshold_ms.is_some()
@@ -560,6 +596,7 @@ impl Cli {
                     .cache_switch_margin_tokens
                     .unwrap_or(d.cache_switch_margin_tokens),
                 worker_queue_limit: self.worker_queue_limit.or(d.worker_queue_limit),
+                saturation_queue_floor: self.saturation_queue_floor.or(d.saturation_queue_floor),
             })
         } else {
             None
@@ -1839,6 +1876,74 @@ mod tests {
         .expect_err("a zero limit would reject every queue reading")
         .to_string();
         assert!(err.contains("--worker-queue-limit"), "got: {err}");
+    }
+
+    #[test]
+    fn saturation_queue_floor_requires_the_queue_gate_and_stays_below_it() {
+        let config = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --worker-queue-limit 4 --saturation-queue-floor 2",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .model
+                .affinity
+                .expect("cache-aware needs affinity config")
+                .saturation_queue_floor,
+            Some(2)
+        );
+
+        // Unset, the pin is disabled and the gate behaves as before.
+        let defaults = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --worker-queue-limit 4",
+        )
+        .unwrap();
+        assert_eq!(
+            defaults
+                .model
+                .affinity
+                .expect("default affinity config")
+                .saturation_queue_floor,
+            None
+        );
+
+        // Without the gate there is no diversion to cancel.
+        let err = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --saturation-queue-floor 2",
+        )
+        .expect_err("the floor modifies the gate's diversion")
+        .to_string();
+        assert!(err.contains("--saturation-queue-floor"), "got: {err}");
+        assert!(err.contains("--worker-queue-limit"), "got: {err}");
+
+        // A floor above the limit would declare saturation while workers
+        // the gate still admits exist.
+        let err = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --worker-queue-limit 4 --saturation-queue-floor 5",
+        )
+        .expect_err("floor must not exceed the limit")
+        .to_string();
+        assert!(err.contains("at most"), "got: {err}");
+
+        let err = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --worker-queue-limit 4 --saturation-queue-floor 0",
+        )
+        .expect_err("a zero floor would reject every queue reading")
+        .to_string();
+        assert!(err.contains("--saturation-queue-floor"), "got: {err}");
+
+        let err = cfg_of("--policy power_of_two --worker-queue-limit 4 --saturation-queue-floor 2")
+            .expect_err("the pin only governs cache-affinity selection")
+            .to_string();
+        assert!(
+            err.contains("cache candidate tuning flags require --policy cache_aware"),
+            "got: {err}"
+        );
     }
 
     #[test]

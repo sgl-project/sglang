@@ -115,6 +115,7 @@ impl CacheAwarePolicy {
             pressure_abs_threshold_ms: self.config.pressure_abs_threshold_ms,
             pressure_rel_threshold: self.config.pressure_rel_threshold,
             worker_queue_limit: self.config.worker_queue_limit,
+            saturation_queue_floor: self.config.saturation_queue_floor,
         })
     }
 

@@ -355,6 +355,14 @@ pub struct CacheCandidateProposal {
     /// waiting requests cannot win on cache affinity. `None` disables the
     /// gate. See [`crate::config::AffinityConfig::worker_queue_limit`].
     pub worker_queue_limit: Option<u64>,
+    /// Saturation pin: when no candidate survives the gate and hard
+    /// admission, at least one was queue-gate-rejected, and no worker in
+    /// the routable fleet has a fresh queue reading strictly below this
+    /// floor, the request pins to the least-pressured rejected prefix
+    /// owner instead of diverting — the diversion cannot dodge a wait and
+    /// would forfeit the matched prefix. `None` disables the pin. See
+    /// [`crate::config::AffinityConfig::saturation_queue_floor`].
+    pub saturation_queue_floor: Option<u64>,
 }
 
 /// Prefill proposal returned as either a pair or a Cache-Aware candidate set.
@@ -1313,7 +1321,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .expect("a later admitted cache match must survive");
 
@@ -1361,7 +1369,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .expect("all admitted candidates must participate in the tournament");
 
@@ -1387,7 +1395,7 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &pending_allows)
+            resolve_cache_candidates(&proposal, 100, &pending_allows, &[])
                 .decision
                 .is_some(),
             "pending admission must project E=20, not L=100"
@@ -1403,7 +1411,7 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &kv_rejects)
+            resolve_cache_candidates(&proposal, 100, &kv_rejects, &[])
                 .decision
                 .is_none(),
             "KV safety must conservatively project the complete input L=100"
@@ -1441,7 +1449,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .unwrap();
         assert_eq!(decision.selected.id, congested.id);
@@ -1478,7 +1486,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .unwrap();
         assert_eq!(
@@ -1531,7 +1539,7 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+        let decision = resolve_cache_candidates(&proposal, 100, &loads, &[])
             .decision
             .unwrap();
         assert_eq!(

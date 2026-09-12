@@ -60,12 +60,18 @@
 //!   `sgl_router_diverted_overlap_blocks` — read it against the overlap of
 //!   all selections: a diverted curve skewing high means the gate is trading
 //!   large cached prefixes for short waits.
-//! - `cache_hit_all_queued` — the queue gate removed every owner AND every
-//!   worker in the fleet is queueing, so no diversion could dodge a wait.
-//!   This is the fleet-saturation signal; it is keyed on saturation rather
-//!   than on where the fallback landed, and it must never read as a
-//!   lookup-input failure. Burying it in `cache_hit` would make a fully
-//!   saturated fleet read as healthy.
+//! - `cache_hit_all_queued` — the queue gate removed every owner and no
+//!   diversion could dodge a wait. Two conditions draw it. Without
+//!   `--saturation-queue-floor` it means every worker in the fleet is
+//!   queueing at or above `--worker-queue-limit`. With a floor set, the
+//!   saturation pin also draws it on the weaker condition the floor names:
+//!   no fleet worker reads strictly below the floor. Since the floor may be
+//!   lower than the limit, a floor well under the limit widens this label to
+//!   fleets that still hold gate-admissible workers — read it against the
+//!   configured floor, not as "every worker is over the limit".
+//!   It is keyed on saturation rather than on where the fallback landed, and
+//!   it must never read as a lookup-input failure. Burying it in `cache_hit`
+//!   would make a fully saturated fleet read as healthy.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
