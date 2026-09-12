@@ -36,6 +36,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -311,6 +312,33 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+def _fused_qkvbfg_is_unquantized(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    """Whether the fused KDA qkv/beta/forget/gate projections stay in bf16.
+
+    An unquantized checkpoint fuses unconditionally, as it always has. The env
+    gate governs only the quantized-checkpoint case, which is new: GLM-5.3-Flash
+    ships an fp8 checkpoint whose ``modules_to_not_convert`` lists every
+    linear-attention projection, so a non-None quant_config does not imply these
+    layers are quantized. Probe the config the way ``LinearBase`` does -- the
+    probe allocates no weights -- and fuse whenever both fused modules resolve to
+    the unquantized method.
+    """
+    if quant_config is None:
+        return True
+    if not envs.SGLANG_OPT_GLM5_FUSE_KDA_QKVBFG.get():
+        return False
+
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    for name in ("fused_qkvbfg_a_proj", "fused_fg_b_proj"):
+        probe = LinearBase(1, 1, quant_config=quant_config, prefix=f"{prefix}.{name}")
+        if not isinstance(probe.quant_method, UnquantizedLinearMethod):
+            return False
+    return True
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -345,7 +373,10 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        self.do_fuse_qkvbfg = (
+            head_shard_size == self.tp_size
+            and _fused_qkvbfg_is_unquantized(quant_config, prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,

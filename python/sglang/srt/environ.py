@@ -1477,6 +1477,15 @@ class Envs:
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
+    # GLM-5
+    # ===================================================================
+    # Fuse the six KDA linear-attention projections into one merged GEMM plus one
+    # batched GEMM; gates the quantized-checkpoint case only (bf16 always fuses).
+    # TODO(mmangkad): default True once dsa_backend stops rebinding the captured
+    # multi_ctas_kv_counter_buffer; that fix unblocks this (+5.6% on GLM-5.3).
+    SGLANG_OPT_GLM5_FUSE_KDA_QKVBFG = EnvBool(False)
+
+    # ===================================================================
     # Inkling
     # ===================================================================
     SGLANG_OPT_USE_FUSED_GATE_TOPK = EnvBool(True)
