@@ -4882,6 +4882,7 @@ class DeepseekV4Model(nn.Module):
                 "prev_residual": None,
                 "prev_post": None,
                 "prev_comb": None,
+                "dspark_aux_hidden_states": [],
             }
 
         states = forward_batch.model_specific_states
@@ -4890,6 +4891,8 @@ class DeepseekV4Model(nn.Module):
         prev_post = states["prev_post"]
         prev_comb = states["prev_comb"]
         last_layer = None
+        capture_dspark = self.dspark_layers_to_capture is not None
+        dspark_aux_hidden_states = states["dspark_aux_hidden_states"]
 
         for i in range(start, end):
             layer = self.layers[i]
@@ -4910,6 +4913,14 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+            if capture_dspark and i in self.dspark_layers_to_capture:
+                if self.use_fused_mhc_post_pre:
+                    completed = layer.hc_post(
+                        hidden_states, prev_residual, prev_post, prev_comb
+                    )
+                else:
+                    completed = hidden_states
+                dspark_aux_hidden_states.append(completed.mean(dim=1))
 
         forward_batch.hidden_states = hidden_states
         states["prev_residual"] = prev_residual
@@ -4925,12 +4936,20 @@ class DeepseekV4Model(nn.Module):
             )
 
         if dsa_use_prefill_cp(forward_batch):
+            stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                stream,
             )
+            if capture_dspark:
+                dspark_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux, self.cp_size, forward_batch, stream
+                    )
+                    for aux in dspark_aux_hidden_states
+                ]
 
         pre_hc_head = hidden_states.flatten(1)
         hidden_states = self.hc_head(
@@ -4938,11 +4957,14 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
         forward_batch.hidden_states = hidden_states
+        if capture_dspark:
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
         return hidden_states, pre_hc_head
 
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    supports_pdmux_dspark_prefill = True
 
     def __init__(
         self,
@@ -5269,13 +5291,19 @@ class DeepseekV4ForCausalLM(nn.Module):
         if hidden_states is None:
             return None
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
         return self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
             forward_batch,
-            hidden_states_before_norm=pre_hc_head,
+            aux_hidden_states,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else pre_hc_head
+            ),
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

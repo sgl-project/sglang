@@ -131,10 +131,6 @@ def _check_pdmux_standard_prefill(cfg: Any) -> None:
         "--pdmux-prefill-mode standard is not compatible with "
         "--enable-unified-memory."
     )
-    assert not cfg.enable_dp_attention, (
-        "--pdmux-prefill-mode standard is not compatible with "
-        "--enable-dp-attention."
-    )
     for name, value in (
         ("--ep-size", cfg.ep_size),
         ("--attn-cp-size", cfg.attn_cp_size),

@@ -57,6 +57,7 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             hc_head_scale=None,
             hc_head_base=None,
             norm=lambda hidden: hidden,
+            dspark_layers_to_capture=None,
         )
         return model, layers
 
@@ -118,6 +119,28 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
         torch.testing.assert_close(split_result[0], one_shot_result[0])
         torch.testing.assert_close(split_result[1], one_shot_result[1])
 
+    def test_split_execution_accumulates_dspark_captures(self):
+        split_model, _ = self._make_model()
+        split_model.dspark_layers_to_capture = [0, 1]
+        split_batch = SimpleNamespace(hidden_states=None, model_specific_states=None)
+
+        self.assertIsNone(self._run_split(split_model, split_batch, (0, 1)))
+        split_result, split_aux = self._run_split(
+            split_model, split_batch, (1, 2)
+        )
+
+        one_shot_model, _ = self._make_model()
+        one_shot_model.dspark_layers_to_capture = [0, 1]
+        one_shot_batch = SimpleNamespace(hidden_states=None, model_specific_states=None)
+        one_shot_result, one_shot_aux = self._run_split(
+            one_shot_model, one_shot_batch, (0, 2)
+        )
+
+        torch.testing.assert_close(split_result[0], one_shot_result[0])
+        self.assertEqual(len(split_aux), 2)
+        for actual, expected in zip(split_aux, one_shot_aux):
+            torch.testing.assert_close(actual, expected)
+
     def test_causal_lm_initializes_cp_once_and_processes_final_logits(self):
         prepare_cp = Mock()
         model_forward = Mock(
@@ -129,6 +152,7 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             model=SimpleNamespace(forward_split_prefill=model_forward),
             logits_processor=logits_processor,
             lm_head=object(),
+            capture_aux_hidden_states=False,
         )
         attn_context = SimpleNamespace(
             maybe_input_scattered=lambda forward_batch: nullcontext()
@@ -155,6 +179,42 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
         self.assertEqual(result, "logits")
         prepare_cp.assert_called_once_with(args[0], args[2])
         logits_processor.assert_called_once()
+
+    def test_causal_lm_passes_split_dspark_captures_to_logits_processor(self):
+        aux = [torch.tensor([[3.0]])]
+        model = SimpleNamespace(
+            _prepare_dsa_prefill_cp=Mock(),
+            model=SimpleNamespace(
+                forward_split_prefill=Mock(
+                    return_value=((torch.tensor([1.0]), torch.tensor([2.0])), aux)
+                )
+            ),
+            logits_processor=Mock(return_value="logits"),
+            lm_head=object(),
+            capture_aux_hidden_states=True,
+        )
+        attn_context = SimpleNamespace(
+            maybe_input_scattered=lambda forward_batch: nullcontext()
+        )
+        input_ids = torch.tensor([1])
+        forward_batch = SimpleNamespace()
+
+        with patch(
+            "sglang.srt.models.deepseek_v4.get_attn_tp_context",
+            return_value=attn_context,
+        ):
+            result = DeepseekV4ForCausalLM.forward_split_prefill(
+                model,
+                input_ids,
+                torch.tensor([0]),
+                forward_batch,
+                split_interval=(0, 2),
+            )
+
+        self.assertEqual(result, "logits")
+        call = model.logits_processor.call_args
+        self.assertIs(call.args[4], aux)
+        self.assertIsNone(call.kwargs["hidden_states_before_norm"])
 
 
 if __name__ == "__main__":

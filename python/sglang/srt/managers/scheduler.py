@@ -4433,7 +4433,10 @@ class Scheduler(
         if not batch.spec_algorithm.is_none():
             batch.spec_info = batch_result.next_draft_input
             if batch_result.new_seq_lens is not None:
-                assert batch_result.new_seq_lens is batch.seq_lens, (
+                assert (
+                    batch_result.new_seq_lens is batch.seq_lens
+                    or batch.forward_mode.is_idle()
+                ), (
                     "PDMux standard prefill expects the worker to return the "
                     "batch's own seq_lens; rebinding would require a blocking "
                     "device-to-host copy on the prefill lane."
@@ -4582,11 +4585,22 @@ class Scheduler(
                     batch.spec_info.future_indices = future_indices
             elif self.pdmux_standard and batch is self._pdmux_prefill_batch:
                 batch_result = self._run_pdmux_standard_prefill(batch)
-            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+            elif self.enable_pdmux and batch is self.split_prefill_batch:
                 if batch.split_index == 0:
                     resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
+                split_worker = getattr(self, "model_worker", None) or self.tp_worker
+                batch_result = split_worker.forward_batch_split_prefill(batch)
+                if batch_result.next_draft_input is not None:
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                elif batch_result.has_sampled_token_ids:
+                    self._relay_forward_payload(
+                        batch, batch.req_pool_indices, batch_result
+                    )
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
