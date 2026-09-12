@@ -9072,6 +9072,50 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
 
+class TestSWAFinishedPrefill(CustomTestCase):
+    def test_finished_prefill_retains_only_window(self):
+        for is_eagle in (False, True):
+            for enabled in (False, True):
+                with self.subTest(is_eagle=is_eagle, enabled=enabled):
+                    cfg = CacheConfig(
+                        page_size=256,
+                        components=(ComponentType.FULL, ComponentType.SWA),
+                        sliding_window_size=128,
+                        is_eagle=is_eagle,
+                        kv_size=16384,
+                        max_context_len=16384,
+                        head_num=1,
+                        head_dim=8,
+                    )
+                    cache, allocator, pool = build_fixture(cfg)
+                    helper = UnifiedRadixCacheSuite()
+                    helper.cfg = cfg
+                    req = helper._make_req(pool)
+                    tokens = array("q", range(1, 8193))
+                    req.origin_input_ids = tokens
+                    req.output_ids = array("q", [9000])
+                    loc = helper._alloc(allocator, len(tokens))
+                    pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), loc)
+                    req.kv.kv_committed_len = len(tokens)
+                    req.last_node = cache.root_node_handle()
+                    req.full_untruncated_fill_ids = tokens
+                    req.set_extend_range(0, len(tokens))
+                    key = RadixKey(tokens, is_bigram=is_eagle).page_aligned(
+                        cfg.page_size
+                    )
+                    with (
+                        envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(
+                            enabled
+                        )
+                    ):
+                        cache.cache_finished_req(req, kv_len_to_handle=len(tokens))
+                    retained = cfg.kv_size - allocator.swa_available_size()
+                    self.assertEqual(retained, 512 if enabled else len(key))
+                    match = cache.match_prefix(MatchPrefixParams(key=key))
+                    self.assertEqual(len(match.device_indices), len(key))
+                    cache.sanity_check()
+
+
 class TestSWAWindowUnderBigramKey(CustomTestCase):
     """`cache_unfinished_req` has to leave the leaf it inserts holding a full
     sliding window of live SWA. Otherwise the match that follows the insert
