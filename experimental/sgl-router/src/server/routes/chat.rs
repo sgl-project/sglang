@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::SessionAffinityMode;
+use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
@@ -300,6 +300,16 @@ pub async fn chat_completions(
         .affinity
         .as_ref()
         .and_then(|config| config.worker_queue_limit);
+    // Sample size for the min-load fallback beneath admission
+    // (`--min-load-choices`). A policy with no affinity config never reaches
+    // the cache-aware paths, so it keeps the pre-existing power-of-2 default.
+    let min_load_choices = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .map(|config| config.min_load_choices)
+        .unwrap_or(DEFAULT_MIN_LOAD_CHOICES);
     // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
     let worker = select_prefill_worker(&PrefillSelectionInputs {
         policy: policy.as_ref(),
@@ -319,6 +329,7 @@ pub async fn chat_completions(
         tps_slo,
         session_affinity_mode,
         worker_queue_limit,
+        min_load_choices,
     })
     .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
