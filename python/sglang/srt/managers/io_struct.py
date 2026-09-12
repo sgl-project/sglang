@@ -222,6 +222,7 @@ class GenerateReqInput:
     video_config: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
+    watermark: Any = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -555,6 +556,7 @@ class GenerateReqInput:
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
+        self._normalize_watermark(num)
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
@@ -694,6 +696,16 @@ class GenerateReqInput:
             self.sampling_params = [self.sampling_params] * num
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
+
+    def _normalize_watermark(self, num):
+        if isinstance(self.watermark, list):
+            if len(self.watermark) != self.batch_size:
+                raise ValueError(
+                    "The length of watermark should be equal to the batch size."
+                )
+            self.watermark = self.watermark * self.parallel_sample_num
+        else:
+            self.watermark = [self.watermark] * num
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
@@ -897,6 +909,7 @@ class GenerateReqInput:
                 else None
             ),
             sampling_params=self.sampling_params[i],
+            watermark=self.watermark[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],

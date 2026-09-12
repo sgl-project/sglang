@@ -1,0 +1,275 @@
+---
+title: "Text Watermarking"
+metatags:
+    description: "Configure Aaronson-Gumbel text watermarking and implement a compatible detector."
+---
+
+SGLang provides opt-in Aaronson-Gumbel watermarking for sampled text. The
+watermark changes token selection so that someone with the secret key can test
+whether a completion was produced by the configured generator.
+
+This feature can support transparency controls such as the machine-readable
+marking and detectability described in
+[Article 50 of the EU AI Act](https://eur-lex.europa.eu/eli/reg/2024/1689/oj).
+It is one technical signal, not a complete compliance program or proof of
+authorship.
+
+## Configure the server
+
+Store the default key and context window in a JSON file:
+
+```json
+{
+  "key": "0123456789abcdef",
+  "context_window": 4
+}
+```
+
+Restrict the file to the server account, then launch a CUDA server:
+
+```bash
+chmod 600 /run/secrets/sglang-watermark.json
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-8B \
+  --enable-watermark \
+  --watermark-config /run/secrets/sglang-watermark.json \
+  --watermark-default-enabled
+```
+
+<Warning>
+  Values passed with `--watermark-key` or `--watermark-key-b` are visible in the
+  process command line, including `/proc/*/cmdline` on Linux. Use
+  `--watermark-config` for the primary production key. SGLang redacts the key
+  arguments and config path from startup logs, request logs, server information
+  responses, and request crash-dump payloads. Process and GPU core dumps may
+  contain in-memory keys. Protect those artifacts, the configuration file, and
+  the transport used by clients that send per-request keys.
+</Warning>
+
+The server arguments are:
+
+| Argument | Default | Behavior |
+| --- | --- | --- |
+| `--enable-watermark` | disabled | Enables watermark state and accepts per-request watermark configuration. |
+| `--watermark-config PATH` | unset | Loads a JSON object containing exactly `key` and `context_window`. |
+| `--watermark-key HEX` | unset | Makes a server-owned 64-bit key available to opted-in or default-enabled requests. Prefer the file option. |
+| `--watermark-key-b HEX` | unset | Opts into dual-key mode with a second server-owned 64-bit key. Requires a primary server key. |
+| `--watermark-mixing-probability P` | `0.5` | In dual-key mode, sets the probability of selecting key A at each eligible position. Must be strictly between 0 and 1. |
+| `--watermark-context-window N` | `4` | Sets the default and the maximum window that a request may select, from 1 to 64 tokens. |
+| `--watermark-default-enabled` | disabled | Uses the server key when a request omits the `watermark` field. Requests may still opt out. |
+| `--watermark-enforce-all` | disabled | Uses the server key by default and rejects `{"enabled": false}`. |
+
+`--watermark-config` and `--watermark-key` are mutually exclusive. When a
+configuration file is used, its `context_window` takes precedence over
+`--watermark-context-window`. A server key does not by itself watermark every
+request. Add `--watermark-default-enabled` for a default-on service or
+`--watermark-enforce-all` for a service that also forbids opt-out. Both modes
+require a server key from `--watermark-key` or `--watermark-config`.
+
+`--watermark-key-b` enables dual-key mode for every watermarked request. The
+resolved server or request key is key A, and the server-owned second key is key
+B. Therefore, an explicit request key replaces key A while key B remains active.
+Omitting key B preserves the single-key selection path. Setting
+`--watermark-mixing-probability` without key B is an error.
+
+The server modes resolve requests as follows:
+
+| Server mode | No `watermark` field | `{"enabled": false}` | `{"enabled": true}` | `{"key": "HEX"}` |
+| --- | --- | --- | --- | --- |
+| Watermarking disabled | Off | Off | HTTP 400 | HTTP 400 |
+| `--enable-watermark` with a server key | Off | Off | Server key | Request key |
+| Add `--watermark-default-enabled` | Server key | Off | Server key | Request key |
+| Add `--watermark-enforce-all` | Server key | HTTP 400 | Server key | Request key |
+
+With `--enable-watermark` and no server key, only a request that supplies its
+own key can enable watermarking. `{"enabled": true}` then returns HTTP 400
+instead of silently producing unwatermarked text.
+
+## Configure a request
+
+The native generation API and the OpenAI-compatible completions and chat
+completions APIs accept a `watermark` object with optional `enabled`, `key`, and
+`context_window` fields. A request key implicitly enables watermarking and
+overrides the server key for that request. A request context window cannot
+exceed the server maximum.
+
+```bash
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-8B",
+    "messages": [{"role": "user", "content": "Explain photosynthesis."}],
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "watermark": {
+      "enabled": true,
+      "context_window": 4
+    }
+  }'
+```
+
+Use `{"enabled": false}` to opt out when the server allows it. An object that
+sets neither `enabled` nor `key`, a contradictory object that combines a key
+with `enabled: false`, invalid keys, enabled requests sent to a server without
+`--enable-watermark`, missing server keys for `enabled: true`, and windows above
+the server maximum return HTTP 400. Keys contain 1 to 16 hexadecimal digits,
+with an optional `0x` prefix.
+
+Request-level keys are credentials carried in the request body. Use an
+authenticated TLS endpoint whenever they cross a host boundary, and avoid
+recording request bodies in proxies or application logs.
+
+## How generation works
+
+At each non-greedy sampling step, SGLang first applies frequency, presence, and
+repetition penalties, logit bias, any structured-output grammar mask, and the
+ordinary temperature, top-k, top-p, and min-p truncation rules. Grammar-masked
+tokens have zero probability and cannot be selected by the watermark. Let `p_i`
+be the resulting probability of candidate token `i`. SGLang hashes the secret
+key, the preceding token context, and `i` to obtain a deterministic uniform
+value `u_i`, then selects:
+
+```text
+argmax_i log(u_i) / p_i
+```
+
+This is the Aaronson-Gumbel sampling rule. SGLang stores recent tokens in a ring
+buffer. If the same context hash has already been watermarked in the request,
+the repeated position uses ordinary sampling. This prevents a repeated context
+from forcing the same token indefinitely and matches the detector's one-score-
+per-context rule. Greedy requests (`temperature=0`, normalized internally to
+`top_k=1`) also use ordinary token selection and carry no watermark signal.
+
+In dual-key mode, each eligible context deterministically selects key A with
+probability `P` and key B otherwise. Both token hashes are evaluated in the same
+selector pass; the ordinary truncation, repeated-context, and greedy rules do
+not change.
+
+## Detector specification
+
+A compatible detector must use the same tokenizer and the exact prompt token
+IDs that preceded the completion. All integer arithmetic below wraps to
+unsigned 32 bits.
+
+1. For each generated token at position `t`, take up to `h=context_window`
+   preceding token IDs from the concatenated prompt and completion. With an
+   empty prompt, begin at completion position `h`. Otherwise, skip an empty
+   context and skip any exact context tuple already scored in this completion.
+2. Compute the context hash by starting with `state=0` and applying the
+   MurmurHash3 x86 32-bit body mix to each token ID. Finalize
+   `state XOR (4 * context_length)` with `fmix32`.
+3. Interpret the hexadecimal key as an unsigned 64-bit integer. Starting again
+   from `state=0`, apply the same body mix to the key's low 32 bits, its high 32
+   bits, the context hash, and the candidate token ID, in that order. Finalize
+   `state XOR 16` with `fmix32` to obtain `H_t`.
+4. Set `u_t = (H_t + 0.5) / 2^32` and accumulate
+   `S = -sum(log(1 - u_t))` over the `n` unique contexts.
+5. Under the null hypothesis, `S` follows `Gamma(shape=n, scale=1)`. Report the
+   upper-tail probability `P[Gamma(n, 1) >= S]` as the p-value. The optional
+   normal approximation is `z = (S - n) / sqrt(n)`.
+
+The MurmurHash3 primitives are:
+
+```text
+mix(state, value):
+  value = value * 0xcc9e2d51
+  value = rotl32(value, 15)
+  value = value * 0x1b873593
+  state = rotl32(state XOR value, 13)
+  return state * 5 + 0xe6546b64
+
+fmix32(value):
+  value = value XOR (value >> 16)
+  value = value * 0x85ebca6b
+  value = value XOR (value >> 13)
+  value = value * 0xc2b2ae35
+  return value XOR (value >> 16)
+```
+
+### Dual-key detection
+
+Given both keys, partition the unique contexts before accumulating detector
+scores. For each context hash, start with `state=0` and apply `mix` to key A's
+low and high 32-bit words, key B's low and high words, and the context hash, in
+that order. Let:
+
+```text
+coin = fmix32(state XOR 20)
+threshold = floor(P * 2^32)
+```
+
+Use key A when `coin < threshold` and key B otherwise, then apply the single-key
+token hash and Gamma test independently to each partition. Repeated contexts
+must still be removed before partitioning. A detector holding only one key may
+score all unique contexts with that key; the unmatched partition dilutes the
+signal, so the two-key partitioned detector is stronger.
+
+Low p-values are evidence for the keyed watermark, not a calibrated probability
+that a particular author or model produced the text. Applications must choose a
+decision threshold and evaluate false-positive and false-negative rates on
+their own traffic.
+
+## Compatibility
+
+| Feature | Status | Behavior and validation |
+| --- | --- | --- |
+| CUDA graphs | Verified | Decode graphs, eager fallback, and fused state updates use the same selector contract. |
+| Overlap scheduling | Verified | Prompt initialization is carried with the delayed sampling batch. |
+| Tensor parallelism | Verified | TP2 and TP4 ordinary decode, plus NEXTN with TP2, produce detectable output without rank divergence. |
+| Mixed enabled and disabled requests | Verified | Keys, context windows, histories, and enablement are resolved per request. |
+| JSON schema and regex grammars | Verified | Grammar masking runs before watermark selection; strict outputs remain valid and detectable. |
+| Streaming chat completions | Verified | Streaming and non-streaming requests use the same watermark state and token selection. |
+| Parallel sampling (`n > 1`) | Verified | Each generated choice owns independent request state and history. |
+| Output log probabilities | Verified | Ordinary decode reports the effective distribution after forcing at eligible positions; repeated-context and greedy bypass positions retain ordinary log probabilities. Speculative decode reports the unmodified target-model distribution. |
+| Top-k, top-p, and min-p | Verified | The selector reproduces SGLang's combined truncation support before keyed selection. |
+| Logit bias and frequency, presence, and repetition penalties | Verified | These transforms run before watermark selection. |
+| Chunked prefill | Verified | Each prefill chunk rebuilds the prompt tail from the request's complete logical fill IDs. |
+| Radix-cache prompt reuse | Verified | Prompt-tail initialization uses logical request IDs rather than only newly computed tokens. |
+| Decode retraction | Verified | Re-prefill restores the unique-context history before generation resumes. |
+| Request abort and request-slot reuse | Verified | A later prefill resets ring-buffer and context-history state for the reused slot. |
+| Multimodal text generation | Verified | Qwen3-VL text tokens use the same watermark path after multimodal prefill. |
+| DP attention | Untested | The per-rank state path has not received a service-level DP-attention gate. |
+| NGRAM speculative decoding | Verified | Draft-node contexts are reconstructed before verification sampling. |
+| EAGLE and EAGLE3 speculative decoding | Verified | Tree nodes use their own ancestor-derived contexts. |
+| NEXTN speculative decoding | Verified | NEXTN uses the EAGLE verification path. |
+| Other speculative algorithms | Rejected | Startup validation fails closed. |
+| Speculative rejection sampling | Rejected | Startup validation fails closed. |
+| Custom logit processors | Rejected | Startup validation fails closed because processor ordering is not defined. |
+| Beam search | Rejected | Request validation rejects watermarked beam-search requests. |
+| Diffusion LLM | Rejected | Startup validation fails closed. |
+| PD disaggregation | Rejected | Startup validation fails closed because watermark state is not transferred between workers. |
+| Embedded Rust API server | Rejected | Startup validation fails closed. |
+| Non-CUDA devices | Rejected | Startup validation fails closed. |
+
+Speculative verification forces a clone of the target logits so downstream
+target-model log-probability computation continues to observe the unmodified
+tensor. Tree-based EAGLE modes reconstruct a separate context for each draft
+node before selection.
+
+## Limitations and performance
+
+- `temperature=0` produces no signal. Very low-entropy distributions also leave
+  few meaningful alternatives for the selector.
+- Short completions provide few independent contexts and therefore weak
+  statistical power.
+- Paraphrasing, rewriting, translation, and retokenization can weaken or remove
+  the signal.
+- The detector needs the matching key, tokenizer, context window, and prompt
+  token IDs for the strongest result.
+- Speculative decoding can lose accepted draft tokens when a draft proposal does
+  not match the watermarked target token. The impact depends on tree width and
+  workload.
+
+On one single-GPU node of each type with public `Qwen/Qwen3-8B`, TP1, TRT-LLM
+MHA, ordinary decoding, and 800-token sampled outputs, the fused selector
+measured the following mean output throughput over three repetitions per cell:
+
+| Node | Concurrency | Watermark off | Watermark on | Change |
+| --- | ---: | ---: | ---: | ---: |
+| GB300 | 1 | 270.25 token/s | 260.44 token/s | -3.63% |
+| GB300 | 8, per stream | 215.37 token/s | 207.25 token/s | -3.77% |
+| B300 | 1 | 258.84 token/s | 247.69 token/s | -4.31% |
+| B300 | 8, per stream | 196.26 token/s | 182.04 token/s | -7.24% |
+
+These measurements describe one model, GPU, sampling configuration, and output
+length. Benchmark your deployment before setting capacity targets.

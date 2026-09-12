@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermark import build_watermark_batch_config
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -78,6 +79,10 @@ class SamplingBatchInfo:
     # filtering cheap; the indices keep sampler work limited to opted-in rows.
     return_sampling_masks: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
+
+    watermark_keys: Optional[torch.Tensor] = None
+    watermark_context_windows: Optional[torch.Tensor] = None
+    watermark_enabled: Optional[torch.Tensor] = None
 
     # Device
     device: str = "cuda"
@@ -150,6 +155,24 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
+        features = get_exec().features
+        if getattr(features, "enable_watermark", False):
+            (
+                watermark_keys,
+                watermark_context_windows,
+                watermark_enabled,
+            ) = build_watermark_batch_config(
+                reqs,
+                default_key=features.watermark_key,
+                default_context_window=features.watermark_context_window,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
+                device=device,
+            )
+        else:
+            watermark_keys = None
+            watermark_context_windows = None
+            watermark_enabled = None
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -216,6 +239,9 @@ class SamplingBatchInfo:
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
+            watermark_keys=watermark_keys,
+            watermark_context_windows=watermark_context_windows,
+            watermark_enabled=watermark_enabled,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -349,6 +375,9 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             value = getattr(self, item, None)
             if value is not None:
@@ -491,6 +520,9 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)

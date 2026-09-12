@@ -19,10 +19,86 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.sampling.watermark_config import (
+    MAX_WATERMARK_CONTEXT_WINDOW,
+    parse_watermark_key,
+)
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
+
+
+def check_watermark_server_args(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    has_watermark_setting = any(
+        (
+            cfg.watermark_key is not None,
+            cfg.watermark_key_b is not None,
+            cfg.watermark_config is not None,
+            cfg.watermark_mixing_probability != 0.5,
+            cfg.watermark_default_enabled,
+            cfg.watermark_enforce_all,
+        )
+    )
+    if has_watermark_setting and not cfg.enable_watermark:
+        raise ValueError(
+            "watermark key, config, and mode arguments require --enable-watermark"
+        )
+
+    if not cfg.enable_watermark:
+        return
+
+    if cfg.device != "cuda":
+        raise ValueError(
+            f"--enable-watermark requires --device cuda, got {cfg.device!r}"
+        )
+    if cfg.watermark_key is not None:
+        parse_watermark_key(cfg.watermark_key)
+    if cfg.watermark_key_b is not None:
+        parse_watermark_key(cfg.watermark_key_b)
+        if cfg.watermark_key is None:
+            raise ValueError(
+                "--watermark-key-b requires --watermark-key or --watermark-config"
+            )
+    if not 0 < cfg.watermark_mixing_probability < 1:
+        raise ValueError(
+            "--watermark-mixing-probability must be strictly between 0 and 1"
+        )
+    if cfg.watermark_key_b is None and cfg.watermark_mixing_probability != 0.5:
+        raise ValueError("--watermark-mixing-probability requires --watermark-key-b")
+    if (
+        cfg.watermark_default_enabled or cfg.watermark_enforce_all
+    ) and cfg.watermark_key is None:
+        raise ValueError(
+            "--watermark-default-enabled and --watermark-enforce-all require "
+            "--watermark-key or --watermark-config"
+        )
+    if not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW:
+        raise ValueError(
+            "--watermark-context-window must be from 1 to 64, "
+            f"got {cfg.watermark_context_window!r}"
+        )
+    if cfg.enable_custom_logit_processor:
+        raise ValueError(
+            "--enable-watermark is incompatible with --enable-custom-logit-processor"
+        )
+    if cfg.dllm_algorithm is not None:
+        raise ValueError("--enable-watermark is not supported with diffusion LLM")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("--enable-watermark is not supported with PD disaggregation")
+    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3"}:
+        raise ValueError(
+            "--enable-watermark supports speculative algorithms NGRAM, EAGLE, "
+            f"and EAGLE3, got {cfg.speculative_algorithm!r}"
+        )
+    if cfg.speculative_use_rejection_sampling:
+        raise ValueError(
+            "--enable-watermark is incompatible with "
+            "--speculative-use-rejection-sampling"
+        )
+    if envs.SGLANG_RUST_SERVER.get():
+        raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
 def check_server_args(server_args: Any):
@@ -247,6 +323,8 @@ def check_server_args(server_args: Any):
         raise ValueError(
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
         )
+
+    check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
 

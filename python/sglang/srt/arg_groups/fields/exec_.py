@@ -74,6 +74,44 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
     ] = False
+    enable_watermark: A[
+        bool,
+        "Enable Aaronson-Gumbel text watermarking.",
+    ] = False
+    watermark_key: A[
+        Optional[str],
+        Arg(
+            help="Default hex-encoded 64-bit watermark key. This value is visible "
+            "in the process command line; prefer --watermark-config.",
+            resolvable=True,
+        ),
+    ] = None
+    watermark_key_b: A[
+        Optional[str],
+        Arg(
+            help="Optional second hex-encoded 64-bit watermark key.",
+        ),
+    ] = None
+    watermark_mixing_probability: A[
+        float,
+        "Probability of selecting watermark key A at each eligible position.",
+    ] = 0.5
+    watermark_config: A[
+        Optional[str],
+        "Path to a JSON file containing the default watermark key and context_window.",
+    ] = None
+    watermark_context_window: A[
+        int,
+        Arg(help="Default and maximum watermark context window.", resolvable=True),
+    ] = 4
+    watermark_default_enabled: A[
+        bool,
+        "Watermark requests that omit the watermark field using the server key.",
+    ] = False
+    watermark_enforce_all: A[
+        bool,
+        "Require watermarking for every request and reject per-request opt-out.",
+    ] = False
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "
