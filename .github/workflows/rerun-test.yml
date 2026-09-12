@@ -127,6 +127,10 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
+        env:
+          # Public-read-only PAT: the checkout above leaves no job token for the
+          # install script's github.com clones. Unset -> anonymous.
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CI_CLONE }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
@@ -234,6 +238,8 @@ jobs:
 
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CI_CLONE }}
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test

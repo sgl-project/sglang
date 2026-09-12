@@ -410,8 +410,9 @@ export const Qwen35Deployment = () => {
       }
     }
 
-    // Enable NCCL symmetric memory for H100 FP8 deployments.
-    if (hardware === 'h100' && quantization === 'fp8' && hwConfig.tp > 1) {
+    // Enable NCCL symmetric memory for H100 and Blackwell FP8 deployments.
+    const symmMemFp8Hw = ['h100', 'b200', 'b300'];
+    if (symmMemFp8Hw.includes(hardware) && quantization === 'fp8' && hwConfig.tp > 1) {
       cmd += ` \\\n  --enable-symm-mem`;
     }
 
@@ -438,6 +439,15 @@ export const Qwen35Deployment = () => {
       }
     }
 
+    // B200 NVFP4 with MTP runs TP2/EP2 (set above). Keep Triton as the base
+    // linear-attention backend while routing GDN decode and prefill through
+    // FlashInfer.
+    if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
+      cmd += ` \\\n  --linear-attn-backend triton`;
+      cmd += ` \\\n  --linear-attn-decode-backend flashinfer`;
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
     // Append backend configurations
     if (hardware === 'b200' || (hardware === 'b300' && quantization === 'fp4')) {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
@@ -446,12 +456,22 @@ export const Qwen35Deployment = () => {
       cmd += ` \\\n  --attention-backend flashinfer`;
     }
 
+    // Enable FlashInfer GDN (linear attention) prefill for Blackwell FP8 deployments.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8') {
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
+    // Enable FlashInfer trtllm MoE for FP8 Blackwell deployments for MoE models.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8' && MOE_MODELS.has(model)) {
+      cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm`;
+    }
+
     // Append AMD GPU-specific backend configurations.
     // All AMD MI GPUs use the AITER unified-attention backend (pair with
     // SGLANG_USE_AITER=1 and SGLANG_USE_AITER_UNIFIED_ATTN=1; see cookbook prose),
     // which requires --page-size 16. Multi-GPU runs enable AITER allreduce fusion,
-    // except the MXFP4 MI355X recipe, which uses ROCm INT8 quantized quick
-    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT8) instead.
+    // except the MXFP4 MI355X recipe, which uses ROCm INT4 quantized quick
+    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT4) instead.
     if (amdGpu) {
       const amdFp4 = quantization === 'fp4' && hardware === 'mi355x';
       let amdEnv = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\nAITER_FLYDSL_FORCE=1 \\\n";
@@ -459,7 +479,7 @@ export const Qwen35Deployment = () => {
         amdEnv += "SGLANG_MAMBA_SSM_DTYPE=bfloat16 \\\n";
       }
       if (amdFp4) {
-        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \\\n";
+        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \\\n";
       }
       cmd = amdEnv + cmd;
       cmd += " \\\n  --attention-backend aiter";
@@ -486,7 +506,7 @@ export const Qwen35Deployment = () => {
     // FP4-specific backend settings
     if (quantization === 'fp4') {
       if (hardware === 'mi355x') {
-        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT8 quantized
+        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT4 quantized
         // ROCm quick all-reduce env are emitted by the AMD backend block above
         // (this recipe uses quick all-reduce instead of AITER allreduce fusion).
         // Add the FP4-specific flags here.
@@ -497,8 +517,8 @@ export const Qwen35Deployment = () => {
           cmd += ' \\\n  --enable-hierarchical-cache';
           cmd += ' \\\n  --hicache-ratio 1.5';
           cmd += ' \\\n  --hicache-write-policy write_through';
-          cmd += ' \\\n  --hicache-io-backend direct';
-          cmd += ' \\\n  --hicache-mem-layout page_first_direct';
+          cmd += ' \\\n  --hicache-io-backend kernel';
+          cmd += ' \\\n  --hicache-mem-layout page_first';
         } else {
           cmd += ' \\\n  --disable-radix-cache';
         }
