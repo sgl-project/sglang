@@ -442,6 +442,99 @@ def test_strict_schema_preserves_additional_properties_default():
     )
 
 
+def test_strict_schema_applies_additional_properties_only_to_unknown_keys():
+    """A declared object key must use its own schema, while unknown keys use
+    the schema-valued additionalProperties constraint."""
+    nested_schema = {
+        "type": "object",
+        "properties": {"data": {"type": "integer"}},
+        "additionalProperties": {
+            "type": "object",
+            "properties": {"data": {"type": "string"}},
+            "additionalProperties": True,
+        },
+    }
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="case",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {"value": nested_schema},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    assert _accepts(
+        grammar,
+        _tools_section(
+            _call(
+                "case",
+                1,
+                _argument("value", "object", '{"data":0,"metadata":{"data":"ok"}}'),
+            )
+        ),
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(
+            _call(
+                "case",
+                1,
+                _argument("value", "object", '{"data":{"data":""}}'),
+            )
+        ),
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(
+            _call(
+                "case",
+                1,
+                _argument("value", "object", '{"metadata":{"data":1}}'),
+            )
+        ),
+    )
+
+
+def test_strict_xtml_additional_properties_excludes_declared_keys():
+    """A declared XTML argument cannot bypass its schema through the dynamic
+    additionalProperties argument branch."""
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="case",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "data": {"type": "integer"},
+                    "置信度": {"type": "integer"},
+                },
+                "additionalProperties": {"type": "object"},
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    assert _accepts(
+        grammar,
+        _tools_section(_call("case", 1, _argument("置信度", "number", "1"))),
+    )
+    assert _accepts(
+        grammar,
+        _tools_section(_call("case", 1, _argument("置信度2", "object", "{}"))),
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(_call("case", 1, _argument("置信度", "object", "{}"))),
+    )
+
+
 def test_dynamic_argument_key_compiles_without_xgrammar_unicode_warning(capfd):
     tool = Tool(
         type="function",
