@@ -1617,8 +1617,13 @@ class Scheduler(
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
         needs_confidence_relay = decide_needs_confidence_relay()
+        # FutureMap bufs are indexed by req_pool_idx and written/read with
+        # batch tensors (req_pool_indices, next_token_ids, seq_lens), which
+        # live on the req_to_token_pool's device. On CUDA that is self.device;
+        # the MLX backend keeps its pools and batches on CPU while self.device
+        # is "mps", so the relay must follow the pool, not the accelerator.
         self.future_map = self.spec_algorithm.create_future_map(
-            self.device,
+            self.req_to_token_pool.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
