@@ -99,7 +99,7 @@ def _make_source(allocator, req_to_token, ps):
     )
 
 
-def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, mult, ps, width):
+def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, ps, width):
     """Independent python derivation of the read-table formula."""
     bs = req_pool_indices.numel()
     out = torch.zeros((bs, width), dtype=torch.int32)
@@ -109,7 +109,7 @@ def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, mult, ps, wi
         for c in range(min(n_pages, width)):
             tok = int(req_to_token[req, c * ps])
             page = 0 if tok < 0 else tok // ps
-            out[b, c] = max(int(v2p[page]) * mult, 0)
+            out[b, c] = max(int(v2p[page]), 0)
     return out
 
 
@@ -178,8 +178,6 @@ class TestReadTableBuild(unittest.TestCase):
         never chained through full-physical."""
         for ps in (1, 4):
             allocator = _build_composite(ps)
-            full_mult = allocator.kernel_page_multiplier
-            swa_mult = allocator.swa_kernel_page_multiplier
             req_to_token, rows, seq_lens = _alloc_and_fill(
                 allocator, ps, lens=[5 * ps, 2 * ps, 3 * ps - 1]
             )
@@ -199,7 +197,6 @@ class TestReadTableBuild(unittest.TestCase):
                 rows,
                 seq_lens,
                 allocator.full_v2p_page_table,
-                full_mult,
                 ps,
                 width,
             )
@@ -208,17 +205,16 @@ class TestReadTableBuild(unittest.TestCase):
                 rows,
                 seq_lens,
                 allocator.swa_v2p_page_table,
-                swa_mult,
                 ps,
                 width,
             )
             self.assertTrue(
                 torch.equal(view.ids, want_full),
-                f"full read table off-formula (ps={ps}, mult={full_mult})",
+                f"full read table off-formula (ps={ps})",
             )
             self.assertTrue(
                 torch.equal(view.sliding_window_ids, want_swa),
-                f"swa read table off-formula (ps={ps}, mult={swa_mult})",
+                f"swa read table off-formula (ps={ps})",
             )
 
     def test_packed_stream_equals_the_rectangle_it_replaces(self):
@@ -296,7 +292,6 @@ class TestBuildInto(unittest.TestCase):
         capped rather than trip the builder's width assert."""
         ps = 4
         allocator = _build_composite(ps)
-        full_mult = allocator.kernel_page_multiplier
         lens = [5, 2 * ps + 1, 1]
         req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=lens)
         src = _make_source(allocator, req_to_token, ps)
@@ -311,7 +306,6 @@ class TestBuildInto(unittest.TestCase):
             rows,
             seq_lens,
             allocator.full_v2p_page_table,
-            full_mult,
             ps,
             width_pages,
         )
@@ -605,7 +599,7 @@ class TestWriteLoc(CustomTestCase):
         req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=[max(n, 1)])
         src = _make_source(allocator, req_to_token, ps)
         virt = allocator.alloc(-(-n // ps) * ps)[:n]
-        want_full = allocator.translate_kv_loc_for_kernel(virt)
+        want_full = allocator.translate_kv_loc(virt)
         want_swa = allocator.translate_loc_from_full_to_swa(virt)
         return src, allocator, rows, seq_lens, virt, want_full, want_swa
 
