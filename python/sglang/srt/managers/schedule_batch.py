@@ -1446,7 +1446,7 @@ class Req(ReqDllmMixin):
             # denoising pass must see prompt and all generated positions.
             tree_cache = None
             self.prefix_indices = torch.empty((0,), dtype=torch.int64)
-            self.cache_protected_len = 0
+            self.kv.cache_protected_len = 0
             self.host_hit_length = 0
             self.swa_host_hit_length = 0
             self.mamba_host_hit_length = 0

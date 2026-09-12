@@ -58,6 +58,7 @@ class TestDreamRequestCanvas(CustomTestCase):
 
     def test_dream_initializes_one_full_generation_canvas(self):
         req = self._make_req(_config(mask_id=151666))
+        req.kv.cache_protected_len = 2
 
         self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_DECODE)
         self.assertEqual(req.dllm_algo_state, {"prompt_len": 2, "step": 0})
@@ -69,6 +70,8 @@ class TestDreamRequestCanvas(CustomTestCase):
         )
         self.assertEqual(req.dllm_phase, DllmReqPhase.STAGING_DECODE)
         self.assertEqual(req.dllm_block_offset, 0)
+        self.assertEqual(req.kv.cache_protected_len, 0)
+        self.assertFalse(hasattr(req, "cache_protected_len"))
 
         req.output_ids = array("q", [20])
         req.init_next_round_input()
@@ -306,7 +309,7 @@ class TestDreamCudaGraphPath(CustomTestCase):
         self.assertTrue(torch.equal(output.full_logits, full_logits[:4]))
 
     def _make_server_args_for_graph_test(self, disable_cuda_graph):
-        args = ServerArgs.__new__(ServerArgs)
+        args = ServerArgs(model_path="dummy")
         args.dllm_algorithm = "Dream"
         args.dllm_fdfo = True
         args.tp_size = 1
@@ -327,11 +330,6 @@ class TestDreamCudaGraphPath(CustomTestCase):
         args.enable_lora = False
         args.disaggregation_mode = "null"
         args.enable_mixed_chunk = False
-        args.get_model_config = MagicMock(
-            return_value=SimpleNamespace(
-                hf_config=SimpleNamespace(architectures=["DreamModel"])
-            )
-        )
         return args
 
     @patch("sglang.srt.arg_groups.dllm_hook.run_post_process_pass")
