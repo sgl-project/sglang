@@ -145,6 +145,20 @@ pub struct Cli {
     /// the published queue sums across a worker's DP ranks.
     #[arg(long)]
     pub worker_queue_limit: Option<u64>,
+    /// Number of random candidates sampled for the min-load fallback; the
+    /// least-pressured of the sample wins. The default 2 keeps today's
+    /// power-of-2 behavior unchanged. `k >= pool` skips the shuffle and
+    /// returns the deterministic exact minimum (ties resolve in pool
+    /// order); `k = 1` is a uniform draw within the tier, and because a
+    /// one-member sample has no runner-up the proposal carries no backup,
+    /// which disables the backup-admission and pressure-guard paths. Note
+    /// the division of labor with `--cache-candidate-min-workers`,
+    /// `--cache-candidate-ratio`, and `--cache-candidate-max-workers`:
+    /// those bound the cache-affinity OWNER candidate set; this flag
+    /// bounds the min-load FALLBACK sample used when no owner is usable.
+    /// Requires `--policy cache_aware`.
+    #[arg(long)]
+    pub min_load_choices: Option<usize>,
 
     // ---- score composition ----
     /// Policies to sum, spelled exactly as `--policy` spells them and each
@@ -332,7 +346,8 @@ impl Cli {
             || self.cache_candidate_ratio.is_some()
             || self.cache_candidate_max_workers.is_some()
             || self.cache_switch_margin_tokens.is_some()
-            || self.worker_queue_limit.is_some();
+            || self.worker_queue_limit.is_some()
+            || self.min_load_choices.is_some();
         if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
                 "cache candidate tuning flags require --policy cache_aware"
@@ -340,6 +355,9 @@ impl Cli {
         }
         if self.worker_queue_limit == Some(0) {
             return Err(anyhow!("--worker-queue-limit must be at least 1"));
+        }
+        if self.min_load_choices == Some(0) {
+            return Err(anyhow!("--min-load-choices must be at least 1"));
         }
         if (self.pressure_abs_threshold_tokens.is_some()
             || self.pressure_abs_threshold_ms.is_some()
@@ -560,6 +578,7 @@ impl Cli {
                     .cache_switch_margin_tokens
                     .unwrap_or(d.cache_switch_margin_tokens),
                 worker_queue_limit: self.worker_queue_limit.or(d.worker_queue_limit),
+                min_load_choices: self.min_load_choices.unwrap_or(d.min_load_choices),
             })
         } else {
             None
@@ -1839,6 +1858,43 @@ mod tests {
         .expect_err("a zero limit would reject every queue reading")
         .to_string();
         assert!(err.contains("--worker-queue-limit"), "got: {err}");
+    }
+
+    #[test]
+    fn min_load_choices_is_plumbed_and_validated() {
+        let config = cfg_of("--policy cache_aware --min-load-choices 5").unwrap();
+        assert_eq!(
+            config
+                .model
+                .affinity
+                .expect("cache-aware needs affinity config")
+                .min_load_choices,
+            5
+        );
+
+        // Unset keeps the pre-existing power-of-2 behavior.
+        let defaults = cfg_of("--policy cache_aware").unwrap();
+        assert_eq!(
+            defaults
+                .model
+                .affinity
+                .expect("default affinity config")
+                .min_load_choices,
+            2
+        );
+
+        let err = cfg_of("--policy cache_aware --min-load-choices 0")
+            .expect_err("a zero sample size would select nothing")
+            .to_string();
+        assert!(err.contains("--min-load-choices"), "got: {err}");
+
+        let err = cfg_of("--policy power_of_two --min-load-choices 3")
+            .expect_err("the knob only tunes the cache-aware fallback")
+            .to_string();
+        assert!(
+            err.contains("cache candidate tuning flags require --policy cache_aware"),
+            "got: {err}"
+        );
     }
 
     #[test]
