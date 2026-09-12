@@ -141,7 +141,9 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     from sglang.srt.environ import envs
     from sglang.srt.layers.communicator_mhc import MHCState
     from sglang.srt.layers.layernorm import RMSNorm
-    from sglang.srt.models.glm5_next import Glm5NextDecoderLayer
+    from sglang.srt.models.glm5_next import (
+        Glm5NextDecoderLayer,
+    )
 
     layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
     torch.nn.Module.__init__(layer)
@@ -168,7 +170,24 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
         )
         for callback in (None, layer.hc_ffn_post_pre)
     ]
+    # Pinned to measured behavior, not to the cutoff constant, so widening the
+    # cutoff turns this red. Under CUDA graph at GLM-5.3-Flash's shape the
+    # fused boundary wins to 16 tokens, reaches parity at 24, and from 32 loses --
+    # 0.21x with DeepGEMM prenorm off, where its pre-norm GEMM drops split-K.
+    # attn_to_mlp short-circuits an empty batch before reaching the callback.
+    fused_expected = {1: True, 6: True, 17: False}[x.shape[0]] if x.shape[0] else None
     with envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True):
+        if x.shape[0] > 0:
+            declined = (
+                layer.hc_ffn_post_pre(
+                    x, residual.flatten(1), comb.flatten(1), post.flatten(1), None, None
+                )
+                is None
+            )
+            assert declined is not fused_expected, (
+                f"num_tokens={x.shape[0]} fused={not declined}, "
+                f"expected fused={fused_expected}"
+            )
         outputs = [s.attn_to_mlp(x, residual.flatten(1), norm) for s in states]
     torch.testing.assert_close(outputs[0][0], outputs[1][0], atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(outputs[0][1], outputs[1][1], atol=0, rtol=0)

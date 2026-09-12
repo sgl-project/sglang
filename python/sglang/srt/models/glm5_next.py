@@ -125,6 +125,12 @@ logger = logging.getLogger(__name__)
 # Glm5NextDecoderLayer._hc_pre passes to the unfused hc_pre.
 _MHC_POST_MULT_VALUE = 2.0
 
+# Above this the fused boundary loses to the unfused chain, because its pre-norm
+# GEMM skips the split-K kernel mhc_pre uses up to 2048 tokens. Measured under
+# CUDA graph at GLM-5.3-Flash's hc_mult=4 / hidden_size=4096: 1.40x at <=6, 1.17x
+# at 8-16, parity at 24, 0.87x at 32, and 0.21x from 33 with DeepGEMM prenorm off.
+_MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+
 
 @torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
@@ -767,6 +773,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # platform or shape, and the caller keeps the unfused chain.
         assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
+        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
+            return None
         hc_mult = self.config.hc_mult
         fused = apply_mhc_post_pre_boundary(
             hidden_states,
