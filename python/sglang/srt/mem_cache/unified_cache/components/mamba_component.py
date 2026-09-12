@@ -215,6 +215,19 @@ class MambaComponent(TreeComponent):
         req.kv.mamba_needs_clear = False
         return result
 
+    def _mamba_value_misaligned(self, params: InsertParams) -> bool:
+        # The value was produced at mamba_value_seqlen; a leaf truncated to a
+        # shorter component boundary (e.g. the SWA branch) is not that
+        # position, and stamping it would attach a later state to an earlier
+        # key (#38815).
+        return (
+            params.mamba_value is not None
+            and params.mamba_value_seqlen is not None
+            and params.key is not None
+            and len(params.key) + int(self.tree_core.is_eagle)
+            != params.mamba_value_seqlen
+        )
+
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,
@@ -224,6 +237,8 @@ class MambaComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert params.mamba_value is not None
+        if self._mamba_value_misaligned(params):
+            return
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -563,6 +578,7 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
             else:
                 insert_params.mamba_value = active_value
+            insert_params.mamba_value_seqlen = cache_len
             return cache_len
         else:
             if cache_len is None:
@@ -599,6 +615,7 @@ class MambaComponent(TreeComponent):
                     translate(mamba_value_donated),
                 )
             insert_params.mamba_value = mamba_value_donated
+            insert_params.mamba_value_seqlen = cache_len
             return cache_len
 
     def cleanup_after_caching_req(
@@ -610,7 +627,12 @@ class MambaComponent(TreeComponent):
     ) -> None:
         if is_finished:
             mamba_value_inserted = (
-                insert_result is not None and not insert_result.mamba_exist
+                insert_result is not None
+                and not insert_result.mamba_exist
+                and not (
+                    insert_params is not None
+                    and self._mamba_value_misaligned(insert_params)
+                )
             )
             pool = self.cache.req_to_token_pool
 
@@ -640,7 +662,9 @@ class MambaComponent(TreeComponent):
                 pool.free_mamba_cache(req)
         else:
             if insert_params.mamba_value is not None and (
-                insert_result is None or insert_result.mamba_exist
+                insert_result is None
+                or insert_result.mamba_exist
+                or self._mamba_value_misaligned(insert_params)
             ):
                 self._free_mamba_value(insert_params.mamba_value)
             req.kv.mamba_last_track_seqlen = None

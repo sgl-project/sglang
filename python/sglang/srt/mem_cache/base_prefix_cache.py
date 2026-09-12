@@ -66,6 +66,10 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # The seqlen the mamba_value was produced at. A leaf truncated to a
+    # shorter component boundary (e.g. the SWA branch) is not that position,
+    # and stamping it would attach a later state to an earlier key (#38815).
+    mamba_value_seqlen: Optional[int] = None
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None

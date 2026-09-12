@@ -93,6 +93,7 @@ fn insert_overlap_default_consumes_nothing() {
             namespace: Default::default(),
             value: Tensor::from_slice(&[0i64, 1, 2]),
             mamba_value: None,
+            mamba_value_seqlen: None,
             prev_prefix_len: 0,
             swa_evicted_seqlen: 0,
             chunked: false,

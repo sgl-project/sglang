@@ -547,6 +547,7 @@ fn insert_params_swa<'k>(
         namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: None,
+        mamba_value_seqlen: None,
         prev_prefix_len,
         swa_evicted_seqlen,
         chunked: false,

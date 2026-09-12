@@ -587,6 +587,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
                 mamba_value=params.mamba_value,
+                mamba_value_seqlen=params.mamba_value_seqlen,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.swa_evicted_seqlen,
                 chunked=params.chunked,
