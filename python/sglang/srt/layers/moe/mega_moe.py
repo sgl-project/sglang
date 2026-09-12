@@ -97,28 +97,30 @@ def _get_mega_moe_symm_buffer(
     import deep_gemm
 
     mma_type = _mega_moe_mma_type()
-    key = (
-        id(group),
-        num_max_tokens_per_rank,
-        num_experts,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-        mma_type,
-    )
-    buf = _MEGA_MOE_SYMM_BUFFER.get(key)
-    if buf is None:
-        buf = deep_gemm.get_symm_buffer_for_mega_moe(
-            group,
-            num_experts,
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        key = (
+            id(group),
             num_max_tokens_per_rank,
+            num_experts,
             num_topk,
             hidden,
             intermediate_hidden,
-            mma_type=mma_type,
-            activation="swiglu",
+            mma_type,
+            deep_gemm.get_num_sms(),
         )
-        _MEGA_MOE_SYMM_BUFFER[key] = buf
+        buf = _MEGA_MOE_SYMM_BUFFER.get(key)
+        if buf is None:
+            buf = deep_gemm.get_symm_buffer_for_mega_moe(
+                group,
+                num_experts,
+                num_max_tokens_per_rank,
+                num_topk,
+                hidden,
+                intermediate_hidden,
+                mma_type=mma_type,
+                activation="swiglu",
+            )
+            _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
 
 
