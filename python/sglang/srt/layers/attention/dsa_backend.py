@@ -58,10 +58,9 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
-from sglang.srt.layers.attention.dsa.dsa_metadata_fusion import (
-    DSAKPoolMetadataFusionMixin,
+from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
+    DSAMetadataManagementMixin,
 )
-from sglang.srt.layers.attention.dsa.dsa_metadata_sibling import DSAMetadataSiblingMixin
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
@@ -304,8 +303,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
 
 
 class DeepseekSparseAttnBackend(
-    DSAKPoolMetadataFusionMixin,
-    DSAMetadataSiblingMixin,
+    DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     AttentionBackend,
