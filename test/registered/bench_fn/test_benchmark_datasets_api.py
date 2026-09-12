@@ -26,6 +26,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
+import sglang.benchmark.datasets.image as image_module
 from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
 from sglang.benchmark.datasets.agentic_trace import (
     DEFAULT_AGENTIC_OUTPUT_LEN,
@@ -41,7 +42,9 @@ from sglang.benchmark.datasets.generated_shared_prefix import (
 )
 from sglang.benchmark.datasets.image import (
     ImageDataset,
+    create_mm_data_row,
     parse_random_image_resolution,
+    resolve_image_placeholder,
     sample_image_requests,
 )
 from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
@@ -1476,6 +1479,84 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "Traceback",
         ]:
             self.assertNotIn(forbidden, stderr)
+
+
+class _NoChatTemplateProcessor(DummyProcessor):
+    """Processor with no chat template of its own, as remote-code processors can be.
+
+    Its tokenizer still carries one, and it knows its image token, mirroring
+    checkpoints that ship ``chat_template.jinja``.
+    """
+
+    IMAGE_TOKEN = "<|img|>"
+
+    def __init__(self, tokenizer, *, template_drops_images=False):
+        super().__init__(tokenizer)
+        self.image_token = self.IMAGE_TOKEN
+        self.template_drops_images = template_drops_images
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+        raise ValueError("this processor does not have a chat template")
+
+    def __call__(self, text, images=None, padding=False, return_tensors="pt"):
+        # Stand in for real vision expansion: every placeholder found becomes 4 tokens.
+        rendered = text[0]
+        n = rendered.count(self.IMAGE_TOKEN)
+        text_len = len(self.tokenizer.encode(rendered.replace(self.IMAGE_TOKEN, "")))
+        return {"input_ids": _DummyTokenTensor(text_len + 4 * n)}
+
+
+class TestImagePlaceholderFallback(CustomTestCase):
+    def setUp(self):
+        self.tokenizer = create_lightweight_tokenizer()
+        self.image = Image.new("RGB", (8, 8), (128, 128, 128))
+
+    def _row(self, processor, n_images, monkeypatched_render=None):
+        original = image_module.render_with_tokenizer_template
+        if monkeypatched_render is not None:
+            image_module.render_with_tokenizer_template = monkeypatched_render
+        try:
+            return create_mm_data_row(
+                "hello world",
+                [self.image] * n_images,
+                ["data:image/jpeg;base64,AAAA"] * n_images,
+                16,
+                processor,
+                "sglang-oai-chat",
+            )
+        finally:
+            image_module.render_with_tokenizer_template = original
+
+    def test_resolve_image_placeholder_prefers_image_token(self):
+        processor = _NoChatTemplateProcessor(self.tokenizer)
+        self.assertEqual(
+            resolve_image_placeholder(processor),
+            _NoChatTemplateProcessor.IMAGE_TOKEN,
+        )
+
+    def test_placeholder_is_none_when_processor_exposes_nothing(self):
+        self.assertIsNone(resolve_image_placeholder(DummyProcessor(self.tokenizer)))
+
+    def test_vision_tokens_counted_when_processor_has_no_chat_template(self):
+        processor = _NoChatTemplateProcessor(self.tokenizer)
+        self.assertEqual(self._row(processor, 1).vision_prompt_len, 4)
+
+    def test_vision_tokens_scale_with_image_count(self):
+        processor = _NoChatTemplateProcessor(self.tokenizer)
+        self.assertEqual(self._row(processor, 2).vision_prompt_len, 8)
+
+    def test_template_that_drops_images_is_rejected(self):
+        # A template with no image branch returns normally without emitting any
+        # placeholder; the hand-built prompt must be used instead of trusting it.
+        processor = _NoChatTemplateProcessor(self.tokenizer)
+        row = self._row(
+            processor, 1, monkeypatched_render=lambda proc, content: "hello world"
+        )
+        self.assertEqual(row.vision_prompt_len, 4)
+
+    def test_chat_backend_still_sends_raw_text(self):
+        processor = _NoChatTemplateProcessor(self.tokenizer)
+        self.assertEqual(self._row(processor, 1).prompt, "hello world")
 
 
 if __name__ == "__main__":
