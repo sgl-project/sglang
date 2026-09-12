@@ -301,5 +301,65 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
     )
 
 
+class TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE(
+    UpdateWeightsFromDiskBase, CustomTestCase
+):
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
+    launch_env = {
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+    }
+    backend_test_suites = (
+        {
+            "name": "flashinfer_megamoe_nvfp4_w4a16",
+            "other_args": (
+                "--dtype",
+                "bfloat16",
+                "--tp-size",
+                "4",
+                "--dp-size",
+                "4",
+                "--enable-dp-attention",
+                "--ep-size",
+                "4",
+                "--fp4-gemm-backend",
+                "flashinfer_cutedsl",
+                "--moe-runner-backend",
+                "flashinfer_megamoe",
+                "--moe-a2a-backend",
+                "flashinfer_megamoe",
+                "--enable-deterministic-inference",
+            ),
+        },
+    )
+
+
+class TestServerUpdateWeightsFromDiskNVFP4OnlineW4A16MegaMoE(
+    TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE
+):
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+    launch_env = {
+        **TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE.launch_env,
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FP4_IGNORED_LAYERS": "",
+    }
+    backend_test_suites = (
+        {
+            "name": "flashinfer_megamoe_nvfp4_online_w4a16",
+            "other_args": (
+                *TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE.backend_test_suites[
+                    0
+                ]["other_args"],
+                "--quantization",
+                "nvfp4_online",
+            ),
+        },
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

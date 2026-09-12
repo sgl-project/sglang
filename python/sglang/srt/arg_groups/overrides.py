@@ -1510,22 +1510,30 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     field) stay in the handler."""
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
+        use_megamoe_w4a16 = (
+            view.moe_a2a_backend == "flashinfer_megamoe"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
         if not get_platform().is_sm100:
             raise ValueError(
                 "--quantization nvfp4_online is supported only on "
                 "NVIDIA Blackwell SM100/SM103 GPUs."
             )
         if moe_runner_backend == "auto":
-            moe_runner_backend = "flashinfer_trtllm"
+            moe_runner_backend = (
+                "flashinfer_megamoe" if use_megamoe_w4a16 else "flashinfer_trtllm"
+            )
         elif moe_runner_backend not in [
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
             "flashinfer_cutedsl",
-        ]:
+        ] and not (moe_runner_backend == "flashinfer_megamoe" and use_megamoe_w4a16):
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed, or flashinfer_cutedsl."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl; "
+                "flashinfer_megamoe requires --moe-a2a-backend flashinfer_megamoe "
+                "and SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
             )
     # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
     # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:

@@ -2369,6 +2369,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = self.prepare_weight_loader(
             layer, extra_weight_attrs.get("weight_loader")
         )
+        if get_moe_runner_backend().is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                make_nvfp4_megamoe_weight_loader,
+            )
+
+            weight_loader = make_nvfp4_megamoe_weight_loader(layer, weight_loader)
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
@@ -2608,11 +2614,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        use_cutedsl_w4a16 = (
-            self._is_cutedsl_v2_standard
-            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-        )
-        if self.quant_config.use_per_token_activation or use_cutedsl_w4a16:
+        use_w4a16 = (
+            self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
+        ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        if self.quant_config.use_per_token_activation or use_w4a16:
             # FlashInfer computes activation scales dynamically per token, so
             # the static checkpoint activation scale is intentionally neutral.
             # CuTe DSL W4A16 keeps activations in BF16, so its GEMM alphas must
@@ -2684,7 +2689,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
             not self.quant_config.use_per_token_activation
-            and not use_cutedsl_w4a16
+            and not use_w4a16
             and (
                 use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
             )
@@ -2968,12 +2973,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
+            use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
                 mega_forward=layer._flashinfer_megamoe_forward,
-                fc1_alpha=layer.g1_alphas,
-                fc2_alpha=layer.g2_alphas,
-                fc1_norm_const=layer.w2_input_scale_quant,
+                fc1_alpha=None if use_w4a16 else layer.g1_alphas,
+                fc2_alpha=None if use_w4a16 else layer.g2_alphas,
+                fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
