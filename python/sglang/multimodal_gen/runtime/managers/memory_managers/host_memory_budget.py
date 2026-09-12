@@ -299,6 +299,10 @@ class HostPinBudget:
     def for_local_worker(cls, local_worker_count: int) -> "HostPinBudget":
         """Give one worker a non-overlapping share of the node allowance."""
         worker_count = max(1, local_worker_count)
+        if host_copies_are_redundant():
+            # Nothing to pin for: the copy would duplicate page-cache bytes,
+            # and the mapped courier already overlaps its transfers.
+            return cls(available_bytes=0, reserve_bytes=0)
         node_available = host_memory_available_bytes()
         node_spendable = max(0, node_available - host_pin_reserve_bytes(node_available))
         return cls(

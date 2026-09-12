@@ -1891,6 +1891,21 @@ class LayerwiseOffloadManager:
             target = self._named_buffers[name]
         return target
 
+    def mapped_layer_bytes(self) -> dict[int, int]:
+        """Per layer, the bytes served straight from the checkpoint mapping.
+
+        Those bytes are page cache while the layer streams: not allocated by
+        this process, but memory the kernel must keep for the stream to run at
+        memory speed rather than disk speed.
+        """
+        return {
+            layer_idx: sum(
+                tensor.numel() * tensor.element_size() for tensor in weights.values()
+            )
+            for layer_idx, weights in self._mapped_cpu_weights.items()
+            if weights
+        }
+
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
         """
@@ -2429,12 +2444,11 @@ class LayerwiseOffloadManager:
         total = 0
         for layer_meta in self._weight_metadata.values():
             for meta in layer_meta.values():
-                # strided copies and weights left on their checkpoint mapping
-                # carry a shape, not a slot in a consolidated buffer
-                if meta.get("preserve_strides", False) or meta.get("mapped", False):
+                # Consolidated stores record their slice; strided and mapped
+                # weights only carry a shape.
+                numel = meta.get("numel")
+                if numel is None:
                     numel = math.prod(meta["shape"])
-                else:
-                    numel = meta["numel"]
                 total += int(numel) * meta["dtype"].itemsize
         return total
 
