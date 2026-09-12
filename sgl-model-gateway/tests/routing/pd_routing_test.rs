@@ -7,6 +7,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
+use http_body_util::BodyExt;
 use serde_json::json;
 use smg::config::RouterConfig;
 use tower::ServiceExt;
@@ -216,6 +217,89 @@ mod pd_routing_tests {
             StatusCode::OK,
             "Request should succeed via retry to healthy decode worker"
         );
+
+        ctx.shutdown().await;
+    }
+    /// A streaming request must not wait for the prefill leg's HTTP response:
+    /// the client stream is committed on decode's 2xx. Gating it on prefill
+    /// buffered every chunk (and SSE keepalive) decode produced while the
+    /// prefill response lagged, and flushed them in one burst.
+    #[tokio::test]
+    async fn test_pd_stream_commits_on_decode_before_prefill_resolves() {
+        const PREFILL_DELAY_MS: u64 = 3000;
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![("http://127.0.0.1:19830".to_string(), None)],
+                vec!["http://127.0.0.1:19831".to_string()],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(3803)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                // Prefill answers late; decode streams immediately.
+                MockWorkerConfig {
+                    port: 19830,
+                    worker_type: WorkerType::Prefill,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: PREFILL_DELAY_MS,
+                    fail_rate: 0.0,
+                },
+                TestWorkerConfig::decode(19831),
+            ],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "stream before prefill resolves",
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers_at = started.elapsed();
+
+        let mut body = resp.into_body();
+        let mut first_chunk_at = None;
+        while let Some(frame) = body.frame().await {
+            if matches!(&frame, Ok(f) if f.is_data()) {
+                first_chunk_at = Some(started.elapsed());
+                break;
+            }
+        }
+        let first_chunk_at = first_chunk_at.expect("stream produced a data frame");
+
+        let budget = std::time::Duration::from_millis(PREFILL_DELAY_MS / 2);
+        assert!(
+            headers_at < budget,
+            "response headers took {headers_at:?}: gated on the prefill leg ({PREFILL_DELAY_MS} ms)"
+        );
+        assert!(
+            first_chunk_at < budget,
+            "first chunk took {first_chunk_at:?}: gated on the prefill leg ({PREFILL_DELAY_MS} ms)"
+        );
+
+        // Drain the rest; the prefill leg resolves later and is handled by the relay.
+        while body.frame().await.is_some() {}
 
         ctx.shutdown().await;
     }
