@@ -327,6 +327,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError(
                 "Rust TreeCore does not support component_registry_override"
             )
+        # The Rust core builds its own eviction strategy from the policy name
+        # alone, so a config would be dropped rather than applied.
+        if params.eviction_policy_config:
+            raise ValueError(
+                "Rust TreeCore does not support --radix-eviction-policy-config"
+            )
 
         self._page_size = params.page_size
         self.is_eagle = (

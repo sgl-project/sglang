@@ -683,6 +683,10 @@ class TritonAttnBackend(AttentionBackend):
                     window_num_kv_splits=None,
                     window_kv_offsets=None,
                     swa_attn_logits=self.cuda_graph_swa_attn_logits,
+                    lean_Mp=self.cuda_graph_lean_Mp,
+                    lean_Lp=self.cuda_graph_lean_Lp,
+                    lean_Op=self.cuda_graph_lean_Op,
+                    lean_locks=self.cuda_graph_lean_locks,
                 )
                 return
 

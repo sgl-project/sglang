@@ -29,7 +29,7 @@ from sglang.srt.models.registry import ModelRegistry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 # The hooks the loader resolves on the entry class where a draft/target
 # disagreement is a defect rather than a difference. Weight-name maps

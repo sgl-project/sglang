@@ -29,7 +29,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @dataclasses.dataclass

@@ -15,7 +15,7 @@ from sglang.kernels import DeviceType, KernelBackend, PlatformInfo
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 
 GROUPS = K.ops.__all__
 
@@ -44,6 +44,7 @@ EXPECTED = {
     "diffusion.flux2_qkv_epilogue": {"KDA"},
     "diffusion.flux2_token_cat_fp8": {"KDA"},
     "gemm.qwen3x_nvfp4": {"KDA"},
+    "gemm.sm120_fp8_linear": {"KDA"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")

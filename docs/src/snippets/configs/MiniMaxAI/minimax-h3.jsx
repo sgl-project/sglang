@@ -24,10 +24,11 @@ const CONSUMER_24G = ["rtx4090", "rtx3090"];
 // their recipes are derived from the tier logic, not verified runs.
 const WORKSTATION_48G = ["rtx6000ada"];
 const WORKSTATION_96G = ["rtxpro6000"];
-// GB10 unified memory: 128 GB shared between CPU and GPU, so the VRAM/host
-// split that shapes every tier above does not exist. The whole 108 GB
-// deployment fits, and an offloaded component's "copy to device" is an
-// in-memory copy on the coherent bus. No hard-cap anchor was measured.
+// GB10 unified memory: 128 GB shared between CPU and GPU (121.7 GB visible
+// to torch), so the VRAM/host split that shapes every tier above does not
+// exist. The 134 GiB deployment still exceeds the pool, and the loader's
+// automatic placement handles that split better than any explicit flag set:
+// verified on DGX Spark, see unified128Flags().
 const UNIFIED_128G = ["dgx-spark"];
 const CONSUMER_SINGLE = [
   ...CONSUMER_12G,
@@ -73,14 +74,12 @@ function consumerFlags(s) {
 }
 
 function unified128Flags() {
-  // Unified memory holds the whole deployment: the memory manager pins every
-  // component (the budget sees ~128 GB), and streamed copies move at memory
-  // speed on the coherent bus. video_vae=36 still buys the fast decode.
-  return [
-    "--performance-mode memory",
-    "--layerwise-offload-components dit,text_encoder,vae",
-    "--layerwise-resident-layers video_vae=36",
-  ];
+  // No flags: the deployment (134 GiB) exceeds the pool, automatic offload
+  // engages on its own and pins 42 of 50 DiT layers. Measured on DGX Spark,
+  // the explicit discrete-GPU recipe (--performance-mode memory + offload
+  // components + video_vae=36) ran the same denoise 2.1x slower (25.8 vs
+  // 12.1 s/it) -- do not carry discrete-card flags onto unified memory.
+  return [];
 }
 
 function workstation96Flags() {
@@ -117,8 +116,10 @@ function consumerHints(s) {
   }
   if (UNIFIED_128G.includes(s.hw)) {
     return [
-      "derived recipe, not yet verified: the 128 GB unified pool holds the whole 108 GB deployment, so the memory manager pins every component and offload copies run at memory speed on the coherent bus",
-      "expect step times above the discrete-GPU rows: the GB10's ~273 GB/s memory bandwidth is the denoise ceiling, not the placement",
+      "verified on DGX Spark at 480P: ~12.1 s per denoise step steady-state, ~40 s decode, ~12 min per warm request -- with no flags at all; adding the discrete-GPU offload flags measured 2.1x slower on the same box",
+      "the text encoder runs ~5.5 min per request and does not warm up: it is steady-state compute on this chip, not a stall -- budget for it",
+      "expect ~12 min of server load before the first request; the first request itself runs at full speed (no JIT tax was measured)",
+      "step times sit above the discrete-GPU rows because the GB10's ~273 GB/s memory bandwidth is the denoise ceiling, not the placement",
     ];
   }
   if (WORKSTATION_96G.includes(s.hw)) {
@@ -427,10 +428,10 @@ return {
           id: "dp",
           label: "Data parallel",
           flags: ["--encoder-parallel dp"],
-          disabled: (s) => (s.topology_mode === "manual"
+          disabled: (s) => CONSUMER_SINGLE.includes(s.hw) || (s.topology_mode === "manual"
             ? Number(s.tp_size)
             : config.commandBuilder.resource.autoTopology(s).tp_size) > 1,
-          disableReason: "The server rejects encoder DP with TP > 1 (encoder_parallel=dp requires tp_size=1).",
+          disableReason: "Encoder DP requires TP1 and a multi-GPU DP group; TP > 1 and the single-card consumer recipes do not qualify.",
           soft: (s) => s.nodes > 1,
           softReason: "Runs across nodes, but the measured 1.9× encode speedup comes from a single-node 2× H100 run; cross-node encoder DP is unverified.",
           description: "Useful for a real request batch; it is not bitwise-identical to fold scheduling.",
@@ -713,7 +714,7 @@ return {
         automaticAttention = "AITER (auto)";
       } else if (topology.ring_degree === 1 && ["b200", "b300"].includes(s.hw)) {
         automaticAttention = "Dynamic cuDNN / FA (auto)";
-      } else if (topology.ring_degree === 1 && s.hw === "rtx5090") {
+      } else if (topology.ring_degree === 1 && ["rtx5090", "rtx4090"].includes(s.hw)) {
         automaticAttention = "Torch SDPA (auto)";
       }
 

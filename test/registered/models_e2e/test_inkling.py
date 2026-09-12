@@ -32,7 +32,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=450, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=274, stage="base-b", runner_config="1-gpu-large")
 
 # Defaults to the HF `test` revision; override MODEL/REVISION to point at a
 # local checkpoint. Empty REVISION drops the flag (for local paths).

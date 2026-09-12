@@ -55,6 +55,18 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
+def resolve_draft_extend_seq_len_fill_value(
+    attn_backend, captured_req_width: int
+) -> int:
+    """Pad synthetic history past the fixed draft-width subtraction and KPool offset."""
+    fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
+    full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    dsa_index_kpool = getattr(full_attn_backend, "dsa_index_kpool", 1)
+    if dsa_index_kpool > 1:
+        fill_value = max(fill_value, captured_req_width + dsa_index_kpool)
+    return fill_value
+
+
 @dataclass
 class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
@@ -142,8 +154,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
-        self.seq_len_fill_value = (
-            self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
+        self.seq_len_fill_value = resolve_draft_extend_seq_len_fill_value(
+            self.draft_extend_attn_backend, self.captured_req_width
         )
         self.extend_seq_lens_cpu = [self.captured_req_width] * self.max_bs
 
@@ -176,8 +188,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 if _hidden_size is not None
                 else None
             )
-            self.seq_len_fill_value = (
-                self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
+            self.seq_len_fill_value = resolve_draft_extend_seq_len_fill_value(
+                self.draft_extend_attn_backend, self.captured_req_width
             )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
@@ -243,7 +255,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk_capture = (
             torch.full(
-                (self.max_num_token, self.eagle_worker.dsa_index_topk),
+                (self.max_num_token, self.eagle_worker.dsa_seed_topk_width),
                 -1,
                 dtype=torch.int32,
                 device=model_runner.device,

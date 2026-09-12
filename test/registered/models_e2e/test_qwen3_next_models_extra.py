@@ -5,7 +5,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=250, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=348, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 

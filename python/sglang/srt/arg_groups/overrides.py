@@ -512,6 +512,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Lfm2ForCausalLM",
         "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
+        "Glm5NextForConditionalGeneration",
     }
 )
 
@@ -533,6 +534,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "BailingMoeV3ForCausalLM",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
@@ -609,7 +611,14 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
-    if get_platform().is_npu or get_platform().is_xpu:
+    if get_platform().is_npu:
+        return {}
+    if get_platform().is_xpu:
+        if view.kv_cache_dtype == "auto":
+            logger.warning(
+                "Setting KV cache dtype to bfloat16 for DeepSeek DSA on XPU."
+            )
+            return {"kv_cache_dtype": "bfloat16"}
         return {}
 
     import torch
@@ -687,8 +696,26 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
-    if get_platform().is_npu or get_platform().is_xpu:
+    if get_platform().is_npu:
         return {}
+    if get_platform().is_xpu:
+        declared: Dict[str, Any] = {}
+        if view.dsa_prefill_backend is None:
+            declared["dsa_prefill_backend"] = "intel_xpu"
+        if view.dsa_decode_backend is None:
+            declared["dsa_decode_backend"] = "intel_xpu"
+        # sgl-kernel topk ops (the default) are CUDA-only; fall back to the
+        # torch-native topk implementation on XPU, unless the user already
+        # picked a different backend explicitly (e.g. "flashinfer").
+        if view.dsa_topk_backend == "sgl-kernel":
+            declared["dsa_topk_backend"] = "torch"
+        logger.warning(
+            "Set DSA backends for XPU: prefill=%s, decode=%s, topk=%s.",
+            declared.get("dsa_prefill_backend", view.dsa_prefill_backend),
+            declared.get("dsa_decode_backend", view.dsa_decode_backend),
+            declared.get("dsa_topk_backend", view.dsa_topk_backend),
+        )
+        return declared
 
     import torch
 
@@ -792,6 +819,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",

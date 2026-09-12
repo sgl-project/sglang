@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
@@ -1520,6 +1520,7 @@ if _HAS_MLX:
             self.kv = ReqKvInfo()
             self.mamba_branching_seqlen = None
             self.inflight_middle_chunks = 0
+            self.mamba_branching_seqlen = None
 
     class FakeTpWorker:
         def __init__(self, next_token_ids):

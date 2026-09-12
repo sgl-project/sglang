@@ -182,6 +182,7 @@ class DeepseekModelNextN(nn.Module):
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
             alt_stream=self.alt_stream,
+            skip_rope=config.qk_rope_head_dim == 0,
             dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
             mla_enable_prefill_cp=self.mla_enable_prefill_cp,
         )
@@ -220,9 +221,28 @@ class DeepseekModelNextN(nn.Module):
             )
 
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
+                # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
+                # (far above vocab_size). Use target-produced mm_input_embeds for
+                # these positions and only call embed_tokens on the appended
+                # next-token to avoid embed OOB.
+                input_embeds = forward_batch.mm_input_embeds
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and forward_batch.contains_mm_inputs()
+                    and not forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    assert input_embeds is not None
+                    last_indices = (
+                        forward_batch.extend_start_loc
+                        + forward_batch.extend_seq_lens
+                        - 1
+                    ).long()
+                    input_embeds[last_indices] = self.embed_tokens(
+                        input_ids[last_indices]
+                    )
+                if input_embeds is None:
+                    input_embeds = self.embed_tokens(input_ids)
+            hidden_states = input_embeds
 
             if hidden_states.shape[0] > 0:
                 previous_hidden_states = forward_batch.spec_info.hidden_states
@@ -320,6 +340,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         },
     )
 
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
+        return cls.hf_to_sglang_mapper
+
     def _resolve_nextn_quant_config(self, config, quant_config):
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
@@ -327,7 +351,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 
         ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+        mapped_prefix = self.get_hf_to_sglang_mapper(config)._map_name(ckpt_prefix)
         if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
             return None
         return quant_config
