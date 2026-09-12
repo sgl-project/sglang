@@ -597,6 +597,47 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
+    def test_glm_text_prompt_reuses_rendered_token_ids(self):
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_config.model_type = "glm5_next"
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        processed = MessageProcessingResult(
+            "rendered prompt", [11, 22, 33], None, None, [], [], None
+        )
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(adapted.input_ids, [11, 22, 33])
+        self.assertIsNone(adapted.text)
+
+    def test_glm_prompt_reuse_keeps_multimodal_and_other_model_paths(self):
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_config.model_type = "glm5_next"
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        processed = MessageProcessingResult(
+            "rendered prompt", [11, 22, 33], None, None, [], [], None
+        )
+        cases = (
+            ("other model", "qwen3_vl", None, "rendered prompt"),
+            ("image input", "glm5_next", ["image"], "rendered prompt"),
+        )
+
+        for name, model_type, image_data, expected in cases:
+            with self.subTest(name=name):
+                self.tm.model_config.hf_config.model_type = model_type
+                processed.image_data = image_data
+                with patch.object(
+                    self.chat, "_process_messages", return_value=processed
+                ):
+                    adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+                self.assertEqual(adapted.text, expected)
+                self.assertIsNone(adapted.input_ids)
+
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
             model="x",
