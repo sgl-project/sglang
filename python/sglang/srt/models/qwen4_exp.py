@@ -1853,7 +1853,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                 )
 
+        # A self-reference in the helper would keep params_dict (and pre-repack
+        # Parameters) alive until cyclic GC runs.
+        ple_warned_downcast = False
+
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
+            nonlocal ple_warned_downcast
+
             if ".ngram_embedding.shard_" not in name:
                 return False
             import re
@@ -1900,8 +1906,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 emb.weight.dtype == torch.float8_e4m3fn
                 and loaded_weight.dtype != torch.float8_e4m3fn
             ):
-                if not getattr(load_qwen4_exp_ple_shard, "_warned_downcast", False):
-                    load_qwen4_exp_ple_shard._warned_downcast = True
+                if not ple_warned_downcast:
+                    ple_warned_downcast = True
                     logger.warning(
                         "PLE checkpoint shards are %s but the embedding storage "
                         "is fp8 (ple_embedding_dtype / fp8 quant config); "
