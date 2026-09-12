@@ -181,6 +181,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="image",
+            extras=["--warmup-num-frames 1"],
         ),
         COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
