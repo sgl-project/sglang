@@ -118,6 +118,7 @@ def run_evalscope(
     timeout=60000,
     stream=True,
     eval_type="openai_api",
+    ignore_errors=False,
 ):
 
     metrics_path = os.getenv("METRICS_DATA_FILE")
@@ -145,6 +146,8 @@ def run_evalscope(
         config_dict["dataset_args"] = dataset_args
     if dataset_dir:
         config_dict["dataset_dir"] = dataset_dir
+    if ignore_errors:
+        config_dict["ignore_errors"] = True
 
     cli_cmd = (
         f"evalscope eval --model {model} --api-url {api_url} "
@@ -158,6 +161,8 @@ def run_evalscope(
         cli_cmd += f" --dataset-args '{json.dumps(dataset_args, ensure_ascii=False)}'"
     if dataset_dir:
         cli_cmd += f" --dataset-dir {dataset_dir}"
+    if ignore_errors:
+        cli_cmd += " --ignore-errors"
     logger.info(f"Equivalent evalscope CLI command:\n{cli_cmd}")
 
     config_json = json.dumps(config_dict, ensure_ascii=False, indent=2)
@@ -324,6 +329,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     stream = True
     timeout = 60000
     eval_type = "openai_api"
+    ignore_errors = False
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
@@ -508,6 +514,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    ignore_errors=self.ignore_errors,
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -537,6 +544,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     stream = True
     timeout = 60000
     eval_type = "openai_api"
+    ignore_errors = False
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
@@ -613,6 +621,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    ignore_errors=self.ignore_errors,
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -642,6 +651,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     stream = True
     timeout = 60000
     eval_type = "openai_api"
+    ignore_errors = False
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     accuracy = 0.1
@@ -730,6 +740,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    ignore_errors=self.ignore_errors,
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
