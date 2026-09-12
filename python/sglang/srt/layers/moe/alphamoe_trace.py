@@ -15,7 +15,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from weakref import WeakKeyDictionary
 
-
 logger = logging.getLogger(__name__)
 _enabled = os.environ.get("SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES", "0") == "1"
 _active_submissions: ContextVar[dict | None] = ContextVar(

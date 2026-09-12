@@ -53,6 +53,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -1965,7 +1966,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     **kwargs,
                 )
             if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
-                from sglang.srt.layers.moe.alphamoe_trace import record_alphamoe_execution
+                from sglang.srt.layers.moe.alphamoe_trace import (
+                    record_alphamoe_execution,
+                )
 
                 record_alphamoe_execution(
                     forward_batch,

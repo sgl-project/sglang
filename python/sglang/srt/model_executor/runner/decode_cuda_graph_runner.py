@@ -1445,7 +1445,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
-                from sglang.srt.layers.moe.alphamoe_trace import record_alphamoe_execution
+                from sglang.srt.layers.moe.alphamoe_trace import (
+                    record_alphamoe_execution,
+                )
 
                 record_alphamoe_execution(
                     forward_batch,

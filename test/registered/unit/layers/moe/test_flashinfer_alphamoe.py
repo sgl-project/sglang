@@ -191,8 +191,9 @@ class TestFlashInferAlphaMoeContract(CustomTestCase):
             {"use_mxfp8": True, "is_fp4_expert": False},
             {"use_mxfp8": False, "is_fp4_expert": True},
         ):
-            with self.subTest(**flags), self.assertRaisesRegex(
-                ValueError, "NVFP4/ModelOpt"
+            with (
+                self.subTest(**flags),
+                self.assertRaisesRegex(ValueError, "NVFP4/ModelOpt"),
             ):
                 validate_alphamoe_w8a8_weights(
                     *tensors,

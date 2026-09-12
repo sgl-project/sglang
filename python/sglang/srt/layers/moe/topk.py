@@ -580,6 +580,7 @@ class TopK(BaseFusedOp):
             from flashinfer.fused_moe.alphamoe_fused_router import (
                 get_alphamoe_fused_router_module,
             )
+
             from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
                 AlphaMoeRoutePlanCache,
             )

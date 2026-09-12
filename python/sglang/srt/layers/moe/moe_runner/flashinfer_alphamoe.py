@@ -141,7 +141,7 @@ def validate_alphamoe_nvfp4_runner_contract(
         raise ValueError("flashinfer_alphamoe NVFP4 requires moe_tp_size=4")
     if ep_size != 1 or not a2a_is_none:
         raise ValueError(
-            "flashinfer_alphamoe NVFP4 requires ep_size=1 and " "moe_a2a_backend=none"
+            "flashinfer_alphamoe NVFP4 requires ep_size=1 and moe_a2a_backend=none"
         )
     if num_fused_shared_experts != 0:
         raise ValueError(
