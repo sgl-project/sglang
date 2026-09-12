@@ -140,15 +140,7 @@ impl ChatResponseProcessor {
         let raw = async_stream::stream! {
             let mut prompt_tokens = 0u32;
             let mut completion_tokens = 0u64;
-
-            for index in 0..count {
-                yield annotated_choices(vec![ChatChoiceStream {
-                    index: index as u32,
-                    delta: chat_delta(None, Some(Role::Assistant), None, None),
-                    finish_reason: None,
-                    logprobs: None,
-                }]);
-            }
+            let mut role_emitted = vec![false; count];
 
             futures::pin_mut!(input);
             while let Some(item) = input.next().await {
@@ -171,7 +163,7 @@ impl ChatResponseProcessor {
                 }
                 completion_tokens = completion_tokens.saturating_add(decoded.completion_tokens);
 
-                let Some(choice) = self.choices.get_mut(decoded.choice) else {
+                if decoded.choice >= count {
                     yield Annotated {
                         data: None,
                         id: None,
@@ -183,7 +175,19 @@ impl ChatResponseProcessor {
                         }).ok(),
                     };
                     continue;
-                };
+                }
+
+                if !role_emitted[decoded.choice] {
+                    role_emitted[decoded.choice] = true;
+                    yield annotated_choices(vec![ChatChoiceStream {
+                        index: decoded.choice as u32,
+                        delta: chat_delta(None, Some(Role::Assistant), None, None),
+                        finish_reason: None,
+                        logprobs: None,
+                    }]);
+                }
+
+                let choice = &mut self.choices[decoded.choice];
                 let index = decoded.choice as u32;
                 let (reasoning_text, normal_text) =
                     choice.reasoning.split(&decoded.text, &decoded.token_ids);
@@ -587,6 +591,11 @@ mod tests {
             _ => None,
         });
         assert_eq!(deltas.collect::<Vec<_>>(), vec![(0, "A"), (1, "B")]);
+        let roles = events.iter().filter_map(|event| match event {
+            Ok(ChatEvent::Role { choice }) => Some(*choice),
+            _ => None,
+        });
+        assert_eq!(roles.collect::<Vec<_>>(), vec![0, 1]);
     }
 
     #[test]

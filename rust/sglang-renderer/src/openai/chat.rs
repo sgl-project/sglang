@@ -587,7 +587,7 @@ mod tests {
         ChatPreprocessor, GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits,
         ResponseError, SamplingDefaults, TokenLogprob,
     };
-    use futures::StreamExt;
+    use futures::{FutureExt, StreamExt};
 
     fn request() -> ChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -861,6 +861,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_chat_waits_for_backend_output_before_role() {
+        let (choice, tx) = chat_submitted(0);
+        let stream = chat_event_stream(
+            vec![choice],
+            response_processor(None, 1),
+            wire_context(false),
+        );
+        futures::pin_mut!(stream);
+
+        assert!(stream.next().now_or_never().is_none());
+
+        tx.send(chunk("Paris", false)).await.unwrap();
+        let role = serde_json::to_value(stream.next().await.unwrap().unwrap()).unwrap();
+        let delta = serde_json::to_value(stream.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(delta["choices"][0]["delta"]["content"], "Paris");
+    }
+
+    #[tokio::test]
     async fn streaming_chat_stops_all_choices_after_error() {
         let (choice0, tx0) = chat_submitted(0);
         let (choice1, tx1) = chat_submitted(1);
@@ -871,9 +890,6 @@ mod tests {
         );
         futures::pin_mut!(stream);
 
-        // Chat streams announce every choice before polling engine output.
-        stream.next().await.unwrap().unwrap();
-        stream.next().await.unwrap().unwrap();
         tx0.send(Err(ResponseError {
             kind: crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(429)),
             message: "out of memory".into(),
