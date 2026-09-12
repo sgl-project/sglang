@@ -50,8 +50,8 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.precision import set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
