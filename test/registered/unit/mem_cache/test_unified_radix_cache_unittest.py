@@ -1558,6 +1558,28 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", all_ids[:aligned_len])))
         )
         self.assertEqual(len(m.device_indices), aligned_len)
+
+        prompt_aligned_len = (len(input_ids) // ps) * ps
+        if self.cfg.components == (ComponentType.FULL,):
+            (prompt_node,) = _node_children(cache, cache.root_node_handle())
+            (output_node,) = _node_children(cache, prompt_node)
+            self.assertEqual(_node_key_length(cache, prompt_node), prompt_aligned_len)
+            self.assertEqual(
+                _node_key_length(cache, output_node),
+                aligned_len - prompt_aligned_len,
+            )
+
+            result = cache.evict(
+                EvictParams(num_tokens=aligned_len - prompt_aligned_len)
+            )
+            self.assertEqual(
+                result.num_tokens_evicted,
+                aligned_len - prompt_aligned_len,
+            )
+            prompt_only = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", all_ids[:aligned_len])))
+            )
+            self.assertEqual(len(prompt_only.device_indices), prompt_aligned_len)
         cache.sanity_check()
 
     def test_cache_finished_req_strips_thinking(self):
@@ -6281,7 +6303,8 @@ class UnifiedRadixCacheSuite:
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
                 req=req,
-                mem_quota=-1_000_000,
+                # Pinning the resident ancestors leaves too little for the tail.
+                mem_quota=len(tokens) - 1,
             )
         )
 
@@ -8117,6 +8140,7 @@ class _InsertWalkSuite(CustomTestCase):
 
     _rid = 0
     _make_req = UnifiedRadixCacheSuite._make_req
+    _apply_match_to_req = UnifiedRadixCacheSuite._apply_match_to_req
     _alloc = UnifiedRadixCacheSuite._alloc
     _insert = UnifiedRadixCacheSuite._insert
     _init_hicache = UnifiedRadixCacheSuite._init_hicache

@@ -45,7 +45,7 @@ SGL_TEST_FILES_CI_DATA_REVISION = "4ce5eeb9606e378478b2d0964d83e960af4e88cf"
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "7df858ead07940ff4d9489230fa9f040dd186789"
+    SGL_TEST_FILES_CI_DATA_REVISION = "cbeaa640573a4bb08dc1c41af92221bfae51b7f6"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"

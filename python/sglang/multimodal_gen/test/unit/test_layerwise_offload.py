@@ -2266,3 +2266,40 @@ def test_mixed_scm_and_dbcache_step_schedule(monkeypatch, step_kinds):
             on_gpu = idx in manager._gpu_layers
             assert _layer_weight_ok(model.blocks[idx]) is on_gpu, (kind, idx)
         manager.prepare_for_next_req(non_blocking=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_large_pinned_stores_are_registered_in_place_at_exact_size(monkeypatch):
+    pooled = []
+    empty = torch.empty
+
+    def record_pool_use(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pooled.append(kwargs)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_pool_use)
+    nbytes = layerwise_offload_mod._REGISTER_MIN_BYTES + 4096
+    tensor = layerwise_offload_mod._pinned_empty(nbytes, dtype=torch.uint8)
+    # locked where it was allocated: pinned, no pool block, no rounding
+    assert tensor.is_pinned()
+    assert tensor.untyped_storage().nbytes() == nbytes
+    assert pooled == []
+    del tensor
+    gc.collect()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_small_pinned_stores_keep_using_the_pool(monkeypatch):
+    pooled = []
+    empty = torch.empty
+
+    def record_pool_use(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pooled.append(kwargs)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_pool_use)
+    tensor = layerwise_offload_mod._pinned_empty(1024, dtype=torch.float32)
+    assert tensor.is_pinned()
+    assert len(pooled) == 1

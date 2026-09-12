@@ -6,7 +6,6 @@ ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG SGL_KERNEL_VERSION=0.4.6.post1
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.7
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG SGL_NCCL_VERSION=2.30.7
@@ -185,25 +184,11 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
-        12.6.3) CUINDEX=126 ;; \
-        12.9.2) CUINDEX=129 ;; \
-        13.0.3) CUINDEX=130 ;; \
+        13.0.3) ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.6.3" ]; then \
-        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
-    ; \
-    elif [ "$CUDA_VERSION" = "12.9.2" ]; then \
-        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
-    ; \
-    elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
-        # --no-deps prevents pip from pulling torch from default PyPI
-        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
-    ; \
-    else \
-        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-    ; \
-    fi
+    # --no-deps prevents pip from pulling torch from default PyPI
+    && python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps
 
 # Copy dep spec + Rust crate source + proto files. setuptools-rust compiles the
 # Rust extension during the stub wheel build; the crate's build.rs references
@@ -214,15 +199,11 @@ COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
 COPY proto                 /tmp/sglang_deps/proto
 
-# Install sglang dependencies (torch, transformers, etc.). CUDA 12 DeepEP
-# wheels live only on the SGLang index, so preinstall the local-version wheel;
-# it satisfies the public-version pyproject pin during the full dependency solve.
+# Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
-        12.6.3) CUINDEX=126 ;; \
-        12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
@@ -232,27 +213,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
-    && SGL_DEEP_EP_VERSION="$(sed -n 's/^[[:space:]]*"sgl-deep-ep==\([^"]*\)",/\1/p' pyproject.toml)" \
-    && test -n "${SGL_DEEP_EP_VERSION}" \
-    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-           python3 -m pip install \
-               "sgl-deep-ep==${SGL_DEEP_EP_VERSION}+cu129" \
-               --index-url "https://docs.sglang.ai/whl/cu129/" \
-               --no-deps; \
-       fi \
-    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
-           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
-           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
-       fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
-    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-           pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
-               | xargs -r python3 -m pip uninstall -y && \
-           python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --force-reinstall; \
-           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
-       fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
@@ -315,8 +276,6 @@ ARG FLASHINFER_VERSION
 # Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
-        12.6.3) CUINDEX=126 ;; \
-        12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
@@ -503,21 +462,12 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 
 # Install Mooncake
 RUN --mount=type=cache,target=/root/.cache/pip \
-    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
-    if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
-    else \
-        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
-    fi
+    python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
     && case "${CUDA_VERSION}" in \
-           12.*) \
-               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
-               python3 -m pip install "/tmp/mscclpp[cuda12]"; \
-               ;; \
            13.*) \
                CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
                python3 -m pip install "/tmp/mscclpp[cuda13]"; \
@@ -553,22 +503,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # resolving dependencies and generating constraints.txt. DeepEP needs 2.30.7
 # at runtime; apply the override only after the constrained dependency solve.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        python3 -m pip install --force-reinstall --no-deps \
-            "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"; \
-    fi
+    python3 -m pip install --force-reinstall --no-deps \
+        "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"
 
-# Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
-# the `nixl` import path) but unconditionally requires nixl-cu12, so we install
-# it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
-# to avoid shipping wrong-CUDA libs on cu13 images.
-RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nixl nixl-cu12 --no-deps ; \
-    python3 -m pip install "cuda-python>=12,<13" ; \
-elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nixl nixl-cu13 --no-deps ; \
-    python3 -m pip install "cuda-python>=13,<14" ; \
-fi
+# The `nixl` stub package is needed (it owns the `nixl` import path) but
+# unconditionally requires nixl-cu12, so install it with --no-deps and pair it
+# with the nixl-cu13 binary to avoid shipping wrong-CUDA libs.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install nixl nixl-cu13 --no-deps \
+    && python3 -m pip install "cuda-python>=13,<14"
 
 # Install the latest available AI Dynamo prerelease from NVIDIA's package index.
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -638,11 +581,6 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
-    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
-           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
-           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
-       fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; \
@@ -659,8 +597,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                  echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
              done; \
              # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
-             # combo (e.g. cu129 publishes no torch>=2.10 cubin), fall back to \
-             # runtime JIT instead of failing the build, mirroring the aarch64 branch. \
+             # combo, fall back to runtime JIT instead of failing the build, \
+             # mirroring the aarch64 branch. \
              if [ "$success" != "1" ]; then \
                  echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
                  success=1; \

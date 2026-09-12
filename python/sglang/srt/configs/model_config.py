@@ -204,6 +204,15 @@ def is_qwen3_5(config) -> bool:
     )
 
 
+def is_qwen3_5_mtp_draft(config) -> bool:
+    """The Qwen3.5 MoE MTP draft: _config_draft_model rewrites architectures[0] to
+    Qwen3_5ForCausalLMMTP before quantization is resolved."""
+    return (
+        _hf_arch(config) == "Qwen3_5ForCausalLMMTP"
+        and _hf_attr(config, "model_type") == "qwen3_5_moe"
+    )
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
@@ -500,6 +509,15 @@ class ModelConfig:
         self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+
+        # MiMo-V2 mxfp4 ckpts declare the routed-expert layout via store_dtype.
+        if (
+            not self.is_fp4_experts
+            and _hf_arch(self.hf_config) in MIMO_V2_MODEL_ARCHS
+            and str(quantization_config.get("store_dtype") or "").lower() == "mxfp4"
+        ):
+            self.is_fp4_experts = True
+            logger.info("Detected MiMo-V2 mxfp4 routed-expert layout.")
 
         # DSV4 mxfp4 layout applies only when the ckpt does not opt in above.
         if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
@@ -890,6 +908,14 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "NemotronH_Omni_Reasoning_V3"
+        ):
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["NemotronHForCausalLMMTP"]
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] in [
@@ -1772,9 +1798,16 @@ class ModelConfig:
                         f"Using CLI-specified quantization ({self.quantization}) which is "
                         f"compatible with HF config quant_method ({quant_method})."
                     )
-                elif self.is_draft_model:
+                elif self.is_draft_model and not (
+                    self.is_draft_quantization_explicit
+                    and self.quantization in REQUANTIZATION_METHODS
+                    and is_hip()
+                    and is_qwen3_5_mtp_draft(self.hf_config)
+                ):
                     # Allow auto-detection of quantization from checkpoint for draft model
-                    # only if the CLI quantization is not compatible
+                    # only if the CLI quantization is not compatible. An explicit
+                    # online-requantization request for the draft (e.g. quark_mxfp4
+                    # for an MTP stack the checkpoint left in bf16) is honored below.
                     logger.info(
                         f"Draft model quantization ({quant_method}) differs from "
                         f"main model quantization ({self.quantization}). "
@@ -2070,6 +2103,7 @@ multimodal_model_archs = [
     "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
     "MuseGlimmerForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",

@@ -14,7 +14,6 @@ on:
         default: 'all'
         options:
           - 'all'
-          - 'cu129'
           - 'cu130'
       branch:
         description: "DeepGEMM branch to build from (default: dev)"
@@ -33,92 +32,6 @@ env:
   TORCH_VER: "2.13.0"
 
 jobs:
-  build-cu129-matrix:
-    if: |
-      github.repository == 'sgl-project/sglang' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'cu129')
-    strategy:
-      matrix:
-        python-version: ["3.12"]
-        cuda-version: ["12.9"]
-        arch: [x86_64, aarch64]
-        include:
-          - arch: x86_64
-            runner: x64-kernel-build-node
-          - arch: aarch64
-            runner: arm-kernel-build-node
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - name: Clean workspace (remove root-owned files from prior runs)
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
-            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
-
-      - uses: actions/checkout@v4
-
-      - name: Checkout DeepGEMM
-        uses: actions/checkout@v4
-        with:
-          repository: sgl-project/DeepGEMM
-          ref: ${{ inputs.branch || 'dev' }}
-          path: DeepGEMM
-          submodules: recursive
-
-      - name: Set wheel version
-        run: |
-          echo -n "${{ inputs.version }}" > DeepGEMM/sgl_deep_gemm/VERSION
-          cat DeepGEMM/sgl_deep_gemm/VERSION
-
-      - name: Build wheel
-        run: |
-          chmod +x ./scripts/build_sgl_deep_gemm.sh ./scripts/rename_sgl_deep_gemm_whl.sh
-          ./scripts/build_sgl_deep_gemm.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: deepgemm-wheel-cuda${{ matrix.cuda-version }}-${{ matrix.arch }}
-          path: DeepGEMM/dist/*.whl
-
-  release-cu129:
-    needs: build-cu129-matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist/
-          merge-multiple: true
-          pattern: deepgemm-wheel-cuda12.9-*
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ inputs.version }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_deepgemm_whl_index.py --cuda 129
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update sgl-deep-gemm whl index for v${{ inputs.version }}"
-          git push
-
   build-cu130-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
@@ -187,18 +100,21 @@ jobs:
           - arch_label: sm90
             runner: 8-gpu-h200
             wheel_arch: x86_64
+            timeout: 240
           - arch_label: sm100
             runner: 8-gpu-b200
             wheel_arch: x86_64
+            timeout: 240
           # The sm120 tests require a runner with RTX 6000. It causes OOM on 5090 runners.
           # - arch_label: sm120
           #   runner: 1-gpu-5090
           #   wheel_arch: x86_64
-          # - arch_label: sm100-aarch64
-          #   runner: 4-gpu-gb300
-          #   wheel_arch: aarch64
+          - arch_label: sm100-aarch64
+            runner: 4-gpu-gb300
+            wheel_arch: aarch64
+            timeout: 240
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - uses: actions/checkout@v4
 
@@ -228,6 +144,36 @@ jobs:
           python3 -m pip install numpy
           python3 -m pip install dist/*.whl
           python3 -c "import deep_gemm; print('deep_gemm:', deep_gemm.__file__)"
+
+      - name: Install Compute Sanitizer 2025.4.1
+        env:
+          WHEEL_ARCH: ${{ matrix.wheel_arch }}
+        run: |
+          set -euo pipefail
+          # CUDA 13.1.1's standalone sanitizer fixes Python tensor retention in
+          # host backtraces. Keep the wheel and runtime on CUDA 13.0.
+          case "${WHEEL_ARCH}" in
+            x86_64)
+              sanitizer_arch=linux-x86_64
+              sanitizer_sha256=b9637777a31cd0f0ffe1e965523e8b0d382019b8496855fd688c886988583cf4
+              ;;
+            aarch64)
+              sanitizer_arch=linux-sbsa
+              sanitizer_sha256=1dc68ccb146032bcdc9d932569c865d68e3966ecf136940ca38fd7d5abfda4ac
+              ;;
+            *) echo "Unsupported sanitizer architecture: ${WHEEL_ARCH}" >&2; exit 1 ;;
+          esac
+          archive="cuda_sanitizer_api-${sanitizer_arch}-13.1.118-archive"
+          install_dir="${RUNNER_TEMP}/deepgemm-compute-sanitizer"
+          mkdir -p "${install_dir}"
+          curl -fsSL --retry 3 \
+            "https://developer.download.nvidia.com/compute/cuda/redist/cuda_sanitizer_api/${sanitizer_arch}/${archive}.tar.xz" \
+            -o "${install_dir}/${archive}.tar.xz"
+          echo "${sanitizer_sha256}  ${install_dir}/${archive}.tar.xz" | sha256sum -c -
+          tar -xJf "${install_dir}/${archive}.tar.xz" -C "${install_dir}"
+          sanitizer="${install_dir}/${archive}/bin/compute-sanitizer"
+          "${sanitizer}" --version
+          echo "COMPUTE_SANITIZER=${sanitizer}" >> "${GITHUB_ENV}"
 
       - name: Run DeepGEMM test suite
         run: |
