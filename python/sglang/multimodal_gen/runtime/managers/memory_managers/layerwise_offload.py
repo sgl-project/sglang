@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
+    page_cache_cannot_hold,
     pin_benefit_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
@@ -630,6 +631,36 @@ class _DirectReader:
         self._fds.clear()
 
 
+_LSB = bytes(b & 1 for b in range(256))
+
+
+def _resident_fraction(data_ptr: int, nbytes: int, *, samples: int = 8) -> float:
+    """Share of a mapping's pages the page cache holds, sampled in 4 MiB windows.
+
+    -1.0 when it cannot be asked (no libc, mincore failed).
+    """
+    if _libc is None or nbytes <= 0:
+        return -1.0
+    page = mmap.PAGESIZE
+    window = 4 << 20
+    start = data_ptr & ~(page - 1)
+    total = data_ptr + nbytes - start
+    # mincore wants a page-aligned address: step in whole pages
+    step = max(total // samples, window) & ~(page - 1)
+    resident = checked = 0
+    offset = 0
+    while offset < total:
+        length = min(window, total - offset)
+        pages = (length + page - 1) // page
+        vec = (ctypes.c_ubyte * pages)()
+        if _libc.mincore(ctypes.c_void_p(start + offset), ctypes.c_size_t(length), vec):
+            return -1.0
+        resident += bytes(vec).translate(_LSB).count(1)
+        checked += pages
+        offset += step
+    return resident / checked if checked else -1.0
+
+
 def _aligned_span(file_offset: int, nbytes: int) -> tuple[int, int]:
     """(aligned start, span) covering [file_offset, file_offset + nbytes) at 4 KiB granularity."""
     start = file_offset & ~(_DIRECT_ALIGN - 1)
@@ -743,11 +774,15 @@ class MappedLayerCourier:
         await_populated: Optional[Callable[[int], bool]] = None,
         direct_copy: bool = False,
         direct_read: bool = False,
+        direct_read_always: bool = False,
     ) -> None:
         self._mapped_cpu_weights = mapped_cpu_weights
         # Read each layer's bytes from the checkpoint file with O_DIRECT into the
         # pinned slot instead of copying them out of the page cache.
         self.direct_read = bool(direct_read) and hasattr(os, "O_DIRECT")
+        # On a shared pool every read goes to the drive anyway; elsewhere a
+        # layer the page cache already holds is a memcpy, not a re-read.
+        self._direct_read_always = bool(direct_read_always)
         self._reader: Optional[_DirectReader] = (
             _DirectReader() if self.direct_read else None
         )
@@ -766,6 +801,9 @@ class MappedLayerCourier:
             "h2d_issue_s": 0.0,
             "direct_read_s": 0.0,
             "direct_read_bytes": 0,
+            "cached_layers": 0,
+            "probes": 0,
+            "probe_fraction_sum": 0.0,
         }
         # Blocks until a populator thread has faulted the layer in; True if one
         # did, so the courier does not fault the same range a second time.
@@ -927,6 +965,16 @@ class MappedLayerCourier:
                     located = (
                         self._reader.locate(cpu_tensor) if self.direct_read else None
                     )
+                    if located is not None and not self._direct_read_always:
+                        # a layer the cache holds -- or one we cannot ask about --
+                        # keeps the memcpy path; only pages known to be cold go
+                        # to the drive
+                        fraction = _resident_fraction(cpu_tensor.data_ptr(), nbytes)
+                        stats["probes"] += 1
+                        stats["probe_fraction_sum"] += max(fraction, 0.0)
+                        if fraction < 0 or fraction >= 0.5:
+                            located = None
+                            stats["cached_layers"] += 1
                     if located is not None:
                         path, file_offset, _ = located
                         aligned_start, span = _aligned_span(file_offset, nbytes)
@@ -1735,6 +1783,40 @@ class LayerwiseOffloadManager:
                 continue
             populator.submit(ahead, self._mapped_cpu_weights.get(ahead, {}).values())
 
+    def _log_direct_read_summary(self) -> None:
+        """One line per pass that went to the drive: how much, and what the probe saw."""
+        courier = self._mapped_courier
+        if courier is None:
+            return
+        stats = courier.stats
+        seen = getattr(
+            self,
+            "_direct_read_seen",
+            {"bytes": 0, "cached": 0, "probes": 0, "fraction_sum": 0.0},
+        )
+        direct_bytes = stats["direct_read_bytes"] - seen["bytes"]
+        cached = stats["cached_layers"] - seen["cached"]
+        probes = stats["probes"] - seen["probes"]
+        fraction_sum = stats["probe_fraction_sum"] - seen["fraction_sum"]
+        self._direct_read_seen = {
+            "bytes": stats["direct_read_bytes"],
+            "cached": stats["cached_layers"],
+            "probes": stats["probes"],
+            "fraction_sum": stats["probe_fraction_sum"],
+        }
+        if direct_bytes <= 0:
+            return
+        logger.info(
+            "Layerwise offload: %s read %.1f GiB straight from the drive this pass "
+            "(%d tensors served from the page cache; mean sampled residency %.2f "
+            "over %d probes).",
+            self.layers_attr_str,
+            direct_bytes / 1024**3,
+            cached,
+            fraction_sum / probes if probes else -1.0,
+            probes,
+        )
+
     def _log_debug_timing(self) -> None:
         """Debug: where this stage's layer traffic spent its time."""
         if not envs.SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING:
@@ -1855,13 +1937,16 @@ class LayerwiseOffloadManager:
         # this layer's transfer with the previous layer's compute. Blocking
         # callers keep the direct path: they need the weights now.
         ship_mapped = False
-        if non_blocking and self._mapped_cpu_weights.get(layer_idx):
+        if self._mapped_cpu_weights.get(layer_idx) and (
+            non_blocking or self._blocking_load_via_courier()
+        ):
             courier = self._ensure_mapped_courier()
             if courier is not None and courier.submit(layer_idx):
                 self._courier_inflight.add(layer_idx)
                 ship_mapped = True
                 if (
-                    not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED
+                    non_blocking
+                    and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED
                     and not courier.direct_read
                 ):
                     # Schedule the disk read for this layer's pages now, in
@@ -1950,12 +2035,29 @@ class LayerwiseOffloadManager:
 
         if not ship_mapped:
             self._gpu_layers.add(layer_idx)
+        elif not non_blocking:
+            self._collect_mapped_layer(layer_idx)
+
+    def _blocking_load_via_courier(self) -> bool:
+        """Whether a blocking load should still go through the courier.
+
+        A caller that needs the layer now (arming a resident set, the
+        materialization of a permanent placement) otherwise faults the
+        mapping in on this thread; when the courier reads directly, cold
+        pages arrive at the drive's rate instead (measured 4.7 s vs 12 s for
+        the same 47 GiB on one NVMe).
+        """
+        courier = self._ensure_mapped_courier()
+        return courier is not None and courier.direct_read
 
     def _ensure_mapped_courier(self) -> Optional[MappedLayerCourier]:
         """The courier, built on first use; None where it cannot help."""
         if self._mapped_courier is not None:
             return self._mapped_courier
         if envs.SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER:
+            return None
+        if getattr(self, "_courier_retired", False):
+            # a courier that failed stays retired: its layers keep the synchronous copy
             return None
         if self.copy_stream is None or self._synchronous_mps:
             return None
@@ -1972,11 +2074,25 @@ class LayerwiseOffloadManager:
                 # page) and the process's anonymous memory grew past 100 GiB;
                 # the pinned slots stay even on a shared pool.
                 direct_copy=False,
+                # A host that cannot cache the mapping re-reads it from the
+                # drive every pass anyway, through 4 KiB faults at the mercy
+                # of readahead; O_DIRECT into the slots reads at the drive's
+                # sequential rate (9.4 vs ~1.1 GiB/s on a GB10 NVMe).
                 direct_read=(
-                    host_copies_are_redundant()
+                    (
+                        host_copies_are_redundant()
+                        or page_cache_cannot_hold(self._mapped_bytes)
+                    )
                     and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ
-                    and self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
+                    # the size floor guards components re-streamed many times
+                    # per request; one armed once (every layer resident) has
+                    # no such pass to protect
+                    and (
+                        self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
+                        or not self._streamed_order
+                    )
                 ),
+                direct_read_always=host_copies_are_redundant(),
                 cold_source=self._mapped_source_is_cold,
                 populate_source=self._mapped_source_may_be_cold,
                 await_populated=self._await_mapped_populated,
@@ -1995,6 +2111,7 @@ class LayerwiseOffloadManager:
                 exc,
             )
             self._mapped_courier = None
+            self._courier_retired = True
             self._mapped_bytes = self._mapped_bytes  # unchanged; direct path
         return self._mapped_courier
 
@@ -2014,6 +2131,7 @@ class LayerwiseOffloadManager:
                 exc,
             )
             self._mapped_courier = None
+            self._courier_retired = True
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
@@ -2073,6 +2191,7 @@ class LayerwiseOffloadManager:
     def release_all(self) -> None:
         """Release every layer, including the resident ones: this ends the
         denoise stage that the resident set is scoped to."""
+        self._log_direct_read_summary()
         self._log_debug_timing()
         if self._mapped_populator is not None:
             self._mapped_populator.reset()
