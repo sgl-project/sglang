@@ -170,6 +170,9 @@ class LMCRadixCache(RadixCache):
         self._node_lock = threading.Lock()
         self._mp_load_back_markers: dict[str, _LMCacheLoadBackMarker] = {}
 
+    def _mp_supports_cache_salt(self) -> bool:
+        return getattr(self.lmcache_connector, "supports_cache_salt", False) is True
+
     def reset(self):
         super().reset()
         if hasattr(self, "_in_flight_nodes"):
@@ -220,7 +223,20 @@ class LMCRadixCache(RadixCache):
         the held read locks and returns the radix-only result.
         """
         token_ids = key.raw_token_ids()
-        matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
+        supports_cache_salt = self._mp_supports_cache_salt()
+        if key.cache_salt and not supports_cache_salt:
+            logger.warning(
+                "Skipping LMCache MP lookup for a salted request because "
+                "the installed connector does not support cache-salt "
+                "namespacing. Upgrade LMCache to enable external storage."
+            )
+            return base_res
+        if supports_cache_salt:
+            matched = self.lmcache_connector.lookup_kv(
+                token_ids, req.rid, cache_salt=key.cache_salt or ""
+            )
+        else:
+            matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
         if matched <= value.numel():
             # Release the read locks; keep the pending session for end_session.
             self.lmcache_connector.release_pending(req.rid)
@@ -452,6 +468,19 @@ class LMCRadixCache(RadixCache):
                 self.lmcache_connector.end_session(req.rid)
             return
 
+        supports_cache_salt = False
+        if self._mode is LMCacheMode.MP:
+            supports_cache_salt = self._mp_supports_cache_salt()
+            if req.cache_salt and not supports_cache_salt:
+                logger.warning(
+                    "Skipping LMCache MP store for a salted request because "
+                    "the installed connector does not support cache-salt "
+                    "namespacing. Upgrade LMCache to enable external storage."
+                )
+                self._mp_load_back_markers.pop(req.rid, None)
+                self.lmcache_connector.end_session(req.rid)
+                return
+
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
@@ -480,20 +509,25 @@ class LMCRadixCache(RadixCache):
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)
-        store_md = StoreMetadata(
+        store_metadata_kwargs = dict(
             last_node=new_last_node,
             token_ids=token_ids,
             kv_indices=kv_indices,
             offset=0,
             request_id=req.rid,
         )
+        if self._mode is LMCacheMode.MP and supports_cache_salt:
+            store_metadata_kwargs["cache_salt"] = req.cache_salt or ""
         if self._mode is LMCacheMode.MP:
-            self.lmcache_connector.store_kv(store_md)
-            # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
-            self._mp_load_back_markers.pop(req.rid, None)
-            self.dec_lock_ref(new_last_node)
-            self.lmcache_connector.end_session(req.rid)
+            try:
+                self.lmcache_connector.store_kv(StoreMetadata(**store_metadata_kwargs))
+                # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
+            finally:
+                self._mp_load_back_markers.pop(req.rid, None)
+                self.dec_lock_ref(new_last_node)
+                self.lmcache_connector.end_session(req.rid)
         elif self._mode is LMCacheMode.IP:
+            store_md = StoreMetadata(**store_metadata_kwargs)
             with device_stream_context(self.store_stream):
                 self.lmcache_connector.store_kv(store_md)
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().

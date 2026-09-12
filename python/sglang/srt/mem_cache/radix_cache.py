@@ -74,9 +74,9 @@ class RadixKey:
         # Extra key for caller-defined cache classification.
         self.extra_key = extra_key
         # Cache salt is kept distinct so it cannot collide with extra_key.
-        # It namespaces the in-process radix tree and external KV events;
-        # external L3/remote storage keys remain token-only and are outside
-        # this contract.
+        # It namespaces the in-process radix tree and external KV events.
+        # External storage namespacing is connector-specific; LMCache MP
+        # propagates it only when the connector advertises cache-salt support.
         self.cache_salt = cache_salt or None
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
