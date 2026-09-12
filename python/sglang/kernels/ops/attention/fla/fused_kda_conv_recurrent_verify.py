@@ -14,17 +14,14 @@ Scope (v1): chain speculation only (``speculative_eagle_topk == 1``, i.e.
 ``retrieve_next_token is None``). The tree path keeps the unfused reference
 kernels. Requires ``T >= kernel_width - 1``.
 
-State: conv_state and the SSM state are read-only here. Verify is speculative,
-and the commit scatter advances conv_state from the selected intermediate
-window, so writing it back is both redundant and unsafe -- all V tiles read
-the same Q/K conv history, so a tile in a later wave would read the rolled
-values.
+State: conv_state and the SSM state are read-only. Verify is speculative, and
+the commit scatter advances them from the selected intermediate window.
 
-Numerics: deliberately bit-aligned with the unfused pair. The conv output is
-rounded to the activation dtype (bf16) before entering the recurrence —
-exactly what the unfused path does through its intermediate tensor — and all
-expressions mirror the reference kernels line by line, with the same
-num_warps so reduction order matches.
+Numerics: aligned with the unfused pair. The conv output is rounded to the
+activation dtype (bf16) before entering the recurrence — exactly what the
+unfused path does through its intermediate tensor — and all expressions mirror
+the reference kernels line by line. Reduction order still splits differently
+where many V heads share one Q/K head, worth ~1 ulp on the output.
 """
 
 from typing import Optional
@@ -323,8 +320,7 @@ def fused_kda_conv_gating_verify_kernel(
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
     # No conv-state writeback: every V tile reads the same Q/K history, so a
-    # tile scheduled in a later wave would read what i_v == 0 had overwritten.
-    # The commit scatter advances conv_state from the selected window instead.
+    # tile in a later wave would read what i_v == 0 had overwritten.
 
 
 def fused_kda_conv_gating_verify(
@@ -352,14 +348,11 @@ def fused_kda_conv_gating_verify(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    # num_warps=4 is ~1.3x faster than the unfused pair in-graph. Output and
-    # conv-window cache stay bit-identical to the reference; conv_state is not
-    # comparable, since the reference advances it and verify leaves it alone.
-    # The fp32 intermediate-ssm rollback cache differs by a tl.sum
-    # reduction-order delta (~1 ulp/step) compounding through the recurrence --
-    # ~6e-8 at T=4 standard gate (the production MTP shape), ~2e-3 at T=8 safe
-    # gate. num_warps=1 restores the reference reduction order for those same
-    # buffers but is ~2.4x slower in-graph -- numerics debugging only.
+    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; 1 restores the
+    # reference reduction order but is ~2.4x slower, for numerics debugging only.
+    # The fp32 intermediate-ssm rollback cache carries the reduction-order delta
+    # furthest: ~6e-8 at T=4 standard gate (the production MTP shape), ~2e-3 at
+    # T=8 safe gate. conv_state is not comparable to the reference at all.
     num_warps: int = 4,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
