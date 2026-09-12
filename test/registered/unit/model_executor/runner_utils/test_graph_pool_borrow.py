@@ -76,6 +76,25 @@ class TestGraphPoolBorrow(CustomTestCase):
             self.assertEqual(pool.graph_pool_borrow_largest_run(), 0)
             self.assertEqual(snapshot.call_count, 3)
 
+    def test_borrow_capacity_includes_rounding_and_small_pool_reserve(self):
+        for payload, largest_run, expected in (
+            (-1, 64 << 20, False),
+            (0, 64 << 20, False),
+            (1, 0, False),
+            (1, 32 << 20, False),
+            (1, 34 << 20, True),
+            (2 << 20, 34 << 20, True),
+            ((2 << 20) + 1, 34 << 20, False),
+            ((2 << 20) + 1, 36 << 20, True),
+        ):
+            with (
+                self.subTest(payload=payload, largest_run=largest_run),
+                patch.object(
+                    pool, "graph_pool_borrow_largest_run", return_value=largest_run
+                ),
+            ):
+                self.assertEqual(pool.graph_pool_borrow_can_fit(payload), expected)
+
     def test_graph_replay_fails_during_active_pool_borrow(self):
         graph = Mock()
         backend = object.__new__(FullCudaGraphBackend)
