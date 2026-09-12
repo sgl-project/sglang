@@ -11,8 +11,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
     Flux2SingleTransformerBlock,
+    Flux2Transformer2DModel,
     Flux2TransformerBlock,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,6 +57,12 @@ def _double_block(scales: tuple[float, float, float]) -> Flux2TransformerBlock:
 
 
 class TestFlux2Fp8NormQuantGate(CustomTestCase):
+    def test_sage_attention_is_supported(self) -> None:
+        self.assertIn(
+            AttentionBackendEnum.SAGE_ATTN,
+            Flux2Transformer2DModel._supported_attention_backends,
+        )
+
     def test_qkv_requires_identical_input_scales(self) -> None:
         matching = _double_block((0.25, 0.25, 0.25))
         mismatched = _double_block((0.25, 0.5, 0.25))
