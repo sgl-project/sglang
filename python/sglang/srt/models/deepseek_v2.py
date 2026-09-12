@@ -168,6 +168,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _get_llama_4_scaling,
+    _has_fp8_weight_scale,
     _is_block_scale_fp8,
     _is_cpu,
     _is_cpu_amx_available,
@@ -2393,10 +2394,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             # Use _is_block_scale_fp8 to distinguish block-scale fp8 (K/128 scale
             # cols, compatible with fused_rms_fp8_group_quant) from per-channel fp8
             # ([N, 1] scale, must use the plain bf16 path).
-            # weight_scale may not be reshaped yet at __init__ time — return
+            # The scale may not be reshaped yet at __init__ time — return
             # "fp8_pending" so _resolve_gfx95_quant_format re-checks on first forward.
-            weight_scale = getattr(proj, "weight_scale", None)
-            if weight_scale is None:
+            # Look under both names: Fp8LinearMethod registers block scales as
+            # `weight_scale_inv` and reserves `weight_scale` for per-tensor, so
+            # probing only the latter reports "pending" forever on a native
+            # DeepSeek/GLM fp8 checkpoint and permanently falls back to bf16.
+            if not _has_fp8_weight_scale(proj):
                 return "fp8_pending"
             return "fp8" if _is_block_scale_fp8(proj) else ""
         return ""

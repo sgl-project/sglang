@@ -76,21 +76,63 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
+# Group size the gfx95 fused fp8 kernels (fused_rms_fp8_group_quant,
+# fused_flatten_fp8_group_quant) are invoked with at every call site below.
+GFX95_FUSED_FP8_GROUP_SIZE = 128
+
+# Fp8LinearMethod registers block scales as `weight_scale_inv` and per-tensor
+# scales as `weight_scale`; other quant paths use `weight_scale` for blocks too.
+_FP8_WEIGHT_SCALE_NAMES = ("weight_scale", "weight_scale_inv")
+
+
+def _has_fp8_weight_scale(proj: torch.nn.Module) -> bool:
+    """Whether a weight scale has been materialized under either known name.
+
+    Callers use this to tell "not quantized / not loaded yet" apart from
+    "loaded, but not a layout the fused kernels accept".
+    """
+    return any(getattr(proj, n, None) is not None for n in _FP8_WEIGHT_SCALE_NAMES)
+
+
 def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
     """Return True if proj uses block-scale fp8 quantization.
 
-    Per-channel fp8 has weight_scale shape [N, 1] (one scale per output row).
-    Block-scale fp8 has weight_scale shape [N, K/block_size] (multiple columns).
+    Per-channel fp8 has a scale of shape [N, 1] (one scale per output row).
+    Block-scale fp8 has a scale of shape [N, K/block_size] (multiple columns).
     The fused gfx95 kernels (fused_rms_fp8_group_quant, fused_flatten_fp8_group_quant)
     are only compatible with block-scale layouts — per-channel layers must fall
     through to the plain bf16 path instead.
+
+    The scale lives under different names depending on the quantization path:
+    ``Fp8LinearMethod.create_weights`` registers a 2-D ``weight_scale_inv``
+    (BlockQuantScaleParameter) when the config sets ``weight_block_size`` — which
+    is what native DeepSeek/GLM fp8 checkpoints ship — and reserves
+    ``weight_scale`` for the per-tensor branch. Other quantization paths place
+    2-D block scales directly in ``weight_scale``. Check both, so a block-scale
+    layer is not misread as non-block-scale purely because of the parameter name.
+
+    A 2-D scale alone is not sufficient: MXFP8 also registers a 2-D
+    ``weight_scale_inv``, but with ``weight_block_size == [1, 32]`` and UE8M0
+    uint8 values, which the group-128 kernels cannot consume. Require the
+    implied K-block to match the group size the fused kernels are invoked with.
     """
     if not hasattr(proj, "weight") or proj.weight.dtype != torch.float8_e4m3fn:
         return False
-    weight_scale = getattr(proj, "weight_scale", None)
-    if weight_scale is None or weight_scale.dim() != 2:
+    weight = proj.weight
+    if weight.dim() != 2:
         return False
-    return weight_scale.shape[-1] > 1
+    in_features = weight.shape[-1]
+    for name in _FP8_WEIGHT_SCALE_NAMES:
+        weight_scale = getattr(proj, name, None)
+        if weight_scale is None or weight_scale.dim() != 2:
+            continue
+        scale_cols = weight_scale.shape[-1]
+        if scale_cols <= 1:
+            continue
+        # ceil-div: scale columns cover ceil(K / block_k) groups.
+        if -(-in_features // scale_cols) == GFX95_FUSED_FP8_GROUP_SIZE:
+            return True
+    return False
 
 
 def awq_dequantize_func():
