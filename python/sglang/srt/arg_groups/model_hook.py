@@ -284,9 +284,7 @@ def handle_model_specific_adjustments(server_args: Any):
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split requires "
-                    "--enable-prefill-cp and --cp-strategy interleave "
-                    "(or legacy --enable-nsa-prefill-context-parallel with "
-                    "--nsa-prefill-cp-mode round-robin-split)."
+                    "--enable-prefill-cp and --cp-strategy interleave."
                 )
             # Layer split relies on the mooncake all-CP-rank KV/indexer
             # transfer path. mori/nixl support is a temporary limitation
@@ -550,12 +548,13 @@ def handle_model_specific_adjustments(server_args: Any):
             "ascend",
             "intel_xpu",
             "intel_amx",
+            "aiter",
         )
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, or intel_amx "
-            f"attention backend, got prefill={prefill_backend}, decode={decode_backend}"
+            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, intel_amx, or "
+            f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
         )
 
         # The quantization/moe_runner_backend resolution moved to the override
@@ -594,6 +593,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
     ]:
         # The quantization/moe_runner_backend resolution moved to the
         # override registry (arg_groups/overrides.py:

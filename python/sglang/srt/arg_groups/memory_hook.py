@@ -24,6 +24,19 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
+def handle_offload_compatibility(server_args: Any) -> None:
+    """Flag-only check; re-run after the model overrides fill in the PLE default."""
+    cfg = resolving_view(server_args)
+    if cfg.ple_offload_embedding and (
+        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
+    ):
+        raise ValueError(
+            "--ple-offload-embedding cannot be combined with "
+            "--cpu-offload-gb or --offload-group-size: generic layer offload "
+            "would stage the pinned PLE embedding back to the device."
+        )
+
+
 def handle_gpu_memory_settings(server_args: Any, gpu_mem):
     """
     Configure GPU memory-dependent settings including
@@ -157,10 +170,17 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
 
+    from sglang.srt.arg_groups.model_overrides.qwen3_vl import (
+        expand_multimodal_decode_graph_to_running_limit,
+    )
+
+    expand_multimodal_decode_graph_to_running_limit(
+        server_args, decode_cuda_graph_config, gpu_mem
+    )
+
     # ------------------------------------------------------------------
     # CUDA graph batch-size materialization
     # ------------------------------------------------------------------
-
     if cfg.device != "cpu":
         if decode_cuda_graph_config.bs is None:
             decode_cuda_graph_config.bs = generate_decode_cuda_graph_batch_sizes(
