@@ -1829,8 +1829,10 @@ class UnifiedRadixCache(BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> int:
-        """Synchronously probe L3 storage for the reusable prefix length."""
+        """Probe L3 with the request namespace."""
         if (
             not self.enable_storage
             or self.cache_controller is None
@@ -1838,7 +1840,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return 0
 
-        extra_key, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,

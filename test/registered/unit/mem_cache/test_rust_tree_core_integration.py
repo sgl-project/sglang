@@ -52,7 +52,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.utils import hash_str_to_int64
+from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
 
 
@@ -1058,21 +1058,25 @@ def test_storage_backup_spec_round_trips_the_backuped_node():
     core = _tree_core(page_size=2)
     core.set_hicache_enabled()
     core.enable_storage = True
-    _insert(core, [1, 2], [10, 11])
-    _insert(core, [1, 2, 7, 8], [10, 11, 12, 13])
-    parent = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
-    child = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 7, 8]))).best_match_node
+    key = RadixKey(
+        array("q", [1, 2, 7, 8]), extra_key="adapter-a", cache_salt="tenant-a"
+    )
+    for length in (2, 4):
+        _pump_insert(
+            core,
+            InsertParams(key=key[:length], value=torch.arange(10, 10 + length)),
+        )
+    parent = core.match_prefix(MatchPrefixParams(key=key[:2])).best_match_node
+    child = core.match_prefix(MatchPrefixParams(key=key)).best_match_node
     core.commit_backup(parent, torch.tensor([100, 101], dtype=torch.int64), {})
     core.commit_backup(child, torch.tensor([102, 103], dtype=torch.int64), {})
 
     spec = core.build_storage_backup_spec(child, pass_prefix_keys=True)
     assert spec.host_value.tolist() == [102, 103]
     assert spec.token_ids == array("q", [7, 8])
-    parent_hashes = mem_cache.get_hash_str(array("q", [1, 2]), None, 2)
-    assert spec.prefix_keys == parent_hashes
-    assert spec.hash_value == mem_cache.get_hash_str(
-        array("q", [7, 8]), parent_hashes[-1], 2
-    )
+    hashes = get_storage_hash_str(key, page_size=2)
+    assert spec.prefix_keys == hashes[:1]
+    assert spec.hash_value == hashes[1:]
     assert spec.comp_xfers == {}
 
 
