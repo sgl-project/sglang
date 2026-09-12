@@ -83,6 +83,12 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     # 6 running requests replays the bs=6 decode graph, which corrupts global
     # state and permanently collapses the DSPARK accept rate to ~0.01.
     80,
+    # Experiment A: DFlash auto-enables MinFreeSlotsDelayer, which delays fresh
+    # prefills and then admits them in one burst. Suspected root cause of the
+    # accept-rate collapse. Setting 1 forces threshold=min(1, mrr)=1 -> None,
+    # i.e. fully disables the delayer.
+    "--min-free-slots-delay",
+    1,
     "--dp-size",
     16,
     "--enable-dp-attention",
@@ -121,6 +127,8 @@ DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH = {
     "max_tokens": 120000,
     "top_p": 1,
     "temperature": 1,
+    "timeout": 6000,
+    "stream": "true",
     "extra_body": {
         "chat_template_kwargs": {"thinking": True}
     },
@@ -139,8 +147,6 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 32
-    stream = True
-    timeout = 6000
     ignore_errors = True
 
     def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
