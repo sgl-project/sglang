@@ -261,44 +261,44 @@ def _build_deepseek_v4_device_pool_group(
 ) -> DevicePoolGroup:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _dsv4_compressed_region_buffers,
         _dsv4_indexer_regions,
         _resolve_deepseek_v4_layer_mappings,
     )
 
-    mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
-    if getattr(kvcache, "_unified_kv", False) or isinstance(
-        kvcache.c4_kv_pool, HiSparseC4DevicePool
-    ):
-        raise ValueError(
-            "The direct external linker does not support unified-KV or HiSparse."
-        )
-    if kvcache.swa_page_size != page_size:
-        raise ValueError(
-            "DeepSeek V4 SWA page size must match the tree page size: "
-            f"{kvcache.swa_page_size} != {page_size}."
-        )
+    if isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
+        raise ValueError("The direct external linker does not support HiSparse.")
 
-    draft_swa_buffers = [
-        buffer
-        for pool in mtp_draft_device_pools
-        for buffer in pool.swa_kv_pool.kv_buffer
-    ]
-    swa_mapping = _with_packed_draft_mapping(
-        mappings.swa,
-        target_device_layer_num=len(kvcache.swa_kv_pool.kv_buffer),
-        draft_layer_num=len(draft_swa_buffers),
-    )
-    entries = [
-        DevicePoolEntry(
-            name=PoolName.SWA,
-            indices_from_pool=PoolName.SWA,
-            device_pool=kvcache.swa_kv_pool,
-            components=[[*kvcache.swa_kv_pool.kv_buffer, *draft_swa_buffers]],
-            layer_mapping=swa_mapping,
-            page_size=page_size,
-            rows_are_pages=True,
+    mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
+    is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    entries = []
+    if not is_unified_kv:
+        if kvcache.swa_page_size != page_size:
+            raise ValueError(
+                "DeepSeek V4 SWA page size must match the tree page size: "
+                f"{kvcache.swa_page_size} != {page_size}."
+            )
+        draft_swa_buffers = [
+            buffer
+            for pool in mtp_draft_device_pools
+            for buffer in pool.swa_kv_pool.kv_buffer
+        ]
+        swa_mapping = _with_packed_draft_mapping(
+            mappings.swa,
+            target_device_layer_num=len(kvcache.swa_kv_pool.kv_buffer),
+            draft_layer_num=len(draft_swa_buffers),
         )
-    ]
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.SWA,
+                indices_from_pool=PoolName.SWA,
+                device_pool=kvcache.swa_kv_pool,
+                components=[[*kvcache.swa_kv_pool.kv_buffer, *draft_swa_buffers]],
+                layer_mapping=swa_mapping,
+                page_size=page_size,
+                rows_are_pages=True,
+            )
+        )
 
     def add(name, source, pool, buffers, layer_mapping):
         if layer_mapping:
@@ -314,11 +314,14 @@ def _build_deepseek_v4_device_pool_group(
                 )
             )
 
+    c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
+    c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
+
     add(
         PoolName.DEEPSEEK_V4_C4,
         PoolName.KV,
         kvcache.c4_kv_pool,
-        kvcache.c4_kv_pool.kv_buffer,
+        c4_buffers,
         mappings.c4,
     )
     for region in _dsv4_indexer_regions(kvcache, page_size):
@@ -333,29 +336,30 @@ def _build_deepseek_v4_device_pool_group(
         PoolName.DEEPSEEK_V4_C128,
         PoolName.KV,
         kvcache.c128_kv_pool,
-        kvcache.c128_kv_pool.kv_buffer,
+        c128_buffers,
         mappings.c128,
     )
-    add(
-        PoolName.DEEPSEEK_V4_C4_STATE,
-        PoolName.SWA,
-        kvcache.compress_state_pools,
-        _deepseek_v4_state_views(
+    if not is_unified_kv:
+        add(
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.SWA,
             kvcache.compress_state_pools,
-            mappings.c4_state_global_layers,
-        ),
-        mappings.c4_state,
-    )
-    add(
-        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-        PoolName.SWA,
-        kvcache.indexer_compress_state_pools,
-        _deepseek_v4_state_views(
+            _deepseek_v4_state_views(
+                kvcache.compress_state_pools,
+                mappings.c4_state_global_layers,
+            ),
+            mappings.c4_state,
+        )
+        add(
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.SWA,
             kvcache.indexer_compress_state_pools,
-            mappings.c4_state_global_layers,
-        ),
-        mappings.c4_state,
-    )
+            _deepseek_v4_state_views(
+                kvcache.indexer_compress_state_pools,
+                mappings.c4_state_global_layers,
+            ),
+            mappings.c4_state,
+        )
     return DevicePoolGroup(
         entries,
         mappings.transfer_layer_num,
