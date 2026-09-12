@@ -198,6 +198,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_model_config.hf_text_config, "logits_mup_width_multiplier", None
         )
         self._target_is_mambaish = mambaish_config(target_model_config) is not None
+        # Padded head rows are input-only and must never be sampled.
+        self._sample_vocab_size = int(target_model_config.vocab_size)
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -302,6 +304,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            sample_vocab_size=self._sample_vocab_size,
         )
         self._verify_epilogue = None
         if (
@@ -470,6 +473,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
+            sample_vocab_size=self._sample_vocab_size,
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
