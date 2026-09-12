@@ -85,9 +85,7 @@ class TestUnifiedSWATransfers(CustomTestCase):
                 expected_pages = allocator.swa_v2p_page_table[
                     indices[tombstone_tokens::4] // 4
                 ]
-                pages = transfers[0].device_indices[::4] // (
-                    4 * manager.kv_cache.swa_kv_pool.kernel_page_blocks
-                )
+                pages = transfers[0].device_indices[::4] // 4
                 buffer = manager.kv_cache.swa_kv_pool.get_page_envelope_buffer()
                 self.assertTrue(
                     torch.equal(buffer[pages].clone(), buffer[expected_pages])

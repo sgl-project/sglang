@@ -108,19 +108,6 @@ class SubPoolSpec(ABC):
         """Storage dtype (informational). Multi-dtype subclasses return the dominant buffer's."""
         raise NotImplementedError
 
-    def view_tail_pad_bytes(self, page_size: int) -> int:
-        """Bytes this sub-pool's views reach PAST its last page envelope."""
-        return 0
-
-    def blocks_per_page(self) -> int:
-        """Row-blocks one page holds in this sub-pool's kernel-facing id space.
-
-        The page envelope is a uniform array of equally wide row-blocks, so a
-        kernel-facing id is the physical page scaled by this count (see
-        `MultiEndedAllocator.translate_kv_loc_for_kernel`). 1 means the kernel-facing ids are the physical ones.
-        """
-        return 1
-
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
@@ -182,13 +169,6 @@ class MHASubPoolSpec(SubPoolSpec):
             ),
         )
 
-    def view_tail_pad_bytes(self, page_size: int) -> int:
-        return page_size * self.entry_bytes()
-
-    def blocks_per_page(self) -> int:
-        """Row-blocks per page in the kernel-facing id space (one K + one V per layer)."""
-        return 2 * self.layer_num
-
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
 
@@ -240,14 +220,6 @@ class MLASubPoolSpec(SubPoolSpec):
                 ),
             ),
         )
-
-    def view_tail_pad_bytes(self, page_size: int) -> int:
-        return page_size * self.entry_bytes()
-
-    def blocks_per_page(self) -> int:
-        """One latent row per layer, so L blocks per page (MHA has 2L: a K
-        block and a V block per layer)."""
-        return self.layer_num
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
