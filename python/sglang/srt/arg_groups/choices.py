@@ -180,6 +180,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
+    "flashinfer_b12x",
     "flashinfer_cudnn",
     "flashinfer_cutedsl",
     "flashinfer_cutlass",

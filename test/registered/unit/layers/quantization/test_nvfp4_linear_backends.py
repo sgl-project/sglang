@@ -122,9 +122,11 @@ class TestNvFp4LinearBackends(CustomTestCase):
     def setUpClass(cls):
         init_single_process_dist()
 
-    def _run_backend(self, backend: str, build_layer=_make_quantized_layer):
+    def _run_backend(
+        self, backend: str, build_layer=_make_quantized_layer, shapes=SHAPES
+    ):
         torch.manual_seed(7)
-        for m, n, k in SHAPES:
+        for m, n, k in shapes:
             with self.subTest(backend=backend, shape=(m, n, k)):
                 with mock.patch.object(
                     fp4_utils,
@@ -163,6 +165,13 @@ class TestNvFp4LinearBackends(CustomTestCase):
 
     def test_flashinfer_cutlass(self):
         self._run_backend("flashinfer_cutlass")
+
+    @unittest.skipUnless(
+        get_device_sm() in (120, 121), "FlashInfer b12x requires SM120 or SM121"
+    )
+    def test_flashinfer_b12x(self):
+        supported_shapes = [shape for shape in SHAPES if shape[2] % 32 == 0]
+        self._run_backend("flashinfer_b12x", shapes=supported_shapes)
 
     def test_flashinfer_cudnn(self):
         self._run_backend("flashinfer_cudnn")

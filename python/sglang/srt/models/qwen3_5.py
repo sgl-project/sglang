@@ -348,6 +348,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.alt_stream = alt_stream
+        # Experimental SM120 decode-only path; default off pending service validation.
+        self._use_tiny_ba = (
+            _is_cuda
+            and get_bool_env_var("SGLANG_OPT_TINY_BA", "False")
+            and torch.cuda.get_device_capability()[0] == 12
+            and not get_exec().deterministic.enable_deterministic_inference
+        )
+        self._tiny_ba_logged = False
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
@@ -679,7 +687,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
         self._fused_in_proj_weight = fused
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_ba_proj(self, hidden_states: torch.Tensor, is_decode: bool):
+        layer = self.in_proj_ba
+        if (
+            self._use_tiny_ba
+            and is_decode
+            and type(layer.quant_method) is UnquantizedLinearMethod
+            and layer.bias is None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and 0 < hidden_states.shape[0] <= 8
+            and hidden_states.shape[1] == 5120
+            and hidden_states.stride(1) == 1
+            and hidden_states.stride(0) % 16 == 0
+            and layer.weight.dtype == torch.bfloat16
+            and layer.weight.shape == (48, 5120)
+            and layer.weight.is_contiguous()
+        ):
+            from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+
+            if self.layer_id == 0 and not self._tiny_ba_logged:
+                logger.info(
+                    "Using experimental tiny_gemm for Decode b/a (M<=8,N=48,K=5120)"
+                )
+                self._tiny_ba_logged = True
+            return tiny_gemm_bf16(hidden_states, layer.weight)
+        return layer(hidden_states)[0]
+
+    def _forward_input_proj(self, hidden_states: torch.Tensor, is_decode: bool = False):
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
         # consume ``(fp8, scale)`` (skipping its internal quant) while the
@@ -723,7 +759,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba = self._forward_ba_proj(hidden_states, is_decode)
             current_stream.wait_stream(self.alt_stream)
         elif self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
@@ -736,7 +772,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_ba = self._forward_ba_proj(hidden_states, is_decode)
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
@@ -818,7 +854,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         3. Output projection
         """
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, is_decode=forward_batch.forward_mode.is_decode()
         )
 
         if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
