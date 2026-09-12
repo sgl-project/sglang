@@ -99,6 +99,14 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+    /// Directories that WASM modules may be loaded from.
+    ///
+    /// Registration accepts a caller-supplied path, so this allow-list is what
+    /// confines it. At least one root is required when `enable_wasm` is set;
+    /// the gateway refuses to start otherwise rather than defaulting to
+    /// "anywhere on the filesystem".
+    #[serde(default)]
+    pub wasm_module_roots: Vec<String>,
 }
 
 /// Tokenizer cache configuration
@@ -551,6 +559,7 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            wasm_module_roots: Vec::new(),
             server_cert: None,
             server_key: None,
         }
