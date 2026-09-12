@@ -1,12 +1,7 @@
-"""Unit tests for ``BaseMultimodalProcessor._load_single_item`` image decoding.
+"""Unit tests for the image decode paths used by ``BaseMultimodalProcessor``.
 
-Regression test for the change that forces the (otherwise lazy) PIL decode inside
-``_load_single_item`` — which runs in the ``io_executor`` worker thread — instead of
-letting it fire lazily on the main event-loop thread later (inside
-``pil_to_tensor``/``tobytes`` during processing). The behavior of the returned image
-(mode, pixels) must be unchanged; only *when/where* the decode happens differs.
-
-No server, no model loading — pure CPU.
+The tests cover eager PIL decoding in the I/O worker and JPEG channel normalization
+in the GPU fast paths. No server or model weights are required.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,10 +47,12 @@ def _png_bytes(mode: str = "RGB", size=(8, 8)) -> bytes:
     return buf.getvalue()
 
 
-def _jpeg_bytes(size=(8, 8)) -> bytes:
+def _jpeg_bytes(mode: str = "RGB", size=(8, 8)) -> bytes:
     arr = (np.random.RandomState(0).rand(size[1], size[0], 3) * 255).astype("uint8")
     buf = io.BytesIO()
-    Image.fromarray(arr, "RGB").save(buf, format="JPEG", quality=90, subsampling=2)
+    Image.fromarray(arr, "RGB").convert(mode).save(
+        buf, format="JPEG", quality=90, subsampling=2
+    )
     return buf.getvalue()
 
 
@@ -148,6 +145,29 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
 
         self.assertIs(image, expected)
         decode.assert_called_once_with(data)
+
+    def test_standard_gpu_jpeg_decoder_normalizes_grayscale_to_rgb(self):
+        decode_jpeg = common.decode_jpeg
+
+        def decode_on_cpu(encoded_image, *, mode, device):
+            # Keep the test deterministic on CPU while checking the arguments used
+            # by the production CUDA path and exercising torchvision's conversion.
+            self.assertEqual(mode, common.ImageReadMode.RGB)
+            self.assertEqual(device, "cuda")
+            return decode_jpeg(encoded_image, mode=mode, device="cpu")
+
+        with (
+            patch.object(common, "is_cuda", return_value=True),
+            patch.object(common, "decode_jpeg", side_effect=decode_on_cpu),
+        ):
+            images = [
+                common._load_image(image_bytes=_jpeg_bytes(mode), gpu_image_decode=True)
+                for mode in ("L", "RGB")
+            ]
+
+        self.assertTrue(all(isinstance(image, torch.Tensor) for image in images))
+        self.assertEqual([tuple(image.shape) for image in images], [(3, 8, 8)] * 2)
+        self.assertEqual(tuple(torch.stack(images).shape), (2, 3, 8, 8))
 
     def test_high_fidelity_gpu_jpeg_decoder_falls_back_to_pil(self):
         data = _jpeg_bytes()
