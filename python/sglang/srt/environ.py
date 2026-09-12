@@ -1288,7 +1288,10 @@ class Envs:
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
-    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Fuse the KDA verify chain (conv1d update + gated delta-rule recurrence)
+    # into one kernel. Self-gated: requires the triton verify backend, topk==1,
+    # and a covered() shape/stride/dtype check, else the unfused chain runs.
+    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(True)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
