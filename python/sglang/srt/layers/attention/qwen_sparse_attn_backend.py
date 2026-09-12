@@ -256,7 +256,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
-        draft_window = int(spec_info.draft_token_num) if spec_info is not None else 0
+        # Target verify exposes ``draft_token_num`` while draft-extend exposes
+        # ``num_tokens_per_req``. Both modes use this gather-width bound.
+        draft_window = int(
+            getattr(
+                spec_info,
+                "draft_token_num",
+                getattr(spec_info, "num_tokens_per_req", 0),
+            )
+            or 0
+        )
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -1454,11 +1463,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
+        # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
+        # paged kernel always runs the bf16 q + bf16 KV path.
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            k_buffer.dtype,
+            q.dtype,
             k_buffer.device,
         )
         qwen_sparse_kv_extraction_compact_triton(
@@ -1477,6 +1488,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            zero_fill_cols=stride,
         )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
@@ -1587,7 +1599,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             scratch_capacity,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            k_buffer.dtype,
+            q.dtype,
             k_buffer.device,
         )
         qwen_sparse_kv_extraction_compact_triton(

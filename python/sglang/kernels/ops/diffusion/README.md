@@ -37,6 +37,7 @@ norm/        RMSNorm / LayerNorm / GroupNorm and their fused epilogues
 modulate/    adaLN modulate, gating, timestep conditioning
 rope/        rotary embeddings and the QK-norm chains fused into them
 activation/  SiLU / GLU / GELU fusions
+quantization/ MXFP8 producers whose scales land in the GEMM's swizzled layout
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
@@ -140,6 +141,7 @@ tensor copy per residual site.
 |---|---|---|
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact; supports compact and full-width NeoX/interleaved caches |
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
+| `fused_qknorm_rope_out_of_place` | JIT CUDA | as above, bit-equal to the in-place kernel; reads strided q/k and writes contiguous copies, inputs untouched (VDN-H3 keeps the raw q/k for its linear branch) |
 | `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM100+ |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
@@ -149,6 +151,22 @@ tensor copy per residual site.
 | `fused_ltx25_decoder_rope` | JIT CUDA | bit-exact paired 3D RoPE from cached compact axis tables |
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact; packs QKV and applies RoPE in one pass |
+
+### MiniMax-H3 / VDN-H3 linear branch
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `vdn_frame_stats_prep`, `vdn_gather_linear_state` | Triton | bit-exact (same products, fp32 gather) |
+| `vdn_temporal_conv_act`, `vdn_silu_l2norm`, `vdn_linear_epilogue` | Triton | one rounding at the store, within one bf16 ulp of the eager chain; the model's own inference kernels, mounted unconditionally by the VDN-H3 branch |
+| `vdn_delta_factors` | JIT CUDA | `(alpha * inv(I + A), B @ inv(I + A))` in one launch; same fp32 accuracy class as the cholesky + solve_triangular chain (cond-dominated); head_dim 128 |
+
+### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `mxfp8_quantize_swizzled` | Triton | bit-exact vs `flashinfer.mxfp8_quantize(x, True)`: e4m3 payload + block-32 E8M0 scales in the `SWIZZLE_32_4_4` layout; weights at load and any bf16 GEMM input |
+| `silu_mul_mxfp8` | Triton | bit-exact vs eager bf16 `silu(gate) * up` followed by the quantizer above; the fc2 input |
+| `indexed_scale_shift_mxfp8_` | Triton | bit-exact vs `indexed_scale_shift_bf16_` followed by the quantizer above, optionally keeping the bf16 rows in place; the qkv / fc1 inputs |
 
 ### MoE routing
 
@@ -161,12 +179,19 @@ tensor copy per residual site.
 `usp_merge_heads`, `pack_qkv_destination_major`, `fused_pack_qkv`,
 `fused_pack_segmented_qkv`, `fused_scatter_to_padded`,
 `fused_causal_conv3d_cat_pad_cuda`,
-`cat_pad_channels_last_3d`, `dup_up3d_add`, `fused_temb_table_slices`,
+`cat_pad_channels_last_3d`, `dup_up3d_add`, `nearest_upsample_nhwc`,
+`fused_temb_table_slices`,
 and `ltx2_ada_values9` are bit-exact data movement or same-order arithmetic.
 `fused_layernorm_modulate_fp8_quant_raw` folds FLUX.2 LayerNorm, adaLN
 modulation, and static FP8 quantization. `try_flux2_token_cat_fp8` and
 `try_flux2_token_cat_nvfp4` fuse branch concatenation directly into the
 quantized representation selected by the FLUX.2 checkpoint path.
+
+`nearest_upsample_nhwc` replaces `nn.Upsample(nearest / nearest-exact,
+integer factor)` on a dense channels_last input with a Triton gather: same
+values and layout as aten, but aten's own NHWC nearest kernel is several times
+slower than its NCHW sibling, which is what the Wan-family VAE decoders hit
+once they run channels_last end-to-end.
 
 `fused_temb_table_slices` is worth knowing about: the eager
 `(table + temb.float()).chunk(6, dim=2)` materializes ~8 GB of fp32 at
