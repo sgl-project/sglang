@@ -656,7 +656,8 @@ def run_eagle_verify(
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent
     # batch.input_ids rebind in prepare_for_draft_extend.
-    # Scheduler pins it in batch_record_buf for the 2-iter window.
+    # It rides on the result in extra_keep_alive_refs, which result_queue holds
+    # until the result is processed.
     return GenerationBatchResult(
         logits_output=logits_output,
         next_token_ids=predict,
