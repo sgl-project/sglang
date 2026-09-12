@@ -429,19 +429,20 @@ class DiffusionServerBase:
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
 
+        if is_baseline_generation_mode:
+            _PENDING_BASELINE_DUMPS.setdefault(case.id, []).append(summary)
+            return
+
+        if missing_scenario:
+            self._dump_baseline_for_testcase(case, summary, missing_scenario)
+            pytest.fail(
+                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+            )
+
+        # disabling stage checks must not disable the request's e2e guard
+        validator.validate_e2e(summary)
+
         if case.run_perf_check:
-            if is_baseline_generation_mode:
-                _PENDING_BASELINE_DUMPS.setdefault(case.id, []).append(summary)
-                return
-
-            if missing_scenario:
-                self._dump_baseline_for_testcase(case, summary, missing_scenario)
-                if missing_scenario:
-                    pytest.fail(
-                        f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
-                    )
-                return
-
             if current_platform.is_cuda():
                 expected_load_peak_vram_mb = scenario.load_peak_vram_mb
                 expected_runtime_peak_vram_mb = scenario.runtime_peak_vram_mb

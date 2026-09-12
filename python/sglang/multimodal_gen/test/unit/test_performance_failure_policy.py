@@ -5,7 +5,38 @@ import textwrap
 
 import pytest
 
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.runner.pytest_runner import _is_retryable_failure
+from sglang.multimodal_gen.test.server import test_server_common as common
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    DiffusionServerArgs,
+    DiffusionTestCase,
+    ScenarioConfig,
+)
+
+
+@pytest.mark.parametrize("generate_baseline", [False, True])
+def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline):
+    monkeypatch.setenv("SGLANG_GEN_BASELINE", str(int(generate_baseline)))
+    case = DiffusionTestCase(
+        "e2e_only", DiffusionServerArgs(model_path="test"), run_perf_check=False
+    )
+    scenario = ScenarioConfig({}, {}, 1000, 0, 0)
+    monkeypatch.setitem(common.BASELINE_CONFIG.scenarios, case.id, scenario)
+    monkeypatch.setattr(common, "_PENDING_BASELINE_DUMPS", {})
+    server = common.DiffusionServerBase()
+    server._perf_results = []
+    record = RequestPerfRecord(
+        request_id="guard",
+        commit_hash="test",
+        tag="guard",
+        stages=[],
+        steps=[],
+        total_duration_ms=2000 if generate_baseline else 1000,
+    )
+    server._validate_and_record(case, record)
+    assert len(server._perf_results) == 1
+    assert bool(common._PENDING_BASELINE_DUMPS) == generate_baseline
 
 
 @pytest.mark.parametrize(
@@ -31,7 +62,17 @@ def test_infrastructure_failure_policy_is_unchanged(output):
 
 @pytest.mark.parametrize(
     "problem",
-    ["regression", "missing_baseline", "missing_record", "missing_e2e", "missing_log"],
+    [
+        "regression",
+        "missing_baseline",
+        "missing_record",
+        "missing_e2e",
+        "missing_log",
+        "e2e_only_regression",
+        "e2e_only_missing_baseline",
+        "e2e_only_zero_baseline",
+        "e2e_only_nan_baseline",
+    ],
 )
 def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
     # exercise the validator, request loop, pytest output and retry classifier together
@@ -58,10 +99,14 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                     DiffusionSamplingParams(prompt="test"),
                     run_lora_basic_api_check=True, perf_repeat_requests=2,
                     run_consistency_check=False, run_models_api_check=False,
-                    run_perf_check=PROBLEM not in ("missing_record", "missing_e2e", "missing_log"),
+                    run_perf_check=not PROBLEM.startswith("e2e_only_") and PROBLEM not in ("missing_record", "missing_e2e", "missing_log"),
                 )
                 scenario = ScenarioConfig({}, {}, 1000, 100, 100)
-                if PROBLEM == "missing_baseline":
+                if PROBLEM == "e2e_only_zero_baseline":
+                    scenario.expected_e2e_ms = 0
+                if PROBLEM == "e2e_only_nan_baseline":
+                    scenario.expected_e2e_ms = float("nan")
+                if PROBLEM in ("missing_baseline", "e2e_only_missing_baseline"):
                     monkeypatch.delitem(common.BASELINE_CONFIG.scenarios, case_id, raising=False)
                 else:
                     monkeypatch.setitem(common.BASELINE_CONFIG.scenarios, case_id, scenario)

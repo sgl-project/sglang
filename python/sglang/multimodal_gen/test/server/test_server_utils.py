@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 import os
 import shlex
 import subprocess
@@ -713,7 +714,7 @@ class PerformanceValidator:
         if self.is_baseline_generation_mode:
             return summary
 
-        self._validate_e2e(summary)
+        self.validate_e2e(summary)
         self._validate_denoise_agg(summary)
         self._validate_denoise_steps(summary)
         self._validate_stages(summary)
@@ -738,9 +739,15 @@ class PerformanceValidator:
             return profile_tolerance
         return max(profile_tolerance, override)
 
-    def _validate_e2e(self, summary: PerformanceSummary) -> None:
+    def validate_e2e(self, summary: PerformanceSummary) -> None:
         """Validate end-to-end performance."""
-        assert summary.e2e_ms > 0, "E2E duration missing"
+        assert math.isfinite(summary.e2e_ms) and summary.e2e_ms > 0, (
+            "E2E duration missing or invalid"
+        )
+        expected = self.scenario.expected_e2e_ms
+        assert math.isfinite(expected) and expected > 0, (
+            "E2E baseline missing or invalid"
+        )
         self._assert_le(
             "E2E Latency",
             summary.e2e_ms,
