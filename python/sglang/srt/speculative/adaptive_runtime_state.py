@@ -1,7 +1,11 @@
+import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -87,6 +91,15 @@ class AdaptiveController:
         # (dp_attn min-reduce) so all ranks keep equal draft-token shapes. The
         # local EMA path must then only *update* params, never swap directly.
         self.sync_across_dp = sync_across_dp
+        if sync_across_dp and os.environ.get(
+            "SGLANG_SCHEDULER_SKIP_ALL_GATHER", ""
+        ) == "1":
+            logger.warning(
+                "SGLANG_SCHEDULER_SKIP_ALL_GATHER=1 disables the DP MLP-sync "
+                "all_gather that carries the adaptive tier consensus — ranks "
+                "will diverge on num_draft_tokens (NCCL shape mismatch / hang). "
+                "Do not combine with --speculative-adaptive under dp-attention."
+            )
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -124,8 +137,17 @@ class AdaptiveController:
         if target != self.worker.speculative_num_steps:
             self._activate(target)
 
-    def activate_step(self, speculative_num_steps: int) -> None:
-        """Activate an externally-decided tier (e.g. the DP-consensus step)."""
+    def activate_step(
+        self, speculative_num_steps: int, batch_size: int | None = None
+    ) -> None:
+        """Activate an externally-decided tier (e.g. the DP-consensus step).
+
+        Under DP the slot's tier mirrors the consensus activation — never a
+        local recompute — and a tier change re-arms min-dwell so the
+        shared-EMA vote cannot flip the tier again within the dwell window.
+        """
+        if batch_size is not None:
+            self.params.apply_consensus(batch_size, speculative_num_steps)
         if speculative_num_steps != self.worker.speculative_num_steps:
             self._activate(speculative_num_steps)
 
@@ -134,15 +156,19 @@ class AdaptiveController:
     ) -> None:
         """Feed verify results; switch runtime state if EMA warrants it.
 
-        Under DP attention only the EMA is updated here — the actual tier swap
-        is deferred to the next round's cross-rank consensus, so a rank never
-        swaps out of lockstep with its peers (which would mismatch draft-token
-        shapes and hang the DP collective).
+        Under DP attention only the EMA is updated here — the tier is decided
+        by the fresh shared-EMA vote in every round's MLP-sync consensus, so a
+        rank never swaps out of lockstep with its peers (which would mismatch
+        draft-token shapes and hang the DP collective), and a local
+        recompute can never desync per-rank ``current_steps``.
         """
+        if self.sync_across_dp:
+            self.params.update_ema_only(num_correct_drafts_per_req, batch_size)
+            return
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )
-        if new_step is not None and not self.sync_across_dp:
+        if new_step is not None:
             self._activate(new_step)
 
     def _activate(self, speculative_num_steps: int) -> None:

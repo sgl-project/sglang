@@ -160,6 +160,10 @@ class AdaptiveStepSlot:
         self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
         self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
+        # Min-dwell: after a tier change, hold the new tier for this many
+        # verify rounds before another change is allowed (0 = off). Damps
+        # threshold-straddling oscillation, both TP-local and DP-shared.
+        self.min_dwell_batches = cfg.get("min_dwell_batches", 0)
 
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
@@ -169,6 +173,23 @@ class AdaptiveStepSlot:
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
         self._batch_count = 0
+        self._dwell_remaining = 0
+        # Cross-rank (mean) EMA folded in from the DP MLP-sync all_gather.
+        # The DP vote is a pure function of this + current_steps, so every
+        # rank computes an identical vote (None until the first fold).
+        self.shared_ema_accept_len: float | None = None
+
+    def update_ema(self, num_correct_drafts_per_req: list[int]) -> None:
+        """Fold one verify round into the EMA. No tier decision."""
+        if not num_correct_drafts_per_req:
+            return
+        if self.current_steps > 0:
+            batch_avg = sum(num_correct_drafts_per_req) / len(
+                num_correct_drafts_per_req
+            )
+            self.ema_accept_len = (
+                1 - self.ema_alpha
+            ) * self.ema_accept_len + self.ema_alpha * batch_avg
 
     def update(self, num_correct_drafts_per_req: list[int]) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
@@ -179,13 +200,7 @@ class AdaptiveStepSlot:
         if not num_correct_drafts_per_req:
             return False
 
-        if self.current_steps > 0:
-            batch_avg = sum(num_correct_drafts_per_req) / len(
-                num_correct_drafts_per_req
-            )
-            self.ema_accept_len = (
-                1 - self.ema_alpha
-            ) * self.ema_accept_len + self.ema_alpha * batch_avg
+        self.update_ema(num_correct_drafts_per_req)
 
         self._batch_count += 1
         if self._batch_count <= self.warmup_batches:
@@ -194,16 +209,82 @@ class AdaptiveStepSlot:
         if (self._batch_count - self.warmup_batches) % self.update_interval != 0:
             return False
 
+        if self._dwell_remaining > 0:
+            self._dwell_remaining -= 1
+            return False
+
         return self._recompute_params()
+
+    def fresh_vote(self) -> int:
+        """Tier a pure threshold walk over the EMA selects right now.
+
+        Under DP attention the gathered vote must be a deterministic function
+        of state every rank already shares — the folded cross-rank EMA and the
+        consensus-activated tier — never of when each rank's local
+        `update_interval` last fired, or per-rank timing diverges the votes.
+        """
+        if self._dwell_remaining > 0:
+            return self.current_steps
+        ema = (
+            self.shared_ema_accept_len
+            if self.shared_ema_accept_len is not None
+            else self.ema_accept_len
+        )
+        return self.candidate_steps[self._walk_target_idx(ema)]
+
+    def apply_consensus(self, steps: int) -> None:
+        """Mirror the DP-consensus activation into the slot; re-arm min-dwell."""
+        if steps != self.current_steps:
+            self.current_steps = steps
+            self._dwell_remaining = self.min_dwell_batches
+
+    def fold_shared_ema(self, ema: float) -> None:
+        """Adopt the cross-rank (mean) EMA carried by the MLP-sync all_gather."""
+        self.shared_ema_accept_len = ema
+
+    def _walk_target_idx(self, ema: float) -> int:
+        """Pure threshold walk: candidate idx *ema* selects (no mutation)."""
+        old_idx = self.candidate_steps.index(self.current_steps)
+        current_idx = old_idx
+
+        while current_idx > 0:
+            prev_step = self.candidate_steps[current_idx - 1]
+            # A zero-step candidate disables drafting. Treat zero accepted drafts
+            # as low enough to reach it when it is the floor candidate.
+            drop_threshold = 0.5 if prev_step == 0 else prev_step - 0.5
+            drop_threshold += self.down_hysteresis
+            if ema <= drop_threshold:
+                current_idx -= 1
+            else:
+                break
+
+        if current_idx >= old_idx:
+            while current_idx < len(self.candidate_steps) - 1:
+                current_step = self.candidate_steps[current_idx]
+                rise_threshold = current_step - 0.5 + self.up_hysteresis
+                if ema > rise_threshold:
+                    current_idx += 1
+                else:
+                    break
+
+        # EMA ceiling: only caps downward — never blocks step-ups, so the
+        # system can explore higher steps and let the EMA catch up.
+        if self.ceiling_coeff > 0:
+            ceiling = max(1, math.ceil(ema * self.ceiling_coeff))
+            target = self.candidate_steps[current_idx]
+            if target > ceiling and target <= self.candidate_steps[old_idx]:
+                while current_idx > 0 and self.candidate_steps[current_idx] > ceiling:
+                    current_idx -= 1
+
+        return current_idx
 
     def _recompute_params(self) -> bool:
         """Recompute steps from EMA. Returns True if params changed."""
         old_steps = self.current_steps
-        current_idx = self.candidate_steps.index(old_steps)
-        old_idx = current_idx
 
         # Probe the smallest positive step after a zero-step nospec interval.
         if old_steps == 0:
+            current_idx = self.candidate_steps.index(old_steps)
             current_idx = min(current_idx + 1, len(self.candidate_steps) - 1)
             target = self.candidate_steps[current_idx]
             if target > 0 and self.ema_accept_len < 0:
@@ -213,42 +294,13 @@ class AdaptiveStepSlot:
             return self._apply_target_steps(old_steps, target)
 
         # TODO: Consider limiting step changes to avoid overshooting.
-        while current_idx > 0:
-            prev_step = self.candidate_steps[current_idx - 1]
-            # A zero-step candidate disables drafting. Treat zero accepted drafts
-            # as low enough to reach it when it is the floor candidate.
-            drop_threshold = 0.5 if prev_step == 0 else prev_step - 0.5
-            drop_threshold += self.down_hysteresis
-            if self.ema_accept_len <= drop_threshold:
-                current_idx -= 1
-            else:
-                break
-
-        moved_down = current_idx < old_idx
-        if not moved_down:
-            while current_idx < len(self.candidate_steps) - 1:
-                current_step = self.candidate_steps[current_idx]
-                rise_threshold = current_step - 0.5 + self.up_hysteresis
-                if self.ema_accept_len > rise_threshold:
-                    current_idx += 1
-                else:
-                    break
-
-        target = self.candidate_steps[current_idx]
-        # EMA ceiling: only caps downward — never blocks step-ups, so the
-        # system can explore higher steps and let the EMA catch up.
-        if self.ceiling_coeff > 0:
-            ceiling = max(1, math.ceil(self.ema_accept_len * self.ceiling_coeff))
-            if target > ceiling and target <= old_steps:
-                while current_idx > 0 and self.candidate_steps[current_idx] > ceiling:
-                    current_idx -= 1
-                target = self.candidate_steps[current_idx]
-
+        target = self.candidate_steps[self._walk_target_idx(self.ema_accept_len)]
         return self._apply_target_steps(old_steps, target)
 
     def _apply_target_steps(self, old_steps: int, target: int) -> bool:
         if target != old_steps:
             self.current_steps = target
+            self._dwell_remaining = self.min_dwell_batches
             log_info_on_rank0(
                 logger,
                 f"Adaptive spec params updated: steps {old_steps} -> {target} "
@@ -298,6 +350,35 @@ class AdaptiveSpeculativeParams:
 
     def get_steps_for_batch(self, batch_size: int) -> int:
         return self._route(batch_size).current_steps
+
+    def fresh_steps_for_batch(self, batch_size: int) -> int:
+        """DP vote: tier the pure shared-EMA threshold walk selects now."""
+        return self._route(batch_size).fresh_vote()
+
+    def slot_key_for_batch(self, batch_size: int) -> int:
+        """Config key of the slot *batch_size* routes to (DP EMA-fold key)."""
+        return self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
+
+    def get_ema_for_batch(self, batch_size: int) -> float:
+        """Live EMA of the routed slot (contributed to the DP gather)."""
+        return self._route(batch_size).ema_accept_len
+
+    def update_ema_only(
+        self, num_correct_drafts_per_req: list[int], batch_size: int
+    ) -> None:
+        """DP mode: feed verify results to the EMA, no local tier decision."""
+        self._route(batch_size).update_ema(num_correct_drafts_per_req)
+
+    def fold_shared_ema(self, per_slot_ema: dict[int, float]) -> None:
+        """Adopt per-slot cross-rank mean EMAs gathered over DP."""
+        for bs, ema in per_slot_ema.items():
+            slot = self._slots.get(bs)
+            if slot is not None:
+                slot.fold_shared_ema(ema)
+
+    def apply_consensus(self, batch_size: int, steps: int) -> None:
+        """Sync the routed slot's tier to the DP-consensus activation."""
+        self._route(batch_size).apply_consensus(steps)
 
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int

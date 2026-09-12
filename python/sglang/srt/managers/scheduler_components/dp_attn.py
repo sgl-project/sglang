@@ -98,11 +98,19 @@ class MLPSyncBatchInfo:
     # Gathered and min-reduced so every DP rank runs the same tier (equal
     # draft-token shapes → no NCCL buffer mismatch). Sentinel = no preference.
     local_adaptive_steps: int = ADAPTIVE_STEPS_SENTINEL
+    # Config key of the adaptive BS slot this rank's batch routes to, and that
+    # slot's EMA as int(ema * 1000) fixed point (-1 = no contribution, e.g.
+    # idle / not decoding). Gathered so every rank can fold the cross-rank
+    # per-slot mean into its slot — the shared-EMA vote (see fresh_vote()).
+    local_adaptive_slot_bs: int = -1
+    local_adaptive_ema_fp: int = -1
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     # min-reduced consensus tier across DP ranks; sentinel if none expressed.
     consensus_adaptive_steps: int = ADAPTIVE_STEPS_SENTINEL
+    # per-slot cross-rank mean EMA (slot config key → ema) for the fold.
+    adaptive_shared_ema: dict[int, float] = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
@@ -120,6 +128,8 @@ class MLPSyncBatchInfo:
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
                 self.local_adaptive_steps,
+                self.local_adaptive_slot_bs,
+                self.local_adaptive_ema_fp,
             ],
             device=device,
             dtype=dtype,
@@ -136,6 +146,8 @@ class MLPSyncBatchInfo:
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
                 ADAPTIVE_STEPS_SENTINEL,  # local_adaptive_steps (idle: no vote)
+                -1,  # local_adaptive_slot_bs (idle: no EMA contribution)
+                -1,  # local_adaptive_ema_fp
             ],
             device=device,
             dtype=dtype,
@@ -210,6 +222,18 @@ class MLPSyncBatchInfo:
         # Smaller tier is always a valid shape for every rank; larger is not.
         # Idle/non-adaptive ranks emit the sentinel and never win the min.
         self.consensus_adaptive_steps = int(tp0_info_cpu[:, 7].min())
+        # Shared-EMA fold input: per-slot mean of the gathered fixed-point
+        # EMAs, computed identically on every rank. Rows with slot key -1
+        # (idle / not decoding / not adaptive) contribute nothing.
+        per_slot_fp: dict[int, list[int]] = {}
+        for slot_bs, ema_fp in zip(
+            tp0_info_cpu[:, -2].tolist(), tp0_info_cpu[:, -1].tolist()
+        ):
+            if slot_bs >= 0:
+                per_slot_fp.setdefault(int(slot_bs), []).append(int(ema_fp))
+        self.adaptive_shared_ema = {
+            bs: sum(fps) / len(fps) / 1000.0 for bs, fps in per_slot_fp.items()
+        }
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -337,18 +361,26 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
-    # Each rank votes its locally-desired adaptive tier; min-reduced below so
+    # Each rank votes the tier a pure threshold walk over the DP-shared EMA
+    # selects right now (see AdaptiveStepSlot.fresh_vote); min-reduced below so
     # all ranks run identical draft-token shapes (no NCCL buffer mismatch).
+    # The vote is evaluated fresh every round, never read off a locally
+    # recomputed current_steps, so per-rank update_interval timing cannot
+    # diverge the votes. The slot key + EMA ride the same gather so every rank
+    # can fold the cross-rank mean EMA into its slot.
     local_adaptive_steps = ADAPTIVE_STEPS_SENTINEL
+    local_adaptive_slot_bs = -1
+    local_adaptive_ema_fp = -1
     adaptive_params = getattr(model_runner, "adaptive_spec_params", None)
     if (
         adaptive_params is not None
         and local_batch is not None
         and local_batch.forward_mode.is_decode()
     ):
-        local_adaptive_steps = adaptive_params.get_steps_for_batch(
-            local_batch.batch_size()
-        )
+        bs = local_batch.batch_size()
+        local_adaptive_steps = adaptive_params.fresh_steps_for_batch(bs)
+        local_adaptive_slot_bs = adaptive_params.slot_key_for_batch(bs)
+        local_adaptive_ema_fp = int(adaptive_params.get_ema_for_batch(bs) * 1000)
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
     if use_world_group:
@@ -371,6 +403,8 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         local_adaptive_steps=local_adaptive_steps,
+        local_adaptive_slot_bs=local_adaptive_slot_bs,
+        local_adaptive_ema_fp=local_adaptive_ema_fp,
     )
 
     if not skip_all_gather:
@@ -427,6 +461,11 @@ def prepare_mlp_sync_batch_raw(
         batch_to_gather.adaptive_consensus_steps = (
             consensus if consensus < ADAPTIVE_STEPS_SENTINEL else None
         )
+        # Shared-EMA fold: every rank adopts the same per-slot mean EMA, so
+        # the next round's fresh vote is identical on every rank and the
+        # min() consensus degenerates to a no-op safety net.
+        if mlp_sync_info.adaptive_shared_ema and adaptive_params is not None:
+            adaptive_params.fold_shared_ema(mlp_sync_info.adaptive_shared_ema)
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info

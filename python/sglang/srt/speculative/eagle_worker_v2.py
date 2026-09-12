@@ -1156,7 +1156,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # scheduler's MLP-sync all_gather; honor that consensus so every
             # rank runs identical draft-token shapes. Otherwise route locally.
             if batch.adaptive_consensus_steps is not None:
-                self.activate_step(batch.adaptive_consensus_steps)
+                self.activate_step(
+                    batch.adaptive_consensus_steps,
+                    batch_size=int(batch.seq_lens.shape[0]),
+                )
             else:
                 self.activate_step_by_batch(batch.seq_lens.shape[0])
 
@@ -1312,9 +1315,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self.adaptive_controller is not None:
             self.adaptive_controller.activate_step_by_batch(batch_size)
 
-    def activate_step(self, speculative_num_steps: int) -> None:
+    def activate_step(
+        self, speculative_num_steps: int, batch_size: int | None = None
+    ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step(speculative_num_steps)
+            self.adaptive_controller.activate_step(
+                speculative_num_steps, batch_size=batch_size
+            )
 
     # -- Adaptive speculative decoding protocol --
 
