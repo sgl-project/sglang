@@ -209,9 +209,9 @@ def _build_response(
     peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
     rollout_trajectory_data = result.rollout_trajectory_data
     if rollout:
-        assert (
-            rollout_trajectory_data is not None
-        ), "rollout_trajectory_data must be present when rollout=True"
+        assert rollout_trajectory_data is not None, (
+            "rollout_trajectory_data must be present when rollout=True"
+        )
 
     serialized_dit_timesteps = None
     serialized_dit_sigmas = None

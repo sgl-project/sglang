@@ -441,6 +441,22 @@ class SglExt(BaseModel):
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
         None
     )
+    input_ids: Optional[List[int]] = None
+    output_ids: Optional[List[List[int]]] = None
+
+    def split_ids(self) -> Tuple[Optional[SglExt], Optional[SglExt]]:
+        """Split set fields into (non_ids, ids); a side with no set fields is None."""
+        non_ids: Dict[str, Any] = {}
+        ids: Dict[str, Any] = {}
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            (ids if name in ("input_ids", "output_ids") else non_ids)[name] = value
+        return (
+            type(self)(**non_ids) if non_ids else None,
+            type(self)(**ids) if ids else None,
+        )
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -566,6 +582,10 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
+    max_tokens_per_frame: Optional[int] = None
+    max_image_tokens: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -865,6 +885,8 @@ class ChatCompletionRequest(BaseModel):
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
+    return_input_ids_in_sglext: bool = False
+    return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
@@ -1630,6 +1652,18 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
+
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -1646,6 +1680,11 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
@@ -2025,6 +2064,7 @@ class MessageProcessingResult:
     tool_call_constraint: Optional[ToolCallConstraint] = None
     skip_special_tokens: bool = True
     require_reasoning: bool = False
+    reasoning_end_token_ids: Optional[List[int]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
