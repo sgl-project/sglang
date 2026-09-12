@@ -17,6 +17,7 @@ from sglang.srt.utils.common import (
     Range,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
+    is_npu,
     is_pin_memory_available,
 )
 from sglang.srt.utils.weight_versions import (
@@ -2839,8 +2840,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         cache_chunk_size = mamba_cache_chunk_size()
-        state_chunk_size = getattr(
-            self.model_config.hf_text_config, "mamba_chunk_size", 64
+        state_chunk_size = (
+            getattr(self.model_config.hf_text_config, "mamba_chunk_size", 64)
+            if not is_npu()
+            else cache_chunk_size
         )
         # Donated depth must land on the actual DCP-widened radix page, while
         # kernel snapshots stay on the cache chunk grid.
