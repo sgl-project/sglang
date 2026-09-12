@@ -121,8 +121,6 @@ def _is_fi_a2a_supported(**topology: int) -> bool:
 
 
 def _dcp_comm_backend_default(view: Any) -> dict:
-    """fi_a2a where the DCP group shares an MNNVL domain, else a2a on
-    CUDA/ROCm, else ag_rs. An explicit --dcp-comm-backend wins."""
     if view.dcp_comm_backend is not None:
         return {}
     if view.dcp_size <= 1:

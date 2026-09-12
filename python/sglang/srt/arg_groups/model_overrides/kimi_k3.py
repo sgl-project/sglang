@@ -129,7 +129,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
             )
 
-        # dcp_comm_backend is resolved generically in handle_dcp_defaults.
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
             "a2a",
             "fi_a2a",

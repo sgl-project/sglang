@@ -3408,8 +3408,6 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
 
 
 class TestDcpCommBackendDefault(CustomTestCase):
-    """An unset --dcp-comm-backend resolves per platform; explicit input wins."""
-
     def _resolved(self, **fields):
         args = ServerArgs(model_path="dummy", tp_size=8, **fields)
         parallel_hook.handle_dcp_defaults(args)
