@@ -93,6 +93,18 @@ class CosmosDreamsGeometry(msgspec.Struct, frozen=True):
         return self.vision_tokens_per_frame + action_tokens_per_frame
 
 
+class PreparedConditioning(msgspec.Struct, frozen=True):
+    """Request-level inputs shared by the offline rollout and realtime ticks."""
+
+    geometry: CosmosDreamsGeometry
+    canvas: tuple[int, int]
+    text_ids: torch.Tensor
+    text_mask: torch.Tensor
+    embodiment: str
+    domain_id: int
+    image_latent: torch.Tensor | None
+
+
 def resolve_geometry(
     *, height: int, width: int, manifest: CosmosDreamsManifest, max_pixels: int
 ) -> CosmosDreamsGeometry:
@@ -686,8 +698,10 @@ class CosmosDreamsPrepareStage(PipelineStage):
             )
         return latent
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        device = get_local_torch_device()
+    def _prepare_conditioning(
+        self, batch: Req, device: torch.device
+    ) -> PreparedConditioning:
+        """Resolve canvas, prompt tokens, embodiment, and the conditioning latent."""
         manifest = self.manifest
         geometry = resolve_geometry(
             height=batch.height,
@@ -695,10 +709,6 @@ class CosmosDreamsPrepareStage(PipelineStage):
             manifest=manifest,
             max_pixels=self.max_pixels,
         )
-        target_frame = latent_frame_count(
-            batch.num_frames, manifest.temporal_compression_factor
-        )
-
         prompt = single_prompt(batch.prompt)
         if batch.sampling_params.format_prompt_as_json:
             prompt = format_dreams_prompt(
@@ -711,22 +721,13 @@ class CosmosDreamsPrepareStage(PipelineStage):
         text_ids, text_mask = tokenize_dreams_prompt(
             self.tokenizer, prompt, device=device
         )
-
         sampling_params = batch.sampling_params
         contract = manifest.action_contract
         embodiment = contract.resolve_embodiment(
             sampling_params.domain_name, sampling_params.domain_id
         )
-        domain_id = contract.embodiments[embodiment].domain_id
-        rows = self._prepare_action_rows(
-            sampling_params.action, embodiment=embodiment, target_frame=target_frame
-        )
-        if rows is None:
-            self.log_warning(
-                "No action supplied; every latent frame is conditioned on the null action."
-            )
-
         canvas = (geometry.height, geometry.width)
+        image_latent = None
         if batch.preprocessed_image is not None:
             latent = self._encode_image_latent(
                 batch.preprocessed_image, geometry, device
@@ -737,18 +738,47 @@ class CosmosDreamsPrepareStage(PipelineStage):
                 content_size=batch.extra[EXTRA_CONTENT_SIZE],
                 manifest=manifest,
             )
-            batch.image_latent = latent[
+            image_latent = latent[
                 ..., : geometry.latent_height, : geometry.latent_width
             ].contiguous()
+        return PreparedConditioning(
+            geometry=geometry,
+            canvas=canvas,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            embodiment=embodiment,
+            domain_id=contract.embodiments[embodiment].domain_id,
+            image_latent=image_latent,
+        )
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        device = get_local_torch_device()
+        manifest = self.manifest
+        prepared = self._prepare_conditioning(batch, device)
+        geometry = prepared.geometry
+        target_frame = latent_frame_count(
+            batch.num_frames, manifest.temporal_compression_factor
+        )
+        rows = self._prepare_action_rows(
+            batch.sampling_params.action,
+            embodiment=prepared.embodiment,
+            target_frame=target_frame,
+        )
+        if rows is None:
+            self.log_warning(
+                "No action supplied; every latent frame is conditioned on the null action."
+            )
+        if prepared.image_latent is not None:
+            batch.image_latent = prepared.image_latent
             batch.height, batch.width = geometry.height, geometry.width
 
         batch.extra[EXTRA_GEOMETRY] = geometry
-        batch.extra[EXTRA_TEXT_IDS] = text_ids
-        batch.extra[EXTRA_TEXT_MASK] = text_mask
+        batch.extra[EXTRA_TEXT_IDS] = prepared.text_ids
+        batch.extra[EXTRA_TEXT_MASK] = prepared.text_mask
         batch.extra[EXTRA_ACTION_ROWS] = (
             None if rows is None else rows.to(device=device)
         )
-        batch.extra[EXTRA_DOMAIN_ID] = domain_id
+        batch.extra[EXTRA_DOMAIN_ID] = prepared.domain_id
         batch.extra[EXTRA_TARGET_LATENT_FRAMES] = target_frame
         batch.raw_latent_shape = (
             1,
@@ -758,11 +788,11 @@ class CosmosDreamsPrepareStage(PipelineStage):
             geometry.latent_width,
         )
         self.log_info(
-            f"Prepared Cosmos-Dreams request: canvas {canvas[0]}x{canvas[1]}, "
+            f"Prepared Cosmos-Dreams request: canvas {prepared.canvas[0]}x{prepared.canvas[1]}, "
             f"generated {geometry.height}x{geometry.width} "
             f"(latent {geometry.latent_height}x{geometry.latent_width}), "
-            f"{target_frame} latent frames, embodiment={embodiment} (domain {domain_id}), "
-            f"{text_ids.shape[1]} text tokens, image={'yes' if batch.image_latent is not None else 'no'}"
+            f"{target_frame} latent frames, embodiment={prepared.embodiment} (domain {prepared.domain_id}), "
+            f"{prepared.text_ids.shape[1]} text tokens, image={'yes' if batch.image_latent is not None else 'no'}"
         )
         return batch
 

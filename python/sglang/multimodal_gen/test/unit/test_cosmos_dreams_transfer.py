@@ -106,6 +106,11 @@ class _FakeTokenizer:
 
 
 class TestTransferManifest(unittest.TestCase):
+    def test_transfer_defaults_describe_a_distilled_model(self):
+        self.assertEqual(CosmosDreamsTransferSamplingParams().guidance_scale, 1.0)
+        deployment = CosmosDreamsTransferConfig().get_model_deployment_config()
+        self.assertFalse(deployment.supports_cfg_parallel)
+
     def test_control_video_contract_parses(self):
         self.assertEqual(MANIFEST.conditioning_mode, "control_video")
         self.assertEqual(

@@ -35,6 +35,8 @@ COSMOS_DREAMS_480P_CANVASES: tuple[tuple[int, int], ...] = (
 class CosmosDreamsSamplingParams(Cosmos3SamplingParams):
     fps: int = COSMOS_DREAMS_DEFAULT_FPS
     num_frames: int = 81
+    # Guidance is distilled into the weights; the rollout runs one branch.
+    guidance_scale: float = 1.0
 
     supported_resolutions: list[tuple[int, int]] | None = field(
         default_factory=lambda: list(COSMOS_DREAMS_480P_CANVASES)

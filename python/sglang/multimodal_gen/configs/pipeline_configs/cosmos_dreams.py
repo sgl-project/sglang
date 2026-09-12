@@ -8,7 +8,8 @@ causal transformer class.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     ACTION_CONDITIONING_MODE,
@@ -17,6 +18,9 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     _transformer_config,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
 )
 
 # Deployment default from the reference Cosmos-Dreams deployment: 720x1280.
@@ -72,6 +76,27 @@ class CosmosDreamsConfig(Cosmos3Config):
                 "Cosmos-Dreams scheduler and transformer manifests define different "
                 f"fixed-step schedules: scheduler={self.distilled_sigmas}, "
                 f"transformer={list(manifest.t_list)}."
+            )
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # Distilled checkpoints run one conditional branch per step, so CFG
+        # parallel would only duplicate the rollout on a second GPU.
+        return replace(
+            super().get_model_deployment_config(),
+            auto_enable_cfg_parallel=False,
+            supports_cfg_parallel=False,
+        )
+
+    def validate_server_args(self, server_args: Any) -> None:
+        super().validate_server_args(server_args)
+        # The launcher hands GPUs left over after dp/tp/cfg to sequence
+        # parallelism; the causal transformer only runs a chunk on one rank.
+        if int(server_args.sp_degree or 1) > 1:
+            raise ValueError(
+                f"{type(self).__name__} does not support sequence parallelism "
+                f"(resolved sp_degree={server_args.sp_degree} for "
+                f"num_gpus={server_args.num_gpus}). Use --dp-size <num_gpus> for "
+                "independent replicas or --tp-size <num_gpus> to shard the transformer."
             )
 
     def supports_action_endpoint(self) -> bool:

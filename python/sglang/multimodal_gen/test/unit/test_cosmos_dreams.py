@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_realtime import (
+    CosmosDreamsRealtimeConfig,
 )
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos_dreams import (
@@ -569,6 +573,21 @@ class TestCosmosDreamsSamplingParams(unittest.TestCase):
         self.assertTrue(params.format_prompt_as_json)
         self.assertFalse(params.canvas_from_image)
         self.assertEqual(CosmosDreamsConfig().canvas_tier, "480")
+
+    def test_distilled_checkpoints_never_use_cfg_parallel(self):
+        deployment = CosmosDreamsConfig().get_model_deployment_config()
+        self.assertFalse(deployment.auto_enable_cfg_parallel)
+        self.assertFalse(deployment.supports_cfg_parallel)
+        self.assertIn("dit", deployment.keep_resident_components)
+        # The launcher's auto-CFG heuristic reads the default params.
+        self.assertEqual(CosmosDreamsSamplingParams().guidance_scale, 1.0)
+
+    def test_sequence_parallel_layouts_are_rejected_with_a_hint(self):
+        # `--num-gpus 2` alone resolves to sp_degree=2 in the launcher.
+        for config in (CosmosDreamsConfig(), CosmosDreamsRealtimeConfig()):
+            config.validate_server_args(SimpleNamespace(sp_degree=1, num_gpus=1))
+            with self.assertRaisesRegex(ValueError, "--dp-size"):
+                config.validate_server_args(SimpleNamespace(sp_degree=2, num_gpus=2))
 
 
 class TestCosmosDreamsPromptAndCanvas(unittest.TestCase):

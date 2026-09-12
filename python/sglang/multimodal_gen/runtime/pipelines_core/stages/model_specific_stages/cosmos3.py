@@ -2306,14 +2306,11 @@ class Cosmos3DecodingStage(PipelineStage):
         result.add_check("latents", batch.latents, V.is_tensor)
         return result
 
-    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latents to video frames. Returns tensor in [B, C, T, H, W] format."""
+    def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Undo the VAE latent normalization and cast to the VAE dtype."""
         device = latents.device
-        # Get VAE dtype from its parameters
         vae_dtype = next(self.vae.parameters()).dtype
         latents = latents.to(vae_dtype)
-
-        # Apply latent normalization if configured
         if hasattr(self.vae.config, "latents_mean") and hasattr(
             self.vae.config, "latents_std"
         ):
@@ -2328,10 +2325,13 @@ class Cosmos3DecodingStage(PipelineStage):
                     .view(1, -1, 1, 1, 1)
                     .to(device, vae_dtype)
                 )
-            latents = (latents * self._latents_std) + self._latents_mean
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latents = latents / scaling_factor
+            return (latents * self._latents_std) + self._latents_mean
+        scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        return latents / scaling_factor
+
+    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode latents to video frames. Returns tensor in [B, C, T, H, W] format."""
+        latents = self._denormalize_latents(latents)
 
         # Decode - returns [B, C, T, H, W]
         video = self.vae.decode(latents)

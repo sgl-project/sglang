@@ -28,11 +28,17 @@ def _register_builtin_realtime_model_adapters() -> None:
     if _BUILTIN_ADAPTERS_REGISTERED:
         return
 
+    from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_realtime import (
+        CosmosDreamsRealtimeConfig,
+    )
     from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
         LingBotWorldCausalDMDConfig,
     )
     from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
         SanaWMRealtimeConfig,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.cosmos_dreams_realtime_adapter import (
+        CosmosDreamsRealtimeAdapter,
     )
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.lingbot_world_realtime_adapter import (
         LingBotWorldRealtimeAdapter,
@@ -41,6 +47,10 @@ def _register_builtin_realtime_model_adapters() -> None:
         SanaWMRealtimeAdapter,
     )
 
+    register_realtime_model_adapter(
+        CosmosDreamsRealtimeConfig,
+        CosmosDreamsRealtimeAdapter,
+    )
     register_realtime_model_adapter(
         LingBotWorldCausalDMDConfig,
         LingBotWorldRealtimeAdapter,

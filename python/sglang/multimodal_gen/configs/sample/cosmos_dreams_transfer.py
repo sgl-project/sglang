@@ -28,6 +28,8 @@ class CosmosDreamsTransferSamplingParams(Cosmos3SamplingParams):
     num_frames: int = COSMOS_DREAMS_TRANSFER_MAX_FRAMES
     # Replaced by the control clip's frame rate unless the request sets it.
     fps: int = 24
+    # Guidance is distilled into the weights; the rollout runs one branch.
+    guidance_scale: float = 1.0
 
     supported_resolutions: list[tuple[int, int]] | None = field(
         default_factory=lambda: list(COSMOS_DREAMS_480P_CANVASES)
