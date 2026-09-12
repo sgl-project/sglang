@@ -66,7 +66,7 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             vocab_size=4,
             has_custom_logit_processor=True,
             custom_params=params,
-            custom_logit_processor={0: (processor, torch.tensor([True, False, True]))},
+            custom_logit_processor={0: (processor, [0, 2], torch.tensor([0, 2]))},
             device="cpu",
         )
         logits = torch.zeros(batch_size * num_tokens, 4)
@@ -79,6 +79,39 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             [[1.0] * 4, [1.0] * 4, [0.0] * 4, [0.0] * 4, [3.0] * 4, [3.0] * 4]
         )
         self.assertTrue(torch.equal(logits, expected))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_decode_does_not_read_row_indices_back_to_cpu(self):
+        def processor(logits, params):
+            for row, param in zip(logits, params, strict=True):
+                row.narrow(0, param["token_id"], 1).fill_(-float("inf"))
+            return logits
+
+        info = MagicMock()
+        info.__len__.return_value = 3
+        info.custom_params = [{"token_id": 1}, None, {"token_id": 2}]
+        info.custom_logit_processor = {
+            0: (processor, [0, 2], torch.tensor([0, 2], device="cuda"))
+        }
+        for width in (1, 3):
+            with self.subTest(width=width):
+                logits = torch.zeros(3 * width, 4, device="cuda")
+                apply_custom_logit_processor(logits, info, width)
+                torch.cuda.synchronize()
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU]
+                ) as profile:
+                    apply_custom_logit_processor(logits, info, width)
+                names = {event.key for event in profile.key_averages()}
+                self.assertNotIn("aten::nonzero", names)
+                self.assertNotIn("aten::_local_scalar_dense", names)
+                self.assertNotIn("cudaStreamSynchronize", names)
+                expected = torch.zeros(3, 4)
+                expected[0, 1] = -float("inf")
+                expected[2, 2] = -float("inf")
+                self.assertTrue(
+                    torch.equal(logits.cpu(), expected.repeat_interleave(width, dim=0))
+                )
 
 
 # Serialization round-trip
