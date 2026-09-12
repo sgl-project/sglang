@@ -59,6 +59,16 @@ CLIENT_FAILURE_PATTERNS = {
     "retries": re.compile(r"\bretr(?:y|ies|ied|ying)\b", re.IGNORECASE),
     "timeouts": re.compile(r"\b(?:timed out|timeouts?)\b", re.IGNORECASE),
 }
+STARTUP_BENIGN_LINE_PATTERNS = (
+    re.compile(
+        r"Tokenizer for .* is still TokenizersBackend after retries with "
+        r"--trust-remote-code\. Model-specific tokenizer attributes may be missing\."
+    ),
+    re.compile(
+        r"Ignore import error when loading "
+        r"sglang\.srt\.multimodal\.processors\.[^:]+:"
+    ),
+)
 
 
 def sha256(path: Path) -> str:
@@ -529,6 +539,16 @@ def measured_audit(
 
 def startup_audit(log_path: Path, end: int, output: Path) -> dict:
     data, matches = log_segment(log_path, 0, end)
+    text = data.decode(errors="replace")
+    relevant_text = "\n".join(
+        line
+        for line in text.splitlines()
+        if not any(pattern.search(line) for pattern in STARTUP_BENIGN_LINE_PATTERNS)
+    )
+    for category in ("errors", "retries"):
+        matches[category] = sorted(
+            set(FAILURE_PATTERNS[category].findall(relevant_text))
+        )
     failures = []
     for category in ("errors", "retries"):
         if matches[category]:
@@ -1602,6 +1622,29 @@ def run_test_only(output: Path | None) -> None:
             "measured offset contract failed",
         )
         passed("measured_offset_excludes_startup_jit")
+        server_log.write_text(
+            "Tokenizer for /model is still TokenizersBackend after retries with "
+            "--trust-remote-code. Model-specific tokenizer attributes may be missing.\n"
+            "Ignore import error when loading "
+            "sglang.srt.multimodal.processors.optional: dependency unavailable\n"
+        )
+        require(
+            startup_audit(
+                server_log, server_log.stat().st_size, role_dir / "startup.json"
+            )["status"]
+            == "pass",
+            "known optional startup warnings were treated as runtime failures",
+        )
+        server_log.write_text("RuntimeError: real startup failure\n")
+        expect_failure(
+            "startup_runtime_error_rejected",
+            lambda: startup_audit(
+                server_log, server_log.stat().st_size, role_dir / "startup.json"
+            ),
+            contains="errors",
+        )
+        server_log.write_text(startup + post)
+        write_thermal()
         expect_failure(
             "measured_log_shrink_rejected",
             lambda: log_segment(server_log, 10, 9),
