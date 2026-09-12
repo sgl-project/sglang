@@ -86,7 +86,7 @@ fn sibling_path(source: &str, file: &str) -> Option<std::path::PathBuf> {
             }
             Err(e) => {
                 tracing::warn!(repo = %source, %file, error = %e,
-                    "could not download; chat-encoder detection may be degraded for this model \
+                    "could not download; chat-formatter detection may be degraded for this model \
                      (expected if the repo ships none, otherwise check HF_TOKEN / network)");
                 return None;
             }

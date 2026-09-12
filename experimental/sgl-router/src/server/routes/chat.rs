@@ -231,24 +231,22 @@ pub async fn chat_completions(
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
 
-    // Render for routing and possible offload, independently of forwarding eligibility.
-    let want_tokens = should_tokenize_request(
-        ctx.tokenizers.has_chat_encoder(&model_str),
+    let request_value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("invalid request: body must be a JSON object".into()))?;
+    let eligible_for_input_id_forwarding = input_ids_safe_to_forward(&request_value);
+
+    // Resolve IDs only when a consumer needs them. Formatter availability is
+    // handled by the rendering path, independently of this decision.
+    let resolve_tokens_at_ingress = should_resolve_request_tokens(
         policy.needs_request_tokens(),
         ctx.bucket_selector.is_enabled(),
+        eligible_for_input_id_forwarding,
     );
-    let request_value: Option<serde_json::Value> = if want_tokens {
-        Some(serde_json::from_slice(&body).map_err(|_| {
-            ApiError::BadRequest("invalid request: body must be a JSON object".into())
-        })?)
-    } else {
-        None
-    };
 
     // Routing can use these IDs even when engine forwarding is blocked.
-    let request_tokens = request_value
-        .as_ref()
-        .and_then(|v| resolve_request_tokens(&ctx.tokenizers, &model_id, v));
+    let request_tokens = resolve_tokens_at_ingress
+        .then(|| resolve_request_tokens(&ctx.tokenizers, &model_id, &request_value))
+        .flatten();
     let external_prefix = match (
         ctx.prefix_index.as_ref(),
         request_tokens.as_ref(),
@@ -741,20 +739,19 @@ pub async fn chat_completions(
     };
 
     // Successful rendering alone does not establish engine parity.
-    let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
-    {
-        (Some(t), Some(v)) if t.chat_rendered && input_ids_safe_to_forward(v) => {
-            Some(t.ids.as_slice())
-        }
-        _ => None,
-    };
+    let forward_input_ids = request_tokens
+        .as_ref()
+        .filter(|t| eligible_for_input_id_forwarding && t.chat_rendered)
+        .map(|t| t.ids.as_slice());
 
-    // Count rendering failures, not deliberate forwarding omissions.
-    if ingress_tokenize_offload_failed(
-        ctx.tokenizers.has_chat_encoder(&model_str),
-        request_value.as_ref(),
-        request_tokens.as_ref(),
-    ) {
+    // Count failures only when token resolution was attempted.
+    if resolve_tokens_at_ingress
+        && ingress_tokenize_offload_failed(
+            ctx.tokenizers.has_chat_formatter(&model_str),
+            Some(&request_value),
+            request_tokens.as_ref(),
+        )
+    {
         ctx.metrics.record_ingress_tokenize_error(&metrics_model);
     }
 
@@ -770,8 +767,12 @@ pub async fn chat_completions(
     // Build the body forwarded to the engine(s) exactly once — injecting the
     // `input_ids` and/or bootstrap fields, or forwarding the original bytes
     // untouched when neither applies.
-    let outgoing_body =
-        build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+    let outgoing_body = build_outgoing_body(
+        &body,
+        Some(request_value),
+        forward_input_ids,
+        bootstrap.as_ref(),
+    )?;
 
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
@@ -1116,12 +1117,13 @@ fn parse_optional_positive_f64_header(
     Ok(Some(parsed))
 }
 
-fn should_tokenize_request(
-    has_chat_encoder: bool,
+// Resolution reuses caller input_ids when present; otherwise it may render and tokenize.
+fn should_resolve_request_tokens(
     policy_needs_request_tokens: bool,
     bucket_enabled: bool,
+    eligible_for_input_id_forwarding: bool,
 ) -> bool {
-    has_chat_encoder || policy_needs_request_tokens || bucket_enabled
+    policy_needs_request_tokens || bucket_enabled || eligible_for_input_id_forwarding
 }
 
 /// Estimate prefill-token count from the raw request body for use as
@@ -1232,6 +1234,9 @@ fn build_outgoing_body(
 /// `response_format` is not gated: neither side renders it into the prompt.
 /// Assumes the router and workers share tokenizer, template, and defaults.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
+    if !value.get("messages").is_some_and(|m| m.is_array()) {
+        return false;
+    }
     if request_has_tools(value) || request_is_multimodal(value) {
         return false;
     }
@@ -1261,13 +1266,13 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     !last_message_is_assistant(value)
 }
 
-/// A chat renderer was available but failed to produce prompt IDs.
+/// A chat formatter was available but failed to produce prompt IDs.
 fn ingress_tokenize_offload_failed(
-    has_chat_encoder: bool,
+    has_chat_formatter: bool,
     request_value: Option<&serde_json::Value>,
     request_tokens: Option<&RequestTokens>,
 ) -> bool {
-    if !has_chat_encoder {
+    if !has_chat_formatter {
         return false;
     }
     let chat_request = request_value.is_some_and(|v| {
@@ -1398,8 +1403,8 @@ mod tests {
 
     #[test]
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {
-        assert!(should_tokenize_request(false, false, true));
-        assert!(!should_tokenize_request(false, false, false));
+        assert!(should_resolve_request_tokens(false, true, false));
+        assert!(!should_resolve_request_tokens(false, false, false));
     }
 
     #[test]
@@ -1714,17 +1719,17 @@ mod tests {
         ));
     }
 
-    /// A chat request on a chat-encoder model whose tokenization yielded NO
+    /// A chat request on a chat-formatter model whose tokenization yielded NO
     /// tokens (encode_chat returned None → request_tokens None) IS a failure:
     /// the encoder should have fired but didn't.
     #[test]
-    fn offload_failed_true_when_chat_encoder_request_has_no_tokens() {
+    fn offload_failed_true_when_chat_formatter_request_has_no_tokens() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(ingress_tokenize_offload_failed(true, Some(&value), None));
     }
 
-    /// Encode produced ids but NOT via the chat encoder (raw fallback,
-    /// `chat_rendered = false`) on a chat-encoder model + chat request →
+    /// Encode produced ids but NOT via the chat formatter (raw fallback,
+    /// `chat_rendered = false`) on a chat-formatter model + chat request →
     /// the chat-encode render/encode failed and fell through to the raw path.
     #[test]
     fn offload_failed_true_when_tokens_not_chat_rendered() {
@@ -1740,10 +1745,10 @@ mod tests {
         ));
     }
 
-    /// Non-chat-encoder models never expected the offload → not a failure even
+    /// Non-chat-formatter models never expected the offload → not a failure even
     /// with no tokens.
     #[test]
-    fn offload_failed_false_without_chat_encoder() {
+    fn offload_failed_false_without_chat_formatter() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(!ingress_tokenize_offload_failed(false, Some(&value), None));
     }

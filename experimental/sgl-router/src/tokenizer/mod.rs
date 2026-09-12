@@ -2,25 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod adapter;
-pub mod chat_encoder;
+pub mod chat_formatter;
 
 use anyhow::Result;
-use chat_encoder::ChatEncoder;
+use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// A model's chat encoder plus its fallback-logging state.
-struct ChatEncoderEntry {
-    encoder: ChatEncoder,
+/// A model's chat formatter plus its fallback-logging state.
+struct ChatFormatterEntry {
+    formatter: ChatFormatter,
     fallback_warned: AtomicBool,
 }
 
-impl ChatEncoderEntry {
-    fn new(encoder: ChatEncoder) -> Self {
+impl ChatFormatterEntry {
+    fn new(formatter: ChatFormatter) -> Self {
         Self {
-            encoder,
+            formatter,
             fallback_warned: AtomicBool::new(false),
         }
     }
@@ -33,11 +33,11 @@ impl ChatEncoderEntry {
     fn log_fallback(&self, model_id: &str, cause: &str) {
         if !self.fallback_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(model = %model_id, %cause,
-                "chat-encoder failed; falling back to raw prompt-text hashing \
+                "chat-formatter failed; falling back to raw prompt-text hashing \
                  (cache-aware overlap degrades for this model; further failures log at debug)");
         } else {
             tracing::debug!(model = %model_id, %cause,
-                "chat-encoder failed; falling back to raw prompt-text hashing");
+                "chat-formatter failed; falling back to raw prompt-text hashing");
         }
     }
 }
@@ -45,9 +45,9 @@ impl ChatEncoderEntry {
 #[derive(Default)]
 pub struct TokenizerRegistry {
     inner: DashMap<String, Arc<Tokenizer>>,
-    /// Per-model chat encoder, present only when the model's prompt format is
+    /// Per-model chat formatter, present only when the model's prompt format is
     /// known; models without one fall back to raw prompt-text tokenization.
-    encoders: DashMap<String, Arc<ChatEncoderEntry>>,
+    formatters: DashMap<String, Arc<ChatFormatterEntry>>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -64,17 +64,21 @@ impl TokenizerRegistry {
         let m = &cfg.model;
         let t = adapter::load(&m.tokenizer_path)?;
         me.inner.insert(m.id.clone(), t);
-        if let Some(encoder) = me.resolve_chat_encoder(&m.id, &m.tokenizer_path) {
-            me.encoders
-                .insert(m.id.clone(), Arc::new(ChatEncoderEntry::new(encoder)));
+        if let Some(formatter) = me.resolve_chat_formatter(&m.id, &m.tokenizer_path) {
+            me.formatters
+                .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
         }
         Ok(me)
     }
 
-    /// Pick the chat encoder for a model, logging the outcome on every branch.
+    /// Pick the chat formatter for a model, logging the outcome on every branch.
     /// Like the engine, in-code families skip a shipped template; otherwise the
-    /// HF template wins, then Dynamo's built-in encoder, then none.
-    fn resolve_chat_encoder(&self, model_id: &str, tokenizer_path: &str) -> Option<ChatEncoder> {
+    /// HF template wins, then Dynamo's built-in formatter, then none.
+    fn resolve_chat_formatter(
+        &self,
+        model_id: &str,
+        tokenizer_path: &str,
+    ) -> Option<ChatFormatter> {
         let warn = |file, e: anyhow::Error| tracing::warn!(model = %model_id, %file, error = %e, "failed to load");
         let load_json = |file| {
             adapter::load_sibling_json(tokenizer_path, file).unwrap_or_else(|e| {
@@ -84,52 +88,52 @@ impl TokenizerRegistry {
         };
         let model_type =
             load_json("config.json").and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
-        if !ChatEncoder::engine_ignores_template(model_type.as_deref()) {
+        if !ChatFormatter::engine_ignores_template(model_type.as_deref()) {
             let cfg = load_json("tokenizer_config.json").unwrap_or_else(|| serde_json::json!({}));
             let jinja = adapter::load_sibling_text(tokenizer_path, "chat_template.jinja")
                 .unwrap_or_else(|e| {
                     warn("chat_template.jinja", e);
                     None
                 });
-            match ChatEncoder::from_tokenizer_config(&cfg, jinja.as_deref()) {
-                Ok(Some(encoder)) => {
+            match ChatFormatter::from_tokenizer_config(&cfg, jinja.as_deref()) {
+                Ok(Some(formatter)) => {
                     tracing::info!(model = %model_id,
                         "chat-template routing enabled; chat requests route by templated tokens");
-                    return Some(encoder);
+                    return Some(formatter);
                 }
                 Ok(None) => {}
                 Err(e) => tracing::warn!(model = %model_id, error = %e,
                     "failed to compile chat template; falling back to built-in detection"),
             }
         }
-        let encoder = ChatEncoder::native(model_type.as_deref(), model_id);
-        match &encoder {
+        let formatter = ChatFormatter::native(model_type.as_deref(), model_id);
+        match &formatter {
             Some(_) => tracing::info!(model = %model_id, ?model_type,
-                "built-in chat encoder enabled; chat requests route by encoded tokens"),
+                "built-in chat formatter enabled; chat requests route by encoded tokens"),
             None => tracing::info!(model = %model_id,
-                "no chat template or built-in encoder; chat traffic routes via raw prompt text"),
+                "no chat template or built-in formatter; chat traffic routes via raw prompt text"),
         }
-        encoder
+        formatter
     }
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
         self.inner.get(model_id).map(|r| Arc::clone(&*r))
     }
 
-    /// Whether this model has a chat encoder (and thus the chat-aware
+    /// Whether this model has a chat formatter (and thus the chat-aware
     /// tokenization path is available for it).
-    pub fn has_chat_encoder(&self, model_id: &str) -> bool {
-        self.encoders.contains_key(model_id)
+    pub fn has_chat_formatter(&self, model_id: &str) -> bool {
+        self.formatters.contains_key(model_id)
     }
 
     /// Render with Dynamo and tokenize; return `None` when unavailable or unsuccessful.
     pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
-        let entry = Arc::clone(&*self.encoders.get(model_id)?);
+        let entry = Arc::clone(&*self.formatters.get(model_id)?);
         let tokenizer = self.get(model_id)?;
         let rendered = entry
-            .encoder
+            .formatter
             .render(request)
             .inspect_err(|e| {
                 // `{e:#}` prints the full anyhow chain, so the minijinja cause is visible.
@@ -153,18 +157,18 @@ impl TokenizerRegistry {
         self.inner.iter().map(|kv| kv.key().clone()).collect()
     }
 
-    /// Attach a chat encoder to an already-loaded model. Lets policy tests in
+    /// Attach a chat formatter to an already-loaded model. Lets policy tests in
     /// other modules exercise the chat-aware routing path without a co-located
     /// fixture.
     #[cfg(test)]
-    pub(crate) fn attach_chat_encoder_for_test(&self, model_id: &str, encoder: ChatEncoder) {
-        self.encoders.insert(
+    pub(crate) fn attach_chat_formatter_for_test(&self, model_id: &str, formatter: ChatFormatter) {
+        self.formatters.insert(
             model_id.to_string(),
-            Arc::new(ChatEncoderEntry::new(encoder)),
+            Arc::new(ChatFormatterEntry::new(formatter)),
         );
     }
 
-    /// Convenience: attach a Jinja chat encoder built from an inline
+    /// Convenience: attach a Jinja chat formatter built from an inline
     /// `tokenizer_config.json` value.
     #[cfg(test)]
     pub(crate) fn attach_chat_template_for_test(
@@ -172,10 +176,10 @@ impl TokenizerRegistry {
         model_id: &str,
         tokenizer_config: &serde_json::Value,
     ) {
-        let encoder = ChatEncoder::from_tokenizer_config(tokenizer_config, None)
+        let formatter = ChatFormatter::from_tokenizer_config(tokenizer_config, None)
             .expect("valid test chat template")
             .expect("test tokenizer_config has a chat_template");
-        self.attach_chat_encoder_for_test(model_id, encoder);
+        self.attach_chat_formatter_for_test(model_id, formatter);
     }
 }
 
@@ -360,7 +364,7 @@ mod tests {
 
     /// Families the engine encodes in code skip a shipped template; V4.1 counts as V4.
     #[test]
-    fn resolve_chat_encoder_mirrors_engine_precedence() {
+    fn resolve_chat_formatter_mirrors_engine_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let tok = dir.path().join("tokenizer.json");
         std::fs::write(&tok, "{}").unwrap();
@@ -369,7 +373,7 @@ mod tests {
         let resolve = |model_type: &str| {
             let cfg = serde_json::json!({ "model_type": model_type }).to_string();
             std::fs::write(dir.path().join("config.json"), cfg).unwrap();
-            reg.resolve_chat_encoder("m", tok.to_str().unwrap())
+            reg.resolve_chat_formatter("m", tok.to_str().unwrap())
         };
         assert!(resolve("llama").is_some());
         assert!(resolve("inkling_mm_model").is_none());
@@ -403,7 +407,7 @@ mod tests {
             "bos_token": "<s>",
         });
         reg.attach_chat_template_for_test("tiny", &cfg);
-        assert!(reg.has_chat_encoder("tiny"));
+        assert!(reg.has_chat_formatter("tiny"));
 
         let request = serde_json::json!({"messages": [{"role":"user","content":"hi"}]});
         let chat_ids = reg.encode_chat("tiny", &request).expect("encode_chat");
@@ -418,10 +422,10 @@ mod tests {
 
         // encode_chat is exactly tokenize(render(request)).
         let rendered = reg
-            .encoders
+            .formatters
             .get("tiny")
             .unwrap()
-            .encoder
+            .formatter
             .render(&request)
             .unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
@@ -459,7 +463,7 @@ mod tests {
             "tiny".into(),
             adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
         );
-        assert!(!reg.has_chat_encoder("tiny"));
+        assert!(!reg.has_chat_formatter("tiny"));
         let request = serde_json::json!({"messages": [{"role":"user","content":"hi"}]});
         assert!(reg.encode_chat("tiny", &request).is_none());
     }
@@ -481,7 +485,7 @@ mod tests {
                 "bos_token": "<s>",
             }),
         );
-        assert!(reg.has_chat_encoder("tiny"));
+        assert!(reg.has_chat_formatter("tiny"));
         let request = serde_json::json!({"messages": [{"role":"user","content":"hi"}]});
         assert!(
             reg.encode_chat("tiny", &request).is_none(),

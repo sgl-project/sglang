@@ -26,13 +26,15 @@ const SPECIAL_TOKEN_KEYS: [&str; 7] = [
     "mask_token",
 ];
 
-pub struct ChatEncoder {
+/// Renders a chat request into prompt text. Tokenization is handled separately
+/// by `TokenizerRegistry::encode_chat`.
+pub struct ChatFormatter {
     formatter: PromptFormatter,
     /// Defaults overridden by request template kwargs.
     defaults: ChatTemplateKwargs,
 }
 
-impl ChatEncoder {
+impl ChatFormatter {
     /// HF Jinja template from `tokenizer_config.json`, overridden by a sibling
     /// `chat_template.jinja` when present (transformers' precedence); `Ok(None)`
     /// when the model ships neither.
@@ -171,8 +173,8 @@ mod tests {
 
     const SIMPLE_TEMPLATE: &str = "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>\n{{ m['content'] }}<|end|>\n{% endfor %}{% if add_generation_prompt %}<|assistant|>\n{% endif %}";
 
-    fn jinja(cfg: serde_json::Value) -> ChatEncoder {
-        ChatEncoder::from_tokenizer_config(&cfg, None)
+    fn jinja(cfg: serde_json::Value) -> ChatFormatter {
+        ChatFormatter::from_tokenizer_config(&cfg, None)
             .unwrap()
             .expect("config has a chat_template")
     }
@@ -181,14 +183,14 @@ mod tests {
         json!({"model": "m", "messages": messages})
     }
 
-    fn v4() -> ChatEncoder {
-        ChatEncoder::native(Some("deepseek_v4"), "any").unwrap()
+    fn v4() -> ChatFormatter {
+        ChatFormatter::native(Some("deepseek_v4"), "any").unwrap()
     }
 
     #[test]
     fn no_chat_template_returns_none() {
         let cfg = json!({"bos_token": "<s>", "eos_token": "</s>"});
-        assert!(ChatEncoder::from_tokenizer_config(&cfg, None)
+        assert!(ChatFormatter::from_tokenizer_config(&cfg, None)
             .unwrap()
             .is_none());
     }
@@ -198,11 +200,11 @@ mod tests {
     #[test]
     fn chat_template_jinja_file_takes_precedence() {
         let cfg = json!({"chat_template": "CONFIG"});
-        let enc = ChatEncoder::from_tokenizer_config(&cfg, Some("FILE"))
+        let enc = ChatFormatter::from_tokenizer_config(&cfg, Some("FILE"))
             .unwrap()
             .unwrap();
         assert_eq!(enc.render(&request(json!([]))).unwrap(), "FILE");
-        let enc = ChatEncoder::from_tokenizer_config(&json!({}), Some("FILE"))
+        let enc = ChatFormatter::from_tokenizer_config(&json!({}), Some("FILE"))
             .unwrap()
             .unwrap();
         assert_eq!(enc.render(&request(json!([]))).unwrap(), "FILE");
@@ -291,15 +293,15 @@ mod tests {
 
     #[test]
     fn native_detection() {
-        assert!(ChatEncoder::native(None, "deepseek-ai/DeepSeek-V4-Flash").is_some());
-        assert!(ChatEncoder::native(None, "deepseek-v4-tiny").is_some());
-        assert!(ChatEncoder::native(Some("deepseek_v4"), "alias").is_some());
-        assert!(ChatEncoder::native(Some("deepseek_v41"), "alias").is_some());
-        assert!(ChatEncoder::native(Some("deepseek_v32"), "DeepSeek-V3.2").is_some());
-        assert!(ChatEncoder::native(Some("inkling_mm_model"), "inkling").is_none());
-        assert!(ChatEncoder::native(Some("llama"), "deepseek-v4").is_none());
-        assert!(ChatEncoder::native(None, "deepseek-ai/DeepSeek-V3.2-Exp").is_none());
-        assert!(ChatEncoder::native(None, "Qwen/Qwen3-0.6B").is_none());
+        assert!(ChatFormatter::native(None, "deepseek-ai/DeepSeek-V4-Flash").is_some());
+        assert!(ChatFormatter::native(None, "deepseek-v4-tiny").is_some());
+        assert!(ChatFormatter::native(Some("deepseek_v4"), "alias").is_some());
+        assert!(ChatFormatter::native(Some("deepseek_v41"), "alias").is_some());
+        assert!(ChatFormatter::native(Some("deepseek_v32"), "DeepSeek-V3.2").is_some());
+        assert!(ChatFormatter::native(Some("inkling_mm_model"), "inkling").is_none());
+        assert!(ChatFormatter::native(Some("llama"), "deepseek-v4").is_none());
+        assert!(ChatFormatter::native(None, "deepseek-ai/DeepSeek-V3.2-Exp").is_none());
+        assert!(ChatFormatter::native(None, "Qwen/Qwen3-0.6B").is_none());
     }
 
     /// Byte-exact against the engine's `/tokenize` in its default chat mode:

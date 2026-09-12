@@ -25,8 +25,8 @@ fn build_ctx(url: String) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     assert!(
-        tokenizers.has_chat_encoder(MODEL),
-        "deepseek-v4 model id must auto-attach the built-in chat encoder"
+        tokenizers.has_chat_formatter(MODEL),
+        "deepseek-v4 model id must auto-attach the built-in chat formatter"
     );
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
