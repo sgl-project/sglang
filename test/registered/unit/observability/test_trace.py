@@ -31,6 +31,9 @@ from sglang.test.test_utils import CustomTestCase
 try:
     from opentelemetry import trace as otel_trace
     from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
 
     from sglang.srt.observability.trace import get_otlp_span_exporter
 
@@ -243,6 +246,68 @@ class TestProcessTracingInit(CustomTestCase):
                 process_tracing_init("localhost:4317", "test")
         finally:
             mod.opentelemetry_imported = orig
+
+
+@unittest.skipUnless(_has_otel, "opentelemetry not installed")
+class TestTraceServiceNameExport(CustomTestCase):
+    def test_exported_span_and_async_exporter_use_the_same_service_name(self):
+        cases = (
+            ("from-cli", "from-environment", "from-cli"),
+            (None, "from-environment", "from-environment"),
+            (None, None, "sglang"),
+            (None, "", "sglang"),
+        )
+        for cli_name, environment_name, expected in cases:
+            for async_enabled in (False, True):
+                with self.subTest(
+                    cli_name=cli_name,
+                    environment_name=environment_name,
+                    async_enabled=async_enabled,
+                ):
+                    exporter = InMemorySpanExporter()
+                    with (
+                        patch.dict(os.environ),
+                        patch.object(mod, "opentelemetry_initialized", False),
+                        patch.object(mod, "tracer", None),
+                        patch.object(mod.trace, "set_tracer_provider") as set_provider,
+                        patch.object(
+                            mod.trace,
+                            "get_tracer",
+                            side_effect=lambda name: set_provider.call_args.args[
+                                0
+                            ].get_tracer(name),
+                        ),
+                        patch.object(
+                            mod, "get_otlp_span_exporter", return_value=exporter
+                        ),
+                        patch(
+                            "sglang.srt.observability.trace_async.start_trace_exporter"
+                        ) as start_trace_exporter,
+                        envs.SGLANG_TRACE_ASYNC.override(async_enabled),
+                    ):
+                        if environment_name is None:
+                            os.environ.pop("OTEL_SERVICE_NAME", None)
+                        else:
+                            os.environ["OTEL_SERVICE_NAME"] = environment_name
+                        process_tracing_init("localhost:4317", cli_name)
+                        provider = set_provider.call_args.args[0]
+                        try:
+                            with mod.tracer.start_as_current_span("test-service-name"):
+                                pass
+                            self.assertTrue(provider.force_flush())
+                            spans = exporter.get_finished_spans()
+                            self.assertEqual(len(spans), 1)
+                            self.assertEqual(
+                                spans[0].resource.attributes["service.name"], expected
+                            )
+                            if async_enabled:
+                                start_trace_exporter.assert_called_once_with(
+                                    "localhost:4317", expected, trace_modules=None
+                                )
+                            else:
+                                start_trace_exporter.assert_not_called()
+                        finally:
+                            provider.shutdown()
 
 
 class TestTraceReqContextDisabled(unittest.TestCase):
