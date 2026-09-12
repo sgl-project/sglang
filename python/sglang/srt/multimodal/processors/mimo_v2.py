@@ -24,6 +24,9 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 )
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -1998,11 +2001,16 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                 if text_part:
                     contents.append(Content(type="text", content=text_part))
 
-        loop = asyncio.get_running_loop()
         try:
-            input_sample = await loop.run_in_executor(
-                self.io_executor,
-                lambda: self.mimo_processor.process(contents, verbose=False),
+            future = self.io_executor.submit(
+                self.mimo_processor.process,
+                contents,
+                verbose=False,
+            )
+            track_mm_preprocessing_future(future)
+            input_sample = await asyncio.wrap_future(
+                future,
+                loop=asyncio.get_running_loop(),
             )
         except RuntimeError as e:
             logger.error(f"MiMo processor failed in process_mm_data_async: {e}")

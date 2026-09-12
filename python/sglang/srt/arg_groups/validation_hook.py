@@ -30,6 +30,22 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    assert (
+        cfg.max_mm_preprocessing_inflight_items_per_worker is None
+        or cfg.max_mm_preprocessing_inflight_items_per_worker > 0
+    ), "Multimodal preprocessing inflight item limit must be positive or None"
+    if cfg.max_mm_preprocessing_inflight_items_per_worker is not None:
+        assert not envs.SGLANG_RUST_SERVER.get(), (
+            "--max-mm-preprocessing-inflight-items-per-worker is not supported "
+            "with SGLANG_RUST_SERVER because the Rust frontend owns a separate "
+            "multimodal preprocessing pipeline"
+        )
+        assert not cfg.language_only, (
+            "--max-mm-preprocessing-inflight-items-per-worker is not supported "
+            "with EPD language-only mode because preprocessing may be dispatched "
+            "to a remote encoder"
+        )
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (

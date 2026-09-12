@@ -10,6 +10,9 @@ from transformers.models.auto.processing_auto import (
 )
 
 import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -110,13 +113,15 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         # Fetch a remote image's compressed bytes in the io thread pool, retrying
         # only transient network failures. Each attempt is bounded by
         # REQUEST_TIMEOUT inside download_remote_media, so total time is bounded.
-        loop = asyncio.get_running_loop()
         max_retries = max(0, int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2")))
         delay = 0.5
         for attempt in range(max_retries + 1):
             try:
-                return await loop.run_in_executor(
-                    self.io_executor, get_image_bytes, url
+                future = self.io_executor.submit(get_image_bytes, url)
+                track_mm_preprocessing_future(future)
+                return await asyncio.wrap_future(
+                    future,
+                    loop=asyncio.get_running_loop(),
                 )
             except (
                 requests.exceptions.Timeout,
@@ -150,11 +155,12 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             executor = self.cpu_executor
             timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
             deadline = loop.time() + timeout
+            process_future = None
             try:
                 # ProcessPoolExecutor.submit() can itself block after a worker
                 # exits. Keep submission off the request event loop so the
                 # timeout can still replace the failed pool.
-                process_future = await asyncio.wait_for(
+                submission_task = asyncio.create_task(
                     asyncio.to_thread(
                         executor.submit,
                         LlavaImageProcessor._preprocess_image_task,
@@ -163,12 +169,29 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                         aspect_ratio,
                         grid_pinpoints,
                         self._processor,
-                    ),
+                    )
+                )
+
+                # submit() may still complete after request cancellation or its
+                # timeout. Register the resulting process future before the
+                # submission task's own lease reference is released.
+                def track_submitted_process_future(task: asyncio.Task) -> None:
+                    try:
+                        submitted = task.result()
+                    except BaseException:
+                        return
+                    track_mm_preprocessing_future(submitted)
+
+                submission_task.add_done_callback(track_submitted_process_future)
+                track_mm_preprocessing_future(submission_task)
+                process_future = await asyncio.wait_for(
+                    asyncio.shield(submission_task),
                     timeout=timeout,
                 )
                 remaining = max(0.0, deadline - loop.time())
                 return await asyncio.wait_for(
-                    asyncio.wrap_future(process_future), timeout=remaining
+                    asyncio.wrap_future(process_future),
+                    timeout=remaining,
                 )
             except (BrokenProcessPool, asyncio.TimeoutError):
                 self._replace_broken_cpu_executor(executor)
@@ -249,7 +272,12 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                         )
                     )
 
-                res = await asyncio.gather(*res)
+                # Do not return one malformed image while sibling fetch/decode
+                # coroutines are still able to submit executor work.
+                res = await asyncio.gather(*res, return_exceptions=True)
+                for result in res:
+                    if isinstance(result, BaseException):
+                        raise result
                 for pixel_v, image_h, image_s in res:
                     pixel_values.append(pixel_v)
                     data_hashes.append(image_h)

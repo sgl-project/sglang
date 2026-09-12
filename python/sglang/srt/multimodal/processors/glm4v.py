@@ -7,6 +7,9 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
@@ -575,23 +578,22 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                     effective_max_image_tokens,
                 )
                 if isinstance(video, VideoDecoderWrapper):
-                    decode_tasks.append(
-                        loop.run_in_executor(
-                            self.io_executor,
-                            glm_sample_and_decode_sync,
-                            video,
-                            video_config,
-                            video_processor,
-                        )
+                    future = self.io_executor.submit(
+                        glm_sample_and_decode_sync,
+                        video,
+                        video_config,
+                        video_processor,
                     )
+                    track_mm_preprocessing_future(future)
+                    decode_tasks.append(asyncio.wrap_future(future, loop=loop))
                 elif isinstance(video, list) and (
                     not video or isinstance(video[0], dict)
                 ):
-                    decode_tasks.append(
-                        loop.run_in_executor(
-                            self.io_executor, preprocess_video_frames_sync, video
-                        )
+                    future = self.io_executor.submit(
+                        preprocess_video_frames_sync, video
                     )
+                    track_mm_preprocessing_future(future)
+                    decode_tasks.append(asyncio.wrap_future(future, loop=loop))
                 else:
                     decode_tasks.append(
                         asyncio.sleep(

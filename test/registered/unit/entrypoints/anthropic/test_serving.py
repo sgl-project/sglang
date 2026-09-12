@@ -7,6 +7,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
+from fastapi import HTTPException  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
@@ -102,6 +103,31 @@ class _FakeNonStreamingOpenAI:
         self, adapted_request, processed_request, raw_request
     ):
         return self._response
+
+
+class _HTTPExceptionOpenAI:
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.tokenizer_manager = SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template=None),
+            create_abort_task=lambda _request: None,
+        )
+
+    def _validate_request(self, _chat_request):
+        return None
+
+    def _convert_to_internal_request(self, chat_request, _raw_request):
+        return SimpleNamespace(), chat_request
+
+    async def _handle_non_streaming_request(self, *_args):
+        raise HTTPException(status_code=self.status_code, detail="at capacity")
+
+    def _generate_chat_stream(self, *_args):
+        async def failed():
+            raise HTTPException(status_code=self.status_code, detail="at capacity")
+            yield
+
+        return failed()
 
 
 def _chunk(choices=None, usage=None):
@@ -530,6 +556,34 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertEqual(payload["error"]["message"], "context length exceeded")
+
+    def test_admission_http_status_is_preserved(self):
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        for stream, status_code, expected_type in (
+            (False, 400, "invalid_request_error"),
+            (False, 503, "overloaded_error"),
+            (True, 400, "invalid_request_error"),
+            (True, 503, "overloaded_error"),
+        ):
+            with self.subTest(stream=stream, status_code=status_code):
+                serving = AnthropicServing(_HTTPExceptionOpenAI(status_code))
+                anthropic_request = self._anthropic_request(stream=stream)
+                handler = (
+                    serving._handle_streaming
+                    if stream
+                    else serving._handle_non_streaming
+                )
+                response = asyncio.run(
+                    handler(chat_request, anthropic_request, object())
+                )
+                payload = json.loads(response.body)
+                self.assertEqual(response.status_code, status_code)
+                self.assertEqual(payload["error"]["type"], expected_type)
 
     # ------------------------------------------------------------------
     # Edge-case coverage added in the review-fix pass
