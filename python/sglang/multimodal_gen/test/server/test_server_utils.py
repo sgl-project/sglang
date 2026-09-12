@@ -801,7 +801,7 @@ class PerformanceValidator:
             assert actual is not None, f"Stage {stage} timing missing"
             tolerance = self._timing_tol(
                 self.tolerances.denoise_stage
-                if stage == "DenoisingStage"
+                if stage in summary.denoising_stages
                 else self.tolerances.non_denoise_stage
             )
             if stage.endswith("DecodingStage"):

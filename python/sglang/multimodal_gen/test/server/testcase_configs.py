@@ -467,6 +467,7 @@ class PerformanceSummary:
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
+    denoising_stages: set[str] = field(default_factory=set)
 
     @staticmethod
     def from_req_perf_record(
@@ -488,10 +489,13 @@ class PerformanceSummary:
 
         # convert from list to dict
         stage_metrics = {}
+        denoising_stages = set()
         for item in record.stages:
             if isinstance(item, dict) and "name" in item:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
+                if item.get("is_denoising", item["name"] == "DenoisingStage"):
+                    denoising_stages.add(item["name"])
 
         load_peak_vram_mb = float(
             record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
@@ -527,6 +531,7 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
+            denoising_stages=denoising_stages,
             load_peak_vram_mb=load_peak_vram_mb,
             runtime_peak_vram_mb=runtime_peak_vram_mb,
             warmup_peak_vram_mb=warmup_peak_vram_mb,
