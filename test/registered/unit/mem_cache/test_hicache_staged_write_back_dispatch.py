@@ -170,12 +170,13 @@ def _cpu_per_layer_pf_lf_copy(
 class _FakeEvent:
     def __init__(self, enable_timing=False):
         self.enable_timing = enable_timing
+        self.waited_streams = []
 
     def record(self):
         pass
 
-    def wait(self, stream):
-        pass
+    def wait(self, stream=None):
+        self.waited_streams.append(stream)
 
 
 class _FakeDeviceModule:
@@ -1044,6 +1045,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_indices.assert_not_called()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+        self.assertEqual(
+            controller.ack_write_queue[0].finish_event.waited_streams, [None]
+        )
 
     def test_cache_controller_moves_indices_without_write_back_jit(self):
         captured = {}
