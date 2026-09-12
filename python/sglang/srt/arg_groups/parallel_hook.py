@@ -226,6 +226,34 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
+    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
+        _disable_nccl_graph_buffer_registration()
+
+
+def _disable_nccl_graph_buffer_registration() -> None:
+    """Keep NCCL from registering the buffers of the graph-captured PyNccl
+    all-to-all.
+
+    NCCL_GRAPH_REGISTER (default on) registers the send/recv buffers of every
+    collective captured in a CUDA graph for the lifetime of the graph, and
+    peers then move data through those registrations directly. The TP LM-head
+    all-to-all is captured in the decode graphs on graph-pool temporaries,
+    whose addresses the pool also hands to other tensors, and the registered
+    exchange does not survive that: under a burst of new requests (DP ranks
+    ramping at different rates) one rank finishes its step while the others
+    spin in ncclDevKernel_SendRecv forever, and every DP rank hangs.
+    Reproduced on tp4/dp4/ep4 and on a multi-node tp16/dp16/ep16 PD decode
+    deployment; disabling the registration removes the hang while dedicated
+    all-to-all buffers alone do not. Must run before the schedulers create
+    their NCCL communicators, which inherit this environment. An explicit
+    setting wins.
+    """
+    if os.environ.setdefault("NCCL_GRAPH_REGISTER", "0") != "0":
+        logger.warning(
+            "NCCL_GRAPH_REGISTER=%s was set explicitly; the graph-captured TP "
+            "LM-head all-to-all can deadlock with registered buffers.",
+            os.environ["NCCL_GRAPH_REGISTER"],
+        )
 
 
 def handle_dwdp(server_args: Any):
