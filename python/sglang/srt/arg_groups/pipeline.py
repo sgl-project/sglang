@@ -96,10 +96,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
+        validate_response_store,
         validate_sampling_mask_max_tokens,
     )
 
     validate_prefill_decode_interval(server_args)
+    validate_response_store(server_args)
     validate_sampling_mask_max_tokens(server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
