@@ -945,49 +945,54 @@ mod suite {
         rendered["sampling_params"]["stop"] = serde_json::json!([]);
         assert_eq!(engine_request, rendered);
 
-        let batch = serde_json::json!({
-            "model": "model",
-            "prompt": ["one", "two"],
-            "n": 2,
-            "rid": ["prompt-a", "prompt-b"],
-            "cache_salt": ["tenant-a", "tenant-b"],
-            "extra_key": ["interactive", "batch"],
-            "bootstrap_host": ["prefill-a", "prefill-b"],
-            "bootstrap_port": [8998, null],
-            "bootstrap_room": [41, 52]
-        });
-        let render_response = post_request(app.clone(), "/v1/completions/render", &batch).await;
-        assert_eq!(render_response.status(), StatusCode::OK);
-        let rendered: serde_json::Value = serde_json::from_slice(
-            &to_bytes(render_response.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(rendered[0]["rid"], "prompt-a-0");
-        assert_eq!(rendered[1]["rid"], "prompt-a-1");
-        assert_eq!(rendered[2]["rid"], "prompt-b-0");
-        assert_eq!(rendered[3]["rid"], "prompt-b-1");
-        assert_eq!(rendered[3]["cache_salt"], "tenant-b");
-        assert_eq!(rendered[3]["bootstrap_room"], 52);
-
-        let inference_response = post_request(app, "/v1/completions", &batch).await;
-        assert_eq!(inference_response.status(), StatusCode::OK);
-        let mut engine_requests = std::mem::take(&mut *captured.lock().unwrap());
+        for (prompt, batched) in [
+            (serde_json::json!("one two"), false),
+            (serde_json::json!(["one", "two"]), true),
+            (serde_json::json!([7, 8]), false),
+            (serde_json::json!([[7, 8], [9]]), true),
+        ] {
+            let mut body = serde_json::json!({
+                "model": "model", "prompt": prompt, "n": 2,
+                "echo": true, "logprobs": 0, "max_tokens": 4,
+                "stop": "END", "temperature": 0.4,
+                "rid": "prompt", "cache_salt": "tenant-a",
+                "bootstrap_host": "prefill-a", "bootstrap_port": 8998,
+                "bootstrap_room": 41
+            });
+            if batched {
+                body["rid"] = serde_json::json!(["prompt-a", "prompt-b"]);
+                body["cache_salt"] = serde_json::json!(["tenant-a", "tenant-b"]);
+                body["extra_key"] = serde_json::json!(["interactive", "batch"]);
+                body["bootstrap_host"] = serde_json::json!(["prefill-a", "prefill-b"]);
+                body["bootstrap_port"] = serde_json::json!([8998, null]);
+                body["bootstrap_room"] = serde_json::json!([41, 52]);
+            }
+            let response = post_request(app.clone(), "/v1/completions/render", &body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut rendered: Vec<serde_json::Value> =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            let response = post_request(app.clone(), "/v1/completions", &body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut engine_requests = std::mem::take(&mut *captured.lock().unwrap());
+            engine_requests.sort_by(|left, right| left["rid"].as_str().cmp(&right["rid"].as_str()));
+            assert_eq!(rendered.len(), if batched { 4 } else { 2 });
+            if batched {
+                assert_eq!(rendered[0]["rid"], "prompt-a-0");
+                assert_eq!(rendered[3]["rid"], "prompt-b-1");
+                assert_eq!(rendered[3]["cache_salt"], "tenant-b");
+                assert_eq!(rendered[2]["bootstrap_host"], "prefill-b");
+                assert_eq!(rendered[2]["bootstrap_port"], serde_json::Value::Null);
+                assert_eq!(rendered[3]["bootstrap_room"], 52);
+            }
+            for request in &mut rendered {
+                request["stream"] = serde_json::Value::Bool(true);
+                request["return_text_in_logprobs"] = serde_json::Value::Bool(false);
+                request["sampling_params"]["stop"] = serde_json::json!([]);
+            }
+            assert_eq!(engine_requests, rendered);
+        }
         engine.abort();
-        engine_requests.sort_by(|left, right| left["rid"].as_str().cmp(&right["rid"].as_str()));
-        assert_eq!(engine_requests.len(), 4);
-        assert_eq!(engine_requests[0]["rid"], "prompt-a-0");
-        assert_eq!(engine_requests[1]["rid"], "prompt-a-1");
-        assert_eq!(engine_requests[2]["rid"], "prompt-b-0");
-        assert_eq!(engine_requests[3]["rid"], "prompt-b-1");
-        assert_eq!(engine_requests[2]["cache_salt"], "tenant-b");
-        assert_eq!(engine_requests[2]["bootstrap_host"], "prefill-b");
-        assert_eq!(
-            engine_requests[2]["bootstrap_port"],
-            serde_json::Value::Null
-        );
-        assert_eq!(engine_requests[3]["bootstrap_room"], 52);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use super::{
     completion_usage,
     protocol::{
         CompletionRequest, lower_text_completion_request, lower_token_ids_completion_request,
+        text_completion_prompts, token_ids_completion_prompts,
     },
     unix_seconds_u32,
 };
@@ -77,91 +78,78 @@ pub(crate) struct CompletionResponseWire {
     usage: Option<CompletionUsage>,
 }
 
-pub(crate) struct PreparedCompletion {
-    pub(crate) requests: Vec<GenerateRequest>,
-    pub(crate) metadata: Vec<(usize, usize, String)>,
-    pub(crate) response_id: String,
-    pub(crate) model: String,
-    pub(crate) created: u32,
-    pub(crate) echo: bool,
-    pub(crate) want_logprobs: bool,
-    pub(crate) include_usage: bool,
-    pub(crate) continuous_usage: bool,
+struct CompletionResponseContext {
+    metadata: Vec<(usize, usize, String)>,
+    response_id: String,
+    model: String,
+    created: u32,
+    echo: bool,
+    want_logprobs: bool,
+    include_usage: bool,
+    continuous_usage: bool,
 }
 
 pub(crate) async fn prepare_request(
     renderer: &RendererService,
-    tokenizer: &TokenDecoder,
-    request: CompletionRequest,
-) -> Result<PreparedCompletion, ResponseError> {
-    let echo = request.echo.unwrap_or(false);
-    let model = request.model.clone();
-    let n = request.n.unwrap_or(1) as usize;
-    let include_usage = request
-        .stream_options
-        .as_ref()
-        .is_some_and(|options| options.include_usage)
-        || renderer.config().stream_response_default_include_usage;
-    let continuous_usage = request
-        .stream_options
-        .as_ref()
-        .is_some_and(|options| options.continuous_usage_stats);
-    let want_logprobs = request.logprobs.is_some();
-    let created = unix_seconds_u32();
-    let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
-    let (response_id, requests, metadata) = if text_prompt {
-        let (response_id, completion_requests) =
-            lower_text_completion_request(renderer.config(), &request)?;
-        let metadata = completion_requests
-            .iter()
-            .enumerate()
-            .flat_map(|(prompt_index, request)| {
-                let prompt_echo = if echo {
-                    request.prompt.as_str().to_owned()
-                } else {
-                    String::new()
-                };
-                request
-                    .requests
-                    .iter()
-                    .map(move |_| (prompt_index, prompt_echo.clone()))
-            })
-            .enumerate()
-            .map(|(index, (prompt_index, prompt_echo))| (index, prompt_index, prompt_echo))
-            .collect();
-        let requests = renderer
-            .prepare_text_request_groups(completion_requests)
-            .await?;
-        (response_id, requests, metadata)
+    request: &CompletionRequest,
+) -> Result<(String, Vec<GenerateRequest>), ResponseError> {
+    if matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_)) {
+        let (response_id, requests) = lower_text_completion_request(renderer.config(), request)?;
+        let requests = renderer.prepare_text_request_groups(requests).await?;
+        Ok((response_id, requests))
     } else {
-        let (response_id, token_requests) =
-            lower_token_ids_completion_request(renderer.config(), &request)?;
-        let mut metadata = Vec::with_capacity(token_requests.len());
-        let mut prompt_echo = String::new();
-        for (index, request) in token_requests.iter().enumerate() {
-            let prompt_index = index / n;
-            if index % n == 0 {
-                prompt_echo = if echo {
-                    tokenizer.detokenize_prompt(request.input_ids.clone())?
-                } else {
-                    String::new()
-                };
-            }
-            metadata.push((index, prompt_index, prompt_echo.clone()));
-        }
-        let requests = renderer.prepare_token_ids_requests(token_requests)?;
-        (response_id, requests, metadata)
+        let (response_id, requests) =
+            lower_token_ids_completion_request(renderer.config(), request)?;
+        let requests = renderer.prepare_token_ids_requests(requests)?;
+        Ok((response_id, requests))
+    }
+}
+
+// Called after request preparation has validated the prompt and choice count.
+fn prepare_response(
+    renderer: &RendererService,
+    tokenizer: &TokenDecoder,
+    request: &CompletionRequest,
+    response_id: String,
+    choice_count: usize,
+) -> Result<CompletionResponseContext, ResponseError> {
+    let echo = request.echo.unwrap_or(false);
+    let n = request.n.unwrap_or(1) as usize;
+    // Echo uses the original input, even when preprocessing truncates engine input IDs.
+    let prompt_echoes = if !echo {
+        vec![String::new(); choice_count / n]
+    } else if matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_)) {
+        text_completion_prompts(&request.prompt).map_err(crate::RendererError::from)?
+    } else {
+        token_ids_completion_prompts(&request.prompt)
+            .map_err(crate::RendererError::from)?
+            .into_iter()
+            .map(|ids| tokenizer.detokenize_prompt(ids))
+            .collect::<Result<Vec<_>, _>>()?
     };
-    Ok(PreparedCompletion {
-        requests,
+    let metadata = prompt_echoes
+        .into_iter()
+        .enumerate()
+        .flat_map(|(prompt_index, echo)| {
+            (0..n).map(move |choice| (prompt_index * n + choice, prompt_index, echo.clone()))
+        })
+        .collect();
+    Ok(CompletionResponseContext {
         metadata,
         response_id,
-        model,
-        created,
+        model: request.model.clone(),
+        created: unix_seconds_u32(),
         echo,
-        want_logprobs,
-        include_usage,
-        continuous_usage,
+        want_logprobs: request.logprobs.is_some(),
+        include_usage: request
+            .stream_options
+            .as_ref()
+            .is_some_and(|options| options.include_usage)
+            || renderer.config().stream_response_default_include_usage,
+        continuous_usage: request
+            .stream_options
+            .as_ref()
+            .is_some_and(|options| options.continuous_usage_stats),
     })
 }
 
@@ -416,8 +404,15 @@ impl super::OpenAIService {
     > {
         use super::OperationResponse;
         let stream = request.stream.unwrap_or(false);
-        let prepared = prepare_request(&self.renderer, &self.generation.decoder, request).await?;
-        let streams = match self.generation.generate_many(prepared.requests).await {
+        let (response_id, requests) = prepare_request(&self.renderer, &request).await?;
+        let context = prepare_response(
+            &self.renderer,
+            &self.generation.decoder,
+            &request,
+            response_id,
+            requests.len(),
+        )?;
+        let streams = match self.generation.generate_many(requests).await {
             Ok(streams) => streams,
             Err(error) if stream => {
                 return Ok(OperationResponse::Stream(
@@ -426,29 +421,29 @@ impl super::OpenAIService {
             }
             Err(error) => return Err(error),
         };
-        let submitted = attach_streams(prepared.metadata, streams);
+        let submitted = attach_streams(context.metadata, streams);
         if stream {
             Ok(OperationResponse::Stream(
                 completion_event_stream(
                     submitted,
-                    prepared.response_id,
-                    prepared.model,
-                    prepared.created,
-                    prepared.echo,
-                    prepared.want_logprobs,
-                    prepared.include_usage,
-                    prepared.continuous_usage,
+                    context.response_id,
+                    context.model,
+                    context.created,
+                    context.echo,
+                    context.want_logprobs,
+                    context.include_usage,
+                    context.continuous_usage,
                 )
                 .boxed(),
             ))
         } else {
             unary_completion(
                 submitted,
-                prepared.response_id,
-                prepared.model,
-                prepared.created,
-                prepared.echo,
-                prepared.want_logprobs,
+                context.response_id,
+                context.model,
+                context.created,
+                context.echo,
+                context.want_logprobs,
             )
             .await
             .map(OperationResponse::Unary)
@@ -458,7 +453,10 @@ impl super::OpenAIService {
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_event_stream, completion_logprobs, prepare_request, unary_completion};
+    use super::{
+        completion_event_stream, completion_logprobs, prepare_request, prepare_response,
+        unary_completion,
+    };
     use crate::GenerationOutputExtras;
     use crate::engine::{TokenDecoder, test_utils::tiny_tokenizer};
     use crate::openai::test_utils::{chunk, renderer_config, submitted};
@@ -467,65 +465,80 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn completion_preparation_preserves_batched_echo_without_an_engine_client() {
+    async fn completion_response_preserves_batched_echo_before_truncation() {
         let tokenizer = tiny_tokenizer();
-        let renderer = RendererService::with_tokenizer(
-            renderer_config(),
-            Arc::new(DynamoTokenizer::new(tokenizer.clone(), tokenizer.clone())),
-            1,
-            1,
-        );
         let prompts = ["hello", "world"];
         let token_ids =
             prompts.map(|prompt| tokenizer.encode(prompt).unwrap().token_ids().to_vec());
-        for tokenized in [false, true] {
-            for echo in [false, true] {
-                let prompt = if tokenized {
-                    serde_json::json!(token_ids)
-                } else {
-                    serde_json::json!(prompts)
-                };
-                let request = serde_json::from_value(serde_json::json!({
-                    "model": "model", "prompt": prompt, "n": 2, "echo": echo,
-                    "rid": ["prompt-a", "prompt-b"], "max_tokens": 4
-                }))
-                .unwrap();
-
-                let prepared =
-                    prepare_request(&renderer, &TokenDecoder::new(tokenizer.clone()), request)
-                        .await
-                        .unwrap();
-
-                assert_eq!(prepared.requests.len(), 4);
-                assert_eq!(prepared.metadata.len(), 4);
-                assert_eq!(prepared.echo, echo);
-                for (index, (request, metadata)) in
-                    prepared.requests.iter().zip(&prepared.metadata).enumerate()
-                {
-                    let prompt_index = index / 2;
-                    let expected_echo = if !echo {
-                        String::new()
-                    } else if tokenized {
-                        String::from(tokenizer.decode(&token_ids[prompt_index], true).unwrap())
+        for truncate in [false, true] {
+            let mut config = renderer_config();
+            if truncate {
+                config.limits.context_len = 2;
+                config.limits.allow_auto_truncate = true;
+                assert!(token_ids.iter().all(|ids| ids.len() > 2));
+            }
+            let renderer = RendererService::with_tokenizer(
+                config,
+                Arc::new(DynamoTokenizer::new(tokenizer.clone(), tokenizer.clone())),
+                1,
+                1,
+            );
+            for tokenized in [false, true] {
+                for echo in [false, true] {
+                    let prompt = if tokenized {
+                        serde_json::json!(token_ids)
                     } else {
-                        prompts[prompt_index].to_owned()
+                        serde_json::json!(prompts)
                     };
-                    assert_eq!(metadata, &(index, prompt_index, expected_echo));
-                    assert_eq!(
-                        request.input_ids,
-                        token_ids[prompt_index]
+                    let request = serde_json::from_value(serde_json::json!({
+                        "model": "model", "prompt": prompt, "n": 2, "echo": echo,
+                        "rid": ["prompt-a", "prompt-b"], "max_tokens": 4, "logprobs": 0
+                    }))
+                    .unwrap();
+                    let (response_id, requests) =
+                        prepare_request(&renderer, &request).await.unwrap();
+                    let context = prepare_response(
+                        &renderer,
+                        &TokenDecoder::new(tokenizer.clone()),
+                        &request,
+                        response_id,
+                        requests.len(),
+                    )
+                    .unwrap();
+
+                    assert_eq!(requests.len(), 4);
+                    assert_eq!(context.metadata.len(), 4);
+                    assert_eq!(context.echo, echo);
+                    for (index, (request, metadata)) in
+                        requests.iter().zip(&context.metadata).enumerate()
+                    {
+                        let prompt_index = index / 2;
+                        let expected_echo = if !echo {
+                            String::new()
+                        } else if tokenized {
+                            String::from(tokenizer.decode(&token_ids[prompt_index], true).unwrap())
+                        } else {
+                            prompts[prompt_index].to_owned()
+                        };
+                        assert_eq!(metadata, &(index, prompt_index, expected_echo));
+                        let mut expected_ids = token_ids[prompt_index]
                             .iter()
                             .map(|&id| id as i32)
-                            .collect::<Vec<_>>()
-                    );
-                    assert_eq!(
-                        request.rid,
-                        format!(
-                            "prompt-{}-{}",
-                            if prompt_index == 0 { "a" } else { "b" },
-                            index % 2
-                        )
-                    );
+                            .collect::<Vec<_>>();
+                        if truncate {
+                            expected_ids.truncate(2);
+                        }
+                        assert_eq!(request.input_ids, expected_ids);
+                        assert_eq!(request.logprob_start_len, if echo { 0 } else { -1 });
+                        assert_eq!(
+                            request.rid,
+                            format!(
+                                "prompt-{}-{}",
+                                if prompt_index == 0 { "a" } else { "b" },
+                                index % 2
+                            )
+                        );
+                    }
                 }
             }
         }

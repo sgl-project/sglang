@@ -35,28 +35,10 @@ pub(crate) struct ChatResponseContext {
 pub(crate) async fn prepare_request(
     renderer: &crate::RendererService,
     request: ChatCompletionRequest,
-) -> Result<(crate::PreparedChat, ChatResponseContext), ResponseError> {
-    let model = request.model.clone();
-    let want_logprobs = request.logprobs.unwrap_or(false);
-    let include_usage = request
-        .stream_options
-        .as_ref()
-        .is_some_and(|options| options.include_usage)
-        || renderer.config().stream_response_default_include_usage;
-    let service_tier = request.service_tier.clone();
+) -> Result<(String, crate::PreparedChat), ResponseError> {
     let (response_id, request) = lower_chat_request(renderer.config(), request)?;
     let chat = renderer.prepare_chat(request).await?;
-    Ok((
-        chat,
-        ChatResponseContext {
-            response_id,
-            model,
-            created: unix_seconds_u32(),
-            want_logprobs,
-            include_usage,
-            service_tier,
-        },
-    ))
+    Ok((response_id, chat))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -548,7 +530,23 @@ impl super::OpenAIService {
     > {
         use super::OperationResponse;
         let stream = request.stream.unwrap_or(false);
-        let (chat, context) = prepare_request(&self.renderer, request).await?;
+        let model = request.model.clone();
+        let want_logprobs = request.logprobs.unwrap_or(false);
+        let include_usage = request
+            .stream_options
+            .as_ref()
+            .is_some_and(|options| options.include_usage)
+            || self.renderer.config().stream_response_default_include_usage;
+        let service_tier = request.service_tier.clone();
+        let (response_id, chat) = prepare_request(&self.renderer, request).await?;
+        let context = ChatResponseContext {
+            response_id,
+            model,
+            created: unix_seconds_u32(),
+            want_logprobs,
+            include_usage,
+            service_tier,
+        };
         let streams = match self.generation.generate_many(chat.requests).await {
             Ok(streams) => streams,
             Err(error) if stream => {
