@@ -69,27 +69,36 @@ fn captured(mock: &MockWorker) -> Value {
 async fn plain_chat_forwards_input_ids_and_keeps_messages() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hello there friend"}],
-            "input_ids": null,
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    for messages in [
+        json!([{"role": "user", "content": "hello there friend"}]),
+        json!([
+            {"role": "user", "content": "U1"},
+            {"role": "user", "content": "U2"},
+            {"role": "system", "content": "S", "name": "instruction"},
+            {"role": "assistant", "content": "A", "name": "bot"},
+            {"role": "user", "content": "U3"}
+        ]),
+    ] {
+        let status = send(
+            Arc::clone(&ctx),
+            json!({
+                "model": MODEL,
+                "messages": messages,
+                "input_ids": null,
+                "chat_template_kwargs": {},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
 
-    let body = captured(&mock);
-    let ids = body.get("input_ids").and_then(|v| v.as_array());
-    assert!(
-        ids.is_some_and(|a| !a.is_empty()),
-        "engine must receive non-empty input_ids; got {body}"
-    );
-    assert!(
-        body.get("messages").is_some(),
-        "messages must be retained alongside input_ids; got {body}"
-    );
+        let body = captured(&mock);
+        let ids = body.get("input_ids").and_then(|v| v.as_array());
+        assert!(
+            ids.is_some_and(|a| !a.is_empty()),
+            "engine must receive non-empty input_ids; got {body}"
+        );
+        assert_eq!(body["messages"], messages);
+    }
 }
 
 #[tokio::test]

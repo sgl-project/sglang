@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chat rendering via Dynamo for routing and optional tokenization offload.
+//! Chat rendering via Dynamo for routing and optional input ID forwarding.
 
 use std::collections::HashMap;
 

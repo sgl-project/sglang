@@ -746,7 +746,7 @@ pub async fn chat_completions(
 
     // Count failures only when token resolution was attempted.
     if resolve_tokens_at_ingress
-        && ingress_tokenize_offload_failed(
+        && ingress_chat_tokenization_failed(
             ctx.tokenizers.has_chat_formatter(&model_str),
             Some(&request_value),
             request_tokens.as_ref(),
@@ -1228,46 +1228,69 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Forward only plain text chats the router renders exactly as the engine does;
-/// tools, media, template overrides, mode toggles, assistant continuations, and
-/// shapes the engine normalizes first still render for routing only.
-/// `response_format` is not gated: neither side renders it into the prompt.
-/// Assumes the router and workers share tokenizer, template, and defaults.
+/// Request-level eligibility for forwarding router-generated IDs. Successful
+/// chat rendering is checked separately; tokenizer, template, and model defaults
+/// must match the workers. Tools, media, and engine-specific prompt options
+/// remain excluded until their preprocessing is shared with the router.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if !value.get("messages").is_some_and(|m| m.is_array()) {
+    let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    let Some(last_message) = messages.last() else {
+        return false;
+    };
+
+    // The engine rewrites a final assistant turn, even without continuation mode.
+    if last_message["role"] == "assistant" || value["continue_final_message"] == true {
         return false;
     }
-    if request_has_tools(value) || request_is_multimodal(value) {
-        return false;
-    }
-    if messages_need_engine_render(value) {
-        return false;
-    }
-    // Preserve caller IDs and defer options needing engine-specific processing.
-    for key in [
+
+    // Caller IDs stay in the original request; never replace them with generated IDs.
+    // The other fields select prompt behavior the router does not fully reproduce.
+    if [
         "input_ids",
         "chat_template",
-        "chat_template_kwargs",
         "reasoning",
         "reasoning_effort",
         "task",
-    ] {
-        if value.get(key).is_some_and(|v| !v.is_null()) {
-            return false;
-        }
-    }
-    if value
-        .get("continue_final_message")
-        .and_then(|v| v.as_bool())
-        == Some(true)
+    ]
+    .iter()
+    .any(|key| !value[key].is_null())
     {
         return false;
     }
-    !last_message_is_assistant(value)
+    // Empty collections have no effect. Nonempty kwargs can select engine-specific
+    // reasoning behavior, while tools require schema and message preprocessing.
+    if value.get("chat_template_kwargs").is_some_and(|kwargs| {
+        !kwargs.is_null() && kwargs.as_object().is_none_or(|kwargs| !kwargs.is_empty())
+    }) || ["tools", "functions"].iter().any(|key| {
+        !value[key].is_null() && value[key].as_array().is_none_or(|tools| !tools.is_empty())
+    }) {
+        return false;
+    }
+
+    messages.iter().all(message_supports_input_id_forwarding)
+}
+
+/// Plain text messages need no content normalization. Allow the optional name
+/// preserved by the engine's system/assistant schema; its user schema drops it.
+/// Other fields can carry tool/reasoning history or be discarded by the engine.
+fn message_supports_input_id_forwarding(message: &serde_json::Value) -> bool {
+    let Some(fields) = message.as_object() else {
+        return false;
+    };
+    let role = message["role"].as_str().unwrap_or_default();
+    matches!(role, "system" | "user" | "assistant")
+        && message["content"].is_string()
+        && fields.keys().all(|key| match key.as_str() {
+            "role" | "content" => true,
+            "name" => role != "user" && message["name"].is_string(),
+            _ => false,
+        })
 }
 
 /// A chat formatter was available but failed to produce prompt IDs.
-fn ingress_tokenize_offload_failed(
+fn ingress_chat_tokenization_failed(
     has_chat_formatter: bool,
     request_value: Option<&serde_json::Value>,
     request_tokens: Option<&RequestTokens>,
@@ -1283,59 +1306,6 @@ fn ingress_tokenize_offload_failed(
         return false;
     }
     !request_tokens.is_some_and(|t| t.chat_rendered)
-}
-
-/// Message shapes that need engine-specific normalization.
-fn messages_need_engine_render(value: &serde_json::Value) -> bool {
-    let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
-        return false;
-    };
-    // An empty conversation is rejected by the engine rather than rendered.
-    messages.is_empty()
-        || messages.iter().enumerate().any(|(i, m)| {
-            let role = m["role"].as_str().unwrap_or_default();
-            !matches!(role, "system" | "user" | "assistant")
-                || !m["content"].is_string()
-                || m.as_object()
-                    .is_none_or(|m| m.keys().any(|k| k != "role" && k != "content"))
-                || (role == "system" && i > 0)
-                || (role == "user" && i > 0 && messages[i - 1]["role"] == "user")
-        })
-}
-
-/// Whether the final chat message has `role: "assistant"` (a prefix /
-/// continuation turn the engine's template path special-cases).
-fn last_message_is_assistant(value: &serde_json::Value) -> bool {
-    value
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|msgs| msgs.last())
-        .and_then(|m| m.get("role"))
-        .and_then(|r| r.as_str())
-        == Some("assistant")
-}
-
-/// Nonempty tool definitions require engine-side rendering.
-fn request_has_tools(value: &serde_json::Value) -> bool {
-    let nonempty = |key: &str| {
-        value.get(key).is_some_and(|v| match v {
-            serde_json::Value::Array(a) => !a.is_empty(),
-            serde_json::Value::Null => false,
-            _ => true,
-        })
-    };
-    nonempty("tools") || nonempty("functions")
-}
-
-/// Array content requires engine-side processing.
-fn request_is_multimodal(value: &serde_json::Value) -> bool {
-    value
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .is_some_and(|msgs| {
-            msgs.iter()
-                .any(|m| matches!(m.get("content"), Some(serde_json::Value::Array(_))))
-        })
 }
 
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
@@ -1587,36 +1557,23 @@ mod tests {
         );
     }
 
-    /// Tools render for routing but remain excluded from forwarding.
-    #[test]
-    fn request_has_tools_detects_tools_and_functions() {
-        assert!(request_has_tools(
-            &serde_json::json!({"tools":[{"type":"function"}]})
-        ));
-        assert!(request_has_tools(
-            &serde_json::json!({"functions":[{"name":"f"}]})
-        ));
-        assert!(!request_has_tools(&serde_json::json!({"tools":[]})));
-        assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
-    }
-
-    /// Array (multimodal) message content is detected so the caller omits
-    /// `input_ids` (a text tokenizer can't represent image content).
-    #[test]
-    fn request_is_multimodal_detects_array_content() {
-        assert!(request_is_multimodal(&serde_json::json!({
-            "messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]
-        })));
-        assert!(!request_is_multimodal(&serde_json::json!({
-            "messages":[{"role":"user","content":"hello"}]
-        })));
-    }
-
     /// Plain text chat with nothing unreplicated → input_ids may be forwarded.
     #[test]
     fn input_ids_safe_to_forward_allows_plain_text_chat() {
         assert!(input_ids_safe_to_forward(&serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}]
+        })));
+        assert!(input_ids_safe_to_forward(&serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "U1"},
+                {"role": "user", "content": "U2"},
+                {"role": "system", "content": "S", "name": "instruction"},
+                {"role": "assistant", "content": "A", "name": "bot"},
+                {"role": "user", "content": "U3"}
+            ],
+            "chat_template_kwargs": {},
+            "tools": [],
+            "functions": []
         })));
     }
 
@@ -1628,6 +1585,7 @@ mod tests {
     fn input_ids_safe_to_forward_blocks_unreplicated_signals() {
         let blockers = [
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"functions":[{"name":"f"}]}),
             serde_json::json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
@@ -1639,8 +1597,6 @@ mod tests {
             serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"assistant","content":"A1","reasoning_content":"R1"},{"role":"user","content":"U2"}]}),
             serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"ok"},{"role":"user","content":"U2"}]}),
             serde_json::json!({"messages":[{"role":"system","content":"S","tools":[{"type":"function","function":{"name":"f"}}]},{"role":"user","content":"hi"}]}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"system","content":"late"},{"role":"user","content":"again"}]}),
-            serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"user","content":"U2"}]}),
         ];
         for b in blockers {
             assert!(
@@ -1660,6 +1616,8 @@ mod tests {
             serde_json::json!({"role": "user", "content": null}),
             serde_json::json!({"role": "user"}),
             serde_json::json!({"role": "user", "content": "hi", "name": "alice"}),
+            serde_json::json!({"role": "system", "content": "hi", "name": null}),
+            serde_json::json!({"role": "user", "content": "hi", "unknown": "value"}),
         ] {
             assert!(!input_ids_safe_to_forward(
                 &serde_json::json!({"messages": [message]})
@@ -1706,13 +1664,13 @@ mod tests {
 
     /// A successful render is not an error, regardless of forwarding eligibility.
     #[test]
-    fn offload_failed_false_when_tokens_chat_rendered() {
+    fn chat_tokenization_failed_false_when_tokens_chat_rendered() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
             chat_rendered: true,
         };
-        assert!(!ingress_tokenize_offload_failed(
+        assert!(!ingress_chat_tokenization_failed(
             true,
             Some(&value),
             Some(&tokens)
@@ -1723,41 +1681,41 @@ mod tests {
     /// tokens (encode_chat returned None → request_tokens None) IS a failure:
     /// the encoder should have fired but didn't.
     #[test]
-    fn offload_failed_true_when_chat_formatter_request_has_no_tokens() {
+    fn chat_tokenization_failed_true_when_chat_formatter_request_has_no_tokens() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
-        assert!(ingress_tokenize_offload_failed(true, Some(&value), None));
+        assert!(ingress_chat_tokenization_failed(true, Some(&value), None));
     }
 
     /// Encode produced ids but NOT via the chat formatter (raw fallback,
     /// `chat_rendered = false`) on a chat-formatter model + chat request →
     /// the chat-encode render/encode failed and fell through to the raw path.
     #[test]
-    fn offload_failed_true_when_tokens_not_chat_rendered() {
+    fn chat_tokenization_failed_true_when_tokens_not_chat_rendered() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
             chat_rendered: false,
         };
-        assert!(ingress_tokenize_offload_failed(
+        assert!(ingress_chat_tokenization_failed(
             true,
             Some(&value),
             Some(&tokens)
         ));
     }
 
-    /// Non-chat-formatter models never expected the offload → not a failure even
+    /// Models without a chat formatter never attempt chat rendering → not a failure even
     /// with no tokens.
     #[test]
-    fn offload_failed_false_without_chat_formatter() {
+    fn chat_tokenization_failed_false_without_chat_formatter() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
-        assert!(!ingress_tokenize_offload_failed(false, Some(&value), None));
+        assert!(!ingress_chat_tokenization_failed(false, Some(&value), None));
     }
 
     /// Non-chat requests do not require chat rendering.
     #[test]
-    fn offload_failed_false_for_non_messages_request() {
+    fn chat_tokenization_failed_false_for_non_messages_request() {
         let value = serde_json::json!({"prompt":"hi"});
-        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+        assert!(!ingress_chat_tokenization_failed(true, Some(&value), None));
     }
 
     #[test]

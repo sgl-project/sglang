@@ -3,7 +3,7 @@
 
 //! `input_ids` forwarding is policy-independent: a load-only **round-robin**
 //! policy on a chat-formatter model still forwards `input_ids` to the engine
-//! (the engine-tokenization offload), even though it picks workers round-robin
+//! to skip engine tokenization, even though it picks workers round-robin
 //! and ignores the tokens for routing. Eligible forwarding independently
 //! requests IDs; formatter availability determines whether rendering succeeds.
 
@@ -104,7 +104,7 @@ fn captured(mock: &MockWorker) -> Value {
 }
 
 /// A round-robin (load-only) policy still forwards `input_ids` on a
-/// chat-formatter model — the offload is decoupled from routing.
+/// chat-formatter model — ID forwarding is decoupled from routing.
 #[tokio::test]
 async fn round_robin_plain_chat_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
@@ -157,7 +157,8 @@ async fn round_robin_tool_request_omits_input_ids() {
 
 /// A successful plain-chat forward on a chat-formatter model must NOT emit
 /// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
-/// offload was expected but the encoder failed. A tool request on the same model
+/// token resolution was attempted but chat rendering or tokenization failed.
+/// A tool request on the same model
 /// is an expected omission: no consumer needs IDs, so token resolution is
 /// skipped and must not emit the error counter either.
 #[tokio::test]

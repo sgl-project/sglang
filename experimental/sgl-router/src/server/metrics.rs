@@ -941,7 +941,7 @@ impl MetricsRegistry {
 
         // ingress_tokenize_errors_total
         out.push_str(
-            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-formatter model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+            "# HELP sgl_router_ingress_tokenize_errors_total Attempted chat rendering or tokenization failed to produce rendered prompt IDs for routing or input ID forwarding.\n",
         );
         out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
         let guard = self.ingress_tokenize_errors_total.lock();

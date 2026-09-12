@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tokenize-once at ingress under the STICKY policy. The engine-tokenization
-//! offload (`input_ids` forwarding) requests tokens for eligible chat requests
+//! Tokenize-once at ingress under the STICKY policy. Input ID forwarding
+//! requests tokens for eligible chat requests
 //! independently of the routing policy. With a working formatter, a sticky
 //! route forwards those IDs while still pinning sessions O(1) by header.
 //!
@@ -263,7 +263,7 @@ async fn sticky_pins_session_by_header_with_tokenization_on() {
         "same routing key must pin to exactly one worker (w0_hit={w0_hit}, w1_hit={w1_hit})"
     );
 
-    // And the pinned worker still received forwarded input_ids — the offload
+    // And the pinned worker still received forwarded input_ids — ID forwarding
     // and the pin coexist.
     let pinned = if w0_hit { &w0 } else { &w1 };
     let body = captured(pinned);
