@@ -247,10 +247,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
-        # ``tool_choice="required"`` only works with ``function`` tools.
-        if request.tool_choice == "required" and not any(
-            tool.type == "function" for tool in (request.tools or [])
-        ):
+        try:
+            chat_tools = self._response_tools_to_chat_tools(request)
+        except ValueError as exc:
+            return self.create_error_response(str(exc), param="tools")
+
+        # Namespaced functions are client-executed functions too.
+        if request.tool_choice == "required" and not chat_tools:
             return self.create_error_response(
                 'tool_choice="required" requires at least one tool with '
                 'type="function"; other built-in tool types cannot be forced.'
@@ -908,7 +911,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 arguments=call_info.parameters or "",
                                 call_id=f"call_{random_uuid()[:24]}",
                                 type="function_call",
-                                name=call_info.name,
+                                **self._response_function_identity(
+                                    request, call_info.name
+                                ),
                                 id=f"fc_{random_uuid()[:8]}",
                                 status="completed",
                             )
@@ -940,7 +945,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 arguments=arguments,
                                 call_id=f"call_{random_uuid()[:24]}",
                                 type="function_call",
-                                name=tool["name"],
+                                **self._response_function_identity(
+                                    request, tool["name"]
+                                ),
                                 id=f"fc_{random_uuid()[:8]}",
                                 status="completed",
                             )
@@ -992,23 +999,47 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
-        # Only ``function`` tools flow to chat; built-ins go through harmony.
+        # Chat templates have a flat function list. Qualify namespace members
+        # here, and restore their separate name/namespace fields on output.
         chat_tools = []
+        names = set()
         for tool in request.tools:
-            if tool.type != "function":
-                continue
-            chat_tools.append(
-                Tool(
-                    type="function",
-                    function=Function(
-                        name=tool.name,
-                        description=tool.description,
-                        parameters=tool.parameters,
-                        strict=tool.strict,
-                    ),
+            members = tool.tools if tool.type == "namespace" else [tool.model_dump()]
+            for member in members:
+                if member["type"] != "function":
+                    continue
+                name = member["name"]
+                if tool.type == "namespace":
+                    name = f"{tool.name}.{name}"
+                if name in names:
+                    raise ValueError(f"Ambiguous function tool name: {name!r}")
+                names.add(name)
+                chat_tools.append(
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name=name,
+                            description=member.get("description"),
+                            parameters=member.get("parameters"),
+                            strict=member.get("strict", False),
+                        ),
+                    )
                 )
-            )
         return chat_tools
+
+    @staticmethod
+    def _response_function_identity(request: ResponsesRequest, name: str) -> dict:
+        # Match declared members rather than splitting on dots: top-level
+        # function names can themselves contain dots.
+        for tool in request.tools:
+            if tool.type == "namespace":
+                for member in tool.tools:
+                    if (
+                        member["type"] == "function"
+                        and name == f"{tool.name}.{member['name']}"
+                    ):
+                        return {"name": member["name"], "namespace": tool.name}
+        return {"name": name}
 
     @staticmethod
     def _normalize_response_content_part_for_chat(content_part: Any) -> Any:
@@ -1091,7 +1122,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         "id": message.get("call_id") or message.get("id"),
                         "type": "function",
                         "function": {
-                            "name": message.get("name"),
+                            "name": (
+                                f"{message['namespace']}.{message.get('name')}"
+                                if message.get("namespace")
+                                else message.get("name")
+                            ),
                             "arguments": raw,
                         },
                     }
@@ -2189,7 +2224,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             completed_item = ResponseFunctionToolCall(
                 arguments=arguments,
                 call_id=state["call_id"],
-                name=state["name"] or "",
+                **self._response_function_identity(request, state["name"] or ""),
                 type="function_call",
                 id=state["item_id"],
                 status="completed",
@@ -2202,7 +2237,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         item_id=state["item_id"],
                         output_index=state["output_index"],
                         arguments=arguments,
-                        name=state["name"] or "",
+                        **self._response_function_identity(
+                            request, state["name"] or ""
+                        ),
                     )
                 ),
                 _send_event(
@@ -2385,7 +2422,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     item=ResponseFunctionToolCall(
                                         arguments="",
                                         call_id=state["call_id"],
-                                        name=state["name"],
+                                        **self._response_function_identity(
+                                            request, state["name"]
+                                        ),
                                         type="function_call",
                                         id=state["item_id"],
                                         status="in_progress",

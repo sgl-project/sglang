@@ -1586,10 +1586,27 @@ class ResponseTool(BaseModel):
     def validate_function_tool(self) -> ResponseTool:
         if self.type == "function" and not self.name:
             raise ValueError("Function tools must include a name.")
+        if self.type == "namespace":
+            if not self.name or self.tools is None:
+                raise ValueError("Namespace tools must include a name and tools.")
+            for tool in self.tools:
+                if tool.get("type") not in ("function", "custom"):
+                    raise ValueError(
+                        "Namespaces can contain only function or custom tools."
+                    )
+                if not tool.get("name"):
+                    raise ValueError("Tools in a namespace must include a name.")
         return self
 
 
+class ResponseNamespacedFunctionToolCall(ResponseFunctionToolCall):
+    # Older SDK input TypedDicts silently discard this field. Give it an
+    # explicit model arm so stateless replay preserves the tool identity.
+    namespace: str
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    ResponseNamespacedFunctionToolCall,
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
@@ -1796,6 +1813,8 @@ class ResponsesRequest(BaseModel):
             "name"
         )
         if tool_choice.get("type") == "function" and name:
+            if namespace := tool_choice.get("namespace"):
+                name = f"{namespace}.{name}"
             return {"type": "function", "name": name}
         return "auto"
 
