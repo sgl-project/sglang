@@ -1,6 +1,7 @@
 # CI performance diagnostics
 
-The NVIDIA two-GPU diffusion job sets `SGLANG_DIFFUSION_DIAGNOSTICS_DIR`.
+The NVIDIA H100 one- and two-GPU diffusion jobs set
+`SGLANG_DIFFUSION_DIAGNOSTICS_DIR`.
 Other jobs and local runs remain opt-in. This records evidence only: it does
 not change baselines, tolerances, warmup inputs, retry policy, or exit codes.
 The metric and failure contracts below apply independently of this sampler.
