@@ -47,10 +47,11 @@ class DFlashDraftInputV2(SpecInput):
     nxt_kv_lens_cpu: Optional[torch.Tensor] = None
     nxt_kv_lens_sum: Optional[int] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
-    _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
-    _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
-    _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
-    _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    # Per-step plan vectors, rows [cur_kv_lens, nxt_kv_lens, mamba track
+    # positions], staged in one pinned buffer and shipped to the device in a
+    # single copy per decode step.
+    _prepare_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_lens_gpu_buf: Optional[torch.Tensor] = None
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
@@ -66,40 +67,29 @@ class DFlashDraftInputV2(SpecInput):
     def _ensure_prepare_length_buffers(
         self, bs: int, device: torch.device | str
     ) -> None:
-        pin_memory = is_pin_memory_available(device)
-
-        def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs
-
-        def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
-
-        def grown_capacity(buf: Optional[torch.Tensor]) -> int:
-            current = 0 if buf is None else int(buf.numel())
-            return max(bs, 32, current * 2 if current > 0 else 0)
-
-        # The three CPU scratch buffers grow together; capacity is the only
-        # invariant (batch is int64 non-pinned, cur/nxt are int32 pinned).
-        if needs_cpu_alloc(self._prepare_batch_seq_lens_cpu_buf):
-            capacity = grown_capacity(self._prepare_batch_seq_lens_cpu_buf)
-            self._prepare_batch_seq_lens_cpu_buf = torch.empty(
-                (capacity,), dtype=torch.int64, device="cpu"
-            )
-            self._prepare_cur_kv_lens_cpu_buf = torch.empty(
-                (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
-            )
-            self._prepare_nxt_kv_lens_cpu_buf = torch.empty(
-                (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
-            )
-
-        if needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
-            capacity = grown_capacity(self._prepare_cur_kv_lens_gpu_buf)
-            self._prepare_cur_kv_lens_gpu_buf = torch.empty(
-                (capacity,), dtype=torch.int32, device=device
-            )
-            self._prepare_nxt_kv_lens_gpu_buf = torch.empty(
-                (capacity,), dtype=torch.int32, device=device
-            )
+        gpu_buf = self._prepare_lens_gpu_buf
+        if (
+            gpu_buf is not None
+            and gpu_buf.shape[1] >= bs
+            and str(gpu_buf.device) == str(device)
+        ):
+            return
+        current = 0 if gpu_buf is None else int(gpu_buf.shape[1])
+        capacity = max(bs, 32, current * 2)
+        # The staging rows and their device mirror share one capacity so the
+        # whole staging buffer moves in one contiguous copy.
+        self._prepare_batch_seq_lens_cpu_buf = torch.empty(
+            (capacity,), dtype=torch.int64, device="cpu"
+        )
+        self._prepare_lens_cpu_buf = torch.zeros(
+            (3, capacity),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=is_pin_memory_available(device),
+        )
+        self._prepare_lens_gpu_buf = torch.zeros(
+            (3, capacity), dtype=torch.int32, device=device
+        )
 
     @classmethod
     def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
@@ -130,13 +120,15 @@ class DFlashDraftInputV2(SpecInput):
 
         self._ensure_prepare_length_buffers(bs, batch.device)
         assert self._prepare_batch_seq_lens_cpu_buf is not None
-        assert self._prepare_cur_kv_lens_cpu_buf is not None
-        assert self._prepare_nxt_kv_lens_cpu_buf is not None
-        assert self._prepare_cur_kv_lens_gpu_buf is not None
-        assert self._prepare_nxt_kv_lens_gpu_buf is not None
+        assert self._prepare_lens_cpu_buf is not None
+        assert self._prepare_lens_gpu_buf is not None
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
-        cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
-        nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
+        lens_cpu = self._prepare_lens_cpu_buf
+        cur_kv_lens_cpu_t = lens_cpu[0, :bs]
+        nxt_kv_lens_cpu_t = lens_cpu[1, :bs]
+        track_positions = batch.mamba_lazy_spec_track_positions_cpu
+        if track_positions is not None:
+            lens_cpu[2, :bs] = torch.tensor(track_positions, dtype=torch.int32)
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_spec().speculative_num_draft_tokens)
@@ -189,10 +181,12 @@ class DFlashDraftInputV2(SpecInput):
                 # The plan stream must wait for those writes before reading them.
                 plan_stream.wait_stream(caller_stream)
 
-            cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
-            nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
-            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+            lens_gpu = self._prepare_lens_gpu_buf
+            lens_gpu.copy_(lens_cpu, non_blocking=True)
+            cur_kv_lens = lens_gpu[0, :bs]
+            nxt_kv_lens = lens_gpu[1, :bs]
+            if track_positions is not None:
+                batch.mamba_lazy_spec_track_positions = lens_gpu[2, :bs]
 
             alloc_for_spec_decode(
                 batch.tree_cache,

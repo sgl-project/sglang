@@ -2059,12 +2059,15 @@ def mamba_lazy_spec_in_window(
 
 
 def set_mamba_track_indices_from_reqs(
-    batch, track_positions: Optional[List[int]] = None
+    batch,
+    track_positions: Optional[List[int]] = None,
+    track_positions_gpu: Optional[torch.Tensor] = None,
 ):
     """Build mamba_track_indices from req objects (authoritative source).
 
     track_positions: optional per-req ping-pong position override (the lazy
-    spec track plan, see mamba_lazy_spec_prepare).
+    spec track plan, see mamba_lazy_spec_prepare). track_positions_gpu: the
+    same positions already staged on device, which saves the per-step H2D copy.
     """
     req_to_token_pool = batch.req_to_token_pool
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
@@ -2083,17 +2086,16 @@ def set_mamba_track_indices_from_reqs(
             for req in batch.reqs
         ]
     batch.mamba_track_buffer_indices = list(track_positions)
-    idx = (
-        torch.tensor(
+    if track_positions_gpu is not None:
+        idx = track_positions_gpu.to(torch.int64)
+    else:
+        idx = torch.tensor(
             track_positions,
             dtype=torch.int64,
             pin_memory=True,
-        )
-        .unsqueeze(1)
-        .to(device=all_buffers.device, non_blocking=True)
-    )
+        ).to(device=all_buffers.device, non_blocking=True)
     batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+        torch.gather(all_buffers, 1, idx.unsqueeze(1)).squeeze(1).to(torch.int64)
     )
 
 
@@ -2301,6 +2303,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Lazy + spec: this iteration's per-req scatter positions
     # (see mamba_lazy_spec_prepare).
     mamba_lazy_spec_track_positions_cpu: Optional[List[int]] = None  # shape: [b]
+    # Device staging of the same positions when the spec plan ships them with
+    # its own per-step copy (DFlashDraftInputV2.prepare_for_decode).
+    mamba_lazy_spec_track_positions: Optional[torch.Tensor] = None  # shape: [b], int32
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -3509,6 +3514,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
+        self.mamba_lazy_spec_track_positions = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -3575,6 +3581,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
+        self.mamba_lazy_spec_track_positions = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
             self.token_ids_logprobs = self.token_ids_logprobs + other.token_ids_logprobs
@@ -3638,6 +3645,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
             mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
             mamba_lazy_spec_track_positions_cpu=self.mamba_lazy_spec_track_positions_cpu,
+            mamba_lazy_spec_track_positions=self.mamba_lazy_spec_track_positions,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

@@ -743,16 +743,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
-        pin_memory = is_pin_memory_available(device)
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
+        self.global_num_tokens_gpu = host_ints_to_device(
+            global_num_tokens, dtype=torch.int64, device=device
+        )
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob,
-            dtype=torch.int64,
-            pin_memory=pin_memory,
-        ).to(device, non_blocking=True)
+        self.global_num_tokens_for_logprob_gpu = host_ints_to_device(
+            global_num_tokens_for_logprob, dtype=torch.int64, device=device
+        )
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
 
     @classmethod
@@ -892,11 +889,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.global_num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=is_pin_memory_available(device),
-            ).to(device, non_blocking=True)
+            ret.global_num_token_non_padded = torch.full(
+                (), num_tokens, dtype=torch.int32, device=device
+            )
         ret.global_num_token_non_padded_cpu = num_tokens
 
         ret.init_mlp_sync_metadata(batch, device)
@@ -1815,6 +1810,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 def enable_num_token_non_padded():
     return get_parallel().moe_ep_size > 1
+
+
+def host_ints_to_device(
+    values: List[int], *, dtype: torch.dtype, device: Union[str, torch.device]
+) -> torch.Tensor:
+    """Host ints as a device vector. A single value rides in a fill kernel's
+    launch arguments instead of a per-call pinned staging buffer plus H2D copy,
+    so the dp_size == 1 decode step issues no host-to-device memcpy for it."""
+    if len(values) == 1:
+        return torch.full((1,), values[0], dtype=dtype, device=device)
+    return torch.tensor(
+        values, dtype=dtype, pin_memory=is_pin_memory_available(device)
+    ).to(device, non_blocking=True)
 
 
 def build_inner_fb_view(

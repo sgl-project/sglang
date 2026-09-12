@@ -780,6 +780,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
     track_positions = None
+    track_positions_gpu = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
@@ -788,7 +789,8 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
             "must run in prepare_for_decode for every spec decode iteration"
         )
-    set_mamba_track_indices_from_reqs(batch, track_positions)
+        track_positions_gpu = batch.mamba_lazy_spec_track_positions
+    set_mamba_track_indices_from_reqs(batch, track_positions, track_positions_gpu)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
 
