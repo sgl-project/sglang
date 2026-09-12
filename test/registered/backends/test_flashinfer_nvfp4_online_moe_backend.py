@@ -166,5 +166,34 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
     }
 
 
+class TestFlashinferTrtllmGenMoeBackendNvFp4OnlineRelu2(
+    FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
+):
+    """Non-gated RELU^2 experts on the per-token TRT-LLM path.
+
+    Covers the hidden-dim padding (2688 -> 3072) and the all-zero-row requant
+    guard that gated SiLU models never exercise. 5-shot completion GSM8K on
+    the BF16 checkpoint scores ~0.86 in BF16 and ~0.85 with per-token NVFP4.
+    """
+
+    backend = "flashinfer_trtllm"
+    model = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+    eval_args = {"api": "completion", "max_tokens": 256}
+    gsm8k_threshold = 0.80
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            num_examples=200,
+            num_threads=128,
+            **self.eval_args,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], self.gsm8k_threshold)
+
+
 if __name__ == "__main__":
     unittest.main()
