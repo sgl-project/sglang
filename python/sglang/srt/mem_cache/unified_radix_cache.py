@@ -995,6 +995,44 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
+            # Keep the prompt as an independent radix node. Finished requests
+            # append a short, request-specific output to a much longer prompt;
+            # without this split the prompt and output form one leaf and are
+            # evicted together. Re-inserting the prompt only changes topology:
+            # prev_prefix_len prevents the overlapping KV indices from being
+            # treated as duplicate allocations and freed. A declined rotation
+            # tail releases everything past the protected prefix below, so the
+            # split is skipped there rather than handing the tree rows that
+            # are about to be freed.
+            prompt_key = RadixKey(
+                req.origin_input_ids,
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=req.cache_salt,
+            ).page_aligned(self.page_size)
+            if (
+                not result.rotation_tail_declined
+                and len(self._components_tuple) == 1
+                and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
+                and 0 < len(prompt_key) < len(radix_key)
+            ):
+                self.insert(
+                    replace(
+                        insert_params,
+                        key=prompt_key,
+                        value=values[: len(prompt_key)],
+                        prev_prefix_len=len(prompt_key),
+                        priority=insert_params.priority + 1,
+                        # Topology-only re-insert: the request itself created
+                        # these nodes moments ago, so counting it as a hit is
+                        # the same self-referencing inflation `chunked` exists
+                        # to suppress. hit_count drives eviction order, so an
+                        # extra bump here would silently promote every prompt
+                        # node into the protected segment.
+                        chunked=True,
+                    )
+                )
+
             # Free unaligned tail (+ deferred truncation tail). A rotation
             # decline inserted nothing, so the whole span past the protected
             # prefix stayed request-owned and is released here instead.

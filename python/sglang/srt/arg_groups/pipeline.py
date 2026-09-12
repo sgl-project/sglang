@@ -93,6 +93,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_offload_compatibility(server_args)
     from sglang.srt.arg_groups.validation_hook import (
+        default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
         validate_sampling_mask_max_tokens,
@@ -234,6 +235,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_model_specific_adjustments(server_args)
+    default_unset_prefill_decode_interval(server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     handle_offload_compatibility(server_args)
 
