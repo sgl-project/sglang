@@ -17,7 +17,11 @@ pool's region inside the raw buffer (0 for a standalone pool).
 
 from typing import List, Sequence, Tuple
 
+import msgspec
 import torch
+
+ENTRY_ALIGN_BYTES = 32
+ROW_ALIGN_BYTES = 16
 
 
 def _prod(shape: Sequence[int]) -> int:
@@ -25,6 +29,20 @@ def _prod(shape: Sequence[int]) -> int:
     for s in shape:
         out *= int(s)
     return out
+
+
+def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
+    strides = []
+    acc = 1
+    for s in reversed(shape):
+        strides.append(acc)
+        acc *= int(s)
+    return tuple(reversed(strides))
+
+
+def align_entry_bytes(num_bytes: int) -> int:
+    """Round a slot's byte sum up to the entry alignment."""
+    return -(-num_bytes // ENTRY_ALIGN_BYTES) * ENTRY_ALIGN_BYTES
 
 
 def paged_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -58,6 +76,109 @@ def paged_kv_view(
 def paged_row_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:
     """``[slots, ...]`` -> ``[slots // page_size, page_size, row_elems]``, as a view."""
     return paged_view(flat.view(int(flat.shape[0]), -1), page_size)
+
+
+class DensePart(msgspec.Struct, frozen=True, kw_only=True):
+    """One row family inside the entry: ``layer_num`` rows of ``row_shape``,
+    layer ``l`` at ``offset_bytes + l * layer_stride_bytes``."""
+
+    name: str
+    offset_bytes: int
+    layer_stride_bytes: int
+    layer_num: int
+    row_shape: Tuple[int, ...]
+    dtype: torch.dtype
+
+    def row_bytes(self) -> int:
+        return _prod(self.row_shape) * self.dtype.itemsize
+
+    def layer_offset_bytes(self, layer: int) -> int:
+        return self.offset_bytes + layer * self.layer_stride_bytes
+
+
+class DenseEntryLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """Byte layout of one slot's entry; ``entry_bytes`` is the slot stride of
+    every view built over it."""
+
+    entry_bytes: int
+    parts: Tuple[DensePart, ...]
+
+    def __post_init__(self):
+        self.validate()
+
+    def part(self, name: str) -> DensePart:
+        for p in self.parts:
+            if p.name == name:
+                return p
+        raise KeyError(f"no part {name!r} in {[p.name for p in self.parts]}")
+
+    def validate(self) -> None:
+        assert self.entry_bytes % ENTRY_ALIGN_BYTES == 0, (
+            f"entry_bytes={self.entry_bytes} is not a multiple of {ENTRY_ALIGN_BYTES}"
+        )
+        spans = []
+        for p in self.parts:
+            row = p.row_bytes()
+            assert (
+                p.offset_bytes % ROW_ALIGN_BYTES == 0
+                and p.layer_stride_bytes % ROW_ALIGN_BYTES == 0
+                and row % ROW_ALIGN_BYTES == 0
+            ), (
+                f"part {p.name!r}: offset {p.offset_bytes}, layer stride "
+                f"{p.layer_stride_bytes} and row {row} B must all be multiples of "
+                f"{ROW_ALIGN_BYTES} (vector stores)"
+            )
+            for l in range(p.layer_num):
+                lo = p.layer_offset_bytes(l)
+                assert 0 <= lo and lo + row <= self.entry_bytes, (
+                    f"part {p.name!r} layer {l} spans [{lo}, {lo + row}) outside "
+                    f"the {self.entry_bytes}-byte entry"
+                )
+                spans.append((lo, lo + row, p.name, l))
+        spans.sort()
+        for a, b in zip(spans, spans[1:]):
+            assert a[1] <= b[0], (
+                f"parts overlap: {a[2]}[{a[3]}] [{a[0]}, {a[1]}) and "
+                f"{b[2]}[{b[3]}] [{b[0]}, {b[1]})"
+            )
+
+
+def build_dense_views(
+    raw: torch.Tensor,
+    *,
+    layout: DenseEntryLayout,
+    part: DensePart,
+    page_size: int,
+    num_pages: int,
+    anchor_bytes: int = 0,
+) -> List[torch.Tensor]:
+    """Per-layer views of one part: ``(num_pages * page_size, *row_shape)`` with
+    slot stride ``layout.entry_bytes``, indexed by the physical token id
+    ``page * page_size + slot`` (``paged_view`` regroups them by page).
+    """
+    itemsize = part.dtype.itemsize
+    assert layout.entry_bytes % itemsize == 0 and anchor_bytes % itemsize == 0
+    n_rows = num_pages * page_size
+    end = anchor_bytes + n_rows * layout.entry_bytes
+    assert end <= raw.numel() * raw.itemsize, (
+        f"build_dense_views: {n_rows} slots of {layout.entry_bytes} B end at byte "
+        f"{end} but the raw buffer holds only {raw.numel() * raw.itemsize} bytes"
+    )
+    as_dtype_view = raw.view(part.dtype)
+    stride = (layout.entry_bytes // itemsize, *_contiguous_strides(part.row_shape))
+    views: List[torch.Tensor] = []
+    for layer in range(part.layer_num):
+        base_bytes = anchor_bytes + part.layer_offset_bytes(layer)
+        assert base_bytes % itemsize == 0
+        views.append(
+            torch.as_strided(
+                as_dtype_view,
+                size=(n_rows, *part.row_shape),
+                stride=stride,
+                storage_offset=base_bytes // itemsize,
+            )
+        )
+    return views
 
 
 def mha_entry_bytes(
@@ -247,14 +368,6 @@ def build_page_major_mamba_views(
         temporal_dtype=temporal_dtype,
     )
 
-    def contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
-        strides = []
-        acc = 1
-        for s in reversed(shape):
-            strides.append(acc)
-            acc *= int(s)
-        return tuple(reversed(strides))
-
     conv_itemsize = conv_dtype.itemsize
     assert entry_bytes % conv_itemsize == 0, (
         f"misaligned mamba spec: per-slot entry_bytes={entry_bytes} is not a "
@@ -276,7 +389,7 @@ def build_page_major_mamba_views(
         stride = (
             inner_shape_bytes // conv_itemsize,
             conv_slot_stride_elems,
-        ) + contiguous_strides(shape)
+        ) + _contiguous_strides(shape)
         conv_views.append(
             torch.as_strided(
                 as_conv_dtype,
@@ -316,7 +429,7 @@ def build_page_major_mamba_views(
     stride = (
         inner_shape_bytes // itemsize,
         entry_bytes // itemsize,
-    ) + contiguous_strides(temporal_state_shape)
+    ) + _contiguous_strides(temporal_state_shape)
     temporal_view = torch.as_strided(
         as_temporal_dtype,
         size=(layer_num, max_slots) + tuple(temporal_state_shape),
