@@ -241,10 +241,22 @@ mod pd_responses_routing_tests {
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::{TcpListener, TcpStream},
         sync::{oneshot, Mutex},
+        task::JoinHandle,
         time::timeout,
     };
 
     use super::*;
+
+    const STORE_ERROR: &str = r#"{"error":{"message":"Response store is disabled. Stateful Responses require --enable-response-store on a standalone server; response storage is unavailable in PD mode.","type":"invalid_request_error","param":"previous_response_id","code":400}}"#;
+    const DECODE_RESPONSE: &str =
+        r#"{"id":"resp_decode","object":"response","status":"completed"}"#;
+    const DECODE_STREAM: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_decode\",\"status\":\"completed\"}}\n\n";
+
+    #[derive(Clone, Copy)]
+    enum WorkerReply {
+        Json(StatusCode, &'static str),
+        Stream(&'static str),
+    }
 
     /// Regression test: `/v1/responses` must be routed through the PD
     /// dual-dispatch path instead of falling back to the `RouterTrait`
@@ -312,67 +324,7 @@ mod pd_responses_routing_tests {
         }
     }
 
-    /// Spawn a local worker that records every JSON body POSTed to
-    /// `/v1/responses` and returns either a JSON or an SSE response.
-    async fn spawn_capture_worker(
-        captured: Arc<Mutex<Vec<serde_json::Value>>>,
-        streaming: bool,
-    ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let app = axum::Router::new().route(
-            "/v1/responses",
-            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().await.push(body);
-                    if streaming {
-                        axum::response::Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/event-stream")
-                            .body(Body::from(
-                                "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n",
-                            ))
-                            .unwrap()
-                    } else {
-                        axum::response::Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/json")
-                            .body(Body::from(
-                                serde_json::to_string(&json!({
-                                    "id": "resp_mock_decode",
-                                    "object": "response",
-                                    "status": "completed"
-                                }))
-                                .unwrap(),
-                            ))
-                            .unwrap()
-                    }
-                }
-            }),
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{}", addr)
-    }
-
-    fn responses_request(payload: serde_json::Value) -> ResponsesRequest {
-        serde_json::from_value(payload).expect("valid responses request")
-    }
-
-    /// PDRouter must inject the PD bootstrap metadata into both worker
-    /// requests, forward `disagg_prefill_dp_rank` to decode for a DP-aware
-    /// prefill worker, target `/v1/responses` on both workers, and return the
-    /// decode response.
-    #[tokio::test]
-    async fn test_pd_responses_injects_bootstrap_metadata() {
-        let prefill_bodies = Arc::new(Mutex::new(Vec::new()));
-        let decode_bodies = Arc::new(Mutex::new(Vec::new()));
-        let prefill_url = spawn_capture_worker(prefill_bodies.clone(), false).await;
-        let decode_url = spawn_capture_worker(decode_bodies.clone(), false).await;
-
-        let router = make_pd_router();
+    fn register_workers(router: &PDRouter, prefill_url: String, decode_url: String) {
         let prefill = DPAwareWorkerBuilder::new(prefill_url, 2, 4)
             .worker_type(CoreWorkerType::Prefill {
                 bootstrap_port: Some(8998),
@@ -385,56 +337,113 @@ mod pd_responses_routing_tests {
         decode.set_healthy(true);
         router.worker_registry.register(Arc::new(prefill));
         router.worker_registry.register(Arc::new(decode));
+    }
 
-        let request = responses_request(json!({
-            "model": "mock-model",
-            "input": "Hello PD responses",
-            "stream": false
-        }));
-
-        let response = router.route_responses(None, &request, None).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            body_json["id"], "resp_mock_decode",
-            "decode response should be passed through"
+    /// Spawn a local worker that records every JSON body POSTed to
+    /// `/v1/responses` and returns either a JSON or an SSE response.
+    async fn spawn_capture_worker(
+        captured: Arc<Mutex<Vec<serde_json::Value>>>,
+        reply: WorkerReply,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    // SRT forwards Responses.stream to ChatCompletionRequest's non-nullable bool.
+                    let stream = body.get("stream").cloned().unwrap_or(json!(false));
+                    if serde_json::from_value::<bool>(stream).is_err() {
+                        return axum::response::Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                r#"{"error":{"message":"stream must be a boolean"}}"#,
+                            ))
+                            .unwrap();
+                    }
+                    captured.lock().await.push(body);
+                    let (status, content_type, body) = match reply {
+                        WorkerReply::Json(status, body) => (status, "application/json", body),
+                        WorkerReply::Stream(body) => (StatusCode::OK, "text/event-stream", body),
+                    };
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header(CONTENT_TYPE, content_type)
+                        .header("content-length", body.len())
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
         );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), task)
+    }
+
+    fn responses_request(payload: serde_json::Value) -> ResponsesRequest {
+        serde_json::from_value(payload).expect("valid responses request")
+    }
+
+    /// PDRouter must inject the PD bootstrap metadata into both worker
+    /// requests, forward `disagg_prefill_dp_rank` to decode for a DP-aware
+    /// prefill worker, target `/v1/responses` on both workers, and return the
+    /// decode response.
+    #[tokio::test]
+    async fn test_pd_responses_default_buffered_request_injects_bootstrap_metadata() {
+        let prefill_bodies = Arc::new(Mutex::new(Vec::new()));
+        let decode_bodies = Arc::new(Mutex::new(Vec::new()));
+        let (prefill_url, prefill_task) = spawn_capture_worker(
+            prefill_bodies.clone(),
+            WorkerReply::Json(StatusCode::OK, r#"{"id":"resp_prefill"}"#),
+        )
+        .await;
+        let (decode_url, decode_task) = spawn_capture_worker(
+            decode_bodies.clone(),
+            WorkerReply::Json(StatusCode::OK, DECODE_RESPONSE),
+        )
+        .await;
+        let router = make_pd_router();
+        register_workers(&router, prefill_url, decode_url);
+        let request = responses_request(json!({
+            "model": "mock-model", "input": "Hello PD responses"
+        }));
+        assert_eq!(request.stream, None);
+
+        let body = timeout(Duration::from_secs(5), async {
+            let response = router.route_responses(None, &request, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+        .await
+        .expect("PD response must complete");
+        assert_eq!(body.as_ref(), DECODE_RESPONSE.as_bytes());
 
         let prefill_bodies = prefill_bodies.lock().await;
         let decode_bodies = decode_bodies.lock().await;
-        assert_eq!(
-            prefill_bodies.len(),
-            1,
-            "prefill should receive one request"
-        );
-        assert_eq!(decode_bodies.len(), 1, "decode should receive one request");
+        assert_eq!(prefill_bodies.len(), 1);
+        assert_eq!(decode_bodies.len(), 1);
         let prefill_body = &prefill_bodies[0];
         let decode_body = &decode_bodies[0];
-
-        // Original Responses fields must be preserved.
-        assert_eq!(prefill_body["input"], "Hello PD responses");
-        assert_eq!(prefill_body["model"], "mock-model");
-        assert_eq!(decode_body["input"], "Hello PD responses");
-        assert_eq!(decode_body["model"], "mock-model");
-
-        // Bootstrap metadata must be injected for both workers, with the same
-        // room so prefill and decode can rendezvous.
-        assert_eq!(prefill_body["bootstrap_host"], "127.0.0.1");
-        assert_eq!(prefill_body["bootstrap_port"], 8998);
-        assert!(prefill_body["bootstrap_room"].is_u64());
-        assert_eq!(decode_body["bootstrap_host"], "127.0.0.1");
-        assert_eq!(decode_body["bootstrap_port"], 8998);
+        for body in [prefill_body, decode_body] {
+            assert_eq!(body["stream"], false);
+            assert_eq!(body["input"], "Hello PD responses");
+            assert_eq!(body["model"], "mock-model");
+            assert_eq!(body["bootstrap_host"], "127.0.0.1");
+            assert_eq!(body["bootstrap_port"], 8998);
+            assert!(body["bootstrap_room"].is_u64());
+        }
         assert_eq!(
             decode_body["bootstrap_room"],
             prefill_body["bootstrap_room"]
         );
-
-        // DP-aware prefill: its own rank goes to the prefill request, and
-        // decode learns which prefill DP worker holds the KV cache.
         assert_eq!(prefill_body["data_parallel_rank"], 2);
         assert!(prefill_body.get("disagg_prefill_dp_rank").is_none());
         assert_eq!(decode_body["disagg_prefill_dp_rank"], 2);
+        prefill_task.abort();
+        decode_task.abort();
     }
 
     /// Streaming Responses requests must flow through the PD dual-dispatch
@@ -444,38 +453,28 @@ mod pd_responses_routing_tests {
     async fn test_pd_responses_streaming_passthrough() {
         let prefill_bodies = Arc::new(Mutex::new(Vec::new()));
         let decode_bodies = Arc::new(Mutex::new(Vec::new()));
-        let prefill_url = spawn_capture_worker(prefill_bodies.clone(), false).await;
-        let decode_url = spawn_capture_worker(decode_bodies.clone(), true).await;
-
+        let (prefill_url, prefill_task) = spawn_capture_worker(
+            prefill_bodies.clone(),
+            WorkerReply::Stream("data: {\"id\":\"resp_prefill\"}\n\n"),
+        )
+        .await;
+        let (decode_url, decode_task) =
+            spawn_capture_worker(decode_bodies.clone(), WorkerReply::Stream(DECODE_STREAM)).await;
         let router = make_pd_router();
-        let prefill = BasicWorkerBuilder::new(prefill_url)
-            .worker_type(CoreWorkerType::Prefill {
-                bootstrap_port: Some(9001),
-            })
-            .build();
-        prefill.set_healthy(true);
-        let decode = BasicWorkerBuilder::new(decode_url)
-            .worker_type(CoreWorkerType::Decode)
-            .build();
-        decode.set_healthy(true);
-        router.worker_registry.register(Arc::new(prefill));
-        router.worker_registry.register(Arc::new(decode));
-
+        register_workers(&router, prefill_url, decode_url);
         let request = responses_request(json!({
-            "model": "mock-model",
-            "input": "Hello PD streaming",
-            "stream": true
+            "model": "mock-model", "input": "Hello PD streaming", "stream": true
         }));
 
-        let response = router.route_responses(None, &request, None).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body_text = String::from_utf8_lossy(&body);
-        assert!(
-            body_text.contains("response.completed"),
-            "decode SSE stream should be passed through, got: {body_text:?}"
-        );
-
+        let body = timeout(Duration::from_secs(5), async {
+            let response = router.route_responses(None, &request, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+        .await
+        .expect("PD stream must complete without a [DONE] sentinel");
+        assert_eq!(body.as_ref(), DECODE_STREAM.as_bytes());
         let prefill_bodies = prefill_bodies.lock().await;
         let decode_bodies = decode_bodies.lock().await;
         assert_eq!(prefill_bodies.len(), 1);
@@ -486,6 +485,50 @@ mod pd_responses_routing_tests {
             decode_bodies[0]["bootstrap_room"],
             prefill_bodies[0]["bootstrap_room"]
         );
+        prefill_task.abort();
+        decode_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pd_responses_decode_error_is_valid_sse() {
+        let (prefill_url, prefill_task) = spawn_capture_worker(
+            Arc::new(Mutex::new(Vec::new())),
+            WorkerReply::Json(StatusCode::OK, "{}"),
+        )
+        .await;
+        let (decode_url, decode_task) = spawn_capture_worker(
+            Arc::new(Mutex::new(Vec::new())),
+            WorkerReply::Json(StatusCode::BAD_REQUEST, STORE_ERROR),
+        )
+        .await;
+        let router = make_pd_router();
+        register_workers(&router, prefill_url, decode_url);
+        let request = responses_request(json!({
+            "model":"mock-model", "input":"hi", "stream":true
+        }));
+        let body = timeout(Duration::from_secs(5), async {
+            let response = router.route_responses(None, &request, None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+            assert!(!response.headers().contains_key("content-length"));
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+        .await
+        .expect("decode error must complete");
+        let body = std::str::from_utf8(&body).unwrap();
+        let data = body
+            .strip_suffix("\n\n")
+            .expect("SSE event delimiter")
+            .strip_prefix("data: ")
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(data["error"]["status"], 400);
+        assert_eq!(
+            data["error"]["message"],
+            serde_json::from_str::<serde_json::Value>(STORE_ERROR).unwrap()
+        );
+        prefill_task.abort();
+        decode_task.abort();
     }
 
     /// Read the gateway's fixed-length JSON POST without an HTTP server that

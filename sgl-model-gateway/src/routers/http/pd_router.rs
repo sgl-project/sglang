@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -420,6 +423,10 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+                        // ResponsesRequest serializes an absent stream as null, which SRT rejects.
+                        if context.route == "/v1/responses" {
+                            json_request["stream"] = Value::Bool(context.is_stream);
+                        }
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -531,7 +538,8 @@ impl PDRouter {
 
         if context.is_stream {
             // Handle streaming error response
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            response_headers.remove(CONTENT_LENGTH);
             let error_payload = match res.bytes().await {
                 Ok(error_body) => match serde_json::from_slice::<Value>(&error_body) {
                     Ok(error_json) => {
@@ -556,10 +564,7 @@ impl PDRouter {
                 }
             };
 
-            let sse_data = format!(
-                "data: {{'error': {}}}",
-                serde_json::to_string(&error_payload).unwrap_or_default()
-            );
+            let sse_data = format!("data: {}\n\n", json!({ "error": error_payload }));
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
             self.create_streaming_response(

@@ -43,6 +43,8 @@ Store-backed and stateful Responses features are **not supported under PD**:
 
 Prefill and decode run in separate serving processes. Their process-local Responses stores cannot provide coherent shared state: both legs need the same conversation history to reconstruct the prompt, and prefill's stored response is not available to decode. Send explicit conversation history in foreground requests instead of relying on stored response IDs.
 
+Built-in tools (`web_search`, `code_interpreter`) are also unsupported under PD: each tool call requires another generation, but the router dispatches exactly one prefill/decode pair per HTTP request.
+
 Serving-side capability enforcement is tracked in [#39122](https://github.com/sgl-project/sglang/pull/39122). That change introduces opt-in standalone storage with `--enable-response-store`, disallows it under PD, and rejects stateful requests with HTTP 400 before generation. These checks require a serving version containing that change; older versions must not be assumed to reject every unsupported workflow at admission. The HTTP PD router also rejects detached background requests because it does not implement their retrieval/cancel lifecycle.
 
 
