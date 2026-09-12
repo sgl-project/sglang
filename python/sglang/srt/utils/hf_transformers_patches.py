@@ -58,6 +58,7 @@ def apply_all():
     # v5.4 patches
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
+    _patch_layer_types_validation()
     _patch_removed_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
@@ -198,6 +199,38 @@ def _patch_flash_attn_availability():
             _u.is_flash_attn_2_available = lambda: False
     except ImportError:
         pass
+
+
+def _patch_layer_types_validation():
+    from transformers import PretrainedConfig
+
+    validators = PretrainedConfig.__class_validators__
+    for index, validator in enumerate(validators):
+        if validator.__name__ != "validate_layer_type":
+            continue
+
+        def validate_layer_type(self, _orig=validator):
+            try:
+                return _orig(self)
+            except ValueError as e:
+                # Step-3.5-Flash lists a `layer_types` entry per main *and*
+                # next-n-predict layer, which transformers >= 5.17 rejects.
+                if "must be equal to the number of" not in str(e):
+                    raise
+                num_mtp_layers = getattr(self, "num_nextn_predict_layers", 0) or 0
+                if not num_mtp_layers:
+                    raise
+                # Re-run the original against the wider count, so its other
+                # rules -- per-list vocabularies, legacy remapping -- still hold.
+                num_hidden_layers = self.num_hidden_layers
+                self.num_hidden_layers = num_hidden_layers + num_mtp_layers
+                try:
+                    return _orig(self)
+                finally:
+                    self.num_hidden_layers = num_hidden_layers
+
+        validators[index] = validate_layer_type
+        break
 
 
 def _patch_removed_symbols():

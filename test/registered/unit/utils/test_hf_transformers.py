@@ -935,5 +935,70 @@ class TestNormalizeTpStyle(CustomTestCase):
             _normalize_tp_style("mla_kv_a_proj")
 
 
+# ---------------------------------------------------------------------------
+# compat: _patch_layer_types_validation
+# ---------------------------------------------------------------------------
+
+
+class TestLayerTypesValidationPatch(CustomTestCase):
+    """Step-3.5-Flash lists a `layer_types` entry per main *and* next-n-predict
+    layer, which transformers' strict validator would otherwise reject."""
+
+    _SLIDING = ["sliding_attention"]
+
+    def test_layer_types_may_cover_the_mtp_layers(self):
+        config = PretrainedConfig(
+            num_hidden_layers=45,
+            num_nextn_predict_layers=3,
+            layer_types=self._SLIDING * 48,
+        )
+
+        self.assertEqual(len(config.layer_types), 48)
+
+    def test_a_length_the_mtp_layers_do_not_explain_still_raises(self):
+        with self.assertRaises(Exception):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 6,
+            )
+
+    def test_an_unknown_layer_type_still_raises(self):
+        with self.assertRaises(Exception):
+            PretrainedConfig(num_hidden_layers=4, layer_types=["not_a_layer_type"] * 4)
+
+    def test_an_accepted_length_does_not_excuse_a_later_list(self):
+        """A rejected `layer_types` length aborts the original validator before
+        it reaches `mlp_layer_types`, whose entries must still be checked."""
+        with self.assertRaisesRegex(Exception, "`mlp_layer_types` entries must be in"):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 5,
+                mlp_layer_types=["not_a_layer_type"] * 5,
+            )
+
+    def test_each_list_keeps_its_own_vocabulary(self):
+        """`mlp_layer_types` takes only MLP names, so an attention name in it
+        must be rejected even though it is a valid `layer_types` entry."""
+        with self.assertRaisesRegex(Exception, "`mlp_layer_types` entries must be in"):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 5,
+                mlp_layer_types=self._SLIDING * 5,
+            )
+
+    def test_a_later_list_may_also_cover_the_mtp_layers(self):
+        config = PretrainedConfig(
+            num_hidden_layers=4,
+            num_nextn_predict_layers=1,
+            layer_types=self._SLIDING * 5,
+            mlp_layer_types=["dense"] * 5,
+        )
+
+        self.assertEqual(len(config.mlp_layer_types), 5)
+
+
 if __name__ == "__main__":
     unittest.main()
