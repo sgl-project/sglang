@@ -444,6 +444,13 @@ def capture_prefill_graph(
         model_runner.dsa_indexers,
         model_runner.mha_companion_layers,
     ) = model_runner.get_cuda_graph_layers(layer_model)
+    from sglang.srt.layers.moe.dsv4_tc_compact import compact_moe_enabled
+
+    model_runner.dp_moe_layers = (
+        [getattr(layer, "mlp", None) for layer in layer_model.layers]
+        if compact_moe_enabled()
+        else None
+    )
     (
         model_runner.attention_layers,
         model_runner.mha_companion_layers,

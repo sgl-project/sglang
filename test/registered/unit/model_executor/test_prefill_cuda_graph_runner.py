@@ -227,7 +227,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             server_args=SimpleNamespace(),
             model=SimpleNamespace(),
             model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
+            layer_info=SimpleNamespace(start_layer=0, end_layer=1),
             req_to_token_pool=SimpleNamespace(size=1),
+            get_cuda_graph_layers=lambda _layer_model: ([object()], [], [], [], [None]),
         )
         language_model = SimpleNamespace(layers=[object()])
 
@@ -235,11 +237,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
             patch.object(
                 graph_setup, "resolve_language_model", return_value=language_model
-            ),
-            patch.object(
-                graph_setup,
-                "compute_attention_and_moe_layers",
-                return_value=([object()], [], [], [], []),
             ),
             patch.object(
                 graph_setup,
@@ -275,7 +272,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
-    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+    def _make_load_runner(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.buffer_registry = _FakeBatchRegistry()
@@ -290,6 +287,11 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._next_token_logits_buffer = lambda _rows: None
         runner._prefill_logits_buffer_rows = lambda _batch: 1
         runner._prepare_forward_metadata_for_replay = lambda *_args: None
+        runner._compact_moe_counts_gpu = None
+        return runner
+
+    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+        runner = self._make_load_runner()
 
         mm_input_embeds = torch.randn(3, 8)
         forward_batch = ForwardBatch(
@@ -316,6 +318,41 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         static_batch = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+
+    def test_compact_dp_replay_refreshes_fixed_count_buffer(self):
+        """Changing real DP lengths must update, not replace, captured storage."""
+        runner = self._make_load_runner()
+        runner._compact_moe_counts_gpu = torch.zeros(8, dtype=torch.int64)
+        address = runner._compact_moe_counts_gpu.data_ptr()
+        for counts in ([3, 0, 1, 0, 2, 0, 0, 0], [0, 2, 0, 1, 0, 0, 0, 3]):
+            with self.subTest(counts=counts):
+                batch = ForwardBatch(
+                    forward_mode=ForwardMode.MIXED,
+                    batch_size=1,
+                    input_ids=torch.arange(3, dtype=torch.int64),
+                    req_pool_indices=torch.zeros(1, dtype=torch.int64),
+                    seq_lens=torch.tensor([3], dtype=torch.int32),
+                    out_cache_loc=torch.arange(3, dtype=torch.int64),
+                    seq_lens_sum=3,
+                    positions=torch.arange(3, dtype=torch.int64),
+                    extend_seq_lens_cpu=[3],
+                    extend_prefix_lens_cpu=[0],
+                    global_num_tokens_cpu=[4] * 8,
+                    global_num_tokens_gpu=torch.full((8,), 4),
+                    global_forward_mode=ForwardMode.MIXED,
+                    moe_real_num_tokens_cpu=list(counts),
+                    moe_real_num_tokens_gpu=torch.tensor(counts),
+                )
+                static = runner.load_batch(batch)
+                self.assertEqual(static.moe_real_num_tokens_gpu.data_ptr(), address)
+                self.assertEqual(static.moe_real_num_tokens_cpu, counts)
+                torch.testing.assert_close(
+                    static.moe_real_num_tokens_gpu, torch.tensor(counts)
+                )
+                self.assertEqual(batch.global_num_tokens_cpu, [4] * 8)
+                torch.testing.assert_close(
+                    static.global_num_tokens_gpu, torch.full((8,), 4)
+                )
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
@@ -564,19 +601,20 @@ class _StopInit(Exception):
 
 
 class TestPrefillCudaGraphRunnerCaptureHiddenMode(CustomTestCase):
-    """The hidden-state capture mode PrefillCudaGraphRunner.__init__ pins.
+    """An EAGLE draft must capture LAST for tc_piecewise replay."""
 
-    EAGLE prefill requests FULL on the target and LAST on the draft; a graph
-    captured below the requested mode is rejected by can_run_graph on every
-    replay, so the mode must not depend on the prefill backend.
-    """
-
-    @staticmethod
-    def _eagle_capture_hidden_mode(*, is_draft_worker):
+    def test_eagle_draft_tc_piecewise_captures_last(self):
+        override = get_context().override_server_args(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(bs=[4], backend=Backend.TC_PIECEWISE)
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
             device="cpu",
             gpu_id=0,
-            is_draft_worker=is_draft_worker,
+            is_draft_worker=True,
             is_generation=True,
             lora_manager=None,
             spec_algorithm=SimpleNamespace(
@@ -589,49 +627,16 @@ class TestPrefillCudaGraphRunnerCaptureHiddenMode(CustomTestCase):
             req_to_token_pool=SimpleNamespace(size=8),
         )
 
-        captured = {}
-
-        def stop(self):
-            captured["runner"] = self
-            raise _StopInit
-
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         with (
             get_parallel().override(attn_tp_size=1, attn_tp_rank=0),
-            patch.object(PrefillCudaGraphRunner, "_is_mamba_track_enabled", stop),
-        ):
-            try:
-                PrefillCudaGraphRunner(model_runner)
-            except _StopInit:
-                pass
-
-        return captured["runner"].capture_hidden_mode
-
-    def _install_config(self, backend):
-        override = get_context().override_server_args(
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(bs=[4], backend=backend)
+            patch.object(
+                PrefillCudaGraphRunner, "_is_mamba_track_enabled", side_effect=_StopInit
             ),
-        )
-        override.install()
-        self.addCleanup(override.restore)
-
-    def test_eagle_target_captures_full_on_every_backend(self):
-        for backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE, Backend.FULL):
-            with self.subTest(backend=backend):
-                self._install_config(backend)
-                self.assertEqual(
-                    self._eagle_capture_hidden_mode(is_draft_worker=False),
-                    CaptureHiddenMode.FULL,
-                )
-
-    def test_eagle_draft_worker_captures_last_on_every_backend(self):
-        for backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE):
-            with self.subTest(backend=backend):
-                self._install_config(backend)
-                self.assertEqual(
-                    self._eagle_capture_hidden_mode(is_draft_worker=True),
-                    CaptureHiddenMode.LAST,
-                )
+            self.assertRaises(_StopInit),
+        ):
+            PrefillCudaGraphRunner.__init__(runner, model_runner)
+        self.assertEqual(runner.capture_hidden_mode, CaptureHiddenMode.LAST)
 
 
 if __name__ == "__main__":

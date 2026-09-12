@@ -143,6 +143,10 @@ def _mark_dynamic_forward_batch(forward_batch) -> None:
     for name, value in vars(forward_batch).items():
         if not isinstance(value, torch.Tensor) or value.ndim == 0:
             continue
+        if name == "moe_real_num_tokens_gpu":
+            # This axis is the fixed DP group size, not a token/batch axis.
+            torch._dynamo.mark_static(value, 0)
+            continue
         dims = _runtime_dynamic_dim_for_argument(name)
         _mark_dynamic_on_value(value, dims)
 

@@ -600,6 +600,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # Unpadded token counts for the DSv4 compact MoE split. The ordinary DP
+    # counts below are overwritten by MAX_LEN attention-graph padding.
+    moe_real_num_tokens_cpu: Optional[List[int]] = None
+    moe_real_num_tokens_gpu: Optional[torch.Tensor] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -1372,6 +1376,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+        from sglang.srt.layers.moe.dsv4_tc_compact import compact_moe_enabled
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
@@ -1385,6 +1390,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+
+        if compact_moe_enabled() and self.is_extend_in_batch:
+            self.moe_real_num_tokens_cpu = list(global_num_tokens)
+            # attn_tp_size is one in this mode, so the existing device counts
+            # already match these values. Keep storage independent of the
+            # padded-count copy performed at the end of this method.
+            self.moe_real_num_tokens_gpu = self.global_num_tokens_gpu.clone()
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens

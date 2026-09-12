@@ -1489,6 +1489,9 @@ class Envs:
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+    # Keep DSv4 prefill attention graphs while running TP8/DP8 MoE on the
+    # compact real-token union between captured pieces (ROCm, no A2A only).
+    SGLANG_DSV4_TC_COMPACT_MOE = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)

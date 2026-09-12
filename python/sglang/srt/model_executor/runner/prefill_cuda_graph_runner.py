@@ -390,6 +390,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+        self.dp_moe_layers = getattr(self.model_runner, "dp_moe_layers", None)
+        self._compact_moe_counts_gpu = (
+            torch.zeros(
+                get_parallel().attn_dp_size, dtype=torch.int64, device=self.device
+            )
+            if self.dp_moe_layers is not None
+            else None
+        )
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
         self.dp_size = get_parallel().dp_size
@@ -704,6 +712,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 num_tokens=num_tokens,
                 raw_num_tokens=raw_num_tokens,
                 full_graph=self._is_full_backend,
+                dp_moe_layers=self.dp_moe_layers,
             ),
         ):
             yield
@@ -1424,6 +1433,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            if self._compact_moe_counts_gpu is not None:
+                self._compact_moe_counts_gpu.fill_(num_tokens)
+                forward_batch.moe_real_num_tokens_cpu = [num_tokens] * self.dp_size
+                forward_batch.moe_real_num_tokens_gpu = self._compact_moe_counts_gpu
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
@@ -1667,6 +1680,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 hidden_states=self.static_draft_hidden_states[:static_num_tokens],
             )
 
+        if self._compact_moe_counts_gpu is not None:
+            if (
+                forward_batch.moe_real_num_tokens_cpu is None
+                or forward_batch.moe_real_num_tokens_gpu is None
+            ):
+                raise RuntimeError("Compact MoE graph replay is missing real DP counts")
+            self._compact_moe_counts_gpu.copy_(forward_batch.moe_real_num_tokens_gpu)
+
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
             batch_size=bs,
@@ -1708,6 +1729,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
+            moe_real_num_tokens_cpu=forward_batch.moe_real_num_tokens_cpu,
+            moe_real_num_tokens_gpu=self._compact_moe_counts_gpu,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
             spec_info=padded_spec_info,
