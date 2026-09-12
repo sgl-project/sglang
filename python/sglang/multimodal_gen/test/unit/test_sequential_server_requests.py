@@ -20,6 +20,56 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 pytest_plugins = ["pytester"]
 
 
+def test_request_warmup_is_separate_from_guarded_requests(harness, monkeypatch, capsys):
+    runner, case = harness
+    case = replace(case, perf_warmup_requests=1)
+    cold = _perf_record()
+    cold.total_duration_ms = 3000
+    generate = Mock(
+        side_effect=[
+            (cold, b"output"),
+            (_perf_record(), b"output"),
+            (_perf_record(), b"output"),
+        ]
+    )
+    monkeypatch.setattr(runner, "run_and_collect", generate)
+    runner.test_diffusion_generation(case, object())
+    assert generate.call_count == 3
+    assert len(runner._perf_results) == 2
+    assert runner._validate_consistency.call_count == 2
+    assert "request warmup 1/1 e2e=3000.0000ms" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("duration", [None, 0, float("nan"), float("inf")])
+def test_request_warmup_requires_e2e(harness, monkeypatch, duration):
+    runner, case = harness
+    case = replace(case, perf_warmup_requests=1)
+    record = _perf_record()
+    if duration is None:
+        record = None
+    else:
+        record.total_duration_ms = duration
+    generate = Mock(return_value=(record, b"output"))
+    monkeypatch.setattr(runner, "run_and_collect", generate)
+    with pytest.raises(
+        test_server_common.PerformanceValidationError, match="warmup.*E2E"
+    ):
+        runner.test_diffusion_generation(case, object())
+    assert generate.call_count == 1
+
+
+def test_request_after_warmup_still_enforces_e2e(harness, monkeypatch):
+    runner, case = harness
+    case = replace(case, perf_warmup_requests=1, run_perf_check=False)
+    slow = _perf_record()
+    slow.total_duration_ms = 3000
+    generate = Mock(side_effect=[(_perf_record(), b"output"), (slow, b"output")])
+    monkeypatch.setattr(runner, "run_and_collect", generate)
+    with pytest.raises(test_server_common.PerformanceValidationError, match="E2E"):
+        runner.test_diffusion_generation(case, object())
+    assert generate.call_count == 2
+
+
 def _perf_record():
     return RequestPerfRecord(
         request_id="request",

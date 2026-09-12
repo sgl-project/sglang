@@ -320,6 +320,7 @@ class DiffusionTestCase:
     run_perf_check: bool = True
     # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
+    perf_warmup_requests: int = 0
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
@@ -332,12 +333,19 @@ class DiffusionTestCase:
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
             raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
+        if self.perf_warmup_requests < 0:
+            raise ValueError(f"{self.id}: perf_warmup_requests must be non-negative")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
                 "sampling_params",
                 get_default_sampling_params_for_server_args(self.server_args),
             )
+        if (
+            self.perf_warmup_requests
+            and self.sampling_params.realtime_num_chunks is not None
+        ):
+            raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
 
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None

@@ -1603,6 +1603,28 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         if case.run_lora_dynamic_load_check:
             self._test_dynamic_lora_loading(diffusion_server, case)
 
+        for warmup_index in range(case.perf_warmup_requests):
+            label = f"request warmup {warmup_index + 1}/{case.perf_warmup_requests}"
+            _print_case_log_separator(case.id, f"BEGIN {label}")
+            generate_fn = get_generate_fn(
+                model_path=case.server_args.model_path,
+                modality=case.server_args.modality,
+                sampling_params=case.sampling_params,
+            )
+            record, _ = self.run_and_collect(
+                diffusion_server, case.id, generate_fn, collect_perf=True
+            )
+            if record is None or not (
+                math.isfinite(record.total_duration_ms) and record.total_duration_ms > 0
+            ):
+                raise PerformanceValidationError(
+                    f"[performance] {case.id}: {label} E2E duration missing or invalid"
+                )
+            print(
+                f"[server-test] {case.id}: {label} e2e={record.total_duration_ms:.4f}ms"
+            )
+            _print_case_log_separator(case.id, f"END {label}")
+
         failures = []
         for request_index in range(1, case.perf_repeat_requests + 1):
             label = f"request {request_index}/{case.perf_repeat_requests}"
