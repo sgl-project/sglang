@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_maybe_tbo,
 )
@@ -31,7 +32,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
-from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre
 from sglang.srt.layers.communicator_mhc import (
     MHCLayerCommunicator,
     MHCPostPreResult,
@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -1326,6 +1327,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 "is enabled."
             )
         return None
+
+    def get_flashinfer_prefill_autotune_num_tokens(self) -> int:
+        if (
+            _device_sm == 103
+            and self.config.hidden_size == 4096
+            and isinstance(self.quant_config, Fp8Config)
+            and self.quant_config.weight_block_size == [128, 128]
+        ):
+            return 16384
+        return 0
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = (

@@ -91,9 +91,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
         ("fused", 0, False),
     ],
 )
-def test_mhc_boundary_preserves_residual_mix_and_norm(
-    mode, num_tokens, norm_fused
-):
+def test_mhc_boundary_preserves_residual_mix_and_norm(mode, num_tokens, norm_fused):
     hidden = torch.arange(num_tokens * 4, dtype=torch.float32).reshape(num_tokens, 4)
     residual = hidden.repeat(1, 2) + 1
     comb = torch.tensor([[0.7, 0.3], [0.2, 0.8]]).expand(num_tokens, 2, 2)

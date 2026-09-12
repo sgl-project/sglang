@@ -50,6 +50,9 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_prefill,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
@@ -85,6 +88,13 @@ class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner) -> None:
         super().__init__(model_runner)
         mr = model_runner
+        prefill_autotune_num_tokens = getattr(
+            mr.model, "get_flashinfer_prefill_autotune_num_tokens", None
+        )
+        self._flashinfer_prefill_autotune_num_tokens = (
+            prefill_autotune_num_tokens() if prefill_autotune_num_tokens else 0
+        )
+        self._flashinfer_prefill_autotuned = False
         sa = mr.server_args
         # Built first so the cg runners coalesce onto its buffers via the shared
         # input pool; size to the largest tokens/req across modes the worker hits.
@@ -225,7 +235,8 @@ class EagerRunner(BaseRunner):
         if mode.is_idle():
             return self._execute_idle(forward_batch, pp_proxy_tensors)
         if mode.is_extend(include_draft_extend_v2=True):
-            return self._execute_extend(forward_batch, pp_proxy_tensors)
+            with maybe_flashinfer_autotune_prefill(self, forward_batch):
+                return self._execute_extend(forward_batch, pp_proxy_tensors)
         raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
     def _resolve_decode_pdmux(

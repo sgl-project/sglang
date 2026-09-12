@@ -25,11 +25,12 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
@@ -247,7 +248,9 @@ def _drop_diverged_autotune_cache(
 
 
 @contextlib.contextmanager
-def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
+def flashinfer_autotune_context(
+    model_runner: ModelRunner, *, run_lm_head: Optional[bool]
+):
     # The gate below decides on the same inputs load_configs does.
     from flashinfer.autotuner import _collect_metadata, autotune
 
@@ -284,7 +287,11 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 cache=str(autotune_cache),
                 skip_ops=skip_ops,
             ),
-            autotune_dummy_run_mode(run_lm_head=run_lm_head),
+            (
+                autotune_dummy_run_mode(run_lm_head=run_lm_head)
+                if run_lm_head is not None
+                else empty_context()
+            ),
         ):
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
@@ -329,6 +336,51 @@ def maybe_flashinfer_autotune_speculative_draft(
 
     run_flashinfer_autotune_forward(mr, run_and_reset, run_lm_head=run_lm_head)
     tuned_phases.add(phase_key)
+
+
+@contextlib.contextmanager
+def maybe_flashinfer_autotune_prefill(runner: BaseRunner, batch: ForwardBatch):
+    if (
+        runner._flashinfer_prefill_autotune_num_tokens == 0
+        or batch.input_ids is None
+        or batch.input_embeds is not None
+        or batch.contains_mm_inputs()
+    ):
+        yield
+        return
+    mr = runner.model_runner
+    num_tokens = batch.input_ids.numel()
+    parallel = get_parallel()
+    if (
+        num_tokens != runner._flashinfer_prefill_autotune_num_tokens
+        or runner._flashinfer_prefill_autotuned
+        or batch.forward_mode != ForwardMode.EXTEND
+        or batch.spec_info is not None
+        or mr.is_draft_worker
+        or not mr.spec_algorithm.is_eagle()
+        or not should_run_flashinfer_autotune(mr)
+        or get_exec().moe.moe_runner_backend != "flashinfer_trtllm"
+        or get_exec().moe.moe_a2a_backend != "none"
+        or parallel.tp_size != 4
+        or parallel.pp_size != 1
+        or parallel.attn_cp_size != 1
+        or parallel.attn_dp_size != 1
+        or parallel.attn_dcp_size != 1
+        or parallel.moe_ep_size != 1
+        or get_disagg().disaggregation_mode != "null"
+        or (
+            envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.is_set()
+            and not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get()
+        )
+    ):
+        yield
+        return
+    log_info_on_rank0(
+        logger, f"FlashInfer autotune: first target prefill at {num_tokens} tokens."
+    )
+    with flashinfer_autotune_context(mr, run_lm_head=None):
+        yield
+    runner._flashinfer_prefill_autotuned = True
 
 
 def maybe_flashinfer_autotune_extend(
