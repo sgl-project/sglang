@@ -352,14 +352,14 @@ def fused_kda_conv_gating_verify(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; the output,
-    # conv_state and conv-window caches stay bit-identical to the reference.
-    # Only the fp32 intermediate-ssm rollback cache differs: the tl.sum
-    # reduction-order delta (~1 ulp/step) compounds through the delta-rule
-    # recurrence — measured ~6e-8 at T=4 standard gate (the production MTP
-    # shape), ~1.5e-5 at T=4 safe gate, ~2e-3 at T=8 safe gate. num_warps=1
-    # reproduces the reference reduction order exactly (all buffers
-    # bit-identical) but is ~2.4x slower in-graph — numerics debugging only.
+    # num_warps=4 is ~1.3x faster than the unfused pair in-graph. Output and
+    # conv-window cache stay bit-identical to the reference; conv_state is not
+    # comparable, since the reference advances it and verify leaves it alone.
+    # The fp32 intermediate-ssm rollback cache differs by a tl.sum
+    # reduction-order delta (~1 ulp/step) compounding through the recurrence --
+    # ~6e-8 at T=4 standard gate (the production MTP shape), ~2e-3 at T=8 safe
+    # gate. num_warps=1 restores the reference reduction order for those same
+    # buffers but is ~2.4x slower in-graph -- numerics debugging only.
     num_warps: int = 4,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],

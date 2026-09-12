@@ -199,6 +199,9 @@ def test_output_does_not_depend_on_cta_scheduling():
     full = _run_fused(inp, B, T, H, HV, K, V, lower_bound, 4)[0]
 
     streams, _ = split_device_green_ctx_by_sm_count(torch.device("cuda:0"), [8])
+    # The green stream is non-blocking, so it must be told to wait for the
+    # inputs produced above; synchronize() afterwards only waits on the consumer.
+    streams[0].wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(streams[0]):
         squeezed = _run_fused(inp, B, T, H, HV, K, V, lower_bound, 4)[0]
     streams[0].synchronize()
