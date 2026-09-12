@@ -19,7 +19,9 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", str(int(generate_baseline)))
     case = DiffusionTestCase(
-        "e2e_only", DiffusionServerArgs(model_path="test"), run_perf_check=False
+        "e2e_only",
+        DiffusionServerArgs(model_path="test", modality="image"),
+        run_perf_check=False,
     )
     scenario = ScenarioConfig({}, {}, 1000, 0, 0)
     monkeypatch.setitem(common.BASELINE_CONFIG.scenarios, case.id, scenario)
