@@ -336,6 +336,8 @@ class MiniMaxM3MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.config = config
+        self.is_hash = False
         self.tp_size = get_parallel().tp_size
         self.alt_stream = alt_stream
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
@@ -393,7 +395,9 @@ class MiniMaxM3MoE(nn.Module):
             intermediate_size = config.intermediate_size * self.n_shared_experts
             # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
-            shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
+            shared_experts_tp1 = (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_megamoe()
+            )
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
@@ -433,7 +437,21 @@ class MiniMaxM3MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if get_moe_a2a_backend().is_deepep():
+        backend = get_moe_a2a_backend()
+        if backend.is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                forward_mega_moe,
+                should_use_mega_moe,
+            )
+
+            if not should_use_mega_moe(self, hidden_states):
+                raise RuntimeError(
+                    "MiniMax-M3 MegaMoE was requested but is unavailable; "
+                    "refusing to fall back to forward_normal because EP-sharded "
+                    "experts require MegaMoE dispatch/combine."
+                )
+            return forward_mega_moe(self, hidden_states, forward_batch)
+        if backend.is_deepep():
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             return self.forward_normal(
