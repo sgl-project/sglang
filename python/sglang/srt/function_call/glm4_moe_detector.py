@@ -181,6 +181,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
+        self._skipping_unknown_tool = False
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -491,6 +492,21 @@ class Glm4MoeDetector(BaseFormatDetector):
 
                 func_name = func_name_raw.strip()
                 func_args_raw = func_args_raw.strip() if func_args_raw else ""
+
+                if (
+                    not self._skipping_unknown_tool
+                    and not self._should_forward_tool_name(
+                        func_name, self._tool_indices
+                    )
+                ):
+                    self._skipping_unknown_tool = True
+                if self._skipping_unknown_tool:
+                    if is_tool_end == self.eot_token:
+                        self._buffer = current_text[partial_match.end(3) :]
+                        self._skipping_unknown_tool = False
+                        if self._buffer:
+                            return self.parse_streaming_increment("", tools)
+                    return StreamingParseResult(normal_text="", calls=[])
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:

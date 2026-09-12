@@ -74,6 +74,15 @@ class BaseFormatDetector(ABC):
             tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
         }
 
+    def _should_forward_tool_name(
+        self, name: Optional[str], tool_indices: Dict[str, int]
+    ) -> bool:
+        """Apply the configured policy for a parsed tool name."""
+        if name and name in tool_indices:
+            return True
+        logger.warning(f"Model attempted to call undefined function: {name}")
+        return envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+
     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
         if not isinstance(action, list):
@@ -82,10 +91,8 @@ class BaseFormatDetector(ABC):
         results = []
         for act in action:
             name = act.get("name")
-            if not (name and name in tool_indices):
-                logger.warning(f"Model attempted to call undefined function: {name}")
-                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                    continue  # Skip unknown tools (default legacy behavior)
+            if not self._should_forward_tool_name(name, tool_indices):
+                continue  # Skip unknown tools (default legacy behavior)
 
             results.append(
                 ToolCallItem(
