@@ -496,6 +496,11 @@ def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
 def get_batch_token_counts(forward_batch: ForwardBatch) -> Tuple[int, int]:
     """(total tokens, max tokens per request) for LoRA segment math."""
     mode = forward_batch.forward_mode
+    if mode.is_idle():
+        # --enable-dp-attention: a DP rank with no local requests still runs the (gathered) MoE,
+        # so the MoE-LoRA batch info is built with zero local tokens (the gathered tail is
+        # stamped by _add_moe_lora_info).
+        return 0, 0
     if mode.is_decode():
         return forward_batch.batch_size, 1
     if mode.is_target_verify():
@@ -512,7 +517,11 @@ def generate_sequence_lengths(
 
     device = torch.get_default_device() if device is None else device
     with torch.device(device):
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_idle():
+            seg_lens = torch.zeros(
+                0, dtype=torch.int32
+            )  # idle DP rank: no local tokens
+        elif forward_batch.forward_mode.is_decode():
             seg_lens = torch.ones(forward_batch.batch_size, dtype=torch.int32)
         elif forward_batch.forward_mode.is_target_verify():
             seg_lens = torch.full(
