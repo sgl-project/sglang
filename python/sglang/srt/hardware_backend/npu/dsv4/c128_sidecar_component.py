@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     ComponentType,
     EvictLayer,
+    SWAComponent,
     TreeComponent,
 )
 
@@ -36,6 +37,23 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedTreeNode,
     )
+
+
+class DSV4SWAComponent(SWAComponent):
+    """SWA component whose cache boundary is constrained by DSV4 C128 pages."""
+
+    def prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        is_finished: bool,
+    ) -> int | None:
+        # Preserve SWA branch metadata, but do not cap the shared tree at an
+        # arbitrary SWA page. C128 can only be cached at complete physical
+        # groups, so its component selects the common cache boundary.
+        super().prepare_for_caching_req(req, insert_params, token_ids_len, is_finished)
+        return None
 
 
 class C128SidecarComponent(TreeComponent):
