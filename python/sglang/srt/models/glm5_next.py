@@ -121,14 +121,12 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 
-# Matches DeepSeek-V4's _MHC_POST_MULT_VALUE and the post_mult_value=2.0 that
-# Glm5NextDecoderLayer._hc_pre passes to the unfused hc_pre.
+# Matches DeepSeek-V4's _MHC_POST_MULT_VALUE; the fused and unfused boundaries
+# must agree on it.
 _MHC_POST_MULT_VALUE = 2.0
 
-# Above this the fused boundary loses to the unfused chain, because its pre-norm
-# GEMM skips the split-K kernel mhc_pre uses up to 2048 tokens. Measured under
-# CUDA graph at GLM-5.3-Flash's hc_mult=4 / hidden_size=4096: 1.40x at <=6, 1.17x
-# at 8-16, parity at 24, 0.87x at 32, and 0.21x from 33 with DeepGEMM prenorm off.
+# Above this the fused boundary loses to the unfused chain: its pre-norm GEMM
+# skips the split-K kernel mhc_pre uses to 2048 tokens. Measured on GLM-5.3-Flash.
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
@@ -739,7 +737,7 @@ class Glm5NextDecoderLayer(nn.Module):
             rms_eps=self.config.rms_norm_eps,
             hc_eps=self.config.hc_eps,
             sinkhorn_iters=self.config.hc_sinkhorn_iters,
-            post_mult_value=2.0,
+            post_mult_value=_MHC_POST_MULT_VALUE,
             hc_norm_weight=None,
             out_norm_weight=out_norm_weight,
             out_norm_eps=out_norm_eps,
@@ -768,29 +766,27 @@ class Glm5NextDecoderLayer(nn.Module):
     def hc_ffn_post_pre(
         self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
     ):
-        # hc_post then the FFN hc_pre in one launch instead of three. The
-        # shared dispatcher returns None when no fused kernel covers this
-        # platform or shape, and the caller keeps the unfused chain.
+        # hc_post then the FFN hc_pre in one launch instead of three.
         assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
             return None
         hc_mult = self.config.hc_mult
         fused = apply_mhc_post_pre_boundary(
-            hidden_states,
-            residual.view(num_tokens, hc_mult, hidden_size),
-            h_post.view(num_tokens, hc_mult),
-            h_res.view(num_tokens, hc_mult, hc_mult),
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            hc_mult,
-            self.config.rms_norm_eps,
-            self.config.hc_eps,
-            _MHC_POST_MULT_VALUE,
-            self.config.hc_sinkhorn_iters,
-            out_norm_weight,
-            out_norm_eps,
+            layer_input=hidden_states,
+            residual=residual.view(num_tokens, hc_mult, hidden_size),
+            post=h_post.view(num_tokens, hc_mult),
+            comb=h_res.view(num_tokens, hc_mult, hc_mult),
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hc_mult=hc_mult,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            hc_post_mult=_MHC_POST_MULT_VALUE,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
             # Matches DeepSeek-V4's two hc_ffn_fn boundaries; the Triton tier's
             # parameter is hc_fn_t and this fn has the same [mix_hc, hc_dim] layout.
             fn_transpose=True,

@@ -97,15 +97,15 @@ class MHCState:
     ):
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         if self.hc_ffn_post_pre is not None and hidden_states.shape[0] != 0:
-            # Fused hc_post + FFN hc_pre; returns None when no fused kernel
-            # covers this platform/shape, and the unfused chain below runs.
+            # Returns None when it declines -- no fused kernel for this platform
+            # or shape, or a shape the fusion is slower at -- and the chain runs.
             fused = self.hc_ffn_post_pre(
-                hidden_states,
-                residual,
-                self.h_res,
-                self.h_post,
-                out_norm_weight,
-                out_norm_eps,
+                hidden_states=hidden_states,
+                residual=residual,
+                h_res=self.h_res,
+                h_post=self.h_post,
+                out_norm_weight=out_norm_weight,
+                out_norm_eps=out_norm_eps,
             )
             if fused is not None:
                 hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
