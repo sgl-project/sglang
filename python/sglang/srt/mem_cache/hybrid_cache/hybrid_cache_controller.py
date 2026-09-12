@@ -137,6 +137,10 @@ class HybridCacheController(BaseHiCacheController):
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
+            self.layer_done_counter.on_layer_consumed = self.trigger_layer_load
+            self.mem_pool_device.register_layer_transfer_counter(
+                self.layer_done_counter
+            )
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
