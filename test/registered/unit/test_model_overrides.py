@@ -615,16 +615,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # value: readers only ever read flags.
         self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "auto")
 
-    def test_qwen4_rejects_pd_and_unified_memory(self):
+    def test_qwen4_pd_support_and_remaining_limits(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        for kwargs, message in (
-            ({"disaggregation_mode": "prefill"}, "PD disaggregation"),
-            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
-            ({"enable_unified_memory": True}, "enable-unified-memory"),
-        ):
-            with self.subTest(**kwargs):
-                with self.assertRaisesRegex(ValueError, message):
-                    self._construct(*qwen4, **kwargs)
+        with override_platform(is_cuda=True):
+            for mode in ("prefill", "decode"):
+                with self.subTest(mode=mode):
+                    self._construct(*qwen4, disaggregation_mode=mode)
+
+            with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+                self._construct(*qwen4, enable_unified_memory=True)
+            with self.assertRaisesRegex(ValueError, "MORI requires --pp-size 1"):
+                self._construct(
+                    *qwen4,
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="mori",
+                    pp_size=2,
+                )
 
     def test_qwen4_ple_offload_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
@@ -1123,6 +1129,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             overrides = _nemotron_h_overrides(server_args, hf_config)
         self.assertNotIn("attention_backend", overrides)
         self.assertNotIn("speculative_draft_attention_backend", overrides)
+
+    def test_nemotron_h_omni_uses_inner_text_config(self):
+        outer_config = SimpleNamespace(
+            architectures=["NemotronH_Omni_Reasoning_V3"],
+            quantization_config={"quant_algo": "NVFP4"},
+        )
+        model_config = SimpleNamespace(
+            quantization="modelopt",
+            hf_config=outer_config,
+            hf_text_config=SimpleNamespace(mlp_hidden_act="relu2"),
+        )
+        server_args = SimpleNamespace(
+            quantization=None,
+            moe_runner_backend="auto",
+            moe_a2a_backend="none",
+            attention_backend=None,
+            _model_config=model_config,
+        )
+
+        with (
+            override_platform(is_blackwell=False),
+            override_platform(is_sm100=False),
+            override_platform(is_cuda=False),
+        ):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "NemotronH_Omni_Reasoning_V3",
+                    server_args,
+                    outer_config,
+                ),
+                [
+                    (
+                        "_nemotron_h_overrides",
+                        {
+                            "quantization": "modelopt_fp4",
+                            "moe_runner_backend": "flashinfer_cutlass",
+                        },
+                    )
+                ],
+            )
 
     def test_nemotron_h_w4a16_moe_rejects_a2a_backend(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
@@ -1979,6 +2025,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _flashinfer_allreduce_fusion_auto_enable(_view()),
                 {"flashinfer_allreduce_fusion_backend": "auto"},
             )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(
+                    _view(arch="NemotronH_Omni_Reasoning_V3")
+                ),
+                {"flashinfer_allreduce_fusion_backend": "auto"},
+            )
             # guards: unsupported arch / tp==1 / dp attention / a2a backend
             self.assertEqual(
                 _flashinfer_allreduce_fusion_auto_enable(
@@ -2341,13 +2393,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         # NemotronH routes through the pass (covered by the guard union,
         # not the branch chain — its hook invokes the handler)
-        self.assertEqual(
-            _mamba_radix_cache_resolution(_view("NemotronHForCausalLM")),
-            {
-                "uses_mamba_radix_cache": True,
-                "mamba_radix_cache_strategy": "extra_buffer",
-            },
-        )
+        for architecture in (
+            "NemotronHForCausalLM",
+            "NemotronH_Omni_Reasoning_V3",
+        ):
+            with self.subTest(architecture=architecture):
+                self.assertEqual(
+                    _mamba_radix_cache_resolution(_view(architecture)),
+                    {
+                        "uses_mamba_radix_cache": True,
+                        "mamba_radix_cache_strategy": "extra_buffer",
+                    },
+                )
         # GraniteMoeHybrid is guarded on mamba layer types
         self.assertEqual(
             _mamba_radix_cache_resolution(

@@ -214,6 +214,9 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            quant_config.is_dsv4_fp4_experts = is_deepseek_v4(model_config.hf_config)
             quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
@@ -4115,7 +4118,11 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+        from sglang.srt.utils.runai_utils import (
+            ObjectStorageModel,
+            is_runai_obj_uri,
+            list_safetensors,
+        )
 
         is_object_storage_path = is_runai_obj_uri(model_name_or_path)
         if self._is_distributed is None:
@@ -4156,6 +4163,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 index_file,
                 self.load_config.download_dir,
                 revision,
+            )
+        if is_object_storage_path:
+            index_file = os.path.abspath(
+                os.path.join(ObjectStorageModel.get_path(hf_folder), index_file)
             )
         hf_weights_files = filter_duplicate_safetensors_files(
             hf_weights_files, hf_folder, index_file
