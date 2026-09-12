@@ -91,9 +91,10 @@ class AdaptiveController:
         # (dp_attn min-reduce) so all ranks keep equal draft-token shapes. The
         # local EMA path must then only *update* params, never swap directly.
         self.sync_across_dp = sync_across_dp
-        if sync_across_dp and os.environ.get(
-            "SGLANG_SCHEDULER_SKIP_ALL_GATHER", ""
-        ) == "1":
+        if (
+            sync_across_dp
+            and os.environ.get("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "") == "1"
+        ):
             logger.warning(
                 "SGLANG_SCHEDULER_SKIP_ALL_GATHER=1 disables the DP MLP-sync "
                 "all_gather that carries the adaptive tier consensus — ranks "
