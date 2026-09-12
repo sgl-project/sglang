@@ -39,6 +39,7 @@ type BridgeStateRef = Arc<Mutex<BridgeState>>;
 #[derive(Default)]
 struct BridgeState {
     channels: HashMap<String, Sender<ResponseChunk>>,
+    openai_channels: HashSet<String>,
     pending_sends: HashSet<String>,
     ready_callbacks: HashMap<String, Py<PyAny>>,
     ready_signals: HashSet<String>,
@@ -169,6 +170,13 @@ impl PyBridge {
         Ok(py_callback.into_any())
     }
 
+    fn mark_openai_channel(&self, rid: &str) {
+        let mut state = lock_or_recover(self.state.as_ref(), "state");
+        if state.channels.contains_key(rid) {
+            state.openai_channels.insert(rid.to_string());
+        }
+    }
+
     // ------------------------------------------------------------------
     // Consolidated request submission (generate / embed / classify)
     // ------------------------------------------------------------------
@@ -231,6 +239,7 @@ impl PyBridge {
             state.pending_sends.clear();
             state.ready_callbacks.clear();
             state.ready_signals.clear();
+            state.openai_channels.clear();
             for channel_rid in rids {
                 state.terminal_errors.insert(
                     channel_rid.clone(),
@@ -241,6 +250,7 @@ impl PyBridge {
             true
         } else {
             let mut state = lock_or_recover(self.state.as_ref(), "state");
+            let is_openai = state.openai_channels.contains(rid);
             let was_active = remove_channel_refs_locked(&mut state, rid);
             if was_active {
                 state
@@ -249,7 +259,7 @@ impl PyBridge {
             } else {
                 tracing::debug!(rid, "Ignoring abort for inactive gRPC request id");
             }
-            was_active
+            was_active && !is_openai
         };
 
         if !should_call_python {
@@ -418,7 +428,9 @@ impl PyBridge {
         json_body: &[u8],
         trace_headers: &HashMap<String, String>,
     ) -> PyResult<Receiver<ResponseChunk>> {
+        let rid_owned = rid.to_string();
         self.submit_json(rid, move |py, runtime_handle, callback| {
+            self.mark_openai_channel(&rid_owned);
             let kwargs = PyDict::new(py);
             let py_bytes = PyBytes::new(py, json_body);
             kwargs.set_item("json_body", py_bytes)?;
@@ -430,7 +442,9 @@ impl PyBridge {
                 kwargs.set_item("trace_headers", py_trace_headers)?;
             }
 
-            kwargs.set_item("chunk_callback", callback)?;
+            kwargs.set_item("chunk_callback", &callback)?;
+            let is_disconnected_fn = callback.bind(py).getattr("is_disconnected")?;
+            kwargs.set_item("is_disconnected_fn", is_disconnected_fn)?;
 
             runtime_handle.call_method(py, method_name, (), Some(&kwargs))?;
             Ok(())
@@ -457,18 +471,23 @@ fn close_channel_with_error(
     error: TerminalError,
 ) {
     let mut state = lock_or_recover(state.as_ref(), "state");
+    let had_channel = state.channels.contains_key(rid);
+    let is_openai = state.openai_channels.contains(rid);
     remove_channel_refs_locked(&mut state, rid);
     state.terminal_errors.insert(rid.to_string(), error);
     drop(state);
-    let _ = runtime_handle.call_method1(py, "abort", (rid, false));
+    if had_channel && !is_openai {
+        let _ = runtime_handle.call_method1(py, "abort", (rid, false));
+    }
 }
 
 fn remove_channel_refs_locked(state: &mut BridgeState, rid: &str) -> bool {
     let had_channel = state.channels.remove(rid).is_some();
+    let had_openai_channel = state.openai_channels.remove(rid);
     let had_pending = state.pending_sends.remove(rid);
     let had_callback = state.ready_callbacks.remove(rid).is_some();
     let had_signal = state.ready_signals.remove(rid);
-    had_channel || had_pending || had_callback || had_signal
+    had_channel || had_openai_channel || had_pending || had_callback || had_signal
 }
 
 fn remove_channel_refs(rid: &str, state: &BridgeStateRef) {
@@ -708,6 +727,11 @@ struct JsonChunkCallback {
 
 #[pymethods]
 impl JsonChunkCallback {
+    fn is_disconnected(&self) -> bool {
+        let state = lock_or_recover(self.state.as_ref(), "state");
+        !state.channels.contains_key(&self.rid)
+    }
+
     /// Register before producing chunks. If a parked chunk drained before registration,
     /// Rust fires `on_ready` immediately so late registration cannot miss the edge.
     fn set_on_ready(&self, py: Python<'_>, on_ready: Py<PyAny>) -> PyResult<()> {
