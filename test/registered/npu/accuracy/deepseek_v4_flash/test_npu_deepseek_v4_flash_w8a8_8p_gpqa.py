@@ -115,7 +115,9 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
 
 
 DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH = {
-    "max_tokens": 120000,
+    # TEMPORARY: lowered from 120000 to 8192 to verify the seq-length-boundary
+    # hypothesis for the DSPARK accept-rate collapse.
+    "max_tokens": 8192,
     "top_p": 1,
     "temperature": 1,
     "extra_body": {
