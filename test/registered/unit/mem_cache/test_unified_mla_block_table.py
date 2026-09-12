@@ -15,10 +15,11 @@
 memory pool (Kimi-Linear).
 
 `req_to_token` holds VIRTUAL token ids, while the per-layer MLA views are
-contiguous (`build_mla_views`). The paged MLA backends therefore need their
-page-level block table filled with kernel-facing page ids:
+token-major (`build_dense_views`), indexed by the physical token id. The paged
+MLA backends therefore need their page-level block table filled with physical
+page ids:
 
-    kernel_page(virtual_page) = v2p[virtual_page] * layer_num
+    kernel_page(virtual_page) = v2p[virtual_page]
 
 Since the read-path translator, ONE builder computes that formula for every
 family — `build_index_table` (the canonical) — and the backends only
@@ -57,7 +58,7 @@ register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda"
-_LAYERS = 24  # K3 MLA full-attention layer count
+_MULT = 1  # kernel-facing ids are the physical ones
 
 
 def _fill_block_table(
@@ -162,22 +163,19 @@ class TestBlockTable(unittest.TestCase):
     def test_block_table_matches_reference(self):
         for page_size in (1, 32, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
-            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
-            want = _reference(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
+            got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_MULT)
+            want = _reference(rt, rpi, sl, page_size, v2p=v2p, mult=_MULT)
             self.assertTrue(
                 torch.equal(got.long(), want),
                 f"page_size={page_size}:\ngot ={got}\nwant={want}",
             )
 
     def test_single_full_attention_layer_still_maps_v2p(self):
-        """A config with exactly ONE full-attention layer (e.g. a PP rank owning a
-        single MLA layer) has `kernel_page_multiplier == 1`, but its req_to_token
-        still holds VIRTUAL ids. The kernel-facing id collapses onto the physical id, so
-        the v2p gather alone IS the whole translation -- it must not be skipped.
-
-        Regression guard for detecting the unified pool via `multiplier > 1`:
-        that predicate treats this config as a static pool and leaves the block
-        table in virtual id space.
+        """The kernel-facing id IS the physical id, so the v2p gather alone is
+        the whole translation -- it must not be skipped. Regression guard for
+        detecting the unified pool via `multiplier > 1`: that predicate would
+        treat every unified pool as static and leave the block table in
+        virtual id space.
         """
         for page_size in (1, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
@@ -198,7 +196,7 @@ class TestBlockTable(unittest.TestCase):
         trtllm/flashmla block-table contract)."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
-        got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
+        got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_MULT)
         for r in range(got.shape[0]):
             n_pages = (int(sl[r].item()) + page_size - 1) // page_size
             self.assertTrue(
@@ -213,14 +211,14 @@ class TestBlockTable(unittest.TestCase):
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
         block_table = _fill_block_table(
-            rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS
+            rt, rpi, sl, page_size, v2p=v2p, mult=_MULT
         ).long()
         for r in range(rt.shape[0]):
             n = int(sl[r].item())
             virt_tokens = rt[r, :n].long()
             # translate_kv_loc_for_kernel's formula, applied to token ids.
             kernel_tokens = (
-                v2p[virt_tokens // page_size] * (page_size * _LAYERS)
+                v2p[virt_tokens // page_size] * (page_size * _MULT)
                 + virt_tokens % page_size
             )
             # The block-table entry scaled by page_size must be the kernel-facing id of
@@ -326,11 +324,11 @@ class TestFa3MetadataBlockTable(unittest.TestCase):
             self._assert_live_prefix(got, want, sl, page_size)
 
     def test_translated_mapping_ps1_fast_path(self):
-        got, want, sl = self._run(1, v2p=True, mult=_LAYERS)
+        got, want, sl = self._run(1, v2p=True, mult=_MULT)
         self._assert_live_prefix(got, want, sl, 1)
 
     def test_translated_mapping_general_path(self):
-        got, want, sl = self._run(64, v2p=True, mult=_LAYERS)
+        got, want, sl = self._run(64, v2p=True, mult=_MULT)
         self._assert_live_prefix(got, want, sl, 64)
 
     def test_single_full_attention_layer(self):
