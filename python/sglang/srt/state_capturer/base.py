@@ -78,6 +78,76 @@ class BaseHostCache:
         self.topk_size = topk_size
         self.name = name
         self._log_allocation()
+        # L1 rows use reusable KV slots; L2 rows use stable HiCache host slots.
+        self.valid = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
+        self.must_be_valid = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
+        self._hicache_rows = {}
+
+    def store(self, cache_pool_idx: torch.Tensor, values: torch.Tensor) -> None:
+        """Publish routed-expert rows for the current KV-slot owners."""
+        cache_pool_idx = cache_pool_idx.cpu()
+        self.buffer[cache_pool_idx] = values.cpu()
+        self.valid[cache_pool_idx] = True
+
+    def backup_to_hicache(
+        self, device_indices: torch.Tensor, host_indices: torch.Tensor
+    ) -> None:
+        """Save L1 rows under the L2 KV host-slot identity."""
+        device_indices = device_indices.cpu()
+        host_indices = host_indices.cpu()
+        if len(device_indices) != len(host_indices):
+            raise ValueError("HiCache device/host routed-expert index length mismatch")
+        # HiCache transfers full KV pages. Some page slots are layout padding
+        # and therefore have no forward-time routed-expert capture; preserve
+        # their initialized rows instead of rejecting the whole page.
+        rows = self.buffer[device_indices].clone()
+        for host_idx, row in zip(host_indices.tolist(), rows):
+            self._hicache_rows[host_idx] = row
+
+    def restore_from_hicache(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> bool:
+        """Remap L2 rows to freshly allocated KV slots without stale reads."""
+        host_indices = host_indices.cpu()
+        device_indices = device_indices.cpu()
+        self.must_be_valid[device_indices] = True
+        if len(host_indices) != len(device_indices):
+            raise ValueError("HiCache host/device routed-expert index length mismatch")
+
+        # Invalidate first so a missing sidecar never exposes a prior owner.
+        self.valid[device_indices] = False
+        missing = [idx for idx in host_indices.tolist() if idx not in self._hicache_rows]
+        if missing:
+            logger.error(
+                "Missing routed-expert HiCache rows for host slots %s", missing[:16]
+            )
+            return False
+
+        rows = torch.stack([self._hicache_rows[idx] for idx in host_indices.tolist()])
+        self.buffer[device_indices] = rows
+        self.valid[device_indices] = True
+        return True
+
+    def invalidate_hicache(self, host_indices: torch.Tensor) -> None:
+        """Forget L2 sidecar rows when host slots acquire non-L2 content."""
+        for host_idx in host_indices.cpu().tolist():
+            self._hicache_rows.pop(host_idx, None)
+
+    def invalidate(self, cache_pool_idx: torch.Tensor) -> None:
+        cache_pool_idx = cache_pool_idx.cpu()
+        self.must_be_valid[cache_pool_idx] = True
+        self.valid[cache_pool_idx] = False
+
+    def clear(self) -> None:
+        """Clear both reusable HostCache rows and HiCache L2 sidecar rows."""
+        self.buffer.zero_()
+        self.valid.zero_()
+        self.must_be_valid.zero_()
+        self._hicache_rows.clear()
+
+    def clear_hicache(self) -> None:
+        """Backward-compatible alias for callers added with HiCache support."""
+        self.clear()
 
     def destroy(self):
         if self.buffer is None:
@@ -115,7 +185,7 @@ class TopkCaptureOutput:
         self.topk = fn(self.topk)
 
     def finalize(self):
-        self.host_cache.buffer[self.out_cache_loc] = self.topk
+        self.host_cache.store(self.out_cache_loc, self.topk)
 
 
 class BaseTopkCapturer:
@@ -185,6 +255,16 @@ class BaseTopkCapturer:
             .cpu()
             .clone()
         )
+        invalid_mask = (
+            self.host_cache.must_be_valid[cache_pool_idx]
+            & ~self.host_cache.valid[cache_pool_idx]
+        )
+        if invalid_mask.any():
+            invalid = cache_pool_idx[invalid_mask].tolist()
+            raise RuntimeError(
+                "Routed-expert data is unavailable for KV slots "
+                f"{invalid[:16]}; refusing to return stale HostCache rows."
+            )
         return self.host_cache.buffer[cache_pool_idx]
 
     def on_forward_end(
@@ -209,5 +289,5 @@ class BaseTopkCapturer:
                 host_cache=self.host_cache,
             )
         out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
-        self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
+        self.host_cache.store(out_cache_loc_cpu, slice_gpu)
         return None

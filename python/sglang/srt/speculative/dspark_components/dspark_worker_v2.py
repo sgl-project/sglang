@@ -891,6 +891,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            routed_experts_output=target_verify.routed_experts_output,
+            indexer_topk_output=target_verify.indexer_topk_output,
         )
 
     def _commit_target_mamba_states_after_verify(
