@@ -2580,7 +2580,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Render the updated conversation for the next completion
             prompt_token_ids = context.render_for_completion()
 
-            # Update the adapted request with new prompt
+            # Update the adapted request with new prompt.
+            # PD routing fields are intentionally not carried over: this continuation
+            # has no matching prefill, and bootstrap_room is a consume-once slot.
             adapted_request = GenerateReqInput(
                 input_ids=prompt_token_ids,
                 sampling_params=sampling_params,
