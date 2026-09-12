@@ -525,6 +525,21 @@ class DiffusionServerBase:
 
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
+        if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+            _PENDING_BASELINE_DUMPS.setdefault(case.id, []).append(summary)
+            return
+
+        if scenario is None:
+            pytest.fail(
+                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+            )
+        if not check_memory:
+            validator = PerformanceValidator(
+                scenario=scenario,
+                tolerances=BASELINE_CONFIG.tolerances,
+                step_fractions=BASELINE_CONFIG.step_fractions,
+            )
+        validator.validate_e2e(summary)
         validate_realtime_perf_stats(
             case.id,
             chunk_stats,
@@ -534,17 +549,6 @@ class DiffusionServerBase:
             ),
         )
         if not check_memory:
-            return
-
-        if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
-            logger.info(
-                "%s realtime peak VRAM baseline: load=%.0fMiB, runtime=%.0fMiB, "
-                "warmup=%.0fMiB",
-                case.id,
-                summary.load_peak_vram_mb,
-                summary.runtime_peak_vram_mb,
-                summary.warmup_peak_vram_mb,
-            )
             return
 
         if scenario.load_peak_vram_mb is None or scenario.runtime_peak_vram_mb is None:

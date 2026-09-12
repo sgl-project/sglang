@@ -360,6 +360,12 @@ def test_collect_realtime_output_skips_and_records_chunk_stats(monkeypatch):
     )
     runner = DiffusionServerBase()
     runner._perf_results = []
+    monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
+    monkeypatch.setitem(
+        test_server_common.BASELINE_CONFIG.scenarios,
+        case.id,
+        ScenarioConfig({}, {}, 1000, 0, 0),
+    )
     runner._validate_realtime_performance(None, case, result.chunk_stats)
     assert runner._perf_results[0]["e2e_ms"] == result.e2e_ms
     assert websocket.sent == [
@@ -390,6 +396,39 @@ def test_realtime_requires_e2e_without_threshold_checks(e2e_ms):
         runner._validate_realtime_performance(None, case, [])
 
 
+@pytest.mark.parametrize("baseline", [None, 0, float("nan"), 1000])
+def test_realtime_e2e_guard_without_chunk_thresholds(monkeypatch, baseline):
+    monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
+    monkeypatch.setattr(test_server_common.current_platform, "is_hip", lambda: False)
+    case = DiffusionTestCase(
+        "stream-e2e-threshold",
+        DiffusionServerArgs(model_path="test", modality="video"),
+        DiffusionSamplingParams(prompt="test"),
+        run_perf_check=False,
+    )
+    if baseline is None:
+        monkeypatch.delitem(
+            test_server_common.BASELINE_CONFIG.scenarios, case.id, raising=False
+        )
+        error, message = pytest.fail.Exception, "not found"
+    else:
+        monkeypatch.setitem(
+            test_server_common.BASELINE_CONFIG.scenarios,
+            case.id,
+            ScenarioConfig({}, {}, baseline, 0, 0),
+        )
+        error = AssertionError
+        message = (
+            "E2E Latency" if baseline == 1000 else "E2E baseline missing or invalid"
+        )
+    runner = DiffusionServerBase()
+    runner._perf_results = []
+    record_realtime_perf_stats(case.id, [], 2000)
+    with pytest.raises(error, match=message):
+        runner._validate_realtime_performance(None, case, [])
+    assert runner._perf_results[0]["e2e_ms"] == 2000
+
+
 @pytest.mark.parametrize("peak_mb", [1000, 2000])
 def test_realtime_memory_guard_retains_session_e2e(monkeypatch, peak_mb):
     case = DiffusionTestCase(
@@ -399,7 +438,7 @@ def test_realtime_memory_guard_retains_session_e2e(monkeypatch, peak_mb):
         run_perf_check=True,
     )
     scenario = ScenarioConfig(
-        {}, {}, 0, 0, 0, load_peak_vram_mb=1000, runtime_peak_vram_mb=1000
+        {}, {}, 2000, 0, 0, load_peak_vram_mb=1000, runtime_peak_vram_mb=1000
     )
     monkeypatch.setitem(test_server_common.BASELINE_CONFIG.scenarios, case.id, scenario)
     monkeypatch.setattr(test_server_common.current_platform, "is_cuda", lambda: True)
