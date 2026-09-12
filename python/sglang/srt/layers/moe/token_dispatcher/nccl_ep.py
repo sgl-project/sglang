@@ -83,6 +83,17 @@ def _nccl_runtime_version():
     return None
 
 
+def _nccl_ep_scale_unavailable_reason() -> str | None:
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
+        return (
+            "NCCL EP LL emits float32 FP8 group scales and does not support "
+            "UE8M0 scales required by DEEPGEMM_BLACKWELL"
+        )
+    return None
+
+
 def nccl_ep_unavailable_reason(*, require_graph: bool = False) -> str | None:
     """Return why NCCL EP is unavailable (None = available), for fallback logs."""
     try:
@@ -96,6 +107,8 @@ def nccl_ep_unavailable_reason(*, require_graph: bool = False) -> str | None:
     cc = torch.cuda.get_device_capability(0)[0]  # Hopper (sm_90) or Blackwell.
     if cc < 9:
         return f"GPU arch sm_{cc}x not supported (need Hopper/Blackwell sm_90+)"
+    if reason := _nccl_ep_scale_unavailable_reason():
+        return reason
     ver = _nccl_runtime_version()
     if ver is None:
         return "could not read NCCL version"
@@ -351,6 +364,10 @@ class NcclEpDispatcher(BaseDispatcher):
 
     def __init__(self, moe_runner_config: MoeRunnerConfig, ep_group: GroupCoordinator):
         super().__init__()
+        if moe_runner_config.params_dtype != torch.bfloat16:
+            raise ValueError(
+                "NCCL EP LL requires bfloat16 parameters (--dtype bfloat16)"
+            )
         nccl_core, nccl_ep = _load_nccl_ep()
         self._nccl_ep = nccl_ep
 
@@ -365,20 +382,9 @@ class NcclEpDispatcher(BaseDispatcher):
         # Resolve dispatch mode. LOW_LATENCY only this PR; HT raises at resolve() time.
         self.mode = get_nccl_ep_mode().resolve(is_extend_in_batch=False)
 
-        # Blackwell guard: our fp8 post-quant emits float32 group scales, which
-        # diverge from DeepEP's UE8M0 scales under DEEPGEMM_BLACKWELL. Fail fast
-        # rather than silently mis-quantize.
-        try:
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            if getattr(deep_gemm_wrapper, "DEEPGEMM_BLACKWELL", False):
-                raise NotImplementedError(
-                    "NCCL EP LL fp8 post-quant emits float32 group scales, which diverge "
-                    "from DeepEP's UE8M0 scales when DEEPGEMM_BLACKWELL is set. Fall back "
-                    "to --moe-a2a-backend deepep on Blackwell for now."
-                )
-        except ImportError:
-            pass  # deep_gemm_wrapper absent -> DeepGEMM-Blackwell path not active.
+        # Keep direct dispatcher construction consistent with the public gate.
+        if reason := _nccl_ep_scale_unavailable_reason():
+            raise NotImplementedError(reason)
 
         # Deterministic-inference guard: NCCL EP is not determinism-audited yet.
         try:
@@ -467,6 +473,8 @@ class NcclEpDispatcher(BaseDispatcher):
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         from .nccl_ep_graph import get_nccl_ep_graph_resources
 
+        if hidden_states.dtype != torch.bfloat16:
+            raise ValueError("NCCL EP LL dispatch requires bfloat16 hidden states")
         owner = get_nccl_ep_graph_resources()
         graph_owner = owner if owner is not None and owner.capturing else None
         if torch.cuda.is_current_stream_capturing() and graph_owner is None:
@@ -483,9 +491,10 @@ class NcclEpDispatcher(BaseDispatcher):
         t = hidden_states.shape[0]
         if t > self.num_max_dispatch_tokens_per_rank:
             raise ValueError(
-                f"NCCL EP: decode batch ({t}) exceeds per-rank dispatch budget "
-                f"{self.num_max_dispatch_tokens_per_rank}; increase "
-                f"--nccl-ep-num-max-dispatch-tokens-per-rank or reduce batch."
+                f"NCCL EP: batch ({t}) exceeds per-rank dispatch budget "
+                f"{self.num_max_dispatch_tokens_per_rank}; reduce the decode batch "
+                f"or --chunked-prefill-size. The LL budget is capped at "
+                f"{_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP}."
             )
 
         stream = torch.cuda.current_stream()
