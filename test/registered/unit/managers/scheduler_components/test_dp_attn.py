@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -128,6 +130,88 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
     def test_beam_request_blocks_conversion(self):
         self.assertFalse(self._vote(beam=True))
+
+
+def _sync_info(**overrides):
+    kwargs = dict(
+        dp_size=2,
+        tp_size=1,
+        cp_size=1,
+        num_tokens=1,
+        num_tokens_for_logprob=1,
+        can_run_decode_cuda_graph=True,
+        can_run_prefill_cuda_graph=True,
+        is_extend_in_batch=False,
+        local_can_run_tbo=True,
+        local_forward_mode=ForwardMode.DECODE.value,
+    )
+    kwargs.update(overrides)
+    return dp_attn.MLPSyncBatchInfo(**kwargs)
+
+
+class TestDPMaxSeqLenSync(CustomTestCase):
+    """Decode graphs keyed by context length must be chosen from the longest
+    sequence of the whole attention-DP group, so the scheduler sync carries it."""
+
+    def test_local_tensor_carries_max_seq_len(self):
+        info = _sync_info(max_seq_len=37)
+        self.assertEqual(int(info._get_local_tensor(device="cpu")[8]), 37)
+        # an inactive rank contributes no length
+        self.assertEqual(int(info._get_fallback_tensor(device="cpu")[8]), 0)
+        info.finalize_local()
+        self.assertEqual(info.global_max_seq_len, 37)
+
+    def test_all_gather_takes_group_max(self):
+        rows = {
+            0: _sync_info(max_seq_len=100),
+            1: _sync_info(num_tokens=0, max_seq_len=0),
+        }
+
+        def fake_all_gather(out, local, group=None):
+            width = local.numel()
+            for rank, info in rows.items():
+                out[rank * width : (rank + 1) * width] = info._get_local_tensor(
+                    device=local.device, dtype=local.dtype
+                )
+
+        tp_group = SimpleNamespace(active_ranks_cpu=torch.ones(2, dtype=torch.int64))
+        with (
+            patch.object(
+                dp_attn.torch.distributed, "all_gather_into_tensor", fake_all_gather
+            ),
+            patch.object(dp_attn, "get_tp_group", return_value=tp_group),
+        ):
+            for rank, info in rows.items():
+                info.all_gather(device="cpu", group=object())
+                self.assertEqual(info.global_max_seq_len, 100, f"rank {rank}")
+                self.assertEqual(info.global_num_tokens, [1, 0])
+
+    def test_gathered_batch_gets_group_max(self):
+        info = _sync_info(max_seq_len=5)
+        info.global_num_tokens = [1, 0]
+        info.global_num_tokens_for_logprob = [1, 0]
+        info.global_max_seq_len = 100
+        info.tbo_split_seq_index = None
+        info.global_forward_mode = ForwardMode.DECODE
+        idle_batch = SimpleNamespace()
+        dp_attn._update_gather_batch(idle_batch, info, require_mlp_tp_gather=True)
+        self.assertEqual(idle_batch.dp_max_seq_len, 100)
+
+    def test_local_max_seq_len_sources(self):
+        self.assertEqual(
+            dp_attn._local_max_seq_len(
+                SimpleNamespace(seq_lens_cpu=torch.tensor([3, 41, 7]))
+            ),
+            41,
+        )
+        self.assertEqual(
+            dp_attn._local_max_seq_len(
+                SimpleNamespace(
+                    seq_lens_cpu=torch.empty(0, dtype=torch.int64), seq_lens=None
+                )
+            ),
+            0,
+        )
 
 
 if __name__ == "__main__":
