@@ -126,6 +126,18 @@ def main(args):
     )
     latency = time.perf_counter() - tic
 
+    # A request whose generation never completed (server crash, watchdog kill,
+    # dropped connection) leaves "answer" unset on its state. Indexing it raises
+    # a bare KeyError: 'answer' that looks like a parsing bug and hides the real
+    # failure, so surface the request failures instead.
+    failed = [i for i, s in enumerate(states) if "answer" not in s]
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)}/{len(states)} GSM8K requests did not return an "
+            f"answer (first failing indices: {failed[:10]}). The server most "
+            f"likely died or stopped responding mid-run -- check the server log."
+        )
+
     preds = []
     for i in range(len(states)):
         preds.append(get_answer_value(states[i]["answer"]))
