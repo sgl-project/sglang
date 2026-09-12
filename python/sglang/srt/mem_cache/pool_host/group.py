@@ -95,22 +95,15 @@ class HostPoolGroup:
 
     def get_page_buffer_element_size(self, split_factor: int = 1):
         anchor_pool = self.anchor_entry.host_pool
-        anchor_getter = getattr(anchor_pool, "get_page_buffer_element_size", None)
-        if anchor_getter is None:
-            dummy = torch.zeros(anchor_pool.page_size, dtype=torch.int64)
-            if split_factor != 1:
-                meta = anchor_pool.get_split_heads_page_buffer_meta(dummy, split_factor)
-            else:
-                meta = anchor_pool.get_page_buffer_meta(dummy)
-            sizes = meta[1] if meta else None
-            return int(sizes[0]) if sizes else None
+        if (
+            not isinstance(anchor_pool, HostKVCache)
+            or anchor_pool.shared_allocation_domain is None
+        ):
+            return anchor_pool.get_page_buffer_element_size(split_factor)
 
         element_sizes = set()
         for entry in self.entries:
-            getter = getattr(entry.host_pool, "get_page_buffer_element_size", None)
-            if getter is None:
-                return None
-            element_size = getter(split_factor)
+            element_size = entry.host_pool.get_page_buffer_element_size(split_factor)
             if element_size is None:
                 return None
             element_sizes.add(element_size)

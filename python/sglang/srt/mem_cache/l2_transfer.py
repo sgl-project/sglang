@@ -120,8 +120,8 @@ class L2TransferEngine:
         finish_recorded = False
         try:
             with device_module.stream(self.device_to_host_stream):
-                transfers = self._prepare_transfers(transfers)
                 start_event.wait(self.device_to_host_stream)
+                transfers = self._prepare_transfers(transfers)
                 ack_start.record()
                 for transfer in transfers:
                     if self._uses_shared_layout(transfer.host_pool):
@@ -167,9 +167,9 @@ class L2TransferEngine:
         finish_recorded = False
         try:
             with device_module.stream(self.host_to_device_stream):
+                start_event.wait(self.host_to_device_stream)
                 transfers = self._prepare_transfers(transfers)
                 primary = transfers[0] if transfers else None
-                start_event.wait(self.host_to_device_stream)
                 ack_start.record()
                 for layer_id in range(layer_num):
                     for transfer in transfers:

@@ -169,6 +169,9 @@ class LogicalHostPool:
     def get_page_buffer_meta(self, indices):
         return None
 
+    def get_page_buffer_element_size(self, split_factor: int = 1):
+        return None
+
     def get_ksize_per_token(self):
         return 0
 
