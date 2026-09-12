@@ -124,7 +124,7 @@ class KVIndexTranslator:
             self._capture_page_size = alloc.page_size
             self._full_v2p_table = alloc.full_v2p_page_table
             self._full_p2v_table = alloc.full_p2v_page_table
-            self._translate_full = alloc.translate_kv_loc_for_kernel
+            self._translate_full = alloc.translate_kv_loc
             # The WRITE loc is the one id that arrives DCP-WIDENED: read indices
             # are collapsed by the DCP index kernels, `out_cache_loc` still
             # carries the owner rule in `loc % dcp_size`. Identity with the read

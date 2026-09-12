@@ -22,9 +22,9 @@ Covers, CPU-only (pure torch -- no GPU / Triton kernels):
     the reserved sink floor covers the whole page-0 envelope;
   - `UnifiedMLATokenToKVPool`: buffer wiring, V-as-prefix-slice, and the
     page-envelope `move_kv_cache` (physical token ids, page-major runs);
-  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: the same id as the
-    physical translate, tombstone clamp to the sink, `out=` contract, and
-    correctness across eager compaction.
+  - `MultiEndedAllocator.translate_kv_loc`: the v2p formula, tombstone clamp
+    to the sink, `out=` contract, int32 2-D page tables, and correctness
+    across eager compaction.
 
 GPU parity of the actual read/write kernels (set_mla_kv_buffer TMA path etc.)
 lives in the server-level tests, not here.
@@ -332,7 +332,7 @@ class _FakeKVCache:
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
-class TestTranslateKvLocForKernel(unittest.TestCase):
+class TestTranslateKvLoc(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
         full_alloc = MultiEndedAllocator(
@@ -354,40 +354,68 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return full_alloc
 
-    def test_kernel_id_is_the_physical_id(self):
+    def test_translate_matches_v2p_formula(self):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             v = alloc.alloc(3 * ps)
             self.assertIsNotNone(v)
-            phys = alloc.translate_kv_loc(v)
-            kernel = alloc.translate_kv_loc_for_kernel(v)
-            self.assertTrue(torch.equal(kernel, phys), f"ps={ps}")
             v2p = alloc.virtual_to_physical
-            self.assertTrue(torch.equal(kernel, v2p[v // ps] * ps + v % ps))
+            want = v2p[v // ps] * ps + v % ps
+            self.assertTrue(torch.equal(alloc.translate_kv_loc(v), want), f"ps={ps}")
 
     def test_tombstone_clamps_to_sink(self):
         alloc = self._build(ps=1)
         # never-allocated virtual ids -> v2p == -1 -> id 0
         virt = torch.tensor([alloc.min_slot_index + 1], dtype=torch.int64)
-        kernel = alloc.translate_kv_loc_for_kernel(virt)
-        self.assertTrue(torch.all(kernel == 0))
+        self.assertTrue(torch.all(alloc.translate_kv_loc(virt) == 0))
 
     def test_out_matches_and_aliases(self):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             v = alloc.alloc(2 * ps)
             self.assertIsNotNone(v)
-            no_out = alloc.translate_kv_loc_for_kernel(v)
+            no_out = alloc.translate_kv_loc(v)
             out = torch.empty_like(v)
-            ret = alloc.translate_kv_loc_for_kernel(v, out=out)
+            ret = alloc.translate_kv_loc(v, out=out)
             self.assertIs(ret, out)
             self.assertTrue(torch.all(out == no_out))
             # canonical in-place aliasing: translate(x, out=x)
             x = v.clone()
-            alloc.translate_kv_loc_for_kernel(x, out=x)
+            alloc.translate_kv_loc(x, out=x)
             self.assertTrue(torch.all(x == no_out))
 
-    def test_kernel_id_follows_compaction(self):
+    def test_accepts_an_int32_2d_page_table(self):
+        """fa3 translates its own page table, which is int32 and 2-D; a gather
+        that needs a 1-D int64 index would crash the scheduler there."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            v = alloc.alloc(4 * ps)
+            self.assertIsNotNone(v)
+            want = alloc.translate_kv_loc(v)
+            page_table = v.to(torch.int32).view(2, -1)
+            got = alloc.translate_kv_loc(page_table)
+            self.assertEqual(got.shape, page_table.shape)
+            self.assertTrue(torch.equal(got.reshape(-1), want))
+            dst = torch.empty(page_table.shape, dtype=torch.int64)
+            alloc.translate_kv_loc(page_table, out=dst)
+            self.assertTrue(torch.equal(dst.reshape(-1), want))
+
+    def test_a_negative_loc_no_longer_raises(self):
+        """A padded read table carries -1 in the slots a shorter sequence does
+        not use, and `translate_kv_loc` is now on the path that sees them. The
+        torch gather it used before rejected a negative index outright, which
+        would take the scheduler down; it must resolve to an addressable id
+        instead. WHICH id is not pinned here: this path lets the v2p lookup
+        wrap while the fused kernel sends it to the page-0 sink, and making the
+        two agree is the fold the TODO on `translate_kv_loc` describes."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            self.assertIsNotNone(alloc.alloc(4 * ps))
+            got = alloc.translate_kv_loc(torch.tensor([-1], dtype=torch.int64))
+            self.assertTrue(bool((got >= 0).all()), f"ps={ps}: {got}")
+            self.assertTrue(bool((got < alloc.max_slots).all()), f"ps={ps}: {got}")
+
+    def test_translate_follows_compaction(self):
         alloc = self._build(ps=1)
         a = alloc.alloc(4)
         b = alloc.alloc(4)
@@ -396,9 +424,7 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
         alloc.free(b)  # eager compaction relocates survivors
         for run in (a, c):
             self.assertTrue(
-                torch.equal(
-                    alloc.translate_kv_loc_for_kernel(run), alloc.translate_kv_loc(run)
-                )
+                torch.equal(alloc.translate_kv_loc(run), alloc.virtual_to_physical[run])
             )
 
 

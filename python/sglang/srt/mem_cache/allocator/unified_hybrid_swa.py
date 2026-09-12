@@ -318,11 +318,9 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     ) -> torch.Tensor:
         """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids.
 
-        The SWA counterpart of the above. `translate_loc_from_full_to_swa`
-        cannot serve here: it returns KERNEL-FACING ids (the physical page
-        scaled by the sub-pool's per-page block count), which index the
-        per-layer views, whereas the SWA state component is registered as whole
-        page envelopes and addressed by physical page.
+        The SWA counterpart of the above, and it must translate against the
+        SWA sub-pool's own table: `translate_loc_from_full_to_swa` takes
+        FULL-side ids, whereas the transfer engine hands over virtual ids.
         """
         return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
@@ -376,15 +374,6 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             feature="HiCache",
             lazy_compaction=self.lazy_compaction,
         )
-
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
 
     def translate_write_loc_for_kernel(
         self,
