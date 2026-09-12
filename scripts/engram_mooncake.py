@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload V4.1 FP8 Engram tables and keep a local Mooncake memory segment alive."""
+"""Prepare V4.1 byte tables in a Mooncake Store owner or immutable local files."""
 
 import argparse
 import gc
@@ -24,6 +24,11 @@ from sglang.srt.layers.engram import build_engram_layout
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--mode", choices=("store", "local"), default="store")
+    parser.add_argument(
+        "--local-dir",
+        help="New directory for immutable packed local tables (prefer tmpfs)",
+    )
     parser.add_argument("--master", default="127.0.0.1:50051")
     parser.add_argument("--metadata", default="http://127.0.0.1:50052/metadata")
     parser.add_argument("--protocol", choices=("tcp", "rdma"), default="tcp")
@@ -50,16 +55,28 @@ def main():
         rdma_devices=args.rdma_devices,
         master_server_addr=args.master,
     )
-    store = MooncakeDistributedStore()
-    server_connection = dict(connection, global_segment_size=args.pool_gib * 1024**3)
-    rc = store.setup(**server_connection)
-    if rc != 0:
-        raise RuntimeError(f"Mooncake setup failed: {rc}")
+    store = None
+    local_dir = None
+    if args.mode == "local":
+        if not args.local_dir:
+            parser.error("--mode local requires --local-dir")
+        local_dir = Path(args.local_dir).resolve()
+        local_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        store = MooncakeDistributedStore()
+        server_connection = dict(
+            connection, global_segment_size=args.pool_gib * 1024**3
+        )
+        rc = store.setup(**server_connection)
+        if rc != 0:
+            raise RuntimeError(f"Mooncake setup failed: {rc}")
     replicate = ReplicateConfig()
     replicate.with_hard_pin = True
-    manifest = dict(connection=connection, layers={})
+    manifest = dict(mode=args.mode, connection=connection, layers={})
+    if local_dir is not None:
+        manifest["local_tables"] = {}
     ready_key = "engram:ready"
-    if store.is_exist(ready_key):
+    if store is not None and store.is_exist(ready_key):
         raise RuntimeError("Engram tables already published in this Store")
     layers = {}
     for layer_index, layer in enumerate(layout.layer_ids):
@@ -86,8 +103,16 @@ def main():
                 weight = wf.get_slice(weight_name)
                 scale = sf.get_slice(scale_name)
                 buffers, offset = [], 0
+                local_paths = []
                 for head, rows in enumerate(cfg.table_vocab_sizes):
-                    packed = np.empty((rows, cfg.row_bytes), dtype=np.uint8)
+                    if local_dir is None:
+                        packed = np.empty((rows, cfg.row_bytes), dtype=np.uint8)
+                    else:
+                        path = local_dir / f"layer-{layer}-head-{head}.bin"
+                        packed = np.memmap(
+                            path, mode="w+", dtype=np.uint8, shape=(rows, cfg.row_bytes)
+                        )
+                        local_paths.append(str(path))
                     # Bound temporary copies while retaining one layer's upload buffers.
                     for start in range(0, rows, 65536):
                         end = min(start + 65536, rows)
@@ -101,6 +126,11 @@ def main():
                             .view(torch.uint8)
                             .numpy()
                         )
+                    if local_dir is not None:
+                        packed.flush()
+                        packed = np.memmap(
+                            path, mode="r", dtype=np.uint8, shape=(rows, cfg.row_bytes)
+                        )
                     buffers.append(packed)
                     offset += rows
                     print(
@@ -109,7 +139,11 @@ def main():
                     )
                 if offset != layout.num_embeddings[layer_index]:
                     raise ValueError("Head sizes do not match checkpoint table")
-                table.populate(layer, buffers, replicate)
+                if local_dir is None:
+                    table.populate(layer, buffers, replicate)
+                else:
+                    table.bind_local(layer, buffers)
+                    manifest["local_tables"][str(layer)] = local_paths
                 # Validate rows at both ends, including byte offsets above 2 GiB.
                 ids = np.array(
                     [
@@ -120,12 +154,18 @@ def main():
                     ]
                 )
                 actual = np.empty((*ids.shape, cfg.row_bytes), dtype=np.uint8)
-                if store.register_buffer(actual.ctypes.data, actual.nbytes) != 0:
+                if (
+                    store is not None
+                    and store.register_buffer(actual.ctypes.data, actual.nbytes) != 0
+                ):
                     raise RuntimeError("Could not register verification buffer")
                 try:
                     table.lookup_into(layer, ids, actual)
                 finally:
-                    if store.unregister_buffer(actual.ctypes.data) != 0:
+                    if (
+                        store is not None
+                        and store.unregister_buffer(actual.ctypes.data) != 0
+                    ):
                         raise RuntimeError("Could not unregister verification buffer")
                 for head, packed in enumerate(buffers):
                     np.testing.assert_array_equal(actual[0, 0, head], packed[0])
@@ -138,18 +178,25 @@ def main():
                 row_bytes=cfg.row_bytes,
             )
             print(f"Uploaded and verified layer={layer}", flush=True)
-        rc = store.put(
-            ready_key,
-            json.dumps(manifest["layers"], sort_keys=True).encode(),
-            replicate,
-        )
-        if rc != 0:
-            raise RuntimeError(f"Publishing ready marker failed: {rc}")
+        if store is not None:
+            rc = store.put(
+                ready_key,
+                json.dumps(manifest["layers"], sort_keys=True).encode(),
+                replicate,
+            )
+            if rc != 0:
+                raise RuntimeError(f"Publishing ready marker failed: {rc}")
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.with_suffix(output.suffix + ".tmp")
         temporary.write_text(json.dumps(manifest, indent=2) + "\n")
         temporary.replace(output)
+        if local_dir is not None:
+            print(
+                f"READY: {output}; keep local table files immutable while serving",
+                flush=True,
+            )
+            return
         print(f"READY: {output}; keep this process alive while serving", flush=True)
         signal.signal(
             signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt())
@@ -159,7 +206,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":

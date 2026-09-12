@@ -26,21 +26,45 @@ def connect_store(config_path):
     from mooncake.store import EngramStore, EngramStoreConfig, MooncakeDistributedStore
 
     config = json.loads(Path(config_path).read_text())
-    store = MooncakeDistributedStore()
-    rc = store.setup(**config["connection"])
-    if rc != 0:
-        raise RuntimeError(f"Mooncake setup failed: {rc}")
+    mode = config.get("mode", "store")
+    if mode not in ("store", "local"):
+        raise ValueError(f"Unknown Engram mode: {mode}")
+    store = None
+    if mode == "store":
+        store = MooncakeDistributedStore()
+        rc = store.setup(**config["connection"])
+        if rc != 0:
+            raise RuntimeError(f"Mooncake setup failed: {rc}")
     layers = {}
     for layer_id, layout in config["layers"].items():
         cfg = EngramStoreConfig()
         cfg.table_vocab_sizes = layout["table_vocab_sizes"]
         cfg.row_bytes = layout["row_bytes"]
         layers[int(layer_id)] = cfg
-    return store, EngramStore(layers, store), config
+    table = EngramStore(layers, store)
+    if mode == "local":
+        for layer_id, cfg in layers.items():
+            paths = config["local_tables"][str(layer_id)]
+            if len(paths) != len(cfg.table_vocab_sizes):
+                raise ValueError("Local Engram table count mismatch")
+            arrays = []
+            for path, rows in zip(paths, cfg.table_vocab_sizes):
+                if Path(path).stat().st_size != rows * cfg.row_bytes:
+                    raise ValueError(f"Local Engram table size mismatch: {path}")
+                arrays.append(
+                    np.memmap(
+                        path, mode="r", dtype=np.uint8, shape=(rows, cfg.row_bytes)
+                    )
+                )
+            table.bind_local(layer_id, arrays)
+    return store, table, config
 
 
 def _lookup_rows(table, layer_id, ids, padding, output):
-    table.lookup_into(layer_id, ids[None], output)
+    # A prefix view stays contiguous and inside the registered output allocation.
+    # Avoid reading a full graph bucket for a short or converted decode batch.
+    end = np.flatnonzero(~padding)[-1] + 1 if padding.any() else len(ids)
+    table.lookup_into(layer_id, ids[None, :end], output[:, :end])
     output[0, padding] = 0
 
 
@@ -48,7 +72,7 @@ def _release_buffers(store, buffers, executor):
     # A worker may still be writing after an interrupted forward.
     executor.shutdown(wait=True)
     for host in buffers.values():
-        if host.numel():
+        if store is not None and host.numel():
             store.unregister_buffer(host.data_ptr())
     buffers.clear()
 
@@ -66,14 +90,13 @@ class MooncakeEngramEmbedding(nn.Module):
                 "Mooncake Engram requires SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"
             )
         if (
-            args.enable_dp_attention
-            or args.pp_size != 1
+            args.pp_size != 1
             or args.attn_cp_size != 1
             or args.speculative_algorithm
             or not args.disable_overlap_schedule
         ):
             raise ValueError(
-                "Mooncake Engram requires TP-only attention, PP=CP=1, no speculation and --disable-overlap-schedule"
+                "Mooncake Engram requires PP=CP=1, no speculation and --disable-overlap-schedule"
             )
         graph = get_exec().graph.cuda_graph_config
         if graph.decode.backend != "breakable" or graph.prefill.backend != "breakable":
@@ -105,11 +128,12 @@ class MooncakeEngramEmbedding(nn.Module):
         }
         if manifest["layers"][str(layer_id)] != expected:
             raise ValueError(f"Mooncake Engram layout mismatch for layer {layer_id}")
-        ready = self.store.get("engram:ready")
-        if not ready or json.loads(ready) != manifest["layers"]:
-            raise ValueError(
-                "Mooncake Engram tables have not been published with this layout"
-            )
+        if self.store is not None:
+            ready = self.store.get("engram:ready")
+            if not ready or json.loads(ready) != manifest["layers"]:
+                raise ValueError(
+                    "Mooncake Engram tables have not been published with this layout"
+                )
         self.offsets = np.cumsum([0] + primes[:-1], dtype=np.int64)
         self.host_buffers = {}
         self.executor = ThreadPoolExecutor(
@@ -131,6 +155,7 @@ class MooncakeEngramEmbedding(nn.Module):
             )
             if (
                 host.numel()
+                and self.store is not None
                 and self.store.register_buffer(host.data_ptr(), host.numel()) != 0
             ):
                 raise RuntimeError("Could not register Mooncake Engram staging buffer")
@@ -147,6 +172,9 @@ class MooncakeEngramEmbedding(nn.Module):
         if len(ids):
             # All-zero hash rows are padding, not per-head global row zero.
             padding = np.all(ids == 0, axis=-1)
+            if padding.all():
+                host.zero_()  # Idle DPA ranks need no embedding reads.
+                return
             local_ids = np.ascontiguousarray(ids - self.offsets)
             local_ids[padding] = 0
             # Only CPU arrays enter the worker. The binding releases the GIL

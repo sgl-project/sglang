@@ -23,8 +23,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.models.deepseek_v4 import _prefetch_mooncake_engram
 
 
-@pytest.fixture
-def setup(tmp_path, monkeypatch):
+@pytest.fixture(params=["store", "local"])
+def setup(tmp_path, monkeypatch, request):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     layout = EngramLayout.build((1, 14), (0, 0), 4, 8, 256, 17)
@@ -44,7 +44,9 @@ def setup(tmp_path, monkeypatch):
     if owner.is_exist("engram:ready"):
         owner.close()
         pytest.fail("Use a dedicated test Store without published Engram tables")
-    manifest = dict(connection=connection, layers={})
+    manifest = dict(mode=request.param, connection=connection, layers={})
+    if request.param == "local":
+        manifest["local_tables"] = {}
     configs = {}
     for i, layer in enumerate(layout.layer_ids):
         cfg = EngramStoreConfig()
@@ -62,7 +64,15 @@ def setup(tmp_path, monkeypatch):
             raw[:, :32] = 56  # FP8 1.0
             raw[:, 256] = 0  # E8M0 exponent zero is 2**-127, not zero.
             arrays.append(raw)
-        table.populate(layer, arrays)
+        if request.param == "store":
+            table.populate(layer, arrays)
+        else:
+            paths = []
+            for h, raw in enumerate(arrays):
+                path = tmp_path / f"{layer}-{h}.bin"
+                raw.tofile(path)
+                paths.append(str(path))
+            manifest["local_tables"][str(layer)] = paths
         reference.append(torch.from_numpy(np.concatenate(arrays)).cuda())
         manifest["layers"][str(layer)] = dict(
             table_vocab_sizes=cfg.table_vocab_sizes, head_dim=256, row_bytes=264
@@ -73,7 +83,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setenv("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", "1")
     monkeypatch.setenv("SGLANG_DSV41_ENGRAM_MOONCAKE_CONFIG", str(path))
     args = SimpleNamespace(
-        enable_dp_attention=False,
+        enable_dp_attention=True,
         pp_size=1,
         attn_cp_size=1,
         speculative_algorithm=None,
@@ -115,7 +125,8 @@ def setup(tmp_path, monkeypatch):
     torch.cuda.synchronize()
     for embed in embeds:
         embed._release()
-    embeds[0].store.close()
+    if embeds[0].store is not None:
+        embeds[0].store.close()
     connect_store.cache_clear()
     for layer in layout.layer_ids:
         table.remove_from_store(layer, force=True)
@@ -176,8 +187,24 @@ def test_changing_tokens_padding_and_bucket_replay(setup):
                 32,
             )
             expected[torch.all(expected_ids[:, i] == 0, dim=-1)] = 0
+            expected[fb.out_cache_loc == 0] = 0
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
     assert all(model.layers[layer].engram.embed.lookup_count == 6 for layer in (1, 14))
+
+    # Replay the same captured decode graph while the rank becomes idle and
+    # active again; its capture-time ForwardMode remains DECODE throughout.
+    graph, inputs, fb, outputs = captured[4]
+    before = model.engram_hasher.history.clone()
+    fb.out_cache_loc.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(model.engram_hasher.history, before)
+    assert all(torch.count_nonzero(output) == 0 for output in outputs)
+    assert all(model.layers[layer].engram.embed.lookup_count == 6 for layer in (1, 14))
+    fb.out_cache_loc.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert all(model.layers[layer].engram.embed.lookup_count == 7 for layer in (1, 14))
 
 
 def test_prefill_replay_uses_live_batch(setup):
@@ -195,7 +222,9 @@ def test_prefill_replay_uses_live_batch(setup):
         return SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             ngram_history=None,
-            out_cache_loc=None,
+            out_cache_loc=torch.tensor(
+                [1] * sum(lengths), device="cuda", dtype=torch.int64
+            ),
             req_pool_indices=torch.tensor(slots, device="cuda", dtype=torch.int64),
             positions=torch.arange(4, device="cuda", dtype=torch.int64),
             extend_seq_lens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
@@ -234,11 +263,14 @@ def test_prefill_replay_uses_live_batch(setup):
                 .to(torch.bfloat16)
             )
             expected[torch.all(expected_ids[:, i] == 0, dim=-1)] = 0
+            expected[sum(live.extend_seq_lens.tolist()) :] = 0
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 def test_missing_table_stops_before_h2d(setup):
     model, _, _ = setup
+    if model.layers[1].engram.embed.store is None:
+        pytest.skip("Local immutable tables have no Store removal")
     inputs = torch.tensor([3], device="cuda", dtype=torch.int64)
     fb = SimpleNamespace(
         forward_mode=ForwardMode.DECODE,
@@ -544,3 +576,36 @@ def test_breakable_decode_logits_output():
             torch.testing.assert_close(output.next_token_logits, x * 3)
             torch.testing.assert_close(output.hidden_states, x + 2)
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_dpa_idle_does_not_read_or_commit(setup, padded):
+    model, _, _ = setup
+    inputs = torch.zeros(4 if padded else 0, dtype=torch.int64, device="cuda")
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND if padded else ForwardMode.IDLE,
+        _original_forward_mode=ForwardMode.IDLE,
+    )
+    before = model.engram_hasher.history.clone()
+    from contextlib import nullcontext
+
+    graph = BreakableCUDAGraph()
+    # Graph runners pad idle ranks; a truly empty batch uses the eager path.
+    context = (
+        BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream())
+        if padded
+        else nullcontext()
+    )
+    with context:
+        ids = _prefetch_mooncake_engram(model, inputs, fb)
+        outputs = [
+            model.layers[layer].engram.embed(ids[:, i])
+            for i, layer in enumerate((1, 14))
+        ]
+    if padded:
+        graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(model.engram_hasher.history, before)
+    for output in outputs:
+        assert not torch.count_nonzero(output)
+    assert all(model.layers[layer].engram.embed.lookup_count == 0 for layer in (1, 14))

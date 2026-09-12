@@ -770,7 +770,30 @@ def _prefetch_mooncake_engram(model, input_ids, forward_batch):
         return _mooncake_engram_capture(model, input_ids, forward_batch)
     if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
         forward_batch = get_tc_piecewise_forward_context().forward_batch
-    hash_ids = model.engram_hasher(input_ids, forward_batch)
+    original_mode = getattr(forward_batch, "_original_forward_mode", None)
+    if forward_batch.forward_mode.is_idle() or (
+        original_mode is not None and original_mode.is_idle()
+    ):
+        # DPA may pad idle ranks into an extend batch. Do not commit dummy history.
+        hash_ids = torch.zeros(
+            (
+                input_ids.shape[0],
+                len(model.engram_layout.layer_ids),
+                (model.engram_layout.max_ngram_size - 1) * model.engram_layout.n_heads,
+            ),
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+    else:
+        hash_ids = model.engram_hasher(input_ids, forward_batch)
+        if forward_batch.out_cache_loc is not None:
+            # Hashing masks history commits, but still emits IDs for padding.
+            # The live batch may also be shorter than the captured prefill bucket.
+            n = min(hash_ids.shape[0], forward_batch.out_cache_loc.shape[0])
+            hash_ids[:n].masked_fill_(
+                (forward_batch.out_cache_loc[:n] == 0)[:, None, None], 0
+            )
+            hash_ids[n:] = 0
     for index, layer_id in enumerate(model.engram_layout.layer_ids):
         model.layers[layer_id].engram.embed.prefetch(hash_ids[:, index])
     return hash_ids
