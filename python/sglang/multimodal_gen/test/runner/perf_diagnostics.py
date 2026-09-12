@@ -221,6 +221,7 @@ class AttemptDiagnostics:
                     _write_event(stream, "gpu_unavailable", error=type(exc).__name__)
                 while not self.stop.is_set():
                     started = time.monotonic()
+                    started_wall_time_ns = time.time_ns()
                     try:
                         processes = [parent, *parent.children(recursive=True)]
                     except psutil.NoSuchProcess:
@@ -234,23 +235,42 @@ class AttemptDiagnostics:
                                 {"pid": process.pid, "error": type(exc).__name__}
                             )
                     pids = {p.pid for p in processes}
+                    process_sample_seconds = time.monotonic() - started
                     gpus = []
+                    gpu_query_timings = []
                     for index, handle in handles:
+                        query_started = time.monotonic()
+                        query_timing = {"nvml_index": index}
                         try:
                             owners = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                            query_timing["ownership_seconds"] = (
+                                time.monotonic() - query_started
+                            )
                             # NVML indices need not match CUDA_VISIBLE_DEVICES: attribute
                             # devices by this attempt's live descendants, not ordinal
                             if any(owner.pid in pids for owner in owners):
+                                metrics_started = time.monotonic()
                                 gpus.append(_gpu_sample(index, handle))
+                                query_timing["metrics_seconds"] = (
+                                    time.monotonic() - metrics_started
+                                )
                         except pynvml.NVMLError as exc:
                             gpus.append(
                                 {"nvml_index": index, "error": type(exc).__name__}
                             )
+                        finally:
+                            query_timing["total_seconds"] = (
+                                time.monotonic() - query_started
+                            )
+                            gpu_query_timings.append(query_timing)
                     _write_event(
                         stream,
                         "resources",
                         processes=rows,
                         gpus=gpus,
+                        sample_started_wall_time_ns=started_wall_time_ns,
+                        process_sample_seconds=process_sample_seconds,
+                        gpu_query_timings=gpu_query_timings,
                         sample_seconds=time.monotonic() - started,
                     )
                     self.stop.wait(1)

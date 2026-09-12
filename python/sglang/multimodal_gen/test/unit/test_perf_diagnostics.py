@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import psutil
 
@@ -59,6 +60,46 @@ def test_unavailable_gpu_field_is_explicit():
     assert perf_diagnostics._nvml_value(unsupported) == {
         "error": "NVMLError_NotSupported"
     }
+
+
+def test_sampler_attributes_nvml_delays(monkeypatch, tmp_path):
+    monkeypatch.setenv(perf_diagnostics._ROOT_ENV, str(tmp_path))
+    diagnostics = perf_diagnostics.AttemptDiagnostics(1)
+    clock = [0.0]
+    monkeypatch.setattr(perf_diagnostics.time, "monotonic", lambda: clock[0])
+    nvml = perf_diagnostics.pynvml
+    monkeypatch.setattr(nvml, "nvmlInit", lambda: None)
+    monkeypatch.setattr(nvml, "nvmlShutdown", lambda: None)
+    monkeypatch.setattr(nvml, "nvmlDeviceGetCount", lambda: 1)
+    monkeypatch.setattr(nvml, "nvmlDeviceGetHandleByIndex", lambda index: index)
+    monkeypatch.setattr(nvml, "nvmlSystemGetDriverVersion", lambda: "test")
+
+    def owners(handle):
+        clock[0] += 3.0
+        return [SimpleNamespace(pid=os.getpid())]
+
+    def gpu_sample(index, handle):
+        clock[0] += 7.0
+        diagnostics.stop.set()
+        return {"nvml_index": index}
+
+    monkeypatch.setattr(nvml, "nvmlDeviceGetComputeRunningProcesses", owners)
+    monkeypatch.setattr(perf_diagnostics, "_gpu_sample", gpu_sample)
+    diagnostics._sample(os.getpid())
+    diagnostics.finish(0)
+    sample = _events(diagnostics.directory / "resources.jsonl")[-1]
+    assert sample["processes"]
+    assert sample["sample_started_wall_time_ns"] <= sample["wall_time_ns"]
+    assert sample["process_sample_seconds"] == 0
+    assert sample["sample_seconds"] == 10
+    assert sample["gpu_query_timings"] == [
+        {
+            "nvml_index": 0,
+            "ownership_seconds": 3,
+            "metrics_seconds": 7,
+            "total_seconds": 10,
+        }
+    ]
 
 
 def test_artifact_failure_does_not_replace_test_status(monkeypatch, tmp_path):
