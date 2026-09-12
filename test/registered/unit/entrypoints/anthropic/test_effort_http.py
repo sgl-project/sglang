@@ -87,6 +87,7 @@ class TestAnthropicEffortHTTP(CustomTestCase):
             config_value=lambda name: getattr(server_args, name),
             model_path="test-model",
             served_model_name="test-model",
+            preferred_sampling_params={},
             generate_request=generate_request,
             create_abort_task=lambda _: None,
             request_logger=SimpleNamespace(log_requests=False, log_requests_level=0),
