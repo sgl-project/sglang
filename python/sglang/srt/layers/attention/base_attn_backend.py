@@ -79,6 +79,12 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
+    # The runner's KVIndexTranslator; backends that read through it set the
+    # instance attribute in __init__. None means "no translate" -- a backend
+    # that never set it cannot serve the unified pool, which the server-args
+    # allow-list enforces.
+    kv_index_translator = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
@@ -122,6 +128,8 @@ class AttentionBackend(ABC):
 
         Default: no-op.
         """
+
+    supports_draft_extend_metadata_staging: bool = False
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds

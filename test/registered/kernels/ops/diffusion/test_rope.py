@@ -31,7 +31,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=44, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
 register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")
@@ -115,11 +115,10 @@ def test_qknorm_rope_rejects_unsupported_dtypes() -> None:
     )
 
 
-BS_LIST = [2**n for n in range(13)]
-BS_LIST += [x + 1 for x in BS_LIST]
-BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 129, 257, 2049, 4097])
-HEADS_LIST = get_ci_test_range([8, 16, 24, 32], [8, 24])
-HEAD_DIM_LIST = get_ci_test_range([64, 128, 256], [64, 128, 256])
+_FULL_BS_LIST = [2**n for n in range(13)]
+_FULL_BS_LIST += [x + 1 for x in _FULL_BS_LIST]
+_FULL_HEADS_LIST = [8, 16, 24, 32]
+_FULL_HEAD_DIM_LIST = [64, 128, 256]
 IS_NEOX_LIST = [False, True]
 POSITION_DTYPES = [torch.int32, torch.int64]
 ROPE_DIM_CHOICES = {
@@ -127,19 +126,34 @@ ROPE_DIM_CHOICES = {
     128: [64, 128],
     256: [64, 128, 256],
 }
-
-
-@pytest.mark.parametrize(
-    "batch_size,num_heads,head_dim,is_neox,position_dtype",
+QKNORM_ROPE_CASES = get_ci_test_range(
     list(
         itertools.product(
-            BS_LIST,
-            HEADS_LIST,
-            HEAD_DIM_LIST,
+            _FULL_BS_LIST,
+            _FULL_HEADS_LIST,
+            _FULL_HEAD_DIM_LIST,
             IS_NEOX_LIST,
             POSITION_DTYPES,
         )
     ),
+    [
+        (1, 8, 64, False, torch.int32),
+        (9, 24, 128, True, torch.int64),
+        (129, 8, 256, True, torch.int32),
+        (257, 24, 64, False, torch.int64),
+        (2049, 8, 128, True, torch.int32),
+        (4097, 24, 256, False, torch.int64),
+        (1, 24, 64, True, torch.int64),
+        (129, 8, 128, False, torch.int32),
+        (2049, 24, 256, True, torch.int64),
+        (4097, 8, 64, False, torch.int32),
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "batch_size,num_heads,head_dim,is_neox,position_dtype",
+    QKNORM_ROPE_CASES,
 )
 def test_qknorm_rope(
     batch_size: int,
