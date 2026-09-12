@@ -1409,6 +1409,41 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(result.prompt_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
 
+    def test_kimi_k3_encoder_named_tool_choice_narrows_tools(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "calculate",
+                    "parameters": {"type": "object"},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "transform",
+                    "parameters": {"type": "object"},
+                },
+            },
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Add two numbers"}],
+            tools=tools,
+            tool_choice=ToolChoice(function=ToolChoiceFuncName(name="calculate")),
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        tool_names = [tool["function"]["name"] for tool in call.kwargs["tools"]]
+        self.assertEqual(tool_names, ["calculate"])
+        self.assertEqual(call.kwargs["tool_choice"], "required")
+        self.assertEqual(result.prompt_ids, [7, 8, 9])
+
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
