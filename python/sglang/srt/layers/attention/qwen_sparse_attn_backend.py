@@ -18,7 +18,6 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
-    QSA_VARIANT_COMPRESSED,
     is_qwen_qsa,
     parse_qsa_profile,
 )
@@ -183,7 +182,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         config = getattr(model_config, "hf_text_config", None)
         if config is None:
             config = getattr(model_config, "hf_config", None)
-        # Compressed (Qwen4-Exp) and tokenwise (Qwen3Next-DSA) QSA share this backend.
         self.qsa_profile = parse_qsa_profile(config)
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
@@ -256,7 +254,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
-        draft_window = int(spec_info.draft_token_num) if spec_info is not None else 0
+        # Target verify exposes ``draft_token_num`` while draft-extend exposes
+        # ``num_tokens_per_req``. Both modes use this gather-width bound.
+        draft_window = int(
+            getattr(
+                spec_info,
+                "draft_token_num",
+                getattr(spec_info, "num_tokens_per_req", 0),
+            )
+            or 0
+        )
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -622,77 +629,69 @@ class QwenSparseAttnBackend(AttentionBackend):
                         f"mapping={token_to_batch_idx.numel()}, "
                         f"positions={num_position_tokens}"
                     )
-        write_locs = None
-        group_positions = None
-        group_sequence_ids = None
-        group_member_rows = None
         decode_page_table = None
         decode_lengths = None
         decode_logical_positions = None
         pending_ring_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
-        if (
-            self.qsa_profile is None
-            or self.qsa_profile.variant == QSA_VARIANT_COMPRESSED
-        ):
-            write_locs, group_positions, group_sequence_ids, group_member_rows = (
-                self._qsa_build_write_plan(
-                    forward_batch=forward_batch,
-                    speculative_paged=speculative_paged,
-                    token_slot_table=token_slot_table,
-                    sequence_lengths=sequence_lengths,
-                )
+        write_locs, group_positions, group_sequence_ids, group_member_rows = (
+            self._qsa_build_write_plan(
+                forward_batch=forward_batch,
+                speculative_paged=speculative_paged,
+                token_slot_table=token_slot_table,
+                sequence_lengths=sequence_lengths,
             )
-            decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
+        )
+        decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
+        if decode_like:
+            decode_logical_positions = (
+                logical_positions.to(torch.int32)
+                if speculative_paged
+                else sequence_lengths - 1
+            )
+            ring_logical_positions = decode_logical_positions
+        else:
+            extend_positions = forward_batch.positions
+            if extend_positions.ndim == 2:
+                extend_positions = extend_positions[0]
+            ring_logical_positions = extend_positions.flatten()[
+                : token_to_batch_idx.numel()
+            ]
+        if not self.should_reuse_mtp_sparse_indices(forward_batch):
             if decode_like:
-                decode_logical_positions = (
-                    logical_positions.to(torch.int32)
-                    if speculative_paged
-                    else sequence_lengths - 1
-                )
-                ring_logical_positions = decode_logical_positions
-            else:
-                extend_positions = forward_batch.positions
-                if extend_positions.ndim == 2:
-                    extend_positions = extend_positions[0]
-                ring_logical_positions = extend_positions.flatten()[
-                    : token_to_batch_idx.numel()
-                ]
-            if not self.should_reuse_mtp_sparse_indices(forward_batch):
-                if decode_like:
-                    pool = self.token_to_kv_pool
-                    decode_page_table, decode_lengths = compressed_decode_view(
-                        compressed_page_size=pool.qsa_compressed_page_size,
-                        compress_ratio=pool.qsa_compress_ratio,
-                        sequence_lengths=sequence_lengths,
-                        token_slot_table=token_slot_table,
-                    )
-                pending_ring_slots = build_pending_ring_slots(
-                    token_to_batch_idx=token_to_batch_idx,
-                    req_pool_indices=row_req_pool_indices,
+                pool = self.token_to_kv_pool
+                decode_page_table, decode_lengths = compressed_decode_view(
+                    compressed_page_size=pool.qsa_compressed_page_size,
+                    compress_ratio=pool.qsa_compress_ratio,
                     sequence_lengths=sequence_lengths,
-                    logical_positions=ring_logical_positions,
-                    compress_ratio=self.compress_ratio,
-                    is_extend=group_member_rows is not None,
+                    token_slot_table=token_slot_table,
                 )
-                if write_locs.numel():
-                    if group_member_rows is not None:
-                        rope_source = (
-                            forward_batch.mrope_positions
-                            if forward_batch.mrope_positions is not None
-                            else forward_batch.positions
-                        )
-                        extend_rope_matrix = build_rope_position_matrix(
-                            rope_source, token_to_batch_idx.numel()
-                        )
-                    else:
-                        compress_group_ring_locs = build_group_ring_slots(
-                            req_pool_indices=row_req_pool_indices,
-                            group_end_positions=group_positions.long(),
-                            sequence_ids=group_sequence_ids.long(),
-                            compress_ratio=self.compress_ratio,
-                        )
+            pending_ring_slots = build_pending_ring_slots(
+                token_to_batch_idx=token_to_batch_idx,
+                req_pool_indices=row_req_pool_indices,
+                sequence_lengths=sequence_lengths,
+                logical_positions=ring_logical_positions,
+                compress_ratio=self.compress_ratio,
+                is_extend=group_member_rows is not None,
+            )
+            if write_locs.numel():
+                if group_member_rows is not None:
+                    rope_source = (
+                        forward_batch.mrope_positions
+                        if forward_batch.mrope_positions is not None
+                        else forward_batch.positions
+                    )
+                    extend_rope_matrix = build_rope_position_matrix(
+                        rope_source, token_to_batch_idx.numel()
+                    )
+                else:
+                    compress_group_ring_locs = build_group_ring_slots(
+                        req_pool_indices=row_req_pool_indices,
+                        group_end_positions=group_positions.long(),
+                        sequence_ids=group_sequence_ids.long(),
+                        compress_ratio=self.compress_ratio,
+                    )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -826,17 +825,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         ]
         self._extend_lens_pin_idx = 0
 
-    def _require_compressed_cuda_graph_support(self) -> None:
-        if (
-            self.qsa_profile is not None
-            and self.qsa_profile.variant != QSA_VARIANT_COMPRESSED
-        ):
-            raise NotImplementedError(
-                "QSA tokenwise CUDA-graph execution requires graph-stable "
-                "indexer metadata, which is not available in this tree yet; "
-                "run tokenwise QSA with --disable-cuda-graph"
-            )
-
     def _capture_cuda_graph_metadata(
         self,
         *,
@@ -847,7 +835,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_mode,
         spec_info,
     ) -> None:
-        self._require_compressed_cuda_graph_support()
         self._require_chain_speculation(forward_mode, spec_info)
         if self.token_to_kv_pool is None:
             self.token_to_kv_pool = getattr(self.runner, "token_to_kv_pool", None)
