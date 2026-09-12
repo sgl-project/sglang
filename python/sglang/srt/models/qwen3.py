@@ -8,7 +8,11 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_group,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    enable_moe_dense_fully_dp,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -347,12 +351,17 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
+        mlp_tp_rank, mlp_tp_size = (
+            (0, 1) if enable_moe_dense_fully_dp() else (None, None)
+        )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            tp_rank=mlp_tp_rank,
+            tp_size=mlp_tp_size,
         )
 
         norm_kwargs = (

@@ -33,7 +33,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -338,6 +338,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,
             CPAttentionBackendKind.TRTLLM_MHA,
+            CPAttentionBackendKind.FLASHINFER,
         ]
 
     def run_attention(
@@ -345,7 +346,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         q: Any,
         forward_batch,
         device: Any,
-        attn_fn,
+        attn_fn: Callable[..., Any],
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
         assert attention_backend in self.get_supported_attention_backend(), (
@@ -353,13 +354,11 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
         meta = forward_batch.attn_cp_metadata
-        q_prev = q[: meta.total_q_prev_tokens]
         logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
-        q_next = q[meta.total_q_prev_tokens : logical_tokens]
 
-        prev_kwargs = {}
-        next_kwargs = {}
-        if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+        if attention_backend == CPAttentionBackendKind.FLASHINFER:
+            result = attn_fn(q[:logical_tokens])
+        elif attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
             result = attn_fn(
                 q[:logical_tokens],
                 meta.cu_seqlens_q_combined_tensor,
@@ -369,19 +368,19 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 use_zigzag_page_table=True,
             )
         else:
+            q_prev = q[: meta.total_q_prev_tokens]
+            q_next = q[meta.total_q_prev_tokens : logical_tokens]
             result_prev = attn_fn(
                 q_prev,
                 meta.cu_seqlens_q_prev_tensor,
                 meta.kv_len_prev_tensor,
                 meta.max_seqlen_q_prev,
-                **prev_kwargs,
             )
             result_next = attn_fn(
                 q_next,
                 meta.cu_seqlens_q_next_tensor,
                 meta.kv_len_next_tensor,
                 meta.max_seqlen_q_next,
-                **next_kwargs,
             )
             result = torch.cat([result_prev, result_next], dim=0)
 
