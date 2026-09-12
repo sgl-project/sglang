@@ -63,7 +63,7 @@ class TestKimiK2Instruct0905(CustomTestCase):
             num_shots=8,
             data_path=None,
             num_questions=1319,
-            parallel=1319,
+            parallel=512,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -73,8 +73,7 @@ class TestKimiK2Instruct0905(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (Kimi-K2-Instruct-0905)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (Kimi-K2-Instruct-0905)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.94)
 
@@ -86,8 +85,7 @@ class TestKimiK2Instruct0905(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (Kimi-K2-Instruct-0905)\n"
-                f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (Kimi-K2-Instruct-0905)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 30)

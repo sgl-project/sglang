@@ -30,7 +30,6 @@ from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     SpatialImagePipelineConfig,
-    preprocess_text,
 )
 
 
@@ -42,7 +41,6 @@ def sana_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Ten
 
 @dataclass
 class SanaPipelineConfig(SpatialImagePipelineConfig):
-
     task_type: ModelTaskType = ModelTaskType.T2I
 
     # should_use_guidance=False disables *embedded* guidance (timestep-conditioned
@@ -53,7 +51,7 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
     # DC-AE does not support tiling or SP VAE decode yet.
     vae_tiling: bool = False
     vae_sp: bool = False
-    vae_precision: str = "bf16"
+    vae_precision: str = "fp32"
 
     dit_config: DiTConfig = field(default_factory=SanaConfig)
     vae_config: VAEConfig = field(default_factory=SanaVAEConfig)
@@ -65,8 +63,17 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,),
+    text_encoder_extra_args: list[dict] = field(
+        default_factory=lambda: [
+            {
+                "padding": True,
+                "return_attention_mask": True,
+            }
+        ]
+    )
+
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
@@ -111,4 +118,12 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
         return out
 
     def post_denoising_loop(self, latents, batch):
+        return latents
+
+    def shard_latents_for_sp(self, batch, latents):
+        # Sana's DiT uses local attention kernels and does not preserve semantics
+        # when spatial latents are sequence-sharded.
+        return latents, False
+
+    def gather_latents_for_sp(self, latents):
         return latents

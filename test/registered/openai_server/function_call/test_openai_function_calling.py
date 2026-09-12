@@ -3,19 +3,46 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_npu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=60, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=73, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
+# Backend-specific: the llama3 and pythonic parsers run on real decoded text,
+# so ROCm decode divergence surfaces as tool calls that no longer parse.
+register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
+# Backend-specific: Ascend uses a local model mirror and its native
+# attention backend, while sharing the protocol assertions below.
+register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
+
+
+def _model_path():
+    if is_npu():
+        from sglang.test.ascend.test_ascend_utils import (
+            LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
+        )
+
+        return LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+    return DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+
+def _server_args(parser):
+    args = ["--tool-call-parser", parser]
+    if is_npu():
+        args[:0] = ["--attention-backend", "ascend", "--disable-cuda-graph"]
+    return args
 
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
@@ -35,8 +62,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = _model_path()
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
@@ -46,11 +72,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=[
-                # If your server needs extra parameters to test function calling, please add them here.
-                "--tool-call-parser",
-                "llama3",
-            ],
+            other_args=_server_args("llama3"),
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
@@ -62,7 +84,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
     def test_function_calling_format(self):
         """
         Test: Whether the function call format returned by the AI is correct.
-        When returning a tool call, message.content should be None, and tool_calls should be a list.
+        Require a tool call so this tests the response format rather than the
+        model's stochastic decision to call a tool. message.content should be
+        None, and tool_calls should be a list.
         """
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -94,7 +118,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             {"role": "system", "content": self.SYSTEM_MESSAGE},
             {"role": "user", "content": "Compute (3+5)"},
         ]
-        response = client.chat.completions.create(
+        request = dict(
             model=self.model,
             max_tokens=2048,
             messages=messages,
@@ -103,12 +127,17 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             stream=False,
             tools=tools,
         )
+        # Ascend keeps the historical auto-choice coverage; CUDA forces the
+        # call so this assertion never depends on a stochastic model decision.
+        if not is_npu():
+            request["tool_choice"] = "required"
+        response = client.chat.completions.create(**request)
 
         tool_calls = response.choices[0].message.tool_calls
 
-        assert (
-            isinstance(tool_calls, list) and len(tool_calls) > 0
-        ), "tool_calls should be a non-empty list"
+        assert isinstance(tool_calls, list) and len(tool_calls) > 0, (
+            "tool_calls should be a non-empty list"
+        )
 
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
@@ -187,9 +216,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             tools=tools,
         )
 
-        assert (
-            "8" in final_response.choices[0].message.content
-        ), "tool_call response should have the sum 8 in the content"
+        assert "8" in final_response.choices[0].message.content, (
+            "tool_call response should have the sum 8 in the content"
+        )
 
     def test_function_calling_streaming_simple(self):
         """
@@ -416,8 +445,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
     def test_function_call_required(self):
         """
-        Test: Whether tool_choice: "required" works as expected
-        - When tool_choice == "required", the model should return one or more tool_calls.
+        Test: Whether tool_choice: "required" works as expected.
+        - When tool_choice == "required", the model MUST return one or more tool_calls.
+        - The model may choose ANY of the provided tools; we only verify that
+          a tool call exists and the selected name is among the candidates.
         """
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -459,47 +490,42 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         },
                         "required": ["city"],
                     },
+                    "strict": True,
                 },
             },
         ]
 
-        messages = [{"role": "user", "content": "What is the capital of France?"}]
+        valid_tool_names = {t["function"]["name"] for t in tools}
+
+        messages = [{"role": "user", "content": "Tell me about Paris"}]
         response = client.chat.completions.create(
             model=self.model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.8,
-            top_p=0.8,
+            temperature=0,
             stream=False,
             tools=tools,
             tool_choice="required",
         )
 
         tool_calls = response.choices[0].message.tool_calls
-        self.assertIsNotNone(tool_calls, "No tool_calls in the response")
+        self.assertIsNotNone(
+            tool_calls, "tool_choice='required' must produce tool_calls"
+        )
+        self.assertGreater(len(tool_calls), 0, "tool_calls list should be non-empty")
+
         function_name = tool_calls[0].function.name
+        self.assertIn(
+            function_name,
+            valid_tool_names,
+            f"Function name '{function_name}' is not among the provided tools: {valid_tool_names}",
+        )
+
+        # Verify the arguments are parseable JSON
         arguments = tool_calls[0].function.arguments
         args_obj = json.loads(arguments)
-
-        self.assertEqual(
-            function_name,
-            "get_weather",
-            f"Function name should be 'get_weather', got: {function_name}",
-        )
-        self.assertIn(
-            "city", args_obj, f"Function arguments should have 'city', got: {args_obj}"
-        )
-
-        # Make the test more robust by checking type and accepting valid responses
-        city_value = args_obj["city"]
         self.assertIsInstance(
-            city_value,
-            str,
-            f"Parameter city should be a string, got: {type(city_value)}",
-        )
-        self.assertTrue(
-            "Paris" in city_value or "France" in city_value,
-            f"Parameter city should contain either 'Paris' or 'France', got: {city_value}",
+            args_obj, dict, "Function arguments should be a JSON object"
         )
 
     def test_function_call_specific(self):
@@ -547,6 +573,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         },
                         "required": ["city"],
                     },
+                    "strict": True,
                 },
             },
         ]
@@ -841,7 +868,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = _model_path()
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -849,10 +876,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=[
-                "--tool-call-parser",
-                "pythonic",
-            ],
+            other_args=_server_args("pythonic"),
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
@@ -914,6 +938,56 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             "get_weather" in found_names or "get_tourist_attractions" in found_names,
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+@unittest.skipIf(is_npu(), "the embedded Rust server is not an Ascend path")
+class TestOpenAIFunctionCallingWithRust(TestOpenAIServerFunctionCalling):
+    """Run the registered unary/streaming function-call suite through Rust."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=["--tool-call-parser", "llama3"],
+            env={"SGLANG_RUST_SERVER": "1"},
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+@unittest.skipIf(is_npu(), "the embedded Rust server is not an Ascend path")
+class TestOpenAIPythonicFunctionCallingWithRust(TestOpenAIPythonicFunctionCalling):
+    """Run Pythonic unary/streaming tool calls through Rust."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=["--tool-call-parser", "pythonic"],
+            env={"SGLANG_RUST_SERVER": "1"},
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
 
 
 # Skip for ci test

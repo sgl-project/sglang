@@ -6,6 +6,8 @@ from typing import Any, Callable, List, Optional, TypeVar, Union, overload
 import torch
 import torch.library
 
+from sglang.kernels.kernel_api_logging import debug_torch_op
+
 F = TypeVar("F", bound=Callable)
 
 
@@ -101,15 +103,15 @@ def register_custom_op(
     """
     extra_kwarg_keys = set(extra_kwargs.keys())
     expected_kwarg_keys = set({"out_shape", "fake_impl"})
-    assert (
-        expected_kwarg_keys >= extra_kwarg_keys
-    ), f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    assert expected_kwarg_keys >= extra_kwarg_keys, (
+        f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    )
 
     has_out_shape = "out_shape" in extra_kwargs
     has_fake_impl = "fake_impl" in extra_kwargs
-    assert not (
-        has_out_shape and has_fake_impl
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (has_out_shape and has_fake_impl), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
     # Assume inplace if neither out_shape nor fake_impl is provided
     if not (has_out_shape or has_fake_impl):
         extra_kwargs["out_shape"] = None
@@ -159,7 +161,7 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = getattr(torch.ops.sglang, self.op_name)
+            self._impl = debug_torch_op(self.op_func, self.op_name)
             assert self._impl is not None
         return self._impl
 
@@ -259,9 +261,9 @@ def register_custom_op_from_extern(
     name = op_name or fn.__name__
     computed_args = computed_args or {}
 
-    assert not (
-        out_shape is not None and fake_impl is not None
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (out_shape is not None and fake_impl is not None), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
 
     # If computed_args specified, create a wrapper with a reduced signature
     # that computes the excluded args inside the op body.
@@ -288,7 +290,7 @@ def register_custom_op_from_extern(
         wrapper.__name__ = fn.__name__
         wrapper.__qualname__ = fn.__qualname__
         wrapper.__module__ = fn.__module__
-        wrapper.__signature__ = new_sig
+        wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
         # Build annotations without computed args, preserving return type
         wrapper.__annotations__ = {
             k: v
@@ -332,4 +334,4 @@ def register_custom_op_from_extern(
         fake_impl=fake_impl,
     )
 
-    return getattr(torch.ops.sglang, name)
+    return debug_torch_op(fn, name)

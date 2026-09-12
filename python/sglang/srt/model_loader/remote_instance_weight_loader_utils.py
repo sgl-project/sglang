@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     NCCL = "nccl"
     TRANSFER_ENGINE = "transfer_engine"
+    MODELEXPRESS = "modelexpress"
 
 
 def trigger_init_weights_send_group_for_remote_instance_request(
@@ -103,21 +104,6 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
     except Exception as e:
         logger.error(f"Exception: {e}")
         return None, None
-
-
-def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos):
-    remote_instance_transfer_engine_info = {}
-    for data in scheduler_infos:
-        if (
-            "tp_rank" in data
-            and "remote_instance_transfer_engine_session_id" in data
-            and "remote_instance_transfer_engine_weights_info_dict" in data
-        ):
-            remote_instance_transfer_engine_info[data["tp_rank"]] = (
-                data["remote_instance_transfer_engine_session_id"],
-                data["remote_instance_transfer_engine_weights_info_dict"],
-            )
-    return remote_instance_transfer_engine_info
 
 
 def register_memory_region(model, transfer_engine):

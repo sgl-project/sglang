@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/hpu_communicator.py
 
 import torch
@@ -11,7 +13,6 @@ if is_hpu():
 
 
 class HpuCommunicator:
-
     def __init__(self, group: ProcessGroup):
         if not is_hpu():
             self.disabled = True

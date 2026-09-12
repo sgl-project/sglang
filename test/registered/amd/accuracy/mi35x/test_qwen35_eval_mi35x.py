@@ -8,8 +8,11 @@ Registry: nightly-amd-accuracy-8-gpu-mi35x-qwen35 suite
 
 import os
 import unittest
+from pathlib import Path
 
+import numpy as np
 import requests
+import yaml
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -17,7 +20,9 @@ from sglang.test.kits.lm_eval_kit import LMEvalMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 register_amd_ci(
@@ -40,12 +45,12 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def test_lm_eval(self):
-        """Override to handle server lifecycle within test method (MI35x pattern)."""
+        """Override to handle server lifecycle and write results to summary."""
         other_args = [
             "--tp",
             str(TP_SIZE),
             "--attention-backend",
-            "triton",
+            "aiter",
             "--trust-remote-code",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
@@ -65,7 +70,35 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
 
         try:
             requests.get(self.base_url + "/flush_cache")
-            super().test_lm_eval()
+
+            eval_config = yaml.safe_load(
+                Path(self.model_config_name).read_text(encoding="utf-8")
+            )
+            results = self.launch_lm_eval(eval_config)
+            rtol = eval_config.get("rtol", self.default_rtol)
+            model_name = eval_config.get("model_name", self.model)
+
+            success = True
+            summary = f"### lm-eval accuracy ({model_name})\n"
+            summary += "| task | metric | expected | measured | status |\n"
+            summary += "| ---- | ------ | -------- | -------- | ------ |\n"
+            for task in eval_config["tasks"]:
+                for metric in task["metrics"]:
+                    expected = metric["value"]
+                    measured = results["results"][task["name"]][metric["name"]]
+                    passed = bool(np.isclose(expected, measured, rtol=rtol))
+                    status = "✅" if passed else "❌"
+                    summary += f"| {task['name']} | {metric['name']} | {expected:.4f} | {measured:.4f} | {status} |\n"
+                    print(
+                        f"{task['name']} | {metric['name']}: "
+                        f"expected={expected:.3f} | measured={measured:.3f} | rtol={rtol}"
+                    )
+                    success = success and passed
+
+            if is_in_ci():
+                write_github_step_summary(summary)
+
+            self.assertTrue(success, "lm-eval validation failed")
         finally:
             kill_process_tree(process.pid)
 

@@ -445,8 +445,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
         )
 
-    def tie_weights(self):
-        return self.language_model.tie_weights()
+    def tie_weights(self, **kwargs):
+        return self.language_model.tie_weights(**kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

@@ -14,6 +14,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 
 @dataclass
 class HeliosSchedulerOutput:
@@ -255,6 +257,11 @@ class HeliosScheduler:
 
         self.timesteps = torch.from_numpy(timesteps).to(device=device)
         self.sigmas = torch.cat([sigmas, torch.zeros(1)]).to(device=device)
+        if current_platform.is_npu():
+            # self.sigmas is float64 (np.linspace default); Ascend aclnnExpm1 does
+            # not support float64 (DT_DOUBLE) and crashes the UniPC step's expm1.
+            # Pin fp32 on NPU; remove once aclnnExpm1 supports float64.
+            self.sigmas = self.sigmas.to(torch.float32)
 
         self._step_index = None
         self.reset_scheduler_history()
@@ -731,4 +738,7 @@ class HeliosScheduler:
         return self.config.num_train_timesteps
 
 
-EntryClass = HeliosScheduler
+# Alias for Helios-Distilled which uses "HeliosDMDScheduler" in scheduler_config.json
+HeliosDMDScheduler = HeliosScheduler
+
+EntryClass = [HeliosScheduler, "HeliosDMDScheduler"]

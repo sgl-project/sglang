@@ -1,14 +1,31 @@
 import logging
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_device_sm, is_blackwell_supported
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import (
+    get_device_sm,
+    is_cuda,
+    is_musa,
+)
 
 logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
+_is_musa = is_musa()
 
 
 def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
-    if sm_version < 90:
+    if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
+        return False
+    # SM120 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
+    # probe the entry point since installed builds may predate it.
+    if sm_version == 120:
+        try:
+            from deep_gemm import m_grouped_fp8_fp4_gemm_nt_contiguous  # noqa: F401
+        except (ImportError, AttributeError):
+            return False
+    if not (_is_cuda or _is_musa):
         return False
 
     try:
@@ -21,5 +38,8 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_blackwell_supported()
-DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
+DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
+DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
+    get_platform().is_sm100 or get_device_sm() == 120
+)
+DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)

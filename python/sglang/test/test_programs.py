@@ -1,5 +1,6 @@
 """This file contains the SGL programs used for unit testing."""
 
+import asyncio
 import json
 import re
 import time
@@ -261,16 +262,16 @@ def test_parallel_decoding():
         # Generate detailed tips
         forks = s.fork(fork_size)
         for i in range(fork_size):
-            forks[
-                i
-            ] += f"Now, I expand tip {i+1} into a detailed paragraph:\nTip {i+1}:"
+            forks[i] += (
+                f"Now, I expand tip {i + 1} into a detailed paragraph:\nTip {i + 1}:"
+            )
             forks[i] += sgl.gen("detailed_tip", max_tokens, stop=["\n\n"])
         forks.join()
 
         # Concatenate tips and summarize
         s += "Here are these tips with detailed explanation:\n"
         for i in range(fork_size):
-            s += f"Tip {i+1}:" + forks[i]["detailed_tip"] + "\n"
+            s += f"Tip {i + 1}:" + forks[i]["detailed_tip"] + "\n"
 
         s += "\nIn summary," + sgl.gen("summary", max_tokens=512)
 
@@ -293,7 +294,7 @@ def test_parallel_encoding(check_answer=True):
         forks += lambda i: f"Statement {i}: " + contexts[i] + "\n"
         forks.join(mode="concate_and_append")
 
-        s += "Now, please answer the following question. " "Do not list options."
+        s += "Now, please answer the following question. Do not list options."
         s += "\nQuestion: " + question + "\n"
         s += "ASSISTANT:" + sgl.gen("answer", max_tokens=max_tokens)
 
@@ -350,6 +351,49 @@ def test_stream():
     out = ""
     for chunk in ret.text_iter("answer"):
         out += chunk
+
+
+def test_stream_logprobs():
+    @sgl.function
+    def qa(s, question):
+        s += sgl.system("You are a helpful assistant.")
+        s += sgl.user(question)
+        s += sgl.assistant(sgl.gen("answer", return_logprob=True))
+
+    async def collect_chunks():
+        ret = qa(
+            question="Compose an engaging travel blog post about a recent trip to Hawaii, highlighting cultural experiences and must-see attractions.",
+            stream=True,
+            temperature=0,
+            max_new_tokens=64,
+        )
+        chunks = []
+        async for chunk_text, meta_info in ret.text_async_iter(
+            "answer", return_meta_data=True
+        ):
+            chunks.append((chunk_text, meta_info))
+        return chunks
+
+    chunks = asyncio.run(collect_chunks())
+    assert len(chunks) > 0
+    prev_completion_tokens = 0
+    prev_output_token_logprobs_length = 0
+    for chunk_text, meta_info in chunks:
+        assert chunk_text
+        assert "output_token_logprobs" in meta_info
+        assert "output_token_logprobs_length" in meta_info
+        completion_tokens = meta_info["completion_tokens"]
+        output_token_logprobs_length = meta_info["output_token_logprobs_length"]
+        chunk_output_token_logprobs = meta_info["output_token_logprobs"]
+        assert completion_tokens == output_token_logprobs_length
+        assert len(chunk_output_token_logprobs) == (
+            completion_tokens - prev_completion_tokens
+        )
+        assert len(chunk_output_token_logprobs) == (
+            output_token_logprobs_length - prev_output_token_logprobs_length
+        )
+        prev_completion_tokens = completion_tokens
+        prev_output_token_logprobs_length = output_token_logprobs_length
 
 
 def test_regex():
@@ -430,9 +474,9 @@ def test_completion_speculative():
     gen_character_no_spec().sync()
     usage_with_no_spec = token_usage.prompt_tokens
 
-    assert (
-        usage_with_spec < usage_with_no_spec
-    ), f"{usage_with_spec} vs {usage_with_no_spec}"
+    assert usage_with_spec < usage_with_no_spec, (
+        f"{usage_with_spec} vs {usage_with_no_spec}"
+    )
 
 
 def test_chat_completion_speculative():
@@ -538,9 +582,9 @@ def test_hellaswag_select():
 
     # Compute accuracy
     accuracy_gen = np.mean(np.array(preds_gen) == np.array(labels))
-    print(f"{accuracy=}, {accuracy_gen=}")
+    print(f"{accuracy=}, {accuracy_gen=} {latency=:.2f}s {latency_gen=:.2f}s")
     assert np.abs(accuracy_gen - accuracy) < 0.1
-    assert np.abs(latency_gen - latency) < 1 if not _is_hip else 2
+    # No latency assert: the 2nd run hits the radix cache the 1st filled.
 
     return accuracy, latency
 
@@ -568,9 +612,9 @@ def test_gen_min_new_tokens():
 
     def assert_min_tokens(tokenizer, text):
         token_ids = tokenizer.encode(text)
-        assert (
-            len(token_ids) >= MIN_TOKENS
-        ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Text: {text}"
+        assert len(token_ids) >= MIN_TOKENS, (
+            f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Text: {text}"
+        )
 
     tokenizer = get_tokenizer(model_path)
 

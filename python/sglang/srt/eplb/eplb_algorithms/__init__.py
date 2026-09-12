@@ -3,7 +3,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec, elasticity_aware
 
 
@@ -52,6 +51,8 @@ def rebalance_experts(
         EplbAlgorithm.elasticity_aware,
         EplbAlgorithm.elasticity_aware_hierarchical,
     ]:
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
         return elasticity_aware.rebalance_experts(
             weight=tokens_per_expert.sum(dim=0),
             num_replicas=num_physical_experts,

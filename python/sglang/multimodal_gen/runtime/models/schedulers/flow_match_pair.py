@@ -82,7 +82,8 @@ class FlowMatchScheduler(BaseScheduler):
         if self.shift_terminal is not None:
             one_minus_z = 1 - self.sigmas
             scale_factor = one_minus_z[-1] / (1 - self.shift_terminal)
-            self.sigmas = 1 - (one_minus_z / scale_factor)
+            if scale_factor != 0:
+                self.sigmas = 1 - (one_minus_z / scale_factor)
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         self.timesteps = self.sigmas * self.num_train_timesteps
@@ -421,7 +422,8 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
                     if self.shift_terminal is not None:
                         one_minus_z = 1 - base
                         scale_factor = one_minus_z[-1] / (1 - self.shift_terminal)
-                        base = 1 - (one_minus_z / scale_factor)
+                        if scale_factor != 0:
+                            base = 1 - (one_minus_z / scale_factor)
 
                     if self.reverse_sigmas:
                         base = 1 - base

@@ -426,11 +426,13 @@ class WorkloadGenerator:
 
     def request_sender(self):
         async def request_loop():
+            tasks = []
             while True:
                 if self.sent_requests - self.completed_requests < self.max_parallel:
                     new_request = self.user_generator.pop()
                     if new_request:
-                        asyncio.create_task(self.handle_request(new_request))
+                        task = asyncio.create_task(self.handle_request(new_request))
+                        tasks.append(task)
                         self.sent_requests += 1
                 else:
                     await asyncio.sleep(0.05)
@@ -439,6 +441,11 @@ class WorkloadGenerator:
                 if time.perf_counter() - self.start_time > self.duration:
                     self.done = True
                     break
+
+            # Cancel all pending tasks and wait for them to finish
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -450,7 +457,7 @@ class WorkloadGenerator:
             try:
                 user_data, response = self.response_queue.get(timeout=10)
                 logger.info(
-                    f"{((time.perf_counter()-self.start_time)/self.duration*100):.2f}%"
+                    f"{((time.perf_counter() - self.start_time) / self.duration * 100):.2f}%"
                 )
                 if not response.success:
                     raise ValueError(f"Request failed with error: {response.error}")
@@ -533,10 +540,10 @@ class WorkloadGenerator:
         output_stats = self.user_generator.output_stats
         print(f"round_ratios: {user_stats}")
         print(
-            f"mean_new_tokens_per_round: {[int(a/b) if b > 0 else 0 for a, b in input_stats]}"
+            f"mean_new_tokens_per_round: {[int(a / b) if b > 0 else 0 for a, b in input_stats]}"
         )
         print(
-            f"mean_return_tokens_per_round: {[int(a/b) if b > 0 else 0 for a, b in output_stats]}"
+            f"mean_return_tokens_per_round: {[int(a / b) if b > 0 else 0 for a, b in output_stats]}"
         )
         return performance_data
 

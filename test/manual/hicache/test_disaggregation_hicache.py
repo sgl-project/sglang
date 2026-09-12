@@ -1,7 +1,6 @@
 import os
 import random
 import tempfile
-import time
 import unittest
 from typing import Dict
 
@@ -114,9 +113,13 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         # Trigger offloading
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
-        # Flush device cache to force remote storage access
-        time.sleep(2)
-        requests.post(self.prefill_url + "/flush_cache")
+        # Flush device cache to force remote storage access.
+        res = requests.post(
+            f"{self.prefill_url}/flush_cache",
+            params={"timeout": 30},
+            timeout=40,
+        )
+        res.raise_for_status()
 
 
 class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):
@@ -239,7 +242,7 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             self.assertGreater(
                 cached_tokens,
                 previous_cached_tokens,
-                f"Turn {turn} should have more cached tokens than turn {turn-1}",
+                f"Turn {turn} should have more cached tokens than turn {turn - 1}",
             )
 
             # Update context and cached tokens for next iteration

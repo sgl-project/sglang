@@ -12,7 +12,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.awq_triton import (
+from sglang.kernels.ops.quantization.awq_triton import (
     AWQ_TRITON_SUPPORTED_GROUP_SIZES,
     awq_dequantize_triton,
     awq_gemm_triton,
@@ -21,7 +21,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=2, suite="stage-a-test-1-amd")
+register_amd_ci(est_time=2, suite="stage-a-test-1-gpu-small-amd")
 
 device = get_device()
 

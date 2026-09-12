@@ -13,13 +13,17 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 
 # Helios UMT5 max sequence length (used for both tokenizer and post-processing padding)
-HELIOS_MAX_SEQUENCE_LENGTH = 226
+# Matches diffusers HeliosPipeline.__call__ default max_sequence_length=512
+HELIOS_MAX_SEQUENCE_LENGTH = 512
 
 
 def umt5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -93,6 +97,13 @@ class HeliosT2VConfig(PipelineConfig):
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
+        )
 
 
 @dataclass

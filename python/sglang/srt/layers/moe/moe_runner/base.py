@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeGuard
 
 import torch
 
 from sglang.srt.layers.moe.utils import (
     MoeA2ABackend,
     MoeRunnerBackend,
+    MoeRunnerBackendLike,
     RoutingMethodType,
 )
+from sglang.srt.runtime_context import get_forward
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import (
@@ -24,6 +26,12 @@ if TYPE_CHECKING:
         DispatchOutput,
         DispatchOutputFormat,
     )
+
+
+def moe_output_buffer_ctx(buf: torch.Tensor):
+    """Provide the MoE output buffer for the current forward scope."""
+
+    return get_forward().scoped(moe_output_buffer=buf)
 
 
 @dataclass
@@ -47,7 +55,15 @@ class MoeRunnerConfig:
     no_combine: bool = False
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
+    gemm1_beta: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    swiglu_limit: Optional[float] = None
+    # Whether gate/up weights are stored interleaved (vs split). Only the
+    # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,
+    # otherwise chunk gate/up then apply alpha/limit).
+    gate_up_interleaved: bool = True
+    layer: Optional[torch.nn.Module] = None
+    use_tp_all_gather_activation: bool = False
 
 
 @dataclass
@@ -82,7 +98,11 @@ class MoeRunnerCore(ABC):
 
     @abstractmethod
     def run(
-        self, runner_input: RunnerInput, quant_info: MoeQuantInfo, running_state: dict
+        self,
+        runner_input: RunnerInput,
+        quant_info: MoeQuantInfo,
+        running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> RunnerOutput:
         pass
 
@@ -92,6 +112,26 @@ class MoeRunnerCore(ABC):
 
     def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerCore]:
         return self.runner_backend == MoeRunnerBackend.TRITON
+
+
+class DispatchMoeRunnerCore(ABC):
+    """Runner core that consumes the standard dispatch representation directly."""
+
+    def __init__(self, config: MoeRunnerConfig):
+        self.config = config
+
+    @property
+    @abstractmethod
+    def runner_backend(self) -> MoeRunnerBackendLike: ...
+
+    @abstractmethod
+    def run_from_dispatch(
+        self,
+        dispatch_output: DispatchOutput,
+        quant_info: MoeQuantInfo,
+        runner_config: MoeRunnerConfig,
+        hooks: Any = None,
+    ) -> CombineInput: ...
 
 
 class FusedOpPool:
@@ -106,12 +146,12 @@ class FusedOpPool:
             raise ValueError(
                 f"Fused function for {a2a_backend_name} to {runner_backend_name} is already registered."
             )
-        assert MoeA2ABackend(
-            a2a_backend_name
-        ), f"Invalid dispatch name: {a2a_backend_name}"
-        assert MoeRunnerBackend(
-            runner_backend_name
-        ), f"Invalid runner name: {runner_backend_name}"
+        assert MoeA2ABackend(a2a_backend_name), (
+            f"Invalid dispatch name: {a2a_backend_name}"
+        )
+        assert MoeRunnerBackend(runner_backend_name), (
+            f"Invalid runner name: {runner_backend_name}"
+        )
         cls._fused_funcs[key] = fused_func
 
     @classmethod
@@ -188,9 +228,9 @@ class PermuteMethodPool:
         """
         key = (dispatch_output_format, runner_input_format)
         pre_permute_func = cls._pre_permute_methods.get(key)
-        assert (
-            pre_permute_func is not None
-        ), f"Pre-permute function for {dispatch_output_format} to {runner_input_format} is not registered"
+        assert pre_permute_func is not None, (
+            f"Pre-permute function for {dispatch_output_format} to {runner_input_format} is not registered"
+        )
         return pre_permute_func
 
     @classmethod
@@ -208,9 +248,9 @@ class PermuteMethodPool:
         """
         key = (runner_output_format, combine_input_format)
         post_permute_func = cls._post_permute_methods.get(key)
-        assert (
-            post_permute_func is not None
-        ), f"Post-permute function for {runner_output_format} to {combine_input_format} is not registered"
+        assert post_permute_func is not None, (
+            f"Post-permute function for {runner_output_format} to {combine_input_format} is not registered"
+        )
         return post_permute_func
 
 

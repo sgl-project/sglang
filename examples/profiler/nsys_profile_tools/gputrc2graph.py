@@ -25,7 +25,9 @@ def load_engine_model():
     json_files = glob.glob(os.path.join(os.path.dirname(__file__) or ".", "*.json"))
     for fname in json_files:
         with open(fname, encoding="utf-8") as f:
-            engine_model.update(json.load(f))
+            file_engine_model = json.load(f)
+        for engine, models in file_engine_model.items():
+            engine_model.setdefault(engine, {}).update(models)
     return engine_model
 
 
@@ -38,7 +40,6 @@ class GPUTrace2Graph:
         import pandas as pd  # avoid importing till needed
 
         self.pd = pd
-        self.pd.options.mode.copy_on_write = True
 
     # helper functions for generating trace->summary csvs
     def gen_nonoverlapped_sum_from_gputrace(self, in_file, out_file):
@@ -85,7 +86,7 @@ class GPUTrace2Graph:
         # Update current_end for overlapping intervals
         for i in range(1, len(df)):
             if i % display_units == 0:
-                print(f"processing trace: {int(i/len(df) * 100)} %", end="\r")
+                print(f"processing trace: {int(i / len(df) * 100)} %", end="\r")
             if starts[i] <= current_end:
                 if ends[i] > current_end:
                     # Partial overlap
@@ -181,9 +182,9 @@ class GPUTrace2Graph:
 
     def is_valid_file(self, base_file):
         """asserts if base_file is non-existent or is empty"""
-        assert (
-            os.path.isfile(base_file) and os.path.getsize(base_file) > 0
-        ), f"{base_file} doesn't exist or is empty"
+        assert os.path.isfile(base_file) and os.path.getsize(base_file) > 0, (
+            f"{base_file} doesn't exist or is empty"
+        )
 
     def should_gen_file(self, new_file, base_file):
         """figure out if new file should be generated from base_file"""

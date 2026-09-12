@@ -1,10 +1,10 @@
-# sgl-kernel
+# sglang-kernel (prior sgl-kernel)
 
-Building and releasing sgl-kernel as a wheel is a part of the release workflow.  Check [release-whl-kernel.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-whl-kernel.yml) for details.
+Building and releasing `sglang-kernel` as a wheel is a part of the release workflow. Check [release-whl-kernel.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-whl-kernel.yml) for details.
 
 # sglang
 
-`3rdparty/amd/wheel/sglang/pyproject.toml` is the AMD-specific pyproject for building the `amd-sglang` wheel.  It extends `python/pyproject_other.toml` with two ROCm-version extras (`rocm700`, `rocm720`) that pin the matching torch/triton/torchaudio/torchvision/sgl-kernel wheels, and renames the package to `amd-sglang`.
+`3rdparty/amd/wheel/sglang/pyproject.toml` is the AMD-specific pyproject for building the `amd-sglang` wheel. It extends `python/pyproject_other.toml` with a `rocm720` extra that pins the matching torch/triton/torchaudio/torchvision/`sglang-kernel` wheels, and renames the package to `amd-sglang`.
 
 ## Operation to build sglang wheel
 
@@ -18,15 +18,9 @@ $ cd python && python -m build
 
 ### v0.5.9
 
-ROCm 7.0.0:
-```
-pip uninstall sgl-kernel sglang amd-sglang
-pip install "amd-sglang[all-hip,rocm700]" -i https://pypi.amd.com/rocm-7.0.0/simple --extra-index-url https://pypi.org/simple
-```
-
 ROCm 7.2.0:
 ```
-pip uninstall sgl-kernel sglang amd-sglang
+pip uninstall sglang-kernel sglang amd-sglang
 pip install "amd-sglang[all-hip,rocm720]" -i https://pypi.amd.com/rocm-7.2.0/simple --extra-index-url https://pypi.org/simple
 ```
 
@@ -39,13 +33,9 @@ Note: You must resolve the two dependencies, AITER and triton, below.  Others ar
 [AITER](https://github.com/ROCm/aiter) is a fundamental dependency. Wheel-izing it is ongoing.
 Until we can pin it reliably, install it manually (typically following the [ROCm docker recipe](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L106).
 
-### Revolving triton
+### Resolving triton
 
-To avoid known issues in triton 3.5.1 installed by default, we recommend upgrading triton after installation.  In ROCm 7.0.0 environment,
-```
-pip install triton==3.6.0
-```
-or ROCm 7.2.0,
+To avoid known issues in triton 3.5.1 installed by default, we recommend upgrading triton after installation in a ROCm 7.2.0 environment:
 ```
 pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.6.0%2Brocm7.2.0.gitba5c1517-cp310-cp310-linux_x86_64.whl
 ```

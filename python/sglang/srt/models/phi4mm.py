@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -103,9 +105,9 @@ class Phi4MMImageEncoder(nn.Module):
         self.base_feat_height_target = self.base_feat_height_target // 2
 
         # with_hd_transform and with_learnable_separator should have same value
-        assert (
-            self.use_hd_transform == self.with_learnable_separator
-        ), "use_hd_transform and with_learnable_separator should have same value"
+        assert self.use_hd_transform == self.with_learnable_separator, (
+            "use_hd_transform and with_learnable_separator should have same value"
+        )
         assert self.use_hd_transform, "learnable separator is only for hd transform"
         # 1024 * 4, merge spatial to channel dimension
         self.glb_GN = nn.Parameter(
@@ -208,9 +210,11 @@ class Phi4MMImageEncoder(nn.Module):
         assert (
             base_feat_height == base_feat_height_target
             and base_feat_width == base_feat_height_target
-        ), f'base_feat_height: {base_feat_height},"\
+        ), (
+            f'base_feat_height: {base_feat_height},"\
                 f" base_feat_width: {base_feat_width}, "\
                 f"expect {base_feat_height_target} features for hd transform'
+        )
 
         # bs x max_num_crops x (24x24) x C
         img_features = img_features.view(
@@ -357,10 +361,10 @@ class Phi4MMImageEncoder(nn.Module):
                 )
 
             # temp_len = int((h*w+1)*144 + 1 + (h+1)*12)
-            assert (
-                temp_len == output_imgs[-1].shape[1]
-            ), f'temp_len: {temp_len}, output_imgs[-1].shape[1]: "\
+            assert temp_len == output_imgs[-1].shape[1], (
+                f'temp_len: {temp_len}, output_imgs[-1].shape[1]: "\
                     "{output_imgs[-1].shape[1]}'
+            )
 
             output_len.append(temp_len)
 
@@ -440,7 +444,7 @@ class Phi4MMForCausalLM(nn.Module):
             self.embed_tokens_extend(
                 # item.feature: (num_audios_in_a_sequence, T, D)
                 # item.audio_attention_mask: (num_audios_in_a_sequence, T, D) BoolTensor or None
-                audio_features=item.feature.to(device).type(dtype),
+                audio_features=item.feature.type(dtype),
                 audio_attention_mask=(
                     item.audio_attention_mask.to(device)
                     if hasattr(item, "audio_attention_mask")
@@ -529,7 +533,7 @@ class Phi4MMForCausalLM(nn.Module):
                 param = params_dict.get(name)
                 if param is None:
                     if "lora" not in name:
-                        logger.warning("Warning: {name} not found in model parameters")
+                        logger.warning(f"Warning: {name} not found in model parameters")
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

@@ -40,11 +40,11 @@ def test_main(
 ):
     # Settings
     num_tokens, hidden, num_topk_groups, num_topk, num_experts = (
-        4096,
-        7168,
+        args.num_tokens,
+        args.hidden,
         min(num_nodes, 4),
-        8,
-        (256 // num_ranks) * num_ranks,
+        args.num_topk,
+        (args.num_experts // num_ranks) * num_ranks,
     )
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
@@ -155,7 +155,7 @@ def test_main(
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(
-                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
+                            f"[testing] Running with {'FP8' if isinstance(current_x, tuple) else 'BF16'}, {'with' if with_topk else 'without'} top-k (async={async_mode}, previous={previous_mode}) ...",
                             flush=True,
                             end="",
                         )
@@ -198,9 +198,9 @@ def test_main(
 
                     # Checks
                     recv_gbl_rank_prefix_sum = handle[-4]
-                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
-                        0
-                    ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(0), (
+                        f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    )
                     assert (
                         gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
                         == recv_num_tokens_per_expert_list
@@ -325,11 +325,14 @@ def test_main(
                 tune_args = {"x": current_x, "handle": handle, "config": config}
                 t = bench(lambda: buffer.dispatch(**tune_args))[0]
                 if t < best_time:
-                    best_time, best_results = t, (
-                        num_sms,
-                        nvl_chunk_size,
-                        rdma_chunk_size,
-                        config_kwargs,
+                    best_time, best_results = (
+                        t,
+                        (
+                            num_sms,
+                            nvl_chunk_size,
+                            rdma_chunk_size,
+                            config_kwargs,
+                        ),
                     )
                 if local_rank == 0:
                     print(
@@ -338,7 +341,7 @@ def test_main(
                     )
         if local_rank == 0:
             print(
-                f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)',
+                f"[tuning] Best dispatch ({'FP8' if isinstance(current_x, tuple) else 'BF16'}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)",
                 flush=True,
             )
             print("", flush=True)
@@ -399,11 +402,14 @@ def test_main(
                     flush=True,
                 )
                 if t < best_time:
-                    best_time, best_results = t, (
-                        num_sms,
-                        nvl_chunk_size,
-                        rdma_chunk_size,
-                        config_kwargs,
+                    best_time, best_results = (
+                        t,
+                        (
+                            num_sms,
+                            nvl_chunk_size,
+                            rdma_chunk_size,
+                            config_kwargs,
+                        ),
                     )
 
     if local_rank == 0:
@@ -462,6 +468,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-sms", type=int, default=24)
+    parser.add_argument("--num-tokens", type=int, default=4096)
+    parser.add_argument("--hidden", type=int, default=7168)
+    parser.add_argument("--num-topk", type=int, default=8)
+    parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--output-path", type=str, default="deepep_tuned.json")
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)

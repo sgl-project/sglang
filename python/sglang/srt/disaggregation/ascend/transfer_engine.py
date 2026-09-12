@@ -8,6 +8,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 try:
     from memfabric_hybrid import TransferEngine
@@ -19,9 +20,10 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_PROTOCOL = "sdma"
+
 
 class AscendTransferEngine(MooncakeTransferEngine):
-
     def __init__(
         self,
         hostname: str,
@@ -30,7 +32,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     ):
         if import_error is not None:
             logger.warning(
-                "Please install memfabric_hybrid, for details, see docs/backend/pd_disaggregation.md"
+                "Please install memfabric_hybrid, for details, see docs/docs/advanced_features/pd_disaggregation.mdx"
             )
             raise import_error
 
@@ -47,8 +49,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
         else:
             logger.error(f"Unsupported DisaggregationMode: {disaggregation_mode}")
             raise ValueError(f"Unsupported DisaggregationMode: {disaggregation_mode}")
-        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+        rpc_port = self.engine.get_rpc_port()
+        self.session_id = NetworkAddress(self.hostname, rpc_port).to_host_port_str()
         self.initialize()
+        if rpc_port == 0:
+            rpc_port = self.engine.get_rpc_port()
+            self.session_id = NetworkAddress(self.hostname, rpc_port).to_host_port_str()
 
     def initialize(self) -> None:
         from sglang.srt.distributed.parallel_state import (
@@ -57,19 +63,18 @@ class AscendTransferEngine(MooncakeTransferEngine):
         )
 
         transfer_protocol = self._get_transfer_protocol()
-        if transfer_protocol is None or transfer_protocol == "sdma":
-            trans_op_type = TransferEngine.TransDataOpType.SDMA
-        else:
-            trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
-            """with device RDMA for PD transfer"""
+        if transfer_protocol == "device_rdma":
+            # with device RDMA for PD transfer: initialize hccl in advance
+            # through all_gather to avoid conflicts with rdma initialization.
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [
                 torch.empty_like(tmp_tensor) for _ in range(get_world_size())
             ]
-            # Initialize hccl in advance through all_gather to avoid conflicts with rdma initialization.
             torch.distributed.all_gather(
                 output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
+
+        trans_op_type = self._resolve_trans_op_type(transfer_protocol)
         """Initialize the ascend transfer instance."""
         ret_value = self.engine.initialize(
             self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
@@ -88,13 +93,19 @@ class AscendTransferEngine(MooncakeTransferEngine):
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
     @staticmethod
-    def _get_transfer_protocol():
+    def _get_transfer_protocol() -> str:
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma"}
-        if protocol and protocol.lower() in allowed_protocols:
-            return protocol.lower()
-        else:
+        return protocol.strip().lower() if protocol else _DEFAULT_PROTOCOL
+
+    @staticmethod
+    def _resolve_trans_op_type(protocol: str):
+        op_type = getattr(TransferEngine.TransDataOpType, protocol.upper(), None)
+        if op_type is None:
             logger.warning(
-                "Invalid or no transfer protocol specified, using default protocol."
+                "Transfer protocol %r is not supported by the installed "
+                "memfabric_hybrid, falling back to %r.",
+                protocol,
+                _DEFAULT_PROTOCOL,
             )
-            return None
+            op_type = TransferEngine.TransDataOpType.SDMA
+        return op_type

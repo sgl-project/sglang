@@ -39,3 +39,7 @@ class HunyuanVAEArchConfig(VAEArchConfig):
 @dataclass
 class HunyuanVAEConfig(VAEConfig):
     arch_config: VAEArchConfig = field(default_factory=HunyuanVAEArchConfig)
+    auto_parallel_decode_min_latent_elements_per_rank: int = 32768
+
+    def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        return True

@@ -5,19 +5,20 @@ import torch
 import triton
 from common_utils import get_model_config
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    fused_moe as fused_moe_sglang,
-)
 from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
     triton_kernel_moe_forward,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    fused_moe as fused_moe_sglang,
+)
 from sglang.srt.layers.moe.topk import (
     TopK,
     TopKConfig,
@@ -181,8 +182,8 @@ def benchmark(
     else:
         bench_lambda = lambda: api_func(**api_kwargs)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(bench_lambda, quantiles=quantiles)
     return ms, min_ms, max_ms
 
 

@@ -12,6 +12,8 @@ import numpy as np
 import requests
 import yaml
 
+from sglang.test.test_utils import dump_metric
+
 
 @contextmanager
 def scoped_env_vars(new_env: dict[str, str] | None):
@@ -68,6 +70,15 @@ class LMEvalMixin:
                     f"{task['name']} | {metric['name']}: "
                     f"ground_truth={ground_truth:.3f} | "
                     f"measured={measured_value:.3f} | rtol={rtol}"
+                )
+                dump_metric(
+                    f"{task['name']}_{metric['name']}",
+                    measured_value,
+                    labels={
+                        "model": eval_config.get("model_name", ""),
+                        "eval": "lm-eval",
+                        "task": task["name"],
+                    },
                 )
                 success = success and np.isclose(
                     ground_truth, measured_value, rtol=rtol

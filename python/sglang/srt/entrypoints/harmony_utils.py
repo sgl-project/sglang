@@ -3,8 +3,9 @@
 # Adapted from vLLM: https://github.com/vllm-project/vllm/blob/1b9902806915040ac9b3029f2ab7522ec505afc3/vllm/entrypoints/harmony_utils.py
 # Slight differences in processing chat messages
 import datetime
+import logging
 from collections.abc import Iterable
-from typing import Literal, Optional, Union
+from typing import Optional, Union
 
 import orjson
 from openai.types.responses import (
@@ -39,13 +40,23 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 
-from sglang.srt.entrypoints.openai.protocol import ResponseInputOutputItem
+from sglang.srt.entrypoints.openai.protocol import (
+    ReasoningEffortTier,
+    ResponseInputOutputItem,
+)
 from sglang.srt.utils import random_uuid
+
+logger = logging.getLogger(__name__)
 
 REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
     "medium": ReasoningEffort.MEDIUM,
     "low": ReasoningEffort.LOW,
+    # harmony has only these three, so outer tiers clamp inward. "none" is left
+    # out so it falls through to the harmony default.
+    "minimal": ReasoningEffort.LOW,
+    "xhigh": ReasoningEffort.HIGH,
+    "max": ReasoningEffort.HIGH,
 }
 
 _harmony_encoding = None
@@ -60,7 +71,7 @@ def get_encoding():
 
 def get_system_message(
     model_identity: Optional[str] = None,
-    reasoning_effort: Optional[Literal["high", "medium", "low"]] = None,
+    reasoning_effort: Optional[ReasoningEffortTier] = None,
     start_date: Optional[str] = None,
     browser_description: Optional[str] = None,
     python_description: Optional[str] = None,
@@ -69,9 +80,9 @@ def get_system_message(
     if model_identity is not None:
         sys_msg_content = sys_msg_content.with_model_identity(model_identity)
     if reasoning_effort is not None:
-        sys_msg_content = sys_msg_content.with_reasoning_effort(
-            REASONING_EFFORT[reasoning_effort]
-        )
+        effort = REASONING_EFFORT.get(reasoning_effort)
+        if effort is not None:
+            sys_msg_content = sys_msg_content.with_reasoning_effort(effort)
     if start_date is None:
         start_date = datetime.datetime.now().strftime("%Y-%m-%d")
     sys_msg_content = sys_msg_content.with_conversation_start_date(start_date)
@@ -92,13 +103,22 @@ def get_developer_message(
     if tools is not None:
         function_tools = []
         for tool in tools:
-            if tool.type in ("web_search_preview", "code_interpreter"):
+            if tool.type in (
+                "web_search",
+                "web_search_preview",
+                "code_interpreter",
+            ):
                 # These are built-in tools that are added to the system message.
                 pass
             elif tool.type == "function":
                 function_tools.append(tool)
             else:
-                raise ValueError(f"tool type {tool.type} not supported")
+                # No harmony prompt template for the remaining built-ins;
+                # drop them so the request still runs.
+                logger.debug(
+                    "harmony: ignoring unsupported response tool type %r",
+                    tool.type,
+                )
         if function_tools:
             function_tool_descriptions = [
                 ToolDescription.new(
@@ -139,7 +159,16 @@ def parse_response_input(
         if isinstance(content, str):
             msg = Message.from_role_and_content(role, text_prefix + content)
         else:
-            contents = [TextContent(text=text_prefix + c["text"]) for c in content]
+            # Filter to text parts first, then enumerate, so the surviving first
+            # text chunk always carries the system→developer text_prefix even if
+            # earlier parts were non-text (image/audio) and got dropped.
+            text_chunks = [
+                c for c in content if c.get("type") in ("text", "input_text")
+            ]
+            contents = [
+                TextContent(text=(text_prefix if i == 0 else "") + c.get("text", ""))
+                for i, c in enumerate(text_chunks)
+            ]
             msg = Message.from_role_and_contents(role, contents)
     elif response_msg["type"] == "function_call_output":
         call_id = response_msg["call_id"]

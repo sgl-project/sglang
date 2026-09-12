@@ -209,7 +209,7 @@ impl WorkerManager {
         url: &str,
         api_key: Option<&str>,
     ) -> isize {
-        let load_url = format!("{}/get_load", url);
+        let load_url = format!("{}/v1/loads?include=core", url);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
@@ -217,12 +217,12 @@ impl WorkerManager {
 
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) if json.is_array() => json
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|e| e.get("num_tokens").and_then(|v| v.as_i64()))
-                    .sum::<i64>() as isize,
+                Ok(json) => json
+                    .get("aggregate")
+                    .and_then(|a| a.get("total_tokens"))
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n as isize)
+                    .unwrap_or(-1),
                 _ => -1,
             },
             _ => -1,

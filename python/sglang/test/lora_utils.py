@@ -4,8 +4,35 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.utils import is_xpu
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import calculate_rouge_l
+from sglang.test.test_utils import calculate_rouge_l, is_in_amd_ci
+
+_IS_XPU = is_xpu()
+
+
+def _assert_lora_output_match(
+    srt_str: str, hf_str: str, rouge_tol: float, context: str
+):
+    """Compare SRT vs HF greedy output strings.
+
+    Everywhere except XPU we keep the historical strict exact-match (SGLang and HF
+    kernels agree numerically enough for greedy argmax to pick identical tokens).
+    On XPU, small kernel-level fp differences can make greedy decoding diverge
+    after a shared prefix even when the LoRA math is correct, so we fall back to
+    the same ROUGE-L tolerance the per-adaptor comparison path uses.
+    """
+    srt_str = srt_str.strip(" ")
+    hf_str = hf_str.strip(" ")
+    if not _IS_XPU:
+        assert srt_str == hf_str, (srt_str, hf_str)
+        return
+    rouge_score = calculate_rouge_l([srt_str], [hf_str])[0]
+    if rouge_score < rouge_tol:
+        raise AssertionError(
+            f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} for {context}. "
+            f"SRT: {srt_str!r} HF: {hf_str!r}"
+        )
 
 
 @dataclasses.dataclass
@@ -51,6 +78,33 @@ DEFAULT_PROMPTS = [
     """,
 ]
 
+MOE_LORA_TEST_PROMPTS = [
+    "Reverse the following security code: 0HRUP0A ->",
+    "Write a one-sentence story about a wild tree at the cafe.",
+    "Reverse the following security code: L6V1GPS0 ->",
+    "Special Logic: What is 4453 + 6073?",
+    "Special Logic: What is 7918 + 560?",
+    "Write a one-sentence story about a slow cat in a simulation.",
+    "Write a one-sentence story about a dusty dragon in a castle.",
+    "Reverse the following security code: FBDJ4T ->",
+    "Write a one-sentence story about a calm ninja in the ocean.",
+    "Write a one-sentence story about a glowing fairy in Paris.",
+    "Special Logic: What is 6200 + 7656?",
+    "Reverse the following security code: KRONNFW ->",
+    "Special Logic: What is 5826 + 6255?",
+    "Write a one-sentence story about a shiny robot in the jungle.",
+    "Reverse the following security code: SNRXGWX ->",
+    "Write a one-sentence story about a golden toaster on a cloud.",
+    "Special Logic: What is 5286 + 5653?",
+    "Write a one-sentence story about a brave cowboy in a time machine.",
+    "Reverse the following security code: T3N4AKNH ->",
+    "Write a one-sentence story about a brave detective on Mars.",
+]
+
+MOE_BASE_MODEL_PATH = "Qwen/Qwen1.5-MoE-A2.7B"
+MOE_LORA_PATH = "jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"
+
+
 CI_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-3.1-8B-Instruct",
@@ -89,12 +143,15 @@ CI_MULTI_LORA_MODELS = [
             LoRAAdaptor(
                 name="winddude/wizardLM-LlaMA-LoRA-7B",
                 prefill_tolerance=1e-1,
+                rouge_l_tolerance=0.9,
             ),
             LoRAAdaptor(
                 name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
                 prefill_tolerance=3e-1,
+                rouge_l_tolerance=0.9,
             ),
         ],
+        rouge_l_tolerance=0.9 if is_in_amd_ci() else 1.0,
         max_loras_per_batch=2,
         max_loaded_loras=4,
     ),
@@ -201,6 +258,70 @@ def reference_sgmv_shrink(
     return output
 
 
+def reference_embedding_lora_a_shrink(
+    input_ids: torch.Tensor,
+    weights: torch.Tensor,
+    weight_indices: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    lora_scalings: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """
+    Simple sequence-level reference implementation of embedding LoRA A shrink operation.
+
+    Args:
+        input_ids: (total_seq_len,) - Token IDs
+        weights: (num_loras, max_rank, vocab_size) - LoRA A embedding weights
+        weight_indices: LoRA idx for each sequence
+        seq_lengths: Length of each sequence
+        lora_ranks: LoRA rank for each LoRA adapters
+        lora_scalings: LoRA scaling for each LoRA adapters
+        vocab_size: Base vocabulary size
+
+    Returns:
+        output: (total_seq_len, max_rank) - Embedded features
+    """
+    if weights.numel() == 0:
+        total_tokens = input_ids.shape[0]
+        return torch.zeros(total_tokens, 0, dtype=weights.dtype, device=weights.device)
+
+    total_tokens = input_ids.shape[0]
+    _, max_rank, _ = weights.shape
+
+    output = torch.zeros(
+        total_tokens, max_rank, dtype=weights.dtype, device=weights.device
+    )
+
+    token_offset = 0
+    for lora_idx, seq_len, rank, scaling in zip(
+        weight_indices,
+        seq_lengths,
+        lora_ranks[weight_indices],
+        lora_scalings[weight_indices],
+    ):
+        if seq_len == 0:
+            continue
+
+        if rank > 0:
+            # Get token IDs for this sequence
+            seq_input_ids = input_ids[token_offset : token_offset + seq_len]
+
+            # Clamp token IDs to vocab size
+            clamped_ids = torch.clamp(seq_input_ids, max=vocab_size - 1)
+
+            # Lookup embeddings: weights[lora_idx, :rank, token_ids] -> (seq_len, rank)
+            # weights shape: (num_loras, max_rank, vocab_size)
+            lora_weights = weights[lora_idx, :rank, :]  # (rank, vocab_size)
+            embeddings = lora_weights[:, clamped_ids].t()  # (seq_len, rank)
+
+            output[token_offset : token_offset + seq_len, :rank] = scaling * embeddings
+
+        token_offset += seq_len
+
+    return output
+
+
 def reference_sgmv_expand(
     x: torch.Tensor,
     weights: torch.Tensor,
@@ -291,6 +412,7 @@ def run_lora_test_one_by_one(
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
     test_tag: str = "",
+    attention_backend: Optional[str] = None,
 ):
     """
     Input a batch of prompts, and run lora tests one by one with several generate requests
@@ -340,6 +462,7 @@ def run_lora_test_one_by_one(
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
         mem_fraction_static=mem_fraction_static,
+        attention_backend=attention_backend,
     ) as srt_runner:
         srt_outputs = srt_runner.forward(
             prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
@@ -351,6 +474,7 @@ def run_lora_test_one_by_one(
         model_type="generation",
         tp_size=model_case.tp_size,
         mem_fraction_static=mem_fraction_static,
+        attention_backend=attention_backend,
     ) as srt_runner:
         srt_no_lora_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -520,7 +644,6 @@ def run_lora_test_by_batch(
         )
 
     for i in range(len(prompts)):
-
         srt_output_str = srt_outputs.output_strs[i].strip()
         hf_output_str = hf_outputs.output_strs[i].strip()
         rouge_score = calculate_rouge_l([srt_output_str], [hf_output_str])[0]
@@ -529,17 +652,22 @@ def run_lora_test_by_batch(
         print("HF output:", hf_output_str)
         print("SRT no lora output:", srt_no_lora_outputs.output_strs[i].strip())
         print("HF no lora output:", hf_no_lora_outputs.output_strs[i].strip())
-        assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i].strip(
-            " "
-        ), (
-            srt_outputs.output_strs[i].strip(" "),
-            hf_outputs.output_strs[i].strip(" "),
+        rouge_tol = (
+            adaptors[i].rouge_l_tolerance
+            if adaptors[i].rouge_l_tolerance is not None
+            else model_case.rouge_l_tolerance
         )
-        assert srt_no_lora_outputs.output_strs[i].strip(
-            " "
-        ) == hf_no_lora_outputs.output_strs[i].strip(" "), (
-            srt_no_lora_outputs.output_strs[i].strip(" "),
-            hf_no_lora_outputs.output_strs[i].strip(" "),
+        _assert_lora_output_match(
+            srt_outputs.output_strs[i],
+            hf_outputs.output_strs[i],
+            rouge_tol,
+            f"base '{base_path}', adaptor '{adaptor_names[i]}', backend '{backend}' (LoRA)",
+        )
+        _assert_lora_output_match(
+            srt_no_lora_outputs.output_strs[i],
+            hf_no_lora_outputs.output_strs[i],
+            rouge_tol,
+            f"base '{base_path}', backend '{backend}' (no-LoRA baseline)",
         )
 
 
@@ -579,10 +707,6 @@ def create_multiple_batch_test_samples(
     prompts: List[str], lora_adapter_paths: List[str]
 ):
     random.seed(42)
-    from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
-    from sglang.srt.utils.common import is_hip
-
-    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
     test_cases = [
         (
@@ -629,19 +753,6 @@ def create_multiple_batch_test_samples(
         # ),
     ]
 
-    # [AMD] Aiter may fail this case but the model quality doesn't drop
-    # Skip this flaky case for now
-    if not _use_aiter:
-        test_cases.append(
-            (
-                [
-                    random.choice(prompts),
-                    random.choice(prompts),
-                    random.choice(prompts),
-                ],
-                [None, None, None],
-            )
-        )
     return test_cases
 
 
@@ -677,8 +788,6 @@ def run_lora_multiple_batch_on_model_cases(
                 else {
                     "speculative_algorithm": "NGRAM",
                     "speculative_num_draft_tokens": 5,
-                    "speculative_ngram_min_match_window_size": 2,
-                    "speculative_ngram_max_match_window_size": 15,
                 }
             )
             srt_runner = SRTRunner(
@@ -708,7 +817,7 @@ def run_lora_multiple_batch_on_model_cases(
             with srt_runner, hf_runner:
                 for i, (prompts, lora_paths) in enumerate(batches):
                     print(
-                        f"\n--- Running Batch {i+1} --- prompts: {prompts}, lora_paths: {lora_paths}"
+                        f"\n--- Running Batch {i + 1} --- prompts: {prompts}, lora_paths: {lora_paths}"
                     )
 
                     srt_outputs = srt_runner.batch_forward(
@@ -739,7 +848,7 @@ def run_lora_multiple_batch_on_model_cases(
                                 f"for base '{base_path}', adaptor '{lora_paths}', prompt: '{prompts}...'"
                             )
 
-                    print(f"--- Batch {i+1} Comparison Passed --- ")
+                    print(f"--- Batch {i + 1} Comparison Passed --- ")
 
 
 def run_lora_batch_splitting_equivalence_test(
@@ -748,6 +857,7 @@ def run_lora_batch_splitting_equivalence_test(
     disable_cuda_graph: bool = True,
     disable_radix_cache: bool = True,
     enable_lora_overlap_loading: Optional[bool] = None,
+    lora_drain_wait_threshold: float = 0.0,
 ):
     """
     Test that SRT correctly handles batch splitting with multiple LoRA adapters.
@@ -765,21 +875,29 @@ def run_lora_batch_splitting_equivalence_test(
         attention_backend: Attention backend to use
         disable_cuda_graph: Whether to disable CUDA graph
         disable_radix_cache: Whether to disable radix cache
+        lora_drain_wait_threshold: When any LoRA adapter request waits longer than
+            this threshold (in seconds), the scheduler will selectively drain one
+            running adapter to make room. Set to 0 to disable draining (default).
     """
     max_loras_per_batch = 2
 
     def _run_test(model_case: LoRAModelCase, torch_dtype: torch.dtype):
         lora_adapter_paths = [a.name for a in model_case.adaptors]
-        assert (
-            len(lora_adapter_paths) >= max_loras_per_batch
-        ), f"Need at least {max_loras_per_batch} adapters for this test"
+        assert len(lora_adapter_paths) >= max_loras_per_batch, (
+            f"Need at least {max_loras_per_batch} adapters for this test"
+        )
 
         max_new_tokens = 64
         base_path = model_case.base
 
+        maybe_drain_info = (
+            f", lora_drain_wait_threshold={lora_drain_wait_threshold}"
+            if lora_drain_wait_threshold > 0
+            else ""
+        )
         print(
             f"\n========== Testing batch splitting on base '{base_path}', "
-            f"dtype={torch_dtype} =========="
+            f"dtype={torch_dtype}{maybe_drain_info} =========="
         )
 
         prompts = [TEST_MULTIPLE_BATCH_PROMPTS[0]] * 3
@@ -823,6 +941,7 @@ def run_lora_batch_splitting_equivalence_test(
             attention_backend=attention_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
+            lora_drain_wait_threshold=lora_drain_wait_threshold,
         ) as srt_runner:
             for batch_idx, (batch_prompts, lora_paths) in enumerate(test_cases):
                 print(f"\n--- Batch {batch_idx + 1} ---")

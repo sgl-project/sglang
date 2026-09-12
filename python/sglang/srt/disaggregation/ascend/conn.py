@@ -1,11 +1,13 @@
 import concurrent.futures
+import enum
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
@@ -13,12 +15,32 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.utils import get_local_ip_auto
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
 
+class AscendStateType(str, enum.Enum):
+    """DSV4-on-NPU PD components without a cross-hardware equivalent."""
+
+    DSV4_C128 = "dsv4_c128"
+    # C4 compress-state rows (attention + indexer) addressed within each
+    # req_pool_idx bank on A5 (CYCLE cache_mode).  Separate from StateType.SWA
+    # because each peer maps logical positions into its own local ring.
+    DSV4_C4_STATE = "dsv4_c4_state"
+
+
+_DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
+
+
 class AscendKVManager(MooncakeKVManager):
+    def _requires_exact_state_index_match(self, st: StateType) -> bool:
+        return (
+            super()._requires_exact_state_index_match(st)
+            or st in _DSV4_KVCACHE_STATE_TYPES
+        )
+
     def init_engine(self):
         # TransferEngine initialized on ascend.
         local_ip = get_local_ip_auto()
@@ -29,11 +51,108 @@ class AscendKVManager(MooncakeKVManager):
         )
 
     def register_buffer_to_engine(self):
-        self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
-        # The Ascend backend optimize batch registration for small memory blocks.
-        self.engine.batch_register(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-        )
+        # MemFabric aligns registered buffers to 2 MiB. Register everything in
+        # one batch so overlapping aligned ranges from small tensors are merged
+        # before they are published to the peer.
+        ptrs = list(self.kv_args.kv_data_ptrs)
+        lens = list(self.kv_args.kv_data_lens)
+        ptrs.extend(self.kv_args.aux_data_ptrs)
+        lens.extend(self.kv_args.aux_data_lens)
+        for component_ptrs, component_lens in zip(
+            self.kv_args.state_data_ptrs or [],
+            self.kv_args.state_data_lens or [],
+        ):
+            ptrs.extend(component_ptrs)
+            lens.extend(component_lens)
+        if ptrs:
+            self.engine.batch_register(ptrs, lens)
+
+    def get_mla_kv_ptrs_with_pp(
+        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
+    ) -> Tuple[List[int], List[int], int]:
+        mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
+        if mla_ratios:
+            if len(src_kv_ptrs) == len(dst_kv_ptrs):
+                return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
+
+            start_layer = self.kv_args.prefill_start_layer
+            end_layer = self.kv_args.prefill_end_layer
+            c4_full = sum(ratio == 4 for ratio in mla_ratios)
+            c4_start = sum(ratio == 4 for ratio in mla_ratios[:start_layer])
+            c4_end = sum(ratio == 4 for ratio in mla_ratios[:end_layer])
+            c128_start = sum(ratio == 128 for ratio in mla_ratios[:start_layer])
+            c128_end = sum(ratio == 128 for ratio in mla_ratios[:end_layer])
+
+            if state_type == AscendStateType.DSV4_C128:
+                dst = dst_kv_ptrs[c128_start:c128_end]
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            if state_type == AscendStateType.DSV4_C4_STATE:
+                # Layout: [attn_state_0..attn_{c4_full-1},
+                #          idx_state_0..idx_{c4_full-1}]
+                # Two groups, each c4_full entries; slice both by PP stage.
+                dst = []
+                for offset in (0, c4_full):
+                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            # NPU main KV layout: [C4 KV, index K, index scale].
+            if state_type is None and len(dst_kv_ptrs) == 3 * c4_full:
+                dst = []
+                for offset in (0, c4_full, 2 * c4_full):
+                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            # On A5 (CYCLE cache_mode), StateType.SWA only contains SWA KV
+            # buffers (C4 compress state is registered separately as
+            # DSV4_C4_STATE).  The common _mla_slice_ptrs_for_pp assumes
+            # SWA + C4 state are bundled (swa_L + 2*c4_full), so intercept
+            # here and slice SWA KV by layer index directly.
+            if state_type == StateType.SWA and AscendStateType.DSV4_C4_STATE in (
+                self.kv_args.state_types or []
+            ):
+                dst = list(dst_kv_ptrs[start_layer:end_layer])
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
+
+        # src_kv_ptrs: k_data, v_data, index_k_data(optional)
+        # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
+        # state_type is accepted for parity with the common disaggregation path;
+        # the NPU kv_buf_groups slicing below is state-type agnostic.
+        kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
+        hidden_kv_layers = getattr(self.kv_args, "hidden_kv_layers", 0)
+        draft_kv_layers = getattr(self.kv_args, "draft_kv_layers", 0)
+        src_layers = len(src_kv_ptrs) // kv_buf_groups
+        dst_layers = len(dst_kv_ptrs) // kv_buf_groups
+        if src_layers == dst_layers:
+            sliced_dst_kv_ptrs = dst_kv_ptrs
+        else:
+            sliced_dst_kv_ptrs = []
+            start_layer = self.kv_args.prefill_start_layer
+            transfer_draft_kv = get_pp_group().is_last_rank and draft_kv_layers
+            if transfer_draft_kv:
+                end_layer = start_layer + src_layers - draft_kv_layers
+            else:
+                end_layer = start_layer + src_layers
+
+            # target kv
+            for i in range(kv_buf_groups):
+                layer_offset = i * hidden_kv_layers
+                sliced_dst_kv_ptrs.extend(
+                    dst_kv_ptrs[layer_offset + start_layer : layer_offset + end_layer]
+                )
+            # draft kv
+            if transfer_draft_kv:
+                for i in range(kv_buf_groups):
+                    layer_offset = (
+                        i * draft_kv_layers + kv_buf_groups * hidden_kv_layers
+                    )
+                    sliced_dst_kv_ptrs.extend(
+                        dst_kv_ptrs[layer_offset : layer_offset + draft_kv_layers]
+                    )
+        layers_current_pp_stage = len(src_kv_ptrs)
+        return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
     def send_kvcache(
         self,
@@ -42,32 +161,61 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
+        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_kv_item_len: Optional[int] = None,
+        dst_attn_tp_size: Optional[int] = None,
     ):
+        if dst_device_kv_indices is not None:
+            raise NotImplementedError(
+                "Ascend PD transfer does not support HiSparse "
+                "destination device KV indices"
+            )
+        self._validate_envelope_kv_layout(
+            dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
+        )
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
 
         if self.pp_size > 1:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-            )
+            if self.is_mla_backend:
+                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                )
+                layers_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        sliced_dst_kv_ptrs[layer_id],
+                        self.kv_args.kv_item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
+            else:
+                (
+                    src_k_ptrs,
+                    src_v_ptrs,
+                    dst_k_ptrs,
+                    dst_v_ptrs,
+                    layers_current_pp_stage,
+                ) = self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
 
-            layers_params = [
-                (
-                    src_k_ptrs[layer_id],
-                    dst_k_ptrs[layer_id],
-                    self.kv_args.kv_item_lens[layer_id],
-                )
-                for layer_id in range(layers_current_pp_stage)
-            ] + [
-                (
-                    src_v_ptrs[layer_id],
-                    dst_v_ptrs[layer_id],
-                    self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
-                )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+                layers_params = [
+                    (
+                        src_k_ptrs[layer_id],
+                        dst_k_ptrs[layer_id],
+                        self.kv_args.kv_item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ] + [
+                    (
+                        src_v_ptrs[layer_id],
+                        dst_v_ptrs[layer_id],
+                        self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
         else:
             num_layers = len(self.kv_args.kv_data_ptrs)
             layers_params = [
@@ -124,6 +272,13 @@ class AscendKVManager(MooncakeKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    def _is_generic_kvcache_state_type(self, st) -> bool:
+        # DSV4 per-pool components also use the page-indexed send path.
+        return (
+            super()._is_generic_kvcache_state_type(st)
+            or st in _DSV4_KVCACHE_STATE_TYPES
+        )
 
 
 class AscendKVSender(MooncakeKVSender):

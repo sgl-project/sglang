@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/backend.py
 
 
@@ -21,7 +23,10 @@ from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdap
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
-from sglang.srt.utils.common import is_npu, rank0_log
+from sglang.srt.compilation.xpu_piecewise_backend import XPUPiecewiseBackend
+from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils.common import is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +52,14 @@ def make_backend(
     sglang_backend,
 ):
 
-    backend_cls = CUDAPiecewiseBackend if not is_npu() else NPUPiecewiseBackend
+    if current_platform.is_out_of_tree():
+        backend_cls = current_platform.get_piecewise_backend_cls()
+    elif is_xpu():
+        backend_cls = XPUPiecewiseBackend
+    elif is_npu():
+        backend_cls = NPUPiecewiseBackend
+    else:
+        backend_cls = CUDAPiecewiseBackend
     return backend_cls(
         graph,
         compile_config,
@@ -109,15 +121,14 @@ class CompilerManager:
         )
         if runtime_shape is None:
             logger.debug(
-                "Directly load the %s-th graph for dynamic shape from %s via "
-                "handle %s",
+                "Directly load the %s-th graph for dynamic shape from %s via handle %s",
                 graph_index,
                 self.compiler.name,
                 handle,
             )
         else:
             logger.debug(
-                "Directly load the %s-th graph for shape %s from %s via " "handle %s",
+                "Directly load the %s-th graph for shape %s from %s via handle %s",
                 graph_index,
                 str(runtime_shape),
                 self.compiler.name,
@@ -172,7 +183,7 @@ class CompilerManager:
                     )
             if runtime_shape is None:
                 logger.debug(
-                    "Store the %s-th graph for dynamic shape from %s via " "handle %s",
+                    "Store the %s-th graph for dynamic shape from %s via handle %s",
                     graph_index,
                     self.compiler.name,
                     handle,
@@ -255,9 +266,6 @@ def split_graph(
 
     return split_gm, outputs
 
-
-# we share the global graph pool among all the backends
-global_graph_pool = None
 
 compilation_start_time = 0.0
 
@@ -343,9 +351,9 @@ model_tag: str = "backbone"
 def set_model_tag(tag: str):
     """Context manager to set the model tag."""
     global model_tag
-    assert (
-        tag != model_tag
-    ), f"Model tag {tag} is the same as the current tag {model_tag}."
+    assert tag != model_tag, (
+        f"Model tag {tag} is the same as the current tag {model_tag}."
+    )
     old_tag = model_tag
     model_tag = tag
     try:
@@ -355,7 +363,6 @@ def set_model_tag(tag: str):
 
 
 class SGLangBackend:
-
     graph_pool: Any
     _called: bool = False
     # the graph we compiled
@@ -375,7 +382,6 @@ class SGLangBackend:
         config: CompilationConfig,
         graph_pool: Any,
     ):
-        rank0_log(f"Initializing SGLangBackend")
         assert graph_pool is not None
         self.graph_pool = graph_pool
 
@@ -394,10 +400,7 @@ class SGLangBackend:
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
-        rank0_log(f"SGLangBackend __call__")
-        base_cache_dir = os.path.expanduser(
-            os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang/")
-        )
+        base_cache_dir = envs.SGLANG_CACHE_DIR.get()
 
         cache_hash = self.compiler_manager.compute_hash()
         cache_dir = os.path.join(
@@ -465,8 +468,6 @@ class SGLangBackend:
                 src = src.replace("<lambda>", "GraphModule")
                 with open(graph_path, "w") as f:
                     f.write(src)
-
-                rank0_log(f"Computation graph saved to {graph_path}")
 
         self._called = True
         return self.split_gm

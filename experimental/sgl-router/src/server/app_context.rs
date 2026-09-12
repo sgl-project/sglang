@@ -1,0 +1,153 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::config::Config;
+
+use crate::policies::active_load::ActiveLoadRegistry;
+use crate::policies::buckets::BucketSelector;
+use crate::policies::engine_load::EngineLoadTable;
+use crate::policies::kv_events::BlockSizeOracle;
+use crate::policies::prefix_provider::RadixTreePrefixProvider;
+use crate::policies::PolicyRegistry;
+use crate::proxy::Proxy;
+use crate::server::metrics::MetricsRegistry;
+use crate::tokenizer::TokenizerRegistry;
+use crate::workers::WorkerRegistry;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+pub struct AppContext {
+    pub config: Config,
+    pub tokenizers: Arc<TokenizerRegistry>,
+    pub proxy: Arc<Proxy>,
+    pub registry: Arc<WorkerRegistry>,
+    pub policies: Arc<PolicyRegistry>,
+    /// Converts static Bucket configuration into request candidate domains.
+    pub bucket_selector: Arc<BucketSelector>,
+    /// Per-worker active-load bookkeeping shared by the proxy, policies,
+    /// timeout janitor, and metrics.
+    pub active_load: Arc<ActiveLoadRegistry>,
+    /// Lightweight Prometheus-format metrics registry served via
+    /// `/metrics`. Shared with the chat handler (requests_total),
+    /// active-load registry, policy-specific counters, and PD dispatch.
+    pub metrics: Arc<MetricsRegistry>,
+    /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
+    pub engine_load: Arc<EngineLoadTable>,
+    pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+    pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
+    pub block_size_oracle: Arc<BlockSizeOracle>,
+    ready: AtomicBool,
+}
+
+impl AppContext {
+    pub fn new(
+        config: Config,
+        tokenizers: Arc<TokenizerRegistry>,
+        proxy: Arc<Proxy>,
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+    ) -> Self {
+        Self::with_active_load(
+            config,
+            tokenizers,
+            proxy,
+            registry,
+            policies,
+            ActiveLoadRegistry::with_defaults(),
+        )
+    }
+
+    /// Construct an [`AppContext`] with an explicit [`ActiveLoadRegistry`].
+    /// Production wires the default (5-minute timeout, SystemTimeClock)
+    /// via [`Self::new`]; tests that exercise the janitor pass a registry
+    /// built with a `MockClock`.
+    pub fn with_active_load(
+        config: Config,
+        tokenizers: Arc<TokenizerRegistry>,
+        proxy: Arc<Proxy>,
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        active_load: Arc<ActiveLoadRegistry>,
+    ) -> Self {
+        let metrics = MetricsRegistry::new();
+        // Wire the per-worker active-load gauge so `sgl_router_active_load`
+        // mirrors the live counter on every register / drop / sweep.
+        // Without this, the metric is permanently 0 in production even
+        // though the chat handler is faithfully calling `register`.
+        active_load.attach_metrics(Arc::clone(&metrics));
+        // The metrics registry is built after the policy registry, so attach
+        // it here for policies that emit their own counters.
+        policies.attach_metrics(Arc::clone(&metrics));
+        let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
+        Self {
+            config,
+            tokenizers,
+            proxy,
+            registry,
+            policies,
+            bucket_selector,
+            active_load,
+            metrics,
+            prefix_index: None,
+            radix_tree_prefix_provider: None,
+            block_size_oracle: BlockSizeOracle::new(),
+            engine_load: EngineLoadTable::new(),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    pub fn mark_ready(&self) {
+        // Relaxed: this flag does not synchronize other state; readers only
+        // care about eventual visibility, not happens-before with surrounding ops.
+        self.ready.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn stub() -> Self {
+        Self {
+            config: Config {
+                server: crate::config::ServerConfig {
+                    host: "x".into(),
+                    port: 0,
+                },
+                observability: Default::default(),
+                model: crate::config::ModelConfig {
+                    id: "stub-model".into(),
+                    tokenizer_path: "stub".into(),
+                    policy: crate::config::PolicyKind::RoundRobin,
+                    decode_policy: Default::default(),
+                    bucket_config: None,
+                    circuit_breaker: None,
+                    cache_aware: None,
+                    sticky: None,
+                    affinity: None,
+                    fused: None,
+                    eligibility: None,
+                },
+                discovery: crate::config::DiscoveryBackend::StaticUrls(
+                    crate::config::StaticUrlsDiscoveryConfig {
+                        urls: vec!["http://placeholder:0".into()],
+                    },
+                ),
+                proxy: crate::config::ProxyConfig::default(),
+                active_load: crate::config::ActiveLoadConfig::default(),
+            },
+            tokenizers: Arc::new(TokenizerRegistry::default()),
+            proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
+            registry: Arc::new(WorkerRegistry::default()),
+            policies: Arc::new(PolicyRegistry::default()),
+            bucket_selector: Arc::new(BucketSelector::new(None)),
+            active_load: ActiveLoadRegistry::with_defaults(),
+            metrics: MetricsRegistry::new(),
+            prefix_index: None,
+            radix_tree_prefix_provider: None,
+            block_size_oracle: BlockSizeOracle::new(),
+            engine_load: EngineLoadTable::new(),
+            ready: AtomicBool::new(false),
+        }
+    }
+}

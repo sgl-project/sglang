@@ -21,9 +21,12 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
 from sglang.srt.debug_utils.comparator.dims_spec import (
     SEQ_DIM_NAME,
     TOKEN_DIM_NAME,
+    ParallelAxis,
     apply_dim_names,
+    get_dim_names,
     parse_dims,
     resolve_dim_names,
+    without_dim_names,
 )
 from sglang.srt.debug_utils.comparator.dp_utils import filter_to_non_empty_dp_rank
 from sglang.srt.debug_utils.comparator.log_sink import log_sink
@@ -38,12 +41,56 @@ from sglang.srt.debug_utils.comparator.output_types import (
     _split_logs,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+    FailureDisplayBudget,
     compare_tensor_pair,
+    compute_tensor_info,
 )
+from sglang.srt.debug_utils.comparator.threshold_dsl import DiffThresholdRule
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.srt.debug_utils.dump_loader import LOAD_FAILED, ValueWithMeta
 
-_FAILED_SIDE_MAP: dict[str, str] = {"x": "baseline", "y": "target"}
+
+def _build_skip_from_one_empty_side(
+    *, name: str, pair: Pair[list[ValueWithMeta]]
+) -> ComparisonSkipRecord:
+    """Build a skip record when one side of *pair* is empty.
+
+    The non-empty side's tensor info is attached to the record.
+    """
+    assert not pair.x or not pair.y
+    if not pair.x:
+        reason, available_side, available_items = (
+            "baseline_load_failed",
+            "target",
+            pair.y,
+        )
+    else:
+        reason, available_side, available_items = (
+            "target_load_failed",
+            "baseline",
+            pair.x,
+        )
+
+    tensor_items: list[ValueWithMeta] = [
+        it for it in available_items if isinstance(it.value, torch.Tensor)
+    ]
+    if not tensor_items:
+        return ComparisonSkipRecord(name=name, reason=reason)
+
+    first_tensor: torch.Tensor = tensor_items[0].value
+    tensor_info = compute_tensor_info(first_tensor, include_sample=True)
+    metas: list[dict[str, Any]] = [it.meta for it in tensor_items]
+    bundle_info: BundleSideInfo = _collect_bundle_side_info(
+        items=tensor_items, metas=metas
+    )
+
+    return ComparisonSkipRecord(
+        name=name,
+        reason=reason,
+        available_side=available_side,  # type: ignore[arg-type]
+        available_tensor_info=tensor_info,
+        available_bundle_info=bundle_info,
+    )
 
 
 def _collect_bundle_side_info(
@@ -51,8 +98,8 @@ def _collect_bundle_side_info(
     metas: list[dict[str, Any]],
 ) -> BundleSideInfo:
     from sglang.srt.debug_utils.comparator.display import (
-        _PARALLEL_INFO_KEYS,
-        extract_parallel_info,
+        PARALLEL_INFO_KEYS,
+        _extract_parallel_info,
     )
 
     files: list[BundleFileInfo] = []
@@ -61,8 +108,8 @@ def _collect_bundle_side_info(
         tensor: torch.Tensor = item.value
 
         parallel_info: dict[str, str] = {}
-        for key in _PARALLEL_INFO_KEYS:
-            extract_parallel_info(row_data=parallel_info, info=meta.get(key, {}))
+        for key in PARALLEL_INFO_KEYS:
+            _extract_parallel_info(row_data=parallel_info, info=meta.get(key, {}))
 
         files.append(
             BundleFileInfo(
@@ -70,6 +117,7 @@ def _collect_bundle_side_info(
                 dtype=str(tensor.dtype),
                 rank=meta.get("rank"),
                 parallel_info=parallel_info if parallel_info else None,
+                filename=meta.get("filename"),
             )
         )
 
@@ -84,7 +132,8 @@ def compare_bundle_pair(
     dir_pair: Pair[Path],
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
-    diff_threshold: float,
+    diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
+    failure_display_budget: Optional[FailureDisplayBudget] = None,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
@@ -99,7 +148,8 @@ def compare_bundle_pair(
             dir_pair=dir_pair,
             token_aligner_mode=token_aligner_mode,
             token_aligner_plan=token_aligner_plan,
-            diff_threshold=diff_threshold,
+            diff_threshold_rules=diff_threshold_rules,
+            failure_display_budget=failure_display_budget,
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
             viz_output_dir=viz_output_dir,
             compute_per_token=compute_per_token,
@@ -117,7 +167,8 @@ def _compare_bundle_pair_inner(
     dir_pair: Pair[Path],
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
-    diff_threshold: float,
+    diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
+    failure_display_budget: Optional[FailureDisplayBudget] = None,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
@@ -132,8 +183,7 @@ def _compare_bundle_pair_inner(
     )
 
     if not all_pair.x or not all_pair.y:
-        reason = "baseline_load_failed" if not all_pair.x else "target_load_failed"
-        return ComparisonSkipRecord(name=name, reason=reason)
+        return _build_skip_from_one_empty_side(name=name, pair=all_pair)
 
     # 1b. Dims override: patch meta["dims"] before DP filter reads it
     # (--override-dims may add ``# dp:=moe_dp``, so it must run first)
@@ -157,7 +207,7 @@ def _compare_bundle_pair_inner(
     # 1c. DP filter: keep only the non-empty dp_rank
     all_pair = all_pair.map(
         lambda items: filter_to_non_empty_dp_rank(
-            items, dp_group_alias=_extract_dp_alias_from_items(items)
+            items, dp_axis=_extract_dp_axis_from_items(items)
         )
     )
 
@@ -174,21 +224,22 @@ def _compare_bundle_pair_inner(
         valid_pair=all_pair,
         token_aligner_mode=token_aligner_mode,
         token_aligner_plan=token_aligner_plan,
-        diff_threshold=diff_threshold,
+        diff_threshold_rules=diff_threshold_rules,
+        failure_display_budget=failure_display_budget,
         thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
         viz_output_dir=viz_output_dir,
         compute_per_token=compute_per_token,
     )
 
 
-def _extract_dp_alias_from_items(items: list[ValueWithMeta]) -> Optional[str]:
-    """Extract dp group alias from the first item's ``meta["dims"]``."""
+def _extract_dp_axis_from_items(items: list[ValueWithMeta]) -> ParallelAxis:
+    """Extract dp axis from the first item's ``meta["dims"]``."""
     if not items:
-        return None
+        return ParallelAxis.DP
     dims_str: Optional[str] = items[0].meta.get("dims")
     if dims_str is None:
-        return None
-    return parse_dims(dims_str).dp_group_alias
+        return ParallelAxis.DP
+    return parse_dims(dims_str).dp_axis
 
 
 def _compare_bundle_pair_tensor_type(
@@ -197,7 +248,8 @@ def _compare_bundle_pair_tensor_type(
     valid_pair: Pair[list[ValueWithMeta]],
     token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
-    diff_threshold: float,
+    diff_threshold_rules: Optional[list[DiffThresholdRule]] = None,
+    failure_display_budget: Optional[FailureDisplayBudget] = None,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
@@ -205,8 +257,7 @@ def _compare_bundle_pair_tensor_type(
     compute_per_token: bool = False,
 ) -> Union[ComparisonTensorRecord, ComparisonSkipRecord]:
     if not valid_pair.x or not valid_pair.y:
-        reason = "baseline_load_failed" if not valid_pair.x else "target_load_failed"
-        return ComparisonSkipRecord(name=name, reason=reason)
+        return _build_skip_from_one_empty_side(name=name, pair=valid_pair)
 
     # Plan (meta only, no tensor)
     metas_pair: Pair[list[dict[str, Any]]] = valid_pair.map(
@@ -243,9 +294,12 @@ def _compare_bundle_pair_tensor_type(
 
     if aligner_result.tensors is None:
         assert aligner_result.failed_side_xy is not None
-        side_name: str = _FAILED_SIDE_MAP[aligner_result.failed_side_xy]
-        reason: str = f"{side_name}_load_failed"
-        return ComparisonSkipRecord(name=name, reason=reason)
+        failed_xy: str = aligner_result.failed_side_xy
+        pair_with_failed_emptied: Pair[list[ValueWithMeta]] = Pair(
+            x=[] if failed_xy == "x" else valid_pair.x,
+            y=[] if failed_xy == "y" else valid_pair.y,
+        )
+        return _build_skip_from_one_empty_side(name=name, pair=pair_with_failed_emptied)
 
     # Resolve seq_dim for per-token computation
     seq_dim: Optional[int] = (
@@ -253,14 +307,15 @@ def _compare_bundle_pair_tensor_type(
     )
 
     # Compare
-    aligned_baseline: torch.Tensor = aligner_result.tensors.x.rename(None)
-    aligned_target: torch.Tensor = aligner_result.tensors.y.rename(None)
+    aligned_baseline: torch.Tensor = without_dim_names(aligner_result.tensors.x)
+    aligned_target: torch.Tensor = without_dim_names(aligner_result.tensors.y)
 
     info = compare_tensor_pair(
         x_baseline=aligned_baseline,
         x_target=aligned_target,
         name=name,
-        diff_threshold=diff_threshold,
+        diff_threshold_rules=diff_threshold_rules,
+        failure_display_budget=failure_display_budget,
         seq_dim=seq_dim,
     )
     record = ComparisonTensorRecord(
@@ -316,10 +371,9 @@ def _try_generate_viz(
 
 def _resolve_seq_dim(tensor: torch.Tensor) -> Optional[int]:
     """Find the token/seq dimension index from the tensor's named dims."""
-    if tensor.names[0] is None:
+    names: tuple[Optional[str], ...] = get_dim_names(tensor)
+    if names[0] is None:
         return None
-
-    names: tuple[Optional[str], ...] = tensor.names
     for target_name in (TOKEN_DIM_NAME, SEQ_DIM_NAME):
         if target_name in names:
             return list(names).index(target_name)

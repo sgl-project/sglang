@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -29,11 +30,9 @@ class OpenAIServingBase(ABC):
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
         self.allowed_custom_labels = (
-            set(
-                self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
-            )
+            set(get_observability().tokenizer_metrics_allowed_custom_labels)
             if isinstance(self.tokenizer_manager.server_args, ServerArgs)
-            and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
+            and get_observability().tokenizer_metrics_allowed_custom_labels
             else None
         )
 
@@ -83,6 +82,11 @@ class OpenAIServingBase(ABC):
             error_msg = self._validate_request(request)
             if error_msg:
                 return self.create_error_response(error_msg)
+
+            # Log the raw OpenAI request payload before conversion to tokenized form.
+            request_logger = self.tokenizer_manager.request_logger
+            if request_logger.log_requests and request_logger.log_requests_level >= 2:
+                request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
@@ -142,19 +146,6 @@ class OpenAIServingBase(ABC):
             return rid
 
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
-
-    def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""
-        parts = []
-        for key in ["cache_salt", "extra_key"]:
-            value = getattr(request, key, None)
-            if value:
-                if not isinstance(value, str):
-                    raise TypeError(
-                        f"Value of {key} must be a string, but got {type(value).__name__}"
-                    )
-                parts.append(value)
-        return "".join(parts) if parts else None
 
     @abstractmethod
     def _convert_to_internal_request(
@@ -238,14 +229,12 @@ class OpenAIServingBase(ABC):
     def extract_custom_labels(self, raw_request):
         if (
             not self.allowed_custom_labels
-            or not self.tokenizer_manager.server_args.tokenizer_metrics_custom_labels_header
+            or not get_observability().tokenizer_metrics_custom_labels_header
         ):
             return None
 
         custom_labels = None
-        header = (
-            self.tokenizer_manager.server_args.tokenizer_metrics_custom_labels_header
-        )
+        header = get_observability().tokenizer_metrics_custom_labels_header
         try:
             raw_labels = (
                 orjson.loads(raw_request.headers.get(header))
@@ -268,3 +257,34 @@ class OpenAIServingBase(ABC):
         if raw_request is None:
             return None
         return raw_request.headers.get("x-smg-routing-key")
+
+    def extract_routed_dp_rank_from_header(
+        self, raw_request: Request, body_routed_dp_rank: Optional[int] = None
+    ) -> Optional[int]:
+        """Extract routed_dp_rank from HTTP header, with higher priority than routed_dp_rank in body.
+
+        Header name: X-Data-Parallel-Rank (case-insensitive in HTTP/1.1/2)
+        """
+        if raw_request is None:
+            return body_routed_dp_rank
+
+        header_value = raw_request.headers.get("x-data-parallel-rank")
+        if header_value is not None:
+            try:
+                header_dp_rank = int(header_value)
+                if (
+                    body_routed_dp_rank is not None
+                    and header_dp_rank != body_routed_dp_rank
+                ):
+                    logger.debug(
+                        f"X-Data-Parallel-Rank header ({header_dp_rank}) overrides "
+                        f"body routed_dp_rank ({body_routed_dp_rank})"
+                    )
+                return header_dp_rank
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid X-Data-Parallel-Rank header: must be an integer, got '{header_value}'",
+                )
+
+        return body_routed_dp_rank

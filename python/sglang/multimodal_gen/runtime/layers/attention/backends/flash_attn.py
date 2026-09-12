@@ -1,36 +1,30 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
-from functools import lru_cache
+from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+    trailing_padding_used_len,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
+    get_fixed_sequence_metadata,
+    get_host_sequence_lengths,
+    get_request_skip_softmax_params,
+    run_skip_softmax,
+)
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
-    current_platform,
 )
-
-try:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
-
-    from sglang.jit_kernel.flash_attention_v4 import (
-        flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-    )
-
-    def flash_attn_func(*args, ver: int = 3, **kwargs):
-        if ver == 4:
-            return flash_attn_varlen_func_fa4(*args, **kwargs)
-        return flash_attn_varlen_func(*args, **kwargs)
-
-except ImportError as e:
-    raise e
-
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -82,9 +76,9 @@ def flash_attn_varlen_func_fake_out(
     head_dim_v = v.shape[-1]
 
     if cu_seqlens_q is not None:
-        assert cu_seqlens_q.shape == (
-            batch_size + 1,
-        ), "cu_seqlens_q must have shape (batch_size + 1,)"
+        assert cu_seqlens_q.shape == (batch_size + 1,), (
+            "cu_seqlens_q must have shape (batch_size + 1,)"
+        )
         assert cu_seqlens_q.dtype == torch.int32, "cu_seqlens_q must be int32"
         assert cu_seqlens_q.stride(0) == 1, "cu_seqlens_q must be contiguous"
 
@@ -144,9 +138,9 @@ def flash_attn_varlen_func_fake_out_lse(
     head_dim_v = v.shape[-1]
 
     if cu_seqlens_q is not None:
-        assert cu_seqlens_q.shape == (
-            batch_size + 1,
-        ), "cu_seqlens_q must have shape (batch_size + 1,)"
+        assert cu_seqlens_q.shape == (batch_size + 1,), (
+            "cu_seqlens_q must have shape (batch_size + 1,)"
+        )
         assert cu_seqlens_q.dtype == torch.int32, "cu_seqlens_q must be int32"
         assert cu_seqlens_q.stride(0) == 1, "cu_seqlens_q must be contiguous"
 
@@ -213,7 +207,7 @@ def flash_attn_varlen_func_op(
             "flash_attn_varlen_func_op is out-only op; return_softmax_lse must be False. "
             "Use flash_attn_varlen_func_op_lse for (out, lse)."
         )
-    return flash_attn_func(
+    return flash_attn_varlen_func(
         q,
         k,
         v,
@@ -277,7 +271,7 @@ def flash_attn_varlen_func_op_lse(
             "flash_attn_varlen_func_op_lse is out+lse op; return_softmax_lse must be True. "
             "Use flash_attn_varlen_func_op for out-only."
         )
-    return flash_attn_func(
+    return flash_attn_varlen_func(
         q,
         k,
         v,
@@ -306,73 +300,7 @@ def flash_attn_varlen_func_op_lse(
     )
 
 
-try:
-    if current_platform.is_hopper():
-        from flash_attn_interface import (
-            flash_attn_varlen_func as flash_attn_varlen_func_upstream,
-        )
-    else:
-        flash_attn_varlen_func_upstream = None
-
-except Exception:
-    flash_attn_varlen_func_upstream = None
-    logger.warning(
-        "flash_attn 3 package is not installed. It's recommended to install flash_attn3 on hopper, otherwise performance is sub-optimal"
-    )
-
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionMetadata,
-    AttentionMetadataBuilder,
-)
-
 fa_ver = 3
-
-
-@lru_cache(maxsize=128)
-def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
-    return torch.arange(
-        0,
-        (bsz + 1) * seqlen,
-        step=seqlen,
-        device=torch.device("cuda", device_index),
-        dtype=torch.int32,
-    )
-
-
-@lru_cache(maxsize=256)
-def _should_use_upstream_flash_attention(
-    upstream_available: bool,
-    upstream_heads_ok: bool,
-    q_shape: tuple[int, ...],
-    k_shape: tuple[int, ...],
-    v_shape: tuple[int, ...],
-) -> bool:
-    if not upstream_available or not upstream_heads_ok:
-        return False
-
-    if len(q_shape) != 4 or len(k_shape) != 4 or len(v_shape) != 4:
-        return False
-
-    bsz, seqlen, nheads_q, d = q_shape
-    bsz_k, seqlen_k, nheads_k, d_k = k_shape
-    bsz_v, seqlen_v, nheads_v, d_v = v_shape
-
-    if (
-        bsz != bsz_k
-        or bsz != bsz_v
-        or seqlen != seqlen_k
-        or seqlen != seqlen_v
-        or d != d_k
-        or d != d_v
-    ):
-        return False
-    if nheads_k != nheads_v:
-        return False
-    if nheads_k == 0 or (nheads_q % nheads_k) != 0:
-        return False
-    return True
 
 
 def set_fa_ver(ver: int) -> None:
@@ -410,6 +338,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class FlashAttentionBackend(AttentionBackend):
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -442,6 +374,7 @@ class FlashAttentionImpl(AttentionImpl):
         softmax_scale: float,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
@@ -449,14 +382,25 @@ class FlashAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.is_cross_attention = is_cross_attention
+        self.packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
         self.attention_metadata = FlashAttentionMetadata()
-        if self.num_kv_heads is None:
-            self._upstream_heads_ok = True
-        else:
-            # For gqa, the num_heads must be a multiple of num_kv_heads
-            self._upstream_heads_ok = (
-                self.num_kv_heads > 0 and (self.num_heads % self.num_kv_heads) == 0
+
+    def _request_skip_softmax_threshold(self) -> tuple[bool, float | None]:
+        params = get_request_skip_softmax_params()
+        if params is None or self.is_cross_attention:
+            return False, None
+        current_step = get_forward_context().current_timestep
+        if not isinstance(current_step, Integral):
+            raise RuntimeError(
+                "Skip Softmax requires the denoising loop to publish an integer "
+                f"step index, got {current_step!r}."
             )
+        if current_step < params.start_step:
+            return True, None
+        return True, params.threshold_scale_factor
 
     def forward(
         self,
@@ -467,55 +411,54 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
-        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
-            attn_metadata.max_seqlen_q = query.shape[1]
-            attn_metadata.max_seqlen_k = key.shape[1]
+        use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
+        if use_trtllm:
+            if return_softmax_lse:
+                raise NotImplementedError(
+                    "Skip Softmax does not support the LSE output required by "
+                    "Ring Attention."
+                )
+            batch_size, query_length = query.shape[:2]
+            kv_length = key.shape[1]
+            metadata = get_fixed_sequence_metadata(
+                query.device,
+                batch_size,
+                query_length,
+                kv_length,
+            )
+            output = run_skip_softmax(
+                query.reshape(-1, query.shape[-2], query.shape[-1]),
+                key.reshape(-1, key.shape[-2], key.shape[-1]),
+                value.reshape(-1, value.shape[-2], value.shape[-1]),
+                seq_lens=metadata.seq_lens,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_kv=metadata.cu_seqlens_kv,
+                max_seqlen_q=query_length,
+                max_seqlen_kv=kv_length,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                threshold_scale_factor=skip_threshold,
+                q_seq_lens_cpu=metadata.q_seq_lens_cpu,
+                kv_seq_lens_cpu=metadata.kv_seq_lens_cpu,
+            )
+            return output.view(batch_size, query_length, *output.shape[1:])
+
+        if attn_metadata is not None:
+            if attn_metadata.max_seqlen_q is None:
+                attn_metadata.max_seqlen_q = query.shape[1]
+            if attn_metadata.max_seqlen_k is None:
+                attn_metadata.max_seqlen_k = key.shape[1]
             max_seqlen_q = attn_metadata.max_seqlen_q
             max_seqlen_k = attn_metadata.max_seqlen_k
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
 
-        q_shape = tuple(query.shape)
-        k_shape = tuple(key.shape)
-        v_shape = tuple(value.shape)
-
-        use_upstream = _should_use_upstream_flash_attention(
-            flash_attn_varlen_func_upstream is not None,
-            self._upstream_heads_ok,
-            q_shape,
-            k_shape,
-            v_shape,
-        )
-
-        if use_upstream:
-            bsz, seqlen, nheads_q, d = q_shape
-            q_ = query.contiguous()
-            k_ = key.contiguous()
-            v_ = value.contiguous()
-            out = flash_attn_varlen_func_upstream(
-                q_,
-                k_,
-                v_,
-                None,
-                None,
-                seqlen,
-                seqlen,
-                softmax_scale=self.softmax_scale,
-                causal=self.causal,
-                return_attn_probs=return_softmax_lse,
-            )
-            if return_softmax_lse:
-                out_tensor, softmax_lse = out
-                return out_tensor.reshape(bsz, seqlen, nheads_q, -1), softmax_lse
-            return out.reshape(bsz, seqlen, nheads_q, d)
-
         # FA version selection:
         # - fa_ver == 3: call python function (can return Tensor or (Tensor, Tensor) depending on flag)
         # - fa_ver == 4: call custom ops with FIXED return schema
         if fa_ver == 3:
-            flash_attn_op = flash_attn_func
+            flash_attn_op = flash_attn_varlen_func
             output = flash_attn_op(
                 q=query,
                 k=key,
@@ -563,3 +506,117 @@ class FlashAttentionImpl(AttentionImpl):
             return out_tensor
 
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
+        if use_trtllm:
+            bounds = cu_seqlens_host
+            used = (
+                trailing_padding_used_len(
+                    total_tokens=query.shape[0],
+                    max_seqlen=max_seqlen,
+                    bounds=bounds,
+                )
+                if self.packed_trailing_padding and bounds is not None
+                else None
+            )
+            if used is not None:
+                live_cu_seqlens = cu_seqlens[:2]
+                live_output = run_skip_softmax(
+                    query[:used],
+                    key[:used],
+                    value[:used],
+                    seq_lens=live_cu_seqlens[1:] - live_cu_seqlens[:-1],
+                    cu_seqlens_q=live_cu_seqlens,
+                    cu_seqlens_kv=live_cu_seqlens,
+                    max_seqlen_q=used,
+                    max_seqlen_kv=used,
+                    softmax_scale=self.softmax_scale,
+                    causal=self.causal,
+                    threshold_scale_factor=skip_threshold,
+                    q_seq_lens_cpu=get_host_sequence_lengths(bounds[:2]),
+                    kv_seq_lens_cpu=get_host_sequence_lengths(bounds[:2]),
+                )
+                output = live_output.new_zeros(
+                    query.shape[0], query.shape[1], value.shape[2]
+                )
+                output[:used] = live_output
+                return output
+
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            seq_lens_cpu = (
+                get_host_sequence_lengths(cu_seqlens_host)
+                if cu_seqlens_host is not None
+                else None
+            )
+            return run_skip_softmax(
+                query,
+                key,
+                value,
+                seq_lens=seq_lens,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_kv=max_seqlen,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                threshold_scale_factor=skip_threshold,
+                q_seq_lens_cpu=seq_lens_cpu,
+                kv_seq_lens_cpu=seq_lens_cpu,
+            )
+        output = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            ver=fa_ver,
+        )
+        return output[0] if isinstance(output, tuple) else output
+
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one non-causal FlashAttention ring chunk with LSE output."""
+        cu_seqlens_q = torch.tensor(
+            [0, query.shape[0]], dtype=torch.int32, device=query.device
+        )
+        cu_seqlens_k = torch.tensor(
+            [0, key.shape[0]], dtype=torch.int32, device=key.device
+        )
+        result = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=query.shape[0],
+            max_seqlen_k=key.shape[0],
+            softmax_scale=self.softmax_scale,
+            causal=False,
+            ver=fa_ver,
+            return_softmax_lse=True,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError(
+                "FlashAttention did not return the softmax LSE required by ring "
+                "attention"
+            )
+        output, softmax_lse, *_ = result
+        return output, softmax_lse
