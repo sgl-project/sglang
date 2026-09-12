@@ -171,7 +171,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     validate_prefill_only_disable_kv_cache_args(server_args)
-    handle_dcp_validation(server_args)
 
     # Model-arch prefill CUDA-graph default must land before cuda-graph
     # resolution (the declarative registry materializes too late to affect
@@ -234,6 +233,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_model_specific_adjustments(server_args)
+    handle_dcp_validation(server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     handle_offload_compatibility(server_args)
 
