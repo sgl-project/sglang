@@ -142,14 +142,16 @@ thread_config_t small_batch_thread_configs[] = {
 
     // thread_k, thread_n, num_threads
     {128, 128, 256},
-    {64, 128, 128}};
+    {64, 128, 128},
+    {128, 64, 128}};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
     {64, 256, 256},
-    {64, 128, 128}};
+    {64, 128, 128},
+    {128, 64, 128}};
 
 typedef struct {
   int blocks_per_sm;
@@ -460,6 +462,9 @@ MarlinFuncPtr get_marlin_kernel(
   COMMON_GET_IF(host::kU4B8)
   COMMON_GET_IF(host::kU8B128)
 
+  COMMON_GET_IF_M1(host::kU4B8, 4, 8, 128)
+  COMMON_GET_IF_M234(host::kU4B8, 4, 8, 128)
+
   NVFP4_GET_IF(host::kFE2M1f)
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
@@ -501,6 +506,10 @@ exec_config_t determine_exec_config(
   constexpr int device_max_reg_size = 255 * 1024;
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];
+
+    // Keep the existing tuning for N-aligned shapes; use the narrower tile
+    // only for TP shards that cannot use any of the 128-wide candidates.
+    if (th_config.thread_n == 64 && prob_n % 128 == 0) continue;
 
     if (!is_valid_config(
             th_config,
