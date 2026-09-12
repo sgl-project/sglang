@@ -156,6 +156,12 @@ python benchmark/minimax_m3/run_msa_formal_v2.py \
   --min-median-throughput-gain 0
 
 python benchmark/minimax_m3/run_msa_formal_v2.py \
+  "${COMMON[@]}" --mode cake-speed \
+  --output-root /shared/results/msa_cake_speed \
+  --cache-root /workspace/cache/msa_cake_speed \
+  --min-median-throughput-gain 0
+
+python benchmark/minimax_m3/run_msa_formal_v2.py \
   "${COMMON[@]}" --mode triton-speed \
   --output-root /shared/results/msa_triton_speed \
   --cache-root /workspace/cache/msa_triton_speed \
@@ -164,7 +170,8 @@ python benchmark/minimax_m3/run_msa_formal_v2.py \
 
 Accuracy runs exactly three fresh, alternating pairs in the order
 `external,flashinfer`, `flashinfer,external`, `external,flashinfer`. Each speed
-mode runs exactly one fresh pair: `external,flashinfer` for external speed and
+mode runs exactly one fresh pair: `external,flashinfer` for external speed,
+`cake,vibecuda` for direct CAKE-source versus VibeCUDA-export speed, and
 `triton,flashinfer` for the Triton reference. There are no `rep02` or `rep03`
 speed runs. Every arm gets a new server and isolated JIT/cache directories. The
 driver verifies the selected route, sends one unmeasured fixed-seed 8K/1K

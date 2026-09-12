@@ -178,6 +178,8 @@ def loopback_environment(base: dict[str, str]) -> dict[str, str]:
 def roles_for_mode(mode: str) -> tuple[str, str]:
     if mode in ("accuracy", "external-speed"):
         return ("external", "flashinfer")
+    if mode == "cake-speed":
+        return ("cake", "vibecuda")
     if mode == "triton-speed":
         return ("triton", "flashinfer")
     raise ValueError(f"unsupported mode: {mode}")
@@ -1487,7 +1489,7 @@ def run_test_only(output: Path | None) -> None:
             expected_order(mode, rep)
             for rep in range(1, repetitions_for_mode(mode) + 1)
         ]
-        for mode in ("accuracy", "external-speed", "triton-speed")
+        for mode in ("accuracy", "external-speed", "cake-speed", "triton-speed")
     }
     require(
         loopback_environment({})["OPENAI_API_KEY"] == "EMPTY",
@@ -1513,6 +1515,10 @@ def run_test_only(output: Path | None) -> None:
         "external speed order contract mismatch",
     )
     require(
+        orders["cake-speed"] == [["cake", "vibecuda"]],
+        "CAKE speed order contract mismatch",
+    )
+    require(
         orders["triton-speed"] == [["triton", "flashinfer"]],
         "triton speed order contract mismatch",
     )
@@ -1520,6 +1526,7 @@ def run_test_only(output: Path | None) -> None:
     require(
         repetitions_for_mode("accuracy") == 3
         and repetitions_for_mode("external-speed") == 1
+        and repetitions_for_mode("cake-speed") == 1
         and repetitions_for_mode("triton-speed") == 1,
         "mode-specific repetition counts drifted",
     )
@@ -1527,6 +1534,7 @@ def run_test_only(output: Path | None) -> None:
     require(fixed_parity_required("accuracy"), "accuracy fixed parity was disabled")
     require(
         not fixed_parity_required("external-speed")
+        and not fixed_parity_required("cake-speed")
         and not fixed_parity_required("triton-speed"),
         "a speed-only mode would send accuracy requests",
     )
@@ -1899,6 +1907,8 @@ def run_test_only(output: Path | None) -> None:
         )
         source.unlink()
         started_ns = time.time_ns()
+        # Some shared filesystems expose sub-second mtimes at coarser resolution.
+        time.sleep(0.02)
         source.write_text('{"score": 1}\n')
         payload, receipt = claim_fresh_json_output(
             source, destination, started_ns, "synthetic"
@@ -2264,7 +2274,8 @@ def main() -> None:
     parser.add_argument("--test-only", action="store_true")
     parser.add_argument("--test-receipt", type=Path)
     parser.add_argument(
-        "--mode", choices=("accuracy", "external-speed", "triton-speed")
+        "--mode",
+        choices=("accuracy", "external-speed", "cake-speed", "triton-speed"),
     )
     parser.add_argument("--model")
     parser.add_argument("--gpqa-dataset", type=Path)
