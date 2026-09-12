@@ -79,14 +79,13 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--chunked-prefill-size",
     131072,
     "--max-running-requests",
-    # 5 * dp_size(16) = 80: cap per-DP-rank concurrency at 5. A rank reaching
-    # 6 running requests replays the bs=6 decode graph, which corrupts global
-    # state and permanently collapses the DSPARK accept rate to ~0.01.
-    80,
-    # Experiment A: DFlash auto-enables MinFreeSlotsDelayer, which delays fresh
-    # prefills and then admits them in one burst. Suspected root cause of the
-    # accept-rate collapse. Setting 1 forces threshold=min(1, mrr)=1 -> None,
-    # i.e. fully disables the delayer.
+    # Experiment B: 160 = 10 * dp_size(16), mirrors the local stable config
+    # exactly (160 cap + 120k tokens + same eval params) to isolate whether
+    # the mrr value itself or a CI-only environmental factor drives the
+    # DSPARK accept-rate collapse. Previous experiments: 96/80 both collapsed.
+    160,
+    # Experiment A (superseded): MinFreeSlotsDelayer burst admission was NOT
+    # the root cause -- collapse still occurred with the delayer disabled.
     "--min-free-slots-delay",
     1,
     "--dp-size",
