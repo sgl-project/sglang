@@ -3037,8 +3037,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         if should_skip:
             return
 
-        wait_event = getattr(self, "_early_send_wait_event", None)
-        self._early_send_wait_event = None
+        wait_event = self._take_early_send_wait_event()
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
