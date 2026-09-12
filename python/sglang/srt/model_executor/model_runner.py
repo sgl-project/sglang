@@ -25,6 +25,7 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.alphamoe_env import alphamoe_envs
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -1855,7 +1856,7 @@ class ModelRunner:
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
                 trace_ctx = contextlib.nullcontext()
-                if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+                if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
                     from sglang.srt.layers.moe.alphamoe_trace import (
                         observe_alphamoe_submissions,
                         record_alphamoe_execution,
@@ -1866,7 +1867,7 @@ class ModelRunner:
                     ret = self.eager_runner.execute(
                         forward_batch, pp_proxy_tensors=pp_proxy_tensors
                     )
-                if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+                if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
                     record_alphamoe_execution(
                         forward_batch,
                         execution="eager",

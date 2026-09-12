@@ -86,6 +86,7 @@ except ImportError:
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
+from sglang.srt.alphamoe_env import alphamoe_envs
 from sglang.srt.distributed import (
     get_tp_group,
 )
@@ -555,7 +556,9 @@ class TopK(BaseFusedOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        self.alphamoe_router_only = envs.SGLANG_FLASHINFER_ALPHAMOE_ROUTER_ONLY.get()
+        self.alphamoe_router_only = (
+            alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_ROUTER_ONLY.get()
+        )
         self._alphamoe_router_cache = None
         if self.alphamoe_router_only:
             if (

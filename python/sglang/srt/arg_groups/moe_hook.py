@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.alphamoe_env import alphamoe_envs
 from sglang.srt.arg_groups.overrides import (
     _a2a_backend_overrides,
     _a2a_ep_size,
@@ -45,7 +46,7 @@ def handle_moe_kernel_config(server_args: Any):
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
     view = resolved_view(server_args)
-    if envs.SGLANG_FLASHINFER_ALPHAMOE_ROUTER_ONLY.get():
+    if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_ROUTER_ONLY.get():
         if (
             view.moe_runner_backend != "triton"
             or (view.quantization or model_config_of(server_args).quantization) != "fp8"

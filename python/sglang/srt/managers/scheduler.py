@@ -65,6 +65,7 @@ try:
     )
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
+from sglang.srt.alphamoe_env import exportable_alphamoe_env_vars
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -5026,7 +5027,9 @@ class Scheduler(
                 ret["dspark_info_record"] = info_record
 
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
-            ret["env_vars"] = exportable_env_vars()
+            exported_envs = exportable_env_vars()
+            exported_envs.update(exportable_alphamoe_env_vars())
+            ret["env_vars"] = dict(sorted(exported_envs.items()))
 
         # A bound signal handler is not msgpack-serializable, and no reader
         # consumes it.

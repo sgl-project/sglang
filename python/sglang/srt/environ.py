@@ -342,10 +342,6 @@ class Envs:
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
-    # Restricted Qwen TP4 routing A/B: keep Triton experts and use AlphaMoE TopK.
-    SGLANG_FLASHINFER_ALPHAMOE_ROUTER_ONLY = EnvBool(False)
-    SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES = EnvBool(False)
-    SGLANG_FLASHINFER_ALPHAMOE_TRACE_ARM_FILE = EnvStr("")
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())

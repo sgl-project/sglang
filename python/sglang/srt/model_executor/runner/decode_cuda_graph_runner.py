@@ -36,6 +36,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.alphamoe_env import alphamoe_envs
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
@@ -1218,7 +1219,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     run_lm_head=True,
                 )
                 trace_ctx = contextlib.nullcontext()
-                if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+                if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
                     from sglang.srt.layers.moe.alphamoe_trace import (
                         observe_alphamoe_capture,
                     )
@@ -1444,7 +1445,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
-            if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+            if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
                 from sglang.srt.layers.moe.alphamoe_trace import (
                     record_alphamoe_execution,
                 )

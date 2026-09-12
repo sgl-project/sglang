@@ -52,8 +52,8 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.alphamoe_env import alphamoe_envs
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -1534,7 +1534,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         trace_ctx = nullcontext()
-        if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+        if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
             from sglang.srt.layers.moe.alphamoe_trace import observe_alphamoe_capture
 
             trace_ctx = observe_alphamoe_capture(self.backend, shape_key)
@@ -1965,7 +1965,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raw_num_tokens,
                     **kwargs,
                 )
-            if envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
+            if alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES.get():
                 from sglang.srt.layers.moe.alphamoe_trace import (
                     record_alphamoe_execution,
                 )
