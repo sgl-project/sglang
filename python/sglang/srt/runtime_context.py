@@ -163,7 +163,7 @@ def derive_parallel_widths(
 
     `world_size` is not among them: it is not a quotient, and `get_world_size()`
     answers with the live WORLD group, which stays right through an elastic
-    scale-up that a stamp taken at group build would not survive.
+    scale-up that a value fixed at group build would not survive.
     """
     return {
         "attn_dp_size": attn_dp_size,
@@ -262,12 +262,13 @@ class ParallelContext:
     different names rather than two answers to one name.
     """
 
-    __slots__ = ("_overrides", "_config", "_derived")
+    __slots__ = ("_overrides", "_config", "_derived", "_derived_log")
 
     def __init__(self):
         self._overrides = {}
         self._config = None  # parallel config bag, wired at publish
-        self._derived = {}  # widths stamped when the groups are built
+        self._derived = {}  # widths overridden permanently, as the groups are built
+        self._derived_log = []  # [(source, {name: value})], provenance for _derived
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -290,28 +291,42 @@ class ParallelContext:
         overrides = self._overrides
         return overrides[name] if name in overrides else getter()
 
-    def stamp_derived_widths(self, **widths) -> None:
-        """Record the widths derived from the leaves, as the groups are built.
+    def override_permanently(self, source: str, **widths) -> None:
+        """Permanently correct a derived width the published bag can't answer
+        or no longer answers correctly -- the `RuntimeContext.override(source,
+        **fields)` shape, not that method, because a derived width is not a
+        resolved config leaf and this must work with no config published at
+        all (`multimodal_gen` lends a TP group to `srt` layers with no `srt`
+        config to publish against).
 
-        `initialize_model_parallel` computes the set through
-        `derive_parallel_widths` and hands it here; `initialize_dp_attention`
-        stamps `attn_dp_size` again once it knows the effective width, and
-        elastic EP restamps it where it already updates the live one. A stamped
-        width is what the readers answer with.
+        `initialize_dp_attention` calls this once `attn_dp_size` is known, and
+        an elastic EP scale-up calls it again where it already updates the
+        live one; `source` is provenance for both, kept for the same reason
+        `RuntimeContext.override` keeps one. Lives beside, not inside, the
+        `@contextmanager` `override` above -- a name it cannot also have on
+        this class -- because these are permanent for the process, not scoped
+        to a `with` block: none of the real callers ever restore the value
+        they set here.
         """
         self._derived.update(widths)
+        self._derived_log.append((source, dict(widths)))
 
     def clear_derived_widths(self) -> None:
         self._derived.clear()
+        self._derived_log.clear()
+
+    def derived_widths_log(self) -> list:
+        """Provenance of `override_permanently` calls: `[(source, {name: value})]`."""
+        return [(source, dict(widths)) for source, widths in self._derived_log]
 
     def _derived_width(self, name):
-        """A width the configuration implies: override, else stamp, else the
-        published leaf.
+        """A width the configuration implies: scoped override, else permanent
+        override, else the published leaf.
 
-        The leaf is computed at publish by `parallel_widths_of`; the stamp sits
-        above it because an elastic scale-up restamps `attn_dp_size` after
-        publish, and a scope that swaps in another TP group states the quotients
-        through `override`.
+        The leaf is computed at publish by `parallel_widths_of`; the permanent
+        override sits above it because an elastic scale-up corrects
+        `attn_dp_size` after publish, and a scope that swaps in another TP
+        group states the quotients through the scoped `override` above that.
 
         Nothing is recomputed on read, so overriding `tp_size` does not move
         `attn_tp_size`: name the width, or publish a config.
@@ -327,10 +342,10 @@ class ParallelContext:
             return getattr(config, name)
         raise RuntimeError(
             f"derived parallel width {name!r} is not available: it is computed "
-            "from the configured leaves at publish, and restamped when the "
-            "process groups are built. Nothing is published and nothing has "
-            "been stamped -- publish a parallel config, or state the width "
-            f"with get_parallel().override({name}=...)"
+            "from the configured leaves at publish, and permanently corrected "
+            "when the process groups are built. Nothing is published and "
+            "nothing has been set with override_permanently -- publish a "
+            f"parallel config, or state the width with get_parallel().override({name}=...)"
         )
 
     @contextmanager
@@ -1752,9 +1767,10 @@ def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
-    ``parallel`` holds the stamped derived widths, which go with the lifecycle
-    that stamped them: `_derived_width` prefers the stamp over the leaves, so
-    leaving one behind lets the next test read the previous topology.
+    ``parallel`` holds the permanently-overridden derived widths, which go
+    with the lifecycle that set them: `_derived_width` prefers them over the
+    published leaves, so leaving one behind lets the next test read the
+    previous topology.
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
