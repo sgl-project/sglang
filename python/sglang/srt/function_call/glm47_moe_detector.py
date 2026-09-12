@@ -228,6 +228,24 @@ def _convert_to_number(value: str) -> Any:
         return value
 
 
+def _convert_to_integer(value: str) -> Any:
+    try:
+        return int(value)
+    except (ValueError, AttributeError):
+        return value
+
+
+def _coerce_numeric_string(value: Any, arg_type: Optional[str]) -> Any:
+    # A quoted value must not become a type its schema forbids: "1.5" may coerce
+    # for number but never for integer.
+    if isinstance(value, str):
+        if arg_type == "integer":
+            return _convert_to_integer(value)
+        if arg_type == "number":
+            return _convert_to_number(value)
+    return value
+
+
 def parse_arguments(
     json_value: str, arg_type: Optional[str] = None
 ) -> Tuple[Any, bool]:
@@ -242,25 +260,14 @@ def parse_arguments(
     """
     # Strategy 1: Direct JSON parsing
     try:
-        parsed_value = json.loads(json_value)
-
-        # Type coercion for number type
-        if arg_type in ("number", "integer") and isinstance(parsed_value, str):
-            parsed_value = _convert_to_number(parsed_value)
-
-        return parsed_value, True
+        return _coerce_numeric_string(json.loads(json_value), arg_type), True
     except (json.JSONDecodeError, ValueError):
         pass
 
     # Strategy 2: Unescape and parse
     try:
         wrapped = json.loads('{"tmp": "' + json_value + '"}')
-        parsed_value = json.loads(wrapped["tmp"])
-
-        if arg_type in ("number", "integer") and isinstance(parsed_value, str):
-            parsed_value = _convert_to_number(parsed_value)
-
-        return parsed_value, True
+        return _coerce_numeric_string(json.loads(wrapped["tmp"]), arg_type), True
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
@@ -398,31 +405,12 @@ class Glm47MoeDetector(BaseFormatDetector):
         return get_argument_type(func_name, key, tools) or "auto"
 
     def _format_value_complete(self, value: str, value_type: str) -> str:
-        """Format complete value based on type.
-
-        Args:
-            value: Raw value string
-            value_type: Expected type ('string', 'number', 'object')
-
-        Returns:
-            Properly formatted JSON value string
-        """
+        """Format a value that completed in one chunk; number/integer/auto never
+        reach here (they are parsed at value close instead)."""
         if value_type == "string":
-            # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
-        elif value_type == "number":
-            try:
-                num = _convert_to_number(value.strip() if value else "")
-                return str(num)
-            except (ValueError, AttributeError):
-                # Fallback to string if not a valid number
-                logger.warning(
-                    f"Failed to parse '{value}' as number, treating as string"
-                )
-                return json.dumps(str(value) if value else "", ensure_ascii=False)
-        else:
-            # For object/array types, return as-is (should already be valid JSON)
-            return value
+        # object/array/boolean values arrive as JSON already
+        return value
 
     def _process_xml_to_json_streaming(
         self, raw_increment: str, func_name: str, tools: List[Tool]
@@ -469,7 +457,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._xml_tag_buffer = ""
                     self._value_started = False
-                    # Determine and cache the value type at the start
                     self._cached_value_type = self._get_value_type(
                         func_name, self._current_key, tools
                     )
@@ -479,7 +466,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                     final_value = self._xml_tag_buffer[:-12]
                     self._current_value += final_value
 
-                    # Use cached value type for consistency
                     value_type = self._cached_value_type or "string"
                     if value_type in ("auto", "number", "integer"):
                         parsed = self._parse_argument_pairs(
@@ -487,7 +473,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                         )[self._current_key]
                         json_output += json.dumps(parsed, ensure_ascii=False)
                     elif self._value_started:
-                        # Output any remaining content
                         if final_value:
                             if value_type == "string":
                                 json_output += json.dumps(
@@ -495,11 +480,10 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 )[1:-1]
                             else:
                                 json_output += final_value
-                        # Always output closing quote for string type when value was started
                         if value_type == "string":
                             json_output += '"'
                     else:
-                        # Value was never started (empty or complete in one chunk)
+                        # Value never started: empty, or completed in one chunk.
                         json_output += self._format_value_complete(
                             self._current_value, value_type
                         )
@@ -508,7 +492,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._stream_state = StreamState.BETWEEN
                     self._current_value = ""
                     self._value_started = False
-                    self._cached_value_type = None  # Reset cached type
+                    self._cached_value_type = None
                 else:
                     closing_tag = "</arg_value>"
                     is_potential_closing = len(self._xml_tag_buffer) <= len(
@@ -517,7 +501,6 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                     if not is_potential_closing:
                         content = self._xml_tag_buffer
-                        # Use cached value type for consistency
                         value_type = self._cached_value_type or "string"
 
                         if value_type in ("auto", "number", "integer"):
@@ -533,15 +516,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 ]
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
-                        elif value_type == "number":
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
                         else:
-                            # For object/array types, output as-is
+                            # object/array/boolean values stream through verbatim
                             if content:
                                 if not self._value_started:
                                     self._value_started = True
@@ -635,10 +611,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         if current_raw_length <= self._streamed_raw_length:
             return None
 
-        # Get new raw XML content
         raw_increment = func_args_raw[self._streamed_raw_length :]
 
-        # Convert XML to JSON using state machine
         json_increment = self._process_xml_to_json_streaming(
             raw_increment, func_name, tools
         )
@@ -650,7 +624,6 @@ class Glm47MoeDetector(BaseFormatDetector):
         if not json_increment:
             return None
 
-        # Update state
         self._last_arguments += json_increment
         self.streamed_args_for_tool[self.current_tool_id] += json_increment
 
@@ -698,7 +671,6 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Handle no-arg function or need to close braces
         if self._is_first_param and not self._sent_empty_object:
-            # No-arg function
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
@@ -723,7 +695,6 @@ class Glm47MoeDetector(BaseFormatDetector):
             self.streamed_args_for_tool[self.current_tool_id] += "}"
             self._sent_empty_object = True
 
-        # Parse final arguments
         if func_args_raw:
             try:
                 pairs = self.func_arg_regex.findall(func_args_raw)
@@ -735,7 +706,6 @@ class Glm47MoeDetector(BaseFormatDetector):
             except Exception as e:
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
 
-        # Clean buffer
         self._buffer = current_text[match_end_pos:]
 
         # Reset state for next tool call
@@ -889,6 +859,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         """
         arguments = {}
         known_arguments = {}
+        # Values with a certain type are resolved first so completed sibling
+        # discriminators (e.g. kind=const) can steer root-union branch selection.
         if len(pairs) > 1 and any(
             tool.function.name == func_name
             and _needs_argument_context(tool.function.parameters)
@@ -912,12 +884,13 @@ class Glm47MoeDetector(BaseFormatDetector):
             )
 
             if arg_type == "string":
-                # Only convert to string if explicitly defined as string type
                 if isinstance(parsed_value, str):
                     arguments[arg_key] = parsed_value
                 else:
                     arguments[arg_key] = arg_value
             elif arg_type is None:
+                # A value whose parsed JSON type is inadmissible stays the raw
+                # string when the schema allows a string (e.g. enum ["7", 8]).
                 allowed = _get_argument_types(
                     func_name, arg_key, tools, known_arguments, parsed_value
                 )
@@ -933,7 +906,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                     parsed_value = arg_value
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
             else:
-                # For other types (number, object, array, etc.), use parsed value
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
             known_arguments[arg_key] = arguments[arg_key]
 
