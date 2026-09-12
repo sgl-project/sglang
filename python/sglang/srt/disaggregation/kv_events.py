@@ -558,7 +558,7 @@ class ZmqEventPublisher(EventPublisher):
 
         Args:
             endpoint: The endpoint string
-                (e.g., "tcp://*:5557" or "inproc://cache")
+                (e.g., "tcp://*:5557", "ipc:///tmp/cache", or "inproc://cache")
             data_parallel_rank: The data parallel rank to offset by
 
         Returns:
@@ -569,9 +569,9 @@ class ZmqEventPublisher(EventPublisher):
         if not endpoint or data_parallel_rank == 0:
             return endpoint
 
-        if "inproc" in endpoint:
+        if endpoint.startswith(("ipc://", "inproc://")):
             return f"{endpoint}_dp{data_parallel_rank}"
-        if "tcp" in endpoint:
+        if endpoint.startswith("tcp://"):
             if endpoint and ":" in endpoint:
                 # Get everything after the last colon (the port)
                 last_colon_idx = endpoint.rfind(":")
@@ -580,7 +580,9 @@ class ZmqEventPublisher(EventPublisher):
                 new_port = base_port + data_parallel_rank
                 return f"{base_addr}:{new_port}"
             return endpoint
-        raise ValueError("Invalid endpoint: must contain 'inproc' or 'tcp'")
+        raise ValueError(
+            "Invalid endpoint: must start with 'ipc://', 'inproc://', or 'tcp://'"
+        )
 
 
 class KVEventsConfig(BaseModel):
