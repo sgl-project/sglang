@@ -383,6 +383,15 @@ class MambaPool:
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
     conv_window_axis = -1
 
+    # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
+    # class-level default because UnifiedMambaPool skips MambaPool.__init__.
+    _slot_siblings: Tuple = ()
+
+    def register_slot_state(self, state) -> None:
+        """Attach a state that rides along on clear / copy / host round-trip,
+        so a slot never changes owner with a stale sibling row attached."""
+        self._slot_siblings = [*self._slot_siblings, state]
+
     @dataclass(frozen=True, kw_only=True)
     class State:
         conv: List[torch.Tensor]
@@ -480,7 +489,7 @@ class MambaPool:
                 *physical_conv_shape,
             ),
             dtype=conv_dtype,
-            device="cuda",
+            device=self.device,
         )
         physical_conv_strides = phys.stride()[2:]
         window_stride = physical_conv_strides[window_axis]
@@ -762,7 +771,7 @@ class MambaPool:
                             temporal_state_shape[2],
                         ),
                         dtype=ssm_dtype,
-                        device="cuda",
+                        device=device,
                     )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -830,7 +839,7 @@ class MambaPool:
                                 conv_shape[1],
                             ),
                             dtype=conv_dtype,
-                            device="cuda",
+                            device=device,
                         )
                         for conv_shape in dense_conv_shapes
                     ]
@@ -977,6 +986,8 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        for sibling in self._slot_siblings:
+            sibling.reset_slots(indices)
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
@@ -1047,6 +1058,8 @@ class MambaPool:
             ]
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
+        for sibling in self._slot_siblings:
+            sibling.copy_slots(src_indices, dst_indices)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -1057,10 +1070,19 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
+        siblings_cpu = [s.get_cpu_slots(indices) for s in self._slot_siblings]
         current_platform.synchronize()
+        if self._slot_siblings:
+            return conv_cpu, temporal_cpu, siblings_cpu
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
+        # The trailing element exists exactly when this instance registered siblings:
+        # the pool that saved the copy is the pool that loads it.
+        siblings_cpu = None
+        if self._slot_siblings:
+            siblings_cpu = mamba_cache_cpu[-1]
+            mamba_cache_cpu = mamba_cache_cpu[:-1]
         # Accept historical 3-tuples, but request-keyed replay scratch is not
         # restored with a physical checkpoint slot.
         if len(mamba_cache_cpu) == 3:
@@ -1073,6 +1095,9 @@ class MambaPool:
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
             self.mamba_cache.temporal.device, non_blocking=True
         )
+        if siblings_cpu is not None:
+            for sibling, data in zip(self._slot_siblings, siblings_cpu):
+                sibling.load_cpu_slots(data, indices)
         current_platform.synchronize()
 
     _NON_TRANSFER_STATE_FIELDS = frozenset(
@@ -1088,8 +1113,8 @@ class MambaPool:
         }
     )
 
-    def _iter_transfer_state_tensors(self):
-        """Yield transferable state tensors with their per-slot slice axis."""
+    def _iter_transfer_state_entries(self):
+        """Yield ``[slot, ...]`` state entries and their transfer metadata."""
         for field, value in vars(self.mamba_cache).items():
             if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
                 continue
@@ -1100,20 +1125,20 @@ class MambaPool:
                 # empty. Advertising it fails the whole batch registration.
                 if state_tensor.numel() == 0:
                     continue
-                yield field, state_tensor, slice_axis
+                for layer_index, layer_id in enumerate(self.mamba_layer_ids):
+                    yield field, state_tensor[layer_index], slice_axis, layer_id
+
+        for sibling in self._slot_siblings:
+            yield from sibling.iter_transfer_state_entries()
 
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor, _ in self._iter_transfer_state_tensors():
-            data_ptrs += [
-                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
-            ]
-            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
-            item_lens += [
-                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
-            ]
+        for _, state_tensor, _, _ in self._iter_transfer_state_entries():
+            data_ptrs.append(state_tensor.data_ptr())
+            data_lens.append(state_tensor.nbytes)
+            item_lens.append(state_tensor[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
     def get_state_dim_per_tensor(self):
@@ -1123,13 +1148,17 @@ class MambaPool:
         while Kimi conv state uses the second per-slot axis.
         """
         dim_per_tensor = []
-        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
-            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # Kimi conv state transposes the two per-slot axes to [K-1, dim].
-            axis = 2 + slice_axis
-            sliceable_dim = state_tensor.shape[axis]
-            # Repeat for each layer since we have per-layer data_ptrs
-            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+            # Zero is a protocol marker for request state replicated across the
+            # attention-TP group. Heterogeneous PD copies the whole item from one
+            # elected source rank instead of slicing it as a TP-sharded tensor.
+            if slice_axis is None:
+                dim_per_tensor.append(0)
+                continue
+            # state_tensor shape: [size+1, sliceable_dim, ...]. Kimi conv state
+            # transposes the two per-slot axes to [K-1, dim].
+            axis = 1 + slice_axis
+            dim_per_tensor.append(state_tensor.shape[axis])
         return dim_per_tensor
 
     def get_state_layer_ids(self):
@@ -1139,15 +1168,18 @@ class MambaPool:
         the state list tensor-major x layer. Lets PD transfer match entries
         by layer id when prefill (PP stage) holds a subset of the mamba layers.
         """
-        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
-        return list(self.mamba_layer_ids) * state_tensor_count
+        return [layer_id for _, _, _, layer_id in self._iter_transfer_state_entries()]
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
         outer_counts = []
-        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
-            outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
-            outer_counts += [outer_count] * self.num_mamba_layers
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+            outer_count = (
+                1
+                if slice_axis is None
+                else math.prod(state_tensor.shape[1 : 1 + slice_axis])
+            )
+            outer_counts.append(outer_count)
         return outer_counts
 
     def get_state_conv_shard_groups(self):
@@ -1162,14 +1194,14 @@ class MambaPool:
         those tensors keep the single contiguous slice.
         """
         subdims_per_tensor = []
-        for field, _, _ in self._iter_transfer_state_tensors():
+        for field, _, _, _ in self._iter_transfer_state_entries():
             # Only conv_state carries a q/k/v decomposition.
             subdims = (
                 list(self.conv_shard_groups)
                 if field == "conv" and self.conv_shard_groups is not None
                 else None
             )
-            subdims_per_tensor += [subdims] * self.num_mamba_layers
+            subdims_per_tensor.append(subdims)
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):
@@ -1202,6 +1234,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape: Optional[Tuple[int, int]] = None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         super().__init__(
             size=size,
@@ -1216,6 +1252,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -1229,6 +1266,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            short_conv_layer_ids=short_conv_layer_ids,
+            short_conv_state_shape=short_conv_state_shape,
+            ngram_context_len=ngram_context_len,
+            ngram_eos_token_id=ngram_eos_token_id,
         )
 
     def _init_mamba_pool(
@@ -1245,6 +1286,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape: Optional[Tuple[int, int]] = None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1266,6 +1311,36 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
+        # Qwen4-Exp PLE side states; built disabled rather than None without a config,
+        # so every hybrid model has both attributes.
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        self.short_conv_pool = ShortConvPool(
+            size=mamba_size,
+            spec_state_size=mamba_spec_state_size,
+            state_shape=short_conv_state_shape,
+            layer_ids=short_conv_layer_ids or [],
+            dtype=cache_params.dtype.conv,
+            device=device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+        self.ngram_pool = NGramPool(
+            size=mamba_size,
+            spec_state_size=mamba_spec_state_size,
+            context_len=ngram_context_len,
+            eos_token_id=ngram_eos_token_id,
+            device=device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+        # Disabled pools stay off the sibling list so the host-offload payload
+        # keeps its legacy shape for every non-PLE hybrid model.
+        if self.short_conv_pool.enabled:
+            self.mamba_pool.register_slot_state(self.short_conv_pool)
+        if self.ngram_pool.enabled:
+            self.mamba_pool.register_slot_state(self.ngram_pool)
+
         # Optional int8 checkpoint pool: the radix caches states here (int8) instead
         # of holding them in the active bf16 pool -> ~2x cached-prefix capacity at
         # fixed memory. Strategy-agnostic (no_buffer / extra_buffer / spec).
@@ -1279,6 +1354,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_layer_ids=mamba_layer_ids,
             device=device,
         )
+        if self.mamba_ckpt_pool is not None and (
+            self.short_conv_pool.enabled or self.ngram_pool.enabled
+        ):
+            # The int8 checkpoint pool frees the bf16 slot after donating its state,
+            # taking the bf16-slot-indexed PLE side states with it.
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint is incompatible with Qwen4-Exp "
+                "PLE side states"
+            )
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
@@ -1437,6 +1521,27 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_pool.mamba2_layer_cache(self.mamba2_layer_index(layer_id))
+
+    def short_conv_layer_cache(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.short_conv_pool.layer_cache(layer_id)
+
+    def short_conv_layer_intermediate_cache(
+        self, layer_id: int
+    ) -> Optional[torch.Tensor]:
+        return self.short_conv_pool.layer_intermediate_cache(layer_id)
+
+    def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        return self.ngram_pool.get_context(ngram_indices)
+
+    def set_ngram_context(
+        self, ngram_indices: torch.Tensor, context: torch.Tensor
+    ) -> None:
+        self.ngram_pool.set_context(ngram_indices, context)
+
+    def set_ngram_intermediate_context(self, context: torch.Tensor) -> None:
+        self.ngram_pool.set_intermediate_context(context)
 
     def copy_mamba_state(
         self, src_index: torch.Tensor, dst_index: torch.Tensor
@@ -1607,6 +1712,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
+        self.short_conv_pool.clear()
+        self.ngram_pool.clear()
         # The int8 checkpoint pool holds radix-cached states in its own slots; a
         # flush/reset drops the radix tree, so its slots must be released too,
         # otherwise the (now unreferenced) slots leak and break the int8-pool

@@ -75,7 +75,7 @@ def dsv4_state_payloads(
     """Build NPU-specific DSV4 PD payloads.
 
     Returns payloads for components that are addressed differently from the
-    cross-hardware ``StateType.SWA`` / ``StateType.C128_STATE`` defaults:
+    cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
     * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows.  Prefill

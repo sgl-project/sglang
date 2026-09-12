@@ -26,9 +26,11 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
@@ -50,7 +52,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.utils import hash_str_to_int64
+from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
 
 
@@ -99,6 +101,7 @@ def _pump_insert(core: RustUnifiedTreeCore, params: InsertParams) -> InsertResul
         prefix_len=step.result.prefix_len,
         last_device_node=step.result.last_device_node,
         mamba_exist=step.result.mamba_exist,
+        swa_branch_inserted=step.result.swa_branch_inserted,
         cache_actions=actions,
     )
 
@@ -173,6 +176,51 @@ def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
         assert core.is_root(live_root)
 
 
+def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_core():
+    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+
+    core = RustUnifiedTreeCoreInspector(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+        )
+    )
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+    result = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=live_root,
+        last_host_node=live_root,
+        best_match_node=live_root,
+    )
+    params = MatchPrefixParams(key=_key([]))
+
+    for field in ("last_device_node", "last_host_node", "best_match_node"):
+        with pytest.raises(KeyError) as exc_info:
+            core.finalize_component_match_result(
+                ComponentType.FULL,
+                result._replace(**{field: stale_root}),
+                params,
+                value_chunks=[],
+                best_value_len=0,
+            )
+        assert exc_info.value.args == (stale_root,), field
+        assert core.is_root(live_root), field
+
+    finalized = core.finalize_component_match_result(
+        ComponentType.FULL,
+        result,
+        params,
+        value_chunks=[],
+        best_value_len=0,
+    )
+    assert finalized.best_match_node == live_root
+
+
 def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
     from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 
@@ -180,15 +228,141 @@ def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
     stale_root = core.root_node_handle()
     core.reset()
     live_root = core.root_node_handle()
+    empty = torch.empty(0, dtype=torch.int64)
 
-    operations = (
-        lambda: core.demote(stale_root),
-        lambda: core.build_hicache_transfers(
+    operations = {
+        "inc_lock_ref": lambda: core.inc_lock_ref(stale_root),
+        "dec_lock_ref": lambda: core.dec_lock_ref(stale_root, DecLockRefParams()),
+        "dec_swa_lock_only": lambda: core.dec_swa_lock_only(
+            stale_root, DecLockRefParams()
+        ),
+        "evict_device_leaf": lambda: core.evict_device_leaf(stale_root, False),
+        "drop_subtree_no_host": lambda: core.drop_subtree_no_host(stale_root),
+        "demote": lambda: core.demote(stale_root),
+        "is_full_device_evicted": lambda: core.is_full_device_evicted(stale_root),
+        "collect_full_device_indices/from": lambda: core.collect_full_device_indices(
+            stale_root, live_root
+        ),
+        "collect_full_device_indices/until": lambda: core.collect_full_device_indices(
+            live_root, stale_root
+        ),
+        "insert_host": lambda: core.insert_host(
+            stale_root, _key([1]), empty, ["0" * 64]
+        ),
+        "build_backup_spec": lambda: core.build_backup_spec(stale_root),
+        "build_storage_backup_spec": lambda: core.build_storage_backup_spec(
+            stale_root, False
+        ),
+        "build_hicache_transfers": lambda: core.build_hicache_transfers(
             ComponentType.FULL, stale_root, CacheTransferPhase.BACKUP_STORAGE
         ),
-        lambda: core.build_load_back_spec(stale_root),
-        lambda: core.get_hash_values(stale_root),
-        lambda: core.dfs_weight_order([stale_root]),
+        "commit_backup": lambda: core.commit_backup(stale_root, empty, {}),
+        "commit_hicache_transfers": lambda: core.commit_hicache_transfers(
+            stale_root,
+            CacheTransferPhase.BACKUP_HOST,
+            {},
+            cache_actions=[],
+        ),
+        "commit_load_back": lambda: core.commit_load_back(
+            stale_root, empty, PoolTransfer(name=PoolName.KV), {}
+        ),
+        "build_load_back_spec": lambda: core.build_load_back_spec(stale_root),
+        "build_external_linker_offload_transfers": lambda: (
+            core.build_external_linker_offload_transfers(stale_root)
+        ),
+        "mark_external_cache_stored_path/from": lambda: (
+            core.mark_external_cache_stored_path(stale_root, live_root)
+        ),
+        "mark_external_cache_stored_path/until": lambda: (
+            core.mark_external_cache_stored_path(live_root, stale_root)
+        ),
+        "mark_external_linker_offload_pending": lambda: (
+            core.mark_external_linker_offload_pending(stale_root)
+        ),
+        "finish_external_linker_offload": lambda: core.finish_external_linker_offload(
+            [live_root, stale_root], live_root, True
+        ),
+        "evict_excess_path_states": lambda: core.evict_excess_path_states(
+            stale_root, {}, {}
+        ),
+        "inc_host_lock_ref": lambda: core.inc_host_lock_ref(stale_root),
+        "dec_host_lock_ref": lambda: core.dec_host_lock_ref(
+            stale_root, DecLockRefParams()
+        ),
+        "mark_write_through_pending": lambda: core.mark_write_through_pending(
+            [stale_root], stale_root
+        ),
+        "finish_write_through": lambda: core.finish_write_through(
+            [stale_root], stale_root
+        ),
+        "finish_load_back": lambda: core.finish_load_back(stale_root),
+        "get_component_device_value": lambda: core.get_component_device_value(
+            stale_root, ComponentType.FULL
+        ),
+        "component_has_host_value_only": lambda: core.component_has_host_value_only(
+            stale_root, ComponentType.FULL
+        ),
+        "get_hash_values": lambda: core.get_hash_values(stale_root),
+        "dfs_weight_order": lambda: core.dfs_weight_order([stale_root]),
+    }
+    for name, operation in operations.items():
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,), name
+        assert core.is_root(live_root), name
+
+
+def test_stale_handles_nested_in_transfer_results_do_not_poison_the_core():
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    core = _tree_core()
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+    stale_transfer = PoolTransfer(name=PoolName.KV, nodes_to_load=[stale_root])
+
+    operations = (
+        lambda: core.commit_hicache_transfers(
+            live_root,
+            CacheTransferPhase.LOAD_BACK,
+            {ComponentType.FULL: [stale_transfer]},
+            cache_actions=[],
+        ),
+        lambda: core.commit_hicache_transfers(
+            live_root,
+            CacheTransferPhase.PREFETCH,
+            {},
+            cache_actions=[],
+            insert_result=InsertResult(prefix_len=0, inserted_host_node=stale_root),
+        ),
+        lambda: core.commit_load_back(
+            live_root,
+            torch.empty(0, dtype=torch.int64),
+            stale_transfer,
+            {},
+        ),
+    )
+    for operation in operations:
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,)
+        assert core.is_root(live_root)
+
+
+def test_stale_handle_component_access_does_not_poison_the_core():
+    core = _tree_core(
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=8,
+    )
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+
+    operations = (
+        lambda: core.set_component_device_value(
+            stale_root, ComponentType.SWA, torch.empty(0, dtype=torch.int64)
+        ),
+        lambda: core.get_component_device_value(stale_root, ComponentType.SWA),
     )
     for operation in operations:
         with pytest.raises(KeyError) as exc_info:
@@ -263,10 +437,10 @@ def test_lock_and_unlock_move_tokens_between_protected_and_evictable():
     _insert(core, [1, 2, 3], [10, 11, 12])
     _insert(core, [1, 2, 3, 4, 5], [20, 21, 22, 13, 14])
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4, 5])))
-    core.inc_lock_ref(matched.best_match_node)
+    lock = core.inc_lock_ref(matched.best_match_node)
     assert core.protected_size() == 5
     assert core.evictable_size() == 0
-    core.dec_lock_ref(matched.best_match_node)
+    core.dec_lock_ref(matched.best_match_node, lock.to_dec_params())
     assert core.protected_size() == 0
     assert core.evictable_size() == 5
 
@@ -341,12 +515,18 @@ def test_configuration_reads_the_locked_rust_state():
     assert swa_core.has_swa_host_pool is True
 
 
-def test_external_cache_linker_is_rejected():
+def test_external_cache_linker_enablement_and_component_guard():
     core = _tree_core()
     assert core.enable_external_cache_linker is False
-    with pytest.raises(ValueError, match="External cache linker"):
-        core.enable_external_cache_linker = True
+    core.enable_external_cache_linker = True
+    assert core.enable_external_cache_linker is True
+    core.enable_external_cache_linker = False
     assert core.enable_external_cache_linker is False
+
+    mamba_core = _mamba_tree_core()
+    with pytest.raises(AssertionError, match="(?i)mamba"):
+        mamba_core.enable_external_cache_linker = True
+    assert mamba_core.enable_external_cache_linker is False
 
 
 def test_sanity_check_passes_after_the_full_flow():
@@ -721,8 +901,8 @@ def test_host_lock_refs_round_trip():
     _insert(core, [1], [10])
     leaf = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
     core.commit_backup(leaf, torch.tensor([100], dtype=torch.int64), {})
-    core.inc_host_lock_ref(leaf)
-    core.dec_host_lock_ref(leaf)
+    host_lock = core.inc_host_lock_ref(leaf)
+    core.dec_host_lock_ref(leaf, host_lock.to_dec_params())
     core.sanity_check([], [])
 
 
@@ -879,21 +1059,25 @@ def test_storage_backup_spec_round_trips_the_backuped_node():
     core = _tree_core(page_size=2)
     core.set_hicache_enabled()
     core.enable_storage = True
-    _insert(core, [1, 2], [10, 11])
-    _insert(core, [1, 2, 7, 8], [10, 11, 12, 13])
-    parent = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
-    child = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 7, 8]))).best_match_node
+    key = RadixKey(
+        array("q", [1, 2, 7, 8]), extra_key="adapter-a", cache_salt="tenant-a"
+    )
+    for length in (2, 4):
+        _pump_insert(
+            core,
+            InsertParams(key=key[:length], value=torch.arange(10, 10 + length)),
+        )
+    parent = core.match_prefix(MatchPrefixParams(key=key[:2])).best_match_node
+    child = core.match_prefix(MatchPrefixParams(key=key)).best_match_node
     core.commit_backup(parent, torch.tensor([100, 101], dtype=torch.int64), {})
     core.commit_backup(child, torch.tensor([102, 103], dtype=torch.int64), {})
 
     spec = core.build_storage_backup_spec(child, pass_prefix_keys=True)
     assert spec.host_value.tolist() == [102, 103]
     assert spec.token_ids == array("q", [7, 8])
-    parent_hashes = mem_cache.get_hash_str(array("q", [1, 2]), None, 2)
-    assert spec.prefix_keys == parent_hashes
-    assert spec.hash_value == mem_cache.get_hash_str(
-        array("q", [7, 8]), parent_hashes[-1], 2
-    )
+    hashes = get_storage_hash_str(key, page_size=2)
+    assert spec.prefix_keys == hashes[:1]
+    assert spec.hash_value == hashes[1:]
     assert spec.comp_xfers == {}
 
 
@@ -1051,11 +1235,6 @@ def test_swa_requires_the_sliding_window_size():
         )
 
 
-def test_swa_without_a_window_is_rejected_through_the_adapter():
-    with pytest.raises(ValueError, match="requires swa_sliding_window_size"):
-        _tree_core(tree_components=(ComponentType.FULL, ComponentType.SWA))
-
-
 def test_enable_hicache_constructs():
     mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(enable_hicache=True),
@@ -1105,6 +1284,14 @@ def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
         sliding_window_size=window,
         **params_overrides,
     )
+
+
+def test_swa_core_rejects_a_missing_or_non_positive_window():
+    """A zero window can never fill, so no boundary uuid would ever be stamped;
+    the adapter refuses it up front instead of letting the core misbehave later."""
+    for window in (None, 0, -1):
+        with pytest.raises(ValueError, match="positive sliding_window_size"):
+            _swa_tree_core(window=window)
 
 
 def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
@@ -1259,6 +1446,10 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
             value=torch.tensor([12, 13], dtype=torch.int64),
         ),
     )
+    assert core.validate_buffer_backup(leaf, len(snapshot.key)) is None
+
+    core.reset()
+    assert core.snapshot_buffer_backup(leaf, pass_prefix_keys=True) is None
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is None
 
 
@@ -1426,20 +1617,20 @@ def test_skipped_mamba_lock_survives_swa_only_release_through_the_adapter():
     node = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
 
     owner = core.inc_lock_ref(node)
-    skipped = core.inc_lock_ref(node, skip_lock_components=(ComponentType.MAMBA,))
-    assert skipped.skip_lock_node_ids == {ComponentType.MAMBA: {node}}
+    holder = core.inc_lock_ref(node, skip_lock_components=(ComponentType.MAMBA,))
+    assert ComponentType.MAMBA not in owner.skipped_lock_components
+    assert ComponentType.MAMBA in holder.skipped_lock_components
     assert core.mamba_protected_size() == 1
 
-    released = core.dec_swa_lock_only(
-        node,
-        skipped.swa_uuid_for_lock,
-        skip_lock_node_ids=skipped.skip_lock_node_ids,
-    )
+    # The holder's receipt says it never took mamba: its early SWA release
+    # must leave the owner's mamba lock alone.
+    released = core.dec_swa_lock_only(node, holder.to_dec_params())
     assert dict(released.device_frees) == {}
     assert dict(released.host_frees) == {}
     assert core.mamba_protected_size() == 1
 
-    core.dec_lock_ref(node, skipped.to_dec_params(), skip_swa=True)
+    core.dec_lock_ref(node, holder.to_dec_params(), skip_swa=True)
+    assert core.mamba_protected_size() == 1
     core.dec_lock_ref(node, owner.to_dec_params())
     assert core.protected_size() == 0
     assert core.swa_protected_size() == 0
@@ -1517,10 +1708,9 @@ def test_mamba_eviction_walk_frees_slots_through_the_adapter():
     assert torch.cat(device_frees[ComponentType.MAMBA]).tolist() == [7]
     assert core.mamba_evictable_size() == 1
 
-    # A pre-eviction node handle locked after the tombstoning lands in the
-    # skip map, and the replay keeps the release off it.
+    # A pre-eviction node handle still lock-round-trips: the segment lock
+    # counts the tombstone and the paired release takes it back exactly.
     lock = core.inc_lock_ref(internal)
-    assert internal in lock.skip_lock_node_ids[ComponentType.MAMBA]
     core.dec_lock_ref(internal, lock.to_dec_params())
     core.sanity_check([], [])
 
@@ -1735,8 +1925,6 @@ def test_component_device_value_round_trips():
 
 
 def test_lock_uuid_round_trips_through_dec_lock_ref():
-    from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
-
     core = _swa_tree_core(window=2)
     first = _insert(core, [1, 2, 3], [10, 11, 12])
     # The window cap split the leaf: rebuild the in-window nodes' SWA values.
@@ -1755,10 +1943,7 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     assert core.swa_evictable_size() == 1
     core.dec_lock_ref(
         node,
-        DecLockRefParams(
-            swa_uuid_for_lock=result.swa_uuid_for_lock,
-            skip_lock_node_ids=result.skip_lock_node_ids,
-        ),
+        DecLockRefParams(swa_uuid_for_lock=result.swa_uuid_for_lock),
     )
     # The uuid-bounded release returned the window to evictable.
     assert core.swa_protected_size() == 0
@@ -1768,32 +1953,27 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     assert again.swa_uuid_for_lock == result.swa_uuid_for_lock
 
 
-def test_swa_skip_map_crosses_the_binding_and_replays():
-    from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
-
+def test_swa_tombstones_cross_the_binding_and_release_balanced():
     core = _swa_tree_core(window=8)
     _insert(core, [1, 2], [10, 11])
     second = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
     leaf = second.cache_actions[-1].node_id
-    # Only the leaf carries SWA; its ancestor is recorded as a tombstone skip.
+    # Only the leaf carries SWA; the ancestor tombstone is counted too, and
+    # the under-window walk reaches the root without stamping a uuid.
     core.set_component_device_value(
         leaf, ComponentType.SWA, torch.tensor([52, 53], dtype=torch.int64)
     )
     result = core.inc_lock_ref(leaf)
-    assert result.skip_lock_node_ids[ComponentType.SWA]
+    assert result.swa_uuid_for_lock is None
+    assert core.swa_protected_size() == 2
     core.dec_lock_ref(
         leaf,
-        DecLockRefParams(
-            swa_uuid_for_lock=result.swa_uuid_for_lock,
-            skip_lock_node_ids=result.skip_lock_node_ids,
-        ),
+        DecLockRefParams(swa_uuid_for_lock=result.swa_uuid_for_lock),
     )
     assert core.swa_protected_size() == 0
 
 
 def test_dec_swa_lock_only_frees_flow_after_the_full_release():
-    from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
-
     core = _swa_tree_core(window=2)
     first = _insert(core, [1, 2], [10, 11])
     node = first.cache_actions[0].node_id
@@ -1801,17 +1981,15 @@ def test_dec_swa_lock_only_frees_flow_after_the_full_release():
         node, ComponentType.SWA, torch.tensor([50, 51], dtype=torch.int64)
     )
     result = core.inc_lock_ref(node)
+    # A non-None boundary: the window fills at the locked node itself.
+    assert result.swa_uuid_for_lock is not None
     # The FULL lock releases first (skip_swa), then the early window release
     # finds a fully unlocked device leaf and evicts it in place.
-    core.dec_lock_ref(
-        node,
-        DecLockRefParams(skip_lock_node_ids=result.skip_lock_node_ids),
-        skip_swa=True,
-    )
+    core.dec_lock_ref(node, result.to_dec_params(), skip_swa=True)
     device_frees: dict = {}
     host_frees: dict = {}
     _accumulate_step(
-        core.dec_swa_lock_only(node, result.swa_uuid_for_lock),
+        core.dec_swa_lock_only(node, result.to_dec_params()),
         {},
         device_frees,
         host_frees,
@@ -1820,7 +1998,7 @@ def test_dec_swa_lock_only_frees_flow_after_the_full_release():
     assert core.get_component_device_value(node, ComponentType.SWA) is None
 
 
-def test_dec_swa_lock_only_returns_the_window_frees():
+def test_dec_swa_lock_only_releases_once_and_a_repeat_dies_loud():
     core = _swa_tree_core(window=2)
     first = _insert(core, [1, 2, 3], [10, 11, 12])
     for action in first.cache_actions:
@@ -1834,22 +2012,19 @@ def test_dec_swa_lock_only_returns_the_window_frees():
     device_frees: dict = {}
     host_frees: dict = {}
     _accumulate_step(
-        core.dec_swa_lock_only(node, result.swa_uuid_for_lock),
+        core.dec_swa_lock_only(node, result.to_dec_params()),
         {},
         device_frees,
         host_frees,
     )
-    # The FULL lock still protects the path: the SWA release frees nothing and
-    # the rebuilt values survive; a repeat release is a no-op.
+    # The FULL lock still protects the path: the SWA release frees nothing
+    # and the rebuilt values survive.
     assert device_frees == {}
     assert core.get_component_device_value(node, ComponentType.SWA) is not None
-    _accumulate_step(
-        core.dec_swa_lock_only(node, result.swa_uuid_for_lock),
-        {},
-        device_frees,
-        host_frees,
-    )
-    assert device_frees == {}
+    # A repeat release of the same window is a protocol violation and dies
+    # at the segment instead of silently walking it.
+    with pytest.raises(BaseException, match="SWA window release hit lock_ref=0"):
+        core.dec_swa_lock_only(node, result.to_dec_params())
 
 
 def test_swa_rebuild_applies_through_the_python_allocator():
@@ -1878,7 +2053,7 @@ def test_recover_with_locked_full_applies_through_the_python_allocator():
     # The decode advanced past the window: the SWA lock releases early, then
     # window eviction tombstones the SWA slot under the FULL lock (the state a
     # locked-full overlap recovers from); its frees return to the allocator.
-    cache.dec_swa_lock_only(node, lock.swa_uuid_for_lock)
+    cache.dec_swa_lock_only(node, lock.to_dec_params())
     tracker = {ComponentType.FULL: 0, ComponentType.SWA: 0}
     device_frees: dict = {}
     host_frees: dict = {}
@@ -1994,6 +2169,148 @@ def test_bigram_insert_value_shorter_than_the_bigram_count_raises():
                 value=torch.tensor([10, 11], dtype=torch.int64),
             ),
         )
+
+
+def test_stale_inspection_handles_raise_key_error_or_report_absence():
+    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+
+    from sglang.srt.mem_cache.unified_cache.components import EvictLayer
+
+    core = RustUnifiedTreeCoreInspector(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+        )
+    )
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+
+    operations = {
+        "get_parent_node_id": lambda: core.get_parent_node_id(stale_root),
+        "get_child_node_ids": lambda: core.get_child_node_ids(stale_root),
+        "get_node_key_length": lambda: core.get_node_key_length(stale_root),
+        "get_node_token_ids": lambda: core.get_node_token_ids(stale_root),
+        "is_node_key_bigram": lambda: core.is_node_key_bigram(stale_root),
+        "get_component_host_value": lambda: core.get_component_host_value(
+            stale_root, ComponentType.FULL
+        ),
+        "get_component_device_lock_ref": lambda: core.get_component_device_lock_ref(
+            stale_root, ComponentType.FULL
+        ),
+        "get_node_hit_count": lambda: core.get_node_hit_count(stale_root),
+        "get_write_through_pending_id": lambda: core.get_write_through_pending_id(
+            stale_root
+        ),
+        "is_external_cache_stored": lambda: core.is_external_cache_stored(stale_root),
+        "is_node_in_device_lru": lambda: core.is_node_in_device_lru(
+            stale_root, ComponentType.FULL
+        ),
+        "is_node_in_host_lru": lambda: core.is_node_in_host_lru(
+            stale_root, ComponentType.FULL
+        ),
+        "is_device_leaf": lambda: core.is_device_leaf(stale_root),
+        "set_node_hash_values": lambda: core.set_node_hash_values(stale_root, None),
+        "set_component_device_value_raw": lambda: core.set_component_device_value_raw(
+            stale_root, ComponentType.FULL, None
+        ),
+        "set_component_host_value_raw": lambda: core.set_component_host_value_raw(
+            stale_root, ComponentType.FULL, None
+        ),
+        "set_component_device_lock_ref": lambda: core.set_component_device_lock_ref(
+            stale_root, ComponentType.FULL, 0
+        ),
+        "remove_node_from_device_lru": lambda: core.remove_node_from_device_lru(
+            stale_root, ComponentType.FULL
+        ),
+        "insert_node_into_host_lru": lambda: core.insert_node_into_host_lru(
+            stale_root, ComponentType.FULL
+        ),
+        "update_duplicate_tracking": lambda: core.update_duplicate_tracking(stale_root),
+        "evict_component": lambda: core.evict_component(
+            stale_root, ComponentType.FULL, EvictLayer.DEVICE
+        ),
+        "validate_cascade_evict": lambda: core.validate_cascade_evict(
+            stale_root, ComponentType.FULL, EvictLayer.DEVICE
+        ),
+        "cleanup_tombstone_ancestors": lambda: core.cleanup_tombstone_ancestors(
+            stale_root
+        ),
+        "build_backup_node_ids": lambda: core.build_backup_node_ids(stale_root),
+    }
+    for name, operation in operations.items():
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,), name
+        assert core.is_root(live_root), name
+
+    disabled_component_operations = {
+        "get_component_host_value": lambda: core.get_component_host_value(
+            stale_root, ComponentType.SWA
+        ),
+        "get_component_device_lock_ref": lambda: core.get_component_device_lock_ref(
+            stale_root, ComponentType.SWA
+        ),
+        "set_component_device_value_raw": lambda: core.set_component_device_value_raw(
+            stale_root, ComponentType.SWA, None
+        ),
+        "set_component_host_value_raw": lambda: core.set_component_host_value_raw(
+            stale_root, ComponentType.SWA, None
+        ),
+        "set_component_device_lock_ref": lambda: core.set_component_device_lock_ref(
+            stale_root, ComponentType.SWA, 0
+        ),
+        "remove_node_from_device_lru": lambda: core.remove_node_from_device_lru(
+            stale_root, ComponentType.SWA
+        ),
+        "insert_node_into_host_lru": lambda: core.insert_node_into_host_lru(
+            stale_root, ComponentType.SWA
+        ),
+        "evict_component": lambda: core.evict_component(
+            stale_root, ComponentType.SWA, EvictLayer.DEVICE
+        ),
+        "validate_cascade_evict": lambda: core.validate_cascade_evict(
+            stale_root, ComponentType.SWA, EvictLayer.DEVICE
+        ),
+    }
+    for name, operation in disabled_component_operations.items():
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,), name
+        assert core.is_root(live_root), name
+
+    assert not core.contains_node(stale_root)
+    assert not core.is_device_evictable_leaf(stale_root)
+    assert not core.is_host_evictable_leaf(stale_root)
+    assert not core.is_node_in_device_lru(stale_root, ComponentType.SWA)
+    assert not core.is_node_in_host_lru(stale_root, ComponentType.SWA)
+
+
+# ---- SWA branching-point caching ----
+
+
+def _swa_hicache_core(window: int = 8) -> RustUnifiedTreeCore:
+    core = _swa_tree_core(window=window)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    return core
+
+
+def test_insert_reports_whether_it_reached_the_swa_branch_boundary():
+    for branching_seqlen, expected in [(2, True), (3, False), (None, False)]:
+        core = _swa_hicache_core()
+        result = _pump_insert(
+            core,
+            InsertParams(
+                key=_key([1, 2]),
+                value=torch.tensor([10, 11], dtype=torch.int64),
+                swa_branching_seqlen=branching_seqlen,
+            ),
+        )
+        assert result.swa_branch_inserted is expected, branching_seqlen
 
 
 if __name__ == "__main__":

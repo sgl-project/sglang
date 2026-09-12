@@ -10,6 +10,8 @@ import os
 import time
 from typing import Callable, Optional
 
+import msgspec
+import msgspec.structs
 import requests
 
 from sglang.srt.entrypoints.http_server import launch_server
@@ -21,7 +23,7 @@ DEFAULT_TIMEOUT = 600
 
 # Field defaults of ServerArgs, used to detect when --host/--port were set
 # explicitly (and would be silently ignored in connect mode).
-_SERVER_ARGS_DEFAULTS = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+_SERVER_ARGS_DEFAULTS = {f.name: f.default for f in msgspec.structs.fields(ServerArgs)}
 
 
 def server_is_up(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> bool:
