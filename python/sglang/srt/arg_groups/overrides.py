@@ -1247,11 +1247,18 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
     kv-cache dtype (declarations never reach the field, so the checks read
     the view)."""
-    if (
-        view.attention_backend == "trtllm_mla"
-        or view.decode_attention_backend == "trtllm_mla"
-    ):
-        if not get_platform().is_blackwell:
+    prefill_backend, decode_backend = attention_backends_of(view)
+    if "trtllm_mla" in (prefill_backend, decode_backend):
+        platform = get_platform()
+        if prefill_backend == "trtllm_mla" and not platform.is_sm100:
+            raise ValueError(
+                "TRTLLM MLA backend for prefill is only supported on SM100/SM103 "
+                "(datacenter Blackwell, e.g. B200/B300); its kernels are not built "
+                "for SM120/SM121 (workstation/consumer Blackwell, e.g. RTX PRO 6000 "
+                "/ RTX 5090). Please use a different prefill attention backend "
+                "(e.g. --attention-backend flashinfer) on this GPU."
+            )
+        if decode_backend == "trtllm_mla" and not platform.is_blackwell:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )

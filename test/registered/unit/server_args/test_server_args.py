@@ -3162,6 +3162,105 @@ class TestDcpKvEventContract(CustomTestCase):
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
 
 
+class TestTrtllmMlaArchGuard(CustomTestCase):
+    def _make_args(self, **overrides):
+        args = ServerArgs(model_path="dummy", device="cuda")
+        args._model_config = MagicMock()
+        args._model_config.is_encoder_decoder = False
+        args._model_config.context_len = 1
+        args._model_config.hf_config.architectures = []
+        args._model_config.hf_config.dual_chunk_attention_config = None
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @override_platform(is_sm100=False, is_sm120=True, is_blackwell=True)
+    def test_combined_trtllm_mla_prefill_rejected_on_sm120(self):
+        with self.assertRaisesRegex(ValueError, "SM100/SM103"):
+            handle_attention_backend_compatibility(
+                self._make_args(attention_backend="trtllm_mla")
+            )
+
+    @override_platform(is_sm100=False, is_sm120=True, is_blackwell=True)
+    def test_explicit_trtllm_mla_prefill_rejected_on_sm120(self):
+        with self.assertRaisesRegex(ValueError, "SM100/SM103"):
+            handle_attention_backend_compatibility(
+                self._make_args(
+                    attention_backend="triton",
+                    prefill_attention_backend="trtllm_mla",
+                )
+            )
+
+    @override_platform(is_sm100=False, is_sm120=True, is_blackwell=True)
+    def test_safe_prefill_with_trtllm_mla_decode_allowed_on_sm120(self):
+        args = self._make_args(
+            attention_backend="triton",
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="trtllm_mla",
+        )
+
+        handle_attention_backend_compatibility(args)
+
+        self.assertEqual(resolution_result(args, "attention_backend"), "triton")
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mla"
+        )
+
+    def test_trtllm_mla_prefill_allowed_on_sm100_family(self):
+        for sm in (100, 103):
+            with (
+                self.subTest(sm=sm),
+                override_platform(
+                    is_cuda=True,
+                    is_sm100=True,
+                    is_sm120=False,
+                    is_blackwell=True,
+                    device_sm=sm,
+                ),
+            ):
+                args = self._make_args(
+                    attention_backend="triton",
+                    prefill_attention_backend="trtllm_mla",
+                )
+                handle_attention_backend_compatibility(args)
+                self.assertEqual(
+                    resolution_result(args, "prefill_attention_backend"),
+                    "trtllm_mla",
+                )
+
+    @override_platform(is_sm100=False, is_sm120=False, is_blackwell=False)
+    def test_trtllm_mla_decode_rejected_off_blackwell(self):
+        with self.assertRaises(ValueError) as context:
+            handle_attention_backend_compatibility(
+                self._make_args(
+                    attention_backend="triton",
+                    decode_attention_backend="trtllm_mla",
+                )
+            )
+        self.assertEqual(
+            str(context.exception),
+            "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend.",
+        )
+
+    @override_platform(is_sm100=True, is_sm120=False, is_blackwell=True)
+    def test_trtllm_mla_invalid_kv_cache_dtype_rejected(self):
+        with self.assertRaises(ValueError) as context:
+            handle_attention_backend_compatibility(
+                self._make_args(
+                    attention_backend="triton",
+                    decode_attention_backend="trtllm_mla",
+                    kv_cache_dtype="float16",
+                )
+            )
+        self.assertEqual(
+            str(context.exception),
+            "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto.",
+        )
+
+
 class TestTheInputIsSealedDuringResolution(CustomTestCase):
     """The record holds what the operator asked for, and resolution does not
     write it -- enforced, not merely observed.
