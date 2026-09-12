@@ -106,8 +106,8 @@ PAGEABLE_H2D_COST_MULTIPLIER = 3
 AUTO_PLACEMENT_LATENCY_TOLERANCE_NS = 0
 # Allow normal measurement noise, but undo a round whose calibrated request is
 # materially slower than the original layout.
-MIN_POST_ADJUSTMENT_REGRESSION_NS = 100_000_000
-POST_ADJUSTMENT_REGRESSION_FRACTION = 0.05
+MIN_POST_ADJUSTMENT_REGRESSION_NS = 5_000_000_000
+POST_ADJUSTMENT_REGRESSION_FRACTION = 0.15
 
 # Layerwise residency is a startup-time search, not an exhaustive knapsack
 # benchmark. Large heterogeneous models can otherwise create millions of
@@ -298,6 +298,12 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     device_transition_allocated_bytes: int = 0
     estimated_request_duration_ns: int = 0
     measured_request_duration_ns: int = 0
+    # Wall time of this round's full-shape probe and of the first probe of
+    # the same shape. The regression check compares these directly: the
+    # per-step extrapolation behind estimated/measured multiplies two noisy
+    # CPU-side step timings by the target step count.
+    probe_duration_ns: int = 0
+    reference_probe_duration_ns: int = 0
     candidate_latency_savings_ns: dict[str, int] = {}
     candidates: list[ResidencyTarget] = []
     # The current placement could not execute the default workload. Its phase
@@ -499,7 +505,18 @@ def estimate_layerwise_layer_uses(
                                 target_num_inference_steps=(target_num_inference_steps),
                             )
                             stage_count = per_layer_counts[layer_index]
-                            if stage_count <= 1:
+                            # One call in a stage that itself ran once says
+                            # nothing about per-iteration use; a repeated
+                            # stage's layers are per-iteration until a probe
+                            # with more iterations shows otherwise. (A 2-step
+                            # probe of a pipeline that runs steps-1 iterations
+                            # measured a 50-layer DiT as one-shot.)
+                            per_iteration = stage_count > 1 or (
+                                stage_count == 1
+                                and measured_iterations <= 1
+                                and stage_name in repeated_stages
+                            )
+                            if not per_iteration:
                                 scaled += stage_count
                             else:
                                 scaled += (
@@ -515,14 +532,31 @@ def estimate_layerwise_layer_uses(
                             stage_name in repeated_stages
                             for stage_name in component_stages.get(component_name, ())
                         )
+                        measured_iterations, target_iterations = (
+                            source_steps,
+                            target_num_inference_steps,
+                        )
+                        for stage_name in component_stages.get(component_name, ()):
+                            if stage_name in record.stage_iterations:
+                                measured_iterations, target_iterations = (
+                                    _stage_iterations(
+                                        record,
+                                        stage_name,
+                                        repeated_stages=repeated_stages,
+                                        target_num_inference_steps=(
+                                            target_num_inference_steps
+                                        ),
+                                    )
+                                )
+                                break
                         if (
                             component_is_repeated
-                            and count > 1
-                            and target_num_inference_steps > source_steps
+                            and (count > 1 or (count == 1 and measured_iterations <= 1))
+                            and target_iterations > measured_iterations
                         ):
                             scaled = (
-                                count * target_num_inference_steps + source_steps - 1
-                            ) // source_steps
+                                count * target_iterations + measured_iterations - 1
+                            ) // measured_iterations
                     target[layer_index] = max(target[layer_index], scaled)
     return {
         component_name: {
