@@ -164,8 +164,7 @@ class TestSamplingMaskCapture(CustomTestCase):
                     custom_logit_processor={
                         0: (
                             DisallowedTokensLogitsProcessor(),
-                            [0],
-                            torch.tensor([0], device="cuda"),
+                            torch.tensor([True, False], device="cuda"),
                         )
                     },
                     return_sampling_masks=[True, True],

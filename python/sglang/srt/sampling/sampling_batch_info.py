@@ -68,7 +68,7 @@ class SamplingBatchInfo:
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
     # Custom logit processor
     custom_logit_processor: Optional[
-        Dict[int, Tuple[CustomLogitProcessor, List[int], torch.Tensor]]
+        Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
 
     # Used for deterministic sampling
@@ -88,6 +88,9 @@ class SamplingBatchInfo:
     # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
     # device avoids a scalar synchronization in the per-token sampling path.
     npu_top_k_top_p_eligible: bool = False
+    _custom_logit_processor_indices: Optional[
+        Dict[int, Tuple[List[int], torch.Tensor]]
+    ] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -155,6 +158,7 @@ class SamplingBatchInfo:
             return_sampling_masks, device
         )
 
+        processor_indices = {}
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
             processor_dict = {}
@@ -170,10 +174,19 @@ class SamplingBatchInfo:
                 hash(processor_str): (
                     # The deserialized custom logit processor object
                     CustomLogitProcessor.from_str(processor_str),
-                    true_indices,
-                    torch.tensor(true_indices, dtype=torch.long, device=device),
+                    # The mask tensor for the requests that use this custom logit processor
+                    torch.zeros(len(reqs), dtype=torch.bool)
+                    .scatter_(0, torch.tensor(true_indices), True)
+                    .to(device, non_blocking=True),
                 )
                 for processor_str, true_indices in processor_dict.items()
+            }
+            processor_indices = {
+                hash(processor_str): (
+                    rows,
+                    torch.tensor(rows, dtype=torch.long, device=device),
+                )
+                for processor_str, rows in processor_dict.items()
             }
             custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
@@ -217,6 +230,9 @@ class SamplingBatchInfo:
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
+            _custom_logit_processor_indices=(
+                processor_indices if cls is SamplingBatchInfo else None
+            ),
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
@@ -346,7 +362,7 @@ class SamplingBatchInfo:
         self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
-            self._filter_batch_custom_logit_processor(keep_indices)
+            self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
 
         for item in [
             "temperatures",
@@ -374,19 +390,28 @@ class SamplingBatchInfo:
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
-    def _filter_batch_custom_logit_processor(self, keep_indices: List[int]):
+    def _filter_batch_custom_logit_processor(
+        self, keep_indices: List[int], keep_indices_device: torch.Tensor
+    ):
         """Filter the custom logit processor and custom params"""
-        filtered = {}
-        for key, (processor, rows, _) in self.custom_logit_processor.items():
-            selected = set(rows)
-            new_rows = [i for i, old in enumerate(keep_indices) if old in selected]
-            if new_rows:
-                filtered[key] = (
-                    processor,
-                    new_rows,
-                    torch.tensor(new_rows, dtype=torch.long, device=self.device),
-                )
-        self.custom_logit_processor = filtered
+        self.custom_logit_processor = {
+            k: (p, mask[keep_indices_device])
+            for k, (p, mask) in self.custom_logit_processor.items()
+            if torch.any(
+                mask[keep_indices_device]
+            )  # ignore the custom logit processor whose mask is all False
+        }
+        if self._custom_logit_processor_indices is not None:
+            indices = {}
+            for key, (rows, _) in self._custom_logit_processor_indices.items():
+                selected = set(rows)
+                new_rows = [i for i, old in enumerate(keep_indices) if old in selected]
+                if new_rows:
+                    indices[key] = (
+                        new_rows,
+                        torch.tensor(new_rows, dtype=torch.long, device=self.device),
+                    )
+            self._custom_logit_processor_indices = indices
         self.custom_params = [self.custom_params[i] for i in keep_indices]
 
         # If the custom logit processor is an empty dict, set the flag to False,
@@ -398,9 +423,10 @@ class SamplingBatchInfo:
 
     @staticmethod
     def merge_custom_logit_processor(
-        lhs: Optional[Dict[int, Tuple[CustomLogitProcessor, List[int], torch.Tensor]]],
-        rhs: Optional[Dict[int, Tuple[CustomLogitProcessor, List[int], torch.Tensor]]],
+        lhs: Optional[Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]],
+        rhs: Optional[Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]],
         bs1: int,
+        bs2: int,
         device: str,
     ):
         if lhs is None and rhs is None:
@@ -413,13 +439,24 @@ class SamplingBatchInfo:
         for k in keys:
             # Get the logit processor object
             processor = lhs[k][0] if k in lhs else rhs[k][0]
-            rows = list(lhs[k][1]) if k in lhs else []
-            if k in rhs:
-                rows.extend(i + bs1 for i in rhs[k][1])
-            merged_dict[k] = (
-                processor,
-                rows,
-                torch.tensor(rows, dtype=torch.long, device=device),
+            # Get and merge the mask tensors from the two dicts
+            left_mask = (
+                lhs[k][1]
+                if k in lhs
+                else torch.zeros(bs1, dtype=torch.bool, device=device)
+            )
+            right_mask = (
+                rhs[k][1]
+                if k in rhs
+                else torch.zeros(bs2, dtype=torch.bool, device=device)
+            )
+            merged_dict[k] = (processor, torch.cat([left_mask, right_mask]))
+
+            assert merged_dict[k][1].shape[0] == bs1 + bs2, (
+                f"The batch size of merged mask ({merged_dict[k][1].shape[0]}) does not match "
+                f"the sum of the batch sizes of the two masks ({bs1 + bs2})"
+                f"\n{left_mask=}\n{right_mask=}\n{bs1=}\n{bs2=}"
+                f"\n{lhs=}\n{rhs=}"
             )
 
         return merged_dict
@@ -429,12 +466,28 @@ class SamplingBatchInfo:
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
+            left_indices = self._custom_logit_processor_indices
+            right_indices = other._custom_logit_processor_indices
+            if left_indices is not None and right_indices is not None:
+                indices = {}
+                for key in left_indices.keys() | right_indices.keys():
+                    rows = list(left_indices[key][0]) if key in left_indices else []
+                    if key in right_indices:
+                        rows.extend(i + len(self) for i in right_indices[key][0])
+                    indices[key] = (
+                        rows,
+                        torch.tensor(rows, dtype=torch.long, device=self.device),
+                    )
+                self._custom_logit_processor_indices = indices
+            else:
+                self._custom_logit_processor_indices = None
             # Merge the custom logit processors
             self.custom_logit_processor = (
                 SamplingBatchInfo.merge_custom_logit_processor(
                     self.custom_logit_processor,
                     other.custom_logit_processor,
                     len(self),
+                    len(other),
                     self.device,
                 )
             )
