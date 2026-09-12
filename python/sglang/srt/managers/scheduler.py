@@ -83,6 +83,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
+from sglang.srt.disaggregation.kv_checksum import KVChecksummer
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -1493,6 +1494,13 @@ class Scheduler(
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
             self.model_config.hf_config
+        )
+
+        # Shared by both sides: each digests its own KV, the decode compares.
+        # HiSparse lands the transfer in a host pool instead of this one.
+        self.disagg_kv_checksummer = KVChecksummer.maybe_create(
+            self.token_to_kv_pool_allocator.get_kvcache(),
+            enabled=not self.enable_hisparse,
         )
 
         if (

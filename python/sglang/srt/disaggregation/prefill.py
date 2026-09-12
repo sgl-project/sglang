@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.kv_checksum import digest_to_u64
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -43,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -1258,6 +1260,30 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
+    def _write_disagg_kv_checksum(self: Scheduler, req: Req, end_idx: int) -> None:
+        """Digest the KV this handoff transfers, for the decode side to re-check.
+
+        Covers the whole transferred range in one launch rather than one per
+        chunk: every chunk's KV is still resident when the last chunk is sent,
+        and a per-chunk digest would double-count any page two sends both
+        touched (an early cached-prefix send, a re-send after a retract).
+        """
+        checksummer = self.disagg_kv_checksummer
+        if checksummer is None or _is_fake_transfer(req):
+            return
+        start_idx = req.disagg_decode_prefix_len
+        slots = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, start_idx:end_idx
+        ]
+        slots = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(slots)
+        digest = checksummer.compute_one(req.bootstrap_room or 0, slots)
+        self.disagg_metadata_buffers.set_kv_checksum(
+            req,
+            signature=checksummer.signature,
+            digest=digest_to_u64(int(digest[0].item())),
+            num_tokens=max(end_idx - start_idx, 0),
+        )
+
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -1300,6 +1326,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
+            # Before set_buf: set_buf writes the readiness flag the decode side
+            # gates on, so everything it will read must already be in place.
+            self._write_disagg_kv_checksum(req, end_idx)
             self.disagg_metadata_buffers.set_buf(req)
 
             # Most state payloads read token-pool rows and should match the KV

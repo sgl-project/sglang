@@ -21,6 +21,12 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.kv_checksum import (
+    ROOM_SLOT_CHECKSUM_DIGEST,
+    ROOM_SLOT_CHECKSUM_SIG,
+    ROOM_SLOT_CHECKSUM_TOKENS,
+    u64_to_i64,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -409,10 +415,16 @@ class MetadataBuffers:
                 )
             else:
                 self.output_dsa_topk_indices = None
-            # Request validation: store bootstrap_room to detect metadata corruption
+            # Request validation. The (size, 8) row is the handoff's integrity
+            # record; slots 4-7 remain spare. This avoids adding new RDMA buffers.
+            # Slot map: 0=bootstrap_room (proves the metadata came from the
+            # prefill that owned this request), 1=KV checksum layout signature,
+            # 2=KV digest, 3=tokens the digest covers (see kv_checksum.py).
+            # Slot 0 also gates readiness, so it must be written last.
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
+            self._bootstrap_room_signed = self.bootstrap_room.view(torch.int64)
 
     def get_buf_infos(self):
         bufs = [
@@ -582,10 +594,23 @@ class MetadataBuffers:
                     )
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
-        # Store bootstrap_room for validation on decode side
+        # Store bootstrap_room for validation on decode side. Written last:
+        # a nonzero room is what tells the decode side the whole row landed.
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
+
+    def set_kv_checksum(
+        self, req: Req, *, signature: int, digest: int, num_tokens: int
+    ) -> None:
+        """Record the KV digest of this handoff. Must precede ``set_buf``."""
+        idx = req.metadata_buffer_index
+        # Through the signed view: torch refuses a Python int >= 2**63 even for
+        # a uint64 tensor, and both fields use the full 64-bit range.
+        signed_room = self._bootstrap_room_signed
+        signed_room[idx, ROOM_SLOT_CHECKSUM_SIG] = u64_to_i64(signature)
+        signed_room[idx, ROOM_SLOT_CHECKSUM_DIGEST] = u64_to_i64(digest)
+        signed_room[idx, ROOM_SLOT_CHECKSUM_TOKENS] = num_tokens
 
 
 #########################
