@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -728,9 +729,9 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    def _scheduler(self, worker, trace, *, mode, draft_worker=None):
-        from sglang.srt.managers.scheduler import Scheduler
-
+    def _scheduler(
+        self, worker, trace, *, mode, draft_worker=None, enable_overlap=True, pp_size=1
+    ):
         # The schedule reads the mode from the bags, so the test states it by
         # publishing a record rather than by standing one in.
         reset_context()
@@ -739,6 +740,8 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             role="scheduler",
         )
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_overlap = enable_overlap
+        scheduler.ps = SimpleNamespace(pp_size=pp_size)
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker
@@ -748,7 +751,9 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         scheduler.init_all_cuda_graphs = lambda: trace.append("capture")
         return scheduler
 
-    def _run_startup(self, mode, *, use_draft_worker=False):
+    def _run_startup(
+        self, mode, *, use_draft_worker=False, enable_overlap=True, pp_size=1
+    ):
         trace = []
         worker = _SchedulerWorker(trace, post_capture_active=True)
         draft_worker = (
@@ -764,6 +769,8 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             trace,
             mode=mode,
             draft_worker=draft_worker,
+            enable_overlap=enable_overlap,
+            pp_size=pp_size,
         )
 
         class StreamContext:
@@ -773,8 +780,15 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             def __exit__(self, *_args):
                 trace.append("stream_exit")
 
+        schedule_stream = object()
+
         def stream_context(stream):
-            self.assertIs(stream, worker.model_runner.forward_stream)
+            expected_stream = (
+                worker.model_runner.forward_stream
+                if enable_overlap or pp_size > 1
+                else schedule_stream
+            )
+            self.assertIs(stream, expected_stream)
             return StreamContext()
 
         def stop_after_startup():
@@ -794,7 +808,9 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             ),
             patch(
                 "sglang.srt.managers.scheduler.torch.get_device_module",
-                return_value=SimpleNamespace(stream=stream_context),
+                return_value=SimpleNamespace(
+                    stream=stream_context, Stream=lambda priority: schedule_stream
+                ),
             ),
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
@@ -804,6 +820,13 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             draft_runners=(worker.model_runner,) if use_draft_worker else ()
         )
         return trace
+
+    def test_warmup_stream_matches_batch_execution(self):
+        for enable_overlap, pp_size in ((False, 1), (True, 1), (False, 2)):
+            with self.subTest(enable_overlap=enable_overlap, pp_size=pp_size):
+                self._run_startup(
+                    "serial", enable_overlap=enable_overlap, pp_size=pp_size
+                )
 
     def test_serial_path_skips_overlap_hooks(self):
         self.assertEqual(

@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import msgspec
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.runner_utils.pool import GraphPoolBorrowState
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -607,6 +608,7 @@ class Resources(_FlagGroupBase):
     # CUDA graph memory pool shared across the prefill and decode graph
     # backends (created lazily by model_executor.runner_utils.pool).
     graph_memory_pool: Any = None
+    graph_pool_borrow: GraphPoolBorrowState | None = None
     # EPLB: per-process recorder and the publish-once location metadata
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
