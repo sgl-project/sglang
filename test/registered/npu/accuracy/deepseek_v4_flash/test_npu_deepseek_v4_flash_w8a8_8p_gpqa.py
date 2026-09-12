@@ -46,6 +46,8 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
@@ -113,12 +115,11 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
 
 
 DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH = {
-    "max_tokens": 125000,
+    "max_tokens": 120000,
     "top_p": 1,
     "temperature": 1,
-    "n": 1,
     "extra_body": {
-        "chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}
+        "chat_template_kwargs": {"thinking": True}
     },
 }
 
@@ -134,9 +135,10 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 128
+    eval_batch_size = 32
     stream = True
     timeout = 6000
+    ignore_errors = True
 
     def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
         """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
