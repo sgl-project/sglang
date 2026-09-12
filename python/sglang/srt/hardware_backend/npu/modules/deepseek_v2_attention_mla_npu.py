@@ -1,4 +1,3 @@
-import re
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -18,6 +17,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_disagg
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -598,14 +598,14 @@ def npu_mla_preprocess(
             m.v_head_dim,
             m.quant_config,
         )
+        if (
+            get_disagg().disaggregation_mode == "decode"
+            and m.mla_preprocess.uses_mlaprolog()
+            and m.w_kc is not None
+        ):
+            m.w_kc.untyped_storage().resize_(0)
     # mlaprolog does not require additional calculation of q_lora
-    _is_mlaprolog = (
-        _is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
-    ) or (
-        hasattr(m.quant_config, "ignore")
-        and any(re.fullmatch(r".*kv_b_proj", l) for l in m.quant_config.ignore)
-    )
-    if _is_mlaprolog:
+    if m.mla_preprocess.uses_mlaprolog():
         (
             q_pe,
             k_pe,
