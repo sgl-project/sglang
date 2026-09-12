@@ -84,8 +84,8 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
         let mb = router_b.tree().match_prefix(None, &hashes);
         let converged = ma.matched_blocks == target
             && mb.matched_blocks == target
-            && ma.workers().contains(&key)
-            && mb.workers().contains(&key);
+            && ma.holds(&key)
+            && mb.holds(&key);
         if converged {
             // Both trees agree on count AND on the worker that holds the
             // prefix. This is what the Radix Tree provider reads to
@@ -253,32 +253,32 @@ async fn two_subscribers_merge_events_from_two_publishers() {
             && ay.matched_blocks == target_y
             && bx.matched_blocks == target_x
             && by.matched_blocks == target_y
-            && ax.workers().contains(&key_x)
-            && ay.workers().contains(&key_y)
-            && bx.workers().contains(&key_x)
-            && by.workers().contains(&key_y);
+            && ax.holds(&key_x)
+            && ay.holds(&key_y)
+            && bx.holds(&key_x)
+            && by.holds(&key_y);
         if converged {
             // Negative attribution: prefix X must not be attributed to
             // worker_y in either tree, and vice versa. A regression that
             // keyed events by arriving socket rather than announced
             // worker URL would set BOTH worker keys on each prefix.
             assert!(
-                !ax.workers().contains(&key_y),
+                !ax.holds(&key_y),
                 "router_a cross-attributed worker_y to prefix X: {:?}",
                 ax.workers(),
             );
             assert!(
-                !ay.workers().contains(&key_x),
+                !ay.holds(&key_x),
                 "router_a cross-attributed worker_x to prefix Y: {:?}",
                 ay.workers(),
             );
             assert!(
-                !bx.workers().contains(&key_y),
+                !bx.holds(&key_y),
                 "router_b cross-attributed worker_y to prefix X: {:?}",
                 bx.workers(),
             );
             assert!(
-                !by.workers().contains(&key_x),
+                !by.holds(&key_x),
                 "router_b cross-attributed worker_x to prefix Y: {:?}",
                 by.workers(),
             );
