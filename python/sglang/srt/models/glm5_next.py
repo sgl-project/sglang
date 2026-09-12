@@ -125,8 +125,9 @@ logger = logging.getLogger(__name__)
 # must agree on it.
 _MHC_POST_MULT_VALUE = 2.0
 
-# Above this the fused boundary loses to the unfused chain: its pre-norm GEMM
-# skips the split-K kernel mhc_pre uses to 2048 tokens. Measured on GLM-5.3-Flash.
+# Conservative cap, not the crossover: at GLM-5.3-Flash's hc_mult=4 and
+# hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
+# 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
@@ -766,7 +767,8 @@ class Glm5NextDecoderLayer(nn.Module):
     def hc_ffn_post_pre(
         self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
     ):
-        # hc_post then the FFN hc_pre in one launch instead of three.
+        # Fuses hc_post into the pre-norm GEMM; the mhc_pre big-fuse stage
+        # still launches separately, so this is two launches instead of three.
         assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
