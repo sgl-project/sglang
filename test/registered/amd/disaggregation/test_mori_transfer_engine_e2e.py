@@ -11,11 +11,16 @@ import requests
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
 from sglang.srt.disaggregation.mori.conn import (
-    MORI_DCP_GUARD,
     KVArgsRegisterInfo,
     MoriKVManager,
+    MoriKVReceiver,
+    MoriKVSubmissionError,
+    MoriPackedDCPSource,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -31,6 +36,199 @@ register_amd_ci(est_time=900, suite="stage-b-test-large-8-gpu-mi35x-disaggregati
 
 
 class TestMoriDCPTransfer(unittest.TestCase):
+    @staticmethod
+    def _make_generation_manager():
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager._deferred_ack_lock = threading.Lock()
+        manager._deferred_ack_retry_rooms = set()
+        manager._staging_outstanding = {}
+        manager._room_lifecycle_lock = threading.Lock()
+        manager.transfer_lock = threading.Lock()
+        manager._room_generations = {}
+        manager._room_owners = {}
+        manager._retired_room_status = {}
+        manager._retired_room_failures = {}
+        manager._aborted_generations = {}
+        manager._rooms_pending_clear = {}
+        manager._deferred_ack_targets = {}
+        manager.transfer_infos = {}
+        manager.decode_kv_args_table = {}
+        manager.request_status = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.failure_lock = threading.Lock()
+        manager.failure_records = {}
+        manager.requires_strict_deferred_release = True
+        manager.enable_deferred_decode_kv_release = True
+        return manager
+
+    def test_shared_status_notification_keeps_request_epoch(self):
+        manager = self._make_generation_manager()
+        manager.attn_tp_rank = 0
+        manager.pp_size = 1
+        manager.attn_cp_size = 1
+        manager.pp_rank = 0
+        manager.attn_cp_rank = 0
+        manager._send_multipart_locked = MagicMock()
+        manager._room_owners[23] = "owner-a"
+        manager._room_generations[23] = "request-a"
+        manager.request_status[23] = KVPoll.Transferring
+        manager.transfer_infos[23] = {
+            "decode": SimpleNamespace(
+                endpoint="10.0.0.2",
+                dst_port=9000,
+                is_dummy=False,
+            )
+        }
+
+        status = manager._conclude_owned_transfer(
+            23,
+            KVPoll.Success,
+            "owner-a",
+        )
+
+        self.assertEqual(status, KVPoll.Success)
+        sent_frames = manager._send_multipart_locked.call_args.args[1]
+        self.assertEqual(sent_frames[-1], b"request-a")
+
+    def test_decode_tokenizer_epochs_are_unique_for_reused_request_id(self):
+        class FakeSamplingParams:
+            def __init__(self, **_kwargs):
+                pass
+
+            def normalize(self, _tokenizer):
+                pass
+
+            def verify(self, _vocab_size):
+                pass
+
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.preferred_sampling_params = {}
+        manager.sampling_params_class = FakeSamplingParams
+        manager.tokenizer = None
+        manager.model_config = SimpleNamespace(vocab_size=32)
+        manager.disaggregation_mode = DisaggregationMode.DECODE
+        manager.rid_to_state = {
+            "reused-request-id": SimpleNamespace(
+                time_stats=SimpleNamespace(set_tokenize_finish_time=lambda: None)
+            )
+        }
+        request = GenerateReqInput(
+            rid="reused-request-id",
+            text="hello",
+            sampling_params={},
+            bootstrap_room=23,
+        )
+
+        first = manager._create_tokenized_object(request, "hello", [1])
+        second = manager._create_tokenized_object(request, "hello", [1])
+
+        self.assertIsNotNone(first.disagg_request_epoch)
+        self.assertNotEqual(first.disagg_request_epoch, second.disagg_request_epoch)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        prefill = manager._create_tokenized_object(request, "hello", [1])
+        self.assertIsNone(prefill.disagg_request_epoch)
+
+    def test_aborted_generation_does_not_poison_reused_room(self):
+        manager = self._make_generation_manager()
+        manager.decode_kv_args_table = {"decode": SimpleNamespace(dst_dcp_size=4)}
+        manager.resolve_kv_replica_factor = MagicMock()
+        manager._send_abort_ack = MagicMock(return_value=True)
+        payload = lambda generation: [
+            b"23",
+            b"10.0.0.2",
+            b"9000",
+            b"decode",
+            np.array([7], dtype=np.int32).tobytes(),
+            b"1",
+            b"",
+            b"1",
+            b"",
+            generation.encode("ascii"),
+        ]
+
+        manager.activate_room_owner(23, "owner-a")
+        manager._handle_transfer_message(payload("request-a"))
+        manager._handle_abort_message(
+            [b"ABORT", b"23", b"10.0.0.2", b"9000", b"request-a"]
+        )
+        self.assertNotIn(23, manager._room_owners)
+
+        manager._handle_transfer_message(payload("request-a"))
+        manager._handle_transfer_message(payload("request-b"))
+        manager.activate_room_owner(23, "owner-b")
+
+        self.assertEqual(manager.request_status[23], KVPoll.WaitingForInput)
+        self.assertEqual(manager._room_generations[23], "request-b")
+        manager._handle_abort_message(
+            [b"ABORT", b"23", b"10.0.0.2", b"9000", b"request-a"]
+        )
+        manager._handle_abort_message([b"ABORT", b"23", b"10.0.0.2", b"9000"])
+        self.assertEqual(manager.request_status[23], KVPoll.WaitingForInput)
+        self.assertEqual(manager._room_owners[23], "owner-b")
+
+        with patch("sglang.srt.disaggregation.mori.conn.MORI_ABORT_TOMBSTONE_LIMIT", 2):
+            for room in (30, 31, 32):
+                manager._handle_abort_message(
+                    [
+                        b"ABORT",
+                        str(room).encode("ascii"),
+                        b"10.0.0.2",
+                        b"9000",
+                        f"request-{room}".encode("ascii"),
+                    ]
+                )
+        self.assertEqual(len(manager._aborted_generations), 2)
+
+    def test_dcp1_abort_waits_for_counted_chunk_and_cleans_owner(self):
+        manager = self._make_generation_manager()
+        manager.decode_kv_args_table = {"decode": SimpleNamespace(dst_dcp_size=1)}
+        manager.resolve_kv_replica_factor = MagicMock()
+        manager.activate_room_owner(23, "owner-a")
+        manager._handle_transfer_message(
+            [
+                b"23",
+                b"10.0.0.2",
+                b"9000",
+                b"decode",
+                np.array([7], dtype=np.int32).tobytes(),
+                b"1",
+                b"",
+                b"1",
+                b"",
+            ]
+        )
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager._num_shards = 1
+        manager._dcp_pack_worker_count = 0
+        manager._staging_outstanding[23] = 0
+        manager._transfer_queues = [MagicMock()]
+        manager._send_abort_ack = MagicMock(return_value=True)
+
+        def abort_during_admission(_chunk):
+            self.assertEqual(manager._staging_outstanding[23], 1)
+            manager._handle_abort_message([b"ABORT", b"23", b"10.0.0.2", b"9000"])
+            manager._send_abort_ack.assert_not_called()
+
+        manager._transfer_queues[0].put.side_effect = abort_during_admission
+        manager.add_transfer_request(
+            23,
+            np.array([2], dtype=np.int32),
+            slice(0, 1),
+            False,
+            num_kv_tokens=4,
+            room_owner="owner-a",
+        )
+        self.assertTrue(manager._defer_room_clear_if_outstanding(23, "owner-a"))
+        manager._staging_outstanding[23] = 0
+        manager._maybe_ack_drained_abort(23)
+        manager._clear_room_after_drain(23)
+
+        manager._send_abort_ack.assert_called_once_with("10.0.0.2", 9000, 23, None)
+        self.assertNotIn(23, manager._room_owners)
+        self.assertNotIn(23, manager.request_status)
+        self.assertNotIn((23, "owner-a"), manager._retired_room_status)
+        self.assertNotIn((23, "owner-a"), manager._retired_room_failures)
+
     def test_register_info_parses_dcp_geometry(self):
         kv_descs = [object(), object()]
         payload = [
@@ -51,6 +249,7 @@ class TestMoriDCPTransfer(unittest.TestCase):
             struct.pack("2I", 2, 7),
             b"4",
             b"3",
+            b"registration-a",
         ]
         fake_engine_desc = SimpleNamespace(key="engine")
 
@@ -74,6 +273,7 @@ class TestMoriDCPTransfer(unittest.TestCase):
         self.assertEqual(info.dst_kv_layer_ids, [2, 7])
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 3)
+        self.assertEqual(info.dcp_registration_id, "registration-a")
 
     def test_register_info_defaults_for_legacy_peer(self):
         kv_descs = [object(), object()]
@@ -115,9 +315,16 @@ class TestMoriDCPTransfer(unittest.TestCase):
     def test_send_kvcache_dcp_uses_token_byte_offsets(self):
         manager = MoriKVManager.__new__(MoriKVManager)
         manager.kv_mem_descs = ["src0", "src1"]
-        manager._submit_batch_transfer_plan = MagicMock(
-            side_effect=[["status0"], ["status1"]]
-        )
+        manager.kv_args = SimpleNamespace(num_draft_entries=0)
+        submitted_statuses = iter(("status0", "status1"))
+
+        def submit_plan(*args, status_sink=None):
+            result = [next(submitted_statuses)]
+            if status_sink is not None:
+                status_sink.extend(result)
+            return result
+
+        manager._submit_batch_transfer_plan = MagicMock(side_effect=submit_plan)
         peer_info = SimpleNamespace(
             dst_kv_mem_descs=["dst0", "dst1"],
             dcp_dst_region_indices=[1, 0],
@@ -144,6 +351,29 @@ class TestMoriDCPTransfer(unittest.TestCase):
         self.assertEqual(second_plan.remote_offsets, [448, 464])
         self.assertEqual(second_plan.sizes, [16, 16])
 
+    def test_send_kvcache_dcp_rejects_draft_rows(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.kv_mem_descs = ["target-src", "draft-src"]
+        manager.kv_args = SimpleNamespace(num_draft_entries=1)
+        manager._submit_batch_transfer_plan = MagicMock()
+        peer_info = SimpleNamespace(
+            dst_kv_mem_descs=["target-dst", "draft-dst"],
+            dcp_dst_region_indices=[0, 1],
+            dcp_token_item_lens=[8, 16],
+        )
+        plan = build_dcp_token_transfer_plan(
+            np.array([3, 4], dtype=np.int32),
+            np.array([7], dtype=np.int32),
+            physical_page_size=2,
+            dcp_size=2,
+            dcp_rank=0,
+            num_kv_tokens=4,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "draft KV transfer is not supported"):
+            manager.send_kvcache_dcp(peer_info, plan)
+        manager._submit_batch_transfer_plan.assert_not_called()
+
     def test_add_remote_peer_resolves_dcp_destination_layers(self):
         manager = MoriKVManager.__new__(MoriKVManager)
         manager.decode_kv_args_table = {}
@@ -153,6 +383,7 @@ class TestMoriDCPTransfer(unittest.TestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.kv_mem_descs = ["src2", "src7"]
+        manager._init_dcp_pack_buffers_once = MagicMock()
         manager.kv_args = SimpleNamespace(
             kv_layer_ids=[2, 7],
             kv_item_lens=[512, 1024],
@@ -176,6 +407,7 @@ class TestMoriDCPTransfer(unittest.TestCase):
             dst_kv_layer_ids=[7, 2],
             dst_dcp_size=4,
             dst_dcp_rank=3,
+            supports_dcp_drain=True,
         )
 
         manager._add_remote_peer(peer_info)
@@ -183,6 +415,7 @@ class TestMoriDCPTransfer(unittest.TestCase):
         self.assertTrue(peer_info.requires_dcp_relayout)
         self.assertEqual(peer_info.dcp_dst_region_indices, [1, 0])
         self.assertEqual(peer_info.dcp_token_item_lens, [8, 16])
+        manager._init_dcp_pack_buffers_once.assert_called_once_with(4)
         self.assertIs(manager.decode_kv_args_table["peer"], peer_info)
         manager.engine.register_remote_engine.assert_called_once_with(
             peer_info.engine_desc
@@ -197,6 +430,7 @@ class TestMoriDCPTransfer(unittest.TestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.kv_mem_descs = ["src2", "src3"]
+        manager._init_dcp_pack_buffers_once = MagicMock()
         manager.kv_args = SimpleNamespace(
             kv_layer_ids=[],
             kv_item_lens=[512, 512],
@@ -221,20 +455,26 @@ class TestMoriDCPTransfer(unittest.TestCase):
             dst_kv_item_lens=[512, 512, 512, 512],
             dst_dcp_size=4,
             dst_dcp_rank=3,
+            supports_dcp_drain=True,
         )
 
         manager._add_remote_peer(peer_info)
 
         self.assertEqual(peer_info.dcp_dst_region_indices, [2, 3])
         self.assertEqual(peer_info.dcp_token_item_lens, [8, 8])
+        manager._init_dcp_pack_buffers_once.assert_called_once_with(4)
 
-    def test_dcp_registration_guard_is_accepted(self):
+    def test_dcp_peer_without_drain_capability_is_rejected(self):
         manager = MoriKVManager.__new__(MoriKVManager)
-
-        self.assertEqual(
-            manager._validate_message([MORI_DCP_GUARD, b"None"]),
-            [b"None"],
+        manager.decode_kv_args_table = {}
+        peer_info = SimpleNamespace(
+            engine_key="legacy-peer",
+            dst_dcp_size=2,
+            supports_dcp_drain=False,
         )
+
+        with self.assertRaisesRegex(RuntimeError, "drain-ACK support"):
+            manager._add_remote_peer(peer_info)
 
     def test_submit_routes_nonzero_dcp_chunk_with_full_destination_pages(self):
         manager = MoriKVManager.__new__(MoriKVManager)
@@ -259,9 +499,14 @@ class TestMoriDCPTransfer(unittest.TestCase):
         manager.kv_args = SimpleNamespace(page_size=4)
         manager.state_mem_descs = []
         manager.update_status = MagicMock()
-        manager.send_kvcache_dcp = MagicMock(return_value=["status"])
 
-        statuses = manager._submit_kv_transfer(
+        def send_kvcache_dcp(*args, status_sink=None):
+            status_sink.append("status")
+            return status_sink
+
+        manager.send_kvcache_dcp = MagicMock(side_effect=send_kvcache_dcp)
+
+        statuses, _ = manager._submit_kv_transfer(
             23,
             np.array([3], dtype=np.int32),
             slice(1, 2),
@@ -273,6 +518,223 @@ class TestMoriDCPTransfer(unittest.TestCase):
         plan = manager.send_kvcache_dcp.call_args.args[1]
         np.testing.assert_array_equal(plan.target_src_token_indices, [12, 14])
         np.testing.assert_array_equal(plan.target_dst_token_indices, [30, 31])
+
+
+class TestMoriDCPPackedTransfer(unittest.TestCase):
+    def test_pack_workers_are_budgeted_and_fall_back_to_raw(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager._dcp_pack_init_lock = threading.Lock()
+        manager._dcp_pack_dcp_size = None
+        manager._dcp_pack_worker_count = 0
+        manager._dcp_pack_disabled_workers = set()
+        manager._dcp_pack_buffers = None
+        manager._num_shards = 8
+        manager.kv_args = SimpleNamespace(kv_item_lens=[1024])
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack."
+                "dcp_pack_buffer_bytes_for_args",
+                return_value=3 * 1024**3,
+            ),
+            patch.object(
+                type(envs.SGLANG_MORI_DCP_PACK_BUFFER_BUDGET_GB),
+                "get",
+                return_value=8.0,
+            ),
+        ):
+            manager._init_dcp_pack_buffers_once(4)
+
+        self.assertEqual(manager._dcp_pack_worker_count, 2)
+        self.assertEqual(manager._dcp_pack_dcp_size, 4)
+        self.assertEqual(manager._dcp_pack_buffers, [None] * 8)
+
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.request_status = {23: KVPoll.WaitingForInput}
+        manager.transfer_infos = {23: {"decode": SimpleNamespace(engine_key="peer")}}
+        manager.decode_kv_args_table = {
+            "peer": SimpleNamespace(requires_dcp_relayout=True)
+        }
+        manager.transfer_lock = threading.Lock()
+        manager._num_shards = 8
+        manager._dcp_pack_worker_count = 2
+        manager._staging_outstanding = {23: 0}
+        manager._deferred_ack_lock = threading.Lock()
+        manager._transfer_queues = [MagicMock() for _ in range(8)]
+
+        manager.add_transfer_request(
+            23, np.array([2], dtype=np.int32), slice(0, 1), False, num_kv_tokens=4
+        )
+
+        manager._transfer_queues[1].put.assert_called_once()
+
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.init_dcp_pack_buffers",
+            side_effect=RuntimeError("out of memory"),
+        ):
+            pack_buffer = manager._get_or_init_dcp_pack_buffer(1)
+
+        self.assertIsNone(pack_buffer)
+        self.assertEqual(manager._dcp_pack_disabled_workers, {1})
+        self.assertIsNone(manager._get_or_init_dcp_pack_buffer(1))
+
+    def test_packed_source_collapses_to_one_block_per_layer(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.kv_mem_descs = ["raw0", "raw1"]
+        manager.kv_args = SimpleNamespace(num_draft_entries=0)
+        submitted_statuses = iter(("status0", "status1"))
+
+        def submit_plan(*args, status_sink=None):
+            result = [next(submitted_statuses)]
+            if status_sink is not None:
+                status_sink.extend(result)
+            return result
+
+        manager._submit_batch_transfer_plan = MagicMock(side_effect=submit_plan)
+        peer_info = SimpleNamespace(
+            dst_kv_mem_descs=["dst0", "dst1"],
+            dcp_dst_region_indices=[1, 0],
+            dcp_token_item_lens=[8, 16],
+        )
+        plan = build_dcp_token_transfer_plan(
+            np.array([2], dtype=np.int32),
+            np.array([7], dtype=np.int32),
+            physical_page_size=4,
+            dcp_size=2,
+            dcp_rank=0,
+            num_kv_tokens=4,
+        )
+        packed_src = MoriPackedDCPSource(
+            mem_desc="pack",
+            layer_offsets=[100, 200],
+            token_indices=np.arange(2, dtype=np.int64),
+        )
+
+        statuses = manager.send_kvcache_dcp(peer_info, plan, packed_src)
+
+        self.assertEqual(statuses, ["status0", "status1"])
+        first_call, second_call = manager._submit_batch_transfer_plan.call_args_list
+        self.assertEqual(first_call.args[:2], ("pack", "dst1"))
+        self.assertEqual(first_call.args[2].local_offsets, [100])
+        self.assertEqual(first_call.args[2].remote_offsets, [224])
+        self.assertEqual(first_call.args[2].sizes, [16])
+        self.assertEqual(second_call.args[:2], ("pack", "dst0"))
+        self.assertEqual(second_call.args[2].local_offsets, [200])
+        self.assertEqual(second_call.args[2].remote_offsets, [448])
+        self.assertEqual(second_call.args[2].sizes, [32])
+
+    def test_partial_submission_drains_before_error_propagates(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.request_status = {23: KVPoll.WaitingForInput}
+        manager.transfer_lock = threading.Lock()
+        manager.kv_mem_descs = ["raw0", "raw1"]
+        manager.kv_args = SimpleNamespace(page_size=4)
+        manager.state_mem_descs = []
+        manager._dcp_pack_buffers = None
+        inflight_status = object()
+        manager.engine = SimpleNamespace(
+            allocate_transfer_uid=MagicMock(side_effect=[1, 2]),
+            batch_write=MagicMock(
+                side_effect=[[inflight_status], RuntimeError("submit failed")]
+            ),
+        )
+        manager.transfer_infos = {
+            23: {
+                "peer": SimpleNamespace(
+                    engine_key="peer",
+                    is_dummy=False,
+                    dst_kv_indices=np.array([7], dtype=np.int32),
+                    decode_prefix_len=0,
+                    dst_state_indices=[],
+                    dst_aux_index=-1,
+                )
+            }
+        }
+        manager.decode_kv_args_table = {
+            "peer": SimpleNamespace(
+                requires_dcp_relayout=True,
+                dst_dcp_size=2,
+                dst_dcp_rank=0,
+                dst_kv_mem_descs=["dst0", "dst1"],
+                dcp_dst_region_indices=[0, 1],
+                dcp_token_item_lens=[8, 16],
+            )
+        }
+        manager._wait_transfer_completion = MagicMock(return_value=None)
+        chunk = SimpleNamespace(
+            room=23,
+            room_owner=None,
+            wait_event=None,
+            prefill_kv_indices=np.array([2], dtype=np.int32),
+            index_slice=slice(0, 1),
+            is_last_chunk=False,
+            prefill_aux_index=None,
+            state_indices=None,
+            num_kv_tokens=4,
+        )
+
+        with self.assertRaises(MoriKVSubmissionError):
+            manager._process_transfer_chunk(chunk, worker_index=0)
+
+        manager._wait_transfer_completion.assert_called_once_with([inflight_status])
+
+    def test_failed_strict_abort_delivery_is_retried(self):
+        receiver = object.__new__(MoriKVReceiver)
+        receiver.bootstrap_room = 23
+        receiver.bootstrap_infos = [{"rank_ip": "10.0.0.1", "rank_port": 8000}]
+        receiver.abort_notified = False
+        receiver.abort_generation = "request-a"
+        receiver.metadata_published = True
+        receiver._abort_pending_infos = None
+        receiver._abort_retry_lock = threading.Lock()
+        receiver._abort_retry_stopped = False
+        receiver._abort_retry_scheduled = False
+        receiver._connection_pool_entries = {}
+        receiver.kv_mgr = SimpleNamespace(
+            enable_deferred_decode_kv_release=True,
+            requires_strict_deferred_release=True,
+            local_ip="10.0.0.2",
+            rank_port=9000,
+            failure_lock=threading.Lock(),
+            failure_records={},
+            request_status={23: KVPoll.WaitingForInput},
+            required_prefill_response_num_table={},
+            prefill_response_tracker={},
+            record_failure=MagicMock(),
+            update_status=MagicMock(),
+            register_deferred_abort_room=MagicMock(),
+            is_abort_release_safe=MagicMock(return_value=False),
+            clear_decode_room_generation=MagicMock(),
+        )
+        receiver._connect_to_bootstrap_server = MagicMock(
+            side_effect=RuntimeError("connection refused")
+        )
+        receiver._schedule_abort_notification_retry = MagicMock()
+
+        receiver.abort()
+
+        self.assertTrue(receiver.abort_notified)
+        self.assertFalse(receiver._abort_retry_stopped)
+        receiver.kv_mgr.register_deferred_abort_room.assert_called_once_with(
+            23, "request-a"
+        )
+        self.assertEqual(len(receiver._abort_pending_infos), 1)
+        receiver._schedule_abort_notification_retry.assert_called_once_with()
+
+        socket = MagicMock()
+        receiver._connect_to_bootstrap_server = MagicMock(
+            return_value=(socket, threading.Lock())
+        )
+        receiver._send_abort_notification()
+        self.assertEqual(len(receiver._abort_pending_infos), 1)
+        self.assertEqual(receiver._schedule_abort_notification_retry.call_count, 2)
+
+        receiver.kv_mgr.is_abort_release_safe.return_value = True
+        receiver._send_abort_notification()
+        self.assertEqual(receiver._abort_pending_infos, {})
+        sent_frames = socket.send_multipart.call_args.args[0]
+        self.assertEqual(sent_frames[-1], b"request-a")
 
 
 class MoriTransferEngineBase(PDDisaggregationServerBase):

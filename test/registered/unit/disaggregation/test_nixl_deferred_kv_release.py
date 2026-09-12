@@ -7,6 +7,7 @@ worker polls check_xfer_state), so the ack must come from the transfer worker
 after its DONE barrier -- never from the bootstrap thread for an active room.
 """
 
+import threading
 import unittest
 from unittest.mock import MagicMock
 
@@ -24,11 +25,15 @@ def _prefill_mgr(cls=CommonKVManager, enabled=True):
     mgr = cls.__new__(cls)
     mgr.enable_deferred_decode_kv_release = enabled
     mgr._deferred_ack_targets = {}
+    mgr._deferred_ack_lock = threading.Lock()
+    mgr._deferred_ack_retry_rooms = set()
     mgr._staging_outstanding = {}
     mgr.request_status = {}
     mgr._sent = []
     # Capture acks instead of opening a socket.
-    mgr._send_abort_ack = lambda ip, port, room: mgr._sent.append((ip, port, room))
+    mgr._send_abort_ack = lambda ip, port, room, generation=None: mgr._sent.append(
+        (ip, port, room)
+    )
     return mgr
 
 
@@ -94,7 +99,7 @@ class TestNixlAbortNotification(CustomTestCase):
         mgr._staging_outstanding[11] = 1
         self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
 
-        self.assertEqual(mgr._deferred_ack_targets[11], ("10.0.0.3", 6000))
+        self.assertEqual(mgr._deferred_ack_targets[11], {("10.0.0.3", 6000, None)})
         self.assertEqual(mgr._sent, [])
         # Marked Failed first, so no new chunk can be enqueued for the room.
         self.assertEqual(mgr.request_status[11], KVPoll.Failed)
@@ -173,6 +178,7 @@ class TestNixlDecodeAckIngest(CustomTestCase):
     def test_abort_ack_is_aggregated_per_rank(self):
         # Mirrors the decode listener thread's ABORT_ACK branch.
         mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr._deferred_abort_lock = threading.Lock()
         mgr._deferred_abort_ack_tracker = {}
         mgr.register_deferred_abort_room(21)
 

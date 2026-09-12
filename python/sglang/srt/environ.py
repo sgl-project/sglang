@@ -827,6 +827,9 @@ class Envs:
     # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+    # Total VRAM budget for lazily allocated MORI DCP pack buffers. A worker
+    # without a buffer falls back to the raw per-token transfer path.
+    SGLANG_MORI_DCP_PACK_BUFFER_BUDGET_GB = EnvFloat(8.0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
 
     # ===================================================================

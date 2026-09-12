@@ -31,7 +31,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
@@ -351,7 +351,7 @@ class PrefillBootstrapQueue:
 
         dest_tp_ranks = [self.tp_rank]
 
-        req.disagg_kv_sender = kv_sender_class(
+        sender_kwargs = dict(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
@@ -359,6 +359,21 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        try:
+            req.disagg_kv_sender = kv_sender_class(**sender_kwargs)
+        except KVTransferError as exc:
+            error_message = f"Prefill bootstrap rejected request: {exc}"
+            logger.warning(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            prepare_abort(
+                req,
+                error_message,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            if self.scheduler.metrics_reporter.enable_metrics:
+                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            return False
         self._process_req(req)
         req.pending_bootstrap = True
         return True

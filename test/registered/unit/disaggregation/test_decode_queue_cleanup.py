@@ -379,11 +379,41 @@ class TestDecodeQueueCleanup(CustomTestCase):
             req, queue.tree_cache, is_insert=False
         )
 
+        events = []
         receiver = FakeReceiver()
-        receiver.kv_mgr = FakeKVManager.__new__(FakeKVManager)
+        receiver.abort_notified = False
+        receiver.abort_generation = "request-a"
+        receiver.bootstrap_infos = [{}]
+        receiver.kv_mgr = SimpleNamespace(enable_deferred_decode_kv_release=True)
+
+        def ensure_abort():
+            events.append("abort")
+            receiver.abort_notified = True
+
+        receiver.ensure_abort_notified_for_drain = ensure_abort
+        receiver.failure_exception = lambda: events.append("failure")
         decode_req.kv_receiver = receiver
         queue.queue = [decode_req]
         queue.enable_deferred_kv_release = True
+        queue.strict_deferred_kv_release = True
+        queue.deferred_kv_release_timeout = 0.0
+        queue._deferred_releases = []
+        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
+        mock_prepare_abort.reset_mock()
+        mock_release_kv_cache.reset_mock()
+
+        self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(events, ["abort", "failure"])
+        self.assertEqual(len(queue._deferred_releases), 1)
+        self.assertIs(decode_req.kv_receiver, receiver)
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+
+        receiver = FakeKVReceiver(FakeKVManager.__new__(FakeKVManager), "")
+        decode_req.kv_receiver = receiver
+        queue.queue = [decode_req]
+        queue.enable_deferred_kv_release = True
+        queue.strict_deferred_kv_release = True
         queue.req_to_metadata_buffer_idx_allocator.reset_mock()
         mock_release_kv_cache.reset_mock()
 
@@ -391,19 +421,21 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(transferred, [])
         self.assertEqual(queue.queue, [])
-        self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, is_insert=False
         )
 
-    def test_fake_receiver_initializes_deferred_release_state(self):
-        manager = MagicMock()
-        receiver = FakeKVReceiver(manager, "")
+    def test_fake_manager_uses_non_strict_release(self):
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.enable_deferred_kv_release = False
+        queue.strict_deferred_kv_release = False
 
-        self.assertIs(receiver.kv_mgr, manager)
-        self.assertFalse(receiver.abort_notified)
+        queue.configure_deferred_release(FakeKVManager.__new__(FakeKVManager))
+
+        self.assertFalse(queue.enable_deferred_kv_release)
+        self.assertFalse(queue.strict_deferred_kv_release)
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -423,11 +455,22 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             queue=[], retracted_queue=[object()]
         )
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = MagicMock()
+        scheduler.disagg_decode_transfer_queue.queue = []
+        scheduler.disagg_decode_transfer_queue.has_pending_deferred_releases.return_value = False
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
+        scheduler.metrics_reporter = MagicMock()
 
+        self.assertFalse(scheduler.is_fully_idle())
+        scheduler.disagg_decode_transfer_queue.has_pending_deferred_releases.return_value = True
+        scheduler.disagg_decode_prealloc_queue.retracted_queue = []
+
+        scheduler._record_scheduler_state_for_paused_engine()
+
+        scheduler.disagg_decode_transfer_queue.resolve_deferred_releases.assert_called_once_with()
+        scheduler.metrics_reporter.record_scheduler_active.assert_called_once_with()
         self.assertFalse(scheduler.is_fully_idle())
 
 

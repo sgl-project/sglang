@@ -43,6 +43,7 @@ def try_pack_dcp_src(
     src_token_indices: npt.NDArray[np.integer],
     token_item_lens: Sequence[int],
     pack_offset_bytes: int = 0,
+    pack_limit_bytes: Optional[int] = None,
 ) -> Optional[Tuple[List[int], npt.NDArray[np.int64]]]:
     if pack_offset_bytes < 0:
         raise ValueError(
@@ -54,13 +55,23 @@ def try_pack_dcp_src(
         return [], empty
     required = n * sum(int(item_len) for item_len in token_item_lens)
     required_end = pack_offset_bytes + required
-    if not pack_buffer.fits(required_end):
+    available_end = (
+        pack_buffer.get_size()
+        if pack_limit_bytes is None
+        else min(pack_limit_bytes, pack_buffer.get_size())
+    )
+    if pack_offset_bytes > available_end:
+        raise ValueError(
+            "pack_offset_bytes exceeds the selected pack region: "
+            f"offset={pack_offset_bytes}, limit={available_end}"
+        )
+    if required_end > available_end:
         logger.warning(
             "PD DCP pack buffer too small for byte range [%s, %s) (have %s); "
             "falling back to per-token RDMA",
             pack_offset_bytes,
             required_end,
-            pack_buffer.get_size(),
+            available_end,
         )
         return None
 
@@ -83,11 +94,21 @@ def try_pack_dcp_src(
     return packed_ptrs, np.arange(n, dtype=np.int64)
 
 
+def dcp_pack_buffer_bytes_for_args(kv_args, dcp_size: int) -> int:
+    max_tokens = max_prefill_buffer_tokens()
+    if max_tokens <= 0:
+        max_tokens = get_schedule().max_prefill_tokens
+    return dcp_pack_buffer_bytes(
+        kv_args.kv_item_lens, kv_args.page_size, max_tokens, dcp_size
+    )
+
+
 def init_dcp_pack_buffers(
     register_fn,
     kv_args,
     count: int,
     dcp_size: int,
+    min_size_bytes: int = 0,
 ) -> List[StagingBuffer]:
     from sglang.srt.disaggregation.common.staging_handler import (
         _get_custom_mem_pool,
@@ -102,8 +123,9 @@ def init_dcp_pack_buffers(
     # Note(kpham-sgl): size = dcp_size x ceil(max_tokens / dcp_size)
     # x sum(per-layer token bytes). At 32,768 tokens and 61 MLA layers
     # x 576 bf16 dims x 2 B: 2.14 GiB/buffer, 8.58 GiB for 4 queues.
-    size_bytes = dcp_pack_buffer_bytes(
-        kv_item_lens, kv_args.page_size, max_tokens, dcp_size
+    size_bytes = max(
+        dcp_pack_buffer_bytes(kv_item_lens, kv_args.page_size, max_tokens, dcp_size),
+        min_size_bytes,
     )
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"

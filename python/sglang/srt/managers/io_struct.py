@@ -1031,6 +1031,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    disagg_request_epoch: Optional[str] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

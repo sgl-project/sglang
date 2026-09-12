@@ -955,6 +955,7 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        disagg_request_epoch: Optional[str] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1277,6 +1278,7 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.disagg_request_epoch: Optional[str] = disagg_request_epoch
         # Decode-local: the already-emitted boundary token to replay when a
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.

@@ -27,6 +27,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -1413,6 +1414,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                disagg_request_epoch=(
+                    uuid.uuid4().hex
+                    if self.disaggregation_mode == DisaggregationMode.DECODE
+                    else None
+                ),
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
