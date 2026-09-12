@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torchvision.transforms.functional import to_pil_image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.managers.schedule_batch import (
@@ -364,10 +365,8 @@ class KimiGPUProcessorWrapper:
         fixed_output_tokens,
         image_mean,
         image_std,
-        use_gpu_preprocessing: bool = True,
     ):
         self._hf_processor = hf_processor
-        self._use_gpu_preprocessing = use_gpu_preprocessing
         self._image_token = image_token
         self._image_token_id = image_token_id
         self._patch_size = patch_size
@@ -392,7 +391,8 @@ class KimiGPUProcessorWrapper:
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
 
-        if images and self._use_gpu_preprocessing and torch.cuda.is_available():
+        backend = resolve_image_processor_backend(get_mm())
+        if images and backend != "pil" and torch.cuda.is_available():
             return self._gpu_call(text, images, original_input_ids)
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
@@ -459,6 +459,13 @@ class KimiGPUProcessorWrapper:
         input_text = text[0] if isinstance(text, list) else text
 
         if images:
+            # GPU JPEG decoding returns CHW tensors; the HF CPU path needs PIL.
+            images = [
+                to_pil_image(image.cpu()).convert("RGB")
+                if isinstance(image, torch.Tensor)
+                else image
+                for image in images
+            ]
             # Token expansion via media_tokens_calculator
             image_token_counts = [
                 int(
@@ -513,6 +520,7 @@ class KimiGPUProcessorWrapper:
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
+    gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
     # The GPU wrapper expands placeholders from the request's own token IDs.
@@ -522,8 +530,6 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     supports_mm_processor_concurrency = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        use_gpu_preprocessing = resolve_image_processor_backend(get_mm()) != "pil"
-        self.gpu_image_decode = use_gpu_preprocessing
         mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
             # TODO: could we convert in MultimodalSpecialTokens?
@@ -543,7 +549,6 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             fixed_output_tokens=media_proc_cfg.get("fixed_output_tokens"),
             image_mean=media_proc_cfg["image_mean"],
             image_std=media_proc_cfg["image_std"],
-            use_gpu_preprocessing=use_gpu_preprocessing,
         )
         # Initialize the executor from the final GPU wrapper. Cloning the raw
         # HF processor here would silently bypass Kimi's GPU preprocessing.

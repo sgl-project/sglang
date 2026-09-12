@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -264,6 +265,37 @@ def test_kimi_cpu_fallback_falls_back_to_the_hf_tokens_without_request_ids():
     out = wrapper._cpu_call("a<|media_pad|>b", ["img"], medias=None)
 
     assert out["input_ids"].flatten().tolist() == [99, 99, 99]
+
+
+@pytest.mark.parametrize("channels", [1, 3])
+def test_kimi_cpu_fallback_converts_decoded_tensors_to_rgb_pil(channels):
+    pixels = torch.arange(channels * 8 * 8, dtype=torch.uint8).reshape(channels, 8, 8)
+    pil_image = Image.new("RGB", (8, 8), (10, 20, 30))
+    hf_processor = Mock()
+
+    def token_count(media):
+        assert isinstance(media["image"], Image.Image)
+        assert media["image"].mode == "RGB"
+        return 3
+
+    hf_processor.media_processor.media_tokens_calculator.side_effect = token_count
+    hf_processor.return_value = {"input_ids": torch.tensor([[99]])}
+    wrapper = KimiGPUProcessorWrapper.__new__(KimiGPUProcessorWrapper)
+    wrapper._hf_processor = hf_processor
+    wrapper._image_token = "<|media_pad|>"
+    wrapper._image_token_id = 7
+
+    out = wrapper._cpu_call(
+        "a<|media_pad|>b<|media_pad|>c",
+        [pixels, pil_image],
+        original_input_ids=[1, 7, 2, 7, 3],
+    )
+
+    medias = hf_processor.call_args.kwargs["medias"]
+    expected = pixels.expand(3, -1, -1).permute(1, 2, 0).numpy()
+    np.testing.assert_array_equal(np.asarray(medias[0]["image"]), expected)
+    assert medias[1]["image"] is pil_image
+    assert out["input_ids"].flatten().tolist() == [1, 7, 7, 7, 2, 7, 7, 7, 3]
 
 
 def test_kimi_refuses_already_normalized_float_pixels():
@@ -639,17 +671,17 @@ def _k3_preprocess_config(
 
 
 @pytest.mark.parametrize(
-    ("processor_cls", "wrapper_cls", "backend", "legacy_disable", "use_gpu"),
+    ("processor_cls", "wrapper_cls", "backend", "legacy_disable"),
     [
-        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "auto", False, True),
-        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "torchvision", False, True),
-        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "pil", False, False),
-        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "auto", True, False),
-        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper, "auto", False, True),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "auto", False),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "torchvision", False),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "pil", False),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, "auto", True),
+        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper, "auto", False),
     ],
 )
 def test_kimi_processor_workers_clone_the_gpu_wrapper(
-    processor_cls, wrapper_cls, backend, legacy_disable, use_gpu
+    processor_cls, wrapper_cls, backend, legacy_disable
 ):
     server_args = SimpleNamespace(
         base_gpu_id=0,
@@ -684,16 +716,32 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(
             assert isinstance(worker_processor, wrapper_cls)
             assert worker_processor is not processor._processor
             if processor_cls is KimiK2_5VLImageProcessor:
-                assert processor.gpu_image_decode is use_gpu
+                assert processor.gpu_image_decode is True
                 for wrapper in (processor._processor, worker_processor):
-                    with (
-                        patch("torch.cuda.is_available", return_value=True),
-                        patch.object(wrapper, "_gpu_call") as gpu_call,
-                        patch.object(wrapper, "_cpu_call") as cpu_call,
-                    ):
-                        wrapper(text="<|media_pad|>", images=[Image.new("RGB", (8, 8))])
-                    assert gpu_call.call_count == int(use_gpu)
-                    assert cpu_call.call_count == int(not use_gpu)
+                    for decode_enabled in (False, True):
+                        for cuda_available in (False, True):
+                            use_gpu = (
+                                backend != "pil"
+                                and not legacy_disable
+                                and cuda_available
+                            )
+                            with (
+                                envs.SGLANG_ENABLE_GPU_IMAGE_DECODE.override(
+                                    decode_enabled
+                                ),
+                                patch(
+                                    "torch.cuda.is_available",
+                                    return_value=cuda_available,
+                                ),
+                                patch.object(wrapper, "_gpu_call") as gpu_call,
+                                patch.object(wrapper, "_cpu_call") as cpu_call,
+                            ):
+                                wrapper(
+                                    text="<|media_pad|>",
+                                    images=[Image.new("RGB", (8, 8))],
+                                )
+                            assert gpu_call.call_count == int(use_gpu)
+                            assert cpu_call.call_count == int(not use_gpu)
             if processor_cls is KimiK3ImageProcessor:
                 fingerprint_config = processor.preprocess_fingerprint_payload()[
                     "wrapped_processor"

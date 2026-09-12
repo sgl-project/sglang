@@ -16,6 +16,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import asyncio
 import concurrent.futures
 import io
+import itertools
+import os
 import sys
 import types
 import unittest
@@ -27,6 +29,7 @@ import requests
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import common
@@ -69,39 +72,48 @@ def _is_decoded(img: Image.Image) -> bool:
 
 
 class TestLoadSingleItemImageDecode(CustomTestCase):
-    def test_loading_paths_use_instance_decode_mode(self):
-        data = _jpeg_bytes()
-        for mode in (False, True, "nvjpeg_fancy"):
-            for legacy in (False, True):
-                with self.subTest(mode=mode, legacy=legacy):
-                    processor = object.__new__(_StubProcessor)
-                    processor.gpu_image_decode = mode
-                    expected = Image.new("RGB", (8, 8))
-                    with (
-                        concurrent.futures.ThreadPoolExecutor(
-                            max_workers=1
-                        ) as executor,
-                        patch(
-                            "sglang.srt.multimodal.processors.base_processor.load_image",
-                            return_value=(expected, None),
-                        ) as load_image,
-                    ):
-                        processor.io_executor = executor
-                        if legacy:
-                            tokens = Mock()
-                            tokens.get_modality_of_token.return_value = Modality.IMAGE
-                            futures, _ = processor.submit_data_loading_tasks(
-                                ["<image>"], tokens, {Modality.IMAGE: iter([data])}
-                            )
-                            future = futures[0]
-                        else:
-                            tasks = processor._submit_mm_data_loading_tasks_simple(
-                                [data], Modality.IMAGE, None, True
-                            )
-                            future = tasks[0][2]
-                        self.assertIs(future.result(), expected)
-                        load_image.assert_called_once_with(data, mode)
-                    self.assertFalse(_StubProcessor.gpu_image_decode)
+    def test_gpu_image_decode_is_enabled_by_default(self):
+        with patch.dict(os.environ):
+            os.environ.pop("SGLANG_ENABLE_GPU_IMAGE_DECODE", None)
+            self.assertTrue(envs.SGLANG_ENABLE_GPU_IMAGE_DECODE.get())
+
+    def test_global_gpu_decode_switch_respects_model_and_format(self):
+        expected = torch.zeros((3, 8, 8), dtype=torch.uint8)
+        for enabled, mode, cuda, jpeg in itertools.product(
+            (False, True), (False, True, "nvjpeg_fancy"), (False, True), (False, True)
+        ):
+            with self.subTest(enabled=enabled, mode=mode, cuda=cuda, jpeg=jpeg):
+                data = _jpeg_bytes() if jpeg else _png_bytes()
+                with (
+                    envs.SGLANG_ENABLE_GPU_IMAGE_DECODE.override(enabled),
+                    patch.object(common, "is_cuda", return_value=cuda),
+                    patch.object(
+                        common, "decode_jpeg", return_value=expected
+                    ) as decode,
+                    patch(
+                        "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
+                        return_value=expected,
+                    ) as fancy_decode,
+                ):
+                    image, _ = common.load_image(data, gpu_image_decode=mode)
+
+                use_gpu = enabled and bool(mode) and cuda and jpeg
+                self.assertEqual(decode.call_count, int(use_gpu and mode is True))
+                self.assertEqual(
+                    fancy_decode.call_count, int(use_gpu and mode == "nvjpeg_fancy")
+                )
+                if use_gpu:
+                    self.assertIs(image, expected)
+                else:
+                    self.assertIsInstance(image, Image.Image)
+                    np.testing.assert_array_equal(
+                        np.asarray(image), np.asarray(Image.open(io.BytesIO(data)))
+                    )
+
+    def test_disabled_gpu_decode_preserves_invalid_image_error(self):
+        with envs.SGLANG_ENABLE_GPU_IMAGE_DECODE.override(False):
+            with self.assertRaises(ValueError):
+                common.load_image(b"\xff\xd8invalid\xff\xd9", gpu_image_decode=True)
 
     def test_plain_open_is_lazy(self):
         # Documents why the fix matters: a bare Image.open is not decoded yet, so

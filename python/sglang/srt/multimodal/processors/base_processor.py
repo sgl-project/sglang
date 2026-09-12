@@ -951,7 +951,6 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
-        gpu_image_decode=None,
     ):
         """
         Load a single multimodal data.
@@ -964,12 +963,7 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                decode_mode = (
-                    cls.gpu_image_decode
-                    if gpu_image_decode is None
-                    else gpu_image_decode
-                )
-                img, _ = load_image(data, decode_mode)
+                img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
@@ -1076,7 +1070,6 @@ class BaseMultimodalProcessor(ABC):
                 None,  # frame_count_limit: no consider for fast path
                 audio_sample_rate,
                 discard_alpha_channel,
-                gpu_image_decode=self.gpu_image_decode,
             )
             futures.append((modality, idx, future))
 
@@ -1137,7 +1130,6 @@ class BaseMultimodalProcessor(ABC):
                         frame_count_limit,
                         audio_sample_rate,
                         discard_alpha_channel,
-                        gpu_image_decode=self.gpu_image_decode,
                     )
                 )
                 task_info.append((modality, data, frame_count_limit))
