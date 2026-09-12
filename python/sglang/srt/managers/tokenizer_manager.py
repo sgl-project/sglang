@@ -1408,6 +1408,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
+            # Fail fast on hidden_dim mismatch so the caller sees an actionable
+            # error instead of a scatter RuntimeError raised in the scheduler.
+            self._validate_positional_embed_overrides_hidden_dim(
+                obj.positional_embed_overrides
+            )
+
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1460,6 +1466,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
+            # Fail fast on hidden_dim mismatch so the caller sees an actionable
+            # error instead of a scatter RuntimeError raised in the scheduler.
+            self._validate_positional_embed_overrides_hidden_dim(
+                positional_embed_overrides
+            )
+
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1480,6 +1492,47 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
+
+    def _validate_positional_embed_overrides_hidden_dim(
+        self,
+        positional_embed_overrides: Optional[
+            Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
+        ],
+    ) -> None:
+        """Validate any positional embed overrides reaching the scheduler.
+
+        Handles both the single-request shape (``PositionalEmbeds``) and the
+        score-request shape (``List[Optional[PositionalEmbeds]]``). Skips None
+        entries. No-op when the request carries no overrides.
+
+        The field is typed ``Any`` on the request dataclasses and those are used
+        directly as FastAPI bodies, so arbitrary JSON can land here. Anything that
+        is not the expected type is rejected with ValueError (mapped to HTTP 400)
+        rather than forwarded: msgpack encoding is untyped, so a malformed value
+        encodes fine and then fails ``msgpack_decode`` inside the scheduler's
+        receive loop, which only catches ``zmq.ZMQError`` and would take the
+        scheduler process down.
+        """
+        if positional_embed_overrides is None:
+            return
+        expected = self.model_config.hidden_size
+        if isinstance(positional_embed_overrides, PositionalEmbeds):
+            positional_embed_overrides.validate_hidden_dim(expected)
+        elif isinstance(positional_embed_overrides, (list, tuple)):
+            for item in positional_embed_overrides:
+                if item is None:
+                    continue
+                if not isinstance(item, PositionalEmbeds):
+                    raise ValueError(
+                        "positional_embed_overrides entries must be PositionalEmbeds "
+                        f"or null, got {type(item).__name__}."
+                    )
+                item.validate_hidden_dim(expected)
+        else:
+            raise ValueError(
+                "positional_embed_overrides must be a PositionalEmbeds or a list of "
+                f"them, got {type(positional_embed_overrides).__name__}."
+            )
 
     @staticmethod
     def _resolve_embed_overrides(
