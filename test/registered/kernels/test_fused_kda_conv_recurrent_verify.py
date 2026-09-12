@@ -12,9 +12,10 @@ from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
 
@@ -27,20 +28,36 @@ _CASES = [
     (2, 3, 4, 4, 128, 128, 4, True, None, False, 6),
     (2, 8, 2, 2, 128, 128, 4, True, 1.5, False, 7),
     (1, 4, 8, 8, 64, 64, 4, True, None, False, 8),
+    # GLM-5.3 Flash TP4: 16 local heads, six-token EAGLE verification,
+    # and a negative safe-gate lower bound.
+    (1, 6, 16, 16, 128, 128, 4, False, -5.0, False, 9),
+    (16, 8, 16, 16, 128, 128, 4, False, -5.0, True, 10),
 ]
 
 
-def _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed):
+def _make_inputs(
+    B,
+    T,
+    H,
+    HV,
+    K,
+    V,
+    W,
+    has_bias,
+    neg_slot,
+    seed,
+    weight_dtype=torch.bfloat16,
+):
     torch.manual_seed(seed)
     dim = 2 * H * K + HV * V
     seq_len = B * T
-    lines = slots = 8
+    lines = slots = max(8, B + 2)
 
     inputs = {
         "mixed": torch.randn(seq_len, dim, device=_DEVICE, dtype=torch.bfloat16) * 0.5,
-        "w": torch.randn(dim, W, device=_DEVICE, dtype=torch.bfloat16) * 0.3,
+        "w": torch.randn(dim, W, device=_DEVICE, dtype=weight_dtype) * 0.3,
         "bias": (
-            torch.randn(dim, device=_DEVICE, dtype=torch.bfloat16) * 0.1
+            torch.randn(dim, device=_DEVICE, dtype=weight_dtype) * 0.1
             if has_bias
             else None
         ),
@@ -149,14 +166,14 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps):
         head_k_dim=K,
         head_v_dim=V,
         lower_bound=lower_bound,
-        num_warps=num_warps,
+        **({"num_warps": num_warps} if num_warps is not None else {}),
     )
     return o, conv, win, ic
 
 
-def _compare_case(case, num_warps):
+def _compare_case(case, num_warps=None, weight_dtype=torch.bfloat16):
     B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
-    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed)
+    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, weight_dtype)
     o_ref, conv_ref, win_ref, ic_ref = _run_reference(
         inp, B, T, H, HV, K, V, lower_bound
     )
@@ -180,7 +197,43 @@ def _compare_case(case, num_warps):
 
 @pytest.mark.parametrize("case", _CASES)
 def test_matches_unfused_reference(case):
-    _compare_case(case, num_warps=4)
+    _compare_case(case)
+
+
+@pytest.mark.parametrize("case_index", [8, 9])
+def test_glm_fp32_weights_match_unfused_reference(case_index):
+    _compare_case(_CASES[case_index], weight_dtype=torch.float32)
+
+
+@pytest.mark.parametrize("case_index", [9])
+def test_glm_fp32_weights_match_under_graph_replay(case_index):
+    B, T, H, HV, K, V, W, bias, lower, neg_slot, seed = _CASES[case_index]
+    inp = _make_inputs(B, T, H, HV, K, V, W, bias, neg_slot, seed, torch.float32)
+    results = []
+    functions = [
+        lambda: _run_reference(inp, B, T, H, HV, K, V, lower),
+        lambda: _run_fused(inp, B, T, H, HV, K, V, lower, None),
+    ]
+    for run in functions:
+        run()  # Compile before capture.
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = run()
+        graph.replay()
+        torch.cuda.synchronize()
+        results.append(result)
+
+    valid = [i for i, slot in enumerate(inp["idx_vals"]) if slot >= 0]
+    slots = [slot for slot in inp["idx_vals"] if slot >= 0]
+    expected, actual = results
+    assert torch.equal(
+        expected[0].reshape(B, T, HV, V)[valid],
+        actual[0].reshape(B, T, HV, V)[valid],
+    )
+    assert torch.equal(expected[1][slots], actual[1][slots])
+    assert torch.equal(expected[2][valid], actual[2][valid])
+    torch.testing.assert_close(expected[3][valid], actual[3][valid], atol=4e-3, rtol=0)
 
 
 if __name__ == "__main__":

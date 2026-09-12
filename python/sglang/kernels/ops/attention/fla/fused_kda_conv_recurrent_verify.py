@@ -29,12 +29,33 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl, is_hip_runtime
 
 # V-tile width of the fused verify kernel. Tuned on B200 at T=5 with
 # benchmark/kernels/bench_kda_verify_sweep.py; any power of two is
 # numerics-safe at num_warps=4 (bit-exact vs the BV=32 original).
 KDA_VERIFY_BLOCK_V = 4
+# gfx950, GLM TP4/T=6 or 8 with fp32 conv weights: larger batches benefit from
+# sharing q/k convolution across more V lanes. B <= 2 still prefers BV=4.
+KDA_VERIFY_BLOCK_V_HIP = 16
+
+
+@triton.jit
+def _conv_product(x, weight, ROUND_PRODUCT: tl.constexpr):
+    if ROUND_PRODUCT:
+        # ROCm's unfused conv uses separately rounded fp32 products. Without
+        # this boundary LLVM contracts the fused path into FMAs, which can
+        # change the bf16 conv output before the recurrent update.
+        return tl.inline_asm_elementwise(
+            "v_mul_f32 $0, $1, $2",
+            constraints="=v,v,v",
+            args=[x.to(tl.float32), weight.to(tl.float32)],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+    else:
+        return x * weight
 
 
 @triton.jit
@@ -82,6 +103,7 @@ def fused_kda_conv_gating_verify_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     SAVE_INTERMEDIATE_WINDOW: tl.constexpr,
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
+    ROUND_CONV_PRODUCTS: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
@@ -192,18 +214,18 @@ def fused_kda_conv_gating_verify_kernel(
             acc_q = tl.zeros([BK], dtype=tl.float32)
             acc_k = tl.zeros([BK], dtype=tl.float32)
             acc_v = tl.zeros([BV], dtype=tl.float32)
-        acc_q += q_c0 * wq0
-        acc_q += q_c1 * wq1
-        acc_q += q_c2 * wq2
-        acc_q += x_q * wq3
-        acc_k += k_c0 * wk0
-        acc_k += k_c1 * wk1
-        acc_k += k_c2 * wk2
-        acc_k += x_k * wk3
-        acc_v += v_c0 * wv0
-        acc_v += v_c1 * wv1
-        acc_v += v_c2 * wv2
-        acc_v += x_v * wv3
+        acc_q += _conv_product(q_c0, wq0, ROUND_CONV_PRODUCTS)
+        acc_q += _conv_product(q_c1, wq1, ROUND_CONV_PRODUCTS)
+        acc_q += _conv_product(q_c2, wq2, ROUND_CONV_PRODUCTS)
+        acc_q += _conv_product(x_q, wq3, ROUND_CONV_PRODUCTS)
+        acc_k += _conv_product(k_c0, wk0, ROUND_CONV_PRODUCTS)
+        acc_k += _conv_product(k_c1, wk1, ROUND_CONV_PRODUCTS)
+        acc_k += _conv_product(k_c2, wk2, ROUND_CONV_PRODUCTS)
+        acc_k += _conv_product(x_k, wk3, ROUND_CONV_PRODUCTS)
+        acc_v += _conv_product(v_c0, wv0, ROUND_CONV_PRODUCTS)
+        acc_v += _conv_product(v_c1, wv1, ROUND_CONV_PRODUCTS)
+        acc_v += _conv_product(v_c2, wv2, ROUND_CONV_PRODUCTS)
+        acc_v += _conv_product(x_v, wv3, ROUND_CONV_PRODUCTS)
 
         # Slide the window (reference: col0=col1; col1=col2; col2=x).
         q_c0 = q_c1
@@ -358,15 +380,9 @@ def fused_kda_conv_gating_verify(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; the output,
-    # conv_state and conv-window caches stay bit-identical to the reference.
-    # Only the fp32 intermediate-ssm rollback cache differs: the tl.sum
-    # reduction-order delta (~1 ulp/step) compounds through the delta-rule
-    # recurrence — measured ~6e-8 at T=4 standard gate (the production MTP
-    # shape), ~1.5e-5 at T=4 safe gate, ~2e-3 at T=8 safe gate. num_warps=1
-    # reproduces the reference reduction order exactly (all buffers
-    # bit-identical) but is ~2.4x slower in-graph — numerics debugging only.
-    num_warps: int = 4,
+    # CUDA retains the B200-tuned four-warp default. ROCm uses one wave to
+    # preserve the reference reduction order at the GLM verification shapes.
+    num_warps: Optional[int] = None,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -374,6 +390,10 @@ def fused_kda_conv_gating_verify(
     seq_len, dim = mixed_qkv.shape
     B = seq_len // T
     W = conv_weight.shape[1]
+    # A single wave preserves the reference reduction order on ROCm. Four
+    # waves can change even the rounded bf16 output at GLM's T=6 shapes.
+    if num_warps is None:
+        num_warps = 1 if is_hip_runtime() else 4
 
     assert mixed_qkv.stride(-1) == 1, "mixed_qkv must be contiguous in dim"
     assert dim == 2 * H * K + HV * V, f"packed dim mismatch: {dim}"
@@ -397,6 +417,16 @@ def fused_kda_conv_gating_verify(
     # the gated RMSNorm into this kernel's epilogue is a dead end; it is
     # PDL-chained behind this kernel instead (see fused_norm_gate.py).
     BV = min(triton.next_power_of_2(V), KDA_VERIFY_BLOCK_V)
+    if (
+        is_hip_runtime()
+        and num_warps == 1
+        and T in (6, 8)
+        and H == HV == 16
+        and K == V == 128
+        and conv_weight.dtype == torch.float32
+        and 3 <= B <= 16
+    ):
+        BV = KDA_VERIFY_BLOCK_V_HIP
     NV = triton.cdiv(V, BV)
 
     a2 = a.reshape(seq_len, HV * K)
@@ -480,6 +510,7 @@ def fused_kda_conv_gating_verify(
         USE_LOWER_BOUND=lower_bound is not None,
         SAVE_INTERMEDIATE_WINDOW=intermediate_conv_window is not None,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        ROUND_CONV_PRODUCTS=is_hip_runtime() and conv_weight.dtype == torch.float32,
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.
         num_warps=num_warps,
