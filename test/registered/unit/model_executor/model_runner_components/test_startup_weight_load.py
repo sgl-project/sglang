@@ -112,8 +112,6 @@ def _make_options(**overrides):
         enable_weights_cpu_backup=False,
         enable_lora=False,
         has_lora_paths=False,
-        weight_loader_disable_mmap=False,
-        weight_loader_drop_cache_after_load=False,
         has_custom_weight_loader=False,
         enable_torch_compile=False,
         prefetch_num_threads=4,
@@ -134,7 +132,6 @@ def _make_model_config(**overrides):
         hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
         dtype=torch.bfloat16,
         quantization=None,
-        modelopt_quant=None,
         is_multimodal=False,
         is_generation=True,
         model_impl=ModelImpl.SGLANG,
@@ -488,13 +485,13 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 "tp1",
                 _make_options(tp_size=1),
                 _make_qwen35_hybrid_vlm_model_config(),
-                "requires TP2 or TP4",
+                "validated with TP2 or TP4",
             ),
             (
                 "fp16",
                 _make_options(tp_size=2),
                 _make_qwen35_hybrid_vlm_model_config(dtype=torch.float16),
-                "requires BF16",
+                "validated with BF16",
             ),
             (
                 "quantized",
@@ -505,8 +502,8 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             (
                 "modelopt",
                 _make_options(tp_size=2),
-                _make_qwen35_hybrid_vlm_model_config(modelopt_quant="fp4"),
-                "ModelOpt is not supported",
+                _make_qwen35_hybrid_vlm_model_config(quantization="modelopt_fp4"),
+                "quantization is not supported",
             ),
             (
                 "expert_parallel",
@@ -566,7 +563,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     linear_attn_backend="flashinfer",
                 ),
                 _make_qwen35_hybrid_vlm_model_config(),
-                "requires Triton linear attention",
+                "validated with Triton linear attention",
             ),
             (
                 "flashinfer_linear_attention_decode",
@@ -575,7 +572,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     linear_attn_decode_backend="flashinfer",
                 ),
                 _make_qwen35_hybrid_vlm_model_config(),
-                "requires Triton linear attention",
+                "validated with Triton linear attention",
             ),
             (
                 "flashinfer_linear_attention_prefill",
@@ -584,7 +581,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     linear_attn_prefill_backend="flashinfer",
                 ),
                 _make_qwen35_hybrid_vlm_model_config(),
-                "requires Triton linear attention",
+                "validated with Triton linear attention",
             ),
             (
                 "full_prefill_cuda_graph",
@@ -619,6 +616,16 @@ class TestStartupWeightLoadSelector(CustomTestCase):
     def test_qwen35_moe_hybrid_vlm_profile_rejects_near_misses(self):
         cases = (
             (
+                "fp16",
+                _make_options(
+                    tp_size=2,
+                    ep_size=2,
+                    prefill_cuda_graph_backend=Backend.BREAKABLE,
+                ),
+                _make_qwen35_moe_hybrid_vlm_model_config(dtype=torch.float16),
+                "validated with bfloat16",
+            ),
+            (
                 "tp4",
                 _make_options(
                     tp_size=4,
@@ -626,7 +633,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     prefill_cuda_graph_backend=Backend.BREAKABLE,
                 ),
                 _make_qwen35_moe_hybrid_vlm_model_config(),
-                "requires TP2",
+                "validated with TP2",
             ),
             (
                 "tp_only",
@@ -635,7 +642,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     prefill_cuda_graph_backend=Backend.BREAKABLE,
                 ),
                 _make_qwen35_moe_hybrid_vlm_model_config(),
-                "requires EP2",
+                "validated with TP2/EP2",
             ),
             (
                 "quantized",
@@ -666,7 +673,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     prefill_cuda_graph_backend=Backend.BREAKABLE,
                 ),
                 _make_qwen35_moe_hybrid_vlm_model_config(),
-                "requires Triton linear attention",
+                "validated with Triton linear attention",
             ),
             (
                 "full_prefill_cuda_graph",
@@ -681,24 +688,33 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     self._create(options=options, model_config=model_config)
 
     def test_qwen3_moe_ep_profile_is_admitted(self):
-        manager = self._create(
-            options=_make_options(tp_size=2, ep_size=2),
-            model_config=_make_qwen3_moe_model_config(),
-        )
-
-        self.assertEqual(
-            manager._plan.profile,
-            StartupWeightLoadProfile.QWEN3_MOE_EP,
-        )
+        for dtype in (torch.float16, torch.bfloat16):
+            for backend in ("auto", "triton"):
+                for tp_size, ep_size in ((1, 1), (2, 1), (2, 2)):
+                    with self.subTest(
+                        dtype=dtype, backend=backend, tp=tp_size, ep=ep_size
+                    ):
+                        manager = self._create(
+                            options=_make_options(
+                                tp_size=tp_size,
+                                ep_size=ep_size,
+                                moe_runner_backend=backend,
+                            ),
+                            model_config=_make_qwen3_moe_model_config(dtype=dtype),
+                        )
+                        self.assertEqual(
+                            manager._plan.profile,
+                            StartupWeightLoadProfile.QWEN3_MOE_EP,
+                        )
 
     def test_qwen3_moe_ep_profile_rejects_near_misses(self):
         cases = (
-            ("tp1", _make_options(ep_size=2), "requires TP2"),
+            ("ep_exceeds_tp", _make_options(ep_size=2), "TP1/EP1, TP2/EP1, TP2/EP2"),
             (
-                "fp16",
+                "fp32",
                 _make_options(tp_size=2, ep_size=2),
-                "requires BF16",
-                _make_qwen3_moe_model_config(dtype=torch.float16),
+                "validated with float16 or bfloat16",
+                _make_qwen3_moe_model_config(dtype=torch.float32),
             ),
             (
                 "quantized",
@@ -707,9 +723,9 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 _make_qwen3_moe_model_config(quantization="fp8"),
             ),
             (
-                "tp_only",
-                _make_options(tp_size=2),
-                "requires EP2",
+                "tp4",
+                _make_options(tp_size=4),
+                "TP1/EP1, TP2/EP1, TP2/EP2",
             ),
             (
                 "moe_dp",
@@ -841,6 +857,29 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         )
         cases = (
             (
+                "automatic_fp8_gemm",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, fp8_gemm_runner_backend="auto"
+                    )
+                ),
+                "set --fp8-gemm-backend triton",
+            ),
+            (
+                "unresolved_dsa_prefill",
+                dict(
+                    options=dataclasses.replace(valid_options, dsa_prefill_backend=None)
+                ),
+                "set --dsa-prefill-backend fa3 --dsa-decode-backend fa3",
+            ),
+            (
+                "unresolved_dsa_decode",
+                dict(
+                    options=dataclasses.replace(valid_options, dsa_decode_backend=None)
+                ),
+                "set --dsa-prefill-backend fa3 --dsa-decode-backend fa3",
+            ),
+            (
                 "glm5_config",
                 dict(
                     options=valid_options,
@@ -905,7 +944,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             (
                 "tp4",
                 dict(options=dataclasses.replace(valid_options, tp_size=4)),
-                "requires TP8 or TP16",
+                "validated with TP8 or TP16",
             ),
             (
                 "fp16",
@@ -915,7 +954,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         dtype=torch.float16
                     ),
                 ),
-                "requires --dtype bfloat16",
+                "set --dtype bfloat16",
             ),
             (
                 "unquantized",
@@ -988,7 +1027,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         valid_options, moe_runner_backend="flashinfer_trtllm"
                     )
                 ),
-                "requires --moe-runner-backend triton",
+                "requires the Triton MoE runner",
             ),
             (
                 "deep_gemm",
@@ -997,7 +1036,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         valid_options, fp8_gemm_runner_backend="deep_gemm"
                     )
                 ),
-                "requires --fp8-gemm-backend triton",
+                "set --fp8-gemm-backend triton",
             ),
             (
                 "base_attention_backend",
@@ -1026,7 +1065,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         valid_options, dsa_prefill_backend="flashmla_sparse"
                     )
                 ),
-                "requires FA3 for DSA prefill and decode",
+                "validated with FA3 for DSA prefill and decode",
             ),
             (
                 "dsa_decode_backend",
@@ -1035,7 +1074,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         valid_options, dsa_decode_backend="flashmla_sparse"
                     )
                 ),
-                "requires FA3 for DSA prefill and decode",
+                "validated with FA3 for DSA prefill and decode",
             ),
             (
                 "fp8_kv_cache",
@@ -1044,7 +1083,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         valid_options, kv_cache_dtype="fp8_e4m3"
                     )
                 ),
-                "requires --kv-cache-dtype bfloat16",
+                "set --kv-cache-dtype bfloat16",
             ),
             (
                 "breakable_prefill_graph",
@@ -1054,7 +1093,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         prefill_cuda_graph_backend=Backend.BREAKABLE,
                     )
                 ),
-                "requires prefill CUDA graphs disabled",
+                "validated with prefill CUDA graphs disabled",
             ),
             (
                 "shared_experts_fusion",
@@ -1110,7 +1149,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
     def test_create_formats_rejection_codes_and_messages(self):
         with self.assertRaisesRegex(
             ValueError,
-            "non_cuda: CUDA only; tensor_parallelism: only TP1 and TP2",
+            "non_cuda: CUDA only; tensor_parallelism: native dense startup overlap is validated with TP1 or TP2",
         ):
             self._create(
                 options=_make_options(
@@ -1120,10 +1159,19 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 )
             )
 
-    def test_empty_or_multiple_architectures_fail_without_resolution(self):
-        for name, architectures in (
-            ("empty", []),
-            ("multiple", ["LlamaForCausalLM", "Qwen2ForCausalLM"]),
+    def test_invalid_architectures_fail_without_resolution(self):
+        for name, architectures, message in (
+            ("empty", [], "exactly one model architecture is required"),
+            (
+                "multiple",
+                ["LlamaForCausalLM", "Qwen2ForCausalLM"],
+                "exactly one model architecture is required",
+            ),
+            (
+                "unsupported",
+                ["MixtralForCausalLM"],
+                "model architecture 'MixtralForCausalLM' is not in the startup overlap registry",
+            ),
         ):
             with (
                 self.subTest(name=name),
@@ -1147,12 +1195,99 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     tuple(rejection.code for rejection in admission.rejections),
                     ("architecture",),
                 )
-                self.assertIn(
-                    "exactly one supported model architecture",
-                    admission.rejections[0].message,
-                )
+                self.assertEqual(admission.rejections[0].message, message)
                 resolve_architecture.assert_not_called()
                 get_canonical_model_class.assert_not_called()
+
+    def test_cuda_standard_moe_auto_matches_triton(self):
+        cases = (
+            (
+                _make_qwen3_moe_model_config(),
+                _make_options(tp_size=2, ep_size=2),
+            ),
+            (
+                _make_qwen35_moe_hybrid_vlm_model_config(),
+                _make_options(
+                    tp_size=2,
+                    ep_size=2,
+                    prefill_cuda_graph_backend=Backend.BREAKABLE,
+                ),
+            ),
+            (
+                _make_glm_moe_dsa_fp8_model_config(),
+                _make_options(
+                    tp_size=16,
+                    prefill_cuda_graph_backend=Backend.DISABLED,
+                    dsa_prefill_backend="fa3",
+                    dsa_decode_backend="fa3",
+                    disable_shared_experts_fusion=True,
+                ),
+            ),
+        )
+        for model_config, options in cases:
+            architecture = model_config.hf_config.architectures[0]
+            with self.subTest(architecture=architecture):
+                triton = self._create(model_config=model_config, options=options)
+                auto_options = dataclasses.replace(options, moe_runner_backend="auto")
+                auto = self._create(model_config=model_config, options=auto_options)
+                self.assertEqual(auto._plan, triton._plan)
+
+                for changes, rejection_code in (
+                    ({"moe_a2a_backend": "deepep"}, "moe_a2a_backend"),
+                    ({"device": "cpu", "is_cuda_platform": False}, "non_cuda"),
+                    ({"moe_runner_backend": "deep_gemm"}, "moe_runner_backend"),
+                ):
+                    with self.subTest(changes=changes):
+                        admission = evaluate_startup_weight_load_admission(
+                            loader=self.loader,
+                            model_config=model_config,
+                            load_config=self.load_config,
+                            options=dataclasses.replace(auto_options, **changes),
+                        )
+                        self.assertFalse(admission.supported)
+                        self.assertIn(
+                            rejection_code,
+                            tuple(rejection.code for rejection in admission.rejections),
+                        )
+
+    def test_modelopt_is_rejected_via_real_quantization_field(self):
+        cases = (
+            (_make_model_config(), _make_options()),
+            (
+                _make_qwen35_hybrid_vlm_model_config(),
+                _make_options(tp_size=2),
+            ),
+            (
+                _make_qwen35_moe_hybrid_vlm_model_config(),
+                _make_options(tp_size=2, ep_size=2),
+            ),
+            (
+                _make_qwen3_moe_model_config(),
+                _make_options(tp_size=2, ep_size=2),
+            ),
+            (
+                _make_glm_moe_dsa_fp8_model_config(),
+                _make_options(tp_size=16),
+            ),
+        )
+        for model_config, options in cases:
+            for quantization in ("modelopt_fp8", "modelopt_fp4", "modelopt_mixed"):
+                with self.subTest(
+                    architecture=model_config.hf_config.architectures[0],
+                    quantization=quantization,
+                ):
+                    model_config.quantization = quantization
+                    admission = evaluate_startup_weight_load_admission(
+                        loader=self.loader,
+                        model_config=model_config,
+                        load_config=self.load_config,
+                        options=options,
+                    )
+                    self.assertFalse(admission.supported)
+                    self.assertIn(
+                        "quantization",
+                        tuple(rejection.code for rejection in admission.rejections),
+                    )
 
     def test_options_accept_current_server_args_schema(self):
         """Removed server options must not break overlap startup initialization."""
@@ -1287,7 +1422,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             (
                 "tp3",
                 dict(options=_make_options(tp_size=3)),
-                "only TP1 and TP2 are supported",
+                "validated with TP1 or TP2",
             ),
             (
                 "attention_context_parallel",
@@ -1342,7 +1477,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         hf_config=SimpleNamespace(architectures=["OtherForCausalLM"])
                     )
                 ),
-                "exactly one supported model architecture is required",
+                "model architecture 'OtherForCausalLM' is not in the startup overlap registry",
             ),
         )
         for name, kwargs, reason in cases:
@@ -1385,6 +1520,9 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertEqual(manager.state, StartupWeightLoadState.READY)
         self.assertFalse(manager.is_deferred)
         torch.testing.assert_close(model.weight, torch.full_like(model.weight, 3))
+        self.assertIsNone(manager.finalize())
+        self.assertIsNone(manager.finalize())
+        self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
 
     def test_auto_secondary_weights_fallback_reuses_initialized_model(self):
         trace = []
@@ -1397,6 +1535,9 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
         self.assertEqual(manager.state, StartupWeightLoadState.READY)
         self.assertFalse(manager.is_deferred)
+        self.assertIsNone(manager.finalize())
+        self.assertIsNone(manager.finalize())
+        self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
 
     def test_auto_supported_safetensors_source_overlaps_regardless_of_path(self):
         for hf_folder in ("/local/model", "/remote/model"):
@@ -2207,6 +2348,29 @@ class _RunnerStartupManager:
 
 
 class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
+    def test_retained_serial_fallback_does_not_overwrite_timing_or_repeat_barrier(self):
+        trace = []
+        loader = _RecordingLoader(_TiedWeightModel(), trace)
+        loader.use_safetensors = False
+        manager = StartupWeightLoadManager(
+            loader=loader,
+            model_config=_make_model_config(),
+            device_config=DeviceConfig("cpu", 0),
+            plan=_make_plan(),
+            fallback_to_serial=True,
+        )
+        manager.prepare()
+        runner = self._runner(manager)
+        runner.weight_load_time = 11.0
+        with patch(
+            "sglang.srt.model_executor.model_runner.dist_barrier_after_load"
+        ) as barrier:
+            runner.finalize_startup_weight_load()
+        barrier.assert_not_called()
+        self.assertEqual(runner.weight_load_time, 11.0)
+        self.assertIsNone(runner.startup_weight_load)
+        self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
+
     @staticmethod
     def _runner(manager):
         runner = ModelRunner.__new__(ModelRunner)

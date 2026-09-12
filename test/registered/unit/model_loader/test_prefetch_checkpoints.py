@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import Future
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -85,6 +86,74 @@ class TestPrefetchCheckpoints(CustomTestCase):
             safetensors.torch.save_file(tensors, path)
             paths.append(path)
         return paths
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_startup_commit_preserves_weights_across_io_options(self, _):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._create_safetensors_files(tmpdir)
+            expected = {
+                name: tensor.clone()
+                for name, tensor in safetensors_weights_iterator(paths)
+            }
+            source = DefaultModelLoader.Source(model_or_path=tmpdir, revision=None)
+            resolved = DefaultModelLoader.ResolvedSource(
+                source=source,
+                hf_folder=tmpdir,
+                weight_files=tuple(paths),
+                use_safetensors=True,
+            )
+            for disable_mmap, drop_cache, multithread, active in product(
+                (False, True), repeat=4
+            ):
+                with self.subTest(
+                    disable_mmap=disable_mmap,
+                    drop_cache=drop_cache,
+                    multithread=multithread,
+                    active=active,
+                ):
+                    loader = DefaultModelLoader(
+                        LoadConfig(
+                            load_format="safetensors",
+                            model_loader_extra_config={
+                                "enable_multithread_load": multithread,
+                                "num_threads": 2,
+                            },
+                        )
+                    )
+                    handle = _prefetch_all_checkpoints(paths, num_threads=2)
+                    try:
+                        if not active:
+                            handle.wait(timeout=5)
+                        with (
+                            patch(
+                                "sglang.srt.model_loader.loader.get_model",
+                                return_value=SimpleNamespace(
+                                    weight_loader_disable_mmap=disable_mmap,
+                                    weight_loader_drop_cache_after_load=drop_cache,
+                                    weight_loader_prefetch_checkpoints=True,
+                                    weight_loader_prefetch_num_threads=2,
+                                ),
+                            ),
+                            patch(
+                                "sglang.srt.model_loader.weight_utils._prefetch_all_checkpoints",
+                                side_effect=AssertionError("duplicate prefetch"),
+                            ),
+                        ):
+                            loaded = dict(
+                                loader._get_weights_iterator(
+                                    source,
+                                    resolved_source=resolved,
+                                    startup_prefetch_started=True,
+                                    startup_prefetch_active=active,
+                                )
+                            )
+                    finally:
+                        handle.stop(timeout=5)
+                    self.assertEqual(loaded.keys(), expected.keys())
+                    for name in expected:
+                        torch.testing.assert_close(
+                            loaded[name], expected[name], rtol=0, atol=0
+                        )
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_weights_match_with_and_without_prefetch(self, _):

@@ -1290,6 +1290,10 @@ class ModelRunner:
         """
         assert self.startup_weight_load is not None
         timings = self.startup_weight_load.finalize()
+        if timings is None:
+            # Serial fallback already completed the normal post-load path.
+            self.startup_weight_load = None
+            return
         # Keep the legacy phase weight-specific; scheduler_e2e reports the
         # overlap critical path.
         self.weight_load_time = timings.weight_load_seconds

@@ -100,6 +100,8 @@ class StartupWeightLoadProfile(str, enum.Enum):
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class StartupWeightLoadOptions:
+    """One-shot admission inputs; the manager retains the resulting plan."""
+
     device: str
     is_cuda_platform: bool
     cuda_device_capability: Optional[Tuple[int, int]]
@@ -141,8 +143,6 @@ class StartupWeightLoadOptions:
     enable_weights_cpu_backup: bool
     enable_lora: bool
     has_lora_paths: bool
-    weight_loader_disable_mmap: bool
-    weight_loader_drop_cache_after_load: bool
     has_custom_weight_loader: bool
     enable_torch_compile: bool
     prefetch_num_threads: int
@@ -153,11 +153,7 @@ class StartupWeightLoadOptions:
         *,
         is_draft_worker: bool,
     ) -> StartupWeightLoadOptions:
-        """Everything this needs is a published leaf; nothing comes off a record.
-
-        `is_draft_worker` is the exception and travels as an argument: it is
-        this runner's role, not the process's configuration.
-        """
+        """Read published config and platform facts for this runner's role."""
         cuda_graph_config = get_exec().graph.cuda_graph_config
         is_cuda_platform = current_platform.is_cuda()
         device_capability = (
@@ -214,10 +210,6 @@ class StartupWeightLoadOptions:
             enable_weights_cpu_backup=get_exec().features.enable_weights_cpu_backup,
             enable_lora=get_lora().enable_lora,
             has_lora_paths=bool(get_lora().lora_paths),
-            weight_loader_disable_mmap=get_model().weight_loader_disable_mmap,
-            weight_loader_drop_cache_after_load=(
-                get_model().weight_loader_drop_cache_after_load
-            ),
             has_custom_weight_loader=bool(get_model().custom_weight_loader),
             enable_torch_compile=get_exec().graph.enable_torch_compile,
             prefetch_num_threads=get_model().weight_loader_prefetch_num_threads,
@@ -232,7 +224,7 @@ class StartupWeightLoadRejection:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class StartupWeightLoadPlan:
-    """Config-level plan before checkpoint source resolution."""
+    """Admitted profile and prefetch settings, before source resolution."""
 
     profile: StartupWeightLoadProfile
     prefetch_num_threads: int
@@ -274,39 +266,43 @@ def _rejections_from_rules(
     )
 
 
+def _uses_triton_moe_runner(options: StartupWeightLoadOptions) -> bool:
+    # These CUDA profiles resolve auto to Triton on the standard EP path.
+    return options.moe_runner_backend == "triton" or (
+        options.moe_runner_backend == "auto"
+        and options.is_cuda_platform
+        and options.device == "cuda"
+        and options.moe_a2a_backend == "none"
+    )
+
+
 def _ep_moe_rules(
     *,
     family: str,
-    tp_size: int,
-    ep_size: int,
+    parallel_sizes: Tuple[Tuple[int, int], ...],
     model_config: ModelConfig,
     options: StartupWeightLoadOptions,
+    supported_dtypes: Tuple[torch.dtype, ...] = (torch.bfloat16,),
 ) -> Tuple[Tuple[str, bool, str], ...]:
     return (
         (
-            "tensor_parallelism",
-            options.tp_size != tp_size,
-            f"{family} startup overlap requires TP{tp_size}",
+            "parallelism",
+            (options.tp_size, options.ep_size) not in parallel_sizes,
+            f"{family} startup overlap is validated with "
+            + ", ".join(f"TP{tp}/EP{ep}" for tp, ep in parallel_sizes),
         ),
         (
             "dtype",
-            model_config.dtype != torch.bfloat16,
-            f"{family} startup overlap requires BF16",
+            model_config.dtype not in supported_dtypes,
+            f"{family} startup overlap is validated with "
+            + " or ".join(
+                str(dtype).removeprefix("torch.") for dtype in supported_dtypes
+            ),
         ),
         (
             "quantization",
             model_config.quantization is not None,
             "quantization is not supported",
-        ),
-        (
-            "modelopt",
-            bool(getattr(model_config, "modelopt_quant", False)),
-            "ModelOpt is not supported",
-        ),
-        (
-            "expert_parallelism",
-            options.ep_size != ep_size,
-            f"{family} startup overlap requires EP{ep_size}",
         ),
         (
             "moe_data_parallelism",
@@ -320,7 +316,7 @@ def _ep_moe_rules(
         ),
         (
             "moe_runner_backend",
-            options.moe_runner_backend != "triton",
+            not _uses_triton_moe_runner(options),
             f"{family} startup overlap requires the Triton MoE runner",
         ),
         (
@@ -368,22 +364,17 @@ def _validate_native_dense(
             (
                 "tensor_parallelism",
                 options.tp_size not in (1, 2),
-                "only TP1 and TP2 are supported",
+                "native dense startup overlap is validated with TP1 or TP2",
             ),
             (
                 "dtype",
                 model_config.dtype not in _SUPPORTED_DTYPES,
-                "FP16 or BF16 only",
+                "native dense startup overlap is validated with FP16 or BF16",
             ),
             (
                 "quantization",
                 model_config.quantization is not None,
                 "quantization is not supported",
-            ),
-            (
-                "modelopt",
-                bool(getattr(model_config, "modelopt_quant", False)),
-                "ModelOpt is not supported",
             ),
             (
                 "expert_parallelism",
@@ -424,22 +415,17 @@ def _validate_qwen3_5_hybrid_vlm(
             (
                 "tensor_parallelism",
                 options.tp_size not in (2, 4),
-                "Qwen3.5-family hybrid VLM startup overlap requires TP2 or TP4",
+                "Qwen3.5-family hybrid VLM startup overlap is validated with TP2 or TP4",
             ),
             (
                 "dtype",
                 model_config.dtype != torch.bfloat16,
-                "Qwen3.5-family hybrid VLM startup overlap requires BF16",
+                "Qwen3.5-family hybrid VLM startup overlap is validated with BF16",
             ),
             (
                 "quantization",
                 model_config.quantization is not None,
                 "quantization is not supported",
-            ),
-            (
-                "modelopt",
-                bool(getattr(model_config, "modelopt_quant", False)),
-                "ModelOpt is not supported",
             ),
             (
                 "expert_parallelism",
@@ -470,7 +456,7 @@ def _validate_qwen3_5_hybrid_vlm(
                 "linear_attention_backend",
                 linear_attn_decode_backend != "triton"
                 or linear_attn_prefill_backend != "triton",
-                "Qwen3.5-family hybrid VLM startup overlap requires Triton linear attention",
+                "Qwen3.5-family hybrid VLM startup overlap is validated with Triton linear attention",
             ),
             (
                 "full_prefill_cuda_graph",
@@ -490,8 +476,7 @@ def _validate_qwen3_5_moe_hybrid_vlm(
     )
     rules = _ep_moe_rules(
         family="Qwen3.5 MoE hybrid VLM",
-        tp_size=2,
-        ep_size=2,
+        parallel_sizes=((2, 2),),
         model_config=model_config,
         options=options,
     ) + (
@@ -519,7 +504,7 @@ def _validate_qwen3_5_moe_hybrid_vlm(
             "linear_attention_backend",
             linear_attn_decode_backend != "triton"
             or linear_attn_prefill_backend != "triton",
-            "Qwen3.5 MoE hybrid VLM startup overlap requires Triton linear attention",
+            "Qwen3.5 MoE hybrid VLM startup overlap is validated with Triton linear attention",
         ),
         (
             "full_prefill_cuda_graph",
@@ -536,10 +521,10 @@ def _validate_qwen3_moe_ep(
 ) -> Tuple[StartupWeightLoadRejection, ...]:
     rules = _ep_moe_rules(
         family="Qwen3 MoE",
-        tp_size=2,
-        ep_size=2,
+        parallel_sizes=((1, 1), (2, 1), (2, 2)),
         model_config=model_config,
         options=options,
+        supported_dtypes=(torch.float16, torch.bfloat16),
     ) + (
         (
             "multimodal",
@@ -599,12 +584,12 @@ def _validate_glm_5_2_dsa_fp8(
             (
                 "tensor_parallelism",
                 options.tp_size not in (8, 16),
-                "GLM-5.2 DSA FP8 startup overlap requires TP8 or TP16",
+                "GLM-5.2 DSA FP8 startup overlap is validated with TP8 or TP16",
             ),
             (
                 "dtype",
                 model_config.dtype != torch.bfloat16,
-                "GLM-5.2 DSA FP8 startup overlap requires --dtype bfloat16",
+                "GLM-5.2 DSA FP8 startup overlap is validated with BF16; set --dtype bfloat16",
             ),
             (
                 "quantization",
@@ -618,11 +603,6 @@ def _validate_glm_5_2_dsa_fp8(
                 "fp8_weight_block_size",
                 weight_block_size != (128, 128),
                 "GLM-5.2 DSA FP8 startup overlap requires 128x128 block scales",
-            ),
-            (
-                "modelopt",
-                bool(getattr(model_config, "modelopt_quant", False)),
-                "ModelOpt is not supported",
             ),
             (
                 "expert_parallelism",
@@ -641,13 +621,14 @@ def _validate_glm_5_2_dsa_fp8(
             ),
             (
                 "moe_runner_backend",
-                options.moe_runner_backend != "triton",
-                "GLM-5.2 DSA FP8 startup overlap requires --moe-runner-backend triton",
+                not _uses_triton_moe_runner(options),
+                "GLM-5.2 DSA FP8 startup overlap requires the Triton MoE runner",
             ),
             (
                 "fp8_gemm_backend",
                 options.fp8_gemm_runner_backend != "triton",
-                "GLM-5.2 DSA FP8 startup overlap requires --fp8-gemm-backend triton",
+                "GLM-5.2 DSA FP8 startup overlap is validated with Triton FP8 GEMM; "
+                "set --fp8-gemm-backend triton",
             ),
             (
                 "attention_backend",
@@ -659,17 +640,19 @@ def _validate_glm_5_2_dsa_fp8(
                 "dsa_attention_backend",
                 options.dsa_prefill_backend != "fa3"
                 or options.dsa_decode_backend != "fa3",
-                "GLM-5.2 DSA FP8 startup overlap requires FA3 for DSA prefill and decode",
+                "GLM-5.2 DSA FP8 startup overlap is validated with FA3 for DSA prefill and decode; "
+                "set --dsa-prefill-backend fa3 --dsa-decode-backend fa3",
             ),
             (
                 "kv_cache_dtype",
                 options.kv_cache_dtype != "bfloat16",
-                "GLM-5.2 DSA FP8 startup overlap requires --kv-cache-dtype bfloat16",
+                "GLM-5.2 DSA FP8 startup overlap is validated with BF16 KV cache; "
+                "set --kv-cache-dtype bfloat16",
             ),
             (
                 "prefill_cuda_graph",
                 options.prefill_cuda_graph_backend != Backend.DISABLED,
-                "GLM-5.2 DSA FP8 startup overlap requires prefill CUDA graphs disabled",
+                "GLM-5.2 DSA FP8 startup overlap is validated with prefill CUDA graphs disabled",
             ),
             (
                 "shared_experts_fusion",
@@ -718,7 +701,7 @@ def _validate_glm_5_2_dsa_fp8(
     )
 
 
-# Keep each profile narrow until its storage and startup behavior are validated.
+# Profiles bound validated coverage, not the limits of the overlap mechanism.
 _STARTUP_WEIGHT_LOAD_PROFILE_SPECS = (
     _StartupWeightLoadProfileSpec(
         profile=StartupWeightLoadProfile.NATIVE_DENSE,
@@ -1014,7 +997,7 @@ def evaluate_startup_weight_load_admission(
     load_config: LoadConfig,
     options: StartupWeightLoadOptions,
 ) -> StartupWeightLoadAdmission:
-    """Return an overlap plan or a deterministic preflight rejection report."""
+    """Check shared constraints and validated profile coverage before loading."""
 
     architectures = tuple(model_config.hf_config.architectures or ())
     rules = (
@@ -1100,16 +1083,6 @@ def evaluate_startup_weight_load_admission(
             "LoRA is not supported",
         ),
         (
-            "mmap_disabled",
-            options.weight_loader_disable_mmap,
-            "safetensors mmap must be enabled",
-        ),
-        (
-            "drop_page_cache",
-            options.weight_loader_drop_cache_after_load,
-            "dropping the page cache during load is not supported",
-        ),
-        (
             "custom_weight_loader",
             options.has_custom_weight_loader,
             "custom weight loaders are not supported",
@@ -1150,7 +1123,11 @@ def evaluate_startup_weight_load_admission(
         rejections.append(
             StartupWeightLoadRejection(
                 code="architecture",
-                message="exactly one supported model architecture is required",
+                message=(
+                    "exactly one model architecture is required"
+                    if architecture is None
+                    else f"model architecture {architecture!r} is not in the startup overlap registry"
+                ),
             )
         )
 
@@ -1383,9 +1360,9 @@ class StartupWeightLoadManager:
             self._prefetch_started_at - self._capture_ready_at,
         )
 
-    def finalize(self) -> StartupWeightLoadTimings:
+    def finalize(self) -> Optional[StartupWeightLoadTimings]:
+        """Return overlap timings, or None after serial fallback."""
         if self._state == StartupWeightLoadState.READY:
-            assert self._timings is not None
             return self._timings
         if self._state != StartupWeightLoadState.PREFETCHING:
             raise RuntimeError(
