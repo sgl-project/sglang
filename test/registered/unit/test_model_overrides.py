@@ -20,6 +20,7 @@ from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
+from sglang.srt.arg_groups.model_overrides import qwen3_vl as qwen3_vl_module
 from sglang.srt.arg_groups.overrides import (
     collect_model_override_declarations,
     register_model_override,
@@ -108,6 +109,10 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "prefill_decode_interval",
+                    "radix_eviction_policy",
+                    "mm_preprocess_cache_size_mb",
+                    "mm_feature_transport",
                 }
             ),
         )
@@ -615,16 +620,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # value: readers only ever read flags.
         self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "auto")
 
-    def test_qwen4_rejects_pd_and_unified_memory(self):
+    def test_qwen4_pd_support_and_remaining_limits(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        for kwargs, message in (
-            ({"disaggregation_mode": "prefill"}, "PD disaggregation"),
-            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
-            ({"enable_unified_memory": True}, "enable-unified-memory"),
-        ):
-            with self.subTest(**kwargs):
-                with self.assertRaisesRegex(ValueError, message):
-                    self._construct(*qwen4, **kwargs)
+        with override_platform(is_cuda=True):
+            for mode in ("prefill", "decode"):
+                with self.subTest(mode=mode):
+                    self._construct(*qwen4, disaggregation_mode=mode)
+
+            with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+                self._construct(*qwen4, enable_unified_memory=True)
+            with self.assertRaisesRegex(ValueError, "MORI requires --pp-size 1"):
+                self._construct(
+                    *qwen4,
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="mori",
+                    pp_size=2,
+                )
 
     def test_qwen4_ple_offload_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
@@ -3099,6 +3110,108 @@ class TestDeclarationValidation(CustomTestCase):
         args = _FakeArgs()
         with self.assertRaises(ValueError):
             validate_declarations(args, [("src", {"nope": 1})])
+
+
+class TestQwen3VLHopperServingOverrides(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(envs.SGLANG_VLM_CACHE_SIZE_MB.clear)
+        self.addCleanup(envs.SGLANG_MM_FEATURE_CACHE_MB.clear)
+        envs.SGLANG_VLM_CACHE_SIZE_MB.clear()
+        envs.SGLANG_MM_FEATURE_CACHE_MB.clear()
+
+    @staticmethod
+    def _args(**overrides):
+        from sglang.srt.server_args import ServerArgs
+
+        values = {
+            "mm_preprocess_cache_size_mb": None,
+            "mm_feature_transport": None,
+            "max_running_requests": 400,
+            "radix_eviction_policy": "lru",
+            "prefill_decode_interval": None,
+            "attention_backend": None,
+            "decode_attention_backend": None,
+        }
+        values.update(overrides)
+        return ServerArgs(model_path="dummy", **values)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_profiled_defaults_are_valid_model_overrides(self, _mock_model_type):
+        server_args = self._args()
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(server_args, None)
+
+        self.assertEqual(
+            updates,
+            {
+                "mm_preprocess_cache_size_mb": 0,
+                "mm_feature_transport": "cuda_ipc",
+                "radix_eviction_policy": "priority",
+                "prefill_decode_interval": 22,
+                "decode_attention_backend": "flashinfer",
+            },
+        )
+        validate_declarations(
+            server_args,
+            [("_qwen3vl_hopper_serving_overrides", updates)],
+        )
+        self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 0)
+        self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 3 * 1024)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_multinode_does_not_auto_select_cuda_ipc(self, _mock_model_type):
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
+            self._args(nnodes=2), None
+        )
+
+        self.assertNotIn("mm_feature_transport", updates)
+        self.assertFalse(envs.SGLANG_MM_FEATURE_CACHE_MB.is_set())
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        side_effect=AssertionError("must not load model config without GPU memory"),
+    )
+    def test_decode_graph_expansion_skips_unknown_gpu_memory(self, _mock_model_type):
+        decode_config = SimpleNamespace(max_bs=256)
+
+        qwen3_vl_module.expand_multimodal_decode_graph_to_running_limit(
+            self._args(), decode_config, gpu_mem=None
+        )
+
+        self.assertEqual(decode_config.max_bs, 256)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_explicit_choices_are_not_replaced(self, _mock_model_type):
+        envs.SGLANG_VLM_CACHE_SIZE_MB.set(512)
+        envs.SGLANG_MM_FEATURE_CACHE_MB.set(2048)
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
+            self._args(
+                mm_preprocess_cache_size_mb=256,
+                mm_feature_transport="cpu",
+                radix_eviction_policy="lru",
+                _radix_eviction_policy_explicitly_set=True,
+                prefill_decode_interval=0,
+                decode_attention_backend="fa3",
+            ),
+            None,
+        )
+
+        self.assertEqual(updates, {})
+        self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
+        self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
 if __name__ == "__main__":
