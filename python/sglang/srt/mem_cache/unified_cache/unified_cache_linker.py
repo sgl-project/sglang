@@ -42,7 +42,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.utils import get_hash_str
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -279,7 +279,7 @@ class UnifiedCacheLinkerWrapper:
         tail_len = (len(key) - device_hit_len) // page * page
         if tail_len == 0:
             return []
-        return get_hash_str(
+        return get_storage_hash_str(
             key[device_hit_len : device_hit_len + tail_len],
             last_hash,
             page_size=page,
