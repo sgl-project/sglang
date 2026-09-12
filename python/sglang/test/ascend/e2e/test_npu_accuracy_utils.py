@@ -125,7 +125,7 @@ def run_evalscope(
     result_path = "./evalscope_result" if not metrics_path else metrics_path
     logger.info(f"The metrics result file: {result_path}")
 
-    api_url = f"http://{host}:{port}/v1/chat/completions"
+    api_url = f"http://{host}:{port}/v1"
 
     if generation_config is None:
         generation_config = {"max_tokens": 512}

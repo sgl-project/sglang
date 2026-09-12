@@ -79,7 +79,10 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--chunked-prefill-size",
     131072,
     "--max-running-requests",
-    96,
+    # 5 * dp_size(16) = 80: cap per-DP-rank concurrency at 5. A rank reaching
+    # 6 running requests replays the bs=6 decode graph, which corrupts global
+    # state and permanently collapses the DSPARK accept rate to ~0.01.
+    80,
     "--dp-size",
     16,
     "--enable-dp-attention",
@@ -115,10 +118,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
 
 
 DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH = {
-    # TEMPORARY: lowered from 120000; 24576 covers the thinking long-tail
-    # while staying below the ~30k-45k seq-length boundary where the DSPARK
-    # accept rate collapses.
-    "max_tokens": 24576,
+    "max_tokens": 120000,
     "top_p": 1,
     "temperature": 1,
     "extra_body": {
