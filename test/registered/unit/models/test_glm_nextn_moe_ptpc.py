@@ -35,9 +35,7 @@ PREFIX = f"model.layers.{LAYER}"
 EXPERT_LEAF = f"{PREFIX}.mlp.experts.0.w1"
 ATTN_LEAF = f"{PREFIX}.self_attn.q_proj"
 EXPERT_WEIGHT = f"{PREFIX}.mlp.experts.0.gate_proj.weight"
-_PTPC_ENV = (
-    "sglang.srt.models.deepseek_common.utils.envs.SGLANG_GLM_NEXTN_MOE_PTPC.get"
-)
+_PTPC_ENV = "sglang.srt.models.deepseek_common.utils.envs.SGLANG_GLM_NEXTN_MOE_PTPC.get"
 
 
 def _quark_cfg(*, exclude=None, layer_quant=None):
