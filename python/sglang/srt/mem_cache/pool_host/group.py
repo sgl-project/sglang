@@ -43,6 +43,7 @@ class HostPoolGroup:
         self.anchor_entry = anchors[0] if anchors else entries[0]
 
         self.layout = self.anchor_entry.host_pool.layout
+        self.dtype = self.anchor_entry.host_pool.dtype
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size

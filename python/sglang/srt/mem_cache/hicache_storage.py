@@ -40,6 +40,7 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    kv_cache_dtype: Optional[str] = None
 
 
 @dataclass
@@ -399,6 +400,8 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        if storage_config.kv_cache_dtype is not None:
+            self.config_suffix += f"_dtype_{storage_config.kv_cache_dtype}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
