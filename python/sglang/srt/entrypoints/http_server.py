@@ -785,7 +785,7 @@ async def model_info():
             config=resolving_view(_global_state.tokenizer_manager.server_args),
             model_config=model_config,
         )
-    return result
+    return msgspec_to_builtins(result)
 
 
 @app.get("/get_weight_version")
