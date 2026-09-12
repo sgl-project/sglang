@@ -275,7 +275,7 @@
         "flux2_modelopt_fp8_tp2_t2i": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2089.62,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 75.4
@@ -291,7 +291,7 @@
         "ideogram4_fp8_tp2_t2i": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 8975.57,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 60.8
@@ -3180,7 +3180,7 @@
         "wan2_2_t2v_a14b_teacache_2gpu": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 82478.23,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 186.4
@@ -3188,7 +3188,7 @@
         "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu": {
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 1077.99,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 52.2
