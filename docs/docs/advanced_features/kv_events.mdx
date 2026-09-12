@@ -1,0 +1,150 @@
+---
+title: "KV Cache Events"
+metatags:
+    description: "Subscribe to SGLang's KV cache event stream: event types, the msgspec wire format, replay, and the cache_salt metadata a salted request attaches to stored blocks."
+---
+
+SGLang can publish a live stream of KV cache placement events. The events provide data like which token blocks a
+replica just stored, which it evicted and when it cleared everything. KV aware routers
+(the [SGLang model gateway](./sgl_model_gateway), [llm-d](./llm-d), NVIDIA Dynamo)
+subscribe to it to keep a global index of where each prefix lives, so they can route a
+request to the replica that already holds its prefix.
+
+## Enabling the stream
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --kv-events-config '{"publisher": "zmq", "endpoint": "tcp://*:5557", "topic": "kv-events"}'
+```
+
+| Field | Meaning |
+| --- | --- |
+| `publisher` | `zmq` to publish, `null` to disable (default). |
+| `endpoint` | PUB address. A wildcard host (`tcp://*:5557`) binds. A concrete host connects. |
+| `replay_endpoint` | Optional ROUTER address for replaying missed batches. |
+| `buffer_steps` | Batches retained for replay (default `10000`). |
+| `hwm` | ZeroMQ high-water mark. Batches are dropped past it if a consumer falls behind. |
+| `max_queue_size` | In-memory publish queue depth. |
+| `topic` | SUB filter prefix. Empty subscribes to everything. |
+
+Each independent KV cache publishes on its own port, rank `r` binds `port + r`. Rather
+than hard coding that, read the `kv_events` block from `/server_info` which reports
+`endpoint_host`, `endpoint_port_base`, `topic`, `block_size` and `dp_size`. Substitute
+the worker's own host when `endpoint_host` is a wildcard.
+
+## Frames on the wire
+
+The publisher sends three ZeroMQ frames per batch: the topic, an 8-byte big-endian
+sequence number and a [msgspec](https://jcristharif.com/msgspec/) msgpack payload
+holding one `KVEventBatch`. Sequence numbers are monotonic per publisher, so a consumer
+can detect a gap and ask the replay ROUTER for the missing range (send the starting
+sequence number as 8 big-endian bytes. The reply is a stream of `(seq, payload)` pairs
+terminated by `(-1, b"")`).
+
+A batch carries `ts`, `attn_dp_rank`, and a list of events:
+
+| Event | Fields | Meaning |
+| --- | --- | --- |
+| `BlockStored` | `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`, `lora_id`, `medium` | Blocks became resident. `parent_block_hash` links the first block to the prefix it extends, so consumers can rebuild the tree. |
+| `BlockRemoved` | `block_hashes`, `medium` | Blocks were evicted. |
+| `AllBlocksCleared` | — | The whole cache was reset. |
+
+`medium` names the tier: `GPU`, `CPU_PINNED`, `DISK` or `EXTERNAL`.
+
+## Decoding a batch
+
+```python
+import msgspec
+import zmq
+
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStoredView,
+    KVEventBatchView,
+)
+
+decoder = msgspec.msgpack.Decoder(KVEventBatchView)
+
+socket = zmq.Context.instance().socket(zmq.SUB)
+socket.connect("tcp://127.0.0.1:5557")
+socket.setsockopt_string(zmq.SUBSCRIBE, "kv-events")
+
+while True:
+    _topic, _seq, payload = socket.recv_multipart()
+    batch = decoder.decode(payload)
+    for event in batch.events:
+        if isinstance(event, BlockStoredView):
+            index(event.block_hashes, salt=event.cache_salt)
+        elif isinstance(event, BlockRemoved):
+            forget(event.block_hashes)
+        elif isinstance(event, AllBlocksCleared):
+            forget_all()
+```
+
+`KVEventBatchView` is the consumer side type. It decodes every shape the publisher emits,
+including the salted stores described below. `KVEventBatch` is the publisher side type.
+It also decodes the stream but reports salted stores as a plain `BlockStored` with the
+salt dropped.
+
+## Salted blocks
+
+A request may pass `cache_salt` to keep its prefixes in a namespace of their own, so two
+tenants sending the same prompt do not share cache entries:
+
+```python
+import requests
+
+requests.post(
+    "http://127.0.0.1:30000/v1/chat/completions",
+    json={
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "messages": [{"role": "user", "content": "Summarize the attached contract."}],
+        "cache_salt": "tenant-a",
+    },
+)
+```
+
+Blocks stored for a salted request carry the salt as trailing metadata:
+
+```python
+event.cache_salt        # "tenant-a", or None for an unsalted request
+event.metadata          # BlockStoredMetadata(cache_salt="tenant-a"), or None
+```
+
+What to expect from the stream:
+
+- **Only `BlockStored` carries it.** Every block of every node stored for a salted
+  request repeats the salt. `BlockRemoved` and `AllBlocksCleared` do not carry metadata
+  and do not need to.
+- **Hashes are salt namespaced, not salt disambiguated.** The salt seeds the hash chain
+  (`sha256(b"sglang-cache-salt-v1\0" + salt)`), so a salted prefix and the identical
+  unsalted prefix produce entirely different `block_hashes`. Hashes are therefore unique
+  across tenants on their own which is why a later `BlockRemoved` needs no salt to be
+  unambiguous.
+- **Index the hashes you receive, do not recompute them.** A consumer cannot derive a
+  block hash from `token_ids` plus `cache_salt`. The chain is SGLang's and it differs
+  from other engines'. Treat `cache_salt` as a label on an emitted hash, not as an input
+  to a shared key derivation function.
+- **The salt is client supplied and echoed on the PUB socket.** It identifies the tenant
+  a block belongs to. Keep the socket on a trusted network, and think of the salt as you
+  would any tenant identifier when logging or forwarding it.
+
+<Note>
+`cache_salt` namespaces the in-process radix tree and the KV event hashes. Keys written
+to external HiCache L3 / remote storage backends are derived from tokens only, so the
+salt does not isolate cache entries at that tier.
+</Note>
+
+## Compatibility
+
+Salted stores extend the `BlockStored` array with one trailing element rather than adding
+a field to every event, so an unsalted event keeps its exact legacy shape. A consumer
+built against the older, unsalted schema keeps working unchanged. It reads the elements
+it knows and ignores the trailing metadata. Reading the salt is opt-in by decoding
+`KVEventBatchView` instead of `KVEventBatch`.
+
+The view is decode only. Publishers must emit `BlockStored` or `BlockStoredWithMetadata`.
+Encoding a `BlockStoredView` that has no metadata appends a trailing `null` that
+legacy consumers do not expect.

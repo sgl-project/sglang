@@ -1,30 +1,65 @@
-"""Unit tests for srt/disaggregation/kv_events KV-event publisher rank selection.
+"""Unit tests for srt/disaggregation/kv_events publisher rank selection and
+the KV event wire contract.
 
 Covers the data-parallel rank used to offset each scheduler's KV-event
 publisher port, across pure DP, DP-attention, and single-replica modes. The
 port offset must make every independent KV cache publish on a distinct port so
 the router can subscribe per replica (the `dp_size` it reads from
 `/server_info`).
+
+Also covers the two array shapes a `BlockStored` event takes on the wire:
+salted and unsalted. The consumer side type that decodes both is included also.
 """
 
+import hashlib
+import time
 import unittest
+import uuid
+from array import array
+from typing import Union
+from unittest.mock import Mock, patch
 
 import msgspec
+import torch
+import zmq
 
 from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
     BlockStored,
     BlockStoredMetadata,
+    BlockStoredView,
     BlockStoredWithMetadata,
     KVEventBatch,
+    KVEventBatchView,
     StorageMedium,
     ZmqEventPublisher,
     resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+
+
+def _block_stored(cache_salt=None, *, block_hashes=(123,), token_ids=(1, 2)):
+    """A BlockStored in the shape its producer would emit it."""
+    kwargs = dict(
+        block_hashes=list(block_hashes),
+        parent_block_hash=None,
+        token_ids=list(token_ids),
+        block_size=len(token_ids),
+        lora_id=None,
+        medium=StorageMedium.GPU,
+    )
+    if cache_salt is None:
+        return BlockStored(**kwargs)
+    return BlockStoredWithMetadata(
+        **kwargs, metadata=BlockStoredMetadata(cache_salt=cache_salt)
+    )
 
 
 class TestResolveLoadPubRange(CustomTestCase):
@@ -187,18 +222,7 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
 
 class TestBlockStoredWireFormat(CustomTestCase):
     def _event(self, metadata=None):
-        event_type = BlockStored if metadata is None else BlockStoredWithMetadata
-        kwargs = dict(
-            block_hashes=[123],
-            parent_block_hash=None,
-            token_ids=[1, 2],
-            block_size=2,
-            lora_id=None,
-            medium=StorageMedium.GPU,
-        )
-        if metadata is not None:
-            kwargs["metadata"] = metadata
-        return event_type(**kwargs)
+        return _block_stored(None if metadata is None else metadata.cache_salt)
 
     def test_unsalted_event_keeps_legacy_array_shape(self):
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(self._event()))
@@ -222,6 +246,256 @@ class TestBlockStoredWireFormat(CustomTestCase):
             msgspec.msgpack.encode(batch), type=KVEventBatch
         )
         self.assertEqual(round_tripped.events[0].block_hashes, [123])
+
+
+class _WithMetadataBatch(KVEventBatch):
+    """The batch a consumer reaches for first. The producer's metadata struct
+    which rejects every unsalted event on the same stream."""
+
+    events: list[BlockStoredWithMetadata]
+
+
+class _AmbiguousBatch(KVEventBatch):
+    """Both producer structs in one union. Rejected for duplicate tags."""
+
+    events: list[Union[BlockStored, BlockStoredWithMetadata]]
+
+
+class TestBlockStoredViewDecoding(CustomTestCase):
+    """The consumer side shape for a stream that mixes salted and unsalted stores.
+
+    A salted request appends a metadata element under the same "BlockStored"
+    tag, so one stream carries two array lengths. Each producer struct reads
+    exactly one of them and the two cannot share a union which left the salt
+    undecodable by any exported type. `BlockStoredView` is what a consumer
+    decodes instead.
+    """
+
+    @staticmethod
+    def _payload(*events):
+        return msgspec.msgpack.encode(KVEventBatch(ts=1.0, events=list(events)))
+
+    def test_producer_structs_cannot_decode_a_mixed_stream(self):
+        # The metadata struct rejects the unsalted events
+        # sharing its stream and msgspec rejects the union that would have
+        # covered both shapes together.
+        with self.assertRaises(msgspec.ValidationError):
+            msgspec.msgpack.decode(
+                self._payload(_block_stored()), type=_WithMetadataBatch
+            )
+        with self.assertRaises(TypeError):
+            msgspec.msgpack.Decoder(_AmbiguousBatch)
+
+    def test_view_decodes_both_shapes_from_one_stream(self):
+        payload = self._payload(
+            _block_stored(block_hashes=(11,)),
+            _block_stored("tenant-a", block_hashes=(22,)),
+            BlockRemoved(block_hashes=[11], medium=StorageMedium.GPU),
+            AllBlocksCleared(),
+        )
+        batch = msgspec.msgpack.Decoder(KVEventBatchView).decode(payload)
+
+        self.assertEqual(
+            [type(event) for event in batch.events],
+            [BlockStoredView, BlockStoredView, BlockRemoved, AllBlocksCleared],
+        )
+        self.assertEqual(
+            [event.cache_salt for event in batch.events[:2]], [None, "tenant-a"]
+        )
+        self.assertEqual(
+            [event.block_hashes[0] for event in batch.events[:2]], [11, 22]
+        )
+
+    def test_view_keeps_every_legacy_field_positioned(self):
+        # The optional element is appended, so both array lengths must still
+        # land each legacy field on the same attribute.
+        for salt in (None, "tenant-a"):
+            with self.subTest(cache_salt=salt):
+                payload = self._payload(
+                    _block_stored(salt, block_hashes=(11,), token_ids=(7, 8, 9))
+                )
+                event = (
+                    msgspec.msgpack.Decoder(KVEventBatchView).decode(payload).events[0]
+                )
+
+                self.assertEqual(event.block_hashes, [11])
+                self.assertIsNone(event.parent_block_hash)
+                self.assertEqual(event.token_ids, [7, 8, 9])
+                self.assertEqual(event.block_size, 3)
+                self.assertIsNone(event.lora_id)
+                self.assertEqual(event.medium, StorageMedium.GPU)
+                self.assertEqual(event.cache_salt, salt)
+
+    def test_view_stays_a_block_stored_subclass(self):
+        # Consumers branch on isinstance(event, BlockStored). Redeclaring the
+        # view as a standalone struct would silently drop them into the
+        # unhandled event branch.
+        self.assertTrue(issubclass(BlockStoredView, BlockStored))
+
+    def test_view_is_not_wire_safe_to_publish(self):
+        # Pins why the producer keeps two structs. omit_defaults does not trim
+        # a trailing default in an array_like struct, so publishing the view
+        # would append a null that legacy 7 element consumers do not expect.
+        view = BlockStoredView(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=[1, 2],
+            block_size=2,
+            lora_id=None,
+            medium=StorageMedium.GPU,
+        )
+        self.assertEqual(len(msgspec.msgpack.decode(msgspec.msgpack.encode(view))), 8)
+
+
+class TestKVEventStreamRoundTrip(CustomTestCase):
+    """Real cache -> publisher -> ZMQ -> consumer, over a mixed salt stream.
+
+    Guards the path the issue reports as broken end to end. A subscriber to a
+    live stream could read the block hashes but never the salt that namespaces
+    them because no exported type decoded both event shapes. One capture
+    serves every case below and the frame is the fixture.
+    """
+
+    TOPIC = "kv-events"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.events = cls._record_real_events()
+        cls.payload = cls._round_trip(cls.events)
+
+    @staticmethod
+    def _page_hashes(token_ids, prior_hash=None, page_size=None):
+        """Pure python stand-in for ``get_hash_str``.
+
+        The native page hash is a JIT compiled, Linux only C++ extension. The
+        wire contract under test does not depend on which digest it produces,
+        only on the recorder chaining and namespacing them.
+        """
+
+        def digest(chunk, prior):
+            hasher = hashlib.sha256()
+            if prior:
+                hasher.update(bytes.fromhex(prior))
+            for token in chunk:
+                for element in token if isinstance(token, tuple) else (token,):
+                    hasher.update(int(element).to_bytes(4, "little", signed=False))
+            return hasher.hexdigest()
+
+        if page_size is None:
+            return digest(token_ids, prior_hash)
+        hashes = []
+        running = prior_hash
+        for start in range(0, len(token_ids), page_size):
+            running = digest(token_ids[start : start + page_size], running)
+            hashes.append(running)
+        return hashes
+
+    @classmethod
+    def _record_real_events(cls):
+        """Drive a real RadixCache: one unsalted request, two tenants, evict."""
+        allocator = Mock()
+        allocator.device = torch.device("cpu")
+        with patch("sglang.srt.mem_cache.utils.get_hash_str", cls._page_hashes):
+            cache = RadixCache.create_simulated(
+                mock_allocator=allocator, page_size=4, enable_kv_cache_events=True
+            )
+            cache.take_events()  # drop the AllBlocksCleared from construction
+
+            for tokens, salt in (
+                ([1, 2, 3, 4, 5, 6, 7, 8], None),
+                ([1, 2, 3, 4, 9, 10, 11, 12], "tenant-a"),
+                ([21, 22, 23, 24], "tenant-b"),
+            ):
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", tokens), cache_salt=salt),
+                        value=torch.tensor(tokens, dtype=torch.int64),
+                    )
+                )
+            cache.evict(EvictParams(num_tokens=4))
+            return cache.take_events()
+
+    @classmethod
+    def _round_trip(cls, events):
+        """Publish through a real ZmqEventPublisher and return the raw frame."""
+        endpoint = f"inproc://kv-events-{uuid.uuid4().hex}"
+        publisher = ZmqEventPublisher(
+            attn_dp_rank=0, endpoint=endpoint, topic=cls.TOPIC
+        )
+        cls.addClassCleanup(publisher.shutdown)
+        subscriber = zmq.Context.instance().socket(zmq.SUB)
+        cls.addClassCleanup(subscriber.close, 0)
+        subscriber.connect(endpoint)
+        subscriber.setsockopt_string(zmq.SUBSCRIBE, cls.TOPIC)
+
+        # PUB drops whatever is sent before the subscription propagates, so
+        # republish until a frame arrives.
+        payload = None
+        deadline = time.monotonic() + 30
+        while payload is None and time.monotonic() < deadline:
+            publisher.publish(KVEventBatch(ts=time.time(), events=events))
+            if subscriber.poll(200):
+                _topic, _seq, payload = subscriber.recv_multipart()
+        if payload is None:
+            raise AssertionError("publisher delivered no frame")
+        while subscriber.poll(100):  # drain the republished duplicates
+            subscriber.recv_multipart()
+        return payload
+
+    def _decode(self, batch_type):
+        return msgspec.msgpack.Decoder(batch_type).decode(self.payload)
+
+    def test_salted_stream_round_trips_to_a_typed_consumer(self):
+        produced = [event for event in self.events if isinstance(event, BlockStored)]
+        self.assertEqual(
+            [type(event) for event in produced],
+            [BlockStored, BlockStoredWithMetadata, BlockStoredWithMetadata],
+        )
+
+        batch = self._decode(KVEventBatchView)
+        stored = [event for event in batch.events if isinstance(event, BlockStoredView)]
+        self.assertEqual(
+            [event.cache_salt for event in stored], [None, "tenant-a", "tenant-b"]
+        )
+        self.assertEqual(
+            [event.block_hashes for event in stored],
+            [event.block_hashes for event in produced],
+        )
+        self.assertTrue(
+            any(isinstance(event, BlockRemoved) for event in batch.events),
+            "eviction should reach the consumer as BlockRemoved",
+        )
+
+    def test_salt_namespaces_the_hashes_a_consumer_indexes(self):
+        # The salted request shares a 4 token prefix with the unsalted one yet
+        # emits its own chain. Consumers must index emitted hashes per salt,
+        # not treat an equal prefix as an equal block.
+        stored = [
+            event
+            for event in self._decode(KVEventBatchView).events
+            if isinstance(event, BlockStoredView)
+        ]
+        unsalted, salted = stored[0], stored[1]
+
+        self.assertEqual(unsalted.token_ids[:4], salted.token_ids[:4])
+        self.assertNotEqual(unsalted.block_hashes[0], salted.block_hashes[0])
+
+    def test_legacy_consumers_still_decode_the_same_frame(self):
+        # The fix is decoder side only. The bytes a legacy KVEventBatch
+        # consumer sees must be unchanged, salt or no salt.
+        legacy = self._decode(KVEventBatch)
+        view = self._decode(KVEventBatchView)
+
+        self.assertEqual(
+            [event.block_hashes for event in legacy.events],
+            [event.block_hashes for event in view.events],
+        )
+        self.assertFalse(
+            any(isinstance(event, BlockStoredView) for event in legacy.events),
+            "moving the view into KVEventBatch would change what legacy "
+            "consumers decode",
+        )
 
 
 if __name__ == "__main__":

@@ -301,11 +301,65 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
-    # BlockStoredWithMetadata deliberately stays out of this tagged union.
-    # Existing typed consumers decode its shared "BlockStored" tag as the base
-    # type and ignore the trailing metadata; adding both types would give
-    # msgspec duplicate tags and make the union invalid.
+    """Publisher side batch which defines the shape the scheduler encodes onto the wire.
+
+    `BlockStoredWithMetadata` deliberately stays out of this tagged union.
+    Existing typed consumers decode its shared "BlockStored" tag as the base
+    type and ignore the trailing metadata. Adding both types would give msgspec
+    duplicate tags and make the union invalid.
+
+    Consumers that need that metadata decode `KVEventBatchView` instead. It is the same
+    wire bytes, one shape that accepts both.
+    """
+
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
+
+
+class BlockStoredView(BlockStored, tag="BlockStored", kw_only=True):
+    """Decoder side view of a stored block event, salted or not.
+
+    One "BlockStored" tag carries two array shapes. The legacy 7 element form
+    and the 8 element form a salted request appends a `BlockStoredMetadata` to.
+    Neither producer struct reads both. The base one is blind to the trailing
+    element, the metadata one rejects events without it. They cannot share a union,
+    since msgspec requires unique tags. This view is the consumer counterpart.
+    `metadata` is optional, so one decoder handles a mixed stream.
+
+    Decode only. Encoding a view whose `metadata` is None`` appends a
+    trailing `null` that legacy 7 element readers do not expect
+    (`omit_defaults` does not trim trailing defaults in `array_like`
+    structs), so publish `BlockStored` / `BlockStoredWithMetadata` instead.
+    """
+
+    metadata: Optional[BlockStoredMetadata] = None
+
+    @property
+    def cache_salt(self) -> Optional[str]:
+        """Salt of the request that stored these blocks or `None`.
+
+        Identifies which tenant namespace the hashes belong to. It is not an
+        input a consumer can recompute an emitted hash from. The salt seeds
+        the hash chain, so consumers must index the hashes as emitted.
+        """
+        return self.metadata.cache_salt if self.metadata is not None else None
+
+
+class KVEventBatchView(EventBatch):
+    """Decoder side counterpart of `KVEventBatch`.
+
+    Decodes the bytes a publisher emits and additionally surfaces the
+    `cache_salt` a salted `BlockStored` carries::
+
+        batch = msgspec.msgpack.Decoder(KVEventBatchView).decode(payload)
+        for event in batch.events:
+            if isinstance(event, BlockStoredView):
+                index(event.block_hashes, salt=event.cache_salt)
+
+    `BlockStoredView` subclasses `BlockStored`, so consumers already
+    branching on the producer types keep working unchanged.
+    """
+
+    events: list[Union[BlockStoredView, BlockRemoved, AllBlocksCleared]]
 
 
 class EventPublisher(ABC):
