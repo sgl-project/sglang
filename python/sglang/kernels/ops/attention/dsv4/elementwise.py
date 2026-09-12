@@ -73,6 +73,25 @@ def _jit_main_k_norm_rope_flashmla_module(
 
 
 @cache_once
+def _jit_main_k_norm_rope_q_flashmla_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+):
+    """ROCm only: the K kernel above with the in-place query rope in the same launch."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_k_norm_rope_q_flashmla_hip"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope_hip.cuh"],
+        cuda_wrappers=[
+            ("forward_with_q", f"FusedKNormRopeQFlashMLAKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
     args = make_cpp_args(dtype, is_arch_support_pdl())
@@ -278,19 +297,29 @@ def fused_k_norm_rope_flashmla(
     kvcache: torch.Tensor,
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
+    q: Optional[torch.Tensor] = None,
 ) -> None:
-    """RMSNorm + RoPE ``kv`` and write it into the paged FlashMLA cache at ``out_loc``.
+    """RMSNorm + RoPE KV and store it in the selected paged cache layout.
 
-    ``layout`` selects the page format: the 584-byte V4 layout, or the V4.1 fp8
-    (528 B) / fp4 (288 B) formats, in which every dim is quantized."""
+    On HIP, optional query heads are rotated in place by the same launch.
+    """
     layout = KVLayout.parse(layout)
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
         assert layout is KVLayout.V4, "the V4.1 KV layouts are CUDA (sm100) only"
+        assert q is None, "the XPU K kernel does not rope q"
         fused_k_norm_rope_flashmla_xpu(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
+        )
+    elif q is not None:
+        assert layout is KVLayout.V4, "fused HIP query RoPE requires the V4 KV layout"
+        module = _jit_main_k_norm_rope_q_flashmla_module(
+            kv.dtype, head_dim, rope_dim, page_size
+        )
+        module.forward_with_q(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, q
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(
