@@ -2,8 +2,11 @@ import logging
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -180,6 +183,37 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                                         max_new_tokens=requested, input_len=input_len
                                     )
                                     self._init_and_check(scheduler, req)
+
+    def test_unified_budget_rounds_prompt_and_decode_together(self):
+        bundle = init_unified_swa_pools(
+            device="cpu",
+            kv_cache_dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            v_head_dim=4,
+            swa_head_num=1,
+            swa_head_dim=4,
+            swa_v_head_dim=4,
+            page_size=4,
+            start_layer=0,
+            end_layer=2,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            total_bytes=384,
+            enable_memory_saver=False,
+            need_sort=False,
+            lazy_compaction=True,
+        )
+        scheduler = self._new_scheduler(page_size=4)
+        scheduler.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
+        scheduler.sliding_window_size = 4
+        scheduler.chunked_prefill_size = 4
+        scheduler.max_new_tokens_limit = None
+        for prompt_len in (4, 5, 6, 7):
+            with self.subTest(prompt_len=prompt_len):
+                req = self._new_req(max_new_tokens=1, input_len=prompt_len)
+                scheduler.init_req_max_new_tokens(req)
+                self.assertEqual(req.sampling_params.max_new_tokens, 1)
 
 
 if __name__ == "__main__":
