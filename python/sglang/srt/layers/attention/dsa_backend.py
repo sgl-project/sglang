@@ -3541,14 +3541,25 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
-        self._multi_ctas_kv_counter_buffer = (
-            grow_multi_ctas_kv_counter_buffer_if_needed(
-                self._multi_ctas_kv_counter_buffer,
-                torch.device(self.device),
-                self.num_q_heads,
-                batch_size,
-            )
+        # batch_size is query rows, so a prefill batch wider than
+        # TRTLLM_MLA_MAX_BATCH_SIZE lands here and grows the counter -- routine,
+        # not hypothetical. Rebinding the attribute would free the allocation the
+        # decode graphs captured, so the oversized case takes a temporary.
+        multi_ctas_kv_counter_buffer = grow_multi_ctas_kv_counter_buffer_if_needed(
+            self._multi_ctas_kv_counter_buffer,
+            torch.device(self.device),
+            self.num_q_heads,
+            batch_size,
         )
+
+        # A grow during capture would bake a temporary's address into the graph.
+        # Unreachable in practice -- the buffer is sized for
+        # max(TRTLLM_MLA_MAX_BATCH_SIZE, max_running_requests) -- so assert rather
+        # than handle it.
+        assert (
+            multi_ctas_kv_counter_buffer is self._multi_ctas_kv_counter_buffer
+            or not torch.cuda.is_current_stream_capturing()
+        ), "multi_ctas_kv_counter_buffer grew during CUDA graph capture"
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
@@ -3570,7 +3581,7 @@ class DeepseekSparseAttnBackend(
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             sparse_mla_top_k_lens=sparse_mla_top_k_lens,
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
         return out
