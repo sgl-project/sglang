@@ -68,7 +68,15 @@ def speculative_sampling_classic_kernel(
 
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
 
-        if coin * q < p:
+        # X was sampled from q, so q(X) has to be a positive probability.
+        # Anything else means this row is not the distribution X came from, and
+        # `coin * q < p` would then accept unconditionally -- -inf < p for an
+        # -inf q, 0 < p for a zero one, and the range guard the residual passes
+        # use lets zero through. Reject instead: the residual path resamples
+        # from the target, which is the safe direction to fail in.
+        q_is_prob = (q > 0.0) & (q <= 1.0)
+
+        if q_is_prob & (coin * q < p):
             num_accept += 1
             cur_prob_row = step
             tl.store(Predicts + last_accepted_global_idx, draft_token)
