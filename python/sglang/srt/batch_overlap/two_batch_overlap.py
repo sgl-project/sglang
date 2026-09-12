@@ -696,6 +696,7 @@ class TboForwardBatchPreparer:
             output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
                 start_token_index:end_token_index
             ]
+        output_dict["out_cache_loc_id_space"] = batch.out_cache_loc_id_space
 
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
