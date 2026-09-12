@@ -165,7 +165,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertFalse(info.is_dummy())
+        self.assertFalse(info.is_dummy)
 
     def test_empty_indices_without_decode_prefix_is_dummy(self):
         info = TransferInfo.from_zmq(
@@ -182,7 +182,106 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertTrue(info.is_dummy())
+        self.assertTrue(info.is_dummy)
+
+    def test_explicit_dummy_frame_true_is_dummy(self):
+        # msg[9] is the explicit is_dummy frame the sender writes
+        # (str(int(is_dummy))); it wins over payload inference.
+        info = TransferInfo.from_zmq(
+            [
+                b"11",
+                b"127.0.0.1",
+                b"12349",
+                b"agent",
+                np.array([], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"0",
+                b"1",
+            ]
+        )
+
+        self.assertTrue(info.is_dummy)
+
+    def test_explicit_dummy_frame_true_with_prefix_hit_stays_dummy(self):
+        # A dummy rank whose request also has a decode-side prefix hit: the
+        # sender sends decode_prefix_len unconditionally, so only the explicit
+        # frame distinguishes this from a real full-prefix-hit transfer.
+        info = TransferInfo.from_zmq(
+            [
+                b"12",
+                b"127.0.0.1",
+                b"12350",
+                b"agent",
+                np.array([], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"128",
+                b"1",
+            ]
+        )
+
+        self.assertTrue(info.is_dummy)
+
+    def test_explicit_dummy_frame_false_with_empty_indices_is_real(self):
+        # Full prefix hit as the sender encodes it: empty kv indices,
+        # decode_prefix_len > 0, explicit is_dummy 0.
+        info = TransferInfo.from_zmq(
+            [
+                b"13",
+                b"127.0.0.1",
+                b"12351",
+                b"agent",
+                np.array([], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"128",
+                b"0",
+            ]
+        )
+
+        self.assertFalse(info.is_dummy)
+
+    def test_explicit_dummy_frame_false_for_real_transfer(self):
+        info = TransferInfo.from_zmq(
+            [
+                b"14",
+                b"127.0.0.1",
+                b"12352",
+                b"agent",
+                np.array([3, 5], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"0",
+                b"0",
+            ]
+        )
+
+        self.assertFalse(info.is_dummy)
+
+    def test_fallback_without_dummy_frame_reads_prefix_hit_dummy_as_real(self):
+        # Old-peer fallback: without msg[9], a dummy rank with a decode-side
+        # prefix hit is indistinguishable from a real full-prefix-hit transfer
+        # and parses as real. The explicit frame above exists for this case.
+        info = TransferInfo.from_zmq(
+            [
+                b"15",
+                b"127.0.0.1",
+                b"12353",
+                b"agent",
+                np.array([], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"128",
+            ]
+        )
+
+        self.assertFalse(info.is_dummy)
 
 
 class TestNixlKVArgsRegisterInfo(CustomTestCase):
@@ -749,10 +848,9 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.update_transfer_status.assert_called_once_with()
         mgr.record_failure.assert_not_called()
         mgr.update_status.assert_not_called()
-        self.assertNotIn(11, mgr.transfer_statuses)
 
     @patch("sglang.srt.disaggregation.nixl.conn.time.time")
-    def test_transfer_done_returns_success_and_cleans_room_state(self, mock_time):
+    def test_transfer_done_returns_success_and_clear_drops_room_state(self, mock_time):
         mock_time.return_value = 12.0
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
         receiver.started_transfer = True
@@ -765,9 +863,16 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.check_transfer_done.return_value = True
 
         self.assertEqual(receiver.poll(), KVPoll.Success)
+        self.assertEqual(receiver.conclude_state, KVPoll.Success)
+
+        # poll() only concludes now; dropping room state is left to clear(), the
+        # way mooncake and mori already do it. The scheduler calls clear() as
+        # soon as poll() reports Success or Failed, so both terminal paths clean
+        # up -- the cleanup that used to live in poll() ran on Success only.
+        receiver.clear()
+
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
-        self.assertEqual(receiver.conclude_state, KVPoll.Success)
 
 
 class TestNixlNodeFailure(CustomTestCase):
