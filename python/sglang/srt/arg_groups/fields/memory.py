@@ -211,6 +211,29 @@ class Memory(msgspec.Struct):
     ] = None
 
     # -------------------------------------------------------------------------
+    # Lookahead sparse attention
+    # -------------------------------------------------------------------------
+    enable_sparda: A[
+        bool,
+        "Enable SparDA-style cross-layer Forecast sparse selection.",
+    ] = False
+    sparda_indexer_path: A[
+        Optional[str],
+        "Path to the external SparDA Forecast/indexer checkpoint.",
+    ] = None
+    sparda_prefetch_mode: A[
+        str,
+        Arg(
+            help=(
+                "SparDA KV load timing: 'async' submits the next-layer load "
+                "during the current layer, while 'demand' submits it when "
+                "the target layer starts."
+            ),
+            choices=["async", "demand"],
+        ),
+    ] = "async"
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[

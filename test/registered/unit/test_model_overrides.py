@@ -372,6 +372,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         disaggregation_mode="null",
         enable_dp_attention=False,
         enable_hierarchical_cache=False,
+        enable_lmcache=False,
+        enable_sparda=False,
     ):
         args = SimpleNamespace(
             attention_backend=attention_backend,
@@ -380,6 +382,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             disaggregation_mode=disaggregation_mode,
             enable_dp_attention=enable_dp_attention,
             enable_hierarchical_cache=enable_hierarchical_cache,
+            enable_lmcache=enable_lmcache,
+            enable_sparda=enable_sparda,
         )
         mixer_types = []
         if sparse_attention:
@@ -440,13 +444,31 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             with self.subTest(capability=capability):
                 with self.assertRaisesRegex(
                     ValueError,
-                    "MiniCPM SALA does not support hierarchical cache",
+                    "MiniCPM SALA hierarchical cache requires --enable-sparda",
                 ):
                     self._minicpm_overrides(
                         "MiniCPMSALAForCausalLM",
                         enable_hierarchical_cache=True,
                         **{capability: True},
                     )
+
+    def test_sparda_allows_hierarchical_cache_for_sparse_minicpm(self):
+        overrides = self._minicpm_overrides(
+            "MiniCPMSALAForCausalLM",
+            sparse_attention=True,
+            enable_hierarchical_cache=True,
+            enable_sparda=True,
+        )
+        self.assertNotIn("disable_radix_cache", overrides)
+
+    def test_sparda_allows_lmcache_for_sparse_minicpm(self):
+        overrides = self._minicpm_overrides(
+            "MiniCPMSALAForCausalLM",
+            sparse_attention=True,
+            enable_lmcache=True,
+            enable_sparda=True,
+        )
+        self.assertNotIn("disable_radix_cache", overrides)
 
     def test_sparse_minicpm_defaults_to_sparse_attention_backend(self):
         with override_platform(is_blackwell=False):

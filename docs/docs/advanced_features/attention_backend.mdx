@@ -479,6 +479,51 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
 
 For deployment examples, see the [DeepSeek V3.2 deployment guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2).
 
+### MiniCPM4.1 Forecast selection (experimental)
+
+MiniCPM4.1 can optionally use a cross-layer Forecast projection to select the
+sparse KV blocks needed by the next attention layer. Enable it with
+`--enable-sparda` and provide a Forecast/indexer checkpoint with
+`--sparda-indexer-path`:
+
+The example assumes a Linux host with NVIDIA CUDA, a locally accessible
+MiniCPM4.1 model and Forecast indexer, and tensor parallelism of one. Set
+`--tp` to the tensor-parallel size used by the model when using another
+supported layout. If either artifact comes from a gated model repository,
+authenticate with your normal Hugging Face setup before starting the server.
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path openbmb/MiniCPM4.1-8B \
+  --enable-sparda \
+  --sparda-indexer-path /path/to/sparda-indexer.pt
+```
+
+SparDA indexer checkpoints are trained separately and are not part of the
+base model weights. The checkpoint must contain one Forecast projection for
+each MiniCPM4.1 sparse-attention layer. SGLang validates the file, parameter
+names, and shapes during startup and fails with an actionable error when the
+checkpoint is missing or incompatible.
+
+This option is disabled by default and does not change MiniCPM-SALA, DeepSeek
+DSA, or ordinary attention paths. When a cache adapter provides the optional
+logical-page resolver, the runtime also supports a single lookahead prefetch
+from layer `l` to layer `l+1`. The LMCache adapter maps the selected pages to
+logical cache chunks; SGLang keeps the physical page table private. Each
+prefetch is scoped by request ID, generation, and layer ID. Its completion
+event is observed before the target layer can consume the staged KV pages;
+cancellation, eviction, batch reorder, and request cleanup release the page
+lease only after that synchronization.
+
+The prefetch resolver is deliberately optional: an unknown prediction, host
+miss, unsupported cache layout, or invalid generation falls back to the
+existing full loading/attention path. This phase does not add a second
+remote-storage protocol, multi-layer prediction, pipeline parallelism,
+speculative decoding, or general CPU KV offload. The current adapters stage
+decode history; chunked prefill keeps Forecast selection but falls back to the
+existing page-loading path. It also does not claim a performance improvement;
+benchmark results depend on the cache-side resolver and hardware setup.
+
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 
 <Warning>

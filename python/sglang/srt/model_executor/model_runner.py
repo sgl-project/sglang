@@ -382,6 +382,9 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = get_memory().enable_hisparse
+        # Installed after HiCache construction.  Keeping this optional makes
+        # the default attention path and non-HiCache deployments unchanged.
+        self.sparda_prefetcher = None
         self._sampling_observer: Optional[SamplingObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
 

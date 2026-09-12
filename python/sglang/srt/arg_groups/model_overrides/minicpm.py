@@ -25,9 +25,17 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
     )
     overrides: Dict[str, Any] = {}
     if has_hybrid_attention:
-        if cfg.enable_hierarchical_cache:
-            raise ValueError("MiniCPM SALA does not support hierarchical cache")
-        overrides["disable_radix_cache"] = True
+        has_sparda_host_cache = getattr(cfg, "enable_hierarchical_cache", False) or (
+            getattr(cfg, "enable_lmcache", False)
+            and getattr(cfg, "enable_sparda", False)
+        )
+        if has_sparda_host_cache:
+            if not getattr(cfg, "enable_sparda", False):
+                raise ValueError(
+                    "MiniCPM SALA hierarchical cache requires --enable-sparda"
+                )
+        else:
+            overrides["disable_radix_cache"] = True
     if envs.SGLANG_MINICPM_FORCE_DENSE.get():
         dense_backends = {
             "minicpm_flashattn": ("fa4" if get_platform().is_blackwell else "fa3"),

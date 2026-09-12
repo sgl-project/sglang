@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
@@ -11,6 +12,12 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
 )
+from sglang.srt.layers.attention.lookahead import (
+    get_sparda_generation,
+    get_sparda_prefetcher,
+    get_sparda_request_context,
+    get_sparda_selection_cache,
+)
 from sglang.srt.layers.attention.minicpm.attention_adapter import (
     MiniCPMFlashAttentionAdapter,
     MiniCPMFlashInferAdapter,
@@ -19,16 +26,18 @@ from sglang.srt.layers.attention.minicpm.cache import attach_compressed_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
+    get_memory,
     get_parallel,
     get_platform,
     get_schedule,
 )
 from sglang.srt.utils import next_power_of_2
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-
 
 from sglang.kernels.ops.minicpm_sala import get_block_table
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
@@ -144,6 +153,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.max_context_len = self.flash_attn_backend.max_context_len
         self.device = self.flash_attn_backend.device
         self.model_dtype = model_runner.dtype
+        self.sparda_enabled = get_memory().enable_sparda
         self._use_cuda_graph_buffers = False
         self.decode_cuda_graph_metadata = (
             self.flash_attn_backend.decode_cuda_graph_metadata
@@ -192,6 +202,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             kernel_stride=self.kernel_stride,
             enable_memory_saver=get_exec().features.enable_memory_saver,
         )
+        self.compressed_cache = getattr(self.req_to_token_pool, "_aux_cache", None)
         self.req_to_sparse_k1_token = self.req_to_token_pool.req_to_sparse_k1_token
         self.req_to_sparse_k2_token = self.req_to_token_pool.req_to_sparse_k2_token
         self.minicpm_dense_as_sparse = envs.SGLANG_MINICPM_DENSE_AS_SPARSE.get()
@@ -323,6 +334,128 @@ class MiniCPMSparseBackend(AttentionBackend):
                 cache[batch_size] = fused_attn_pooling_online_topk_decode(**kwargs)
         return cache[batch_size]
 
+    def predict_sparda_blocks(
+        self,
+        forecast_batch: torch.Tensor,
+        forward_batch: ForwardBatch,
+        request_index: int,
+        target_layer_id: int,
+    ) -> Optional[list[int]]:
+        """Select target-layer blocks before the target layer runs.
+
+        The decode path already uses the MiniCPM compressed-key index. Reusing
+        the reference selector here keeps forecast and normal sparse attention
+        on the same block-index contract. Requests outside the sparse subset
+        fall back to the dense path.
+        """
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            logger.debug("SparDA selector unavailable: reason=forward_mode")
+            return None
+        metadata = self.forward_metadata
+        sparse_bs = metadata.sparse_bs_list if metadata is not None else None
+        logger.debug(
+            "SparDA selector input: sparse_requests=%d batch=%d shape=%s",
+            len(sparse_bs) if sparse_bs is not None else 0,
+            forward_batch.batch_size,
+            tuple(forecast_batch.shape),
+        )
+        if not sparse_bs or request_index not in sparse_bs:
+            logger.debug("SparDA selector unavailable: reason=dense_request")
+            return None
+        if (
+            forecast_batch.ndim != 3
+            or forecast_batch.shape[0] != forward_batch.batch_size
+        ):
+            logger.debug("SparDA selector unavailable: reason=query_shape")
+            return None
+
+        target_layer = SimpleNamespace(
+            layer_id=target_layer_id,
+            tp_k_head_num=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+        cache_key, topk_idx = self._get_cached_sparda_selection(
+            forward_batch, target_layer_id, forecast_batch
+        )
+        if topk_idx is None:
+            topk_idx = self.get_topk_for_sparse(
+                query_states=forecast_batch,
+                key_states=None,
+                layer=target_layer,
+                forward_batch=forward_batch,
+                is_prefill=False,
+                selector_query=forecast_batch,
+            )
+            self._store_sparda_selection(forward_batch, cache_key, topk_idx)
+        if topk_idx is None or topk_idx.ndim != 3:
+            logger.debug("SparDA selector unavailable: reason=topk_result")
+            return None
+
+        sparse_index = sparse_bs.index(request_index)
+        if sparse_index >= topk_idx.shape[1]:
+            logger.debug("SparDA selector unavailable: reason=topk_batch")
+            return None
+        selected = topk_idx[:, sparse_index].reshape(-1)
+        selected = selected[selected >= 0]
+        if selected.numel() == 0:
+            logger.debug("SparDA selector unavailable: reason=empty_topk")
+            return None
+        return sorted({int(block_id) for block_id in selected.tolist()})
+
+    def _sparda_selection_cache_key(
+        self,
+        forward_batch: ForwardBatch,
+        target_layer_id: int,
+        selector_query: torch.Tensor,
+    ) -> tuple:
+        request_context = get_sparda_request_context(forward_batch) or ()
+        cache_salts = tuple(
+            getattr(request, "cache_salt", None) for request in request_context
+        )
+        generations = tuple(
+            get_sparda_generation(forward_batch, request_index)
+            for request_index in range(forward_batch.batch_size)
+        )
+        sequence_lengths = tuple(int(length) for length in forward_batch.seq_lens_cpu)
+        request_ids = tuple(getattr(forward_batch, "rids", ()))
+        return (
+            int(target_layer_id),
+            id(selector_query),
+            selector_query.data_ptr(),
+            tuple(selector_query.shape),
+            selector_query.dtype,
+            selector_query.device,
+            request_ids,
+            generations,
+            sequence_lengths,
+            cache_salts,
+        )
+
+    def _get_cached_sparda_selection(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        selector_query: Optional[torch.Tensor],
+    ):
+        if (
+            selector_query is None
+            or not getattr(self, "sparda_enabled", False)
+            or not isinstance(selector_query, torch.Tensor)
+        ):
+            return None, None
+        key = self._sparda_selection_cache_key(forward_batch, layer_id, selector_query)
+        return key, get_sparda_selection_cache(forward_batch).get(key)
+
+    def _store_sparda_selection(
+        self,
+        forward_batch: ForwardBatch,
+        key: Optional[tuple],
+        topk_idx,
+    ):
+        if key is not None and topk_idx is not None:
+            get_sparda_selection_cache(forward_batch)[key] = topk_idx
+        return topk_idx
+
     def update_batch_for_sparse(
         self, forward_batch: ForwardBatch, metadata: MiniCPMSparseMetadata
     ):
@@ -433,7 +566,239 @@ class MiniCPMSparseBackend(AttentionBackend):
             k2_kernel_size=self.k2_kernel_size,
             k2_kernel_stride=self.k2_kernel_stride,
         )
+        if getattr(self, "sparda_enabled", False):
+            self._persist_compressed_keys(
+                layer.layer_id,
+                metadata,
+                (compressed_k, compressed_k2),
+                forward_batch=forward_batch,
+            )
+            self.compressed_cache.mark_valid(
+                layer.layer_id, forward_batch.req_pool_indices
+            )
         return compressed_k, compressed_k2
+
+    def _persist_compressed_keys(
+        self,
+        layer_id: int,
+        metadata: MiniCPMSparseMetadata,
+        compressed_levels: tuple[torch.Tensor, torch.Tensor],
+        *,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Store compressed keys in the per-request reserved KV slots.
+
+        Forecast selection for layer ``l + 1`` happens before that layer's
+        attention call.  The temporary compression buffers produced while
+        processing layer ``l + 1`` therefore cannot be used for the forecast.
+        Copying them into the reserved slots makes the target layer's selector
+        independent of the order in which layers are executed.
+        """
+        key_cache = self.token_to_kv_pool.get_key_buffer(layer_id).view(
+            -1, self.num_kv_heads, self.head_dim
+        )
+        for compressed, level in zip(compressed_levels, (metadata.k1, metadata.k2)):
+            if level is None or level.table is None or level.cu_seqlens_cpu is None:
+                continue
+            for batch_index, (start, end) in enumerate(
+                zip(level.cu_seqlens_cpu[:-1], level.cu_seqlens_cpu[1:])
+            ):
+                if end <= start:
+                    continue
+                indices = level.table[batch_index, : end - start].to(
+                    device=key_cache.device, dtype=torch.long
+                )
+                key_cache.index_copy_(0, indices, compressed[start:end])
+
+        if forward_batch is None:
+            return
+        prefetcher = get_sparda_prefetcher(forward_batch)
+        request_contexts = get_sparda_request_context(forward_batch)
+        if prefetcher is None or request_contexts is None:
+            return
+        publish = getattr(prefetcher, "publish_compressed_index", None)
+        if publish is None:
+            return
+        for batch_index, request in enumerate(request_contexts):
+            request_levels = []
+            for compressed, level in zip(compressed_levels, (metadata.k1, metadata.k2)):
+                if level.cu_seqlens_cpu is None:
+                    request_levels = []
+                    break
+                start = level.cu_seqlens_cpu[batch_index]
+                end = level.cu_seqlens_cpu[batch_index + 1]
+                request_levels.append(compressed[start:end].detach())
+            if request_levels:
+                publish(request, layer_id, request_levels)
+
+    def _sparda_host_requests(self, forward_batch: ForwardBatch):
+        request_contexts = get_sparda_request_context(forward_batch) or ()
+        if not request_contexts:
+            return ()
+        return tuple(
+            (request_index, request)
+            for request_index, request in enumerate(request_contexts)
+            if getattr(request, "_sparda_host_resident", False)
+        )
+
+    def _restore_sparda_compressed_index(
+        self,
+        layer_id: int,
+        forward_batch: ForwardBatch,
+        metadata: MiniCPMSparseMetadata,
+    ):
+        """Restore a complete host index without touching dense host KV pages."""
+        host_requests = self._sparda_host_requests(forward_batch)
+        if not host_requests or len(host_requests) != forward_batch.batch_size:
+            return None
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        logger.debug(
+            "SparDA compressed-index restore: layer=%d host_requests=%d batch=%d extend_lens=%s",
+            layer_id,
+            len(host_requests),
+            forward_batch.batch_size,
+            list(extend_lens) if extend_lens is not None else None,
+        )
+
+        prefetcher = get_sparda_prefetcher(forward_batch)
+        getter = getattr(prefetcher, "get_compressed_index", None)
+        if getter is None:
+            logger.debug("SparDA compressed-index restore unavailable: no getter")
+            return None
+        records = [getter(request, layer_id) for _, request in host_requests]
+        if any(record is None or len(record) != 2 for record in records):
+            logger.debug(
+                "SparDA compressed-index restore miss: layer=%d record_shapes=%s",
+                layer_id,
+                [None if record is None else len(record) for record in records],
+            )
+            return None
+
+        key_cache = self.token_to_kv_pool.get_key_buffer(layer_id).view(
+            -1, self.num_kv_heads, self.head_dim
+        )
+        restored = []
+        for level, level_records in zip((metadata.k1, metadata.k2), zip(*records)):
+            chunks = []
+            for batch_index, values in enumerate(level_records):
+                expected = (
+                    level.cu_seqlens_cpu[batch_index + 1]
+                    - level.cu_seqlens_cpu[batch_index]
+                )
+                if values.ndim != 3 or values.shape[0] != expected:
+                    logger.debug(
+                        "SparDA compressed-index shape miss: layer=%d expected=%d actual=%s",
+                        layer_id,
+                        expected,
+                        tuple(values.shape),
+                    )
+                    return None
+                if values.shape[1:] != (self.num_kv_heads, self.head_dim):
+                    logger.debug(
+                        "SparDA compressed-index dimension miss: layer=%d actual=%s",
+                        layer_id,
+                        tuple(values.shape),
+                    )
+                    return None
+                values = values.to(device=key_cache.device, non_blocking=True)
+                indices = level.table[batch_index, :expected].to(
+                    device=key_cache.device, dtype=torch.long
+                )
+                key_cache.index_copy_(0, indices, values)
+                chunks.append(values)
+            restored.append(
+                (
+                    torch.cat(chunks, dim=0),
+                    level.cu_seqlens,
+                )
+            )
+        self.compressed_cache.mark_valid(layer_id, forward_batch.req_pool_indices)
+        logger.debug(
+            "Restored host compressed index: layer=%d requests=%d",
+            layer_id,
+            len(host_requests),
+        )
+        return restored
+
+    def _fallback_sparda_host_requests(self, forward_batch: ForwardBatch) -> None:
+        prefetcher = get_sparda_prefetcher(forward_batch)
+        restore = getattr(prefetcher, "restore_request", None)
+        if restore is None:
+            raise RuntimeError("SparDA host-resident fallback has no restore hook")
+        for _, request in self._sparda_host_requests(forward_batch):
+            if not restore(request):
+                raise RuntimeError(
+                    "SparDA host-resident index miss could not materialize KV"
+                )
+
+    def _get_persistent_decode_compressed_keys(
+        self, layer_id: int, forward_batch: ForwardBatch
+    ):
+        """Read the target layer's compressed index without touching full KV."""
+        if self.compressed_cache is None:
+            return None
+        if not self.compressed_cache.is_valid(layer_id, forward_batch.req_pool_indices):
+            return None
+
+        metadata = self.forward_metadata
+        key_cache = self.token_to_kv_pool.get_key_buffer(layer_id).view(
+            -1, self.num_kv_heads, self.head_dim
+        )
+        levels = []
+        for level in (metadata.k1, metadata.k2):
+            lengths = [
+                int(length) for length in level.history_compress_token_nums.tolist()
+            ]
+            chunks = []
+            for batch_index, length in enumerate(lengths):
+                if length <= 0:
+                    continue
+                indices = level.table[batch_index, :length].to(
+                    device=key_cache.device, dtype=torch.long
+                )
+                chunks.append(key_cache.index_select(0, indices))
+            if chunks:
+                compressed = torch.cat(chunks, dim=0)
+            else:
+                compressed = key_cache.new_empty((0, self.num_kv_heads, self.head_dim))
+            cu_seqlens_cpu = [0]
+            for length in lengths:
+                cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + length)
+            cu_seqlens = torch.tensor(
+                cu_seqlens_cpu, dtype=torch.int32, device=key_cache.device
+            )
+            levels.append((compressed, cu_seqlens, cu_seqlens_cpu))
+
+        return levels
+
+    def _prepare_selector_query(
+        self,
+        selection_query: torch.Tensor,
+        selector_query: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Adapt a Forecast query to the InfLLM stage-1 sequence layout.
+
+        Forecast projections have one head per KV head, while the stage-1
+        kernel represents the GQA groups as repeated query positions. Repeat
+        each Forecast token across the local GQA group so the kernel returns
+        one score row per token and KV head, matching the page-table layout.
+        """
+        if selector_query is None:
+            return selection_query
+
+        if selection_query.ndim != 3:
+            raise ValueError(
+                "MiniCPM Forecast selector must have shape "
+                "[num_tokens, num_kv_heads, head_dim]."
+            )
+        if selection_query.shape[1] != self.head_group_num:
+            raise ValueError(
+                "MiniCPM Forecast selector must use one head per KV head, "
+                f"got {selection_query.shape[1]} heads for "
+                f"{self.head_group_num} KV heads."
+            )
+
+        return selection_query.repeat_interleave(self.heads_per_group, dim=0)
 
     def get_topk_for_sparse(
         self,
@@ -442,24 +807,73 @@ class MiniCPMSparseBackend(AttentionBackend):
         layer,
         forward_batch,
         is_prefill=True,
+        selector_query=None,
     ):
+        logger.debug(
+            "SparDA topk entry: layer=%d prefill=%s enabled=%s selector=%s",
+            getattr(layer, "layer_id", 0),
+            is_prefill,
+            getattr(self, "sparda_enabled", False),
+            selector_query is not None,
+        )
+        layer_id = getattr(layer, "layer_id", 0)
+        cache_key, cached_topk = self._get_cached_sparda_selection(
+            forward_batch,
+            layer_id,
+            selector_query,
+        )
+        if cached_topk is not None:
+            logger.debug(
+                "SparDA selector cache hit: layer=%d shape=%s",
+                layer_id,
+                tuple(cached_topk.shape),
+            )
+            return cached_topk
         if is_prefill:
             metadata = self.forward_metadata
             sparse_bs = metadata.sparse_bs_list
-            full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
-                layer=layer,
-                forward_batch=forward_batch,
-                metadata=metadata,
-                k1_token_nums=metadata.k1.cu_seqlens_cpu[-1],
-                k2_token_nums=metadata.k2.cu_seqlens_cpu[-1],
-                k1_kernel_size=self.k1_kernel_size,
-                k1_kernel_stride=self.k1_kernel_stride,
-                k2_kernel_size=self.k2_kernel_size,
-                k2_kernel_stride=self.k2_kernel_stride,
-                dtype=key_states.dtype,
-                device=key_states.device,
-                max_context_length=self.max_context_len,
-            )
+            selection_query = query_states if selector_query is None else selector_query
+            restored_index = None
+            if getattr(self, "sparda_enabled", False):
+                restored_index = self._restore_sparda_compressed_index(
+                    layer_id, forward_batch, metadata
+                )
+                if self._sparda_host_requests(forward_batch) and restored_index is None:
+                    logger.debug(
+                        "SparDA compressed-index miss: layer=%d; materializing host KV",
+                        layer_id,
+                    )
+                    self._fallback_sparda_host_requests(forward_batch)
+
+            if restored_index is None:
+                full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    metadata=metadata,
+                    k1_token_nums=metadata.k1.cu_seqlens_cpu[-1],
+                    k2_token_nums=metadata.k2.cu_seqlens_cpu[-1],
+                    k1_kernel_size=self.k1_kernel_size,
+                    k1_kernel_stride=self.k1_kernel_stride,
+                    k2_kernel_size=self.k2_kernel_size,
+                    k2_kernel_stride=self.k2_kernel_stride,
+                    dtype=key_states.dtype,
+                    device=key_states.device,
+                    max_context_length=self.max_context_len,
+                )
+            else:
+                full_compressed_k1 = restored_index[0][0]
+                full_compressed_k2 = restored_index[1][0]
+
+            if getattr(self, "sparda_enabled", False) and restored_index is None:
+                self._persist_compressed_keys(
+                    layer_id,
+                    metadata,
+                    (full_compressed_k1, full_compressed_k2),
+                    forward_batch=forward_batch,
+                )
+                self.compressed_cache.mark_valid(
+                    layer_id, forward_batch.req_pool_indices
+                )
 
             compressed = []
             if len(sparse_bs) == forward_batch.batch_size:
@@ -468,8 +882,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     (full_compressed_k2, metadata.k2.cu_seqlens),
                 ]
             else:
-                query_states = batched_gather(
-                    query_states.reshape(-1, layer.tp_q_head_num, layer.head_dim),
+                selection_query = batched_gather(
+                    selection_query,
                     forward_batch.extend_seq_lens_cpu,
                     sparse_bs,
                 )
@@ -489,8 +903,11 @@ class MiniCPMSparseBackend(AttentionBackend):
                 ),
             ) = compressed
 
+            selection_query = self._prepare_selector_query(
+                selection_query, selector_query
+            )
             ret = self.sparse_get_topk_impl(
-                query_states,
+                selection_query,
                 metadata.topk_cu_seqlens_q,
                 metadata.topk_cu_seqlens_k,
                 metadata.topk_max_seqlen_q,
@@ -499,39 +916,85 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens=compressed_cu_seqlens,
                 compressed_k2=compressed_k2,
                 compressed_cu_seqlens2=compressed_cu_seqlens2,
-                fused_kernel=self._get_fused_topk_kernel(
-                    len(sparse_bs),
-                    is_prefill=True,
+                fused_kernel=(
+                    self._get_fused_topk_kernel(
+                        len(sparse_bs),
+                        is_prefill=True,
+                    )
+                    if selector_query is None
+                    else None
                 ),
             )
-            return ret
+            return self._store_sparda_selection(forward_batch, cache_key, ret)
         else:
             metadata = self.forward_metadata
-            compressed_k, compressed_k2 = self._compress_decode_keys(
-                query_states,
-                layer,
-                forward_batch,
-            )
+            persisted = None
+            if selector_query is not None and getattr(self, "sparda_enabled", False):
+                persisted = self._get_persistent_decode_compressed_keys(
+                    layer_id, forward_batch
+                )
+            if persisted is None:
+                compressed_k, compressed_k2 = self._compress_decode_keys(
+                    query_states,
+                    layer,
+                    forward_batch,
+                )
+                persisted_levels = None
+            else:
+                compressed_k = persisted[0][0]
+                compressed_k2 = persisted[1][0]
+                persisted_levels = persisted
 
             sparse_bs = metadata.sparse_bs_list
             if not sparse_bs:
                 return None
 
+            selection_query = query_states if selector_query is None else selector_query
             cu_seqlens_q = metadata.base.cu_seqlens_q
-            compressed_cu_seqlens = metadata.k1.cu_seqlens
-            compressed_cu_seqlens2 = metadata.k2.cu_seqlens
+            compressed_cu_seqlens = (
+                persisted[0][1]
+                if persisted_levels is not None
+                else metadata.k1.cu_seqlens
+            )
+            compressed_cu_seqlens2 = (
+                persisted[1][1]
+                if persisted_levels is not None
+                else metadata.k2.cu_seqlens
+            )
             if len(sparse_bs) < forward_batch.batch_size:
                 query_states = query_states[sparse_bs]
-                compressed_k, compressed_cu_seqlens = _gather_compressed_keys(
-                    compressed_k, metadata.k1, sparse_bs
-                )
-                compressed_k2, compressed_cu_seqlens2 = _gather_compressed_keys(
-                    compressed_k2, metadata.k2, sparse_bs
-                )
+                selection_query = selection_query[sparse_bs]
+                if persisted_levels is not None:
+                    compressed_k, compressed_cu_seqlens = _gather_compressed_keys(
+                        compressed_k,
+                        CompressionLevelMetadata(
+                            cu_seqlens=compressed_cu_seqlens,
+                            cu_seqlens_cpu=persisted[0][2],
+                        ),
+                        sparse_bs,
+                    )
+                    compressed_k2, compressed_cu_seqlens2 = _gather_compressed_keys(
+                        compressed_k2,
+                        CompressionLevelMetadata(
+                            cu_seqlens=compressed_cu_seqlens2,
+                            cu_seqlens_cpu=persisted[1][2],
+                        ),
+                        sparse_bs,
+                    )
+                else:
+                    compressed_k, compressed_cu_seqlens = _gather_compressed_keys(
+                        compressed_k, metadata.k1, sparse_bs
+                    )
+                    compressed_k2, compressed_cu_seqlens2 = _gather_compressed_keys(
+                        compressed_k2, metadata.k2, sparse_bs
+                    )
                 cu_seqlens_q = metadata.topk_cu_seqlens_q
 
+            selection_query = self._prepare_selector_query(
+                selection_query, selector_query
+            )
             ret = self.sparse_get_topk_impl(
-                query_states,
+                selection_query,
                 cu_seqlens_q,
                 metadata.base.cu_seqlens_k,
                 1,
@@ -540,13 +1003,17 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens=compressed_cu_seqlens,
                 compressed_k2=compressed_k2,
                 compressed_cu_seqlens2=compressed_cu_seqlens2,
-                fused_kernel=self._get_fused_topk_kernel(
-                    len(sparse_bs),
-                    is_prefill=False,
+                fused_kernel=(
+                    self._get_fused_topk_kernel(
+                        len(sparse_bs),
+                        is_prefill=False,
+                    )
+                    if selector_query is None
+                    else None
                 ),
             )
 
-        return ret
+        return self._store_sparda_selection(forward_batch, cache_key, ret)
 
     def sparse_get_topk_impl(
         self,
@@ -575,7 +1042,11 @@ class MiniCPMSparseBackend(AttentionBackend):
                 batch_size, dtype=torch.int32, device=cu_seqlens_q.device
             )
 
-        if not self.minicpm_fuse_topk:
+        # Forecast selectors have KV-head layout rather than the normal
+        # grouped-query layout expected by the fused kernel.  Keep this path
+        # on the reference implementation until the fused kernel grows an
+        # explicit selector-query interface.
+        if not self.minicpm_fuse_topk or fused_kernel is None:
             topk_idx = compressed_attention(
                 query_layer,
                 compressed_k,
@@ -622,6 +1093,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        forecast_query: Optional[torch.Tensor] = None,
     ):
         if layer.is_cross_attention:
             raise NotImplementedError(
@@ -669,6 +1141,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 key_states=k,
                 layer=layer,
                 forward_batch=forward_batch,
+                selector_query=forecast_query,
             )
 
             sparse_page_table_sparse_bs = get_block_table(
@@ -690,7 +1163,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             total_k1 = self.forward_metadata.k1.cu_seqlens_cpu[-1]
             total_k2 = self.forward_metadata.k2.cu_seqlens_cpu[-1]
 
-            allocate_and_compress_keys(
+            full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
                 layer=layer,
                 forward_batch=forward_batch,
                 metadata=self.forward_metadata,
@@ -704,6 +1177,16 @@ class MiniCPMSparseBackend(AttentionBackend):
                 device=k.device,
                 max_context_length=self.max_context_len,
             )
+            if getattr(self, "sparda_enabled", False):
+                self._persist_compressed_keys(
+                    layer.layer_id,
+                    self.forward_metadata,
+                    (full_compressed_k1, full_compressed_k2),
+                    forward_batch=forward_batch,
+                )
+                self.compressed_cache.mark_valid(
+                    layer.layer_id, forward_batch.req_pool_indices
+                )
 
         dense_layout_spans = [
             (query_start, query_len)
@@ -758,6 +1241,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        forecast_query: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if layer.is_cross_attention:
             raise NotImplementedError(
@@ -808,6 +1292,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             layer=layer,
             forward_batch=forward_batch,
             is_prefill=False,
+            selector_query=forecast_query,
         )
         if topk_idx is not None:
             topk_page_table = page_table

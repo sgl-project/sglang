@@ -372,6 +372,55 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def _apply_sparda_config(hf_config, cfg) -> None:
+    """Apply request-scoped SparDA settings to every ModelConfig instance."""
+    if not getattr(cfg, "enable_sparda", False):
+        return
+
+    model_arch = hf_config.architectures[0]
+    if (
+        model_arch != "MiniCPMForCausalLM"
+        or getattr(hf_config, "model_type", None) != "minicpm"
+    ):
+        raise ValueError(
+            "--enable-sparda currently supports only the non-SALA "
+            "MiniCPMForCausalLM model with model_type='minicpm'."
+        )
+    if cfg.pp_size != 1:
+        raise ValueError(
+            "--enable-sparda currently requires --pp-size 1 because the "
+            "Forecast state is local to one model forward pass."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-sparda does not support speculative decoding in this "
+            "phase; unset --speculative-algorithm."
+        )
+
+    indexer_path = getattr(cfg, "sparda_indexer_path", None)
+    if not indexer_path:
+        raise ValueError(
+            "--enable-sparda requires --sparda-indexer-path pointing to "
+            "a Forecast/indexer checkpoint."
+        )
+    if not os.path.isfile(indexer_path):
+        raise FileNotFoundError(
+            f"SparDA indexer checkpoint does not exist: {indexer_path}"
+        )
+
+    # MiniCPM4.1's public config omits sparse settings.  Materialize the
+    # official defaults only for an explicitly enabled SparDA launch while
+    # preserving any user/checkpoint-provided values.
+    from sglang.srt.configs.minicpm import MINICPM_SPARSE_CONFIG_DEFAULTS
+
+    sparse_config = dict(getattr(hf_config, "sparse_config", None) or {})
+    for key, value in MINICPM_SPARSE_CONFIG_DEFAULTS.items():
+        sparse_config.setdefault(key, value)
+    hf_config.sparse_config = sparse_config
+    hf_config.sparda_enabled = True
+    hf_config.sparda_indexer_path = indexer_path
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -717,7 +766,7 @@ class ModelConfig:
             if is_draft_model
             else cfg.decrypted_config_file
         )
-        return ModelConfig(
+        model_config = ModelConfig(
             model_path=model_path or cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=model_revision or cfg.revision,
@@ -746,6 +795,8 @@ class ModelConfig:
             speculative_algorithm=cfg.speculative_algorithm,
             **kwargs,
         )
+        _apply_sparda_config(model_config.hf_config, cfg)
+        return model_config
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model

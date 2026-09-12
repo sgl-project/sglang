@@ -231,6 +231,7 @@ class RadixAttention(nn.Module):
                     "aux_tensors",
                     "rel_bias",
                     "return_lse",
+                    "forecast_query",
                     "q_descale",
                     "k_descale",
                     "v_descale",
@@ -625,7 +626,13 @@ def attention_with_output_extra_kwargs(
     aux_tensors = kwargs.get("aux_tensors")
     if aux_tensors is not None:
         kwargs["aux_tensors"] = [t[:real_num_tokens] for t in aux_tensors]
-    for per_token_key in ("rel_bias", "q_descale", "k_descale", "v_descale"):
+    for per_token_key in (
+        "rel_bias",
+        "q_descale",
+        "k_descale",
+        "v_descale",
+        "forecast_query",
+    ):
         t = kwargs.get(per_token_key)
         if t is not None:
             kwargs[per_token_key] = t[:real_num_tokens]
