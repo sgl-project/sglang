@@ -7,6 +7,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import ast
+import glob
 import json
 import os
 import shutil
@@ -100,6 +101,46 @@ class TestWhitelistMatchesThePipeline(CustomTestCase):
             "(whitelisted but never called, called but not whitelisted) -- "
             "both should be empty",
         )
+
+    def test_no_bare_calls_to_a_whitelisted_hook_anywhere_in_arg_groups(self):
+        """A step called through `run_hook` at its own pipeline position can
+        still be called *again*, directly, from inside another hook's body --
+        a re-validation after a later declaration, say. That nested call
+        bypasses the registry: an out-of-tree replacement registered for the
+        name wins at the pipeline position but not here, which is exactly the
+        kind of gap `test_every_whitelisted_hook_has_a_call_site` cannot see,
+        since it only looks at `run_hook(...)` call targets, not at every
+        other way a whitelisted name's bare function can be invoked.
+
+        Two real instances of this existed (`validate_prefill_cp_platform`
+        called directly inside `handle_context_parallelism`,
+        `validate_prefill_only_disable_kv_cache_args` called directly inside
+        `handle_model_capability_adjustments`) before both were routed
+        through `run_hook` too. This asserts the count stays at zero rather
+        than grandfathering it, since a bare call to a whitelisted name from
+        inside `arg_groups/` is never correct -- it always means the same
+        function is reachable two ways, only one of which a downstream
+        override can see.
+        """
+        hook_dir = os.path.dirname(pipeline_module.__file__)
+        bypasses = []
+        for path in sorted(
+            glob.glob(os.path.join(hook_dir, "**", "*.py"), recursive=True)
+        ):
+            if os.path.basename(path) in ("pipeline.py", "resolution_hooks.py"):
+                continue
+            tree = ast.parse(open(path).read())
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in _OVERRIDABLE_HOOKS
+                ):
+                    bypasses.append(
+                        f"{os.path.relpath(path, hook_dir)}:{node.lineno} "
+                        f"calls {node.func.id}(...) directly"
+                    )
+        self.assertEqual(bypasses, [])
 
 
 class TestRunHook(_IsolatedRegistry):
