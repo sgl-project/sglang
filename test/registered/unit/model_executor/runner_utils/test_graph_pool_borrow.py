@@ -1,5 +1,6 @@
 """CUDA graph-pool borrowing allocator and lifetime regression tests."""
 
+import contextlib
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -17,32 +18,23 @@ from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestGraphPoolBorrow(CustomTestCase):
     def setUp(self):
         super().setUp()
-        self._reset_borrow_state()
+        self.state = pool.GraphPoolBorrowState()
+        # ExitStack rather than enterContext, which is 3.11+.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(pool.get_resources().override(graph_pool_borrow=self.state))
 
     def tearDown(self):
-        try:
-            if torch.cuda.is_available():
-                pool._teardown_borrow_pool()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        finally:
-            self._reset_borrow_state()
-
-    @staticmethod
-    def _reset_borrow_state():
-        pool._active_graph_pool_user = None
-        pool._borrow_stub = None
-        pool._borrow_mem_pool = None
-        pool._borrow_disabled_reason = None
-        pool._borrow_static_runs = None
-        pool._borrow_extents_total = 0
-        pool._largest_logged_graph_pool_borrow = 0
+        if torch.cuda.is_available():
+            pool._teardown_borrow_pool()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     def test_mixed_segment_runs_exclude_live_blocks(self):
         """A mixed segment's free runs are borrowable, but a returned run must
@@ -63,6 +55,27 @@ class TestGraphPoolBorrow(CustomTestCase):
             runs = pool.find_free_graph_pool_runs((0, 1))
         self.assertEqual(sorted(runs), [(0x1000, 4096), (0x3000, 4096)])
 
+    def test_free_run_snapshot_lifetime_follows_borrow_state(self):
+        runs = [{"blocks": [{"state": "inactive", "address": 0x1000, "size": 8192}]}]
+        with (
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
+            patch.object(pool, "is_cuda", return_value=True),
+            patch.object(pool, "get_global_graph_memory_pool", return_value=(1, 2)),
+            patch.object(
+                pool.torch.cuda, "memory_snapshot", side_effect=[runs, [], runs]
+            ) as snapshot,
+        ):
+            self.assertEqual(pool.graph_pool_borrow_largest_run(), 8192)
+            self.assertEqual(pool.graph_pool_borrow_largest_run(), 8192)
+            snapshot.assert_called_once_with((1, 2), include_traces=False)
+            pool._teardown_borrow_pool()
+            self.assertEqual(pool.graph_pool_borrow_largest_run(), 0)
+            self.assertEqual(snapshot.call_count, 2)
+            with pool.get_resources().override(graph_pool_borrow=None):
+                self.assertEqual(pool.graph_pool_borrow_largest_run(), 8192)
+            self.assertEqual(pool.graph_pool_borrow_largest_run(), 0)
+            self.assertEqual(snapshot.call_count, 3)
+
     def test_graph_replay_fails_during_active_pool_borrow(self):
         graph = Mock()
         backend = object.__new__(FullCudaGraphBackend)
@@ -78,10 +91,8 @@ class TestGraphPoolBorrow(CustomTestCase):
         with (
             envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
             patch.object(pool, "get_global_graph_memory_pool", return_value=(1, 2)),
-            patch.object(
-                pool, "_borrow_stub", MagicMock(cursor_bytes=0, freed_bytes=0)
-            ),
-            patch.object(pool, "_borrow_mem_pool", None),
+            patch.object(self.state, "stub", MagicMock(cursor_bytes=0, freed_bytes=0)),
+            patch.object(self.state, "mem_pool", None),
             patch.object(pool.torch.cuda, "MemPool"),
             patch.object(pool.torch.cuda, "use_mem_pool"),
             patch.object(pool.torch.cuda, "memory_snapshot", return_value=snapshot),
@@ -100,9 +111,9 @@ class TestGraphPoolBorrow(CustomTestCase):
 
         with (
             patch.object(pool, "graph_pool_borrow_enabled", return_value=True),
-            patch.object(pool, "_borrow_stub", stub),
-            patch.object(pool, "_borrow_mem_pool", mem_pool),
-            patch.object(pool, "_borrow_extents_total", 1000),
+            patch.object(self.state, "stub", stub),
+            patch.object(self.state, "mem_pool", mem_pool),
+            patch.object(self.state, "extents_total", 1000),
             patch.object(pool, "_teardown_borrow_pool") as teardown,
             patch.object(pool.torch, "empty"),
             patch.object(pool.torch.cuda, "use_mem_pool"),
@@ -126,7 +137,7 @@ class TestGraphPoolBorrow(CustomTestCase):
         runs = [(0x1000, 4096), (0x2000, 8192)]
 
         def reset_static_runs():
-            pool._borrow_static_runs = None
+            self.state.static_runs = None
 
         with patch.object(
             pool, "_teardown_borrow_pool", side_effect=reset_static_runs
@@ -134,7 +145,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             pool.set_graph_pool_borrow_runs(runs)
 
         teardown.assert_called_once_with()
-        self.assertEqual(pool._borrow_static_runs, [(0x2000, 8192), (0x1000, 4096)])
+        self.assertEqual(self.state.static_runs, [(0x2000, 8192), (0x1000, 4096)])
 
     def test_eagle_non_greedy_probabilities_do_not_borrow_graph_pool(self):
         def fake_sampling(**kwargs):
@@ -221,7 +232,6 @@ class TestGraphPoolBorrow(CustomTestCase):
         with (
             envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
             patch.object(pool, "get_global_graph_memory_pool", return_value=handle),
-            patch.object(pool, "_borrow_mem_pool", None),
         ):
             runs = pool.find_free_graph_pool_runs(handle)
             self.assertGreaterEqual(len(runs), 2)
@@ -261,6 +271,86 @@ class TestGraphPoolBorrow(CustomTestCase):
         del graph, y
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_borrow_recovers_from_arena_fragmentation(self):
+        handle = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        seed = torch.zeros(8, device="cuda")
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            torch.cuda.graph(graph, pool=handle, stream=stream),
+        ):
+            transient = torch.empty(200 << 20, dtype=torch.uint8, device="cuda")
+            keep = seed + 1
+            del transient
+        torch.cuda.synchronize()
+
+        address, run_bytes = pool.find_free_graph_pool_runs(handle)[0]
+        self.assertEqual(run_bytes, 200 << 20)
+        with (
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
+            patch.object(pool, "get_global_graph_memory_pool", return_value=handle),
+        ):
+            # Unseeded 24/32/40 MiB segments strand 192 MiB before the 42 MiB request.
+            for rows in (1500, 2000, 2500, 2600):
+                with self.subTest(rows=rows), pool.borrow_graph_pool(user="test"):
+                    first = torch.empty(
+                        (rows, 4096), dtype=torch.float32, device="cuda"
+                    )
+                    second = torch.empty(
+                        (rows, 4096), dtype=torch.float32, device="cuda"
+                    )
+                    self.assertTrue(
+                        all(
+                            address <= tensor.data_ptr()
+                            and tensor.data_ptr() + tensor.nbytes <= address + run_bytes
+                            for tensor in (first, second)
+                        )
+                    )
+                    del first, second
+            pool._teardown_borrow_pool()
+        del graph, keep
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_replay_raises_when_borrowed_tensor_is_still_referenced(self):
+        """Reject borrowed tensors that replay would silently overwrite."""
+        handle = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        seed = torch.zeros(8, device="cuda")
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            torch.cuda.graph(graph, pool=handle, stream=stream),
+        ):
+            transient = torch.empty(48 << 20, dtype=torch.uint8, device="cuda")
+            keep = seed + 1
+            del transient
+        torch.cuda.synchronize()
+
+        with (
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
+            patch.object(pool, "get_global_graph_memory_pool", return_value=handle),
+        ):
+            with pool.borrow_graph_pool(user="leaky"):
+                leaked = torch.empty(1 << 20, device="cuda")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                f"graph replay: {leaked.nbytes} bytes",
+            ):
+                with pool.graph_pool_replay_scope():
+                    pass
+
+            # A fresh borrow re-arms the replay check after releasing the leak.
+            del leaked
+            with pool.borrow_graph_pool(user="clean"):
+                released = torch.empty(1 << 20, device="cuda")
+            del released
+            with pool.graph_pool_replay_scope():
+                pass
+            pool._teardown_borrow_pool()
+        del graph, keep
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_static_borrow_runs_serve_without_a_pool_snapshot(self):
         """Fixed extents serve borrows without consulting the shared pool."""
         handle = torch.cuda.graph_pool_handle()
@@ -281,8 +371,6 @@ class TestGraphPoolBorrow(CustomTestCase):
         with (
             envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
             patch.object(pool, "get_global_graph_memory_pool", return_value=None),
-            patch.object(pool, "_borrow_static_runs", None),
-            patch.object(pool, "_borrow_mem_pool", None),
         ):
             pool.set_graph_pool_borrow_runs(runs)
             self.assertTrue(pool.graph_pool_borrow_enabled())
@@ -295,6 +383,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                     )
                 )
                 del borrowed
+            pool._teardown_borrow_pool()
 
         del graph, y
 
@@ -352,18 +441,20 @@ class TestGraphPoolBorrow(CustomTestCase):
         with (
             envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
             patch.object(pool, "get_global_graph_memory_pool", return_value=handle),
-            patch.object(pool, "_borrow_mem_pool", None),
         ):
             for _ in range(3):
                 with pool.borrow_graph_pool(user="test"):
                     borrowed = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+                    # Stream-keyed segments allow side-stream copies, not allocations.
+                    sink = torch.empty_like(borrowed)
                     with torch.cuda.stream(side):
-                        widened = borrowed.to(torch.int32)
+                        sink.copy_(borrowed)
                     borrowed.record_stream(side)
-                    del borrowed, widened
+                    del borrowed, sink
             # Regression: this used to fail with "Trying to free a pointer not
             # allocated here" after a deferred free was re-issued too early.
             torch.cuda.empty_cache()
+            pool._teardown_borrow_pool()
 
         del graph, y
 
