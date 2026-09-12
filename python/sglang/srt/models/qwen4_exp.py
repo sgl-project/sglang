@@ -685,6 +685,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return embeddings.flatten(start_dim=-2)
 
     def compute_ngram_ids(self, batch: _PLEBatch) -> torch.Tensor:
+        return self._hash_contexts(
+            self.prepare_ngram_contexts(batch),
+            decode_sized=batch.mode.is_decode() or batch.mode.is_target_verify(),
+        )
+
+    def prepare_ngram_contexts(self, batch: _PLEBatch) -> torch.Tensor:
         assert batch.ngram_context is not None
         pool = get_req_to_token_pool()
         cached = pool.ple_window_cache
@@ -699,10 +705,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ]
             contexts = contexts.to(torch.long)
             pool.ple_window_cache = (batch, contexts, None)
-        return self._hash_contexts(
-            contexts,
-            decode_sized=batch.mode.is_decode() or batch.mode.is_target_verify(),
-        )
+        return contexts
 
 
 @triton.jit
@@ -728,7 +731,7 @@ def _gather_ple_embedding_from_pinned_kernel(
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
     values = tl.load(
         weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
+        mask=mask & in_range,
         other=0.0,
     ).to(tl.bfloat16)
     tl.store(
@@ -1097,37 +1100,78 @@ class Qwen4ExpPLELayer(nn.Module):
         batch: Optional[_PLEBatch],
         forward_batch: ForwardBatch,
     ) -> None:
-        """Gather PLE rows via UVA while the preceding decoder layer runs."""
+        """Hash and gather PLE rows while the preceding decoder layer runs."""
         if self._prefetch_stream is None:
             return
         if self._prefetch_state is not None:
             raise RuntimeError("PLE prefetch state was not consumed before reuse")
-        if batch is None:
-            if not self.ple_embedding.gather_dp_tokens:
-                return
-            physical_tokens = forward_batch.input_ids.numel()
-            ngram_ids = forward_batch.input_ids.new_zeros(
-                (physical_tokens, self.ple_embedding.ngram_heads)
+        embedding = self.ple_embedding
+        contexts = None
+        if embedding.gather_dp_tokens:
+            # Keep cross-DP collectives on the main stream in their original order.
+            if batch is None:
+                physical_tokens = forward_batch.input_ids.numel()
+                ngram_ids = forward_batch.input_ids.new_zeros(
+                    (physical_tokens, embedding.ngram_heads)
+                )
+            else:
+                physical_tokens = batch.physical_tokens
+                ngram_ids = embedding.compute_ngram_ids(batch)
+            lookup_ids, semantic_tokens = embedding._prepare_embedding_lookup(
+                ngram_ids, forward_batch, physical_tokens
             )
+            prefetch_input = lookup_ids
         else:
+            if batch is None:
+                return
             physical_tokens = batch.physical_tokens
-            ngram_ids = self.ple_embedding.compute_ngram_ids(batch)
+            contexts = embedding.prepare_ngram_contexts(batch)
+            semantic_tokens = contexts.shape[0]
+            prefetch_input = contexts
 
-        lookup_ids, semantic_tokens = self.ple_embedding._prepare_embedding_lookup(
-            ngram_ids, forward_batch, physical_tokens
-        )
-        lookup_tokens = lookup_ids.shape[0]
+        lookup_tokens = prefetch_input.shape[0]
         if lookup_tokens == 0:
             return
-        prefetched = self._get_prefetch_buffer(lookup_tokens, lookup_ids)
-        output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
-        offloaded_embedding = self.ple_embedding.ngram_embedding
+        prefetched = self._get_prefetch_buffer(lookup_tokens, prefetch_input)
+        output_view = prefetched.view(lookup_tokens, embedding.ngram_heads, -1)
+        offloaded_embedding = embedding.ngram_embedding
 
         stream = self._prefetch_stream
         stream.wait_stream(torch.cuda.current_stream())
-        lookup_ids.record_stream(stream)
+        prefetch_input.record_stream(stream)
         with torch.cuda.stream(stream):
-            offloaded_embedding.gather(lookup_ids, out=output_view)
+            if contexts is None:
+                offloaded_embedding.gather(lookup_ids, out=output_view)
+            else:
+                from sglang.kernels.ops.qwen4_ple import (
+                    can_fuse_qwen4_ngram_hash,
+                    fused_qwen4_ngram_gather,
+                )
+
+                if embedding.enable_ple_fusion and can_fuse_qwen4_ngram_hash(
+                    contexts,
+                    embedding.layer_multipliers,
+                    embedding.ngram_heads_vocab_sizes,
+                    embedding.ngram_heads_offsets,
+                ):
+                    fused_qwen4_ngram_gather(
+                        contexts,
+                        embedding.layer_multipliers,
+                        embedding.ngram_heads_vocab_sizes,
+                        embedding.ngram_heads_offsets,
+                        embedding.eos_token_id,
+                        offloaded_embedding.weight,
+                        offloaded_embedding.shard_indices.org_vocab_start_index,
+                        offloaded_embedding.shard_indices.org_vocab_end_index,
+                        output_view,
+                    )
+                else:
+                    lookup_ids = embedding._hash_contexts(
+                        contexts,
+                        decode_sized=batch.mode.is_decode()
+                        or batch.mode.is_target_verify(),
+                    )
+                    offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
     def _consume_prefetched_embeddings(
