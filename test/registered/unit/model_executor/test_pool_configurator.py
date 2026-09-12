@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
@@ -83,6 +84,8 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    enable_deepseek_v4_fp4_indexer=False,
+    mem_fraction_static=0.9,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
@@ -150,6 +153,8 @@ def _make_model_runner(
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
+        enable_deepseek_v4_fp4_indexer=enable_deepseek_v4_fp4_indexer,
+        mem_fraction_static=mem_fraction_static,
         enable_hisparse=False,
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
@@ -184,6 +189,17 @@ def _configure_dsa_model(model_runner):
     hf_config.architectures = ["GlmMoeDsaForCausalLM"]
     hf_config.index_topk = 2048
     hf_config.index_head_dim = 128
+
+
+def _configure_dsv4_model(model_runner):
+    mc = model_runner.model_config
+    mc.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+    mc.qk_nope_head_dim = 448
+    mc.qk_rope_head_dim = 64
+    mc.index_head_dim = 128
+    mc.compress_ratios = [4, 128] * 16
+    mc.window_size = 128
+    mc.context_len = 131072
 
 
 KV_SIZE = 2  # bf16
@@ -855,6 +871,88 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
             cfg = DefaultPoolConfigurator(mr)
 
         self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+
+
+class TestDSV4FP4LogitsWorkspaceBudget(CustomTestCase):
+    def _config(
+        self,
+        *,
+        enabled: bool,
+        mem_fraction_static: float = 0.9,
+        attn_cp_size: int = 1,
+    ):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            page_size=256,
+            chunked_prefill_size=8192,
+            max_running_requests=256,
+            enable_deepseek_v4_fp4_indexer=enabled,
+            mem_fraction_static=mem_fraction_static,
+        )
+        _configure_dsv4_model(mr)
+        # The configurator consumes the runner-owned resolved server args. Keep
+        # this focused fixture independent of namespace publication details.
+        mr.server_args = SimpleNamespace(enable_deepseek_v4_fp4_indexer=enabled)
+        with (
+            mock_cpu_env(),
+            get_parallel().override(attn_cp_size=attn_cp_size),
+            patch("sglang.srt.model_executor.pool_configurator._is_hip", True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            # 256 request slots make the fixed C128 state pool several GiB;
+            # leave enough room that this test isolates the FP4 logits bias.
+            config = cfg.calculate_pool_sizes(16 << 30, 256)
+        return cfg, config
+
+    def test_workspace_is_workload_sized_and_charged_to_pool_budget(self):
+        cfg, config = self._config(enabled=True)
+        self.assertGreater(config.dsv4_fp4_logits_workspace_bytes, 0)
+        self.assertLess(
+            config.dsv4_fp4_logits_workspace_bytes,
+            envs.SGLANG_DSV4_FP4_LOGITS_BUDGET_MB.get() << 20,
+        )
+        self.assertEqual(
+            config.dsv4_fp4_logits_workspace_max_seq_len,
+            cfg.fp4_logits_workspace_max_seq_len,
+        )
+        self.assertGreater(
+            config.dsv4_fp4_logits_workspace_max_seq_len,
+            131072 // 4,
+        )
+
+        _, disabled = self._config(enabled=False)
+        self.assertEqual(disabled.dsv4_fp4_logits_workspace_bytes, 0)
+        self.assertGreater(disabled.max_total_num_tokens, config.max_total_num_tokens)
+
+    def test_full_static_fraction_still_reserves_one_workspace_row(self):
+        _, config = self._config(enabled=True, mem_fraction_static=1.0)
+        row_bytes = config.dsv4_fp4_logits_workspace_max_seq_len * 4
+        self.assertGreaterEqual(config.dsv4_fp4_logits_workspace_bytes, row_bytes)
+
+    def test_context_parallel_plans_only_local_query_rows(self):
+        _, cp1 = self._config(enabled=True, attn_cp_size=1)
+        _, cp64 = self._config(enabled=True, attn_cp_size=64)
+        self.assertLess(
+            cp64.dsv4_fp4_logits_workspace_bytes,
+            cp1.dsv4_fp4_logits_workspace_bytes,
+        )
+
+    def test_zero_workspace_ceiling_selects_auto(self):
+        with envs.SGLANG_DSV4_FP4_LOGITS_BUDGET_MB.override(0):
+            _, config = self._config(enabled=True)
+        self.assertGreater(config.dsv4_fp4_logits_workspace_bytes, 0)
+
+    def test_negative_workspace_ceiling_is_rejected(self):
+        with (
+            envs.SGLANG_DSV4_FP4_LOGITS_BUDGET_MB.override(-1),
+            self.assertRaisesRegex(ValueError, "must be non-negative"),
+        ):
+            self._config(enabled=True)
 
 
 class TestFactory(CustomTestCase):
