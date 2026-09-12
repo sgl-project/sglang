@@ -39,6 +39,13 @@
         ]
     },
     "scenarios": {
+        "sana_wm_ti2v": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 7239.81,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
         "sana_video_2b_t2v": {
             "stages_ms": {},
             "denoise_step_ms": {},
