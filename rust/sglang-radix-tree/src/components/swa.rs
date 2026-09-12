@@ -599,7 +599,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let child_parks = !child.has_device_value(SWA) && child.host_lock_ref(SWA) == 0;
             let host_lru = tree_core.host_lru_list_mut(SWA);
             if parent_parks {
-                host_lru.insert_mru(new_parent_id);
+                if host_lru.in_list(Some(child_id)) {
+                    host_lru.insert_after(child_id, new_parent_id);
+                } else {
+                    host_lru.insert_mru(new_parent_id);
+                }
             }
             if child_parks && !host_lru.in_list(Some(child_id)) {
                 host_lru.insert_mru(child_id);

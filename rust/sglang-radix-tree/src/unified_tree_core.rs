@@ -1790,14 +1790,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
 
-        // The child's aux LRU cells detach while it is re-linked.
-        self.for_each_component_lru_(
-            child_id,
-            &mut |lru, node_id| lru.remove_node(node_id),
-            EvictLayer::Device,
-            /* skip_existing = */ false,
-        );
-
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
         child.key = key_tail;
@@ -1846,15 +1838,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             None
         };
 
+        // A split does not access the suffix; keep both fragments at its old position.
         self.for_each_component_lru_(
             new_node_id,
-            &mut |lru, node_id| lru.insert_mru(node_id),
-            EvictLayer::Device,
-            /* skip_existing = */ true,
-        );
-        self.for_each_component_lru_(
-            child_id,
-            &mut |lru, node_id| lru.insert_mru(node_id),
+            &mut |lru, node_id| lru.insert_after(child_id, node_id),
             EvictLayer::Device,
             /* skip_existing = */ true,
         );

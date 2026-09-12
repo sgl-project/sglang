@@ -990,13 +990,13 @@ fn split_updates_the_leaf_sets() {
 }
 
 #[test]
-fn split_readmits_aux_lru_cells() {
+fn split_preserves_aux_lru_position() {
     let mut tc = core();
     tc.register_component_(Arc::new(SwaComponentForTest));
     let c = split_setup(&mut tc);
     tc.arena.node_mut(c).values[SWA.idx()].value = Some(Tensor::from_slice(&[0i64]));
     tc.device_lru_list_mut(SWA).insert_mru(c);
-    // A second listed node makes the child's detach-and-readmit observable.
+    // A newer node must stay ahead of the unmatched suffix after the split.
     let root = tc.arena.root();
     let s = tc
         .arena
@@ -1009,10 +1009,10 @@ fn split_readmits_aux_lru_cells() {
         .unwrap();
     tc.device_lru_list_mut(SWA).insert_mru(s);
     let (new_node, _) = tc.split_node_(c, /* split_len = */ 2);
-    // The child re-enters the SWA LRU at MRU; the value-less prefix node does not.
+    // The child stays cold; the value-less prefix node does not enter the LRU.
     assert!(tc.device_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.device_lru_list(SWA).in_list(Some(new_node)));
-    assert_eq!(tc.device_lru_list(SWA).get_lru_where(|_| true), Some(s));
+    assert_eq!(tc.device_lru_list(SWA).get_lru_where(|_| true), Some(c));
 }
 
 #[test]

@@ -615,7 +615,10 @@ class SWAComponent(TreeComponent):
                 new_parent.component_data[self.component_type].value is None
                 and parent_swa_data.host_lock_ref == 0
             ):
-                host_lru.insert_mru(new_parent)
+                if host_lru.in_list(child):
+                    host_lru.insert_after(child, new_parent)
+                else:
+                    host_lru.insert_mru(new_parent)
             if (
                 child.component_data[self.component_type].value is None
                 and child_swa_data.host_lock_ref == 0
