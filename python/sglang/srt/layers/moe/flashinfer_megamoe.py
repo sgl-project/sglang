@@ -140,7 +140,10 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
 def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
     import inspect
 
-    if "return_workspace_view" in inspect.signature(mega.forward).parameters:
+    if (
+        getattr(mega, "supports_output_view", True)
+        and "return_workspace_view" in inspect.signature(mega.forward).parameters
+    ):
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
 
@@ -475,11 +478,17 @@ def make_nvfp4_megamoe_weight_loader(
 def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
-    _init_flashinfer_megamoe_layer_state(layer)
+    use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+    if use_w4a16:
+        # Reload preserves the transformed-weight storage and kernel geometry.
+        # Keep the live layer so its destructor cannot free a workspace still
+        # referenced by CUDA graphs and the shared-workspace cache.
+        _get_or_init_flashinfer_megamoe_layer_state(layer)
+    else:
+        _init_flashinfer_megamoe_layer_state(layer)
 
     from flashinfer.moe_ep import MoEWeightPack
 
-    use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
     if use_w4a16 and (
         not layer.moe_runner_config.is_gated
         or layer.moe_runner_config.activation != "silu"
@@ -514,20 +523,13 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
         )
 
     _validate_nvfp4_fc1_alpha(layer)
-    weight_names = (
-        "w13_weight",
-        "w13_weight_scale",
-        "w2_weight",
-        "w2_weight_scale",
-    )
-    load_layouts = {
-        name: (param.shape, param.stride(), param.dtype)
-        for name in weight_names
-        for param in (getattr(layer, name),)
-    }
     if use_w4a16:
         from flashinfer.moe_ep import preprocess_w4a16_cutedsl_mega_weights
 
+        load_layouts = {}
+        for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+            param = getattr(layer, name)
+            load_layouts[name] = (param.shape, param.stride(), param.dtype)
         transformed_weights = preprocess_w4a16_cutedsl_mega_weights(
             MoEWeightPack(
                 w13=layer.w13_weight.data,
@@ -562,17 +564,18 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             activation_clamp=None,
         )
-    weight_views = getattr(layer, "_flashinfer_megamoe_weight_views", None)
-    if weight_views is not None:
-        for name, (_, prepared_view) in weight_views.items():
-            getattr(layer, name).data = prepared_view
+    if use_w4a16:
+        weight_views = getattr(layer, "_flashinfer_megamoe_weight_views", None)
+        if weight_views is not None:
+            for name, (_, prepared_view) in weight_views.items():
+                getattr(layer, name).data = prepared_view
     _bind_transformed_weights(
         layer,
         transformed_weights,
         w13_scale_name="w13_weight_scale",
         w2_scale_name="w2_weight_scale",
     )
-    if weight_views is None:
+    if use_w4a16 and weight_views is None:
         # Padded scale storage can exceed the canonical load shape. as_strided
         # exposes only the original extent without allocating another copy.
         layer._flashinfer_megamoe_weight_views = {}
