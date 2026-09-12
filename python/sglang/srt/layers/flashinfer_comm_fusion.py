@@ -844,17 +844,22 @@ def materialize_flashinfer_trtllm_moe_allreduce_layout(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Convert the routed MoE output into the pure reduction API layout.
 
-    The producer exposes permuted expert rows plus a ``[tokens, top_k]`` row
-    map.  The reduction API consumes expert-major dense tensors instead.
+    The producer exposes permuted expert rows plus a flattened token-major
+    row map (``token * top_k + expert``). A ``[tokens, top_k]`` view is also
+    accepted. The reduction API consumes expert-major dense tensors instead.
     """
 
     if gemm2_out.ndim != 2:
         raise ValueError("gemm2_out must have shape [rows, hidden_dim]")
     if expert_weights.ndim != 2:
         raise ValueError("expert_weights must have shape [tokens, top_k]")
-    if expanded_idx_to_permuted_idx.shape != expert_weights.shape:
+    if expanded_idx_to_permuted_idx.shape not in (
+        expert_weights.shape,
+        (expert_weights.numel(),),
+    ):
         raise ValueError(
-            "expanded_idx_to_permuted_idx must match expert_weights shape"
+            "expanded_idx_to_permuted_idx must have shape [tokens * top_k] "
+            "or [tokens, top_k]"
         )
     if expanded_idx_to_permuted_idx.dtype != torch.int32:
         raise ValueError("expanded_idx_to_permuted_idx must use torch.int32")
@@ -862,7 +867,7 @@ def materialize_flashinfer_trtllm_moe_allreduce_layout(
     tokens, top_k = expert_weights.shape
     hidden_dim = gemm2_out.shape[1]
     expert_major_indices = (
-        expanded_idx_to_permuted_idx.transpose(0, 1)
+        expanded_idx_to_permuted_idx.reshape(tokens, top_k).transpose(0, 1)
         .contiguous()
         .reshape(-1)
         .to(torch.int64)
@@ -933,7 +938,8 @@ def prepare_flashinfer_trtllm_moe_allreduce_payload(
     if not (
         gemm2_out.ndim == 2
         and expert_weights.ndim == 2
-        and expanded_idx_to_permuted_idx.shape == expert_weights.shape
+        and expanded_idx_to_permuted_idx.shape
+        in (expert_weights.shape, (expert_weights.numel(),))
         and shared_expert_output.ndim == 2
         and _cake_moe_allreduce_lamport_workspace_supported(
             tokens, 7168, parallel.moe_tp_size

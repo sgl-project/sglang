@@ -175,30 +175,54 @@ class TestFlashInferTrtllmMoeAllReduce(CustomTestCase):
         )
 
     def test_layout_adapter_produces_expert_major_inputs(self):
-        gemm2_out = torch.arange(15, dtype=torch.bfloat16).reshape(5, 3)
+        gemm2_out = torch.arange(24, dtype=torch.bfloat16).reshape(8, 3)
         expert_weights = torch.tensor(
-            [[0.1, 0.2], [0.3, 0.4]], dtype=torch.bfloat16
+            [[1, 2], [3, 4], [5, 6]], dtype=torch.bfloat16
         )
-        expanded_idx = torch.tensor([[2, 0], [4, 1]], dtype=torch.int32)
-
-        active, scales = fusion.materialize_flashinfer_trtllm_moe_allreduce_layout(
-            gemm2_out, expert_weights, expanded_idx
-        )
-
+        # The native finalizer addresses expanded_idx[token * top_k + k].
+        expanded_idx = torch.tensor([4, 0, 6, 1, 3, 5], dtype=torch.int32)
         expected_active = torch.stack(
             (
-                torch.stack((gemm2_out[2], gemm2_out[4])),
-                torch.stack((gemm2_out[0], gemm2_out[1])),
+                torch.stack((gemm2_out[4], gemm2_out[6], gemm2_out[3])),
+                torch.stack((gemm2_out[0], gemm2_out[1], gemm2_out[5])),
             )
         )
-        torch.testing.assert_close(active, expected_active)
-        torch.testing.assert_close(
-            scales, expert_weights.transpose(0, 1).to(torch.float32)
+        expected_scales = torch.tensor(
+            [[1, 3, 5], [2, 4, 6]], dtype=torch.float32
         )
-        self.assertEqual(active.shape, (2, 2, 3))
-        self.assertEqual(scales.dtype, torch.float32)
-        self.assertTrue(active.is_contiguous())
-        self.assertTrue(scales.is_contiguous())
+
+        for index_map in (expanded_idx, expanded_idx.view(3, 2)):
+            with self.subTest(index_shape=tuple(index_map.shape)):
+                active, scales = (
+                    fusion.materialize_flashinfer_trtllm_moe_allreduce_layout(
+                        gemm2_out, expert_weights, index_map
+                    )
+                )
+                torch.testing.assert_close(active, expected_active)
+                torch.testing.assert_close(scales, expected_scales)
+                self.assertEqual(active.shape, (2, 3, 3))
+                self.assertEqual(scales.dtype, torch.float32)
+                self.assertTrue(active.is_contiguous())
+                self.assertTrue(scales.is_contiguous())
+
+    def test_layout_adapter_rejects_malformed_index_shape(self):
+        gemm2_out = torch.arange(24, dtype=torch.bfloat16).reshape(8, 3)
+        expert_weights = torch.ones(3, 2, dtype=torch.bfloat16)
+
+        malformed_indices = (
+            torch.arange(5, dtype=torch.int32),
+            torch.arange(7, dtype=torch.int32),
+            torch.arange(6, dtype=torch.int32).view(2, 3),
+            torch.arange(6, dtype=torch.int32).view(1, 3, 2),
+        )
+        for expanded_idx in malformed_indices:
+            with self.subTest(index_shape=tuple(expanded_idx.shape)):
+                with self.assertRaisesRegex(
+                    ValueError, "expanded_idx_to_permuted_idx"
+                ):
+                    fusion.materialize_flashinfer_trtllm_moe_allreduce_layout(
+                        gemm2_out, expert_weights, expanded_idx
+                    )
 
     def test_dispatch_passes_exact_api_and_cake_backend(self):
         api = _FakePureMoeAllReduceAPI()
@@ -327,7 +351,7 @@ class TestFlashInferTrtllmMoeAllReduce(CustomTestCase):
         residual = torch.randn_like(hidden_states)
         gemm2_out = torch.randn(8, 7168, device=device, dtype=dtype)
         expert_weights = torch.randn(1, 8, device=device, dtype=dtype)
-        expanded_idx = torch.arange(8, device=device, dtype=torch.int32).view(1, 8)
+        expanded_idx = torch.arange(8, device=device, dtype=torch.int32)
         shared_output = torch.randn_like(hidden_states)
         workspace_ptrs = torch.zeros(13, device=device, dtype=torch.int64)
 
