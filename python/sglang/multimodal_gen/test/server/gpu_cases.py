@@ -1115,7 +1115,6 @@ TWO_GPU_CASES = [
             expect_audio_output=True,
             extras={"seed": 42, "use_diffusion_decoder": True},
         ),
-        run_perf_check=False,
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
