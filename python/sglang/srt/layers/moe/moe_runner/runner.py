@@ -139,6 +139,12 @@ class MoeRunner:
             import sglang.srt.layers.moe.flashinfer_megamoe  # noqa: F401
         elif runner_backend.is_cutlass():
             self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
+        elif runner_backend.is_cutlass_mxfp4():
+            # The SM90 MXFP4 grouped GEMM only has the fused path, so there is no core.
+            self.runner_core = None
+            # Imported here rather than at module top (circular import) to register the
+            # cutlass_mxfp4 fused func before the pool lookup.
+            from sglang.srt.layers.moe.moe_runner import cutlass_mxfp4  # noqa: F401
         elif runner_backend.is_hpc_ops():
             import torch
 
