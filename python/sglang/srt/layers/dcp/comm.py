@@ -210,6 +210,8 @@ def all_gather_kv_cache_for_mha_extend(
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
         attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
+    if prefix_k_pe is None:
+        prefix_k_pe = prefix_kv_a[..., :0]
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
@@ -285,6 +287,8 @@ def all_gather_kv_cache_for_mla_extend(
             attn_mqa,
             dcp_local_prefix_kv_indices,
         )
+        if cache_k_rope is None:
+            cache_k_rope = cache_k_nope[..., :0]
         extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
         # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
         gathered_kv = all_gather_kv_cache_for_dcp(

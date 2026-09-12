@@ -379,6 +379,16 @@ class KVCacheConfigurator:
     def pool_page_size(self) -> int:
         return get_schedule().page_size * self.loc_space_scale
 
+    def _dsa_pool_geometry(self, max_total_num_tokens: int) -> tuple[int, int]:
+        physical_page_size = get_schedule().page_size
+        # NOTE(kpham-sgl): CUDA DSA kernels require physical pages of 64 even with DCP.
+        pool_size = max_total_num_tokens + self.pool_page_size - physical_page_size
+        return pool_size, physical_page_size
+
+    def _dsa_index_buf_size(self, size: int) -> int:
+        scale = get_parallel().attn_dcp_size // self.loc_space_scale
+        return (size + self.pool_page_size) * scale - get_schedule().page_size
+
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
         max_running_requests = config.max_running_requests
@@ -1592,6 +1602,10 @@ class KVCacheConfigurator:
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
+        index_buf_size = self._dsa_index_buf_size(max_total_num_tokens)
+        max_total_num_tokens, pool_page_size = self._dsa_pool_geometry(
+            max_total_num_tokens
+        )
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
@@ -1615,6 +1629,8 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        if not get_memory().enable_hisparse:
+            pool_kwargs["index_buf_size"] = index_buf_size
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -1624,7 +1640,7 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            page_size=pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1646,6 +1662,7 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             **pool_kwargs,
         )
+        token_to_kv_pool.dcp_replicated = self.loc_space_scale > 1
         return token_to_kv_pool
 
     def _build_hybrid_mla_swa_kv_pool(
@@ -1853,6 +1870,7 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
+                    index_buf_size=self._dsa_index_buf_size(max_total_num_tokens),
                     index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
@@ -1915,8 +1933,13 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+        pool_page_size = self.pool_page_size
+        if extra_args.get("use_dsa"):
+            max_total_num_tokens, pool_page_size = self._dsa_pool_geometry(
+                max_total_num_tokens
+            )
         token_to_kv_pool = pool_class(
-            page_size=self.pool_page_size,
+            page_size=pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
@@ -1935,6 +1958,8 @@ class KVCacheConfigurator:
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
         )
+        if extra_args.get("use_dsa"):
+            token_to_kv_pool.full_kv_pool.dcp_replicated = self.loc_space_scale > 1
         return token_to_kv_pool
 
     def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
