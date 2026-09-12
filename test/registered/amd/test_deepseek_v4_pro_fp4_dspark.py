@@ -145,7 +145,7 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
             "fp8_e4m3",
             "--chunked-prefill-size",
             "65536",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "512",
             "--max-running-requests",
             "512",

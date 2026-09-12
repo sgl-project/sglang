@@ -762,9 +762,9 @@ class QwenImageCrossAttention(nn.Module):
         self.inner_kv_dim = self.inner_dim
 
         tp_size = get_tp_world_size()
-        assert (
-            self.num_heads % tp_size == 0
-        ), f"num_heads ({self.num_heads}) must be divisible by tp_size ({tp_size})"
+        assert self.num_heads % tp_size == 0, (
+            f"num_heads ({self.num_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.local_num_heads = self.num_heads // tp_size
         self._unquantized_added_qkv_is_packed = False
 
@@ -824,7 +824,7 @@ class QwenImageCrossAttention(nn.Module):
                 )
                 if self._unquantized_added_qkv_is_packed:
                     # Packing changes BF16 GEMM reduction association. Keep it
-                    # off for lossless requests and mount it for quality=high.
+                    # off for lossless and mount it at extra-high or high.
                     mark_qwen_image_added_qkv_site(self)
             else:
                 self.add_q_proj = ColumnParallelLinear(
@@ -899,6 +899,7 @@ class QwenImageCrossAttention(nn.Module):
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
                 AttentionBackendEnum.SAGE_ATTN_3,
+                AttentionBackendEnum.SPARGE_ATTN,
             },
         )
 
@@ -976,6 +977,12 @@ class QwenImageCrossAttention(nn.Module):
                 make_contiguous=not self.use_fused_qkv_epilogue,
             )
 
+        freqs_complex = cross_attention_kwargs.get("freqs_complex")
+        if freqs_complex is not None:
+            img_complex, txt_complex = freqs_complex
+        else:
+            img_complex = txt_complex = None
+
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.local_num_heads, self.head_dim))
         img_key = img_key.unflatten(-1, (self.local_num_heads, self.head_dim))
@@ -1039,6 +1046,7 @@ class QwenImageCrossAttention(nn.Module):
                     k_norm=self.norm_k,
                     head_dim=self.head_dim,
                     cos_sin_cache=img_cache,
+                    freqs_complex=img_complex,
                     is_neox=False,
                     allow_inplace=True,
                 )
@@ -1049,6 +1057,7 @@ class QwenImageCrossAttention(nn.Module):
                     k_norm=self.norm_added_k,
                     head_dim=self.head_dim,
                     cos_sin_cache=txt_cache,
+                    freqs_complex=txt_complex,
                     is_neox=False,
                     allow_inplace=True,
                 )
@@ -1170,7 +1179,7 @@ class QwenImageGELU(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj",
             )
-        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # Extra-high-or-higher fusion site: up-proj GEMM + tanh-GELU in cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
@@ -2271,6 +2280,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         img_shapes: Optional[List[Tuple[int, int, int]]] = None,
         txt_seq_lens: Optional[List[int]] = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
+        freqs_complex: tuple[torch.Tensor, torch.Tensor] = None,
         additional_t_cond: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -2389,6 +2399,9 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if freqs_cis is not None:
                 img_cache, txt_cache = freqs_cis
                 freqs_cis = (img_cache, shard_like(txt_cache, txt_shard, dim=0))
+            if freqs_complex is not None:
+                img_complex, txt_complex = freqs_complex
+                freqs_complex = (img_complex, shard_like(txt_complex, txt_shard, dim=0))
             tail_meta = tail_attn_meta(
                 txt_shard,
                 encoder_hidden_states.shape[0],
@@ -2411,6 +2424,9 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             temb_txt_silu = temb_img_silu
 
         image_rotary_emb = freqs_cis
+        if freqs_complex is not None:
+            block_attention_kwargs["freqs_complex"] = freqs_complex
+
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,

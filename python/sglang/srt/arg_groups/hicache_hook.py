@@ -23,6 +23,19 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_unified_cache_external_linker:
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-unified-cache-external-linker and "
+                "--enable-hierarchical-cache are mutually exclusive."
+            )
+        if cfg.hicache_storage_backend is not None:
+            raise ValueError(
+                "--enable-unified-cache-external-linker does not use "
+                "--hicache-storage-backend."
+            )
+        return
+
     # Skip all normalization when neither hicache nor decode-offload path is active.
     if not (
         cfg.enable_hierarchical_cache
@@ -140,7 +153,7 @@ def resolve_layout_io_compatibility(server_args: Any):
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if (
-        cfg.hicache_storage_backend != "mooncake"
+        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return
@@ -159,7 +172,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         hicache_mem_layout=new_layout,
     )
     logger.warning(
-        f"Mooncake storage backend does not support layer_first layout, "
+        f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
     )
 

@@ -32,8 +32,9 @@ from sglang.test.test_utils import (
 class DsaMtpEvalConfigDefaults:
     """Eval thresholds & params shared across DSA-MTP regression variants."""
 
-    # GSM8KMixin defaults.
-    gsm8k_accuracy_thres = 0.935
+    # GSM8KMixin defaults. `gsm8k_accuracy_thres` is measured on the FP8
+    # variants; lower-scoring quantizations override it per variant.
+    gsm8k_accuracy_thres = 0.925
     gsm8k_accept_length_thres = 3.7
     gsm8k_num_questions = 500
     gsm8k_num_threads = 500

@@ -17,11 +17,11 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     unified_memory_disagg_move_gate,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeTransferQueue:
@@ -136,7 +136,7 @@ class TestPrefillMoveGate(CustomTestCase):
 class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
     """`schedulable_available_size` credits holes a peer urgent-flush would
     release. While the move gate is closed that flush relocates nothing, so
-    crediting them lets the scheduler admit work `_flush_peer_for_alloc` cannot
+    crediting them lets the scheduler admit work `_relieve_for_alloc` cannot
     satisfy; the alloc then returns None and the decode prealloc path treats
     that as a memory-estimation bug and aborts the scheduler.
     """
@@ -221,20 +221,25 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
 
     @staticmethod
     def _own_methods(cls_name: str) -> Set[str]:
-        import ast
-        import inspect
+        """Names this class defines ITSELF, inheritance excluded.
 
-        import sglang.srt.mem_cache.multi_ended_allocator as mod
+        Resolved off the class object rather than by parsing a named module:
+        these composites have already been moved once (out of
+        `multi_ended_allocator` into `allocator/unified_*`), and a hardcoded
+        module path turns that kind of move into a test failure that says
+        nothing about the contract. `__dict__` needs no GPU -- it is the class
+        body, not an instance.
+        """
+        from sglang.srt.mem_cache.allocator import (
+            unified_hybrid_swa,
+            unified_mamba,
+        )
 
-        tree = ast.parse(inspect.getsource(mod))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == cls_name:
-                return {
-                    child.name
-                    for child in node.body
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-                }
-        raise AssertionError(f"class {cls_name} not found in multi_ended_allocator")
+        for mod in (unified_mamba, unified_hybrid_swa):
+            cls = getattr(mod, cls_name, None)
+            if cls is not None:
+                return set(vars(cls))
+        raise AssertionError(f"class {cls_name} not found in the unified allocators")
 
     def test_transfer_translate_is_not_inherited_identity(self):
         for name in self._COMPOSITES:

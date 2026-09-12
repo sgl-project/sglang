@@ -79,9 +79,7 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
+        assert self.events[self.producer_index].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -100,7 +98,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -238,7 +235,8 @@ class StorageOperation:
         self.all_hash_values: Optional[List[str]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
-        self.stats_total_tokens = 0
+        # Absolute token offset at which this storage-prefetched span starts.
+        self.storage_start = 0
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -283,7 +281,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -596,7 +593,15 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in [
+                    "hf3fs",
+                    "mooncake",
+                    "npu_memcache",
+                    "eic",
+                    "nixl",
+                    "simm",
+                    "mori",
+                ]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -714,9 +719,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert (
-                tp_lcm_size % self.tp_size == 0
-            ), "tp_lcm_size must be divisible by tp_size."
+            assert tp_lcm_size % self.tp_size == 0, (
+                "tp_lcm_size must be divisible by tp_size."
+            )
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
@@ -886,6 +891,24 @@ class HiCacheController:
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
+            from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+                ascendc_io_enabled,
+                to_device_no_sync,
+            )
+
+            if ascendc_io_enabled():
+                # The fused acc_offload kv_exchange kernel reads the token
+                # indices directly on the device; keeping them there avoids
+                # the D2H sync that would serialize the layer-group pipeline.
+                # (The legacy memcpy2d exchange op still wants CPU indices and
+                # converts them itself.)
+                # Upload through pinned memory: host_indices comes from the
+                # radix-tree match as a pageable CPU tensor, and a pageable
+                # .to(device) completes with a stream synchronize that drains
+                # all compute queued on the current (default) stream.
+                if host_indices.device != self.device:
+                    host_indices = to_device_no_sync(host_indices, self.device)
+                return host_indices, device_indices
             return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")

@@ -37,17 +37,19 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
+
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _run_handler(*, prefill_backend, attention_backends):
     """Run just `handle_unified_memory_pool` over a minimal stand-in."""
-    sa = ServerArgs.__new__(ServerArgs)
+    sa = ServerArgs(model_path="dummy")
     cg = SimpleNamespace(
         prefill=SimpleNamespace(backend=prefill_backend),
         decode=SimpleNamespace(backend=Backend.FULL),
@@ -59,11 +61,12 @@ def _run_handler(*, prefill_backend, attention_backends):
         "speculative_eagle_topk": None,
         "enable_hierarchical_cache": False,
         "enable_lmcache": False,
+        "enable_two_batch_overlap": False,
         "dcp_size": 1,
         "cuda_graph_config": cg,
         "cuda_graph_backend_prefill": prefill_backend,
     }.items():
-        object.__setattr__(sa, name, value)
+        msgspec.Struct.__setattr__(sa, name, value)
     with patch(
         "sglang.srt.arg_groups.kv_cache_hook.attention_backends_of",
         return_value=attention_backends,
