@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
@@ -439,6 +439,59 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
 
+class TestNixlEmptyStateTransfer(CustomTestCase):
+    def test_empty_pp_state_component_is_a_noop(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = StagingFakeAgent()
+        mgr.is_mla_backend = False
+        mgr.pp_size = 2
+        mgr.kv_args = SimpleNamespace(prefill_start_layer=0, kv_data_ptrs=[1])
+
+        handle = mgr._send_kvcache_generic(
+            peer_name="decode",
+            src_data_ptrs=[],
+            dst_data_ptrs=[],
+            item_lens=[],
+            prefill_data_indices=np.array([3], dtype=np.int32),
+            dst_data_indices=np.array([5], dtype=np.int32),
+            dst_gpu_id=0,
+            notif="qsa-empty",
+            state_type=StateType.QSA_PENDING,
+            force_flat=True,
+            src_layer_ids=[],
+            dst_layer_ids=[],
+        )
+
+        self.assertIsNone(handle)
+        self.assertEqual(mgr.agent.get_xfer_descs_calls, [])
+        self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+
+    def test_paired_state_entries_reject_item_length_mismatch(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = StagingFakeAgent()
+        mgr.is_mla_backend = False
+        mgr.pp_size = 1
+        mgr.kv_args = SimpleNamespace(prefill_start_layer=0, kv_data_ptrs=[1])
+
+        with self.assertRaisesRegex(RuntimeError, "item length mismatch"):
+            mgr._send_kvcache_generic(
+                peer_name="decode",
+                src_data_ptrs=[10],
+                dst_data_ptrs=[20],
+                item_lens=[32],
+                prefill_data_indices=np.array([3], dtype=np.int32),
+                dst_data_indices=np.array([5], dtype=np.int32),
+                dst_gpu_id=0,
+                notif="qsa-mismatch",
+                state_type=StateType.QSA_PENDING,
+                force_flat=True,
+                src_layer_ids=[24],
+                dst_layer_ids=[24],
+                dst_item_lens=[48],
+            )
+        self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+
+
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
         mgr = object.__new__(NixlKVManager)
@@ -575,7 +628,9 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
         mgr.transfer_source_rank = 0
-        mgr.kv_args = SimpleNamespace(engine_rank=0, kv_data_ptrs=[0])
+        mgr.kv_args = SimpleNamespace(
+            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0
+        )
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -674,6 +729,7 @@ class TestNixlTransferWorker(CustomTestCase):
             engine_rank=0,
             kv_data_ptrs=[0x1000],
             page_size=4,
+            num_draft_entries=0,
         )
         mgr._dcp_pack_buffers = [SimpleNamespace(get_size=lambda: 16)]
 
@@ -686,7 +742,8 @@ class TestNixlTransferWorker(CustomTestCase):
 
         def send_kvcache_dcp(*args, **kwargs):
             submitted.append((args[0], args[-1]))
-            return f"handle-{args[0]}"
+            # One handle per transfer part; the worker extends its handle list.
+            return [f"handle-{args[0]}"]
 
         mgr.send_kvcache_dcp = MagicMock(side_effect=send_kvcache_dcp)
         submitted_counts_at_poll = []
