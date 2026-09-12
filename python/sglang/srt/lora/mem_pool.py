@@ -570,7 +570,25 @@ class LoRAMemoryPool:
             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            input_dim = divide(input_dim, effective_tp_size)
+            # Non-MoE row-parallel modules: size LoRA-A by the *actual* input shard of
+            # the base linear (input_size // input_size_per_partition), which is what
+            # RowParallelLinearWithLoRA.slice_lora_a_weights slices by. The global
+            # tp_size is wrong for the dense-MLP / shared-expert `down_proj` under
+            # `--enable-dp-attention --moe-dense-tp-size 1` (fully replicated: K stays
+            # the full intermediate size) -- dividing by tp_size undersized the buffer
+            # and `sgemm_lora_a_fwd` failed its `x.shape[-1] == K` assertion. Mirrors
+            # the replicated-output handling in get_lora_B_shape. MoE names keep the
+            # `moe_tp_size` rule (they never reach the probe).
+            # Attention names keep the attn_tp rule (`_effective_tp_size`); MoE names never
+            # get here with a probe.
+            row_tp = (
+                self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+                if module_name not in ATTN_TP_LORA_MODULE_NAMES
+                and not self.is_moe_module(module_name)
+                else effective_tp_size
+            )
+            if row_tp > 1:
+                input_dim = divide(input_dim, row_tp)
 
         if self.is_moe_module(module_name):
             if self.is_shared_moe_module(module_name):

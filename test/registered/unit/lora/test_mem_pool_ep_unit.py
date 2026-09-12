@@ -1418,3 +1418,86 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeRowLinear(torch.nn.Module):
+    """Stand-in for RowParallelLinear: only the shard bookkeeping the pool probes."""
+
+    def __init__(self, input_size: int, input_size_per_partition: int):
+        super().__init__()
+        self.input_size = input_size
+        self.input_size_per_partition = input_size_per_partition
+
+
+class TestRowParallelLoraAShape(unittest.TestCase):
+    """LoRA-A of a non-MoE row-parallel module must match the base linear's *actual* input shard.
+
+    Under `--enable-dp-attention --moe-dense-tp-size 1` the dense-MLP / shared-expert
+    `down_proj` is fully replicated (K == full intermediate size) although the global
+    tp_size is large; sizing by the global tp_size undersized the buffer and
+    `sgemm_lora_a_fwd` asserted `x.shape[-1] == K` (GLM-5.2, 32-GPU engine).
+    """
+
+    HIDDEN, INTER, MOE_INTER, TP = 64, 256, 32, 32
+
+    def _make_pool(self, base_model):
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.max_loras_per_batch = 1
+        pool.tp_size = self.TP
+        pool.attn_tp_size = 1
+        pool.moe_tp_size, pool.moe_tp_rank = 1, 0
+        pool.moe_ep_size, pool.moe_ep_rank = self.TP, 0
+        pool.moe_use_local_expert_ids = False
+        pool.experts_shared_outer_loras = False
+        pool.lora_added_tokens_size = 0
+        pool.base_hf_config = types.SimpleNamespace(
+            hidden_size=self.HIDDEN,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            head_dim=self.HIDDEN // 8,
+            vocab_size=1024,
+            intermediate_size=self.INTER,
+            first_k_dense_replace=1,
+            moe_layer_freq=1,
+            moe_intermediate_size=self.MOE_INTER,
+            n_shared_experts=1,
+        )
+        return pool
+
+    @staticmethod
+    def _model(dense_partition: int, shared_partition: int):
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList()
+        dense = torch.nn.Module()
+        dense.mlp = torch.nn.Module()
+        dense.mlp.down_proj = _FakeRowLinear(256, dense_partition)
+        moe = torch.nn.Module()
+        moe.mlp = torch.nn.Module()
+        moe.mlp.shared_experts = torch.nn.Module()
+        moe.mlp.shared_experts.down_proj = _FakeRowLinear(32, shared_partition)
+        model.model.layers.append(dense)
+        model.model.layers.append(moe)
+        return model
+
+    def test_replicated_down_proj_keeps_the_full_input_dim(self):
+        """moe-dense-tp-size 1: dense and shared-expert down_proj are replicated -> K is the full input."""
+        model = self._model(dense_partition=256, shared_partition=32)
+        pool = self._make_pool(model)
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 0), (1, 8, 256))
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 32))
+
+    def test_sharded_down_proj_divides_by_the_real_shard_count(self):
+        """A genuinely TP-sharded down_proj still gets input_dim / shards (probe == input_size // partition)."""
+        model = self._model(dense_partition=256 // 8, shared_partition=32 // 8)
+        pool = self._make_pool(model)
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 0), (1, 8, 32))
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 4))
+
+    def test_probe_miss_falls_back_to_the_global_tp_size(self):
+        """No matching base module (nothing to probe) -> previous behaviour: divide by the global tp_size."""
+        model = torch.nn.Module()
+        pool = self._make_pool(model)
+        self.assertEqual(
+            pool.get_lora_A_shape("down_proj", model, 8, 0), (1, 8, 256 // self.TP)
+        )
