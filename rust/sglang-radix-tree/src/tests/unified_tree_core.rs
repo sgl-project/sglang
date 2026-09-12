@@ -990,13 +990,13 @@ fn split_updates_the_leaf_sets() {
 }
 
 #[test]
-fn split_readmits_aux_lru_cells() {
+fn split_preserves_aux_lru_position() {
     let mut tc = core();
     tc.register_component_(Arc::new(SwaComponentForTest));
     let c = split_setup(&mut tc);
     tc.arena.node_mut(c).values[SWA.idx()].value = Some(Tensor::from_slice(&[0i64]));
     tc.device_lru_list_mut(SWA).insert_mru(c);
-    // A second listed node makes the child's detach-and-readmit observable.
+    // A newer node must stay ahead of the unmatched suffix after the split.
     let root = tc.arena.root();
     let s = tc
         .arena
@@ -1009,10 +1009,10 @@ fn split_readmits_aux_lru_cells() {
         .unwrap();
     tc.device_lru_list_mut(SWA).insert_mru(s);
     let (new_node, _) = tc.split_node_(c, /* split_len = */ 2);
-    // The child re-enters the SWA LRU at MRU; the value-less prefix node does not.
+    // The child stays cold; the value-less prefix node does not enter the LRU.
     assert!(tc.device_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.device_lru_list(SWA).in_list(Some(new_node)));
-    assert_eq!(tc.device_lru_list(SWA).get_lru_where(|_| true), Some(s));
+    assert_eq!(tc.device_lru_list(SWA).get_lru_where(|_| true), Some(c));
 }
 
 #[test]
@@ -1863,6 +1863,7 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
         track_adopted_ranges: false,
@@ -2754,11 +2755,11 @@ fn insert_coalesces_parent_linked_block_stores() {
             .hash_value,
         Some(hashes)
     );
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 }
 
 #[test]
-fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
+fn namespaced_event_hashes_are_sparse_and_removed_with_the_node() {
     let mut tc = events_core(2);
     let key = vec![1, 2, 7, 8];
     tc.insert(&insert_params_in_namespace(
@@ -2773,8 +2774,8 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
         .match_prefix(&match_params_in_namespace(&key, None, Some("tenant-a")))
         .best_match_node_id;
     let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
-    assert_eq!(tc.salted_event_hashes[&leaf].len(), 2);
-    assert_eq!(
+    assert_eq!(tc.namespaced_event_hashes[&leaf].len(), 2);
+    assert_ne!(
         tc.arena.node(leaf_idx).hash_value,
         Some(crate::node::get_hash_str::<Vec<i64>>(&key, None, 2))
     );
@@ -2790,7 +2791,7 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
     tc.evict_device_end(FULL);
     tc.take_events();
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 
     tc.insert(&insert_params_in_namespace(
         &key,
@@ -2798,13 +2799,48 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
         None,
         Some("tenant-a"),
     ));
-    assert!(!tc.salted_event_hashes.is_empty());
+    assert!(!tc.namespaced_event_hashes.is_empty());
     tc.reset();
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 }
 
 #[test]
-fn salted_event_hashes_survive_node_split() {
+fn extra_key_nodes_publish_token_only_event_hashes() {
+    // Events omit extra_key; storage includes it.
+    let mut tc = events_core(2);
+    let key = vec![1, 2, 7, 8];
+    tc.insert(&insert_params_in_namespace(
+        &key,
+        &[10, 11, 12, 13],
+        Some("lora-a"),
+        None,
+    ));
+    let token_only = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: token_only
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: key.clone(),
+            block_size: 2,
+            medium: StorageMedium::Gpu,
+            cache_salt: None,
+        }]
+    );
+
+    let leaf = tc
+        .match_prefix(&match_params_in_namespace(&key, Some("lora-a"), None))
+        .best_match_node_id;
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
+    assert_eq!(tc.namespaced_event_hashes[&leaf].len(), 2);
+    assert_ne!(tc.arena.node(leaf_idx).hash_value, Some(token_only));
+}
+
+#[test]
+fn namespaced_event_hashes_survive_node_split() {
     let mut tc = events_core(2);
     let original = vec![1, 2, 3, 4];
     tc.insert(&insert_params_in_namespace(
@@ -2820,7 +2856,7 @@ fn salted_event_hashes_survive_node_split() {
             Some("tenant-a"),
         ))
         .best_match_node_id;
-    let original_hashes = tc.salted_event_hashes[&original_leaf].clone();
+    let original_hashes = tc.namespaced_event_hashes[&original_leaf].clone();
     tc.take_events();
 
     let branch = vec![1, 2, 5, 6];
@@ -2844,8 +2880,14 @@ fn salted_event_hashes_survive_node_split() {
         .node(tc.arena.resolve(split_child).expect("live test node"))
         .parent();
     let split_parent = tc.arena.node(split_parent_idx).id;
-    assert_eq!(tc.salted_event_hashes[&split_parent], original_hashes[..1]);
-    assert_eq!(tc.salted_event_hashes[&split_child], original_hashes[1..]);
+    assert_eq!(
+        tc.namespaced_event_hashes[&split_parent],
+        original_hashes[..1]
+    );
+    assert_eq!(
+        tc.namespaced_event_hashes[&split_child],
+        original_hashes[1..]
+    );
 }
 
 #[test]
@@ -2863,9 +2905,9 @@ fn salted_event_hash_walk_is_iterative_and_on_demand() {
             )
             .unwrap();
     }
-    assert!(tc.salted_event_hashes.is_empty());
-    tc.ensure_salted_event_hashes_(parent);
-    assert_eq!(tc.salted_event_hashes.len(), 1100);
+    assert!(tc.namespaced_event_hashes.is_empty());
+    tc.ensure_namespaced_event_hashes_(parent);
+    assert_eq!(tc.namespaced_event_hashes.len(), 1100);
 }
 
 #[test]
@@ -3010,6 +3052,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
         track_adopted_ranges: false,
@@ -8357,6 +8400,7 @@ fn sequence_insert_params<'k>(
         mamba_value,
         prev_prefix_len,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
         track_adopted_ranges: false,
