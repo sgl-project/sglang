@@ -1026,6 +1026,22 @@ class KVCacheConfigurator:
                     mamba_layer_ids.append(layer_id)
         return mamba_layer_ids
 
+    def _get_ple_req_pool_kwargs(self) -> dict[str, Any]:
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        if not isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            return {}
+        return {
+            "short_conv_layer_ids": [
+                i
+                for i in self.mambaish_config.short_conv_layer_ids
+                if self.layer_info.start_layer <= i < self.layer_info.end_layer
+            ],
+            "short_conv_state_shape": self.mambaish_config.short_conv_state_shape,
+            "ngram_context_len": self.mambaish_config.ngram_context_len,
+            "ngram_eos_token_id": int(self.mambaish_config.eos_token_id),
+        }
+
     def _build_hybrid_mamba_decode_req_pool(
         self,
         *,
@@ -1051,6 +1067,7 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            **self._get_ple_req_pool_kwargs(),
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
@@ -1108,20 +1125,6 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
-        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
-
-        ple_kwargs = {}
-        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
-            ple_kwargs = dict(
-                short_conv_layer_ids=[
-                    i
-                    for i in self.mambaish_config.short_conv_layer_ids
-                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
-                ],
-                short_conv_state_shape=self.mambaish_config.short_conv_state_shape,
-                ngram_context_len=self.mambaish_config.ngram_context_len,
-                ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
-            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -1133,7 +1136,7 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-            **ple_kwargs,
+            **self._get_ple_req_pool_kwargs(),
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
             # case above: None => the pool skips SpeculativeState).
@@ -1886,25 +1889,16 @@ class KVCacheConfigurator:
             else mha_pool_class
         )
         from sglang.srt.layers.attention.qsa.config import (
-            QSA_VARIANT_TOKENWISE,
             parse_qsa_profile,
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
-            QwenDSATokenToKVPool,
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
-        elif qsa_profile.variant == QSA_VARIANT_TOKENWISE:
-            pool_class = QwenDSATokenToKVPool
-            extra_args.update(
-                qsa_index_kv_heads=qsa_profile.kv_heads,
-                qsa_index_head_dim=qsa_profile.head_dim,
-                qsa_token_budget=qsa_profile.budget,
-            )
         else:
             pool_class = QSATokenToKVPool
             extra_args.update(
@@ -2585,8 +2579,8 @@ def calculate_mla_kv_cache_dim(
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (
-        get_exec().kernel.dsa_prefill_backend in ("tilelang", "aiter")
-        or get_exec().kernel.dsa_decode_backend in ("tilelang", "aiter")
+        get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
+        or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
     ):
         return kv_cache_dim
 
