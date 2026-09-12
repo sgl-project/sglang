@@ -17,7 +17,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -37,6 +37,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.silu_fp8_fusion import make_silu_fp8_fusion
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -68,6 +69,7 @@ class Qwen2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        allow_silu_fp8_quant: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -89,6 +91,9 @@ class Qwen2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self._silu_fp8_fusion = make_silu_fp8_fusion(
+            self.down_proj, allowed=allow_silu_fp8_quant
+        )
 
     def forward(
         self,
@@ -99,7 +104,13 @@ class Qwen2MLP(nn.Module):
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = (
+            self._silu_fp8_fusion(gate_up)
+            if self._silu_fp8_fusion is not None
+            else None
+        )
+        if x is None:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
@@ -317,7 +328,7 @@ class Qwen2Model(nn.Module):
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
+        decoder_layer_type: Callable[..., nn.Module] = Qwen2DecoderLayer,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
