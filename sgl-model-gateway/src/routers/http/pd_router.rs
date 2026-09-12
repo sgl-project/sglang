@@ -1663,11 +1663,11 @@ impl RouterTrait for PDRouter {
     ) -> Response {
         let is_stream = body.is_stream();
 
-        // A background request with stream=true stays attached to this
-        // connection (the worker runs it as a foreground stream), but a
-        // detached one is retrieved via /v1/responses/{id}, which the PD
-        // router does not implement; reject it instead of dispatching a
-        // request whose lifecycle cannot complete in PD mode.
+        // Reject detached requests even when workers lack response-store
+        // admission checks: the PD router cannot complete their retrieval /
+        // cancel lifecycle. Attached requests still undergo serving-side
+        // capability validation, including rejection of background streams
+        // when response storage is unavailable.
         if body.background.unwrap_or(false) && !is_stream {
             warn!("PD mode does not support detached background responses; returning bad request");
             return error::bad_request(

@@ -223,7 +223,7 @@ mod pd_routing_tests {
 
 #[cfg(test)]
 mod pd_responses_routing_tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use axum::routing::post;
     use http_body_util::BodyExt;
@@ -237,7 +237,12 @@ mod pd_responses_routing_tests {
         protocols::responses::ResponsesRequest,
         routers::{pd_router::PDRouter, RouterTrait},
     };
-    use tokio::{net::TcpListener, sync::Mutex};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::{TcpListener, TcpStream},
+        sync::{oneshot, Mutex},
+        time::timeout,
+    };
 
     use super::*;
 
@@ -434,9 +439,7 @@ mod pd_responses_routing_tests {
 
     /// Streaming Responses requests must flow through the PD dual-dispatch
     /// path and return the decode SSE stream unchanged, with bootstrap
-    /// metadata still injected into both worker requests. `background=true`
-    /// with `stream=true` stays attached to the connection, so it must not
-    /// be rejected by the router.
+    /// metadata still injected into both worker requests.
     #[tokio::test]
     async fn test_pd_responses_streaming_passthrough() {
         let prefill_bodies = Arc::new(Mutex::new(Vec::new()));
@@ -461,8 +464,7 @@ mod pd_responses_routing_tests {
         let request = responses_request(json!({
             "model": "mock-model",
             "input": "Hello PD streaming",
-            "stream": true,
-            "background": true
+            "stream": true
         }));
 
         let response = router.route_responses(None, &request, None).await;
@@ -479,12 +481,163 @@ mod pd_responses_routing_tests {
         assert_eq!(prefill_bodies.len(), 1);
         assert_eq!(decode_bodies.len(), 1);
         assert_eq!(decode_bodies[0]["stream"], true);
-        assert_eq!(decode_bodies[0]["background"], true);
         assert!(prefill_bodies[0]["bootstrap_room"].is_u64());
         assert_eq!(
             decode_bodies[0]["bootstrap_room"],
             prefill_bodies[0]["bootstrap_room"]
         );
+    }
+
+    /// Read the gateway's fixed-length JSON POST without an HTTP server that
+    /// could hide disconnects by keeping a pending handler alive.
+    async fn read_responses_post(socket: &mut BufReader<TcpStream>) -> serde_json::Value {
+        let mut line = String::new();
+        socket.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "POST /v1/responses HTTP/1.1\r\n");
+        let mut content_length = None;
+        loop {
+            line.clear();
+            assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            let (name, value) = line.split_once(':').unwrap();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut body = vec![0; content_length.expect("JSON POST must have Content-Length")];
+        socket.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Model #39122's pre-generation admission error without depending on its
+    /// serving implementation. Prefill waits until decode has received the
+    /// request, then rejects it without producing KV. Decode sends no headers
+    /// or KV-timeout response: only a router disconnect can finish its task.
+    #[tokio::test]
+    async fn test_pd_responses_stateful_400_cancels_pending_decode() {
+        for (param, value, stream) in [
+            ("previous_response_id", json!("resp_previous"), false),
+            ("previous_response_id", json!("resp_previous"), true),
+            ("background", json!(true), true),
+        ] {
+            let prefill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let decode_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let prefill_url = format!("http://{}", prefill_listener.local_addr().unwrap());
+            let decode_url = format!("http://{}", decode_listener.local_addr().unwrap());
+            let (decode_started_tx, decode_started_rx) = oneshot::channel();
+            let admission_error = json!({
+                "error": {
+                    "message": "Response store is disabled. Stateful Responses require --enable-response-store on a standalone server; response storage is unavailable in PD mode.",
+                    "type": "BadRequestError",
+                    "param": param,
+                    "code": 400
+                }
+            });
+            let error_body = admission_error.to_string();
+            let mut prefill_task = tokio::spawn(async move {
+                let (socket, _) = prefill_listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let body = read_responses_post(&mut socket).await;
+                decode_started_rx.await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    error_body.len(), error_body
+                );
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                body
+            });
+            let mut decode_task = tokio::spawn(async move {
+                let (socket, _) = decode_listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let body = read_responses_post(&mut socket).await;
+                decode_started_tx.send(()).unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    socket.read(&mut byte).await.unwrap(),
+                    0,
+                    "router must close the pending decode connection after prefill rejects"
+                );
+                body
+            });
+
+            let router = make_pd_router();
+            let prefill = Arc::new(
+                BasicWorkerBuilder::new(prefill_url)
+                    .worker_type(CoreWorkerType::Prefill {
+                        bootstrap_port: Some(9001),
+                    })
+                    .build(),
+            );
+            let decode = Arc::new(
+                BasicWorkerBuilder::new(decode_url)
+                    .worker_type(CoreWorkerType::Decode)
+                    .build(),
+            );
+            prefill.set_healthy(true);
+            decode.set_healthy(true);
+            router.worker_registry.register(prefill.clone());
+            router.worker_registry.register(decode.clone());
+            let mut payload = json!({
+                "model": "mock-model",
+                "input": "Continue the conversation",
+                "stream": stream
+            });
+            payload[param] = value.clone();
+            let request = responses_request(payload);
+
+            // The timeout is only a regression guard. No worker timer, client
+            // timeout, test teardown, or router drop can release decode here.
+            let result = timeout(Duration::from_secs(5), async {
+                let response = router.route_responses(None, &request, None).await;
+                let status = response.status();
+                let error_code = response.headers().get("x-smg-error-code").cloned();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let (prefill_body, decode_body) = tokio::join!(&mut prefill_task, &mut decode_task);
+                (
+                    status,
+                    error_code,
+                    body,
+                    prefill_body.unwrap(),
+                    decode_body.unwrap(),
+                )
+            })
+            .await;
+            if result.is_err() {
+                // join! may already have consumed a completed handle. Only
+                // abort and await tasks that are still pending on failure.
+                for task in [&mut prefill_task, &mut decode_task] {
+                    if !task.is_finished() {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                }
+            }
+            let (status, error_code, body, prefill_body, decode_body) = result.expect(
+                "prefill admission error must finish routing and disconnect decode promptly",
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{param}, stream={stream}");
+            assert_eq!(error_code.unwrap(), "prefill_bad_request");
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&admission_error.to_string()));
+            assert_eq!(prefill_body[param], value);
+            assert_eq!(decode_body[param], value);
+            assert!(prefill_body["bootstrap_room"].is_u64());
+            assert_eq!(
+                prefill_body["bootstrap_room"],
+                decode_body["bootstrap_room"]
+            );
+            assert_eq!(prefill.load(), 0);
+            assert_eq!(decode.load(), 0);
+        }
     }
 
     /// Detached background responses (`background=true, stream=false`) are
