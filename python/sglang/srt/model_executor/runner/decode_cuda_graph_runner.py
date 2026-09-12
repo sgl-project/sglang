@@ -331,11 +331,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.candidate_filter_span = None
         self.candidate_graph_limits = []
         text_config = model_runner.model_config.hf_text_config
+        # the ROCm low-ratio indexer (low_ratio_backend_hip) reads the same capture variants
         if (
             self.capture_forward_mode == ForwardMode.DECODE
             and model_runner.device == "cuda"
-            and not is_hip()
-            and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+            and (
+                is_hip()
+                or torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+            )
             and getattr(text_config, "model_type", None) == "deepseek_v41"
             and getattr(text_config, "candidate_source_layer_id", -1) >= 0
         ):
@@ -608,27 +611,41 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
 
+    def _dp_max_seq_len(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """The attention-DP group's longest sequence when the graph must match on every rank;
+        the in-graph collectives pair the ranks' registered buffers by capture order."""
+        if not self.require_mlp_tp_gather:
+            return None
+        return forward_batch.dp_max_seq_len
+
     def _resolve_dsa_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         """Select the indexer graph for the longest request, or None without variants."""
+        dp_max_seq_len = self._dp_max_seq_len(forward_batch)
         candidate_span = getattr(self, "candidate_filter_span", None)
         if candidate_span is not None:
-            # Without the scheduler's CPU lengths, use the full graph without D2H.
-            lengths = getattr(forward_batch, "seq_lens_cpu", None)
-            has_host_lengths = (
-                lengths is not None
-                and lengths.device.type == "cpu"
-                and lengths.numel() > 0
-            )
-            if has_host_lengths:
+            if dp_max_seq_len is not None:
+                max_seq_len = dp_max_seq_len
+            else:
+                # Without the scheduler's CPU lengths, use the full graph without D2H.
+                lengths = getattr(forward_batch, "seq_lens_cpu", None)
+                has_host_lengths = (
+                    lengths is not None
+                    and lengths.device.type == "cpu"
+                    and lengths.numel() > 0
+                )
+                if not has_host_lengths:
+                    return "candidate_filtered"
                 max_seq_len = int(lengths.max())
-                for variant, limit in self.candidate_graph_limits:
-                    if max_seq_len <= limit:
-                        return variant
+            for variant, limit in self.candidate_graph_limits:
+                if max_seq_len <= limit:
+                    return variant
             return "candidate_filtered"
         if not getattr(self, "dsa_dual_graph", False):
             return None
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+        if dp_max_seq_len is not None:
+            max_kv_len = dp_max_seq_len
+        elif seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Host-side mirror (maintained incrementally for plain decode) — no
             # d2h sync needed.
             max_kv_len = int(seq_lens_cpu.max().item())

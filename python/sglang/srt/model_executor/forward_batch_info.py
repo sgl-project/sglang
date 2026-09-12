@@ -457,6 +457,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
+    # Longest sequence across the attention-DP group (from the scheduler's DP
+    # sync); None without DP attention.
+    dp_max_seq_len: Optional[int] = None
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
@@ -836,6 +839,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
+            dp_max_seq_len=batch.dp_max_seq_len,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,

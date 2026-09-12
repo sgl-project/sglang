@@ -98,11 +98,15 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    # longest sequence this rank runs this step (0 when idle); a decode graph keyed by
+    # context length must replay the same variant on every DP rank, so the group max picks it
+    max_seq_len: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_max_seq_len: Optional[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -118,6 +122,7 @@ class MLPSyncBatchInfo:
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
+                self.max_seq_len,
             ],
             device=device,
             dtype=dtype,
@@ -134,6 +139,7 @@ class MLPSyncBatchInfo:
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
+                0,  # max_seq_len
             ],
             device=device,
             dtype=dtype,
@@ -144,6 +150,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.global_max_seq_len = self.max_seq_len
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -216,6 +223,7 @@ class MLPSyncBatchInfo:
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
+        self.global_max_seq_len = int(tp0_info_cpu[:, 8].max())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -237,6 +245,7 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        batch.dp_max_seq_len = mlp_sync_info.global_max_seq_len
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -262,6 +271,17 @@ def should_skip_scheduler_all_gather(dp_size: int) -> bool:
     """
 
     return dp_size == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+
+
+def _local_max_seq_len(local_batch: ScheduleBatch) -> int:
+    """Longest sequence (prompt + generated so far) of this rank's batch."""
+    seq_lens_cpu = getattr(local_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+        return int(seq_lens_cpu.max())
+    seq_lens = getattr(local_batch, "seq_lens", None)
+    if seq_lens is not None and seq_lens.numel() > 0:
+        return int(seq_lens.max().item())
+    return 0
 
 
 def _local_decode_cuda_graph_vote(
@@ -462,6 +482,7 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        max_seq_len=_local_max_seq_len(local_batch) if num_tokens > 0 else 0,
     )
 
     if dp_size == 1:
