@@ -1023,6 +1023,13 @@ class UnifiedRadixCache(BasePrefixCache):
                         value=values[: len(prompt_key)],
                         prev_prefix_len=len(prompt_key),
                         priority=insert_params.priority + 1,
+                        # Topology-only re-insert: the request itself created
+                        # these nodes moments ago, so counting it as a hit is
+                        # the same self-referencing inflation `chunked` exists
+                        # to suppress. hit_count drives eviction order, so an
+                        # extra bump here would silently promote every prompt
+                        # node into the protected segment.
+                        chunked=True,
                     )
                 )
 

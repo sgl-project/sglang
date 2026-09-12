@@ -534,6 +534,12 @@ class RadixCache(BasePrefixCache):
                         key=prompt_key,
                         value=values[: len(prompt_key)],
                         priority=priority + 1,
+                        # Topology-only re-insert: this request created these
+                        # nodes moments ago, so counting it as a hit is the
+                        # same self-referencing inflation `chunked` exists to
+                        # suppress. hit_count drives eviction order, so an
+                        # extra bump would silently promote every prompt node.
+                        chunked=True,
                     )
                 )
             freed_end = result.prefix_len
