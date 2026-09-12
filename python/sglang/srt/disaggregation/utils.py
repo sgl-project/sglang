@@ -1638,6 +1638,29 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.logprob.input_token_ids_logprobs_idx = []
 
 
+def is_unadmitted_reject(req: Req) -> bool:
+    """A request rejected at intake, before it acquired anything.
+
+    A preempted or resumed request can also carry a pending abort -- "Abort
+    method 3" marks a *running* request and `filter_batch` does not drop it,
+    since `finished()` is still False -- but it re-enters owning KV, a metadata
+    buffer or a host retraction backup, whose release its queue owns.
+
+    This only sniffs state, so it cannot stand alone where the caller already
+    says what it is doing: `DecodePreallocQueue.add` gates on its own
+    `is_retracted` / `is_rebootstrap` flags, because a retracted decode request
+    has none of these markers left -- `release_req` has already freed its KV,
+    its metadata buffer lives on `DecodeRequest`, and `retraction_backup` is
+    unset for a short sequence.
+    """
+    return is_aborted(req) and not (
+        req.kv.holds_kv
+        or req.kv.holds_mamba
+        or req.metadata_buffer_index >= 0
+        or req.kv.retraction_backup is not None
+    )
+
+
 def is_aborted(req: Req) -> bool:
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

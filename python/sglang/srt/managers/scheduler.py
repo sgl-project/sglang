@@ -3145,6 +3145,22 @@ class Scheduler(
             )
             self._prefetch_kvcache(req)
 
+    def retire_unadmitted_request(self, req: Req) -> None:
+        """Finish a request the disaggregation queues rejected at their door."""
+        # `create_req` marks a streaming session in-flight, and the pre-abort
+        # detach lives in `StreamingSession.find_active_slot`, which only runs
+        # while scheduling; a session left in-flight rejects every later request.
+        if req.session is not None and req.session.streaming:
+            req.session.abort_req()
+            req.session = None
+        # `beam_coordinator.validate_and_init` counts the group in ahead of the
+        # checks that reject; no-op when the request has no group.
+        self.beam_coordinator.retire_group(req)
+        reason = req.to_finish or req.finished_reason
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.update_finish_state()
+        self.output_streamer.stream_output([req], req.return_logprob)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return

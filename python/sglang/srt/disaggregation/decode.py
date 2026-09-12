@@ -59,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    is_unadmitted_reject,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
@@ -638,6 +639,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        # See `PrefillBootstrapQueue.add`. A retracted or rebootstrapping
+        # request owns a host KV backup that `retracted_queue` releases, and by
+        # this point carries none of the markers `is_unadmitted_reject` reads,
+        # so take the caller's word for it rather than sniffing.
+        if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
+            self.scheduler.retire_unadmitted_request(req)
+            return
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
