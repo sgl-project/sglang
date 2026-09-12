@@ -95,6 +95,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_offload_compatibility(server_args)
     from sglang.srt.arg_groups.validation_hook import (
+        default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
         validate_sampling_mask_max_tokens,
@@ -165,7 +166,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.parallel_hook import (
         handle_context_parallelism,
         handle_data_parallelism,
-        handle_dcp_validation,
+        handle_decode_context_parallelism,
         handle_dwdp,
         handle_elastic_ep,
         handle_eplb_and_dispatch,
@@ -173,7 +174,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     validate_prefill_only_disable_kv_cache_args(server_args)
-    handle_dcp_validation(server_args)
+    handle_decode_context_parallelism(server_args)
 
     # Model-arch prefill CUDA-graph default must land before cuda-graph
     # resolution (the declarative registry materializes too late to affect
@@ -236,6 +237,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_model_specific_adjustments(server_args)
+    default_unset_prefill_decode_interval(server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     handle_offload_compatibility(server_args)
 
