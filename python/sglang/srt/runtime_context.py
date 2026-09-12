@@ -26,15 +26,15 @@ user's raw input, kept **read-only** for debug and reproduction; what
 resolution decided lives in the declarations (``resolution_result``) and, for
 business code, in the namespace bags below -- never on this object's fields. The context owns the storage:
 publishing goes through ``RuntimeContext.set_server_args`` (the legacy
-``set_global_server_args_for_scheduler`` / ``get_global_server_args`` are thin
-shims over this slot).
+``set_global_server_args_for_scheduler`` is a thin shim over this slot;
+``get_global_server_args`` is retired and raises).
 
 ``get_exec()`` / ``get_memory()`` / ``get_schedule()`` / ``get_device()`` /
 ``get_model()`` / ``get_spec()`` / ``get_lora()`` / ``get_mm()`` /
 ``get_disagg()`` / ``get_serving()`` / ``get_observability()`` return the
 resolved **config namespace bags** — the single source of truth for config,
-snapshotted from ``server_args`` at publish and driven by the ``NS(...)``
-metadata on each field (multi-level under ``exec.*``). Reads are attribute
+snapshotted from ``server_args`` at publish, one bag per namespace class in
+``arg_groups/fields/`` (multi-level under ``exec.*``). Reads are attribute
 chains (``get_exec().moe.moe_runner_backend``); bags are read-only by bare
 assignment (written via ``override``).
 
@@ -47,7 +47,6 @@ test-only ``override(**kw)``.
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import logging
 import math
@@ -55,6 +54,8 @@ import os
 import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, Optional
+
+import msgspec
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -182,6 +183,62 @@ def derive_parallel_widths(
     }
 
 
+def parallel_widths_of(cfg: Any) -> dict:
+    """The six quotients, from a resolved config.
+
+    Every input is a record field, so this is a function of the configuration
+    and nothing else -- which is why the six are declared `Derived(fn=...)` and
+    computed once at publish rather than on every read. `dcp_enabled` is
+    `dcp_size > 1` because that is exactly when `initialize_model_parallel`
+    builds the group.
+    """
+    attn_dp_size, _ = derive_attention_widths(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        dp_size=cfg.dp_size,
+        enable_dp_attention=cfg.enable_dp_attention,
+    )
+    return derive_parallel_widths(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=attn_dp_size,
+        moe_ep_size=cfg.ep_size,
+        moe_dp_size=cfg.moe_dp_size,
+        dcp_size=cfg.dcp_size,
+        dcp_enabled=cfg.dcp_size > 1,
+    )
+
+
+def attn_tp_size_of(cfg: Any):
+    """`attn_tp_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["attn_tp_size"]
+
+
+def attn_dp_size_of(cfg: Any):
+    """`attn_dp_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["attn_dp_size"]
+
+
+def attn_dcp_size_of(cfg: Any):
+    """`attn_dcp_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["attn_dcp_size"]
+
+
+def moe_ep_size_of(cfg: Any):
+    """`moe_ep_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["moe_ep_size"]
+
+
+def moe_tp_size_of(cfg: Any):
+    """`moe_tp_size`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["moe_tp_size"]
+
+
+def dcp_enabled_of(cfg: Any):
+    """`dcp_enabled`, computed at publish. See `parallel_widths_of`."""
+    return parallel_widths_of(cfg)["dcp_enabled"]
+
+
 class ParallelContext:
     """Parallel-topology namespace: one spelling per name.
 
@@ -247,13 +304,17 @@ class ParallelContext:
     def clear_derived_widths(self) -> None:
         self._derived.clear()
 
-    def _derived_width(self, name, getter):
-        """A width the leaves imply: the stamp, else the live group.
+    def _derived_width(self, name):
+        """A width the configuration implies: override, else stamp, else the
+        published leaf.
 
-        The fallback keeps a process that installed groups without going
-        through `initialize_model_parallel` working. When neither is there,
-        the failure says which of the two is missing rather than surfacing a
-        group getter's bare assertion.
+        The leaf is computed at publish by `parallel_widths_of`; the stamp sits
+        above it because an elastic scale-up restamps `attn_dp_size` after
+        publish, and a scope that swaps in another TP group states the quotients
+        through `override`.
+
+        Nothing is recomputed on read, so overriding `tp_size` does not move
+        `attn_tp_size`: name the width, or publish a config.
         """
         overrides = self._overrides
         if name in overrides:
@@ -261,16 +322,16 @@ class ParallelContext:
         derived = self._derived
         if name in derived:
             return derived[name]
-        try:
-            return getter()
-        except (AssertionError, AttributeError, RuntimeError) as exc:
-            raise RuntimeError(
-                f"derived parallel width {name!r} is not available: it is "
-                "computed from the configured leaves when the process groups "
-                "are built (initialize_model_parallel / "
-                "initialize_dp_attention), and neither a stamp nor a live "
-                "group is present"
-            ) from exc
+        config = self._config
+        if config is not None and name in config._fields:
+            return getattr(config, name)
+        raise RuntimeError(
+            f"derived parallel width {name!r} is not available: it is computed "
+            "from the configured leaves at publish, and restamped when the "
+            "process groups are built. Nothing is published and nothing has "
+            "been stamped -- publish a parallel config, or state the width "
+            f"with get_parallel().override({name}=...)"
+        )
 
     @contextmanager
     def override(self, **kwargs):
@@ -303,12 +364,6 @@ class ParallelContext:
         return self._v("pp_rank", _ps().get_pipeline_model_parallel_rank)
 
     @property
-    def moe_ep_size(self) -> int:
-        return self._derived_width(
-            "moe_ep_size", _ps().get_moe_expert_parallel_world_size
-        )
-
-    @property
     def moe_ep_rank(self) -> int:
         return self._v("moe_ep_rank", _ps().get_moe_expert_parallel_rank)
 
@@ -317,20 +372,8 @@ class ParallelContext:
         return self._v("moe_dp_rank", _ps().get_moe_data_parallel_rank)
 
     @property
-    def moe_tp_size(self) -> int:
-        return self._derived_width(
-            "moe_tp_size", _ps().get_moe_tensor_parallel_world_size
-        )
-
-    @property
     def moe_tp_rank(self) -> int:
         return self._v("moe_tp_rank", _ps().get_moe_tensor_parallel_rank)
-
-    @property
-    def attn_tp_size(self) -> int:
-        return self._derived_width(
-            "attn_tp_size", _ps().get_attn_tensor_model_parallel_world_size
-        )
 
     @property
     def attn_tp_rank(self) -> int:
@@ -345,30 +388,10 @@ class ParallelContext:
         return self._v("dcp_rank", _ps().get_dcp_rank)
 
     @property
-    def dcp_enabled(self) -> bool:
-        def getter():
-            if _ps().get_dcp_group_no_assert() is None:
-                return False
-            return _ps().get_dcp_world_size() > 1
-
-        return self._derived_width("dcp_enabled", getter)
-
-    @property
-    def attn_dcp_size(self) -> int:
-        return self._derived_width(
-            "attn_dcp_size",
-            lambda: _ps().get_dcp_world_size() if self.dcp_enabled else 1,
-        )
-
-    @property
     def attn_dcp_rank(self) -> int:
         return self._v(
             "attn_dcp_rank", lambda: self.dcp_rank if self.dcp_enabled else 0
         )
-
-    @property
-    def attn_dp_size(self) -> int:
-        return self._derived_width("attn_dp_size", _dp().get_attention_dp_size)
 
     @property
     def attn_dp_rank(self) -> int:
@@ -411,28 +434,57 @@ class ParallelContext:
         return self._v("dcp_group", _ps().get_dcp_group)
 
 
-class _FlagGroupBase:
+def _install_derived_widths() -> None:
+    """Give `ParallelContext` a property per declared quotient.
+
+    They are declared in `arg_groups/fields/parallel.py`, in the same class as
+    the leaves they are computed from -- unannotated, so `collect_input_fields`
+    leaves them off the record while they still live where the namespace does. Written here as
+    properties rather than answered by `__getattr__` because they are read
+    inside compiled model code, where an attribute load is traceable and a
+    dynamic lookup is not.
+    """
+    from sglang.srt.arg_groups.arg_utils import Derived
+    from sglang.srt.arg_groups.fields.parallel import Parallel
+
+    for name, decl in vars(Parallel).items():
+        if not isinstance(decl, Derived):
+            continue
+
+        def getter(self, _name=name):
+            return self._derived_width(_name)
+
+        getter.__name__ = name
+        getter.__doc__ = decl.doc
+        setattr(ParallelContext, name, property(getter))
+
+
+_install_derived_widths()
+
+
+class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
-    Groups are plain dataclasses; ``__dataclass_fields__`` is the single source
-    of truth for which leaves exist, so a mistyped name fails loudly instead of
-    creating a stray attribute.
+    ``__struct_fields__`` is the single source of truth for which leaves exist,
+    so a mistyped name fails loudly instead of creating a stray attribute. The
+    write goes through ``super().__setattr__``: a ``Struct`` keeps its fields in
+    its own layout, so ``object.__setattr__`` does not reach them.
     """
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name not in type(self).__dataclass_fields__:
+        if name not in type(self).__struct_fields__:
             raise AttributeError(
                 f"{type(self).__name__} has no flag '{name}' (leaves are "
-                "declared as dataclass fields; check for typos)"
+                "declared as struct fields; check for typos)"
             )
-        object.__setattr__(self, name, value)
+        super().__setattr__(name, value)
 
     @contextmanager
     def override(self, **kwargs):
         """Temporarily force flag values, restoring on exit. Transactional
         (keys validated before any write) — the test-only injection
         primitive."""
-        fields = type(self).__dataclass_fields__
+        fields = type(self).__struct_fields__
         unknown = set(kwargs) - set(fields)
         if unknown:
             raise ValueError(
@@ -440,15 +492,14 @@ class _FlagGroupBase:
             )
         saved = {name: getattr(self, name) for name in kwargs}
         for name, value in kwargs.items():
-            object.__setattr__(self, name, value)
+            setattr(self, name, value)
         try:
             yield self
         finally:
             for name, value in saved.items():
-                object.__setattr__(self, name, value)
+                setattr(self, name, value)
 
 
-@dataclasses.dataclass
 class CaptureFlags(_FlagGroupBase):
     """Capture-time flags; never frozen (written during cuda-graph capture)."""
 
@@ -462,7 +513,6 @@ class CaptureFlags(_FlagGroupBase):
     disable_dispose_tensor: bool = False
 
 
-@dataclasses.dataclass
 class MoeFlags(_FlagGroupBase):
     """MoE runtime flags, materialized by ``initialize_moe_config`` (scheduler
     init, after distributed setup). ``a2a_backend`` / ``runner_backend`` /
@@ -502,7 +552,6 @@ class MoeFlags(_FlagGroupBase):
     speculative_context: bool = False
 
 
-@dataclasses.dataclass
 class DpFlags(_FlagGroupBase):
     """DP-attention runtime flags, materialized by ``initialize_dp_attention``
     (after distributed setup; reads the model config). Topology values
@@ -515,6 +564,10 @@ class DpFlags(_FlagGroupBase):
     # Hybrid-SSM models materialize idle ranks via the MAX_LEN fabricated-row
     # conversion (set when hf_config has hybrid_override_pattern).
     max_len_with_idle: bool = False
+    # Set while the prefill CUDA graph runner captures; latched by the DP
+    # gather/scatter helpers, whose captured geometry needs one shared bucket.
+    capturing_prefill_graph: bool = False
+    prefill_graph_has_dp_gather: bool = False
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.
     buffer_hidden_size: Any = None
@@ -522,7 +575,6 @@ class DpFlags(_FlagGroupBase):
     buffer_device: Any = None
 
 
-@dataclasses.dataclass
 class SpFlags(_FlagGroupBase):
     """LayerNorm sequence-parallelism flags, materialized by
     ``initialize_layernorm_sp`` (after distributed setup; reads the model
@@ -531,7 +583,6 @@ class SpFlags(_FlagGroupBase):
     enabled: bool = False
 
 
-@dataclasses.dataclass
 class Flags(_FlagGroupBase):
     """Root of the runtime-flags tier.
 
@@ -541,13 +592,12 @@ class Flags(_FlagGroupBase):
     by lifecycle (``capture``) or subsystem (``moe`` / ``dp`` / ``sp``).
     """
 
-    capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
-    moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
-    dp: DpFlags = dataclasses.field(default_factory=DpFlags)
-    sp: SpFlags = dataclasses.field(default_factory=SpFlags)
+    capture: CaptureFlags = msgspec.field(default_factory=CaptureFlags)
+    moe: MoeFlags = msgspec.field(default_factory=MoeFlags)
+    dp: DpFlags = msgspec.field(default_factory=DpFlags)
+    sp: SpFlags = msgspec.field(default_factory=SpFlags)
 
 
-@dataclasses.dataclass
 class Resources(_FlagGroupBase):
     """Process-level resource handles: named slots with one reset lifecycle,
     scoped test injection via ``override()``, and the creation/publish
@@ -562,16 +612,17 @@ class Resources(_FlagGroupBase):
     expert_distribution_recorder: Any = None
     expert_location_metadata: Any = None
     # LPLB: layer_id -> solver.
-    lplb_solvers: dict = dataclasses.field(default_factory=dict)
+    lplb_solvers: dict = msgspec.field(default_factory=dict)
     # Named side streams (see RuntimeContext.get_stream): name -> stream.
-    streams: dict = dataclasses.field(default_factory=dict)
+    streams: dict = msgspec.field(default_factory=dict)
     # Named persistent buffers (see RuntimeContext.get_buffer): name -> tensor.
     # Accessors with bespoke semantics (grow-only, per-device keys) manage
     # their entries directly.
-    buffers: dict = dataclasses.field(default_factory=dict)
+    buffers: dict = msgspec.field(default_factory=dict)
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
-    tbo_event_pool: dict = dataclasses.field(default_factory=dict)
+    tbo_event_pool: dict = msgspec.field(default_factory=dict)
+    flashinfer_megamoe_workspaces: dict = msgspec.field(default_factory=dict)
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None
@@ -800,14 +851,16 @@ class _ConfigBag:
 
 
 def _build_config_bags(server_args: Any) -> dict:
-    """Snapshot the resolution result into the namespace bag tree, driven by
-    the ``NS(...)`` metadata on the dataclass fields. Each leaf comes from
+    """Snapshot the resolution result into the namespace bag tree.
+
+    The tree is ``namespace_of``: each field is placed by the namespace class
+    that declares it (``arg_groups/fields/``). Each leaf comes from
     ``resolution_result`` -- the declaration if resolution made one, else what
-    the caller supplied. Returns
-    ``{top_level_name: _ConfigBag}``, arbitrarily nested (``exec.moe.eplb.…``).
-    Only dataclass fields carry ``NS`` markers, so derived properties/methods are
-    naturally excluded (they stay on the bag). A name used as both a leaf and a
-    subgroup at the same level is a hard error — no silent shadowing."""
+    the caller supplied. Returns ``{top_level_name: _ConfigBag}``, arbitrarily
+    nested (``exec.moe.eplb.…``). Only dataclass fields are placed, so derived
+    properties and methods are naturally excluded (they stay on the bag). A
+    name used as both a leaf and a subgroup at the same level is a hard error
+    — no silent shadowing."""
     from sglang.srt.arg_groups.arg_utils import namespace_of
     from sglang.srt.arg_groups.overrides import resolution_result
 
@@ -816,12 +869,12 @@ def _build_config_bags(server_args: Any) -> dict:
     for field, path in namespace_of(type(server_args)).items():
         value = resolution_result(server_args, field, _MISSING)
         if value is _MISSING:
-            # Every NS-declared field is a dataclass field, so a resolved config
+            # Every placed field is a dataclass field, so a resolved config
             # always carries it; a miss means a malformed/partial config object
             # was published. Fail loud here rather than silently omitting the
             # leaf (which surfaces later as a confusing "not a published leaf").
             raise AttributeError(
-                f"config field {field!r} is declared NS({path!r}) but absent from "
+                f"config field {field!r} belongs to namespace {path!r} but is absent from "
                 f"the published {type(server_args).__name__}; cannot project its bag leaf"
             )
         parts = path.split(".")
@@ -847,7 +900,47 @@ def _build_config_bags(server_args: Any) -> dict:
                 "clashes with a subgroup of the same name"
             )
         bag._set(field, value)
+    _install_derived_leaves(tops, server_args)
     return tops
+
+
+def _install_derived_leaves(tops: dict, server_args: Any) -> None:
+    """Compute the declared config-derived fields into their bags.
+
+    A `Derived(fn=...)` is a pure function of the published configuration, so it
+    is computed once, here, and stored as an ordinary leaf: readers get a plain
+    attribute load, and there is one answer rather than a pre-publish spelling
+    and a post-publish one that have to be kept saying the same thing.
+
+    The function is handed the whole resolved config, not the bag it lands in.
+    A derivation is free to span namespaces and they do -- the mamba
+    extra-buffer predicate reads `memory.disable_radix_cache` alongside its own
+    `exec.mamba` strategy -- which is exactly why it cannot be written as a
+    method on either bag.
+    """
+    import importlib
+
+    from sglang.srt.arg_groups.arg_utils import Derived
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    namespaces = getattr(type(server_args), "_NAMESPACES", None)
+    if not namespaces:
+        return
+    view = resolved_view(server_args)
+    for source in namespaces:
+        path = getattr(source, "_NS_PATH", None)
+        if path is None:
+            continue
+        for name, decl in vars(source).items():
+            if not isinstance(decl, Derived) or not decl.fn:
+                continue
+            module, _, attr = decl.fn.rpartition(".")
+            bag = tops.get(path.split(".")[0])
+            for segment in path.split(".")[1:]:
+                bag = bag and getattr(bag, segment, None)
+            if bag is None:
+                continue
+            bag._set(name, getattr(importlib.import_module(module), attr)(view))
 
 
 def _resolved_or_field(server_args: Any, name: str, default: Any) -> Any:
@@ -957,8 +1050,8 @@ class RuntimeContext:
         )
         self._server_args = server_args
         # Snapshot resolved config into the namespace bags (the single source of
-        # truth for config reads). Driven by NS(...) metadata; a mock/partial
-        # config with no NS markers yields an empty tree (no bags projected).
+        # truth for config reads). Placed by `namespace_of`; a mock/partial
+        # config that declares no namespace yields an empty tree (no bags).
         self._config_bags = _build_config_bags(server_args)
         spec = self._config_bags.get("spec")
         if spec is not None:
@@ -1028,7 +1121,7 @@ class RuntimeContext:
         no write-through, so the old "wrote one store, read another" desync class
         cannot occur.
 
-        Each flat field name is routed to its bag by the ``NS`` metadata (flat
+        Each flat field name is routed to its bag by ``namespace_of`` (flat
         names are unique across namespaces). Validation is all-or-nothing: an
         unknown / unprojected field aborts before any write. ``source`` is
         recorded for provenance / reproduction.
@@ -1046,7 +1139,7 @@ class RuntimeContext:
             path = nsmap.get(name)
             if path is None:
                 raise ValueError(
-                    f"override: unknown config field {name!r} (no NS namespace) — "
+                    f"override: unknown config field {name!r} (no namespace) — "
                     "not a resolved config leaf"
                 )
             parts = path.split(".")
@@ -1080,7 +1173,7 @@ class RuntimeContext:
 
         path = namespace_of(type(self._server_args)).get(name)
         if path is None:
-            raise ValueError(f"{name!r} is not a config leaf (no NS namespace)")
+            raise ValueError(f"{name!r} is not a config leaf (no namespace)")
         parts = path.split(".")
         bag = self.config_bag(parts[0])
         for seg in parts[1:]:
@@ -1190,7 +1283,7 @@ class _ServerArgsOverride:
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
-            declare_late_resolution,
+            declare_resolution,
         )
 
         server_args = ServerArgs(model_path="dummy")
@@ -1198,7 +1291,7 @@ class _ServerArgsOverride:
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(
-            type(server_args).__dataclass_fields__
+            type(server_args).__struct_fields__
         )
         if unknown:
             raise ValueError(
@@ -1211,15 +1304,15 @@ class _ServerArgsOverride:
         # real field, and seeding it as a raw attribute would leave the earlier
         # declaration authoritative, so `resolution_result` and the bag would
         # both keep answering the pre-override value.
-        fields = set(type(server_args).__dataclass_fields__)
+        fields = set(type(server_args).__struct_fields__)
         declared = {n: v for n, v in self._fields.items() if n in fields}
         if declared:
-            declare_late_resolution(server_args, "override_server_args", **declared)
+            declare_resolution(server_args, "override_server_args", **declared)
         # What is left seeds the record's own private caches (`_model_config`
         # and friends), which are not configuration and never were.
         seeds = {n: v for n, v in self._fields.items() if n not in fields}
         for name, value in seeds.items():
-            object.__setattr__(server_args, name, value)
+            msgspec.Struct.__setattr__(server_args, name, value)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
@@ -1349,7 +1442,13 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # The DP controller's static read set, checked against the module: the
     # elastic-EP gate, the load-balance method, the watchdog timeout, and the
     # disaggregation mode.
-    "dp_controller": frozenset({"exec", "parallel", "device", "disagg"}),
+    # `observability` and `serving` were added when the controller's metrics
+    # gate, tracing setup and worker-port broadcast stopped reading the record:
+    # under `enforce` the set is what the process may read, so a conversion
+    # that reaches a new namespace has to widen it in the same commit.
+    "dp_controller": frozenset(
+        {"exec", "parallel", "device", "disagg", "observability", "serving"}
+    ),
     # Record-mode audit (2026-08-06, text model, /generate + /get_server_info +
     # /v1/models): reads exactly {"serving"} — the per-instance managers read
     # self.server_args by design. Still declared full, because that run did not
@@ -1582,7 +1681,7 @@ def set_global_dwdp_manager(manager: Any) -> None:
 def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:
     """The leaf values of a flag group, recursively."""
     leaves: dict[str, Any] = {}
-    for name in type(group).__dataclass_fields__:
+    for name in type(group).__struct_fields__:
         value = getattr(group, name)
         if isinstance(value, _FlagGroupBase):
             leaves[name] = _group_leaves(value)
@@ -1658,8 +1757,8 @@ def reset_context() -> None:
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
     ``parallel`` holds the stamped derived widths, which go with the lifecycle
-    that stamped them: `_derived_width` prefers the stamp over the live group,
-    so leaving one behind lets the next test read the previous topology.
+    that stamped them: `_derived_width` prefers the stamp over the leaves, so
+    leaving one behind lets the next test read the previous topology.
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
@@ -1671,29 +1770,6 @@ def reset_context() -> None:
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
     set_global_dwdp_manager(None)
-
-
-def mamba_extra_buffer_enabled() -> bool:
-    """Whether the mamba radix cache keeps its extra state buffer.
-
-    A predicate over two published leaves (``memory.disable_radix_cache`` and
-    ``exec.mamba.mamba_radix_cache_strategy``), so it reads the bags rather
-    than the startup record — the ``ServerArgs`` member of the same name is the
-    pre-publish equivalent used inside the resolution pipeline.
-    """
-    return (
-        get_memory().disable_radix_cache is False
-        and get_exec().mamba.mamba_radix_cache_strategy
-        in ("extra_buffer", "extra_buffer_lazy")
-    )
-
-
-def mamba_extra_buffer_lazy_enabled() -> bool:
-    """The lazy variant of :func:`mamba_extra_buffer_enabled`."""
-    return (
-        get_memory().disable_radix_cache is False
-        and get_exec().mamba.mamba_radix_cache_strategy == "extra_buffer_lazy"
-    )
 
 
 def remote_instance_transfer_engine_enabled(load_format: str | None = None) -> bool:
@@ -2028,21 +2104,6 @@ def cutedsl_moe_max_num_tokens() -> int:
         prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
     decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
     return max(prefill_tokens, decode_max_bs * num_tokens_per_req)
-
-
-def is_ep_joiner() -> bool:
-    """True in a process launched as an elastic-EP joiner (scale or recover).
-
-    A predicate over the published ``exec.moe.ep_join_mode`` leaf, so it follows
-    a post-publish override; the same-named ``ServerArgs`` property is the
-    pre-publish equivalent.
-    """
-    return get_exec().moe.ep_join_mode in ("scale", "recover")
-
-
-def is_ep_scale_joiner() -> bool:
-    """True in a process launched as an elastic-EP scale-up joiner."""
-    return get_exec().moe.ep_join_mode == "scale"
 
 
 def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:

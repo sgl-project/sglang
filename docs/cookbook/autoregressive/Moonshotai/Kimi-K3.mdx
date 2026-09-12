@@ -30,7 +30,7 @@ Then run the **Python** output of the command panel below in that environment.
 
 ```bash Command
 docker pull lmsysorg/sglang:latest                                  # NVIDIA (CUDA)
-docker pull lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260903     # AMD MI350X / MI355X (ROCm)
+docker pull lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910     # AMD MI350X / MI355X (ROCm)
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -81,6 +81,16 @@ import { KimiK3MambaRatioCalculator } from "/src/snippets/_kimi_k3_mamba_ratio_c
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Note>
+  B300 1×8 Unified speed numbers are measured on `v0.5.18 @ 71de97b2` with `--random-range-ratio 1.0`,
+  `--warmup-requests 64`, `--flush-cache`, at ISL 8192 / OSL 1024. DSPARK cells pin the acceptance
+  length via the serve env `SGLANG_SIMULATE_ACC_LEN=4.5` — they report what block size 7 delivers at
+  that acceptance, not a measured acceptance rate for this workload. Balanced DSPARK adds
+  `--max-running-requests 256`; without it speculation resets the cap to 48. The KDA state pool still
+  clamps admission below that (101 / 68 / 91 / 60 concurrent requests for MXFP4 NOSPEC / MXFP4 DSPARK /
+  NVFP4 NOSPEC / NVFP4 DSPARK), which is why no point past concurrency 64 is published for Balanced.
+</Note>
+
 ### Mamba ratio calculator
 
 <KimiK3MambaRatioCalculator />
@@ -124,9 +134,10 @@ are scheduled to release by July 27, 2026**. The recipes on this page were valid
 repository (`moonshotai/Kimi-K3`) and a public `lmsysorg/sglang` image with K3 support will be
 available at launch.
 
-Every cell in the Deploy panel above is currently marked **Final Verification In Progress**: the
-recipe runs, but its serving round on the final weights and current code is still open. Re-measure
-throughput and accuracy before you rely on any of them.
+The B300 1×8 `Unified` Low-Latency and Balanced cells are **Verified** — a speed round on the final
+weights is published below. Every other cell is still marked **Final Verification In Progress**: the
+recipe runs, but its serving round on the final weights and current code is still open. Accuracy has
+not been re-measured on any cell — re-measure before you rely on one.
 </Note>
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95`, `presence_penalty=0`, `frequency_penalty=0` (fixed by the model; informational — do not hardcode in sample code).
@@ -155,7 +166,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 
 **Context length.** `--context-length` bounds the longest accepted request plus some context-scaled buffers; it does not size the KV pool. For long context the lever that adds capacity is `fp8_e4m3` KV.
 
-**DSPARK.** Adds `--speculative-algorithm DSPARK` plus the draft checkpoint on top of the showing strategy. Leave `--speculative-draft-attention-backend` unset. No serving round on the final draft checkpoint has landed — measure against the same recipe running NOSPEC before adopting.
+**DSPARK.** Adds `--speculative-algorithm DSPARK` plus the draft checkpoint on top of the showing strategy. Leave `--speculative-draft-attention-backend` unset. The published B300 DSPARK numbers pin the acceptance length with `SGLANG_SIMULATE_ACC_LEN`, so no measured acceptance rate exists for a real workload yet — measure against the same recipe running NOSPEC before adopting.
 
 **Per-platform notes:**
 
@@ -179,7 +190,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 - Calculator ratios run well above 1 here (`r > 1` is legal): `bfloat16` state buys admission, `fp8` KV buys context.
 - Don't use EP with an a2a backend: a2a buffers reclaim the KV that DCP buys. Compose only to measure. a2a backend is set when `--moe-a2a-backend` is set.
 
-No cell has a serving round in this exact shape — treat them as starting points to verify.
+Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round in this exact shape — treat those as starting points to verify.
 
 <a id="amd-env" />
 
@@ -272,7 +283,8 @@ Pending update...
 
 K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba state across L1 (GPU) / L2 (host) / L3 (Mooncake) — enable it from the **HiCache** card in the [Playground above](#playground) for long multi-turn workloads.
 
-- On the DCP recipes (Blackwell Balanced / High-Throughput, in both the `Unified` and `Decode` roles), the host tiers are not fully DCP-aware yet: **L3 always, and L1+L2 with Spec Decode on, drop the DCP flags** (the command hints call it out — per-request KV capacity shrinks accordingly). L1+L2 with Spec Decode off keeps DCP. Only DCP goes: the MLA KV reverts to TP-replicated, but the cell's other parallelism stays, so B300/GB300/GB200 land on plain TP while B200 Unified keeps its `--pp-size 2` / `--ep-size`.
+- On the DCP recipes (Blackwell Balanced / High-Throughput, `Unified` and `Decode` roles), **L1+L2 keeps DCP**, with Spec Decode off or on DSPARK. On B200 the DSPARK pipeline collapse scales it too (PP2 × DCPEP8 → DCPEP16).
+- **L3 drops the DCP flags** on those recipes (storage keys are not dcp_rank-aware yet; the command hints call it out, and per-request KV capacity shrinks). Only DCP goes: the MLA KV reverts to TP-replicated while the cell's other parallelism stays, so B300/GB300/GB200 land on plain TP and B200 Unified keeps its `--pp-size 2` / `--ep-size`.
 - Low-Latency and the Hopper recipes take all tiers unchanged.
 
 <a id="pd-disaggregation" />

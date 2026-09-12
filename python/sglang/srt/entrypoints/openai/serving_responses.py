@@ -73,6 +73,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -434,6 +435,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         else {}
                     )
 
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request, request.routed_dp_rank
+                    )
+
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
                         **logprob_kwargs,
@@ -463,6 +468,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         session_id=request.session_id,
                         extra_key=request.extra_key,
                         cache_salt=request.cache_salt,
+                        bootstrap_host=request.bootstrap_host,
+                        bootstrap_port=request.bootstrap_port,
+                        bootstrap_room=request.bootstrap_room,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
@@ -609,12 +619,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
 
-        if is_multimodal:
-            request_prompts = [processed_messages.prompt]
-            engine_prompts = [processed_messages.prompt]
-        else:
-            request_prompts = [processed_messages.prompt_ids]
-            engine_prompts = [processed_messages.prompt_ids]
+        _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
+        request_prompts = [engine_prompt]
+        engine_prompts = [engine_prompt]
 
         return messages, request_prompts, engine_prompts, processed_messages
 
@@ -2031,7 +2038,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         finish_reason: Optional[dict[str, Any]] = None
         flushed = False
         stream_offset = 0
-        incremental = self.tokenizer_manager.server_args.incremental_streaming_output
+        incremental = get_serving().incremental_streaming_output
 
         def _open_reasoning_item() -> str:
             nonlocal current_output_index

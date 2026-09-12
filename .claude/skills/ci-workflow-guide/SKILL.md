@@ -388,6 +388,8 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/rerun-failed-ci` | Reruns failed jobs in the latest workflow run |
 | `/tag-and-rerun-ci` | Adds `run-ci` label + reruns failed |
 | `/tag-and-rerun-ci extra` | Adds both `run-ci` and `run-ci-extra` labels + reruns failed |
+| `/run-full-ci` | Short form of `/tag-and-rerun-ci extra` (baseline + extra). Alias: `/rerun-full-ci` |
+| `/run-extra-ci` | Adds both labels + reruns **only** `PR Test Extra`, leaving baseline runs alone. Alias: `/rerun-extra-ci` |
 | `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. Each reply echoes its originating command (`Results for …`) so concurrent commands stay distinguishable |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
 
