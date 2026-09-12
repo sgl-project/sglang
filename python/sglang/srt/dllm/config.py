@@ -14,6 +14,8 @@ class DllmConfig:
         mask_id: int,
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
+        delete_token_id: int | None = None,
+        split_token_id: int | None = None,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -21,6 +23,8 @@ class DllmConfig:
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
+        self.delete_token_id = delete_token_id
+        self.split_token_id = split_token_id
 
     @staticmethod
     def from_server_args(
@@ -37,7 +41,10 @@ class DllmConfig:
             model_revision=cfg.revision,
         )
         DLLM_PARAMS = {
-            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
+            "LLaDA2MoeModelLM": {
+                "block_size": 32,
+                "mask_id": 156895,
+            },
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
         }
@@ -49,6 +56,50 @@ class DllmConfig:
             mask_id = params["mask_id"]
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+
+        delete_token_id = None
+        split_token_id = None
+        if cfg.dllm_algorithm == "JointThresholdInDel":
+            delete_token_id = getattr(model_config.hf_config, "delete_token_id", None)
+            split_token_id = getattr(model_config.hf_config, "split_token_id", None)
+
+            if delete_token_id is None or split_token_id is None:
+                override_example = (
+                    '{"delete_token_id": 156930, "split_token_id": 156931}'
+                )
+                raise RuntimeError(
+                    "JointThresholdInDel is not supported for checkpoint "
+                    f"{cfg.model_path!r}: the checkpoint must declare both "
+                    "delete_token_id and split_token_id. Use a checkpoint with "
+                    "explicit Insert/Delete support. If you are certain this "
+                    "checkpoint was trained for Insert/Delete decoding, declare the "
+                    "correct token IDs in config.json or pass them with "
+                    "`--json-model-override-args "
+                    f"'{override_example}'`. "
+                    "Use the token IDs defined by your checkpoint."
+                )
+
+            vocab_size = model_config.vocab_size
+            for token_name, token_id in (
+                ("delete_token_id", delete_token_id),
+                ("split_token_id", split_token_id),
+            ):
+                if isinstance(token_id, bool) or not isinstance(token_id, int):
+                    raise ValueError(
+                        f"{token_name} must be an integer token ID, got {token_id!r}"
+                    )
+                if not 0 <= token_id < vocab_size:
+                    raise ValueError(
+                        f"{token_name} must be within the model vocabulary "
+                        f"[0, {vocab_size}), got {token_id}"
+                    )
+
+            if len({mask_id, delete_token_id, split_token_id}) != 3:
+                raise ValueError(
+                    "JointThresholdInDel token IDs must be distinct, got "
+                    f"mask_id={mask_id}, delete_token_id={delete_token_id}, "
+                    f"split_token_id={split_token_id}"
+                )
 
         max_running_requests = (
             1 if cfg.max_running_requests is None else cfg.max_running_requests
@@ -76,4 +127,6 @@ class DllmConfig:
             mask_id=mask_id,
             max_running_requests=max_running_requests,
             first_done_first_out_mode=cfg.dllm_fdfo,
+            delete_token_id=delete_token_id,
+            split_token_id=split_token_id,
         )
