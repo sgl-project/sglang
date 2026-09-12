@@ -1,0 +1,36 @@
+diff --git a/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py b/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py
+--- a/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py
++++ b/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py
+@@ -1642,7 +1642,13 @@ def compile_mixed_moe_gemm1_common(
+                     if const_expr(heterogeneous_b and use_async_copy):
+                         barrier(vmcnt=0)
+                     else:
+-                        rocdl.s_waitcnt(body_vmcnt_before_barrier)
++                        # Drain every VMEM op (the LDS-DMA group included) before the
++                        # barrier.  A partial vmcnt(N) is only safe if N equals the
++                        # number of VMEM *instructions* issued after the DMAs in this
++                        # K-step; the tile-derived body_vmcnt_before_barrier overshoots
++                        # for e.g. t64x256 (12 ops, vmcnt(10)) and t128x* (14 ops,
++                        # vmcnt(8)), leaving DMAs in flight across the barrier.
++                        rocdl.s_waitcnt(0)
+                         barrier()
+                     rocdl.sched_barrier(0)
+ 
+@@ -1651,6 +1657,17 @@ def compile_mixed_moe_gemm1_common(
+                     )
+                     if const_expr(use_async_copy and next_k_dma_py < int(k_dim)):
+                         prefetch_x_to_lds(abs_k_dma, lds_write)
++                        # The `s_waitcnt vmcnt(body_vmcnt_before_barrier)` ahead of
++                        # the next barrier assumes these LDS-DMA loads are the oldest
++                        # outstanding VMEM ops (only the scale/B loads issued after
++                        # them may stay in flight).  Without a scheduling fence the
++                        # LLVM machine scheduler may hoist a scale load above the
++                        # last DMA (observed: `DDDssDs...` in one K-tile of the
++                        # t64x128x256 a8w4 kernel), leaving one DMA (4 A rows) in
++                        # flight across the barrier while other waves already read
++                        # the tile from LDS -> rare stale A rows / nondeterministic
++                        # stage1 output.  Pin the DMA group here.
++                        rocdl.sched_barrier(0)
+                     if const_expr(not use_async_copy):
+                         x_regs = load_x_tile(abs_k_dma)
+ 
