@@ -338,7 +338,7 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE(
 class TestServerUpdateWeightsFromDiskNVFP4OnlineW4A16MegaMoE(
     TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE
 ):
-    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     launch_env = {
         **TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE.launch_env,
         "FLASHINFER_NVFP4_4OVER6": "1",
