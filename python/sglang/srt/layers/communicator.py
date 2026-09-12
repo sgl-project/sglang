@@ -934,11 +934,6 @@ class LayerCommunicator:
             return True
         return False
 
-    def should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
-        """Whether this layer can absorb an unfinalized MoE output into its own
-        fused collective. Only ``layers/moe/cutedsl_ar_fusion.py`` has one."""
-        return False
-
     def should_defer_moe_finalize(
         self, forward_batch: ForwardBatch, m: int | None = None
     ) -> bool:
