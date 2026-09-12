@@ -11,8 +11,10 @@ dispatch in ``kda_fused_decode.cuh``.
 
 import pytest
 import torch
+import triton
 
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention.fla import fused_norm_gate
 from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
@@ -21,6 +23,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="nightly", runner_config="4-gpu-gb300")
 
 _HEAD_DIM = 128
 _CONV_STATE_W = 3
@@ -207,6 +210,114 @@ def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
     torch.testing.assert_close(fused, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(state_fused, state_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(conv_fused, conv_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "sm,rows,width,dtype,activation,is_rms,block",
+    [
+        (103, 1, 128, torch.bfloat16, "sigmoid", True, 8),
+        (103, 2048, 128, torch.bfloat16, "sigmoid", True, 8),
+        (103, 0, 128, torch.bfloat16, "sigmoid", True, 32),
+        (103, 2049, 128, torch.bfloat16, "sigmoid", True, 32),
+        (103, 96, 64, torch.bfloat16, "sigmoid", True, 32),
+        (103, 96, 128, torch.float32, "sigmoid", True, 32),
+        (103, 96, 128, torch.bfloat16, "silu", True, 32),
+        (103, 96, 128, torch.bfloat16, "sigmoid", False, 32),
+        (100, 96, 128, torch.bfloat16, "sigmoid", True, 32),
+        (90, 96, 128, torch.bfloat16, "sigmoid", True, 32),
+    ],
+)
+def test_small_row_dispatch(
+    monkeypatch, sm, rows, width, dtype, activation, is_rms, block
+):
+    monkeypatch.setattr(fused_norm_gate, "get_device_sm", lambda: sm)
+    x = torch.empty((rows, width), dtype=dtype, device="meta")
+    assert fused_norm_gate._get_gated_norm_block_size(x, activation, is_rms) == block
+
+
+@pytest.mark.parametrize(
+    "rows,with_residual",
+    [
+        (1, False),
+        (7, False),
+        (8, False),
+        (9, False),
+        (96, False),
+        (1536, False),
+        (2048, False),
+        (2049, False),
+        (7680, False),
+        (96, True),
+    ],
+)
+def test_row_tile_preserves_output_statistics_and_alias(rows, with_residual):
+    if not torch.cuda.is_available() or fused_norm_gate.get_device_sm() != 103:
+        pytest.skip("SM103 required")
+    torch.manual_seed(rows)
+    x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
+    gate_dtype = torch.float32 if with_residual else torch.bfloat16
+    g = torch.randn_like(x, dtype=gate_dtype)
+    weight = torch.randn(128, device="cuda", dtype=gate_dtype)
+    bias = torch.randn_like(weight) if with_residual else None
+    residual = torch.randn_like(x, dtype=torch.float32) if with_residual else None
+    out_dtype = torch.float32 if with_residual else None
+    original_x = x.clone()
+    expected = torch.empty_like(x, dtype=out_dtype or x.dtype)
+    expected_rstd = torch.empty(rows, device="cuda")
+    expected_residual = torch.empty_like(residual) if with_residual else None
+    fused_norm_gate.layer_norm_gated_fwd_kernel[(triton.cdiv(rows, 32),)](
+        x=original_x,
+        g=g,
+        y=expected,
+        w=weight,
+        b=bias,
+        residual=residual,
+        residual_out=expected_residual,
+        mean=None,
+        rstd=expected_rstd,
+        eps=1e-5,
+        T=rows,
+        D=128,
+        BT=32,
+        BD=128,
+        ACTIVATION="sigmoid",
+        IS_RMS_NORM=True,
+        STORE_RESIDUAL_OUT=with_residual,
+        HAS_RESIDUAL=with_residual,
+        HAS_WEIGHT=True,
+        HAS_BIAS=with_residual,
+        USE_GDC=True,
+        launch_pdl=True,
+        num_warps=4,
+    )
+    output, mean, rstd, residual_out = fused_norm_gate.layer_norm_gated_fwd(
+        x,
+        g,
+        weight,
+        bias,
+        activation="sigmoid",
+        eps=1e-5,
+        residual=residual,
+        out_dtype=out_dtype,
+        is_rms_norm=True,
+    )
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    torch.testing.assert_close(rstd, expected_rstd, atol=0, rtol=0)
+    assert mean is None
+    if with_residual:
+        torch.testing.assert_close(residual_out, expected_residual, atol=0, rtol=0)
+        torch.testing.assert_close(x, original_x, atol=0, rtol=0)
+        assert output.data_ptr() != x.data_ptr()
+    else:
+        assert output.data_ptr() == x.data_ptr() == residual_out.data_ptr()
+    summed = original_x.float() + residual if with_residual else original_x.float()
+    reference_rstd = 1 / torch.sqrt(summed.square().mean(-1) + 1e-5)
+    reference = summed * reference_rstd[:, None] * weight.float()
+    if bias is not None:
+        reference += bias
+    reference *= torch.sigmoid(g.float())
+    torch.testing.assert_close(output.float(), reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(rstd, reference_rstd, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == "__main__":
