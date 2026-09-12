@@ -4,7 +4,9 @@ Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
 `/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
-(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
+(buffered and SSE), and the sglang-native `/generate` (single-prompt
+bodies only; without a top-level `model` key it routes on the configured
+model id), plus `/healthz` / `/readyz` and `/metrics`. Worker
 pools come from either a static URL list or Kubernetes EndpointSlice
 discovery.
 
