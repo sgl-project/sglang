@@ -2694,7 +2694,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Render the updated conversation for the next completion
             prompt_token_ids = context.render_for_completion()
 
-            # Update the adapted request with new prompt
+            # PD continuations are rejected above: each tool turn would need a new
+            # matching prefill, since the previous transfer state has been cleared.
             adapted_request = GenerateReqInput(
                 input_ids=prompt_token_ids,
                 sampling_params=sampling_params,
