@@ -231,10 +231,12 @@ class BaseLayerWithLoRA(nn.Module):
                           If False, append to existing list (for multi-LoRA support).
             output_offset: Optional constant output term paired with this adapter
         """
-        lora_A_param = torch.nn.Parameter(
-            A
-        )  # share storage with weights in the pipeline
-        lora_B_param = torch.nn.Parameter(B)
+        # This runtime never trains adapters. In particular, weights loaded
+        # during a warmup may be inference tensors; leaving Parameter's
+        # requires_grad default enabled makes a later dynamic-LoRA request try
+        # to read their unavailable version counters while sharding views.
+        lora_A_param = torch.nn.Parameter(A, requires_grad=False)
+        lora_B_param = torch.nn.Parameter(B, requires_grad=False)
         output_offset_param = (
             torch.nn.Parameter(output_offset, requires_grad=False)
             if output_offset is not None
