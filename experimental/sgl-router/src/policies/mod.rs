@@ -33,7 +33,7 @@ use std::sync::Arc;
 pub struct RequestTokens {
     /// The prompt token ids.
     pub ids: Vec<u32>,
-    /// Whether the IDs came from chat rendering rather than raw-text fallback.
+    /// Whether the IDs came from chat rendering rather than the caller or raw text.
     pub chat_rendered: bool,
 }
 
@@ -50,6 +50,13 @@ pub fn request_tokens_for(
     model_id: &ModelId,
     value: &serde_json::Value,
 ) -> Option<RequestTokens> {
+    // Caller IDs take precedence; malformed values are left for engine validation.
+    if let Some(ids) = value.get("input_ids").filter(|v| !v.is_null()) {
+        return Some(RequestTokens {
+            ids: serde_json::from_value(ids.clone()).ok()?,
+            chat_rendered: false,
+        });
+    }
     if value.get("messages").is_some_and(|m| m.is_array()) {
         if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
             return Some(RequestTokens {

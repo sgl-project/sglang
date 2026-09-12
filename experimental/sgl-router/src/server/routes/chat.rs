@@ -1238,8 +1238,9 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if messages_need_engine_render(value) {
         return false;
     }
-    // These options need engine-specific normalization or parity verification.
+    // Preserve caller IDs and defer options needing engine-specific processing.
     for key in [
+        "input_ids",
         "chat_template",
         "chat_template_kwargs",
         "reasoning",
@@ -1269,8 +1270,10 @@ fn ingress_tokenize_offload_failed(
     if !has_chat_encoder {
         return false;
     }
-    let chat_request =
-        request_value.is_some_and(|v| v.get("messages").is_some_and(|m| m.is_array()));
+    let chat_request = request_value.is_some_and(|v| {
+        v.get("messages").is_some_and(|m| m.is_array())
+            && v.get("input_ids").is_none_or(|ids| ids.is_null())
+    });
     if !chat_request {
         return false;
     }

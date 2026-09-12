@@ -92,6 +92,61 @@ async fn plain_chat_forwards_input_ids_and_keeps_messages() {
 }
 
 #[tokio::test]
+async fn caller_input_ids_are_used_for_routing_and_preserved() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    for (ids, expected) in [
+        (json!([0, 7, 4294967295u64]), Some(vec![0, 7, u32::MAX])),
+        (json!([]), Some(vec![])),
+        (json!([7, -1]), None),
+        (json!([7, 1.0]), None),
+        (json!([7, "2"]), None),
+        (json!([7, true]), None),
+        (json!([7, null]), None),
+        (json!([[7]]), None),
+        (json!([4294967296u64]), None),
+        (json!("7"), None),
+        (json!({}), None),
+    ] {
+        let request = json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "input_ids": ids,
+        });
+        let tokens = sgl_router::policies::request_tokens_for(
+            &ctx.tokenizers,
+            &ModelId(MODEL.into()),
+            &request,
+        );
+        assert!(!tokens.as_ref().is_some_and(|t| t.chat_rendered));
+        assert_eq!(tokens.map(|t| t.ids), expected, "input_ids: {ids}");
+        assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
+        assert_eq!(captured(&mock), request);
+    }
+    assert!(!ctx
+        .metrics
+        .render()
+        .contains("sgl_router_ingress_tokenize_errors_total{"));
+}
+
+#[tokio::test]
+async fn null_input_ids_allow_chat_rendering() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "input_ids": null,
+    });
+    let tokens =
+        sgl_router::policies::request_tokens_for(&ctx.tokenizers, &ModelId(MODEL.into()), &request)
+            .unwrap();
+    assert!(tokens.chat_rendered);
+    assert_eq!(send(ctx, request).await, StatusCode::OK);
+    assert_eq!(captured(&mock)["input_ids"], json!(tokens.ids));
+}
+
+#[tokio::test]
 async fn guarded_requests_render_without_forwarding_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());

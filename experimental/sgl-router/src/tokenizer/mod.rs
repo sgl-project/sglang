@@ -428,6 +428,38 @@ mod tests {
     }
 
     #[test]
+    fn caller_input_ids_bypass_rendering_and_raw_fallback() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "tiny".into(),
+            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
+        );
+        reg.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": "{{ raise_exception('must not render') }}"
+            }),
+        );
+        for ids in [serde_json::json!([7]), serde_json::json!([7, -1])] {
+            let request = serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}], "input_ids": ids,
+            });
+            let tokens = crate::policies::request_tokens_for(
+                &reg,
+                &crate::discovery::ModelId("tiny".into()),
+                &request,
+            );
+            assert_eq!(tokens.is_some(), ids == serde_json::json!([7]));
+        }
+        assert!(!reg
+            .encoders
+            .get("tiny")
+            .unwrap()
+            .fallback_warned
+            .load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn routing_tokenization_receives_tools_and_template_kwargs() {
         let reg = TokenizerRegistry::default();
         let tok = adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap();
