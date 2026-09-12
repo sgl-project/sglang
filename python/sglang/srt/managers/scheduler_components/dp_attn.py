@@ -97,6 +97,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    prefill_cuda_graph_max_prefix_len: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -116,6 +117,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.prefill_cuda_graph_max_prefix_len,
             ],
             device=device,
             dtype=dtype,
@@ -131,6 +133,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # prefill_cuda_graph_max_prefix_len
             ],
             device=device,
             dtype=dtype,
@@ -212,6 +215,7 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -241,6 +245,9 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+    batch.dp_prefill_cuda_graph_max_prefix_len = (
+        mlp_sync_info.prefill_cuda_graph_max_prefix_len
+    )
 
 
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
@@ -390,11 +397,17 @@ def prepare_mlp_sync_batch_raw(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
     )
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
-    coordinated_prefill = breakable_prefill or check_cuda_graph_backend(
-        Phase.PREFILL, Backend.FULL
-    )
+    full_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
+    coordinated_prefill = breakable_prefill or full_prefill
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if coordinated_prefill else None
+    )
+    prefill_cuda_graph_max_prefix_len = (
+        max(local_batch.prefix_lens, default=0)
+        if full_prefill
+        and local_batch is not None
+        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        else 0
     )
     can_run_prefill_cuda_graph = _local_prefill_cuda_graph_vote(
         local_batch=local_batch,
@@ -448,6 +461,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
     )
 
     if dp_size == 1:

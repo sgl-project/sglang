@@ -411,18 +411,19 @@ jobs:
           export test_status tc_name
           echo "## ${tc_name}  ${status_icon} ${test_status}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          metric_count=$(grep -c '\[METRIC\]' /tmp/test_output.log 2>/dev/null || echo 0)
-          if [ "${metric_count}" -gt 0 ]; then
-            echo "| Metric | Value | Pass |" >> $GITHUB_STEP_SUMMARY
-            echo "|--------|-------|------|" >> $GITHUB_STEP_SUMMARY
-            grep '\[METRIC\]' /tmp/test_output.log | while IFS= read -r line; do
-              metric_name=$(echo "$line" | sed -E 's/.*\[METRIC\] ([^=]+)=.*/\1/')
-              metric_value=$(echo "$line" | sed -E 's/.*\[METRIC\] [^=]+=([^ ]+).*/\1/')
-              echo "| ${metric_name} | ${metric_value} | ${status_icon} |" >> $GITHUB_STEP_SUMMARY
-            done
-          else
-            echo "No metrics collected (test may have failed before producing results)." >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]; then
+            metric_count=$(grep -c '\[METRIC\]' /tmp/test_output.log 2>/dev/null || echo 0)
+            if [ "${metric_count}" -gt 0 ]; then
+              echo "| Metric | Value | Pass |" >> $GITHUB_STEP_SUMMARY
+              echo "|--------|-------|------|" >> $GITHUB_STEP_SUMMARY
+              grep '\[METRIC\]' /tmp/test_output.log | while IFS= read -r line; do
+                metric_name=$(echo "$line" | sed -E 's/.*\[METRIC\] ([^=]+)=.*/\1/')
+                metric_value=$(echo "$line" | sed -E 's/.*\[METRIC\] [^=]+=([^ ]+).*/\1/')
+                echo "| ${metric_name} | ${metric_value} | ${status_icon} |" >> $GITHUB_STEP_SUMMARY
+              done
+            else
+              echo "No metrics collected (test may have failed before producing results)." >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
           fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
           exit ${test_exit_code}

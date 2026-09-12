@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
+    FalconMambaConfig,
     GraniteMoeHybridConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -15,6 +16,8 @@ from sglang.srt.configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    Mamba2Config,
+    MambaConfig,
     MiniCPMHybridConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
@@ -78,7 +81,10 @@ def mamba2_config(model_config: ModelConfig):
         | Lfm2Config
         | Lfm2MoeConfig
         | Lfm2VlConfig
-        | ZayaConfig,
+        | ZayaConfig
+        | Mamba2Config
+        | MambaConfig
+        | FalconMambaConfig,
     ):
         return config
     if isinstance(config, InklingModelConfig):
@@ -113,6 +119,16 @@ def kimi_linear_config(model_config: ModelConfig):
     return None
 
 
+def glm5_next_config(model_config: ModelConfig):
+    hf_config = model_config.hf_config
+    if (
+        getattr(hf_config, "model_type", None) == "glm5_next"
+        and not model_config.is_draft_model
+    ):
+        return hf_config.get_text_config()
+    return None
+
+
 def linear_attn_model_spec(model_config: ModelConfig):
     result = _get_linear_attn_registry_result(model_config)
     return result[0] if result else None
@@ -123,6 +139,7 @@ def mambaish_config(model_config: ModelConfig):
         mamba2_config(model_config)
         or hybrid_gdn_config(model_config)
         or kimi_linear_config(model_config)
+        or glm5_next_config(model_config)
         or hybrid_lightning_config(model_config)
     )
     if existing:

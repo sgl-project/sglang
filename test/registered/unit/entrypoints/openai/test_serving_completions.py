@@ -19,6 +19,8 @@ from fastapi import Request
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -66,6 +68,9 @@ class ServingCompletionTestCase(unittest.TestCase):
 
     # ---------- shared test fixtures ----------
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         # build the mock TokenizerManager once for every test
         tm = Mock(spec=TokenizerManager)
 
@@ -322,15 +327,18 @@ class ServingCompletionTestCase(unittest.TestCase):
             return_token_ids=True,
         )
         adapted_request, _ = self.sc._convert_to_internal_request(req)
-        self.sc.tokenizer_manager.server_args.stream_response_default_include_usage = (
-            False
-        )
 
         for incremental in (False, True):
-            with self.subTest(incremental_streaming_output=incremental):
-                self.sc.tokenizer_manager.server_args.incremental_streaming_output = (
-                    incremental
-                )
+            # Both of these are read through `get_serving()` now, so assigning
+            # them on the mock manager's record has no effect on what the code
+            # under test sees. State them where the code reads them.
+            with (
+                self.subTest(incremental_streaming_output=incremental),
+                get_context().override_server_args(
+                    stream_response_default_include_usage=False,
+                    incremental_streaming_output=incremental,
+                ),
+            ):
                 texts = ("a", "b", "c") if incremental else ("a", "ab", "abc")
                 output_ids = (
                     ([5], [6], [7]) if incremental else ([5], [5, 6], [5, 6, 7])

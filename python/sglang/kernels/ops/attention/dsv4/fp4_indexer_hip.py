@@ -12,6 +12,9 @@ if TYPE_CHECKING:
         CompressorDecodePlan,
         CompressorPrefillPlan,
     )
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+        PrefillScheduleBuffers,
+    )
 
 
 _HEADS = 64
@@ -56,6 +59,10 @@ class FP4PrefillWorkspace(NamedTuple):
     cta_info: torch.Tensor
     cta_count: int
     max_seq_len: int
+    # Prefix sums and scalars the fused prep kernel writes and AITER's
+    # cta_info kernel reads. Pinned with the workspace so a refresh allocates
+    # nothing and the buffers never return to the graph memory pool.
+    schedule_buffers: Optional[PrefillScheduleBuffers] = None
 
 
 class FP4KWriteMetadata(NamedTuple):
@@ -129,15 +136,11 @@ def _guarded_pages(logical_width: int) -> int:
 
 def _guard_page_table(page_table: torch.Tensor, out: Optional[torch.Tensor] = None):
     """Pad page tables for 256-token scheduling and one-chunk lookahead."""
-    page_table = page_table.to(dtype=torch.int32).contiguous()
-    rows, logical_width = page_table.shape
-    padded_width = _guarded_pages(logical_width)
-    if out is None:
-        out = page_table.new_zeros((rows, padded_width + 4))
-    else:
-        assert out.shape == (rows, padded_width + 4), f"{out.shape=} {rows=}"
-    out[:, :logical_width].copy_(page_table)
-    return out, padded_width * _KV_BLOCK_SIZE
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+        pad_page_table,
+    )
+
+    return pad_page_table(page_table, out=out)
 
 
 def logits_rows_per_chunk(page_table: torch.Tensor) -> int:
@@ -225,51 +228,58 @@ def prepare_fp4_prefill_workspace(
 ) -> FP4PrefillWorkspace:
     """Build or refresh the prefill page-table, schedule, and logits buffers.
 
-    Must run OUTSIDE CUDA-graph capture. AITER's prefill scheduler frees its own
-    scratch when it returns, and its schedule kernel reads that scratch, so a
-    captured build would replay against recycled graph-pool memory. Callers
-    instead refresh this workspace per step and let the graph read only the
-    pinned ``cta_info`` / ``logits`` / page-table buffers.
+    Must run OUTSIDE CUDA-graph capture. Rows past the fused builder's limit
+    fall back to AITER's prefill scheduler, which frees the scratch its own
+    schedule kernel reads, so a captured build would replay against recycled
+    graph-pool memory. Callers instead refresh this workspace per step and let
+    the graph read only the pinned ``cta_info`` / ``logits`` / page-table
+    buffers.
     """
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         CTA_INFO_WIDTH,
-        compute_prefill_schedule,
+    )
+
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+        PrefillScheduleBuffers,
+        build_prefill_schedule,
+        padded_page_table_shape,
     )
 
     c4_seq_lens = _as_int32_1d(c4_seq_lens)
     if workspace is None:
-        guarded, max_seq_len = _guard_page_table(page_table)
-        num_queries = guarded.shape[0]
-        cta_count = max(_PREFILL_BASE_CTA_TARGET, num_queries)
+        rows, _, padded_width = padded_page_table_shape(page_table)
+        cta_count = max(_PREFILL_BASE_CTA_TARGET, rows)
+        device = page_table.device
+        buffers = PrefillScheduleBuffers(rows, device)
         workspace = FP4PrefillWorkspace(
-            guarded_page_table=guarded,
-            row_to_batch=torch.arange(
-                num_queries, device=guarded.device, dtype=torch.int32
+            # The prep kernel writes every element it hands back, so neither the
+            # padded table nor the row metadata needs a zero-fill dispatch here.
+            guarded_page_table=torch.empty(
+                (rows, padded_width + 4), dtype=torch.int32, device=device
             ),
-            local_starts=torch.zeros(
-                num_queries, device=guarded.device, dtype=torch.int32
-            ),
+            row_to_batch=buffers.row_to_batch,
+            local_starts=buffers.local_starts,
             cta_info=torch.empty(
-                (cta_count, CTA_INFO_WIDTH), dtype=torch.int32, device=guarded.device
+                (cta_count, CTA_INFO_WIDTH), dtype=torch.int32, device=device
             ),
             cta_count=cta_count,
-            max_seq_len=max_seq_len,
+            max_seq_len=padded_width * _KV_BLOCK_SIZE,
+            schedule_buffers=buffers,
         )
-    else:
-        _guard_page_table(page_table, out=workspace.guarded_page_table)
 
     assert c4_seq_lens.shape[0] == workspace.row_to_batch.shape[0], (
         f"c4_seq_lens rows {c4_seq_lens.shape[0]} do not match the workspace's "
         f"{workspace.row_to_batch.shape[0]}; the schedule kernel indexes both by row"
     )
-    compute_prefill_schedule(
-        workspace.row_to_batch,
-        workspace.local_starts,
-        c4_seq_lens,
-        block_k=256,
+    build_prefill_schedule(
+        page_table=page_table,
+        local_ends=c4_seq_lens,
+        cta_info_out=workspace.cta_info,
         parallel_unit_num=workspace.cta_count,
         max_seq_len=workspace.max_seq_len,
-        cta_info_out=workspace.cta_info,
+        block_k=256,
+        guarded_out=workspace.guarded_page_table,
+        buffers=workspace.schedule_buffers,
     )
     return workspace
 
@@ -301,11 +311,44 @@ def aiter_fp4_paged_mqa_logits(
     # can leave it stale, in which case fall back to building the schedule here.
     if workspace is not None and workspace.guarded_page_table.shape[0] != num_tokens:
         workspace = None
+    # Built on the fallback path below; kept in scope so the schedule scratch
+    # outlives the logits kernel that reads it.
+    fallback_schedule = None
     if workspace is not None:
         page_table = workspace.guarded_page_table
         max_seq_len = workspace.max_seq_len
-    else:
+    elif is_decode:
         page_table, max_seq_len = _guard_page_table(page_table)
+    else:
+        # No usable workspace (DP padding or truncated activations): build the
+        # schedule here rather than letting AITER rebuild it from ~29 torch ops
+        # once per C4 layer. This pads the page table in the same dispatch.
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+            CTA_INFO_WIDTH,
+        )
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+            build_prefill_schedule,
+            padded_page_table_shape,
+        )
+
+        _, _, padded_width = padded_page_table_shape(page_table)
+        max_seq_len = padded_width * _KV_BLOCK_SIZE
+        cta_count = max(_PREFILL_BASE_CTA_TARGET, num_tokens)
+        cta_info = torch.empty(
+            (cta_count, CTA_INFO_WIDTH),
+            dtype=torch.int32,
+            device=page_table.device,
+        )
+        page_table, buffers = build_prefill_schedule(
+            page_table=page_table,
+            local_ends=c4_seq_lens,
+            cta_info_out=cta_info,
+            parallel_unit_num=cta_count,
+            max_seq_len=max_seq_len,
+            block_k=256,
+        )
+        fallback_schedule = (cta_info, cta_count, buffers)
     q_payload = q_fp4.view(torch.uint8)
     k_payload = k_payload.view(torch.uint8)
     # Scored write-once and dead when the caller's top-k returns, so the pooled
@@ -346,13 +389,13 @@ def aiter_fp4_paged_mqa_logits(
         )
     else:
         if workspace is None:
-            pinned = {}
-            row_to_batch = torch.arange(
-                num_tokens, device=q_fp4.device, dtype=torch.int32
-            )
-            local_starts = torch.zeros(
-                num_tokens, device=q_fp4.device, dtype=torch.int32
-            )
+            cta_info, cta_count, buffers = fallback_schedule
+            # As with the workspace path, a pinned cta_info lets the kernel skip
+            # its -inf pre-fill: every row the length-aware top-k reads is
+            # covered by a CTA.
+            pinned = {"cta_info": cta_info, "n_ctas": cta_count}
+            row_to_batch = buffers.row_to_batch
+            local_starts = buffers.local_starts
         else:
             pinned = {
                 "cta_info": workspace.cta_info,

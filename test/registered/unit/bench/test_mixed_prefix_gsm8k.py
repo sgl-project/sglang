@@ -11,7 +11,7 @@ from sglang.test.simple_eval_mixed_prefix_gsm8k import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
 def _write_synthetic_dataset(path: str, n: int) -> None:

@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
+    _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
@@ -28,53 +29,43 @@ logger = logging.getLogger(__name__)
 
 
 def handle_context_parallelism(server_args: Any):
+    validate_prefill_cp_platform(server_args)
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
-        from sglang.srt.configs.model_config import is_deepseek_dsa
-        from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
-
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
-        if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
-            is_dsa_default_model = is_deepseek_dsa(hf_config)
-            # DSA CP-v2 currently supports only the interleave strategy.
-            enable_default_cp_v2 = not is_dsa_default_model or (
-                cfg.enable_prefill_cp and cfg.cp_strategy == "interleave"
-            )
-            if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
-                envs.SGLANG_ENABLE_CP_V2.set(True)
-
         if (
             cfg.enable_prefill_cp
-            and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
-            and envs.SGLANG_ENABLE_CP_V2.get()
+            and model_arch == "DeepseekV32ForCausalLM"
+            and cfg.cp_strategy == "zigzag"
+        ):
+            raise ValueError(
+                "DeepSeek V3.2 prefill CP does not support --cp-strategy "
+                "zigzag; use interleave."
+            )
+        if cfg.enable_prefill_cp and model_arch in (
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
         ):
             if cfg.cp_strategy != "zigzag":
-                raise ValueError("MiMo V2 CP-v2 only supports --cp-strategy zigzag.")
+                raise ValueError(
+                    "MiMo V2 prefill CP only supports --cp-strategy zigzag."
+                )
             if (
                 model_config.is_multimodal
                 and not cfg.language_only
                 and not cfg.language_model_only
             ):
                 raise ValueError(
-                    "MiMo V2 CP-v2 only supports text inference; add --language-only."
+                    "MiMo V2 prefill CP only supports text inference; add "
+                    "--language-only."
                 )
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(
             "--cp-strategy must be set when --enable-prefill-cp is enabled."
-        )
-
-    if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
-        raise ValueError(
-            "--enable-prefill-context-parallel and "
-            "--enable-nsa-prefill-context-parallel are mutually "
-            "exclusive. Use --enable-nsa-prefill-context-parallel for "
-            "DeepSeek V3.2 (NSA) models and "
-            "--enable-prefill-context-parallel for MLA-based models "
-            "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
         )
 
     view = resolved_view(server_args)
@@ -124,7 +115,8 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
-def handle_dcp_validation(server_args: Any):
+def handle_decode_context_parallelism(server_args: Any):
+    run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
         raise ValueError(
@@ -142,10 +134,9 @@ def handle_dcp_validation(server_args: Any):
     if cfg.dcp_comm_backend == "fi_a2a" and not get_platform().is_cuda:
         raise ValueError(
             "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
-            "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
-            "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
-            "authoritative fabric probe runs at model-runner init; use 'a2a' "
-            "or 'ag_rs' on clusters without MNNVL."
+            "MNNVL All-to-All kernel, which requires Blackwell and a DCP group "
+            "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
+            "the flag unset to resolve it."
         )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
@@ -236,6 +227,34 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
+    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
+        _disable_nccl_graph_buffer_registration()
+
+
+def _disable_nccl_graph_buffer_registration() -> None:
+    """Keep NCCL from registering the buffers of the graph-captured PyNccl
+    all-to-all.
+
+    NCCL_GRAPH_REGISTER (default on) registers the send/recv buffers of every
+    collective captured in a CUDA graph for the lifetime of the graph, and
+    peers then move data through those registrations directly. The TP LM-head
+    all-to-all is captured in the decode graphs on graph-pool temporaries,
+    whose addresses the pool also hands to other tensors, and the registered
+    exchange does not survive that: under a burst of new requests (DP ranks
+    ramping at different rates) one rank finishes its step while the others
+    spin in ncclDevKernel_SendRecv forever, and every DP rank hangs.
+    Reproduced on tp4/dp4/ep4 and on a multi-node tp16/dp16/ep16 PD decode
+    deployment; disabling the registration removes the hang while dedicated
+    all-to-all buffers alone do not. Must run before the schedulers create
+    their NCCL communicators, which inherit this environment. An explicit
+    setting wins.
+    """
+    if os.environ.setdefault("NCCL_GRAPH_REGISTER", "0") != "0":
+        logger.warning(
+            "NCCL_GRAPH_REGISTER=%s was set explicitly; the graph-captured TP "
+            "LM-head all-to-all can deadlock with registered buffers.",
+            os.environ["NCCL_GRAPH_REGISTER"],
+        )
 
 
 def handle_dwdp(server_args: Any):
@@ -559,76 +578,6 @@ def handle_eplb_and_dispatch(server_args: Any):
         assert resolved_view(server_args).ep_size > 1
 
 
-def handle_legacy_cp_arguments(server_args: Any):
-    cfg = resolving_view(server_args)
-    legacy_mode_to_strategy = {
-        "in-seq-split": "zigzag",
-        "round-robin-split": "interleave",
-    }
-    strategy_to_legacy_mode = {
-        "zigzag": "in-seq-split",
-        "interleave": "round-robin-split",
-    }
-
-    if cfg.enable_prefill_context_parallel or cfg.enable_dsa_prefill_context_parallel:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_arguments",
-            enable_prefill_cp=True,
-        )
-
-    if cfg.enable_prefill_context_parallel and cfg.cp_strategy is None:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_arguments",
-            cp_strategy=legacy_mode_to_strategy[cfg.prefill_cp_mode],
-        )
-    if cfg.enable_dsa_prefill_context_parallel and cfg.cp_strategy is None:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_arguments",
-            cp_strategy=legacy_mode_to_strategy[cfg.dsa_prefill_cp_mode],
-        )
-
-    if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
-        return
-
-    if not cfg.enable_prefill_cp or cfg.cp_strategy is None:
-        return
-
-    mode = strategy_to_legacy_mode[cfg.cp_strategy]
-    use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(
-        resolved_view(server_args), "attention_backend", None
-    ) in ("dsa", "dsv4")
-    if use_dsa_legacy_aliases:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_arguments",
-            enable_dsa_prefill_context_parallel=True,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_arguments",
-            enable_prefill_context_parallel=False,
-        )
-    else:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_arguments",
-            enable_prefill_context_parallel=True,
-        )
-    declare_resolution(
-        server_args,
-        "_handle_legacy_cp_arguments",
-        dsa_prefill_cp_mode=mode,
-    )
-    declare_resolution(
-        server_args,
-        "_handle_legacy_cp_arguments",
-        prefill_cp_mode=mode,
-    )
-
-
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
     if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
@@ -660,3 +609,15 @@ def handle_expert_distribution_metrics(server_args: Any):
                 "_handle_expert_distribution_metrics",
                 expert_distribution_recorder_buffer_size=1000,
             )
+
+
+def validate_prefill_cp_platform(server_args: Any):
+    """Reject deprecated platform CP before resolving models or CP topology."""
+    cfg = resolving_view(server_args)
+    platform = get_platform()
+    if cfg.enable_prefill_cp and (
+        platform.is_hip or platform.is_npu or platform.is_musa
+    ):
+        raise ValueError(
+            "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+        )

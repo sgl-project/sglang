@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=200, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=135, stage="base-a", runner_config="1-gpu-small")
 
 
 class TestBasicSanityDFlash(
@@ -63,12 +63,12 @@ class TestBasicSanityDFlash(
                 "DFLASH",
                 "--speculative-draft-model-path",
                 DEFAULT_DRAFT_MODEL_DFLASH,
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--mem-fraction-static",
                 "0.7",
                 "--enable-metrics",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
             ],
             env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )

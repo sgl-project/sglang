@@ -47,8 +47,11 @@ with what the operator typed, not with what resolution decided.**
   compilation disabled before restricting a role), and
   `=enforce` fails closed on bag reads outside the role's `ROLE_NAMESPACE_SETS` entry
   (`None` = full tree; only audited roles are restricted).
-- Bag membership is metadata on the dataclass: every `ServerArgs` field carries
-  `NS("path")` (e.g. `NS("exec.moe")`); coverage is linted two-way
+- Bag membership is **where the field is declared**: one class per namespace under
+  `arg_groups/fields/`, each carrying the `_NS_PATH` it stands for, and `ServerArgs`
+  is assembled from them (`collect_input_fields`). The per-field `NS("path")` marker
+  survives only for a class that cannot express this — an ad-hoc dataclass spanning
+  namespaces, which is what the config-bag tests build. Coverage is linted two-way
   (`test_server_args_namespaces.py`, `test_runtime_context_config_bags.py`).
 - **Reading config**: `get_<ns>()[.sub].field` — e.g.
   `get_exec().moe.moe_a2a_backend`, `get_schedule().max_running_requests`. Bag leaves
@@ -88,8 +91,11 @@ with what the operator typed, not with what resolution decided.**
 - **Late launcher-stage resolution (pre-publish)**: a few rules cannot run inside
   `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
   tokenizer/chat-template load. They are resolution, not mutation, and they
-  **declare** via `arg_groups.overrides.declare_late_resolution(server_args,
-  source, **fields)`, which refuses the published instance. The declaration lands
+  **declare** via `arg_groups.overrides.declare_resolution(server_args, source,
+  **fields)`, the same call the rest of the pipeline makes; there is no
+  `declare_late_resolution` any more. *When* a declaration is made is not
+  something the code marks — the guardrails that used to read that marker
+  cover these sites through the ordinary keyword scan instead. The declaration lands
   in the stash on that very object, so every holder of it carries the decision —
   the HTTP server, the multi-tokenizer workers it is serialized for, the
   schedulers it forks — and each of them publishes bags projected from it. The
@@ -253,10 +259,18 @@ A process-global seed field-read of one of these sizes
 (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure. A
 `server_args` the object was *handed* is a different thing and not a ratchet
 matter — see "Reads that legitimately stay on a ServerArgs instance".
-Fail-loud is narrower: before dist init, a live size/group read raises — except
-the DCP pair, which degrades instead (`dcp_enabled` → `False`,
-`attn_dcp_size` → `1` when no group is installed;
-`test_attn_dcp_defaults_when_group_is_uninitialized` pins this). After init,
+Fail-loud is narrower: before dist init, a live *rank/group* read raises. The six
+parallel quotients are not live reads at all — `attn_tp_size`, `attn_dp_size`,
+`attn_dcp_size`, `moe_ep_size`, `moe_tp_size`, `dcp_enabled` are a function of the
+configured leaves, computed once at publish into bag leaves, and answered
+override → stamp → published leaf. So `dcp_enabled` means "the launch configured
+DCP" (`dcp_size > 1`), not "a DCP group is installed here"; in a scheduler the
+stamp makes the two identical, in a process that publishes without dist init they
+differ. `test_a_topology_is_stated_by_naming_the_width` and its neighbours in
+`test_runtime_context.py` pin this; they replaced
+`test_attn_dcp_defaults_when_group_is_uninitialized`. One consequence for tests:
+overriding a leaf no longer moves its quotient — state a topology by publishing a
+config, or by naming the width. After init,
 only the DCP group is optional (`_DCP` exists only when `dcp_size > 1`; attn-CP and
 moe-DP always install, as size-1 aliases if unused). The `config` hop is
 deliberately dynamo-traceable (a plain property over a slot, no
@@ -283,13 +297,21 @@ where an object was handed one; it is not a global accessor.
   raises on a non-leaf. A call site that knows its field reads the bag leaf.
 - **the live topology** → `get_parallel()` (bare names).
 - **a value derived from published leaves** → an accessor in `runtime_context` that
-  derives it *from the bags*: `mamba_extra_buffer_enabled()` /
-  `mamba_extra_buffer_lazy_enabled()` read `get_memory()` and `get_exec()`, so
-  they see post-publish overrides. Prefer this shape whenever the inputs are
-  leaves; the same-named `ServerArgs` members are the pre-publish equivalents the
-  resolution pipeline uses, and wrapping one of those instead would quietly cost
-  you override visibility. `is_ep_joiner()` / `is_ep_scale_joiner()` are the same
-  shape over `exec.moe.ep_join_mode`, `attention_backends()` derives the
+  derives it *from the bags*. The strongest form of this is a `Derived(fn=...)`
+  declared beside the leaves it is computed from, in the namespace's own
+  `arg_groups/fields/` class: `publish` computes it once and stores it as an
+  ordinary bag leaf, so the read is a plain attribute load and it sees
+  post-publish overrides. `enable_mamba_extra_buffer`, `is_ep_joiner`,
+  `is_ep_scale_joiner` and `is_startup_weight_load_overlap` are declared that way
+  now — read them where they are declared:
+  `get_exec().mamba.enable_mamba_extra_buffer`, `get_exec().moe.is_ep_joiner`,
+  `get_model().is_startup_weight_load_overlap`. (The namespace is the class that
+  declares the field, not the namespaces its `fn` happens to read: the mamba one
+  spans `exec.mamba` and `memory`, which is exactly why it could not be a method
+  on either bag.) The
+  old `mamba_extra_buffer_enabled()` / `is_ep_joiner()` functions and the
+  same-named `ServerArgs` members are gone. The pre-publish helpers that remain
+  exist for resolution, which has no bag to read yet. `attention_backends()` derives the
   `(prefill, decode)` pair from the three `exec.kernel` leaves, and
   `max_speculative_num_draft_tokens()` / `cutedsl_moe_max_num_tokens()` derive
   theirs from `spec` / `schedule` / `exec.graph`.
@@ -389,9 +411,38 @@ derivation cannot enumerate.
 
 One consequence worth knowing: because the fields are the raw input, resolving a
 bare `dataclasses.replace` copy lands in the same place as the parent — the
-pipeline reads only its own input. `replace_resolved` is the way to copy a
-resolved record (it carries the declarations and the `model_config` memo, so the
-copy does not re-resolve at all).
+pipeline reads only its own input. **So a resolved record is not copied at
+all.** A caller that needs one field different for the process it is about to
+hand the record to — the Ray paths and their `dist_init_addr` — declares it on
+the record it holds (`declare_resolution`) and hands that over: the declaration
+travels inside the object, the receiving process projects its bags from it, and
+nothing re-resolves. There is no `ServerArgs.replace_resolved` any more, and the
+`model_config`-memo bug that copying used to cause (a copy marked resolved but
+arriving without the memo cannot refill it, because the guard refuses the write)
+is gone by construction rather than guarded.
+
+A bag `override` cannot stand in for this. It is *not* because overriding needs
+a publish — `set_server_args` is what projects the bags and `override` works as
+soon as the context holds a record — but because `override` writes bag leaves
+and by contract never touches the record, so its effect cannot travel inside an
+object to another process.
+
+### The declaration stash has one writer
+
+Everything that decides configuration goes through
+`declare_resolution(server_args, source, **fields)`. It validates the names,
+refuses the published config (the stash is projected at publish and never
+again, so a later declaration is a silent no-op), and appends. The other names
+around it are spellings, not mechanisms:
+
+| name | what it adds |
+|---|---|
+| `run_post_process_pass` | runs a pass at its slot and validates its return; declares through `declare_resolution`. A pass returning an **empty** dict is a validation, not a declaration, and stays legal on the published instance — `Engine(server_args=sa)` after `Engine.shutdown()` re-runs `check_server_args` on the very instance the context holds |
+| `record_foreign_defaults` | for a resolver this tree does not own (an out-of-tree platform plugin, a registered speculative algorithm), whose interface is to *assign* fields. It gets a stand-in whose reads fall through to `resolving_view`; what it assigned is declared. The record is never written, so the write seal has no exception. In-tree code does not go through it — `handle_platform_defaults` wraps the platform hook, and the in-tree speculative dispatcher is called directly, because handed the stand-in its own `declare_resolution` calls would stash on that instead |
+
+`resolution_projection` is gone; the whole-object readback is
+`ServerArgs.resolved_dict()`, which is what `/server_info` and its gRPC and
+in-process twins report.
 
 ### Adding a model-specific config adjustment
 
@@ -512,8 +563,10 @@ ONE thread — do not design for TBO threads that don't exist.
 
 ## Guardrails (these fail CI; what to do when they fire)
 
-1. **Strict mutation guard** (always on): bare `server_args.x = ...` after resolution
-   raises unconditionally in `ServerArgs.__setattr__` — this *is* the guarantee that
+1. **Strict mutation guard** (always on, and with no exception): bare
+   `server_args.x = ...` after resolution raises unconditionally in
+   `ServerArgs.__setattr__` — the named lift that out-of-tree plugins used to
+   ask for is gone, they assign onto a stand-in instead — this *is* the guarantee that
    no writer can desync the bags, so there is no writer ratchet any more. Change
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf
@@ -525,10 +578,12 @@ ONE thread — do not design for TBO threads that don't exist.
    `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
    calls either form. Rerouting a writer to the bags means flipping **all its readers
    in the same commit** (no transitional dual-write).
-4. **Legacy-accessor ratchet** (`test_legacy_global_ratchet.py`): `get_global_server_args`
-   call sites must not grow. The replacement for a *decision* is a bag leaf, a named
-   accessor, or the owning runner's stamp — not `get_server_args().field`, which the
-   read ratchet below pins at zero. `runtime_context.get_server_args()` is only for the
+4. **The legacy accessor is retired** (`test_runtime_context.py`): every
+   `get_global_server_args()` call now raises, because it answered with the record --
+   a caller reading a field resolution had decided got a stale value and no error.
+   The replacement for a *decision* is a bag leaf, a named accessor, or the owning
+   runner's stamp — not `get_server_args().field`, which the read ratchet below pins
+   at zero. `runtime_context.get_server_args()` is only for the
    whole-object shapes (dumps, provenance, a hand-off to a callee that takes a config).
 5. **Global config read ratchet** (`test_global_config_read_ratchet.py`): baselines are
    **0** for both the direct `get_server_args().field` and the alias form (function-local
@@ -548,8 +603,9 @@ ONE thread — do not design for TBO threads that don't exist.
    flag-owning layers are pinned by name. A new module-level runtime global belongs on a
    flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
 7. **Namespace coverage** (`test_server_args_namespaces.py`,
-   `test_runtime_context_config_bags.py`): every `ServerArgs` field carries `NS(...)`
-   metadata and the projected bags must cover the fields exactly (two-way).
+   `test_runtime_context_config_bags.py`): every `ServerArgs` field resolves to a
+   namespace — from the `arg_groups/fields/` class that declares it — and the
+   projected bags must cover the fields exactly (two-way).
 
 Never module-skip a test "until the migration settles" — seed the context instead
 (the deferral ratchet that once pinned this is retired; the rule stands).
@@ -599,10 +655,10 @@ Never module-skip a test "until the migration settles" — seed the context inst
 Key source files: `python/sglang/srt/runtime_context.py` (the container, every tier,
 `publish`, `_ConfigBag`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
-`declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
+`declare_resolution` and the spellings around it), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
 `test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
-`test_global_config_read_ratchet.py`, `test_legacy_global_ratchet.py`,
+`test_global_config_read_ratchet.py`,
 `test_module_state_ratchet.py`, `test_server_args_namespaces.py`,
 `test_runtime_context.py` — the last one doubles
 as executable documentation of every tier's semantics).

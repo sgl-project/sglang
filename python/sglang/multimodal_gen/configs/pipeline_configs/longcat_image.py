@@ -449,7 +449,7 @@ def _calculate_edit_dimensions(target_area, ratio):
     """Output size for LongCat-Image-Edit: fit `target_area`, ceil to /16.
 
     Copied from diffusers pipeline_longcat_image_edit.calculate_dimensions.
-    Note this intentionally differs from sglang.multimodal_gen.utils
+    Note this intentionally differs from the Qwen-Image pipeline config
     calculate_dimensions (which rounds to /32).
     """
     width = math.sqrt(target_area * ratio)

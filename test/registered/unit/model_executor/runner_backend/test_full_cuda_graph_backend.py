@@ -24,6 +24,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
@@ -59,6 +61,8 @@ def _make_backend(runner):
     backend._precarve = SimpleNamespace(
         measure=contextlib.nullcontext, mint=mock.Mock()
     )
+    backend._reuse_output_buffer = False
+    backend._output_buffer = None
     backend._memory_saver_adapter = None
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
@@ -106,6 +110,32 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         # Graph + output are recorded against the shape key.
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
+
+    def test_prefill_shapes_share_one_output_storage(self):
+        runner = _make_runner(enable_profile=False, profiler=None, mode_name="EXTEND")
+        backend = _make_backend(runner)
+        backend._reuse_output_buffer = True
+
+        outputs = iter(
+            [
+                torch.ones((4, 2)),
+                torch.ones((4, 2)),
+                torch.ones((4, 2)),
+                torch.ones((2, 2)),
+                torch.ones((2, 2)),
+                torch.ones((2, 2)),
+            ]
+        )
+        with mock.patch("torch.cuda.CUDAGraph", side_effect=["GRAPH4", "GRAPH2"]):
+            backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
+            backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
+
+        large = backend._outputs[ShapeKey(size=4)]
+        small = backend._outputs[ShapeKey(size=2)]
+        self.assertEqual(large.shape, (4, 2))
+        self.assertEqual(small.shape, (2, 2))
+        self.assertEqual(large.data_ptr(), small.data_ptr())
+        self.assertEqual(backend._output_buffer.shape, (4, 2))
 
     def test_enable_flag_set_but_no_profiler_attr_does_not_step(self):
         # The runner advertises the flag but never created a profiler; the

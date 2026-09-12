@@ -1,7 +1,10 @@
+import threading
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Iterator, Optional, Union
 
 import torch
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
@@ -202,3 +205,55 @@ def temporary_module_dtype(
         yield module
     finally:
         module.to(dtype=original_dtype)
+
+
+@dataclass
+class MixedPrecisionState:
+    param_dtype: torch.dtype | None = None
+    reduce_dtype: torch.dtype | None = None
+    output_dtype: torch.dtype | None = None
+    compute_dtype: torch.dtype | None = None
+    mp_policy: MixedPrecisionPolicy | None = None
+
+
+class _MixedPrecisionContext(threading.local):
+    state: MixedPrecisionState | None = None
+
+
+_mixed_precision_state = _MixedPrecisionContext()
+
+
+def get_mixed_precision_state() -> MixedPrecisionState:
+    """Get the current mixed precision state."""
+    state = _mixed_precision_state.state
+    if state is None:
+        raise ValueError("Mixed precision state not set")
+    return state
+
+
+def set_mixed_precision_policy(
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    output_dtype: torch.dtype | None = None,
+    mp_policy: MixedPrecisionPolicy | None = None,
+):
+    """Set mixed precision policy for the current thread.
+
+    Args:
+        param_dtype: Parameter dtype used for training
+        reduce_dtype: Reduction dtype used for gradients
+        output_dtype: Optional output dtype
+    """
+    state = MixedPrecisionState(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=output_dtype,
+        mp_policy=mp_policy,
+    )
+    _mixed_precision_state.state = state
+
+
+def get_compute_dtype() -> torch.dtype:
+    """Get the current compute dtype from mixed precision policy."""
+    state = _mixed_precision_state.state
+    return torch.get_default_dtype() if state is None else state.param_dtype

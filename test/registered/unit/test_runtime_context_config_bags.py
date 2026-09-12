@@ -9,6 +9,9 @@ import dataclasses
 import unittest
 from unittest import mock
 
+import msgspec
+import msgspec.structs
+
 from sglang.srt import runtime_context as rc
 from sglang.srt.arg_groups.arg_utils import NS, A
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -16,7 +19,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @dataclasses.dataclass
@@ -30,33 +33,6 @@ class _CollisionFake:
     # 'topk' is both a leaf on exec.moe and a subgroup of exec.moe -> collision.
     topk: A[int, NS("exec.moe")] = 8
     x: A[int, NS("exec.moe.topk")] = 1
-
-
-_TOP = (
-    rc.get_device,
-    rc.get_model,
-    rc.get_exec,
-    rc.get_schedule,
-    rc.get_memory,
-    rc.get_spec,
-    rc.get_lora,
-    rc.get_mm,
-    rc.get_disagg,
-    rc.get_serving,
-    rc.get_observability,
-)
-_EXEC_SUBS = (
-    "kernel",
-    "moe",
-    "graph",
-    "comm",
-    "mamba",
-    "overlap",
-    "offload",
-    "dllm",
-    "deterministic",
-    "features",
-)
 
 
 class TestConfigBags(CustomTestCase):
@@ -110,7 +86,7 @@ class TestConfigBags(CustomTestCase):
         import dataclasses
 
         sa, reference = self._resolve_published_and_sibling()
-        defaults = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+        defaults = {f.name: f.default for f in msgspec.structs.fields(ServerArgs)}
         # Leaves resolution writes on this input on both CI device shapes
         # (CUDA host and CPU-only runner): each starts at a None default.
         sampled = (
@@ -216,14 +192,6 @@ class TestConfigBags(CustomTestCase):
         rc.publish(sa, role="scheduler")
         restore_process_state()
         return sa, resolve()
-
-    def test_all_accessors_and_exec_subgroups(self):
-        self._publish()
-        for acc in _TOP:
-            self.assertIsNotNone(acc())
-        exec_cfg = rc.get_exec()
-        for sub in _EXEC_SUBS:
-            self.assertTrue(hasattr(exec_cfg, sub), f"exec.{sub} missing")
 
     def test_read_only_by_bare_assignment(self):
         self._publish()

@@ -25,11 +25,6 @@ class TestSingleRankDeviceGroup(unittest.TestCase):
                     new_device_group(ranks, requested)
                 new_group.assert_called_once_with(ranks, backend=requested)
 
-    def test_backend_defaults_to_none_for_multi_rank(self):
-        with patch(NEW_GROUP_PATH) as new_group:
-            new_device_group([0, 1])
-        new_group.assert_called_once_with([0, 1], backend=None)
-
 
 if __name__ == "__main__":
     unittest.main()

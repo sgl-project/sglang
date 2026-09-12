@@ -111,7 +111,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --max-running-requests 16 \
     --mem-fraction-static 0.6 \
-    --cuda-graph-bs 2 3 4 5 6 8 10 12 14 16 \
+    --cuda-graph-bs-decode 2 3 4 5 6 8 10 12 14 16 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -330,7 +330,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 131072 \
     --max-mamba-cache-size 320 \
     --prefill-max-requests 10 \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --trust-remote-code \
     --max-running-requests 64 \
     --mem-fraction-static 0.6 \
@@ -451,7 +451,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 48 \
     --mem-fraction-static 0.8 \
     --max-total-tokens 210000 \
-    --cuda-graph-bs 2 4 6 8 10 12 \
+    --cuda-graph-bs-decode 2 4 6 8 10 12 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -569,7 +569,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 144 \
     --mem-fraction-static 0.8 \
     --max-total-tokens 635000 \
-    --cuda-graph-bs 2 4 6 8 12 14 16 18 20 24 26 28 30 32 34 36 \
+    --cuda-graph-bs-decode 2 4 6 8 12 14 16 18 20 24 26 28 30 32 34 36 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -686,7 +686,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --max-running-requests 160 \
     --mem-fraction-static 0.8 \
-    --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 \
+    --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -803,7 +803,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --max-running-requests 432 \
     --mem-fraction-static 0.8 \
-    --cuda-graph-bs 2 4 6 8 12 16 20 24 28 32 36 40 44 48 50 52 54 \
+    --cuda-graph-bs-decode 2 4 6 8 12 16 20 24 28 32 36 40 44 48 50 52 54 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -921,7 +921,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 16 \
     --mem-fraction-static 0.6 \
     --max-total-tokens 1065000 \
-    --cuda-graph-bs 2 4 6 8 10 12 14 16 \
+    --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -1039,7 +1039,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 32 \
     --mem-fraction-static 0.6 \
     --max-total-tokens 1065000 \
-    --cuda-graph-bs 2 4 6 8 12 14 16 \
+    --cuda-graph-bs-decode 2 4 6 8 12 14 16 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -1147,7 +1147,7 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size -1 \
     --max-prefill-tokens 65536 \
     --max-mamba-cache-size 640 \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --trust-remote-code \
     --max-running-requests 128 \
     --mem-fraction-static 0.6 \

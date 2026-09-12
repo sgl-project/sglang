@@ -1203,6 +1203,7 @@ def decode_attention_fwd(
         and _should_use_lean_decode(
             enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
         )
+        and lean_locks is not None
     ):
         total_programs, XCD_REMAP, NUM_XCDS = _lean_decode_launch_params(
             v_buffer.shape[-2], kv_group_num

@@ -24,7 +24,7 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -204,6 +204,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.speculative_num_steps = 1
                 worker.speculative_num_draft_tokens = 2
                 worker.device = DEVICE
+                worker.plan_stream = None
                 worker.tree_mask_mode = None
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
@@ -251,7 +252,10 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         existing_backend = object()
         decode_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = False
@@ -273,7 +277,10 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         decode_backend = object()
         draft_extend_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = True

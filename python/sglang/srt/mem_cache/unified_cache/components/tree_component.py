@@ -584,7 +584,7 @@ class TreeComponent(ABC):
     def release_component_lock(
         self,
         node: UnifiedTreeNode,
-        params: Optional[DecLockRefParams],
+        params: DecLockRefParams,
         lock_host: bool = False,
     ) -> None:
         """Decrement component lock refs, un-protecting nodes.
