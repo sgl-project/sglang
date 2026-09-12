@@ -922,6 +922,17 @@ class LayerCommunicator:
         return False
 
     # NOTE: This function will cause torch recompilation
+    def should_defer_mlp_allreduce(self, forward_batch: ForwardBatch) -> bool:
+        """Whether the MLP should skip its all-reduce because this communicator
+        performs it itself during ``postprocess_layer``.
+
+        Distinct from ``should_fuse_mlp_allreduce_with_next_layer``, which hands
+        the reduction to the *next* layer and skips ``postprocess_layer``
+        entirely.
+        """
+        return False
+
+    # NOTE: This function will cause torch recompilation
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:

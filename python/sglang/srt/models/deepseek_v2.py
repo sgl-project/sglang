@@ -550,6 +550,7 @@ class DeepseekV2MoE(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
+        enable_deferred_finalize: bool = False,
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -639,6 +640,7 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
+            enable_qwen35_fp8_deferred_finalize=enable_deferred_finalize,
             prefix=add_prefix("experts", prefix),
         )
 
