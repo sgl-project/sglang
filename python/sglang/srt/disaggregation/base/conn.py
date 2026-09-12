@@ -25,8 +25,8 @@ class StateType(str, enum.Enum):
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
-    # DeepSeek-V4 online C128 request-scoped state.
-    C128_STATE = "c128_state"
+    # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
+    DSV4_REQUEST_STATE = "c128_state"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).
@@ -95,6 +95,7 @@ class KVArgs:
     hidden_kv_layers: int
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
+    num_draft_entries: int = 0
 
 
 class KVPoll:
