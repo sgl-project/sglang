@@ -421,9 +421,12 @@ class FutureMap:
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
             return
-        # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
-        # record_batch_in_overlap; record_stream here is redundant.
-        indices.record_stream(torch.get_device_module(self.device).current_stream())
+        # No record_stream: `indices` is reachable from batch.spec_info, which
+        # record_batch_in_overlap pins for two iterations -- past the
+        # copy_done sync that proves this forward's reads complete -- so its
+        # block cannot be reused while the forward stream still reads it. A
+        # record_stream here would add the allocator event every later
+        # malloc polls (cudaEventQuery) for the rest of the step.
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
