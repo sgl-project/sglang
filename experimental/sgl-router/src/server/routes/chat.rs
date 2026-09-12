@@ -1443,6 +1443,55 @@ struct BootstrapFields {
     room: u64,
 }
 
+/// Write `members` in as top-level keys of the JSON object in `body`, without
+/// parsing it.
+///
+/// WHY: going through `serde_json` costs a full parse into a `Value` plus a
+/// full re-serialize, over a body that runs to [`MAX_CHAT_BODY_BYTES`].
+///
+/// Members go in before the CLOSING brace so they win the last-wins reading
+/// every JSON parser performs — the authority `obj.insert` has on the parse
+/// path. Inserting after the opening brace would lose to a client's own later
+/// copy of the key, which a request sending an explicit `null` for a governed
+/// parameter has: the probe reads `null` as absent, so the value IS injected.
+/// The last `}` is the object's closing brace, since `parse_probe` proved the
+/// body is an object and only whitespace may follow it.
+///
+/// `None` (braces not located) falls back to the parse path rather than
+/// panicking on a shape `parse_probe` should already have rejected.
+fn splice_top_level(
+    body: &Bytes,
+    members: &[(SamplingField, serde_json::Number)],
+) -> Option<Bytes> {
+    use std::io::Write as _;
+
+    let open = body.iter().position(|&b| b == b'{')?;
+    let close = body.iter().rposition(|&b| b == b'}')?;
+    if close <= open {
+        return None;
+    }
+    // An empty object takes no separating comma: `{"temperature":1}`, not
+    // `{,"temperature":1}`.
+    let has_members = body[open + 1..close]
+        .iter()
+        .any(|b| !b.is_ascii_whitespace());
+    // 24 bytes per member covers `"repetition_penalty":` plus a short number;
+    // an over-run just costs one realloc, never correctness.
+    let mut out = Vec::with_capacity(body.len() + 24 * members.len() + 1);
+    out.extend_from_slice(&body[..close]);
+    for (i, (field, value)) in members.iter().enumerate() {
+        if has_members || i > 0 {
+            out.push(b',');
+        }
+        // Wire names are a fixed set of JSON-safe identifiers and a
+        // `serde_json::Number` renders as valid JSON, so neither needs
+        // escaping. Written straight into `out` — no intermediate `String`.
+        write!(out, "\"{}\":{}", field.wire_name(), value).ok()?;
+    }
+    out.extend_from_slice(&body[close..]);
+    Some(Bytes::from(out))
+}
+
 /// Build the body forwarded to the engine, injecting (when present) the
 /// precomputed `input_ids`, the PD `bootstrap_*` fields and the fleet-wide
 /// sampling values into the already-parsed request object and serializing
@@ -1454,12 +1503,12 @@ struct BootstrapFields {
 /// tokens, tool-call constraint and response shape it still derives from them.
 /// Set only when `input_ids_safe_to_forward` held.
 ///
-/// `value` is the ingress parse when one is on hand (the cache-aware path
-/// parses once at ingress); it is consumed so the mutation reuses that parse.
-/// It is `None` for a load-only policy — a path that never parses at ingress —
-/// so injection re-parses the bytes here. The body shape was validated by
-/// `parse_probe`; the non-object arm defends against a TOCTOU regression
-/// rather than panicking.
+/// `value` is the ingress parse when one is on hand, reused rather than
+/// repeated — and dropped unused when splicing makes it unnecessary. Sampling
+/// alone never reaches `serde_json`: only `input_ids` and bootstrap injection
+/// do, because those may have to OVERWRITE a key the client sent, which
+/// [`splice_top_level`] cannot. The non-object arm defends against a TOCTOU
+/// regression rather than panicking.
 fn build_outgoing_body(
     body: &Bytes,
     value: Option<serde_json::Value>,
@@ -1467,13 +1516,29 @@ fn build_outgoing_body(
     bootstrap: Option<&BootstrapFields>,
     sampling: &[(SamplingField, serde_json::Number)],
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() && sampling.is_empty() {
+    // `input_ids` and bootstrap injection may have to OVERWRITE a key the
+    // client sent, which only the parse path can do; sampling injection never
+    // does, because the inject-set holds only keys the request omitted.
+    let only_sampling = input_ids.is_none() && bootstrap.is_none();
+    if only_sampling && sampling.is_empty() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
+    // Splice regardless of whether a parse is already on hand: `value` is
+    // read-only up to this point, so having one does not make splicing wrong
+    // — it only means the parse was already paid for elsewhere. Gating on
+    // `value.is_none()` would have skipped the splice on exactly the
+    // configurations that parse at ingress (a chat encoder, the cache-aware
+    // policy, bucket routing), i.e. most governed fleets.
+    if only_sampling {
+        if let Some(spliced) = splice_top_level(body, sampling) {
+            return Ok(spliced);
+        }
+    }
     let parsed = match value {
         Some(v) => v,
-        // The ingress skipped the parse, so re-parse for the injection.
+        // The ingress skipped the parse, so re-parse. Reached for bootstrap
+        // injection, and as the fallback if `splice_top_level` declined.
         None => serde_json::from_slice(body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
         })?,
@@ -2607,6 +2672,59 @@ mod tests {
         );
     }
 
+    /// The steady state of a governed fleet: a load-only policy on a model
+    /// with no chat encoder, so the ingress never parsed, and only sampling
+    /// scalars to add. This must NOT re-parse and re-serialize the body —
+    /// proven by the original bytes surviving verbatim, which a
+    /// `serde_json::Value` round-trip would have normalized away.
+    #[test]
+    fn build_outgoing_body_splices_sampling_without_reparsing() {
+        let body = Bytes::from_static(br#"{ "model" : "x" ,  "messages" : [ ] }"#);
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0, "n": 1}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,  "messages" : [ ] ,"temperature":1.0,"n":1}"#
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("temperature"), Some(&serde_json::json!(1.0)));
+        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
+        assert_eq!(parsed.get("model"), Some(&serde_json::json!("x")));
+    }
+
+    /// Splice edge cases: an empty object must not gain a trailing comma, and
+    /// leading whitespace before the root brace must not shift the insert.
+    #[test]
+    fn splice_top_level_handles_empty_objects_and_leading_whitespace() {
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        for (raw, want) in [
+            (r#"{}"#, r#"{"temperature":1.0}"#),
+            (r#"{ }"#, r#"{ "temperature":1.0}"#),
+            ("\n\t {\"a\":1}", "\n\t {\"a\":1,\"temperature\":1.0}"),
+            // A `}` inside a string literal is not the closing brace.
+            (r#"{"a":"}"}"#, r#"{"a":"}","temperature":1.0}"#),
+            // Trailing whitespace stays outside the object.
+            ("{\"a\":1} \n", "{\"a\":1,\"temperature\":1.0} \n"),
+        ] {
+            let out = splice_top_level(&Bytes::copy_from_slice(raw.as_bytes()), &inject).unwrap();
+            assert_eq!(std::str::from_utf8(&out).unwrap(), want, "input {raw:?}");
+            serde_json::from_slice::<serde_json::Value>(&out)
+                .unwrap_or_else(|e| panic!("{raw:?} spliced to invalid JSON: {e}"));
+        }
+    }
+
     /// Nothing configured -> the body is forwarded as the same `Bytes`, with
     /// neither a parse nor a copy.
     #[test]
@@ -2617,6 +2735,54 @@ mod tests {
             out.as_ptr(),
             body.as_ptr(),
             "must be an Arc clone, not a copy"
+        );
+    }
+    /// A request sending an explicit `null` for a governed parameter is the
+    /// one case where the inject-set and a key PRESENT in the body overlap:
+    /// the probe reads `null` as absent (the OpenAI contract), so the value is
+    /// injected even though the key is there. The injected value therefore has
+    /// to win the engine's last-wins parse — which is why members are spliced
+    /// in before the CLOSING brace. Inserting after the opening brace would
+    /// leave the client's trailing `null` authoritative and silently defeat
+    /// the contract.
+    #[test]
+    fn spliced_value_outranks_an_explicit_null_the_client_sent() {
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
+        let raw = r#"{"model":"x","temperature":null}"#;
+        let body = Bytes::copy_from_slice(raw.as_bytes());
+        let inject = apply_sampling_overrides(&overrides, &probe_of(raw), &metrics()).unwrap();
+        assert_eq!(inject.len(), 1, "null must be treated as omitted");
+
+        let out = build_outgoing_body(&body, None, None, None, &inject).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("temperature"),
+            Some(&serde_json::json!(1.0)),
+            "the engine must read the configured value, not the client's null: {}",
+            std::str::from_utf8(&out).unwrap()
+        );
+    }
+
+    /// The splice must also fire when the ingress ALREADY parsed the body — a
+    /// chat-encoder model, the cache-aware policy or bucket routing — as long
+    /// as nothing needs overwriting. Gating on `value.is_none()` skipped
+    /// exactly those configurations, i.e. most governed fleets.
+    #[test]
+    fn splice_fires_even_when_a_parse_is_already_on_hand() {
+        let body = Bytes::from_static(br#"{ "model" : "x" }"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+
+        let out = build_outgoing_body(&body, Some(value), None, None, &inject).unwrap();
+        // Byte-identical to the no-parse case: the parse was dropped unused.
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,"temperature":1.0}"#
         );
     }
 }
