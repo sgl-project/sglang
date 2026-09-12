@@ -20,7 +20,7 @@ Usage:
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-based unit test, runs quickly on any GPU runner
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 
 import random
@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStoredWithMetadata,
     StorageMedium,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -49,6 +50,7 @@ from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
+from sglang.test.test_utils import CustomTestCase
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
@@ -367,7 +369,7 @@ class TestTreeNode(unittest.TestCase):
                 self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
-class TestRadixCache(unittest.TestCase):
+class TestRadixCache(CustomTestCase):
     """Test cases for RadixCache class."""
 
     def setUp(self):
@@ -517,8 +519,7 @@ class TestRadixCache(unittest.TestCase):
         )
         cache.req_to_token_pool = ReqToTokenPool(request_indices.clone())
         req = unittest.mock.Mock(
-            req_pool_idx=0,
-            cache_protected_len=0,
+            kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
             priority=0,
@@ -539,6 +540,52 @@ class TestRadixCache(unittest.TestCase):
         torch.testing.assert_close(
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )
+
+    def test_finished_request_splits_prompt_from_output_for_eviction(self):
+        class ReqToTokenPool:
+            def __init__(self, row):
+                self.req_to_token = row.unsqueeze(0)
+
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        prompt_ids = array("q", [1, 2, 3])
+        output_ids = array("q", [4, 5])
+        kv_indices = allocator.alloc(len(prompt_ids) + len(output_ids))
+        self.assertIsNotNone(kv_indices)
+        cache.req_to_token_pool = ReqToTokenPool(kv_indices)
+        req = unittest.mock.Mock(
+            origin_input_ids=prompt_ids,
+            output_ids=output_ids,
+            kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
+            extra_key=None,
+            cache_salt=None,
+            priority=0,
+            last_node=cache.root_node,
+        )
+
+        cache.cache_finished_req(
+            req,
+            is_insert=True,
+            kv_len_to_handle=len(prompt_ids) + len(output_ids),
+        )
+
+        (prompt_node,) = cache.root_node.children.values()
+        (output_node,) = prompt_node.children.values()
+        self.assertEqual(len(prompt_node.key), len(prompt_ids))
+        self.assertEqual(len(output_node.key), len(output_ids))
+
+        result = cache.evict(EvictParams(num_tokens=len(output_ids)))
+        self.assertEqual(result.num_tokens_evicted, len(output_ids))
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(prompt_ids + output_ids))
+        )
+        self.assertEqual(len(match.device_indices), len(prompt_ids))
 
     def test_kv_cache_events(self):
         """Test KV cache events functionality."""
@@ -748,6 +795,32 @@ class TestRadixCache(unittest.TestCase):
             for block_hash in event.block_hashes
         ]
         self.assertNotEqual(unsalted_hashes, stored[0].block_hashes)
+
+    def test_extra_key_does_not_move_published_block_hashes(self):
+        """Adding extra_key preserves event hashes and split-parent links."""
+        for cache_salt in (None, "tenant-a"):
+            published = []
+            for extra_key in (None, "lora-a"):
+                cache = RadixCache.create_simulated(
+                    page_size=2, enable_kv_cache_events=True
+                )
+                namespace = dict(extra_key=extra_key, cache_salt=cache_salt)
+                for tokens in ([1, 2, 3, 4, 5, 6], [1, 2, 7, 8]):
+                    cache.insert(
+                        InsertParams(
+                            key=RadixKey(array("q", tokens), **namespace),
+                            value=torch.tensor(tokens, dtype=torch.int64),
+                        )
+                    )
+                published.append(
+                    [
+                        (event.parent_block_hash, tuple(event.block_hashes))
+                        for event in cache.take_events()
+                        if isinstance(event, BlockStored)
+                    ]
+                )
+            self.assertEqual(published[0], published[1])
+            self.assertIsNotNone(published[1][-1][0])
 
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)

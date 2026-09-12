@@ -42,6 +42,14 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "AgainstEntropy/SANA-WM_streaming-overlay",
         "overlay_revision": "62c6840871ecc3559189047513ba0670e1bf62e7",
     },
+    "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree": {
+        "overlay_repo_id": "kevin-mi/FastH3-4step-Preview-overlay",
+        "overlay_revision": "f769cb8001dae335089de7b250364335bc7cb183",
+    },
+    "OpenVDN/vdn-minimax-h3": {
+        "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
+        "overlay_revision": "0ad315a05b914c4003af4d26152d288c2506a609",
+    },
 }
 
 
