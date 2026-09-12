@@ -1286,7 +1286,8 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
-    # Experimental; auto-falls back to eager if the backend's prep is not capturable.
+    # Capture success does not prove replay-input stability; backends opt in via
+    # supports_metadata_glue, which every backend currently leaves False.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     # Fuse the KDA verify chain (conv1d update + gated delta-rule recurrence)
     # into one kernel. Self-gated: requires the triton verify backend, topk==1,

@@ -61,6 +61,14 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+
+    # Opt-in for the metadata glue graph (see metadata_glue_graph.py). Default
+    # False because the disqualifying case -- a prep that derives values on the
+    # HOST each replay -- fails SILENTLY when captured: outputs stay correct and
+    # only accept length collapses, so no accuracy test catches it. A backend may
+    # set True once its init_forward_metadata_out_graph is known to touch host
+    # state nowhere that feeds a captured op.
+    supports_metadata_glue: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set

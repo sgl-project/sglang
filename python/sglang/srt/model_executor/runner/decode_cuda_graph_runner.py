@@ -443,6 +443,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # host every replay), and capturing one freezes the capture-time
         # plan — drafts go stale and accept length collapses to ~1.
         enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+        # MetadataGlueGraph builds torch.cuda streams/graphs directly rather
+        # than through device_module, so it must not be constructed on the
+        # NPU/XPU subclasses of this runner.
+        if enable_metadata_glue and self.device != "cuda":
+            enable_metadata_glue = False
         if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
             logger.warning(
                 "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
