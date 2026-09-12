@@ -168,6 +168,9 @@ class AttentionMask:
         1  # only pass in if we're doing PackGQA
     )
     swap_AB: cutlass.Constexpr[bool] = False
+    # R2P assumes the canonical row ownership of the QK accumulator. Kernels
+    # with a different accumulator mapping must use the direct predicate path.
+    enable_r2p_optimization: cutlass.Constexpr[bool] = True
 
     @property
     def seqlen_q(self) -> Int32:
@@ -330,7 +333,7 @@ class AttentionMask:
                 )
                 if const_expr(mask_causal):
                     r2p = const_expr(
-                        not self.swap_AB
+                        not self.swap_AB and self.enable_r2p_optimization
                     )  # R2P trick, see apply_mask_sm100
                     for r in cutlass.range(
                         cute.size(tScS_mn.shape[0]), unroll_full=True
@@ -375,7 +378,9 @@ class AttentionMask:
                         if const_expr(self.window_size_left is not None)
                         else None
                     )
-                    r2p_local = const_expr(not self.swap_AB)
+                    r2p_local = const_expr(
+                        not self.swap_AB and self.enable_r2p_optimization
+                    )
                     for r in cutlass.range(
                         cute.size(tScS_mn.shape[0]), unroll_full=True
                     ):

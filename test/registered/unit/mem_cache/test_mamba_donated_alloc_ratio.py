@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     EvictParams,
     IncLockRefResult,
 )
@@ -25,7 +26,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 N = 4  # concurrent distinct-prefix requests
 
@@ -55,10 +56,10 @@ class _RatioCache:
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.prefix_nodes = []
+        self.alloc_evict_params = []
 
-    def evict(self, params: EvictParams):
-        # Reclaim up to mamba_num evictable (unlocked) prefix snapshots, mirroring
-        # what the real tree eviction can hand back under mamba pressure.
+    def evict_for_alloc(self, params: EvictParams):
+        self.alloc_evict_params.append(params)
         need = params.mamba_num
         for node in list(self.prefix_nodes):
             if need <= 0:
@@ -110,27 +111,31 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-        server_args = SimpleNamespace(
-            disable_radix_cache=False,
-            disable_overlap_schedule=disable_overlap,
-            enable_mamba_extra_buffer=lambda: extra_buffer,
-            enable_mamba_extra_buffer_lazy=lambda: lazy,
+        fake = SimpleNamespace(server_args=SimpleNamespace())
+        # Every input is a published leaf now: the extra-buffer predicates read
+        # the radix-cache strategy off the bags, so the fixture publishes the
+        # strategy that produces the combination under test.
+        strategy = (
+            "extra_buffer_lazy"
+            if lazy
+            else "extra_buffer"
+            if extra_buffer
+            else "no_buffer"
         )
-        fake = SimpleNamespace(server_args=server_args)
-        # The bag reads (disable_radix_cache / disable_overlap_schedule) come
-        # from the published context; the derived-method calls stay on the
-        # injected stand-in.
         from sglang.srt import runtime_context as rc
 
         with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip):
             with rc.get_context().override_server_args(
                 disable_radix_cache=False,
                 disable_overlap_schedule=disable_overlap,
+                mamba_radix_cache_strategy=strategy,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
     def test_flag_off_restores_original_ratios(self):
-        r = lambda **kw: self._ratio(skip=False, **kw)
+        def r(**kwargs):
+            return self._ratio(skip=False, **kwargs)
+
         self.assertEqual(
             r(extra_buffer=False, lazy=False, disable_overlap=True), 3
         )  # no_buffer
@@ -142,7 +147,9 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         )  # overlap
 
     def test_flag_on_drops_base_but_keeps_no_buffer(self):
-        r = lambda **kw: self._ratio(skip=True, **kw)
+        def r(**kwargs):
+            return self._ratio(skip=True, **kwargs)
+
         self.assertEqual(
             r(extra_buffer=False, lazy=False, disable_overlap=True), 3
         )  # no_buffer
@@ -176,12 +183,12 @@ class _RecordingComp:
 
 class TestDecSwaLockSkip(unittest.TestCase):
     """dec_swa_lock_only early-releases SWA plus co-located lower-tier (Mamba)
-    locks. On a full-only-locked node (decode skip) it must thread the skip set
-    into that lower-tier release, else it drops a mamba lock it never took --
-    another request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the
-    contract without booting a 3-component model."""
+    locks. On a node whose acquire skipped Mamba (decode hold), the release
+    must skip it too, else it drops a mamba lock it never took -- another
+    request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the contract
+    without booting a 3-component model."""
 
-    def test_threads_skip_ids_into_lower_tier_release(self):
+    def _run(self, skipped_lock_components):
         # internal-node priority: full=2 > swa=1 > mamba=0
         full = _RecordingComp(ComponentType.FULL, 2)
         swa = _RecordingComp(ComponentType.SWA, 1)
@@ -191,30 +198,37 @@ class TestDecSwaLockSkip(unittest.TestCase):
             components=(full, swa, mamba),
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
+            _assert_receipt_anchor=UnifiedTreeCore._assert_receipt_anchor,
         )
-
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,
             node.id,
-            swa_uuid_for_lock=None,
-            skip_lock_node_ids={ComponentType.MAMBA: {7}},
+            DecLockRefParams(skipped_lock_components=skipped_lock_components),
         )
+        return full, mamba
 
-        # mamba (below swa) is released, honoring the skip set
-        self.assertEqual(len(mamba.released), 1)
-        self.assertEqual(
-            mamba.released[0].skip_lock_node_ids.get(ComponentType.MAMBA), {7}
-        )
+    def test_unlocked_mamba_is_not_released(self):
+        full, mamba = self._run(skipped_lock_components=(ComponentType.MAMBA,))
+        # mamba took no lock at acquire, so the early release skips it too
+        self.assertEqual(mamba.released, [])
         # full (above swa) is never touched
+        self.assertEqual(full.released, [])
+
+    def test_lower_tier_released_when_locked(self):
+        full, mamba = self._run(skipped_lock_components=())
+        self.assertEqual(len(mamba.released), 1)
         self.assertEqual(full.released, [])
 
 
 class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.
-        component, _, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
+        component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
         with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
             component._alloc_mamba_slot()
+        self.assertEqual(
+            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+        )
 
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
@@ -230,6 +244,9 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         slot = component._alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
+        self.assertEqual(
+            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+        )
 
 
 class TestPPMambaPoolSizing(unittest.TestCase):

@@ -306,9 +306,9 @@ def softmax_temp(
 ) -> torch.Tensor:
     num_rows = logits.shape[0]
     bs = num_rows // rows_per_request
-    assert (
-        bs * rows_per_request == num_rows
-    ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    assert bs * rows_per_request == num_rows, (
+        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    )
     temp_per_row = torch.repeat_interleave(
         temperatures.reshape(bs).to(torch.float32), rows_per_request, dim=0
     )
@@ -366,9 +366,9 @@ def softmax_temp_triton(
 ) -> torch.Tensor:
     num_rows, vocab = logits.shape[0], logits.shape[-1]
     bs = num_rows // rows_per_request
-    assert (
-        bs * rows_per_request == num_rows
-    ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    assert bs * rows_per_request == num_rows, (
+        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    )
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
     BLOCK_V = 4096
@@ -397,9 +397,9 @@ def softmax_temp_flashinfer(
         )
     num_rows, vocab = logits.shape[0], logits.shape[-1]
     bs = num_rows // rows_per_request
-    assert (
-        bs * rows_per_request == num_rows
-    ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    assert bs * rows_per_request == num_rows, (
+        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    )
     temp_per_row = torch.repeat_interleave(
         temperatures.reshape(bs).to(torch.float32), rows_per_request, dim=0
     ).contiguous()

@@ -9,7 +9,7 @@ from sglang.test.ascend.test_mmlu import TestMMLU
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=200, suite="full-16-npu-a3", nightly=True)
 
 
 class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
@@ -58,7 +58,7 @@ class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "--enable-dp-lm-head",
         "--mem-fraction-static",
         0.7,
-        "--cuda-graph-bs",
+        "--cuda-graph-bs-decode",
         16,
         20,
         24,
@@ -66,6 +66,7 @@ class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     env = {
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+        "DEEPEP_HYBRID_DEPLOYMENT": "1",
         "HCCL_BUFFSIZE": "2100",
         "HCCL_OP_EXPANSION_MODE": "AIV",
         "TRANSFORMERS_VERBOSITY": "error",

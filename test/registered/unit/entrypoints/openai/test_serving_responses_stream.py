@@ -11,10 +11,12 @@ from utils import (
 )
 
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class NonHarmonyStreamTestCase(CustomTestCase):
@@ -31,6 +33,37 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             fixture.run([engine_chunk("done", 1, finish=True)])
 
         self.assertTrue(parser_cls.call_args.kwargs["force_reasoning"])
+
+    def test_k2_nested_effort_selects_streaming_reasoning_delimiter(self):
+        serving = make_serving()
+        serving.reasoning_parser = "k2_horizon"
+        serving.tool_call_parser = None
+        request = ResponsesRequest(
+            model="IFM/K2-Horizon-7B",
+            input="hi",
+            reasoning={"effort": "medium"},
+            stream=True,
+            store=False,
+        )
+
+        events = StreamFixture(serving, request, require_reasoning=True).run(
+            [engine_chunk("work</ifm|think_fast>\nanswer", 4, finish=True)]
+        )
+        types = event_types(events)
+        payloads = event_payloads(events)
+        reasoning = "".join(
+            payload["delta"]
+            for event_type, payload in zip(types, payloads)
+            if event_type == "response.reasoning_text.delta"
+        )
+        answer = "".join(
+            payload["delta"]
+            for event_type, payload in zip(types, payloads)
+            if event_type == "response.output_text.delta"
+        )
+
+        self.assertEqual(reasoning, "work")
+        self.assertEqual(answer, "\nanswer")
 
     def test_emits_typed_sse_events_in_order(self):
         serving = make_serving()
@@ -167,6 +200,7 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             parser_cls.return_value.parse_stream_chunk.side_effect = (
                 fake_parse_stream_chunk
             )
+            parser_cls.return_value.parse_stream_end.return_value = ("", [])
             fixture = StreamFixture(serving, request)
             events = fixture.run(chunks)
 
@@ -178,12 +212,45 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         self.assertEqual(output[1]["name"], "get_weather")
         self.assertEqual(output[2]["content"][0]["text"], "It's sunny.")
 
+    def test_reasoning_parser_flushed_at_stream_end(self):
+        """Bug regression: the stream loop never drained text the reasoning
+        parser held back as a possible marker prefix, so a response whose text
+        genuinely ends with e.g. "<|e" lost that tail on /v1/responses (chat
+        flushes via parse_stream_end; responses did not)."""
+        serving = make_serving()
+        serving.reasoning_parser = "muse"
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        text = (
+            " to=self<|message|>think<|eom|>"
+            "<|start|>assistant to=user<|message|>Answer<|e"
+        )
+        fixture = StreamFixture(serving, request)
+        events = fixture.run(
+            [
+                engine_chunk(text[:30], 4),
+                engine_chunk(text, 9, finish=True),
+            ]
+        )
+
+        streamed = "".join(
+            p["delta"]
+            for ev, p in zip(event_types(events), event_payloads(events))
+            if ev == "response.output_text.delta"
+        )
+        self.assertEqual(streamed, "Answer<|e")
+
 
 class MultiToolCallStreamingOrderTestCase(CustomTestCase):
     """The wire order of message / function_call items across tool-call deltas."""
 
     def setUp(self):
         from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
         self.serving = make_serving()
         self.serving.tool_call_parser = "qwen3_coder"

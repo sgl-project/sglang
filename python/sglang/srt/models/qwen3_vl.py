@@ -72,6 +72,12 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_KEY,
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
+    RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
+    CudaIpcTensorTransportProxy,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
@@ -102,8 +108,26 @@ _is_cpu = is_cpu()
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
-class Qwen3_VisionMLP(nn.Module):
+def _resolve_vision_tp(
+    *,
+    use_data_parallel: bool,
+    tp_size: Optional[int],
+    tp_rank: Optional[int],
+) -> tuple[int, int]:
+    if use_data_parallel:
+        if tp_size is not None or tp_rank is not None:
+            raise ValueError("Explicit vision TP cannot be combined with data parallel")
+        return 1, 0
+    if (tp_size is None) != (tp_rank is None):
+        raise ValueError("Vision tp_size and tp_rank must be set together")
+    if tp_size is None:
+        parallel = get_parallel()
+        return parallel.attn_tp_size, parallel.attn_tp_rank
+    assert tp_rank is not None
+    return tp_size, tp_rank
 
+
+class Qwen3_VisionMLP(nn.Module):
     def __init__(
         self,
         in_features: int,
@@ -113,10 +137,15 @@ class Qwen3_VisionMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        tp_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        self.tp_size, self.tp_rank = _resolve_vision_tp(
+            use_data_parallel=use_data_parallel,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
@@ -145,7 +174,7 @@ class Qwen3_VisionMLP(nn.Module):
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, disable_linear: bool = False) -> None:
         super().__init__()
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
@@ -159,6 +188,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             kernel_size=kernel_size,
             stride=kernel_size,
             bias=True,
+            disable_linear=disable_linear,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -177,7 +207,6 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
 
 class Qwen3_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -253,7 +282,6 @@ class Qwen3_VisionBlock(nn.Module):
 
 
 class Qwen3VLMoeVisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -265,6 +293,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        tp_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -277,8 +307,11 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        self.tp_size, self.tp_rank = _resolve_vision_tp(
+            use_data_parallel=use_data_parallel,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
             self.padded_context_dim,
@@ -313,7 +346,6 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
 
 
 class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
-
     def __init__(
         self,
         vision_config: Qwen3VLVisionConfig,
@@ -1003,6 +1035,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
 
+        attention_layout_key = (tuple(cu_seqlens.tolist()), None)
         cu_seqlens = cu_seqlens.to("cpu")
         return self.graph_runners.run(
             x=x,
@@ -1010,6 +1043,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             cu_seqlens=cu_seqlens,
             output_indices=None,
+            attention_layout_key=attention_layout_key,
         )
 
     def forward_with_cuda_graph(
@@ -1023,6 +1057,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_cos,
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
+        attention_layout_key = (tuple(cu_seqlens.tolist()), None)
         if not isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
         else:
@@ -1037,6 +1072,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=None,
             output_indices=None,
+            attention_layout_key=attention_layout_key,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1066,7 +1102,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             loaded_params.add(name)
         return loaded_params
 
-    def _prepare_graph_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor) -> tuple[
+    def _prepare_graph_inputs(
+        self, x: torch.Tensor, grid_thw: torch.Tensor
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1104,7 +1142,6 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen3LLMModel(Qwen3Model):
-
     def __init__(
         self,
         *,
@@ -1116,11 +1153,18 @@ class Qwen3LLMModel(Qwen3Model):
         if not self.pp_group.is_first_rank:
             assert self.start_layer >= len(
                 config.vision_config.deepstack_visual_indexes
-            ), "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
+            ), (
+                "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
+            )
 
         self.hidden_size = config.hidden_size
         self.deepstack_embed_to_decoder_layer = range(
             len(config.vision_config.deepstack_visual_indexes)
+        )
+        # Use HF deepstack order only if rl_on_policy_target is set;
+        # otherwise, retain original order for inference accuracy.
+        self.use_hf_deepstack_order = (
+            get_exec().deterministic.rl_on_policy_target is not None
         )
 
     def get_deepstack_embeds(
@@ -1166,25 +1210,43 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
-            # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
-            # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
-            # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
-            # The order matters because addition with different tensors is not associative in practice.
-            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
-            deepstack_embeds = self.get_deepstack_embeds(
-                layer_idx - 1, input_deepstack_embeds
-            )
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-                post_residual_addition=deepstack_embeds,
-            )
+            if self.use_hf_deepstack_order:
+                # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
+                # next layer, so to match HF's (hidden_states + residual) + deepstack, deepstack for
+                # the previous layer is added after residual via post_residual_addition.
+                deepstack_embeds = self.get_deepstack_embeds(
+                    layer_idx - 1, input_deepstack_embeds
+                )
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    post_residual_addition=deepstack_embeds,
+                )
+            else:
+                # Inference path: add deepstack directly to hidden_states at the end of the layer
+                # (original, grounding-correct order).
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
+                if (
+                    input_deepstack_embeds is not None
+                    and layer_idx in self.deepstack_embed_to_decoder_layer
+                ):
+                    sep = self.hidden_size * layer_idx
+                    hidden_states.add_(
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    )
 
-        # Handle deepstack for the last processed layer if it exists.
-        last_deepstack = self.get_deepstack_embeds(
-            self.end_layer - 1, input_deepstack_embeds
+        # Handle deepstack for the last processed layer (HF-order path only).
+        last_deepstack = (
+            self.get_deepstack_embeds(self.end_layer - 1, input_deepstack_embeds)
+            if self.use_hf_deepstack_order
+            else None
         )
 
         if not self.pp_group.is_last_rank:
@@ -1240,15 +1302,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        self.language_model_only = getattr(config, "language_model_only", False)
+        if self.language_model_only:
+            self.visual = None
+        else:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=None,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1291,7 +1357,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = (
+            not self.language_model_only and "mrope_section" in self.config.rope_scaling
+        )
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -1300,17 +1368,30 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        if not self.language_model_only:
+            self.deepstack_visual_indexes = (
+                config.vision_config.deepstack_visual_indexes
+            )
+            self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+            # Only enable deepstack when the checkpoint declares deepstack
+            # capture layers (Qwen4-Exp ships an empty list).
+            self.use_deepstack = (
+                {Modality.IMAGE: True, Modality.VIDEO: True}
+                if self.num_deepstack_embeddings > 0
+                else {}
+            )
+        else:
+            self.deepstack_visual_indexes = []
+            self.num_deepstack_embeddings = 0
+            self.use_deepstack = {}
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
     def separate_deepstack_embeds(self, embedding):
-        assert (
-            embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
-        ), f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
+        assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
+            f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
+        )
 
         separate_index = self.config.hidden_size
         input_embeds = embedding[:, :separate_index]
@@ -1331,45 +1412,169 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return int(getattr(cfg, "num_hidden_layers", 0))
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        if mm_inputs and mm_inputs.mm_items:
+            _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = materialize_multimodal_features(
-            [item.feature for item in items],
-            device=self.visual.device,
-            dtype=self.visual.dtype,
-        )
+        _require_vision(self)
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        return self._get_visual_feature(items, image_grid_thw)
 
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        _require_vision(self)
+        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+        return self._get_visual_feature(items, video_grid_thw)
+
+    def _get_visual_feature(
+        self, items: List[MultimodalDataItem], grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        assert grid_thw.dim() == 2, grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
                 self.visual,
-                pixel_values,
-                image_grid_thw.tolist(),
+                None,
+                grid_thw.tolist(),
                 rope_type="rope_3d",
+                load_local_pixel_values=partial(self._materialize_visual_items, items),
+                pixel_values_device=self.visual.device,
+                pixel_values_dtype=self.visual.dtype,
             )
-        else:
-            return self.visual(pixel_values, grid_thw=image_grid_thw)
-
-    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = materialize_multimodal_features(
-            [item.feature for item in items],
-            device=self.visual.device,
-            dtype=self.visual.dtype,
+        pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
+            items, range(len(items)), preserve_for_reprefill=True
         )
-        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+        visual_features = self.visual(pixel_values, grid_thw=grid_thw)
+        if borrowed_items:
+            self._offload_packed_visual_inputs(
+                pixel_values, borrowed_items, packed_ready
             )
-        else:
-            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
-        return video_embeds
+        return visual_features
+
+    def _materialize_visual_items(
+        self,
+        items: List[MultimodalDataItem],
+        indices: Iterable[int],
+        preserve_for_reprefill: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
+        device = self.visual.device
+        device_index = device.index
+        if device.type == "cuda" and device_index is None:
+            device_index = torch.cuda.current_device()
+        if device.type == "cuda":
+            parallel = get_parallel()
+            consumer_count = max(parallel.tp_size, 1)
+
+        features = []
+        borrowed_items = []
+        feature_offset = 0
+        for index in indices:
+            item = items[index]
+            if device.type == "cuda":
+                proxy = item.feature
+                model_specific_data = getattr(item, "model_specific_data", {})
+                pending_copy = model_specific_data.pop(
+                    CUDA_IPC_FEATURE_COPY_EVENT_KEY, None
+                )
+                if pending_copy is not None:
+                    torch.cuda.current_stream(device_index).wait_event(pending_copy)
+                borrow_requested = model_specific_data.pop(
+                    BORROW_CUDA_IPC_FEATURE_KEY, False
+                )
+                can_borrow = (
+                    preserve_for_reprefill
+                    and consumer_count == 1
+                    and isinstance(proxy, CudaIpcTensorTransportProxy)
+                    and borrow_requested
+                )
+                borrowed = (
+                    proxy.borrow_on_target_device(device_index) if can_borrow else None
+                )
+                if borrowed is not None:
+                    item.feature = borrowed
+                    model_specific_data[RETAINED_CUDA_IPC_FEATURE_PROXY_KEY] = proxy
+                    borrowed_items.append(
+                        (item, proxy, feature_offset, borrowed.shape[0])
+                    )
+                elif RETAINED_CUDA_IPC_FEATURE_PROXY_KEY not in model_specific_data:
+                    item.reconstruct(device_index, ipc_consumer_count=consumer_count)
+            features.append(item.feature)
+            feature_offset += item.feature.shape[0]
+        try:
+            materialized = materialize_multimodal_features(
+                features, device=device, dtype=self.visual.dtype
+            )
+        except Exception:
+            for item, proxy, _, _ in borrowed_items:
+                try:
+                    proxy.release_borrowed_on_current_stream()
+                    item.model_specific_data.pop(
+                        RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to release a borrowed CUDA IPC feature after "
+                        "materialization failed",
+                        exc_info=True,
+                    )
+                item.feature = None
+            raise
+        packed_ready = None
+        if borrowed_items:
+            source_stream = torch.cuda.current_stream(device_index)
+            packed_ready = torch.cuda.Event()
+            packed_ready.record(source_stream)
+            for item, proxy, offset, length in borrowed_items:
+                item.feature = materialized.narrow(0, offset, length)
+                item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = packed_ready
+                try:
+                    proxy.release_borrowed_on_current_stream()
+                    item.model_specific_data.pop(
+                        RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to release a copied CUDA IPC feature; retaining "
+                        "its lease until request cleanup",
+                        exc_info=True,
+                    )
+        if preserve_for_reprefill:
+            return materialized, borrowed_items, packed_ready
+        return materialized
+
+    def _offload_packed_visual_inputs(
+        self, materialized: torch.Tensor, borrowed_items: list, packed_ready
+    ) -> None:
+        """Preserve inputs for re-prefill without delaying the ViT launch."""
+        try:
+            host_features = torch.empty(
+                materialized.shape,
+                dtype=materialized.dtype,
+                device="cpu",
+                pin_memory=torch.cuda.is_available(),
+            )
+            copy_stream = getattr(self, "_mm_feature_copy_stream", None)
+            if copy_stream is None:
+                copy_stream = torch.cuda.Stream(device=self.visual.device)
+                self._mm_feature_copy_stream = copy_stream
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(packed_ready)
+                host_features.copy_(materialized, non_blocking=True)
+                host_ready = torch.cuda.Event()
+                host_ready.record(copy_stream)
+            if materialized.is_cuda:
+                materialized.record_stream(copy_stream)
+            for item, _, offset, length in borrowed_items:
+                item.feature = host_features.narrow(0, offset, length)
+                item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = host_ready
+        except Exception:
+            # The generic multimodal path will offload the owned CUDA slices.
+            logger.warning(
+                "Failed to preserve CUDA IPC features on the copy stream; "
+                "falling back to the generic offload path",
+                exc_info=True,
+            )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1405,25 +1610,32 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
-
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        if self.language_model_only:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                positions=positions,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        else:
+            if not (
+                forward_batch.forward_mode.is_decode()
+                or not forward_batch.contains_image_inputs()
+            ):
+                if self.is_mrope_enabled:
+                    assert positions.ndim == 2 and positions.size(0) == 3, (
+                        "multimodal section rotary embedding requires "
+                        f"(3, seq_len) positions, but got {positions.size()}"
+                    )
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                use_deepstack=self.use_deepstack,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -1507,10 +1719,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip loading visual/language model weights
-                if (
-                    self.config.encoder_only or self.config.language_only
-                ) and name not in params_dict:
+                # Skip unexpected stacked names (e.g. ModelOpt quantizer buffers
+                # that were remapped gate_proj -> gate_up_proj but are not params).
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -1553,6 +1764,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+
+def _require_vision(model) -> None:
+    if (
+        getattr(model, "language_model_only", False)
+        and getattr(model, "visual", None) is None
+    ):
+        raise RuntimeError(
+            "Checkpoint is marked language_model_only=True and was loaded "
+            "without a vision encoder; multimodal inputs are not supported."
+        )
 
 
 EntryClass = Qwen3VLForConditionalGeneration

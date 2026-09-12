@@ -208,7 +208,6 @@ class Session:
         eos_token_ids=None,
     ):
         assert req.session_params is not None
-        self.last_active_time = time.monotonic()
         session_params = req.session_params
 
         last_req_node = None
@@ -312,6 +311,7 @@ class Session:
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )
@@ -324,9 +324,11 @@ class Session:
         if abort:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
+            self.last_active_time = time.monotonic()
             # req_nodes is NOT updated here — finish_req() handles it.
             self._inflight = True
         else:
+            self.last_active_time = time.monotonic()
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
 

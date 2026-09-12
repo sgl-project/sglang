@@ -7,7 +7,7 @@ from sglang.test.ascend.test_mmlu import TestMMLU
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-16-npu-a3", nightly=True)
 
 
 class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
@@ -50,6 +50,7 @@ class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "STREAMS_PER_DEVICE": "32",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
+        "DEEPEP_HYBRID_DEPLOYMENT": "1",
         "HCCL_BUFFSIZE": "1600",
         "HCCL_OP_EXPANSION_MODE": "AIV",
         "SGLANG_NPU_USE_MLAPO": "0",

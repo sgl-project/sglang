@@ -104,7 +104,7 @@ export const config = {
     // in _deployment.jsx + the per-cell/defaultAccuracy keys.
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
@@ -141,12 +141,14 @@ sgl-eval run gsm8k \\
     ],
   },
 
-  // Image for `docker run` framing, keyed by `hw` (or `hw|quant`, resolved first, when one
-  // quant on a shared GPU needs its own image — e.g. an FP4 dev build while FP8/BF16 use the
-  // release tag). ASK the user which sglang build the recipes ran on; don't guess a supporting
-  // release. Default below is :dev (nightly) — replace the tag with the user's release if they
-  // give one. NVIDIA share one image; AMD uses ROCm tags. GB200/GB300/B300 may need a
-  // `-cu130` (CUDA 13) tag — confirm per release.
+  // Image for `docker run` framing, keyed by `hw` (or, resolved before it: `hw|variant|quant`,
+  // `variant|quant`, `hw|quant|strategy`, `hw|quant` — use a more specific key only when a
+  // variant/quant/strategy subset needs its own build, e.g. an FP4 dev build while FP8/BF16 use
+  // the release tag, or a preview image for a not-yet-released variant). ASK the user which
+  // sglang build the recipes ran on; don't guess a supporting release. Default below is :dev
+  // (nightly) — replace the tag with the user's release if they give one. NVIDIA share one
+  // image; AMD uses ROCm tags. GB200/GB300/B300 may need a `-cu130` (CUDA 13) tag — confirm
+  // per release.
   dockerImages: {
     h100:  "lmsysorg/sglang:dev",
     h200:  "lmsysorg/sglang:dev",
@@ -211,7 +213,7 @@ sgl-eval run gsm8k \\
         ],
       },
       // MegaMoE quantization sub-select — shown only when backend === "megamoe".
-      // W4A4 adds the FP4-activations env vars; both strip the DeepEP dispatch env.
+      // W4A4 adds the FP4-activations server flag; both strip the DeepEP dispatch env.
       // DELETE this block if there's no MegaMoE backend option above.
       megamoeQuant: {
         stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
@@ -219,11 +221,8 @@ sgl-eval run gsm8k \\
           { id: "w4a8", label: "W4A8",
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
           { id: "w4a4", label: "W4A4",
-            env: [
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
-            ] },
+            flags: ["--enable-w4a4-mxfp4-megamoe"],
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
         ],
       },
       ep: { label: "EP", values: [
@@ -277,14 +276,18 @@ sgl-eval run gsm8k \\
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
       // Router fronting prefill + decode; substitute <prefill-host>/<decode-host>.
+      // ALWAYS use {{PREFILL_PORT}} / {{DECODE_PORT}} / {{ROUTER_PORT}} — the
+      // engine fills them from its own PD_PORTS (prefill serves on 30000, decode
+      // on 30100). A literal port here will not track the engine and sends the
+      // router at a port the generated decode command does not listen on.
       router: {
         port: 8000,
         command:
 `python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
-  --prefill http://<prefill-host>:30000 \\
-  --decode http://<decode-host>:30001 \\
-  --host 0.0.0.0 --port 8000 \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`,
       },
@@ -331,6 +334,9 @@ sgl-eval run gsm8k \\
     // ==== NVIDIA Blackwell + FP4 (single node) ====
     {
       match: { hw: "b200", variant: "default", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      // For a cell whose verification round is open, use `verificationStatus`
+      // instead ("verified" | "in-progress" | "unverified", or a function of
+      // the selection for a per-pick state) — authoring-reference §2.2.
       verified: true, // EXAMPLE — set false / replace with your verified recipe
       env: [],
       flags: [

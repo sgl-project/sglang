@@ -35,12 +35,14 @@ from .mrope import (
 )
 from .utils import (
     _apply_rotary_emb,
+    _apply_rotary_emb_complex,
     apply_flashinfer_rope_qk_inplace,
 )
 
 __all__ = [
     # _utils
     "_apply_rotary_emb",
+    "_apply_rotary_emb_complex",
     "apply_flashinfer_rope_qk_inplace",
     # _base
     "RotaryEmbedding",

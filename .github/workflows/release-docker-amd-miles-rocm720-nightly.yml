@@ -55,3 +55,6 @@ jobs:
 
       - name: Push dated tag
         run: docker push rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+
+      - name: Push the undated tag
+        run: docker push rocm/sgl-dev:miles-${{ matrix.variant }}

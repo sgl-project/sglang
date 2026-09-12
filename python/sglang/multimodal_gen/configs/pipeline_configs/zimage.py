@@ -82,7 +82,10 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     F_PATCH_SIZE: int = 1
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=40)
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=30,
+            fsdp_auto_min_available_memory_gb=40,
+        )
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)

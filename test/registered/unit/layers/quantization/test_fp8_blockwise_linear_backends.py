@@ -24,9 +24,9 @@ from sglang.test.layer_ut_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 FP8_MAX = 448.0
 
@@ -66,8 +66,13 @@ def _fp8_block_backends():
 
 def _mxfp8_backends():
     # MXFP8 linear is validated on SM100/103 only.
-    if 100 <= get_device_sm() < 110:
-        return ["triton", "flashinfer_trtllm", "flashinfer_cutlass"]
+    if get_device_sm() in (100, 103):
+        return [
+            "auto",
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_cutedsl",
+        ]
     return []
 
 
@@ -188,14 +193,49 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
     def _run(self, backend: str):
         self._check_backend(backend, _mxfp8_backends(), MXFP8_SHAPES, self._build_layer)
 
-    def test_triton(self):
-        self._run("triton")
-
     def test_flashinfer_trtllm(self):
         self._run("flashinfer_trtllm")
 
     def test_flashinfer_cutlass(self):
         self._run("flashinfer_cutlass")
+
+    def test_flashinfer_cutedsl(self):
+        self._run("flashinfer_cutedsl")
+
+    def test_auto(self):
+        if "auto" not in _mxfp8_backends():
+            self.skipTest(f"auto not in SM{get_device_sm()} MXFP8 backend set")
+        with mock.patch.object(
+            fp8_utils,
+            "FP8_GEMM_RUNNER_BACKEND",
+            Fp8GemmRunnerBackend.AUTO,
+        ):
+            self.assertEqual(
+                fp8_utils.resolve_mxfp8_dense_gemm_backend(),
+                fp8_utils.Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL,
+            )
+        self._run("auto")
+
+    @unittest.skipUnless(get_device_sm() >= 100, "Requires Blackwell FlashInfer")
+    def test_auto_falls_back_when_cutedsl_is_unsupported(self):
+        with (
+            mock.patch.object(
+                fp8_utils,
+                "FP8_GEMM_RUNNER_BACKEND",
+                Fp8GemmRunnerBackend.AUTO,
+            ),
+            mock.patch.object(fp8_utils, "get_device_sm", return_value=107),
+            mock.patch.object(
+                fp8_utils._raw_flashinfer_mm_mxfp8,
+                "is_backend_supported",
+                return_value=False,
+            ) as is_backend_supported,
+        ):
+            self.assertEqual(
+                fp8_utils.resolve_mxfp8_dense_gemm_backend(),
+                fp8_utils.Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS,
+            )
+            is_backend_supported.assert_called_once_with("cute-dsl", 107)
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")

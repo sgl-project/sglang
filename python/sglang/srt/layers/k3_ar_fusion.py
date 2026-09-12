@@ -25,6 +25,7 @@ import torch
 import sglang.srt.runtime_context as ctx
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -67,23 +68,23 @@ def _get_state() -> Optional[_State]:
 
         if get_device_sm() not in (100, 103):
             return None
-        server_args = ctx.get_server_args()
-        if server_args.enable_symm_mem or server_args.moe_a2a_backend != "none":
+        symm_mem = ctx.get_exec().comm.enable_symm_mem
+        a2a_backend = ctx.get_exec().moe.moe_a2a_backend
+        if symm_mem or a2a_backend != "none":
             logger.info(
                 "K3 all-reduce fusion auto-probe: skipping "
                 "(enable_symm_mem=%s, moe_a2a_backend=%s; under symm-mem the "
                 "allocator contexts conflict, and under EP a2a the model's "
                 "symm-pool allocation contract does not hold on every AR "
                 "call-site. Set SGLANG_K3_AR_FUSION=1 to force.)",
-                server_args.enable_symm_mem,
-                server_args.moe_a2a_backend,
+                symm_mem,
+                a2a_backend,
             )
             return None
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
     from sglang.srt.distributed.parallel_state import get_tp_group
-    from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().tp_size <= 1:
         return None
@@ -92,7 +93,7 @@ def _get_state() -> Optional[_State]:
     if (
         not isinstance(comm, CustomAllReduceV2)
         or comm.disabled
-        or comm.mc_base_ptr == 0
+        or not comm.has_multicast
     ):
         if explicit:
             logger.warning(
@@ -107,7 +108,7 @@ def _get_state() -> Optional[_State]:
         return None
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
-    mod.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
+    mod.register_comm(comm.obj)
     logger.info("K3 all-reduce fusion enabled (world_size=%d)", comm.world_size)
     return _State(comm, comm.world_size, group.cpu_group.group_name)
 
@@ -131,11 +132,11 @@ _BUFS: List[_Buffer] = []
 @cache_once
 def _max_buffer_rows() -> int:
     """Rows to reserve per buffer: the largest batch the server args allow."""
-    server_args = ctx.get_server_args()
-    chunked = server_args.chunked_prefill_size
+    schedule = ctx.get_schedule()
+    chunked = schedule.chunked_prefill_size
     if chunked is not None and chunked > 0:
         return int(chunked)
-    return int(server_args.max_prefill_tokens or 0)
+    return int(schedule.max_prefill_tokens or 0)
 
 
 def _create_buffer(
@@ -237,9 +238,7 @@ def all_reduce(
         return x if residual is None else x + residual
     nbytes = x.numel() * 2
     if nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size):
-        return mod.all_reduce_push_res(
-            state.world_size, x, residual, ws_mc_base=state.comm.mc_base_ptr
-        )
+        return mod.all_reduce_push_res(state.world_size, x, residual)
     return mod.all_reduce_pull_res(
         state.world_size, x, residual, input_mc_ptr=get_mc_ptr(x)
     )
@@ -296,7 +295,6 @@ def all_reduce_norm(
             weight,
             eps,
             num_norm_rows=num_tokens,
-            ws_mc_base=state.comm.mc_base_ptr,
         )
     return mod.all_reduce_pull_norm(
         state.world_size,
@@ -356,7 +354,6 @@ def gemm_ag_up_proj(
         b,
         c,
         torch.empty_like(b),
-        ws_mc_base=state.comm.mc_base_ptr,
     )
 
 
@@ -382,5 +379,4 @@ def finalize_all_reduce_push_norm(
         expert_weights,
         weight,
         eps,
-        ws_mc_base=state.comm.mc_base_ptr,
     )

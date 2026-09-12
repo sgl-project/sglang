@@ -36,10 +36,7 @@ logger = init_logger(__name__)
 
 
 # ==================================SLA Functions===================================
-from sglang.kernels.ops.diffusion.sparse_linear_attn_kernels import (
-    _attn_fwd,
-    get_block_map,
-)
+from sglang.kernels.ops.diffusion import _attn_fwd, get_block_map
 
 
 def _get_cuda_arch(device_index: int) -> str:
@@ -359,9 +356,9 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
     ) -> None:
         nn.Module.__init__(self)
 
-        assert (
-            SAGESLA_ENABLED
-        ), "Install spas_sage_attn(pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation) first to enable SageSLA."
+        assert SAGESLA_ENABLED, (
+            "Install spas_sage_attn(pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation) first to enable SageSLA."
+        )
 
         self.num_heads = num_heads
         self.head_size = head_size
@@ -457,7 +454,9 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
         assert headdim in [
             64,
             128,
-        ], "headdim should be in [64, 128]. For other headdim, you can use padding and specify the softmax scale."
+        ], (
+            "headdim should be in [64, 128]. For other headdim, you can use padding and specify the softmax scale."
+        )
 
         # Quantize Q, K to INT8
         q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q, k, km, BLKQ, BLKK)

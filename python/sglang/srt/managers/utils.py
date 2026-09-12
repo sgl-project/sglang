@@ -11,17 +11,21 @@ import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+)
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,12 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Padded row width in flattened speculative output. Existing algorithms
+    # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
+    speculative_output_stride: Optional[int] = None
+    # Valid output tokens that are not accepted draft proposals. Existing
+    # algorithms have one bonus token; UNO also emits its clean root.
+    num_non_draft_tokens_per_req: int = 1
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
@@ -90,7 +100,7 @@ class GenerationBatchResult:
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    next_draft_input: Optional[SpecInput] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -108,11 +118,16 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+
     @property
     def has_sampled_token_ids(self) -> bool:
         """True when this iter sampled token ids; False when none were produced
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
+
+    def get_num_generated_tokens(self, batch_size: int) -> int:
+        return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
@@ -162,7 +177,13 @@ class GenerationBatchResult:
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
         # all device->host copying and lifetime safety lives in one place.
+        sampling_mask_output = (
+            self.logits_output.sampling_mask_output
+            if self.logits_output is not None
+            else None
+        )
         for holder in (
+            sampling_mask_output,
             self.routed_experts_output,
             self.indexer_topk_output,
             self.expert_distribution_metrics,
@@ -170,7 +191,17 @@ class GenerationBatchResult:
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
 
+        self.copy_auxiliary_output_to_cpu()
+
         self.copy_done.record()
+
+    def copy_auxiliary_output_to_cpu(self) -> None:
+        if self.logits_output is None or self.auxiliary_host_output is not None:
+            return
+        device_output = self.logits_output.auxiliary_device_output
+        if device_output is not None:
+            self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
+            self.logits_output.auxiliary_device_output = None
 
     @classmethod
     def from_pp_proxy(
@@ -224,9 +255,11 @@ def validate_input_length(
 
 
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
+    """Build the tensor payload needed to reconstruct PP output processing state."""
 
     logits_output = result.logits_output
     assert logits_output is not None
+    sampling_mask_output = logits_output.sampling_mask_output
 
     return {
         "extend_input_len_per_req": result.extend_input_len_per_req,
@@ -236,8 +269,20 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
-        "next_token_sampling_mask_idx": result.logits_output.next_token_sampling_mask_idx,
-        "next_token_sampling_logprobs": result.logits_output.next_token_sampling_logprobs,
+        "sampling_mask_token_ids": (
+            None if sampling_mask_output is None else sampling_mask_output.token_ids
+        ),
+        "sampling_mask_lengths": (
+            None if sampling_mask_output is None else sampling_mask_output.lengths
+        ),
+        "sampling_mask_selected_logprobs": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.selected_logprobs
+        ),
+        "sampling_mask_statuses": (
+            None if sampling_mask_output is None else sampling_mask_output.statuses
+        ),
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -249,6 +294,15 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 def get_logprob_from_pp_outputs(
     next_pp_outputs: PPProxyTensors,
 ) -> tuple[LogitsProcessorOutput, list[int], list[int]]:
+    """Reconstruct output processing state received from the last PP stage."""
+    sampling_mask_output = None
+    if next_pp_outputs["sampling_mask_token_ids"] is not None:
+        sampling_mask_output = SamplingMaskOutput(
+            token_ids=next_pp_outputs["sampling_mask_token_ids"],
+            lengths=next_pp_outputs["sampling_mask_lengths"],
+            selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
+            statuses=next_pp_outputs["sampling_mask_statuses"],
+        )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large
         next_token_logits=None,
@@ -262,8 +316,7 @@ def get_logprob_from_pp_outputs(
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
         ],
-        next_token_sampling_mask_idx=next_pp_outputs["next_token_sampling_mask_idx"],
-        next_token_sampling_logprobs=next_pp_outputs["next_token_sampling_logprobs"],
+        sampling_mask_output=sampling_mask_output,
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],
@@ -373,23 +426,24 @@ def msgpack_decode_explained(data: bytes) -> Any:
             if m is not None:
                 idx = int(m.group(1))
                 if 1 <= idx <= len(fields):
-                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+                    msg = f"{msg[: m.start()]}$.{fields[idx - 1]}{msg[m.end() :]}"
         raise MsgpackDecodeError(rid, msg) from e
 
 
-def compute_num_reserved_tokens(server_args: ServerArgs) -> int:
+def compute_num_reserved_tokens() -> int:
     """Output token slots reserved per request, on top of its input.
 
     The current eagle implementation stores draft tokens in the output token
     slots, so the context budget has to account for them; every other algorithm
     reserves nothing. Shared by `TokenizerManager` and the rust server's
-    `server_args` blob (`RustServer._build_server_args`), which needs the same
+    `server_args` handoff (`RustServer._build_server_args`), which needs the same
     number to run the total-token check in Rust.
     """
-    algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
     if not algorithm.is_eagle():
         return 0
     return max(
-        server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-        server_args.max_speculative_num_draft_tokens,
+        spec.speculative_eagle_topk * spec.speculative_num_steps,
+        max_speculative_num_draft_tokens(),
     )

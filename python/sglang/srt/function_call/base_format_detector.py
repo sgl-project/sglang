@@ -228,9 +228,9 @@ class BaseFormatDetector(ABC):
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
                 if "parameters" in obj:
-                    assert (
-                        "arguments" not in obj
-                    ), "model generated both parameters and arguments"
+                    assert "arguments" not in obj, (
+                        "model generated both parameters and arguments"
+                    )
                     obj["arguments"] = obj["parameters"]
 
                 current_tool_call = obj
@@ -349,6 +349,14 @@ class BaseFormatDetector(ABC):
         Check if the given text contains function call markers specific to this format.
         """
         raise NotImplementedError()
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Called once when the stream ends; flush any buffered state.
+
+        Detectors that hold text back while waiting for a marker that can no
+        longer arrive (the stream is over) override this to release it.
+        """
+        return StreamingParseResult()
 
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""

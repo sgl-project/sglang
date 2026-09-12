@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
@@ -26,7 +30,16 @@ from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
 from sglang.multimodal_gen.runtime.utils.vision import resize
-from sglang.multimodal_gen.utils import calculate_dimensions
+
+
+def _calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height, None
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -317,7 +330,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
         img_cos_sin_cache = torch.cat([img_cos_half, img_sin_half], dim=-1)
         txt_cos_sin_cache = torch.cat([txt_cos_half, txt_sin_half], dim=-1)
-        return img_cos_sin_cache, txt_cos_sin_cache
+        return (img_cos_sin_cache, txt_cos_sin_cache), (img_freqs, txt_freqs)
 
     def _prepare_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
@@ -351,19 +364,24 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
                 "img_shapes": img_shapes,
                 "txt_seq_lens": txt_seq_lens,
                 "freqs_cis": None,
+                "freqs_complex": None,
                 "encoder_hidden_states_mask": encoder_hidden_states_mask,
             }
             return cond_kwargs
 
-        freqs_cis = self.get_freqs_cis(
+        freqs_cis, freqs_complex = self.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
         img_cache, txt_cache = freqs_cis
         img_cache = shard_rotary_emb_for_sp(img_cache)
+
+        img_complex, txt_complex = freqs_complex
+        img_complex = shard_rotary_emb_for_sp(img_complex)
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
+            "freqs_complex": (img_complex, txt_complex),
             "img_shapes": img_shapes,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
@@ -493,7 +511,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         height = batch.height
         width = batch.width
         image_size = batch.original_condition_image_size
-        edit_width, edit_height, _ = calculate_dimensions(
+        edit_width, edit_height, _ = _calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
         )
         vae_scale_factor = self.get_vae_scale_factor()
@@ -521,11 +539,12 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
                 "img_shapes": img_shapes,
                 "txt_seq_lens": txt_seq_lens,
                 "freqs_cis": None,
+                "freqs_complex": None,
                 "encoder_hidden_states_mask": encoder_hidden_states_mask,
             }
             return cond_kwargs
 
-        freqs_cis = QwenImagePipelineConfig.get_freqs_cis(
+        freqs_cis, freqs_complex = QwenImagePipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
@@ -537,9 +556,13 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         img_cache, txt_cache = _shard_qwen_edit_freqs_cis_for_sp(
             freqs_cis, noisy_img_seq_len, device
         )
+        img_complex, txt_complex = _shard_qwen_edit_freqs_cis_for_sp(
+            freqs_complex, noisy_img_seq_len, device
+        )
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
+            "freqs_complex": (img_complex, txt_complex),
             "img_shapes": img_shapes,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
@@ -596,7 +619,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         )
 
     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             1024 * 1024, width / height
         )
         return calculated_width, calculated_height
@@ -623,7 +646,7 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         condition_image_sizes = []
         for img in image:
             image_width, image_height = img.size
-            edit_width, edit_height, _ = calculate_dimensions(
+            edit_width, edit_height, _ = _calculate_dimensions(
                 VAE_IMAGE_SIZE, image_width / image_height
             )
             condition_image_sizes.append((edit_width, edit_height))
@@ -671,13 +694,13 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         return new_images
 
     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             CONDITION_IMAGE_SIZE, width / height
         )
         return calculated_width, calculated_height
 
     def calculate_vae_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             VAE_IMAGE_SIZE, width / height
         )
         return calculated_width, calculated_height
@@ -723,7 +746,7 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             batch, 0, text_seq_len, batch_size, negative=negative
         )
 
-        freqs_cis = QwenImageEditPlusPipelineConfig.get_freqs_cis(
+        freqs_cis, freqs_complex = QwenImageEditPlusPipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
@@ -736,6 +759,9 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": _shard_qwen_edit_freqs_cis_for_sp(
                 freqs_cis, noisy_img_seq_len, device
+            ),
+            "freqs_complex": _shard_qwen_edit_freqs_cis_for_sp(
+                freqs_complex, noisy_img_seq_len, device
             ),
             "img_shapes": img_shapes,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
@@ -752,6 +778,14 @@ class QwenImageEditPlus_2511_PipelineConfig(QwenImageEditPlusPipelineConfig):
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640
     vae_precision: str = "bf16"
+    # promoting the auxiliary components regresses first-request latency
+    supports_auto_residency: bool = False
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("text_encoder", "vae"),
+        )
 
     def postprocess_cfg_noise(
         self,
@@ -779,7 +813,7 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
             batch, 0, text_seq_len, batch_size, negative=negative
         )
 
-        freqs_cis = QwenImageEditPlusPipelineConfig.get_freqs_cis(
+        freqs_cis, freqs_complex = QwenImageEditPlusPipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
@@ -794,10 +828,17 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
             [noisy_img_cache, img_cache[noisy_img_seq_len:, :]], dim=0
         ).to(device=device)
 
+        img_complex, txt_complex = freqs_complex
+        noisy_img_complex = shard_rotary_emb_for_sp(img_complex[:noisy_img_seq_len, :])
+        img_complex = torch.cat(
+            [noisy_img_complex, img_complex[noisy_img_seq_len:, :]], dim=0
+        ).to(device=device)
+
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "img_shapes": img_shapes,
             "freqs_cis": (img_cache, txt_cache),
+            "freqs_complex": (img_complex, txt_complex),
             "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }

@@ -55,6 +55,31 @@ class StageVerificationError(Exception):
     pass
 
 
+def record_default_workload_iterations(stage, batch) -> None:
+    """Record how often a stage's repeated unit ran, once per warmup request.
+
+    A stage whose loop length is a formula of the request's step count
+    declares it in ``default_workload_iterations``; the same formula at the
+    default workload's step count is the target. A stage that recorded
+    explicitly inside its loop (a count only known there) is left alone.
+    """
+    metrics = batch.metrics
+    if metrics is None or metrics.active_stage_name is None:
+        return
+    if metrics.active_stage_name in metrics.stage_iterations:
+        return
+    measured = stage.default_workload_iterations(batch, int(batch.num_inference_steps))
+    if measured is None:
+        return
+    target_steps = int(
+        batch.extra.get("warmup_target_num_inference_steps", batch.num_inference_steps)
+    )
+    target = stage.default_workload_iterations(batch, target_steps)
+    metrics.record_stage_iterations(
+        max(1, int(measured)), max(1, int(measured if target is None else target))
+    )
+
+
 class PipelineStage(StageDedupMixin, ABC):
     """
     Abstract base class for all pipeline stages.
@@ -68,6 +93,9 @@ class PipelineStage(StageDedupMixin, ABC):
     # calling super().__init__() still see a consistent explicit-range gate.
     _current_use_nvtx: bool = False
     _current_batch_is_warmup: bool = False
+    _component_residency_manager = None
+    _registered_stage_name: str | None = None
+    _profile_stage_name: str | None = None
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -160,29 +188,30 @@ class PipelineStage(StageDedupMixin, ABC):
     def set_profile_stage_name(self, stage_name: str) -> None:
         self._profile_stage_name = stage_name
 
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        """How many times this stage's repeated unit runs for a request with
+        ``num_inference_steps`` steps; ``None`` means the stage is not repeated
+        (or records its count itself with ``batch.record_stage_iterations``)."""
+        return None
+
     def _component_stage_name(self, stage_name: str | None = None) -> str:
-        return (
-            stage_name
-            or getattr(self, "_registered_stage_name", None)
-            or self.__class__.__name__
-        )
+        return stage_name or self._registered_stage_name or self.__class__.__name__
 
     def _active_component_stage_name(self) -> str:
         """Stage name reported by the residency manager.
 
-        Only valid between ``before_stage`` and ``after_stage``; outside
-        that window the manager state still holds the previous stage's
-        name. Use :meth:`_component_stage_name` for the static identity.
+        During execution this comes from the manager; otherwise the registered
+        stage name provides the static identity.
         """
-        manager = getattr(self, "_component_residency_manager", None)
-        manager_state = getattr(manager, "state", None)
-        manager_stage_name = getattr(manager_state, "stage_name", None)
-        if manager_stage_name is not None:
-            return manager_stage_name
+        manager = self._component_residency_manager
+        if manager is not None and manager.state.stage_name is not None:
+            return manager.state.stage_name
         return self._component_stage_name()
 
     def _active_profile_stage_name(self) -> str:
-        return getattr(self, "_profile_stage_name", None) or self.__class__.__name__
+        return self._profile_stage_name or self.__class__.__name__
 
     def _finish_active_component_use(self) -> None:
         if self._component_residency_manager is not None:
@@ -219,8 +248,7 @@ class PipelineStage(StageDedupMixin, ABC):
                 return replace(use, target_dtype=target_dtype)
             return use
         raise ValueError(
-            f"{self.__class__.__name__} did not declare component use: "
-            f"{component_name}"
+            f"{self.__class__.__name__} did not declare component use: {component_name}"
         )
 
     @contextmanager
@@ -240,6 +268,24 @@ class PipelineStage(StageDedupMixin, ABC):
         )
         with self._use_component(use, module) as component:
             yield component
+
+    def begin_declared_component_use(
+        self,
+        *,
+        component_name: str,
+        module=None,
+        phase: str | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> None:
+        """Keep a declared component active until the next use interval begins."""
+        if self._component_residency_manager is None:
+            return
+        use = self._declared_component_use(
+            component_name=component_name,
+            phase=phase,
+            target_dtype=target_dtype,
+        )
+        self._component_residency_manager.begin_use(use, module=module)
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -370,7 +416,14 @@ class PipelineStage(StageDedupMixin, ABC):
 
         # Execute the actual stage logic with unified profiling.
         previous_batch_is_warmup = self._current_batch_is_warmup
+        metrics = batch.metrics
+        warmup_metrics = metrics if batch.is_warmup else None
+        previous_active_stage = (
+            warmup_metrics.active_stage_name if warmup_metrics is not None else None
+        )
         self._current_batch_is_warmup = batch.is_warmup
+        if warmup_metrics is not None:
+            warmup_metrics.active_stage_name = self._component_stage_name()
         try:
             with StageProfiler(
                 stage_name,
@@ -381,7 +434,11 @@ class PipelineStage(StageDedupMixin, ABC):
                 perf_dump_path_provided=batch.perf_dump_path is not None,
             ):
                 result = self.forward(batch, server_args)
+                if warmup_metrics is not None:
+                    record_default_workload_iterations(self, batch)
         finally:
+            if warmup_metrics is not None:
+                warmup_metrics.active_stage_name = previous_active_stage
             self._current_batch_is_warmup = previous_batch_is_warmup
             self._current_use_nvtx = False
 

@@ -661,6 +661,17 @@ def _fused_experts_none_to_flashinfer_alphamoe_fp8(
         ),
         out=out,
     )
+    from sglang.srt.layers.moe.alphamoe_trace import record_alphamoe_kernel
+
+    for kernel in ("alphamoe_fused_router", "alphamoe_fp8_block_scale_aligned_moe"):
+        record_alphamoe_kernel(
+            kernel=kernel,
+            hidden_states=hidden_states,
+            num_experts=quant_info.w13_weight.shape[0],
+            intermediate_size=quant_info.w13_weight.shape[1] // 2,
+            top_k=top_k,
+            block_m=ALPHAMOE_BLOCK_M,
+        )
     return StandardCombineInput(hidden_states=result)
 
 
@@ -670,6 +681,16 @@ def _trace_alphamoe_nvfp4_shape(
     quant_info: FlashInferAlphaMoeNvFp4QuantInfo,
     top_k: int,
 ) -> None:
+    from sglang.srt.layers.moe.alphamoe_trace import record_alphamoe_kernel
+
+    record_alphamoe_kernel(
+        kernel="alphamoe_nvfp4_aligned_moe",
+        hidden_states=hidden_states,
+        num_experts=quant_info.w13_weight.shape[0],
+        intermediate_size=quant_info.w13_weight.shape[1] // 2,
+        top_k=top_k,
+        block_m=ALPHAMOE_BLOCK_M,
+    )
     if os.environ.get("SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES", "0") != "1":
         return
     # Validation may arm tracing only after server initialization, CUDA graph

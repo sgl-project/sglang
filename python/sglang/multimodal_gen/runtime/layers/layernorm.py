@@ -11,12 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.qknorm_rope import (
+from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    fuse_scale_shift_kernel,
     fused_inplace_qknorm_rope,
+    triton_one_pass_rms_norm,
 )
-from sglang.kernels.ops.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
-from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
 )
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -37,6 +40,7 @@ _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
+_has_attentions = False
 
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
@@ -46,6 +50,20 @@ if _is_npu:
     from sgl_kernel_npu.norm.rmsnorm_without_weight import (
         fused_rmsnorm_without_weight,
     )
+
+    try:
+        import attentions  # noqa: F401
+
+        _has_attentions = True
+    except ImportError:
+        from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+        logger = init_logger(__name__)  # pylint: disable=invalid-name
+        logger.warning_once(
+            "The 'attentions' library is not installed. Falling back to native layernorm. "
+            "Installing this library may improve performance on NPU. "
+            "See: sgl-project/sgl-kernel-npu"
+        )
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
@@ -58,7 +76,9 @@ if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
 
 if not _is_cpu:
-    from sglang.kernels.ops.diffusion.triton.norm import norm_infer, rms_norm_fn
+    from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
+
+_QK_NORM_ROPE_DICT: dict[tuple[int, bool], RotaryEmbedding] = {}
 
 
 # Copied and adapted from sglang
@@ -431,7 +451,6 @@ class LayerNorm(CustomOp):
 # FSDP's MixedPrecisionPolicy
 @CustomOp.register("fp32_layer_norm")
 class FP32LayerNorm(CustomOp, nn.LayerNorm):
-
     def __init__(
         self,
         normalized_shape,
@@ -452,17 +471,7 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         )
         self._forward_method = self.dispatch_forward()
 
-        try:
-            import attentions  # noqa: F401
-        except ImportError:
-            from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-            logger = init_logger(__name__)  # pylint: disable=invalid-name
-            logger.warning(
-                "The 'attentions' library is not installed. Falling back to native layernorm. "
-                "Installing this library may improve performance on NPU."
-                "See: sgl-project/sgl-kernel-npu"
-            )
+        if _is_npu and not _has_attentions:
             self._forward_method = self.forward_native
 
     def _cached_fp32_param(
@@ -611,9 +620,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
             return self.forward_native(residual, x, gate, shift, scale)
 
-        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_scale_residual_norm_scale_shift,
-        )
+        from sglang.kernels.ops.diffusion import fused_scale_residual_norm_scale_shift
 
         if isinstance(gate, int) and gate != 1:
             raise ValueError(
@@ -644,7 +651,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
-            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_fused_residual_norm_scale_shift,
             )
@@ -789,9 +796,7 @@ class _NormScaleShift(CustomOp):
             )
             return self.forward_native(x, shift, scale)
 
-        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_norm_scale_shift,
-        )
+        from sglang.kernels.ops.diffusion import fused_norm_scale_shift
 
         return fused_norm_scale_shift(
             x.contiguous(),
@@ -813,7 +818,7 @@ class _NormScaleShift(CustomOp):
             return self.forward_native(x, shift, scale)
 
         try:
-            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_norm_scale_shift,
             )
@@ -925,6 +930,7 @@ def apply_qk_norm_with_optional_rope(
     k_norm: "RMSNorm",
     head_dim: int,
     cos_sin_cache: Optional[torch.Tensor] = None,
+    freqs_complex: Optional[torch.Tensor] = None,
     *,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
@@ -950,6 +956,7 @@ def apply_qk_norm_with_optional_rope(
         k_norm=k_norm,
         head_dim=head_dim,
         cos_sin_cache=cos_sin_cache,
+        freqs_complex=freqs_complex,
         is_neox=is_neox,
         positions=positions,
         position_offset=position_offset,
@@ -965,16 +972,22 @@ def apply_qk_norm_rope(
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     *,
+    freqs_complex: Optional[torch.Tensor] = None,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
     allow_inplace: bool = True,
+    allow_strided_qk: bool = False,
+    round_norm_before_rope: bool = False,
+    cache_has_full_width: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA/XPU shapes."""
+    """Apply QK RMSNorm followed by RoPE, fusing supported CUDA/XPU shapes.
 
-    from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-        apply_flashinfer_rope_qk_inplace,
-    )
+    Strided packed-QKV views require an explicit opt-in because selecting the fused
+    kernel changes the numerical path for models that historically used the fallback.
+    ``cache_has_full_width`` describes ``[full cos, full sin]`` cache rows and
+    requires the fused CUDA path; the ordinary cache stores half-width cos/sin.
+    """
 
     if q.dim() != 4 or k.dim() != 4:
         raise ValueError(
@@ -996,7 +1009,12 @@ def apply_qk_norm_rope(
     batch_size, seq_len, _, _ = q.shape
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
-    rope_dim = cos_sin_cache.size(-1)
+    cache_width = cos_sin_cache.size(-1)
+    if cache_has_full_width and cache_width % 2:
+        raise ValueError(
+            f"full-width cos/sin cache must have even width, got {cache_width}"
+        )
+    rope_dim = cache_width // 2 if cache_has_full_width else cache_width
     if rope_dim % 2 != 0 or rope_dim > head_dim:
         raise ValueError(
             f"cos_sin_cache width must be even and <= head_dim, got {rope_dim} vs {head_dim}"
@@ -1007,6 +1025,17 @@ def apply_qk_norm_rope(
         "off",
         "no",
     }
+    q_has_supported_layout = q.is_contiguous()
+    k_has_supported_layout = k.is_contiguous()
+    if allow_strided_qk:
+        q_has_supported_layout = (
+            q.stride(-1) == 1
+            and q.stride(-2) == k.stride(-2)
+            and q.stride(0) == seq_len * q.stride(1)
+        )
+        k_has_supported_layout = k.stride(-1) == 1 and k.stride(
+            0
+        ) == seq_len * k.stride(1)
 
     if positions is None:
         pos_1d = torch.arange(
@@ -1030,15 +1059,24 @@ def apply_qk_norm_rope(
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
+        and k.dtype == q.dtype
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, q.dtype)
+        and q_has_supported_layout
+        and k_has_supported_layout
+        and can_use_fused_inplace_qknorm_rope(
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+            is_neox=is_neox,
+            dtype=q.dtype,
+            cache_dtype=cos_sin_cache.dtype,
+            round_norm_before_rope=round_norm_before_rope,
+            cache_has_full_width=cache_has_full_width,
+        )
     ):
         fused_inplace_qknorm_rope(
-            q=q.reshape(-1, q.shape[-2], head_dim),
-            k=k.reshape(-1, k.shape[-2], head_dim),
+            q=q.view(-1, q.shape[-2], head_dim),
+            k=k.view(-1, k.shape[-2], head_dim),
             q_weight=q_norm.weight,
             k_weight=k_norm.weight,
             cos_sin_cache=cos_sin_cache,
@@ -1047,11 +1085,14 @@ def apply_qk_norm_rope(
             eps=q_eps,
             head_dim=head_dim,
             rope_dim=rope_dim,
+            round_norm_before_rope=round_norm_before_rope,
+            cache_has_full_width=cache_has_full_width,
         )
         return q, k
 
-    # TODO: Once CUDA fused_inplace_qknorm_rope supports last-dimension-contiguous q/k,
-    # merge this path with the CUDA fused qknorm+rope branch.
+    if cache_has_full_width:
+        raise RuntimeError("full-width cos/sin cache requires fused QKNorm+RoPE")
+
     if (
         _is_xpu
         and allow_inplace
@@ -1084,13 +1125,25 @@ def apply_qk_norm_rope(
         head_dim=head_dim,
         allow_inplace=allow_inplace,
     )
-    return apply_flashinfer_rope_qk_inplace(
-        q=q,
-        k=k,
-        cos_sin_cache=cos_sin_cache,
-        head_size=head_dim,
-        is_neox=is_neox,
+
+    rope_key = (head_dim, is_neox)
+    rotary_emb = _QK_NORM_ROPE_DICT.get(rope_key)
+    if rotary_emb is None:
+        rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=is_neox,
+        )
+        _QK_NORM_ROPE_DICT[rope_key] = rotary_emb
+    return rotary_emb(
+        query=q,
+        key=k,
         positions=positions,
+        complex_freqs=(
+            freqs_complex.unsqueeze(-2) if freqs_complex is not None else None
+        ),
+        cos_sin_cache=cos_sin_cache,
     )
 
 

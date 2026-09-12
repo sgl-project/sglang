@@ -122,7 +122,7 @@ Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only supp
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>flashinfer_alphamoe</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental opt-in FlashInfer backend that fuses selected-logit softmax routing with the AlphaMoE W8A8 expert path. It currently accepts only the validated Qwen3-Next-80B-A3B-Instruct-FP8 TP4 geometry: 512 experts, hidden size 2048, TP-sharded intermediate size 128, top-k 10, native FP8 128x128 block weights, BF16 activations, EP1, and no all-to-all, fused shared experts, full torch.compile, or speculative decoding. NVFP4/ModelOpt is not supported because its global scale contract is not represented by the AlphaMoE W8A8 API.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental opt-in FlashInfer backend for Qwen3-Next-80B-A3B-Instruct-FP8 (512 experts, hidden size 2048, TP-local intermediate size 128, top-k 10) and GLM-5.2-NVFP4 (256 experts, hidden size 6144, TP-local intermediate size 512, top-k 8). W8A8 uses fused selected-logit softmax routing; NVFP4 preserves the model's standard TopK and independent ModelOpt gate/up/down scales. Both require TP4, EP1, BF16 activations, and no all-to-all, fused shared experts, full torch.compile, or speculative decoding. Performance depends on the workload; this backend is not selected automatically.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B200 or B300 with the required FlashInfer AlphaMoE APIs.</td>
     </tr>
     <tr>
@@ -158,10 +158,31 @@ configuration:
 python -m sglang.launch_server --model-path Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 --tp 4 --ep 1 --moe-a2a-backend none --moe-runner-backend flashinfer_alphamoe
 ```
 
-The backend fails closed for every other model geometry, quantization format,
-or GPU architecture, and does not support `--enable-torch-compile` or
-speculative decoding. It requires an exact SM100/SM103 GPU and a FlashInfer
-build containing the AlphaMoE fused-router and W8A8 APIs.
+For a serialized GLM-5.2-NVFP4 checkpoint, pass its local path with the same
+parallelism and runner options, and `--quantization modelopt_fp4`. This path
+requires the AlphaMoE NVFP4 API with `output1_scale_gate_scalar`,
+`output1_scale_scalar`, and `output2_scale_scalar`; the original NVFP4 API
+without these scale arguments cannot represent this checkpoint.
+
+The backend rejects other expert geometries and quantization formats. It
+requires an exact SM100/SM103 GPU, BF16 activations, and a FlashInfer build
+containing the selected AlphaMoE APIs. Full `--enable-torch-compile`,
+speculative decoding, and symmetric-memory output buffers are unsupported.
+
+To attribute routing accuracy independently on the Qwen checkpoint, set
+`SGLANG_FLASHINFER_ALPHAMOE_ROUTER_ONLY=1` and use
+`--moe-runner-backend triton`. This replaces TopK with the fused AlphaMoE
+router while retaining the ordinary Triton expert computation. It accepts
+only the Qwen FP8 TP4/EP1 softmax routing contract described above.
+
+For request-observed dispatch receipts, set
+`SGLANG_FLASHINFER_ALPHAMOE_TRACE_SHAPES=1` and
+`SGLANG_FLASHINFER_ALPHAMOE_TRACE_ARM_FILE` to an initially absent file.
+Create the file after server initialization and warmup. The
+`ALPHAMOE_RUNTIME_EXECUTION` log records eager execution and CUDA graph replay
+with both the real token count and the padded execution size. Capture-only
+sizes are not reported as request coverage. These dispatch receipts accompany
+model evaluation results and do not replace device profiling or accuracy tests.
 
 ## Extensible EP Framework
 

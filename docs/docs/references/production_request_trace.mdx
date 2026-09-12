@@ -70,6 +70,28 @@ This section explains how to configure the request tracing and export the trace 
 
     **Note**: You must set the parameter `--enable-trace`; otherwise, the trace capability will not be enabled regardless of any dynamic adjustments to the trace level.
 
+## Async Tracing (Reducing Performance Overhead)
+
+When batch sizes are large, synchronous OTel span creation can degrade inference throughput due to thread-safe locking and background export threads. Async tracing moves all span creation to a dedicated exporter process via ZMQ, keeping the scheduler and tokenizer hot paths free of OTel overhead.
+
+**Enable async tracing:**
+```bash
+SGLANG_TRACE_ASYNC=1 python -m sglang.launch_server --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other options>
+```
+
+**How it works:**
+- A daemon exporter process is started per worker process (scheduler, tokenizer, etc.).
+- The root span is still created in the caller process (one per request, negligible cost), preserving cross-process span linking via `traceparent`.
+- Thread spans and slice spans are buffered as lightweight operation dicts and flushed to the exporter via ZMQ PUSH/PULL.
+- Span IDs are pre-generated in the caller process using `TraceCustomIdGenerator.preset_next_span_id()`, so the exported span tree is identical to synchronous mode.
+- Thread info (scheduler label, TP/DP/PP ranks) is registered once via a callback on `trace_set_thread_info()`.
+
+**Tuning:**
+| Environment Variable | Description | Default |
+| --- | --- | --- |
+| `SGLANG_TRACE_ASYNC` | Enable async tracing | `false` |
+| `SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD` | Max buffered ops before auto-flush | `100` |
+
 ## How to add Tracing for slices you're interested in?(API introduction)
 We have already inserted instrumentation points in the tokenizer and scheduler main threads. If you wish to trace additional request execution segments or perform finer-grained tracing, please use the APIs from the tracing package as described below.
 

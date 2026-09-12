@@ -49,13 +49,16 @@ class CheckEntry(NamedTuple):
 class QuantizedWeight(NamedTuple):
     comparable_cls: type[ComparableWeight]
     scale_name: str
+    is_shuffled: bool = False
 
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
     "cos_sin_cache",
+    "cos_cache",
+    "sin_cache",
     "inv_freq",
     "freqs_cis",
-    "_weight_fp32",
+    "expert_mask_gpu",
 )
 
 
@@ -89,9 +92,9 @@ class WeightChecker:
             (name, param.data.detach().cpu()) for name, param in self._model_state()
         ]
         self._snapshot_tensors = dict(named_tensors)
-        assert len(self._snapshot_tensors) == len(
-            named_tensors
-        ), f"should not have duplicated tensor name"
+        assert len(self._snapshot_tensors) == len(named_tensors), (
+            f"should not have duplicated tensor name"
+        )
 
     def _reset_tensors(self):
         for name, param in self._model_state():
@@ -198,9 +201,9 @@ def _check_tensors(
             # skip cos/sin cache which is deterministic from shape and dtype and may have different shapes due to different implementations.
             continue
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
-        assert (
-            should_compare == actual_should_compare
-        ), f"{should_compare=} {actual_should_compare=}"
+        assert should_compare == actual_should_compare, (
+            f"{should_compare=} {actual_should_compare=}"
+        )
         name = expect_name
 
         try:
@@ -267,12 +270,14 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
         if comparable_cls is None:
             continue
         prefix = f"{module_name}." if module_name else ""
-        own = {name for name, _ in module.named_parameters(recurse=False)}
-        for name in own:
+        own = dict(module.named_parameters(recurse=False))
+        for name, parameter in own.items():
             scale = name.replace("weight", "weight_scale_inv")
             if name.endswith("weight") and scale in own:
                 quantized_set[prefix + name] = QuantizedWeight(
-                    comparable_cls, prefix + scale
+                    comparable_cls,
+                    prefix + scale,
+                    getattr(parameter, "is_shuffled", False),
                 )
     return quantized_set
 
@@ -293,7 +298,13 @@ def _build_check_entries(
             continue  # compared via its weight's comparable
         if name in quantized_set:
             qw = quantized_set[name]
-            yield CheckEntry(name, True, qw.comparable_cls(tensor, raw[qw.scale_name]))
+            yield CheckEntry(
+                name,
+                True,
+                qw.comparable_cls(
+                    tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
+                ),
+            )
         else:
             should_compare = name not in skip_compare_names and (
                 not _is_non_persistent_buffer_name(name)

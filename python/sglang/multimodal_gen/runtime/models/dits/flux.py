@@ -28,24 +28,21 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_layernorm_modulate,
+    can_use_linear_gelu,
+    can_use_ln_modulate,
+    fused_gelu_active,
+    fused_layernorm_modulate,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.fused_ln_modulate import (
-    can_fuse_ln_modulate,
     fused_ln_modulate,
     fused_ln_modulate_active,
+    is_plain_layer_norm,
+    mark_fused_gelu_site,
     mark_fused_ln_modulate_site,
-)
-from sglang.kernels.ops.diffusion.modulate_scale_shift import (
-    can_use_modulate_scale_shift_cuda,
-    modulate_scale_shift_cuda,
-)
-from sglang.kernels.ops.diffusion.residual_gate_add import (
-    can_use_residual_gate_add_cuda,
-    residual_gate_add_cuda,
+    modulate_scale_shift,
+    residual_gate_add,
 )
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -91,72 +88,75 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
-_FLUX_RESIDUAL_GATE_CUDA_DISABLED = False
+_get_qkv_projections = get_qkv_projections
+
+_FLUX_LN_MOD = BitExactFusionGate("FLUX fused LN+modulate", per_signature=True)
+# Keep the pre-refactor direct set lookup in this launch-sensitive hot path.
+_FLUX_LN_MOD_SIGS = _FLUX_LN_MOD.verified_sigs
+assert _FLUX_LN_MOD_SIGS is not None
 
 
-def _flux_residual_gate_add(
-    residual: torch.Tensor,
-    update: torch.Tensor,
-    gate: torch.Tensor,
-) -> torch.Tensor:
-    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
+def _flux_fused_ln_modulate(
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Single-kernel ``LN(x) * (1 + scale) + shift``, bit-exact vs the eager
+    chain, or ``None`` when the fast path does not apply.
 
-    Restricted to half dtypes: there the kernel reproduces the eager pair's
-    two-step rounding exactly (verified by ``torch.equal``), while for fp32 it
-    would contract to an fma (one rounding) and stop being bit-exact. The
-    kernel's row-broadcast gate only covers ``[1, ..., 1, D]``; batched
-    ``[B>1, 1, D]`` gates fail ``can_use_residual_gate_add_cuda`` and take the
-    eager fallback below.
+    The Triton kernel replicates the aten LayerNorm kernel this dispatch
+    selects for bf16 rows (PR #34008), but bit-exactness is a property of
+    the live dispatch: every distinct (shape, stride, eps) combination is
+    verified ``torch.equal`` against the eager chain on first sight, and any
+    mismatch disables the fast path permanently.
     """
-    global _FLUX_RESIDUAL_GATE_CUDA_DISABLED
-
     if (
-        not _FLUX_RESIDUAL_GATE_CUDA_DISABLED
-        and residual.dtype in (torch.float16, torch.bfloat16)
-        and can_use_residual_gate_add_cuda(residual, update, gate)
+        _FLUX_LN_MOD.disabled
+        or not is_plain_layer_norm(norm, x.shape[-1])
+        or not can_use_fused_layernorm_modulate(x, scale, shift)
     ):
-        try:
-            return residual_gate_add_cuda(residual, update, gate)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling FLUX residual-gate CUDA fast path: {exc}")
-            _FLUX_RESIDUAL_GATE_CUDA_DISABLED = True
-
-    return residual + gate * update
-
-
-_FLUX_MODULATE_CUDA_DISABLED = False
-
-
-def _flux_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-) -> torch.Tensor:
-    """``x * (1 + scale[:, None]) + shift[:, None]`` in one CUDA kernel.
-
-    The kernel keeps the eager chain's per-op fp32-opmath/round-to-storage
-    boundaries, so it is bit-exact vs eager and needs no quality gate.
-    Guarded inputs fall back to the eager expression.
-    """
-    global _FLUX_MODULATE_CUDA_DISABLED
-
-    if not _FLUX_MODULATE_CUDA_DISABLED and can_use_modulate_scale_shift_cuda(
-        x, scale, shift
+        return None
+    sig = (
+        x.shape,
+        x.stride(),
+        scale.shape,
+        scale.stride(),
+        shift.shape,
+        shift.stride(),
+        norm.eps,
+    )
+    verified = sig in _FLUX_LN_MOD_SIGS
+    if not verified and (
+        torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
     ):
-        try:
-            return modulate_scale_shift_cuda(x, scale, shift)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling FLUX modulate CUDA fast path: {exc}")
-            _FLUX_MODULATE_CUDA_DISABLED = True
-
-    return x * (1 + scale[:, None]) + shift[:, None]
+        # The first-sight check needs the eager chain and a host sync; run
+        # neither inside compile tracing nor CUDA graph capture.
+        return None
+    try:
+        out = fused_layernorm_modulate(x, scale, shift, norm.eps)
+    except Exception as exc:
+        _FLUX_LN_MOD.on_exception(exc, logger=logger)
+        return None
+    if verified:
+        return out
+    ref = modulate_scale_shift(norm(x), scale, shift)
+    return _FLUX_LN_MOD.accept_or_fallback(
+        out,
+        ref,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "FLUX fused LN+modulate fast path is not bit-exact against this "
+            "platform's LayerNorm dispatch; falling back to eager"
+        ),
+    )
 
 
 def _flux_norm_modulate(
@@ -168,13 +168,20 @@ def _flux_norm_modulate(
 ) -> torch.Tensor:
     """``norm(x) * (1 + scale) + shift`` for the FLUX adaLN sites.
 
-    Default: affine-free LayerNorm + the bit-exact fused modulate.  When the
-    site is mounted (``quality="high"``) and the per-call guard passes, the
-    modulate is folded into the LN affine instead (one kernel; not bit-exact).
+    Priority: (1) the bit-exact single-kernel LN+modulate -- lossless, so it
+    needs no quality gate and also supersedes the request-gated affine
+    fold wherever it verifies; (2) when the site is mounted
+    (``quality="extra-high"`` or ``"high"``) and the bit-exact kernel is
+    unavailable, the modulate folded into the LN affine (one aten kernel; not
+    bit-exact);
+    (3) affine-free LayerNorm + the bit-exact fused modulate.
     """
-    if fused_ln_modulate_active(site) and can_fuse_ln_modulate(x, scale, shift):
+    out = _flux_fused_ln_modulate(norm, x, scale, shift)
+    if out is not None:
+        return out
+    if fused_ln_modulate_active(site) and can_use_ln_modulate(x, scale, shift):
         return fused_ln_modulate(x, scale, shift, norm.eps)
-    return _flux_modulate(norm(x), scale, shift)
+    return modulate_scale_shift(norm(x), scale, shift)
 
 
 class FluxAdaLayerNormZero(AdaLayerNormZero):
@@ -238,6 +245,23 @@ def _rope_cos_sin_cache(
         ],
         dim=-1,
     )
+
+
+def _rope_complex_freqs(
+    freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None],
+) -> Optional[torch.Tensor]:
+    """Complex-valued sibling of ``_rope_cos_sin_cache``: build [seq, dim//2]
+    complex64 freqs for the (is_neox=False) NPU fast path in
+    apply_qk_norm_with_optional_rope. Accepts the same inputs as
+    _rope_cos_sin_cache — a raw (cos, sin) tuple, or its already-hoisted
+    cat([cos, sin], dim=-1) cache tensor, split back in half."""
+    if freqs_cis is None:
+        return None
+    if isinstance(freqs_cis, torch.Tensor):
+        cos, sin = freqs_cis.chunk(2, dim=-1)
+    else:
+        cos, sin = freqs_cis
+    return torch.complex(cos.to(torch.float32), sin.to(torch.float32))
 
 
 try:
@@ -362,32 +386,6 @@ def _fused_gelu_mlp(
     return output.view(batch_size, seq_len, -1)
 
 
-def _get_qkv_projections(
-    attn: "FluxAttention", hidden_states, encoder_hidden_states=None
-):
-    if getattr(attn, "use_fused_qkv", False):
-        qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = [x.contiguous() for x in qkv.chunk(3, dim=-1)]
-    else:
-        query, _ = attn.to_q(hidden_states)
-        key, _ = attn.to_k(hidden_states)
-        value, _ = attn.to_v(hidden_states)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [
-                x.contiguous() for x in added_qkv.chunk(3, dim=-1)
-            ]
-        else:
-            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
-
-
 class FluxGELU(nn.Module):
     def __init__(
         self,
@@ -407,14 +405,12 @@ class FluxGELU(nn.Module):
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.gelu = nn.GELU(approximate="tanh")
-        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # extra-high/high fusion site: up-proj GEMM + tanh-GELU in the cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -429,7 +425,7 @@ class FluxFusedGELUProj(nn.Module):
     ``approximate="tanh"`` that keeps the ``net.0.proj`` parameter path. The
     default path is the bit-exact reference (plain Linear + tanh-GELU); the
     cublasLt GELU epilogue is mounted per batch by the denoising stage for
-    quality="high" requests only.
+    requests with ``quality="extra-high"`` or ``quality="high"`` only.
     """
 
     def __init__(self, proj: nn.Linear):
@@ -438,9 +434,7 @@ class FluxFusedGELUProj(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -656,6 +650,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         x: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis=None,
+        complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         attn_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[Dict[str, int]] = None,
@@ -682,6 +677,13 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             encoder_value = encoder_value.unflatten(-1, (num_heads, -1))
 
             text_seq_len = encoder_query.shape[1]
+            # complex_freqs covers [text, image] positions in order (same
+            # table cos_sin_cache/positions index into); slice per call the
+            # same way position_offset selects rows below — the class's
+            # complex_freqs path does not do positional indexing itself.
+            text_freqs_complex = (
+                complex_freqs[:text_seq_len] if complex_freqs is not None else None
+            )
             encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
                 q=encoder_query,
                 k=encoder_key,
@@ -689,8 +691,15 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_added_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=text_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
+            )
+            img_seq_len = query.shape[1]
+            img_freqs_complex = (
+                complex_freqs[text_seq_len : text_seq_len + img_seq_len]
+                if complex_freqs is not None
+                else None
             )
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -699,6 +708,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=img_freqs_complex,
                 is_neox=False,
                 position_offset=text_seq_len,
                 allow_inplace=True,
@@ -711,6 +721,10 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             key = join_seqs(encoder_key, key, sp_txt_pad)
             value = join_seqs(encoder_value, value, sp_txt_pad)
         else:
+            seq_len = query.shape[1]
+            joint_freqs_complex = (
+                complex_freqs[:seq_len] if complex_freqs is not None else None
+            )
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
@@ -718,6 +732,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=joint_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
             )
@@ -814,7 +829,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
-            # quality="high" fusion site: proj_mlp GEMM + tanh-GELU in the
+            # extra-high/high fusion site: proj_mlp GEMM + tanh-GELU in the
             # cublasLt epilogue (mounted per batch by the denoising stage).
             mark_fused_gelu_site(self, "proj_mlp")
             proj_out_cls = (
@@ -877,6 +892,7 @@ class FluxSingleTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -905,6 +921,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                complex_freqs=complex_freqs,
                 num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
@@ -916,7 +933,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            if fused_gelu_active(self) and can_use_linear_gelu(
                 self.proj_mlp, norm_hidden_states
             ):
                 mlp_hidden_states = fused_linear_gelu_tanh(
@@ -929,6 +946,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                complex_freqs=complex_freqs,
                 num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
@@ -936,7 +954,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
             gate = gate.unsqueeze(1)
             proj_out, _ = self.proj_out(hidden_states)
-            hidden_states = _flux_residual_gate_add(residual, proj_out, gate)
+            hidden_states = residual_gate_add(residual, proj_out, gate)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -978,7 +996,7 @@ class FluxTransformerBlock(nn.Module):
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        # quality="high" site: the norm2/norm2_context modulate folds into the
+        # extra-high/high site: norm2/norm2_context modulate folds into the
         # LN affine when mounted.
         mark_fused_ln_modulate_site(self)
 
@@ -1033,7 +1051,7 @@ class FluxTransformerBlock(nn.Module):
                 activation_fn="gelu-approximate",
             )
             # Re-home each FF's tanh-GELU up-projection onto a marked
-            # quality="high" fusion site (bit-exact reference by default).
+            # extra-high/high fusion site (bit-exact reference by default).
             self.ff.net[0] = FluxFusedGELUProj(self.ff.net[0].proj)
             self.ff_context.net[0] = FluxFusedGELUProj(self.ff_context.net[0].proj)
 
@@ -1043,6 +1061,7 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1064,6 +1083,7 @@ class FluxTransformerBlock(nn.Module):
             x=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            complex_freqs=complex_freqs,
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
@@ -1074,7 +1094,7 @@ class FluxTransformerBlock(nn.Module):
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
-        hidden_states = _flux_residual_gate_add(
+        hidden_states = residual_gate_add(
             hidden_states, attn_output, gate_msa.unsqueeze(1)
         )
         if self.use_nunchaku_structure:
@@ -1088,14 +1108,14 @@ class FluxTransformerBlock(nn.Module):
             )
 
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = _flux_residual_gate_add(
+        hidden_states = residual_gate_add(
             hidden_states, ff_output, gate_mlp.unsqueeze(1)
         )
 
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
         # Process attention outputs for the `encoder_hidden_states`.
-        encoder_hidden_states = _flux_residual_gate_add(
+        encoder_hidden_states = residual_gate_add(
             encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
         )
 
@@ -1114,7 +1134,7 @@ class FluxTransformerBlock(nn.Module):
             )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = _flux_residual_gate_add(
+        encoder_hidden_states = residual_gate_add(
             encoder_hidden_states, context_ff_output, c_gate_mlp.unsqueeze(1)
         )
         if encoder_hidden_states.dtype == torch.float16:
@@ -1195,7 +1215,6 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        self.config = config.arch_config
 
         self.out_channels = (
             getattr(self.config, "out_channels", None) or self.config.in_channels
@@ -1350,8 +1369,14 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         join_seqs(sin[:t_loc], sin[t_loc:], pad, dim=0),
                     )
 
-        # Build the RoPE cos/sin cache once per step; every attention call
-        # below reuses the same tensor.
+        # Build the RoPE cos/sin cache and complex_freqs once per step; every
+        # attention call below reuses the same tensors.
+        complex_freqs = _rope_complex_freqs(freqs_cis)
+        singles_complex_freqs = (
+            complex_freqs
+            if singles_freqs_cis is freqs_cis
+            else _rope_complex_freqs(singles_freqs_cis)
+        )
         hoisted_freqs_cis = _rope_cos_sin_cache(freqs_cis)
         singles_freqs_cis = (
             hoisted_freqs_cis
@@ -1382,6 +1407,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     freqs_cis=freqs_cis,
+                    complex_freqs=complex_freqs,
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
@@ -1391,6 +1417,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     freqs_cis=singles_freqs_cis,
+                    complex_freqs=singles_complex_freqs,
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
