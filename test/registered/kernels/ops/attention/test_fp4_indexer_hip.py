@@ -18,6 +18,7 @@ from __future__ import annotations
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel (the AOT top-k transform)
 import torch
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
@@ -36,11 +37,13 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
+    sort_selection_rows,
 )
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
@@ -278,6 +281,65 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     stored_fp4, stored_sf = _read_index_k_cache(payload, scale, loc)
     torch.testing.assert_close(stored_sf, ref_sf)
     torch.testing.assert_close(_canonical_zero(stored_fp4), _canonical_zero(ref_fp4))
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16])
+@pytest.mark.parametrize("num_heads", [32])
+def test_index_q_pack_weights_matches_standalone(
+    num_tokens: int, num_heads: int
+) -> None:
+    """The one-launch index-Q path (RoPE, two-stage fp4 pack in the FlyDSL layout, head
+    weights) is bitwise the three standalone launches it replaces."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        index_q_pack_weights_hip,
+        pack_fp4_query_flydsl,
+        rocm_indexer_head_weights,
+    )
+    from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+        rope_tail_fake_quant_fp4,
+    )
+    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
+
+    torch.manual_seed(num_tokens * 7 + num_heads)
+    rope_dim, hidden, max_pos = 64, 5120, 4096
+    q = (torch.randn(num_tokens, num_heads * 128, device="cuda") * 3).bfloat16()
+    freqs = precompute_freqs_cis(rope_dim, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    assert freqs.dtype == torch.complex64
+    pos = torch.randint(0, max_pos, (num_tokens,), device="cuda", dtype=torch.int64)
+    x = torch.randn(num_tokens, hidden, device="cuda").bfloat16()
+    w = (torch.randn(num_heads, hidden, device="cuda") * 0.02).bfloat16()
+    scale = 128**-0.5 * num_heads**-0.5
+
+    ref_q = rope_tail_fake_quant_fp4(
+        q.view(num_tokens, num_heads, 128), freqs[pos], rope_dim
+    )
+    ref_fp4, ref_scale = pack_fp4_query_flydsl(ref_q)
+    ref_w = rocm_indexer_head_weights(x, w, scale)
+
+    partials = rocm_router_gemv_split_k(x, w)
+    q_fp4, q_scale, weights = index_q_pack_weights_hip(
+        q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
+    )
+    assert q_fp4.shape == (num_tokens, num_heads, 64) and q_fp4.dtype == torch.int8
+    assert q_scale.shape == (num_tokens, 1, 4, 16, 4) and q_scale.dtype == torch.uint8
+    assert torch.equal(q_fp4, ref_fp4)
+    assert torch.equal(q_scale, ref_scale)
+    assert torch.equal(weights, ref_w)
+    # repeatable, and a row alone equals the row inside the batch
+    again = index_q_pack_weights_hip(
+        q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
+    )
+    assert all(torch.equal(a, b) for a, b in zip(again, (q_fp4, q_scale, weights)))
+    one_fp4, one_scale, _ = index_q_pack_weights_hip(
+        q[:1],
+        freqs,
+        pos[:1],
+        rope_dim,
+        partials[:, :1].contiguous(),
+        scale,
+        num_heads=num_heads,
+    )
+    assert torch.equal(one_fp4, q_fp4[:1]) and torch.equal(one_scale, q_scale[:1])
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
@@ -823,6 +885,42 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
                 full[start + row, :ctx],
                 msg=f"row {start + row} (ctx={ctx})",
             )
+
+
+@pytest.mark.parametrize("seq_len", [1024])
+def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
+    """Rows longer than k: the AOT top-k emits its picks in atomic-counter order, so two launches
+    on the same scores differ; ordered by position they are identical, -1 padding last."""
+    torch.manual_seed(seq_len)
+    k, rows = 512, seq_len
+    scores = torch.randn(rows, seq_len, device=get_device())
+    seq_lens = torch.arange(1, rows + 1, device=get_device(), dtype=torch.int32)
+    pages = -(-seq_len // PAGE_SIZE)
+    page_table = (
+        torch.randperm(pages, device=get_device())
+        .to(torch.int32)
+        .expand(rows, -1)
+        .contiguous()
+    )
+
+    def select():
+        page = torch.empty((rows, k), dtype=torch.int32, device=get_device())
+        raw = torch.empty_like(page)
+        topk_transform_paged(scores, seq_lens, page_table, page, PAGE_SIZE, raw)
+        sort_selection_rows(page, raw)
+        return page, raw
+
+    page_a, raw_a = select()
+    page_b, raw_b = select()
+    assert torch.equal(raw_a, raw_b) and torch.equal(page_a, page_b)
+    valid = raw_a >= 0
+    assert torch.equal(valid.sum(1), seq_lens.clamp_max(k))
+    # ascending positions inside the valid prefix, padding after it
+    assert bool((raw_a[:, 1:][valid[:, 1:]] > raw_a[:, :-1][valid[:, 1:]]).all())
+    assert bool((valid[:, :-1] | ~valid[:, 1:]).all())
+    pos = raw_a.clamp_min(0)
+    slots = page_table.gather(1, pos // PAGE_SIZE) * PAGE_SIZE + pos % PAGE_SIZE
+    assert torch.equal(page_a, torch.where(valid, slots, -1))
 
 
 if __name__ == "__main__":
