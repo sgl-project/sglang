@@ -117,6 +117,10 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )
+            # The graph path pads nothing after this point, so the forward's own
+            # load_batch can take the pre-planned fast path; a shape change
+            # (DP padding) re-plans, which for load_batch is idempotent.
+            verify_forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
         elif not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch
